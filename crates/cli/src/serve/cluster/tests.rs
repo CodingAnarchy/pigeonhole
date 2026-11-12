@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::{
-    ClusterMap, GetMapRequest, Node as MapNode, Partition, SetMapRequest, SplitKey, StatusRequest,
-    TablePlacement, split_key,
+    ClusterMap, GetMapRequest, Node as MapNode, Partition, PushMapRequest, SetMapRequest, SplitKey,
+    StatusRequest, TablePlacement, split_key,
 };
 use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
@@ -139,6 +139,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         partitions: [("p1", "a"), ("p2", "b"), ("p3", "c")]
             .iter()
             .map(|(id, node)| Partition {
+                history_epoch: 0,
                 id: (*id).into(),
                 node: (*node).into(),
                 epoch: 1,
@@ -177,6 +178,15 @@ async fn version(port: u16) -> u64 {
         .map_version
 }
 
+/// A `phdb cluster move` or `relocate` within 2 minutes: one that hangs fails its test, with
+/// the move's progress lines in the output, rather than the CI job at its time limit
+/// (#1729's Windows run).
+async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(120), f)
+        .await
+        .expect("the move or relocation finishes within 2 minutes")
+}
+
 /// Waits for `cond` (a node's state settling after a background push or pull).
 async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
     for _ in 0..100 {
@@ -186,6 +196,128 @@ async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("{what}: never happened");
+}
+
+#[test]
+fn a_forced_first_map_starts_each_history_at_its_epoch() {
+    // simp724's S1 on #1729: a restore's forced map onto a fresh node carries the backup
+    // map's old `history_epoch`, which the restored files no longer hold. The node derives it.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = test_dir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let n = node(&dir, "a");
+    let _stop = serve(&rt, &n, listener);
+    rt.block_on(async {
+        let mut m = the_map(1, &[port, port + 1, port + 2]);
+        m.partitions[0].epoch = 7;
+        m.partitions[0].history_epoch = 3;
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                expected_map_version: 0,
+                map: Some(m),
+                copies: Vec::new(),
+                force: true,
+            })
+            .await
+            .unwrap();
+        let got = client(port)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p1 = &got.partitions[0];
+        assert_eq!((p1.id.as_str(), p1.epoch, p1.history_epoch), ("p1", 7, 7));
+    });
+}
+
+#[test]
+fn a_map_set_derives_each_partitions_history_and_its_peers_take_it() {
+    // D317 ticket 6: `history_epoch` is derived where a map is set (`SetMapRequest.copies`
+    // marks a relocation by copy), and peers take it as set.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let nodes = [
+        node(&dirs[0], "a"),
+        node(&dirs[1], "b"),
+        node(&dirs[2], "c"),
+    ];
+    let _stops: Vec<_> = nodes
+        .iter()
+        .zip(listeners)
+        .map(|(n, l)| serve(&rt, n, l))
+        .collect();
+    rt.block_on(async {
+        let set = async |expected: u64, map: ClusterMap, copies: &[&str]| {
+            client(ports[0])
+                .await
+                .set_map(SetMapRequest {
+                    expected_map_version: expected,
+                    map: Some(map),
+                    copies: copies.iter().map(|c| (*c).to_owned()).collect(),
+                    force: false,
+                })
+                .await
+        };
+        let p3 = async |port: u16| {
+            let m = client(port)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let p = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+            (p.node.clone(), p.epoch, p.history_epoch)
+        };
+        // A first map relocates nothing, so it can't mark a copy.
+        let e = set(0, the_map(1, &ports), &["p3"]).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        // A first map's histories start at its epochs, whatever it says (simp724's S1 on
+        // #1729): the_map sends 0.
+        set(0, the_map(1, &ports), &[]).await.unwrap();
+        assert_eq!(p3(ports[0]).await, ("c".into(), 1, 1));
+
+        // p3 copied from c to b at epoch 2: its history is kept, on every node.
+        let mut v2 = the_map(2, &ports);
+        v2.partitions[2].node = "b".into();
+        v2.partitions[2].epoch = 2;
+        set(1, v2.clone(), &["p3"]).await.unwrap();
+        for port in ports {
+            assert_eq!(p3(port).await, ("b".into(), 2, 1), "node at {port}");
+        }
+
+        // A mark on a change that isn't a move by one epoch is refused, and nothing changes.
+        let mut v3 = v2.clone();
+        v3.map_version = 3;
+        v3.partitions[2].node = "a".into();
+        v3.partitions[2].epoch = 4;
+        let e = set(2, v3.clone(), &["p3"]).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        assert!(e.message().contains("marked as copied"), "{e:?}");
+        assert_eq!(p3(ports[0]).await, ("b".into(), 2, 1));
+
+        // Unmarked (a promotion or a restore), the move starts another history, whatever
+        // the map sent says.
+        v3.partitions[2].history_epoch = 0;
+        set(2, v3, &[]).await.unwrap();
+        for port in ports {
+            assert_eq!(p3(port).await, ("a".into(), 4, 4), "node at {port}");
+        }
+    });
 }
 
 #[test]
@@ -213,6 +345,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let r = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 force: false,
                 expected_map_version: 0,
                 map: Some(the_map(1, &ports)),
@@ -230,6 +363,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let e = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 force: false,
                 expected_map_version: 0,
                 map: Some(the_map(2, &ports)),
@@ -244,6 +378,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let e = client(ports[1])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 force: false,
                 expected_map_version: 1,
                 map: Some(the_map(2, &ports)),
@@ -260,6 +395,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         let e = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 force: false,
                 expected_map_version: 1,
                 map: Some(reshaped),
@@ -292,6 +428,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 force: false,
                 expected_map_version: 1,
                 map: Some(v2.clone()),
@@ -3126,6 +3263,7 @@ fn split_nodes(
             .collect(),
         partitions: (0..n)
             .map(|i| Partition {
+                history_epoch: 0,
                 id: format!("q{i}"),
                 node: format!("n{i}"),
                 epoch: 1,
@@ -3528,6 +3666,7 @@ fn a_writer_that_restarts_with_a_map_sets_none_until_it_has_its_peers_maps() {
     let _stop = serve(&rt, &a, listeners.next().unwrap());
     let start = super::start_sync(&a, 1).expect("a node with a map syncs at start");
     let set = |version: u64| SetMapRequest {
+        copies: Vec::new(),
         force: false,
         expected_map_version: version - 1,
         map: Some(the_map(version, &ports)),
@@ -3635,7 +3774,8 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .unwrap()
             .into_inner();
         // A forced map that still names a as its writer is refused, and changes nothing.
-        let Err(e) = super::cli::set_map(&args(ports[1]), current.clone(), true).await else {
+        let Err(e) = super::cli::set_map(&args(ports[1]), current.clone(), true, Vec::new()).await
+        else {
             panic!("a forced map naming a writer that's down was set");
         };
         assert!(format!("{e:?}").contains("can't be"), "{e:?}");
@@ -3644,21 +3784,62 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
         let mut forced = current.clone();
         forced.map_version = 1;
         forced.nodes.retain(|n| n.id != "a");
+        let history = |m: &ClusterMap, id: &str| {
+            let p = m.partitions.iter().find(|p| p.id == id).unwrap();
+            (p.epoch, p.history_epoch)
+        };
+        let p2 = history(&current, "p2");
         for p in &mut forced.partitions {
             if p.id == "p1" {
                 p.node = "b".into();
                 p.epoch += 1;
+                // A history the caller claims is never taken (D317 ticket 6): p1 was
+                // promoted, not copied.
+                p.history_epoch = 0;
             }
         }
-        if let Err(e) = super::cli::set_map(&args(ports[1]), forced, true).await {
-            panic!("the forced map: {e:?}");
-        }
+        // A forced map can't mark a copy: a copy is a planned move, through the writer.
+        let e = client(ports[1])
+            .await
+            .set_map(SetMapRequest {
+                copies: vec!["p1".into()],
+                force: true,
+                expected_map_version: 0,
+                map: Some(forced.clone()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        assert!(
+            e.message().contains("can't mark a partition as copied"),
+            "{e:?}"
+        );
+        let p1_epoch = history(&forced, "p1").0;
+        let report = match super::cli::set_map(&args(ports[1]), forced, true, Vec::new()).await {
+            Ok(r) => r,
+            Err(e) => panic!("the forced map: {e:?}"),
+        };
+        // a couldn't be reached, so the forced epochs weren't checked against its map: the
+        // report names it.
+        assert_eq!(report.document["unchecked"], serde_json::json!(["a"]));
         let v = current.map_version + 1;
         // b sets it; c takes it by b's push (#1778).
         eventually("b and c to take the forced map", async || {
             (version(ports[1]).await, version(ports[2]).await) == (v, v)
         })
         .await;
+        // p1's history restarts at its new epoch, on b and on c, which took b's push; p2's,
+        // whose epoch didn't move, is kept.
+        for &port in &ports[1..] {
+            let m = client(port)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(history(&m, "p1"), (p1_epoch, p1_epoch), "at {port}");
+            assert_eq!(history(&m, "p2"), p2, "at {port}");
+        }
         // Schema calls work again, through b, the writer now.
         schema(ports[2])
             .await
@@ -3691,6 +3872,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
         let e = client(ports[0])
             .await
             .set_map(SetMapRequest {
+                copies: Vec::new(),
                 force: false,
                 expected_map_version: at_a.map_version,
                 map: Some(ClusterMap {
@@ -3702,8 +3884,10 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .unwrap_err();
         assert_eq!(code(&e), "WrongPartition", "{e:?}");
         assert!(e.message().contains("node b"), "{e:?}");
-        // A schema call through a reaches b. b and c end on one map, none divergent; a,
-        // no longer in the map, isn't pushed to, and stays at the forced map: it wrote none.
+        // A schema call through a reaches b. b and c end on one map, none divergent. a,
+        // no longer in the map, isn't pushed to and writes no map; its unconfirmed start
+        // fence keeps it fetching its peers' maps, so it holds the forced map or b's later
+        // one, never another (#1778).
         schema(ports[0])
             .await
             .create_table(create("t2", "p3"))
@@ -3711,7 +3895,8 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .unwrap();
         let last = version(ports[1]).await;
         assert_eq!(last, newest + 1);
-        assert_eq!(version(ports[0]).await, newest);
+        let at_a = version(ports[0]).await;
+        assert!(at_a == newest || at_a == last, "a at map {at_a}");
         let mut maps = Vec::new();
         for &port in &ports[1..] {
             eventually("every node to take the last map", async || {
@@ -3743,6 +3928,105 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
     }
 }
 
+#[test]
+fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
+    // simp724's F1 and F2 on #1729: a forced map's `history_epoch` is derived against the
+    // receiving node's map, so its epochs must be new. The node refuses one that goes back
+    // or moves a partition at a kept epoch (F1); `set-map --force` refuses one below, or
+    // moved at, an epoch a reachable node has, even when the receiving node is behind (F2).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let args = |port: u16| super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{port}"),
+        token_file: None,
+        ca: None,
+    };
+    let with_p3 = |m: &ClusterMap, version: u64, node: &str, epoch: u64| {
+        let mut m = m.clone();
+        m.map_version = version;
+        for p in &mut m.partitions {
+            if p.id == "p3" {
+                p.node = node.into();
+                p.epoch = epoch;
+                p.history_epoch = epoch;
+            }
+        }
+        m
+    };
+    rt.block_on(async {
+        let v1 = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        // b and c take a map that raised p3's epoch to 2; a doesn't, so it's behind.
+        let v2 = with_p3(&v1, 2, "c", 2);
+        for &port in &ports[1..] {
+            client(port)
+                .await
+                .push_map(PushMapRequest {
+                    map: Some(v2.clone()),
+                })
+                .await
+                .unwrap();
+        }
+        let force_at = |port: u16, map: ClusterMap| async move {
+            client(port)
+                .await
+                .set_map(SetMapRequest {
+                    copies: Vec::new(),
+                    force: true,
+                    expected_map_version: 0,
+                    map: Some(map),
+                })
+                .await
+        };
+        // F1, at b: p3's epoch can't go back to 1, and p3 can't move to a at epoch 2.
+        for (map, why) in [
+            (with_p3(&v2, 3, "c", 1), "epoch went back from 2 to 1"),
+            (with_p3(&v2, 3, "a", 2), "without a new epoch"),
+        ] {
+            let e = force_at(ports[1], map).await.unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+            assert!(e.message().contains(why), "{e:?}");
+        }
+        assert_eq!(version(ports[1]).await, 2, "nothing was set at b");
+        // F2, at a, whose own map (p3 at 1 on c) accepts both: b's and c's don't.
+        for (map, why) in [
+            (with_p3(&v1, 3, "c", 1), "epoch went back from 2 to 1"),
+            (with_p3(&v1, 3, "b", 2), "without a new epoch"),
+        ] {
+            assert_eq!(version(ports[0]).await, 1, "a is still behind");
+            let Err(e) = super::cli::set_map(&args(ports[0]), map, true, Vec::new()).await else {
+                panic!("a forced map reusing an epoch b and c have was set ({why})");
+            };
+            let e = format!("{e:?}");
+            assert!(
+                e.contains("has a newer placement than the forced map"),
+                "{e}"
+            );
+            assert!(e.contains(why), "{e}");
+        }
+        for &port in &ports {
+            assert!(version(port).await <= 2, "no forced map was set");
+        }
+        // An epoch above every node's is set, and nothing is unchecked: all three answered.
+        let r = super::cli::set_map(&args(ports[0]), with_p3(&v1, 3, "b", 3), true, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(r.document["unchecked"], serde_json::json!([]));
+        let m = client(ports[2])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+        assert_eq!((p3.node.as_str(), p3.epoch, p3.history_epoch), ("b", 3, 3));
+    });
+}
+
 mod backup;
 mod charge;
 mod close;
@@ -3750,6 +4034,7 @@ mod feed;
 mod fence;
 mod idle;
 mod metrics;
+mod moving;
 mod open;
 mod restore;
 mod several;

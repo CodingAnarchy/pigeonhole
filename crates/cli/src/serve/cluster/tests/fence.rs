@@ -184,6 +184,7 @@ fn unfence_is_refused_unless_the_map_names_the_node_at_the_files_epoch() {
                 force: true,
                 expected_map_version: 0,
                 map: Some(m),
+                copies: Vec::new(),
             })
             .await
             .unwrap();

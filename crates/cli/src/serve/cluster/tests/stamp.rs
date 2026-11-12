@@ -161,6 +161,7 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
                 force: false,
                 expected_map_version: 1,
                 map: Some(m),
+                copies: Vec::new(),
             })
             .await
             .unwrap();
@@ -226,7 +227,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
     rt.block_on(async {
         put(b, "alice", "1").await;
         // Not fenced on a: refused.
-        let e = super::super::cli::relocate(&args, "p1", "c", false)
+        let e = within(super::super::cli::relocate(&args, "p1", "c", false, false))
             .await
             .err()
             .expect("refused");
@@ -236,7 +237,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             e.message()
         );
         // --old-unreachable still asks a, which answers and serves p1 (cli692's S3).
-        let e = super::super::cli::relocate(&args, "p1", "c", true)
+        let e = within(super::super::cli::relocate(&args, "p1", "c", true, false))
             .await
             .err()
             .expect("refused");
@@ -245,13 +246,36 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             "{}",
             e.message()
         );
+        // A copy is taken from the old node's closed files, so it's never unreachable.
+        let e = within(super::super::cli::relocate(&args, "p1", "c", true, true))
+            .await
+            .err()
+            .expect("refused");
+        assert!(e.message().contains("--copy needs"), "{}", e.message());
         client(a).await.fence(req()).await.unwrap();
         client(a).await.close(req()).await.unwrap();
         upload_set(c, "p1", &dirs[0].join("p1.phdb"), 2).await;
-        let r = super::super::cli::relocate(&args, "p1", "c", false)
+        // Its files were copied whole (`--copy`): p1 keeps its feed history (D317 ticket 6).
+        let r = within(super::super::cli::relocate(&args, "p1", "c", false, true))
             .await
             .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        assert_eq!(r.document["copied"], true, "{:?}", r.document);
+        for port in ports {
+            let m = client(port)
+                .await
+                .get_map(crate::serve::proto::GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+            assert_eq!(
+                (p1.node.as_str(), p1.epoch, p1.history_epoch),
+                ("c", 2, 0),
+                "on {port}: the copy keeps p1's history (0: the first map's, unmoved); a \
+                 move that isn't a copy starts another at 2"
+            );
+        }
         assert!(r.document["installed_files"].as_u64().unwrap() >= 1);
         eventually("c to serve p1", async || {
             get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
@@ -261,13 +285,110 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
         put(a, "alice", "2").await;
         assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"2".to_vec()));
         // Again: done.
-        let r = super::super::cli::relocate(&args, "p1", "c", false)
+        let r = within(super::super::cli::relocate(&args, "p1", "c", false, true))
             .await
             .unwrap();
         assert!(r.document.contains_key("done"), "{:?}", r.document);
         // a's old copy goes aside.
         client(a).await.drop_partition(req()).await.unwrap();
         assert!(!dirs[0].join("p1.phdb").exists());
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// A `phdb cluster move` run again after an earlier one stamped the new node but died
+/// before the map moved: it finishes the move, but can't compare the set again (the stamp
+/// installs nothing this time), so it says the copy isn't re-verified and keeps the old
+/// node's files even with `--drop-source`.
+#[test]
+fn a_move_run_again_after_its_stamp_finishes_but_drops_nothing() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let [a, b, c] = ports;
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    let req = || PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    rt.block_on(async {
+        put(b, "alice", "1").await;
+        // The earlier run, up to its stamp: fenced and closed on a, copied and stamped on c.
+        client(a).await.fence(req()).await.unwrap();
+        client(a).await.close(req()).await.unwrap();
+        eventually("p1's files to be hashed", async || {
+            client(a)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p1" && !lp.files.is_empty())
+        })
+        .await;
+        upload_set(c, "p1", &dirs[0].join("p1.phdb"), 3).await;
+        let lp = client(c)
+            .await
+            .stamp(StampRequest {
+                cluster_id: "c1".into(),
+                partition: "p1".into(),
+                from_epoch: 1,
+                to_epoch: 2,
+                restore: false,
+                restore_from_cluster_id: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!lp.files.is_empty(), "installed: {lp:?}");
+
+        let r = within(super::super::moving::run(&args, "p1", "c", true))
+            .await
+            .unwrap();
+        assert_eq!(r.document["verified"], false, "{:?}", r.document);
+        let source = r.document["source"].as_str().unwrap();
+        assert!(source.contains("not re-verified"), "{source}");
+        assert!(source.contains("drop-partition p1"), "{source}");
+        assert!(!r.document.contains_key("dropped"), "{:?}", r.document);
+        assert!(dirs[0].join("p1.phdb").exists(), "a's files stay");
+        // The move itself finished: c serves p1, with its history kept.
+        assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
+        let m = client(b)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!((p1.node.as_str(), p1.epoch, p1.history_epoch), ("c", 2, 0));
     });
     drop(stops);
     for db in dbs {

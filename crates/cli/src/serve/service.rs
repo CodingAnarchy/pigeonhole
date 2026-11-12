@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use pigeonhole::{KeySet, KeysPosition, Pigeonhole, RowPosition, ScanPosition, Table};
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 use super::auth::{Caller, Scope};
 use super::config::Limits;
@@ -478,6 +478,57 @@ fn identity_fields(id: Option<&super::backup::CopyIdentity>) -> proto::BackupChu
 }
 
 /// A download's offset past its copy's end.
+/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::backup::CHUNK) chunks with
+/// `send`, the last carrying the total, the SHA-256 and the identity: a download's copy, or a
+/// closed partition's file (D317 ticket 6). Stops early, `Ok`, once the client went away.
+async fn send_kept<F, Fut>(
+    kept: &super::backup::Kept,
+    start: u64,
+    id: &str,
+    pool: &Arc<Semaphore>,
+    send: F,
+) -> Result<(), ApiError>
+where
+    F: Fn(proto::BackupChunk) -> Fut,
+    Fut: Future<Output = Result<bool, ApiError>>,
+{
+    let mut at = start;
+    loop {
+        let path = kept.path.clone();
+        let data = blocking(pool, move || super::backup::read_chunk(&path, at)).await?;
+        // A file that isn't its listed size any more (a closed partition's file, which goes
+        // as it lies, changed after its close) fails the download: short, an empty read
+        // would never reach `total`; long, bytes past it would go out (#1729).
+        let left = kept.total - at;
+        if (data.is_empty() && left > 0) || data.len() as u64 > left {
+            return Err(ApiError::failed_precondition(format!(
+                "the file changed after it was taken: it isn't its {} bytes any more (a \
+                 closed partition's file: close it again)",
+                kept.total
+            )));
+        }
+        let next = at + data.len() as u64;
+        let last = next >= kept.total;
+        let chunk = proto::BackupChunk {
+            data: data.into(),
+            total: if last { kept.total } else { 0 },
+            backup_id: id.to_owned(),
+            offset: at,
+            sha256: if last {
+                kept.sha256.to_vec().into()
+            } else {
+                Default::default()
+            },
+            feed_token: kept.feed_token.clone().into(),
+            ..identity_fields(last.then_some(kept.identity.as_ref()).flatten())
+        };
+        if !send(chunk).await? || last {
+            return Ok(());
+        }
+        at = next;
+    }
+}
+
 fn past_the_copy(offset: u64, total: u64) -> ApiError {
     ApiError::invalid(format!(
         "offset {offset} is past the backup's {total} bytes"
@@ -1678,6 +1729,12 @@ impl Service {
                 if !r.partition.is_empty() {
                     return Err(single_node_partition());
                 }
+                if r.fenced_file.is_some() {
+                    return Err(ApiError::invalid(
+                        "fenced_file is a cluster node's (D317 ticket 6): a single node's \
+                         download is a backup",
+                    ));
+                }
                 self.backup_download(self.part()?, r, None)
                     .await
                     .map(ServiceReply::Download)
@@ -2402,7 +2459,7 @@ impl Service {
         r: proto::BackupDownloadRequest,
         map_version: Option<u64>,
     ) -> Result<super::backup::Download, ApiError> {
-        use super::backup::{self, Copy, CopyIdentity, Taken};
+        use super::backup::{Copy, CopyIdentity, Taken};
         let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
             return Err(ApiError::overloaded(
                 "the server is at its concurrent stream limit (--max-streams)",
@@ -2546,30 +2603,7 @@ impl Service {
                         "backup {task_id} is of partition {of:?}, not {want:?}"
                     )));
                 }
-                let mut at = start;
-                loop {
-                    let path = kept.path.clone();
-                    let data = blocking(&pool, move || backup::read_chunk(&path, at)).await?;
-                    let next = at + data.len() as u64;
-                    let last = next >= kept.total;
-                    let chunk = proto::BackupChunk {
-                        data: data.into(),
-                        total: if last { kept.total } else { 0 },
-                        backup_id: task_id.clone(),
-                        offset: at,
-                        sha256: if last {
-                            kept.sha256.to_vec().into()
-                        } else {
-                            Default::default()
-                        },
-                        feed_token: kept.feed_token.clone().into(),
-                        ..identity_fields(last.then_some(kept.identity.as_ref()).flatten())
-                    };
-                    if !send(chunk).await? || last {
-                        return Ok(());
-                    }
-                    at = next;
-                }
+                send_kept(&kept, start, &task_id, &pool, send).await
             }
             .await;
             metrics.count(
@@ -2589,6 +2623,78 @@ impl Service {
             id,
             offset: r.offset,
             copy,
+            chunks: rx,
+        })
+    }
+
+    /// `Admin.BackupDownload` of a closed partition's file (D317 ticket 6, `fenced_file`):
+    /// `file`'s bytes at `path` as they lie, from `r.offset`, with no backup taken. The
+    /// partition is closed, so the file is final, and `file` carries its size and SHA-256 as
+    /// hashed at its close. Holds a `--max-streams` slot, as a download does.
+    pub(crate) async fn fenced_download(
+        &self,
+        path: std::path::PathBuf,
+        file: proto::PartitionFile,
+        r: proto::BackupDownloadRequest,
+    ) -> Result<super::backup::Download, ApiError> {
+        use super::backup::{Copy, Kept};
+        if r.durable || r.replica || !r.backup_id.is_empty() {
+            return Err(ApiError::invalid(
+                "a fenced file is sent as it lies: durable, replica and backup_id don't apply",
+            ));
+        }
+        let sha256: [u8; 32] = file.sha256.as_ref().try_into().map_err(|_| {
+            ApiError::internal(format!("fenced file {:?} has no SHA-256", file.name))
+        })?;
+        let kept = Kept {
+            path,
+            total: file.bytes,
+            sha256,
+            feed_token: Vec::new(),
+            identity: None,
+        };
+        if r.offset > kept.total {
+            return Err(past_the_copy(r.offset, kept.total));
+        }
+        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
+            return Err(ApiError::overloaded(
+                "the server is at its concurrent stream limit (--max-streams)",
+            ));
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let (pool, idle) = (Arc::clone(&self.blocking), self.limits.stream_idle);
+        let metrics = Arc::clone(&self.metrics);
+        let started = Instant::now();
+        let (start, task_kept) = (r.offset, kept.clone());
+        tokio::spawn(async move {
+            let send = |chunk: proto::BackupChunk| {
+                let tx = tx.clone();
+                async move {
+                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
+                        Ok(Ok(())) => Ok(true),
+                        Ok(Err(_)) => Ok(false),
+                        Err(_) => Err(ApiError::deadline(
+                            "the client took no chunk for --stream-idle-ms; resume from the \
+                             offset it reached",
+                        )),
+                    }
+                }
+            };
+            let outcome = send_kept(&task_kept, start, "", &pool, send).await;
+            metrics.count(
+                DOWNLOAD,
+                outcome.as_ref().err().map(|e| e.code.as_str()),
+                started.elapsed(),
+            );
+            if let Err(e) = outcome {
+                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
+            }
+            drop(slot);
+        });
+        Ok(super::backup::Download {
+            id: String::new(),
+            offset: r.offset,
+            copy: watch::channel(Copy::Ready(kept)).1,
             chunks: rx,
         })
     }

@@ -481,7 +481,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             .find(|j| j.copy.partition == p.id)
             .map_or(p.epoch, |j| j.epoch);
     }
-    let set = set_map(args, m, true).await?;
+    let set = set_map(args, m, true, Vec::new()).await?;
     progress.map_version = set.document.get("map_version").and_then(Value::as_u64);
     record(&r.dir, &progress, &mut unwritable);
     fault(&r.dir, "mapped")?;
