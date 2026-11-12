@@ -819,6 +819,53 @@ A table's split keys are fixed once its ranges hold data, until range moves in 1
 
 **A range that turns out hot:** until ranges can move, give its partition a node of its own or a bigger one, by moving the partition ([Fencing and relocation](#fencing-and-relocation)).
 
+## Performance
+These numbers are for `phdb serve` on one machine, serving a single database file and also as a one-node cluster. All rows use a fixed offered write rate. They show latency and feed delivery at that rate, not peak throughput.
+
+**Setup**
+
+- **Machine:** AMD Ryzen 9 7950X3D (16 cores, 32 hardware threads), 128 GB RAM, local NVMe SSD, Linux.
+- **CPU split:** the server is pinned to 20 hardware threads (10 cores) and the load generator to the other 12.
+- **Server:** 4 shards. Memory, compaction and thread settings are the defaults: 9 network threads, 3 feed threads, 1 feed hub thread and 12 blocking threads. Change feed is on.
+- **Transport:** gRPC over HTTP/2, plaintext TCP on loopback, no authentication.
+- **Writes:**
+  - 16 concurrent writers send `Data.Mutate` (one cell each, 100-byte values) at the default durability (group sync).
+  - Puts follow a fixed schedule. A put's latency counts from when it was due, so a server that falls behind can't hide the delay.
+- **Subscribers:**
+  - `Feed.Subscribe` streams use the durable feed, 64 streams per connection.
+  - "256 subscribers" means 16 subscriptions to different table sets with 16 streams each. "32 subscribers" means 16 subscriptions with 2 streams each.
+- **Duration:** each row is a 30 s put loop, except the 256-subscriber row at 55,000 puts/s, which is 90 s.
+
+**Mutate latency and feed delivery**
+
+| offered puts/s | subscribers | server | put p50 | put p99 | put p99.9 | commits delivered per subscriber | feed lag p50 | feed lag p99 |
+|---|---|---|---|---|---|---|---|---|
+| 20,000 | 0 | single file | 0.09–0.10 ms | 0.18–0.20 ms | 0.24–0.25 ms | | | |
+| 20,000 | 0 | one-node cluster | 0.09–0.10 ms | 0.18–0.20 ms | 0.23–0.24 ms | | | |
+| 20,000 | 1 | single file | 0.10–0.11 ms | 0.18–0.20 ms | 0.23–1.2 ms | all | 0.1 ms | 0.2 ms |
+| 20,000 | 1 | one-node cluster | 0.11 ms | 0.18–0.19 ms | 0.24–0.25 ms | all | 0.1 ms | 0.2 ms |
+| 20,000 | 256 | single file | 0.14–0.15 ms | 1.5–1.7 ms | 2.9–3.5 ms | all | 1.4–2.0 ms | 12–48 ms |
+| 20,000 | 256 | one-node cluster | 0.15–0.17 ms | 2.0–2.3 ms | 4.0–9.7 ms | all | 1.2–1.3 ms | 21–122 ms |
+| 55,000 | 0 | single file | 0.15–0.16 ms | 0.24–0.27 ms | 3.1–4.5 ms | | | |
+| 55,000 | 0 | one-node cluster | 0.15–0.16 ms | 0.25–0.32 ms | 8.4–19 ms | | | |
+| 55,000 | 1 | single file | 0.16–0.17 ms | 0.27–0.36 ms | 5.6–6.1 ms | all | 0.2 ms | 0.3 ms |
+| 55,000 | 1 | one-node cluster | 0.17 ms | 0.30–0.31 ms | 5.6–5.8 ms | all | 0.2 ms | 0.3 ms |
+| 55,000 | 32 | single file | 0.17–0.18 ms | 0.71–1.1 ms | 11–14 ms | 56–58% within the run | 4–6 s | 11–17 s |
+| 55,000 | 32 | one-node cluster | 0.18 ms | 0.67–1.1 ms | 9.4–13 ms | 51–52% within the run | 6–7 s | 18 s |
+| 55,000 | 256 | single file | 0.21–0.86 ms | 45–90 ms | 59–118 ms | 41–52% within the run | 13–18 s | 52–73 s |
+| 55,000 | 256 | one-node cluster | 0.31–2.2 ms | 550–1,460 ms | 610–1,500 ms | 53–54% within the run | 8–11 s | 47–49 s |
+
+**Reading the table**
+
+- **Every row sustained its offered rate:** 20,000 or about 54,750 puts/s.
+- **At 20,000 puts/s, every subscriber keeps up**, even at 256. Writers' p99 rises from about 0.2 ms to 1.5–2.3 ms with 256 subscribers.
+- **At 55,000 puts/s, one subscriber keeps up**, but 32 or 256 do not.
+  - Delivery trails the writes by seconds, so each subscriber received only about half of the run's commits before it ended.
+  - Subscribers that fall behind catch up from the log rather than being dropped.
+- **A one-node cluster matches a single file** up to 32 subscribers at 55,000 puts/s.
+- **With 256 subscribers at 55,000 puts/s, the cluster's writers wait much longer:** p99 of 0.55–1.46 s, against 45–90 ms for a single file. This is a known gap, tracked for 1.3.0 (#1798).
+- **Feed lag** is measured from a put's send time to its arrival at a subscriber, so it includes the put's own latency.
+
 ## Next
 - [Observability](observability.md): the engine's metrics, alerts and dashboard.
 - [Using Pigeonhole from AI agents](ai-agents.md): `phdb mcp`, and remote MCP's client configuration.
