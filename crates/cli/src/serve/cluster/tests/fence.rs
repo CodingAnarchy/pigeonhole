@@ -72,6 +72,37 @@ fn a_fenced_partition_refuses_writes_through_every_node_and_unfence_lifts_it() {
         let lp = fence(a, "p1").await.unwrap();
         assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
         assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+        // `phdb cluster status`: a row per partition, with its state on its node.
+        let args = super::super::cli::NodeArgs {
+            node: format!("http://127.0.0.1:{c}"),
+            token_file: None,
+            ca: None,
+        };
+        let Ok(r) = super::super::cli::status(&args).await else {
+            panic!("phdb cluster status failed");
+        };
+        let col = |name: &str| r.columns.iter().position(|k| k.name == name).unwrap();
+        let states: Vec<(String, String)> = r
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row[col("partition")]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    row[col("state")].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        assert!(
+            states.contains(&("p1".into(), "fenced (operator)".into())),
+            "{states:?}"
+        );
+        assert!(
+            states.contains(&("p2".into(), "serving".into())),
+            "{states:?}"
+        );
         // Its node, and a forward from another: refused, nothing written.
         for entry in [a, b, c] {
             let e = try_put(entry, "alice", "2").await.unwrap_err();

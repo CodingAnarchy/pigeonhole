@@ -680,7 +680,7 @@ pub(crate) async fn set_map(
     Ok(r)
 }
 
-async fn status(args: &NodeArgs) -> Result<Report, Failure> {
+pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
     let m = c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
@@ -711,14 +711,26 @@ async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     behind += 1;
                 }
                 let ok = s.partitions.iter().filter(|p| p.ok).count();
-                rows.push(vec![
-                    json!(n.id),
-                    json!(n.address),
-                    json!(s.map_version),
-                    json!(format!("{ok}/{}", s.partitions.len())),
-                    json!(s.divergent.join(",")),
-                    json!(""),
-                ]);
+                let node_row = |partition: &str, state: String, error: &str| {
+                    vec![
+                        json!(n.id),
+                        json!(n.address),
+                        json!(s.map_version),
+                        json!(partition),
+                        json!(state),
+                        json!(format!("{ok}/{}", s.partitions.len())),
+                        json!(s.divergent.join(",")),
+                        json!(error),
+                    ]
+                };
+                // A row per partition, with its state on the node (D317 ticket 6); a node
+                // that holds none has one row.
+                if s.partitions.is_empty() {
+                    rows.push(node_row("", String::new(), ""));
+                }
+                for lp in &s.partitions {
+                    rows.push(node_row(&lp.id, state_text(lp), &lp.error));
+                }
                 nodes.push(serde_json::to_value(&s).expect("NodeStatus serializes"));
             }
             Err(e) => {
@@ -727,6 +739,8 @@ async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     json!(n.id),
                     json!(n.address),
                     Value::Null,
+                    json!(""),
+                    json!(""),
                     Value::Null,
                     json!(""),
                     json!(e.message()),
@@ -746,6 +760,8 @@ async fn status(args: &NodeArgs) -> Result<Report, Failure> {
         "node",
         "address",
         "map_version",
+        "partition",
+        "state",
         "partitions_ok",
         "divergent",
         "error",
