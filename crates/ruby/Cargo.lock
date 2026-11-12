@@ -385,7 +385,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pigeonhole"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arc-swap",
  "futures-core",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memory"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-core",
  "getrandom 0.3.4",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-ruby"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "magnus",
  "nix",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-text"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-core",
  "levenshtein_automata",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-vector"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-core",
  "pigeonhole",
