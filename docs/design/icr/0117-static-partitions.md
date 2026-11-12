@@ -415,7 +415,7 @@
   - It checks that P is fenced or closed on its node (cli692's S7; closed for an in-place restore), unless `--old-unreachable`.
   - Then it stamps the target from `e` to `e + 1`, and sets the map through the writer.
   - Run again once done, it answers done.
-  - `--copy` (keeping the feed history, `SetMapRequest.copies = 4`) comes with feed1248's #1729, ticket 6 PR 2.
+  - `--copy` (keeping the feed history, `SetMapRequest.copies = 4`) is ticket 6 PR 2's (#1729, its own section).
 - **`drop-partition`** moves P's files and any `.replaced` ones into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`, deleting nothing, the main file last, so a drop that stopped part way finishes on a retry (cli692's N6). It refuses while the map places P on the node or P is open there.
 - **`relocate --old-unreachable`** still asks the old node's `Status` for 3 s, and refuses if it answers serving P (cli692's S3).
 - **`phdb cluster status`** gives each partition's state, for example `fenced (operator)`.
@@ -463,16 +463,35 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
 
 **Feeds:** a cluster token's component taken at epoch `e` resumes while its partition's `history_epoch` is at most `e`. Otherwise it's `FeedExpired`. That's checked at the resume, and again when a part reopens where the map now puts its partition. A part that reopens records the epoch it opened at, so later checkpoints carry the new epoch. The token format is unchanged.
 
-**`BackupDownloadRequest.fenced_file`** (admin.proto, field 6, `string`): on a cluster node, one file of `partition`, closed here after a fence, sent as it lies. No backup is taken.
-- `fenced_file` names the file by its suffix after the partition's database path (`""` the main file, `-wal-<n>`, `-feed`; ICR 0135).
+**`BackupDownloadRequest.fenced_file`** (admin.proto, field 6, `optional string`): on a cluster node, one file of `partition`, closed here after a fence, sent as it lies. No backup is taken.
+- `fenced_file` names the file by its suffix after the partition's database path (`""` the main file, `-wal-<n>`, `-feed`; ICR 0135). It's `optional` so that `""` asks for the main file: set, it asks for a fenced file; unset, for a backup.
+- **The file** is one the close's hash listed (PR 1's closed record, `close.rs`'s `Closed::file`), read from the partition's own path.
 - **The chunks** are `BackupChunk`s of the file's bytes from `offset`. The last carries `total` and the file's `sha256`, as hashed at the close.
 - **Refusals:**
-  - only a partition in state `closed` (PR 1); otherwise `FailedPrecondition`;
+  - only a partition in state `closed` (PR 1), and only once its hash is done; otherwise `FailedPrecondition` (a failed hash says to close it again);
+  - a name the hash didn't list: `NotFound`, naming the files it did;
+  - a file that isn't its listed size any more (it changed after the close): the download fails with `FailedPrecondition` rather than sending past or short of it. This holds for every download that streams a kept file;
   - `partition` is required;
   - `durable`, `replica` and `backup_id` must be unset (`InvalidArgument`);
   - a single node refuses `fenced_file` (`InvalidArgument`).
 
 **`PartitionFile`** (common.proto) is the upload's (the section above). PR 1's closed-partition status (`LocalPartition.files`) lists one per file, and `fenced_file` takes its `name`. A move sends the closed partition's whole set, which the stamp installs only once complete. With a change feed, as every cluster partition has, that's the main file, every `-wal-<n>` and the feed sidecar `-feed`: a clean close keeps the WAL files as the feed's retained history (D310 §2.1), so the set can be as large as the feed's retention, and the move's downtime grows with it. That's why feed history survives: the WAL holds the retained changes, and the feed sidecar, bound to the database's id, holds the feed's sessions.
+
+**`phdb cluster relocate P --to ID --copy`** sends PR 1's map change with `copies = [P]`. It's refused with `--old-unreachable`, since a copy is made from the old node's closed files, and a stopped node's partition is promoted instead. The CLI doesn't check that the stamp installed a copy: a rerun after a successful stamp also installs nothing. The guide says `--copy` is for files copied whole (by `move`, or by hand through the upload).
+
+**`phdb cluster move P --to ID [--drop-source]`** (`cluster/moving.rs`) runs the whole move against the writer's map, where P is on OLD at epoch `e`:
+1. **Fence and close** P on OLD (skipping what's done), then poll OLD's `Status` until P's `files` are listed. A failed hash is closed again. A close the database itself reported an error for stops the move.
+2. **Copy** each file: `PartitionUploadStatus` on NEW for `received` and `max_chunk`, then `BackupDownload{fenced_file}` from OLD at `received`, re-chunked into `PartitionUpload{RELOCATE, epoch e, manifest = OLD's files}`. The upload id is the first 16 bytes, as hex, of a SHA-256 over the cluster, the partition, `e`, the file's name and its hash. So a rerun resumes its own uploads, and a re-close with other bytes starts new ones. The download's last chunk must carry the listed size and hash.
+3. **Stamp** NEW from `e` to `e + 1`. Compare the reply's `files` (the installed set, Q1) with OLD's closed `files`, by name, size and SHA-256. A mismatch stops the move before the map changes.
+4. **The map:** `relocate --copy`. Its stamp is a no-op now (the file is at `e + 1`).
+5. **Serving:** poll NEW's `Status` until P is `serving`. A node serves P only at the map's epoch, so the state is enough.
+6. **`--drop-source`:** `drop-partition` on OLD, only after step 3 compared and matched.
+
+**A rerun** finds where the last run stopped:
+- the map already names NEW: it's done, and nothing is compared or dropped;
+- NEW's file is at `e + 1` (the stamp ran): it skips the copy and the stamp. The comparison can't be made again, because the stamp installs nothing a second time. It reports "not re-verified", drops nothing, and prints the `drop-partition` command.
+
+Nothing is persisted client-side. The report gives the write downtime (fence to map, when this run fenced), the read downtime (close to serving), each file's size and bytes sent, whether the copy was verified, and what happened to the source.
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.
