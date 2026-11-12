@@ -18,6 +18,7 @@ pub(crate) mod forward;
 pub(crate) mod identity;
 pub(crate) mod idle;
 pub(crate) mod map;
+pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
 mod restore;
@@ -199,6 +200,24 @@ impl std::fmt::Debug for Reconciler {
     }
 }
 
+/// Where a map [`Node::install`] takes comes from.
+#[derive(Clone, Copy)]
+enum MapSource<'a> {
+    /// Set here through the writer (`SetMap`): a valid change from the current map, with
+    /// its partitions' `history_epoch` derived (`map::with_history`), keeping the history
+    /// of each partition in `SetMapRequest.copies`.
+    Change(&'a [String]),
+    /// Set here by the forced recovery (`SetMap` with `force`): the same cluster's and newer
+    /// (`map::validate_catch_up`), with no epoch going back and no move keeping one
+    /// (`map::validate_epochs`), and `history_epoch` derived as for a change that copied
+    /// nothing. That's only as new as this node's map: `phdb cluster set-map --force`
+    /// checks the epochs against every node it reaches (simp724's F2 on #1729), so a forced
+    /// epoch is above every one the cluster used and its history value is new.
+    Forced,
+    /// A peer's, pushed or pulled: only the same cluster's and newer (cli692's R1), taken
+    /// as it arrives, derived where it was set.
+    Peer,
+}
 impl Node {
     fn new(
         dir: &Path,
@@ -282,10 +301,9 @@ impl Node {
     }
 
     /// Validates and persists `map` as the node's newest; `check` decides, under the state
-    /// lock, whether it may replace the current one. `step`: a map being set here, which must
-    /// be a valid change from the current one; otherwise a peer's, which only has to be the
-    /// same cluster's and newer (`map::validate_catch_up`, cli692's R1). Returns the new
-    /// version.
+    /// lock, whether it may replace the current one. `from` says where the map comes from,
+    /// which decides its checks and whether its partitions' `history_epoch` is derived here
+    /// ([`MapSource`]). Returns the new version.
     ///
     /// **Blocking** (address resolution, an fsync): run it on a blocking thread
     /// ([`Node::install_async`]). The state lock is held only to check and to publish; the
@@ -293,10 +311,14 @@ impl Node {
     fn install(
         &self,
         map: &ClusterMap,
-        step: bool,
+        from: MapSource<'_>,
         check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError>,
     ) -> Result<u64, ApiError> {
         map::validate(map, self.loopback_only).map_err(ApiError::invalid)?;
+        // A map set here, forced or not, gets its partitions' `history_epoch` derived from
+        // the current one, or from none for a first map (D317 ticket 6); a peer's arrives
+        // derived.
+        let mut derived = None;
         let _one = self
             .installing
             .lock()
@@ -313,16 +335,44 @@ impl Node {
                         self.id
                     )));
                 }
-                None => {}
-                Some((old, _)) if step => {
-                    map::validate_change(old, map).map_err(ApiError::invalid)?;
+                None if matches!(from, MapSource::Change(c) if !c.is_empty()) => {
+                    return Err(ApiError::invalid(
+                        "a first map can't mark a partition as copied: it relocates nothing",
+                    ));
                 }
-                Some((old, _)) => {
-                    map::validate_catch_up(old, map).map_err(ApiError::invalid)?;
+                // A first map set here (a new cluster, or a restore's forced map onto fresh
+                // nodes) starts every history at its epoch, whatever the map sent says: a
+                // backup's map carries its old values, which its files no longer hold
+                // (simp724's S1 on #1729). A peer's arrives derived.
+                None => {
+                    if !matches!(from, MapSource::Peer) {
+                        derived = Some(
+                            map::with_history(&ClusterMap::default(), map, &[])
+                                .map_err(ApiError::invalid)?,
+                        );
+                    }
                 }
+                Some((old, _)) => match from {
+                    MapSource::Change(copies) => {
+                        map::validate_change(old, map).map_err(ApiError::invalid)?;
+                        derived =
+                            Some(map::with_history(old, map, copies).map_err(ApiError::invalid)?);
+                    }
+                    MapSource::Forced => {
+                        map::validate_catch_up(old, map).map_err(ApiError::invalid)?;
+                        // No epoch goes back and no move keeps one, so no history value is
+                        // used twice (simp724's F1 on #1729); the tables needn't step.
+                        map::validate_epochs(old, map).map_err(ApiError::invalid)?;
+                        derived =
+                            Some(map::with_history(old, map, &[]).map_err(ApiError::invalid)?);
+                    }
+                    MapSource::Peer => {
+                        map::validate_catch_up(old, map).map_err(ApiError::invalid)?;
+                    }
+                },
             }
         }
-        let canonical = map::canonical(map);
+        let canonical = map::canonical(derived.as_ref().unwrap_or(map));
         let json = map::canonical_json(&canonical);
         write_map(&self.dir, &json)
             .map_err(|e| ApiError::internal(format!("persist the cluster map: {e}")))?;
@@ -349,13 +399,18 @@ impl Node {
     async fn install_async(
         self: &Arc<Self>,
         map: ClusterMap,
-        step: bool,
+        copies: Option<Vec<String>>,
         check: impl FnOnce(&mut MapState) -> Result<Option<u64>, ApiError> + Send + 'static,
     ) -> Result<u64, ApiError> {
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || node.install(&map, step, check))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            let from = copies
+                .as_deref()
+                .map_or(MapSource::Forced, MapSource::Change);
+            node.install(&map, from, check)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
     }
 
     /// `Cluster.SetMap`: compare-and-set on the version, then push to the others. Only the
@@ -369,7 +424,15 @@ impl Node {
             .map
             .ok_or_else(|| ApiError::invalid("SetMap needs a map"))?;
         if req.force {
-            let version = self.install_async(map, false, |_| Ok(None)).await?;
+            // A copy is a planned move, never part of a recovery: a forced map's raised
+            // epochs all restart their partitions' histories.
+            if !req.copies.is_empty() {
+                return Err(ApiError::invalid(
+                    "a forced map can't mark a partition as copied: relocate by copy through \
+                     the map's writer",
+                ));
+            }
+            let version = self.install_async(map, None, |_| Ok(None)).await?;
             let pushed = self.push_all().await;
             return Ok(SetMapResponse {
                 map_version: version,
@@ -401,7 +464,7 @@ impl Node {
         }
         let expected = req.expected_map_version;
         let version = self
-            .install_async(map, true, move |st| {
+            .install_async(map, Some(req.copies), move |st| {
                 let current = st.version();
                 if expected != current {
                     return Err(ApiError::from_code(
@@ -535,7 +598,7 @@ impl Node {
     }
 
     fn push_map_install(&self, map: ClusterMap, from: Option<&str>) -> Result<u64, ApiError> {
-        let version = self.install(&map, false, |st| {
+        let version = self.install(&map, MapSource::Peer, |st| {
             let Some((old, json)) = &st.map else {
                 return Ok(None);
             };
@@ -604,6 +667,14 @@ impl Node {
                 error: String::new(),
                 ..Default::default()
             };
+            // A partition being opened: no read of its file, whose read-only open would refuse
+            // the node's own open (#1770). It shows as opening.
+            if self.fences.is_opening(&named) {
+                lp.set_state(proto::LocalPartitionState::Opening);
+                lp.ok = true;
+                partitions.push(lp);
+                continue;
+            }
             let read = match open.get(&named) {
                 Some(part) => identity::read(&part.db),
                 None => identity::read_file(&path),
@@ -1679,6 +1750,27 @@ pub(crate) fn partition_options(
         .compaction_cores(share.compaction)
 }
 
+/// Opens the database at `path` for writing, retrying a moment while a read-only open of
+/// the file holds its writer lock (an operator's `phdb info`, another node's tooling): 50 ms,
+/// doubling, about 1.5 s in all, then the refusal stands (#1770).
+pub(crate) fn open_retrying(
+    path: &Path,
+    options: &pigeonhole::Options,
+) -> pigeonhole::Result<pigeonhole::Pigeonhole> {
+    let mut wait = std::time::Duration::from_millis(50);
+    loop {
+        match pigeonhole::Pigeonhole::open(path, options.clone()) {
+            Err(e)
+                if e.code() == pigeonhole::ErrorCode::WriterLocked && wait.as_millis() <= 800 =>
+            {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            opened => return opened,
+        }
+    }
+}
+
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
@@ -1700,8 +1792,7 @@ fn open_partition(
             path.display()
         )));
     }
-    let db = pigeonhole::Pigeonhole::open(&path, options)
-        .map_err(|e| Failure::db("open the partition", &e))?;
+    let db = open_retrying(&path, &options).map_err(|e| Failure::db("open the partition", &e))?;
     let want = identity::Identity {
         cluster_id: cluster_id.to_owned(),
         partition_id: partition.to_owned(),

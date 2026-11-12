@@ -142,6 +142,7 @@ pub(crate) async fn subscribe(
         }
     }
     let epoch = |p: &str| routes.owner(p).map_or(0, |o| o.epoch);
+    let history = |p: &str| routes.owner(p).map_or(0, |o| o.history_epoch);
     let subscription = subscription_hash(&tables, &r.prefix, r.visible);
     let mut skips: HashMap<String, u64> = HashMap::new();
     for s in &r.skip_through {
@@ -168,7 +169,7 @@ pub(crate) async fn subscribe(
                     "the resume token isn't a cluster feed token ({why})"
                 ))
             })?;
-            resume_starts(&t, routes.cluster_id(), subscription, &placed, epoch)?
+            resume_starts(&t, routes.cluster_id(), subscription, &placed, history)?
         }
     };
     if !skips.is_empty() && !resumed {
@@ -429,13 +430,15 @@ impl Merging {
 }
 
 /// Each component's start from a resume token, after checking that it's this cluster's,
-/// this subscription's, and that the map hasn't moved anything under it.
+/// this subscription's, and that no partition's history changed under it: a component taken
+/// at epoch `e` resumes while its partition's `history_epoch` is at most `e` (D317 ticket 6:
+/// a relocation by copy keeps the history; a promotion or a restore starts another).
 fn resume_starts(
     t: &ClusterToken,
     cluster_id: &str,
     subscription: u64,
     placed: &BTreeMap<String, Vec<String>>,
-    epoch: impl Fn(&str) -> u64,
+    history_epoch: impl Fn(&str) -> u64,
 ) -> Result<BTreeMap<String, At>, ApiError> {
     if t.cluster_id != cluster_id {
         return Err(ApiError::invalid(format!(
@@ -460,14 +463,11 @@ fn resume_starts(
     }
     let mut starts = BTreeMap::new();
     for c in &t.components {
-        let now = epoch(&c.partition);
-        if c.epoch != now {
-            // A relocation by promotion gives the partition another history, so its token
-            // can't resume there. D317's ticket 6 records which relocations copied the file
-            // and kept it; until then no epoch moves.
+        let began = history_epoch(&c.partition);
+        if began > c.epoch {
             return Err(expired(format!(
-                "partition {:?} was relocated since the token (epoch {} then, {now} now): \
-                 subscribe again",
+                "partition {:?} has another history since the token (taken at epoch {}, its \
+                 history began at {began}: a promotion or a restore): subscribe again",
                 c.partition, c.epoch
             )));
         }
@@ -507,7 +507,7 @@ struct Merge {
     /// Parts opening again in the background, each bounded by the request timeout, so
     /// unreachable partitions never stop the merge from reading the others (simp724's S1 on
     /// #1700).
-    opens: tokio::task::JoinSet<(usize, Result<Events, ApiError>)>,
+    opens: tokio::task::JoinSet<(usize, Opened)>,
 }
 
 /// What a component's event was.
@@ -522,8 +522,7 @@ impl Merge {
     /// `allow_partial`: then the part starts unavailable, reported in a first event.
     async fn open_all(&mut self) -> Result<(), ApiError> {
         let mut set = tokio::task::JoinSet::new();
-        let mut opened: Vec<Option<Result<Events, ApiError>>> =
-            (0..self.parts.len()).map(|_| None).collect();
+        let mut opened: Vec<Option<Opened>> = (0..self.parts.len()).map(|_| None).collect();
         let mut next = 0;
         loop {
             while set.len() < OPENS && next < self.parts.len() {
@@ -561,6 +560,7 @@ impl Merge {
             },
             skip: p.skip,
             map_version: self.map_version,
+            epoch: p.epoch,
         }
     }
 
@@ -578,10 +578,10 @@ impl Merge {
     /// An open of part `i` finished: its stream from now on, and reported available again
     /// if it wasn't; or unavailable until the next try (`allow_partial`), or the stream's
     /// end.
-    fn opened(&mut self, i: usize, result: Result<Events, ApiError>) -> Result<(), ApiError> {
+    fn opened(&mut self, i: usize, result: Opened) -> Result<(), ApiError> {
         self.parts[i].opening = false;
         match result {
-            Ok(events) => {
+            Ok((events, epoch)) => {
                 // A reopen may have taken a newer map: later checkpoints carry it (simp724's
                 // nit on round 2).
                 if let Some(r) = self.ctx.node.routes().as_ref() {
@@ -589,6 +589,9 @@ impl Merge {
                 }
                 let p = &mut self.parts[i];
                 p.events = Some(events);
+                // Where it opened: later checkpoints carry it, so a token taken after a
+                // relocation by copy is the new epoch's (D317 ticket 6).
+                p.epoch = epoch;
                 p.retry = None;
                 if std::mem::take(&mut p.unavailable) {
                     self.states.push(state_event(&p.partition, None));
@@ -616,10 +619,10 @@ impl Merge {
         let p = &mut self.parts[i];
         p.retry = None;
         p.opening = true;
-        let (ctx, open, epoch) = (Arc::clone(&self.ctx), self.request(i), self.parts[i].epoch);
+        let (ctx, open) = (Arc::clone(&self.ctx), self.request(i));
         let pull = pull.then_some(owner).flatten();
         self.opens
-            .spawn(async move { (i, ctx.reopen(open, epoch, pull).await) });
+            .spawn(async move { (i, ctx.reopen(open, pull).await) });
     }
 
     /// Part `i`'s next item: an event to send; nothing (a progress, or the part's failure
@@ -983,19 +986,25 @@ fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
     out.put_slice(value);
 }
 
+/// A part opened: its events, and the epoch it opened at (the map's for its partition then).
+type Opened = Result<(Events, u64), ApiError>;
+
 /// What opening one component sends.
 struct Open {
     partition: String,
     request: proto::SubscribeRequest,
     skip: u64,
     map_version: u64,
+    /// The epoch the part's position is from: the open refuses a partition whose history
+    /// began after it (D317 ticket 6).
+    epoch: u64,
 }
 
 impl Ctx {
     /// Opens a component where the map puts its partition: here, or on its node. Bounded by
     /// the request timeout, the connection and the first response included, so a node that
     /// accepts connections but never answers can't hold an open forever.
-    async fn open(self: Arc<Self>, open: Open) -> Result<Events, ApiError> {
+    async fn open(self: Arc<Self>, open: Open) -> Opened {
         let within = self.service.request_timeout();
         let partition = open.partition.clone();
         tokio::time::timeout(within, Arc::clone(&self).open_now(open))
@@ -1009,13 +1018,9 @@ impl Ctx {
     }
 
     /// A background reopen ([`Merge::reopen`]): after `pull`'s map, if given (bounded by the
-    /// request timeout too), and only at the epoch the part's position is from.
-    async fn reopen(
-        self: Arc<Self>,
-        mut open: Open,
-        epoch: u64,
-        pull: Option<super::route::Owner>,
-    ) -> Result<Events, ApiError> {
+    /// request timeout too). The open checks the partition's history against the epoch the
+    /// part's position is from.
+    async fn reopen(self: Arc<Self>, mut open: Open, pull: Option<super::route::Owner>) -> Opened {
         if let Some(o) = pull {
             let within = self.service.request_timeout();
             let _ = tokio::time::timeout(
@@ -1024,26 +1029,17 @@ impl Ctx {
             )
             .await;
         }
-        let now = {
-            let routes = self.node.routes();
-            let routes = routes
-                .as_ref()
-                .ok_or_else(|| ApiError::partition_unavailable("this node has no map"))?;
-            open.map_version = open.map_version.max(routes.map_version());
-            routes.owner(&open.partition).map_or(0, |o| o.epoch)
-        };
-        if now != epoch {
-            // A relocation by promotion gives the partition another history (ticket 6 lets a
-            // relocation by file copy keep it).
-            return Err(expired(format!(
-                "partition {:?} was relocated (epoch {epoch} to {now}): subscribe again",
-                open.partition
-            )));
+        if let Some(r) = self.node.routes().as_ref() {
+            open.map_version = open.map_version.max(r.map_version());
         }
         self.open(open).await
     }
 
-    async fn open_now(self: Arc<Self>, open: Open) -> Result<Events, ApiError> {
+    /// Opens part `open` where the map puts it now, returning its events and the epoch it
+    /// opened at. A partition whose history began after the part's position (a promotion
+    /// or a restore since) is `FeedExpired`; one relocated by copying its files keeps its
+    /// history, and the position continues there (D317 ticket 6).
+    async fn open_now(self: Arc<Self>, open: Open) -> Opened {
         let owner = {
             let routes = self.node.routes();
             let routes = routes
@@ -1053,6 +1049,14 @@ impl Ctx {
                 ApiError::internal(format!("the map lists no node for {:?}", open.partition))
             })?
         };
+        if owner.history_epoch > open.epoch {
+            return Err(expired(format!(
+                "partition {:?} has another history since this position (from epoch {}, its \
+                 history began at {}: a promotion or a restore): subscribe again",
+                open.partition, open.epoch, owner.history_epoch
+            )));
+        }
+        let epoch = owner.epoch;
         if owner.node == self.node.id() {
             let Some(here) = self.parts.load().get(&open.partition).cloned() else {
                 return Err(ApiError::partition_unavailable(format!(
@@ -1063,7 +1067,7 @@ impl Ctx {
             let events = here
                 .subscribe_part(open.request, &self.caller, open.skip, true)
                 .await?;
-            return Ok(Box::pin(LocalEvents(events)));
+            return Ok((Box::pin(LocalEvents(events)), epoch));
         }
         let channel = self.channel(&owner.address).await?;
         let req = proto::ForwardSubscribeRequest {
@@ -1086,10 +1090,13 @@ impl Ctx {
             .await
             .map_err(failed)?
             .into_inner();
-        Ok(Box::pin(RemoteEvents {
-            stream,
-            address: owner.address,
-        }))
+        Ok((
+            Box::pin(RemoteEvents {
+                stream,
+                address: owner.address,
+            }),
+            epoch,
+        ))
     }
 
     /// The subscription's connection to the peer at `address` (S1): a stream lease of its
@@ -1338,6 +1345,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::cluster::token::Component;
+
+    #[test]
+    fn a_token_resumes_across_a_copy_and_expires_across_another_history() {
+        // D317 ticket 6: a component taken at epoch `e` resumes while its partition's
+        // history began at or before `e`.
+        let token = ClusterToken {
+            cluster_id: "c1".into(),
+            map_version: 3,
+            subscription: 7,
+            components: ["p1", "p2"]
+                .map(|p| Component {
+                    partition: p.into(),
+                    epoch: 2,
+                    at: At::Token(Bytes::from_static(b"t")),
+                })
+                .to_vec(),
+        };
+        let placed: BTreeMap<String, Vec<String>> = ["p1", "p2"]
+            .map(|p| (p.to_owned(), vec!["users".to_owned()]))
+            .into();
+        let starts = |history: [u64; 2]| {
+            resume_starts(&token, "c1", 7, &placed, |p: &str| {
+                if p == "p1" { history[0] } else { history[1] }
+            })
+        };
+        // Maps from before ticket 6 (0), a history from before the token, one that began
+        // with it, and one a copy since kept (still 2 at a later epoch): all resume.
+        for h in [[0, 0], [1, 2], [2, 2]] {
+            let s = starts(h).unwrap();
+            assert_eq!(s.len(), 2, "{h:?}");
+        }
+        // p2 promoted or restored at epoch 3: its history began after the token.
+        let e = starts([2, 3]).unwrap_err();
+        assert_eq!(e.code, "FeedExpired", "{e:?}");
+        assert!(e.message.contains("\"p2\" has another history"), "{e:?}");
+    }
 
     /// A runtime on a paused clock: virtual time, advanced only when every task waits.
     fn paused() -> tokio::runtime::Runtime {
@@ -1642,7 +1686,7 @@ mod tests {
             let (p0, events) = fed();
             m.merge.opens.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                (0, Ok(events))
+                (0, Ok((events, 1)))
             });
             p0.send(Ok(event(b"t1", Some(5)))).unwrap();
             assert_eq!(

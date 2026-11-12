@@ -318,7 +318,10 @@ short-scans 13068 0.3
 # check's own Reply variant is one more arm in the shard's apply and notify matches on every
 # commit: 8581 -> 8591 (+10, +0.12%) on run 42088494045 (571a5bf3), after #1566 removed the
 # rest (wait_visible kept inline). The highest times 1.003, as commit-async's.
-commit-one 8617 0.3
+# Raised by D195 (#1792, coordinator 2026-11-12): commit-one 8617 -> 8647 (+0.35%). CI's stable
+# toolchain moved to Rust 1.100, and main's base build counts 8621 (run 43283228102 on #1792, whose head matches base to 0.0%).
+# Base times 1.003.
+commit-one 8647 0.3
 # Raised by D195 (#1581, #1559 A): commit-sixteen 36382 -> 36521 (+0.38%). It measured
 # 36352 -> 36412 (+60 per commit, +0.17%; run 42133196250), all in ShardState::apply's inlined
 # code (B-tree map, Vec, the futex mutex, shard.rs; integer and tuple code down), and nothing
@@ -332,7 +335,10 @@ ycsb-c 39116 1.0
 # unit (0.16%) from the commit handoff (Signal::wake_target / park_for_reply), inside its 1.0%
 # headroom. Re-run once before treating a delta within 40 in the PR's base-vs-head table as cost.
 ycsb-a 24626 1.0
-commit-overwrite 10608 0.5
+# Raised by D195 (#1792, coordinator 2026-11-12): commit-overwrite 10608 -> 10661 (+0.50%). CI's
+# stable toolchain moved to Rust 1.100, and main's base build counts 10613 (run 43283228102 on #1792, whose head matches base to 0.0%).
+# Base times 1.005 would be +0.56%, so the raise stops at 0.5%, leaving 0.45% headroom.
+commit-overwrite 10661 0.5
 # commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
 # wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
 # before treating a delta within 10 in the PR's base-vs-head table as cost.
@@ -402,6 +408,9 @@ text-term-hub 70603557 0.3
 text-two-terms 27657383 0.3
 text-five-terms 22144727 0.3
 text-two-terms-k100 52001738 0.3
-text-fuzzy 59091020 0.3
+# Raised by D195 (#1792, coordinator 2026-11-12): text-fuzzy 59091020 -> 59386475 (+0.50%). CI's
+# stable toolchain moved to Rust 1.100, and main's base build counts 59349164 (run 43283228102 on #1792, whose head matches base to 0.0%).
+# Base times 1.003 would be +0.74%, so the raise stops at 0.5%, leaving 0.06% headroom.
+text-fuzzy 59386475 0.3
 text-phrase 126670191 0.3
 text-phrase-slop2 131159719 0.3

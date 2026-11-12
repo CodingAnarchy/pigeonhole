@@ -93,6 +93,45 @@ fn a_fenced_partition_closes_with_its_files_hashed_and_unfence_reopens_it() {
         );
         // Again: the same answer, nothing done.
         assert_eq!(close(a, "p1").await.unwrap().files, lp.files);
+        // Each closed file streams as it lies, the main file (`""`) included, matching its
+        // listed size and hash (D317 ticket 6: what a move copies).
+        for f in &lp.files {
+            let mut chunks = super::upload::admin(a)
+                .await
+                .backup_download(crate::serve::proto::BackupDownloadRequest {
+                    partition: "p1".into(),
+                    fenced_file: Some(f.name.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let mut got = Vec::new();
+            while let Some(c) = chunks.message().await.unwrap() {
+                got.extend_from_slice(&c.data);
+            }
+            assert_eq!(got.len() as u64, f.bytes, "{:?}", f.name);
+            assert_eq!(
+                <sha2::Sha256 as sha2::Digest>::digest(&got).to_vec(),
+                f.sha256.to_vec(),
+                "{:?}",
+                f.name
+            );
+            let mut path = dirs[0].join("p1.phdb").into_os_string();
+            path.push(&f.name);
+            assert_eq!(got, std::fs::read(path).unwrap(), "{:?}", f.name);
+        }
+        let e = super::upload::admin(a)
+            .await
+            .backup_download(crate::serve::proto::BackupDownloadRequest {
+                partition: "p1".into(),
+                fenced_file: Some("-wal-99".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::NotFound, "{e:?}");
+        assert!(e.message().contains("has no file \"-wal-99\""), "{e:?}");
         // Unfence reopens it, and its rows are there.
         let lp = client(a)
             .await
@@ -219,6 +258,7 @@ fn drop_partition_moves_a_closed_partitions_files_aside_once_the_map_moved_it() 
                 force: false,
                 expected_map_version: 1,
                 map: Some(m),
+                copies: Vec::new(),
             })
             .await
             .unwrap();
@@ -316,6 +356,7 @@ fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
                 force: true,
                 expected_map_version: 0,
                 map: Some(m),
+                copies: Vec::new(),
             })
             .await
             .unwrap();

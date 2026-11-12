@@ -306,6 +306,20 @@ impl Router {
                     .await
                     .map(ServiceReply::Backup)
             }
+            // A closed partition's file as it lies, for a relocation by copy (D317 ticket 6).
+            ServiceOp::BackupDownload(r) if r.fenced_file.is_some() => {
+                if r.partition.is_empty() {
+                    return Err(ApiError::invalid(
+                        "a fenced file names its partition (`partition`)",
+                    ));
+                }
+                let name = r.fenced_file.as_deref().unwrap_or_default();
+                let (path, file) = cluster.node.closed_file(&r.partition, name)?;
+                self.service
+                    .fenced_download(path, file, r)
+                    .await
+                    .map(ServiceReply::Download)
+            }
             ServiceOp::BackupDownload(r) => {
                 let part = named(&r.partition)?;
                 self.service

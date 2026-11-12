@@ -159,6 +159,12 @@ message Partition {
   // row cache, taken off the top of the node's `--engine-memory` before the rest is split
   // equally across the node's other partitions. 0: an equal share.
   uint64 memory_bytes = 4;
+  // The epoch P's current history began at (D317 ticket 6): kept by a relocation that copied
+  // P's files (`SetMapRequest.copies`), and set to the new epoch by every other one (a
+  // promotion, a restore), which gives P another history. A feed token taken at epoch `e`
+  // resumes only while `history_epoch <= e`. Derived where a map is set; 0 in maps from
+  // before ticket 6, when no epoch had moved.
+  uint64 history_epoch = 5;
 }
 
 message TablePlacement {
@@ -199,6 +205,10 @@ message SetMapRequest {
   // the cluster's, at a version above this node's. `phdb cluster set-map --force` sets it at
   // a version above every reachable node's, naming a live writer.
   bool force = 3;
+  // The partitions this change relocates by copying their files (D317 ticket 6, `phdb
+  // cluster relocate --copy`): each keeps its `history_epoch`. Each must move to another
+  // node at exactly its epoch + 1. Not part of the map: it marks this change only.
+  repeated string copies = 4;
 }
 
 message SetMapResponse {

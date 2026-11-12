@@ -167,8 +167,7 @@ fn a_commit_resubmitted_on_the_same_rows_right_after_the_answer_does_not_stall()
     first.expect("answered").expect("committed");
     // Shard 0 has not run since: `Applied` waits in its queue, ahead of what follows.
     let mut txn = db.engine.begin().unwrap();
-    for shard in 0..2 {
-        let t = &db.tables[shard];
+    for t in &db.tables {
         assert!(
             txn.get(t.id, t.families[0].id, b"x", b"q")
                 .unwrap()

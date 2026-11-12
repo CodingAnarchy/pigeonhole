@@ -47,6 +47,9 @@ pub(crate) struct Owner {
     pub node: String,
     pub address: String,
     pub epoch: u64,
+    /// The epoch P's current history began at (D317 ticket 6): a feed token from an epoch
+    /// before it can't resume.
+    pub history_epoch: u64,
 }
 
 /// The routing view of one map version.
@@ -76,6 +79,7 @@ impl Routes {
                     node: p.node.clone(),
                     address: address.to_owned(),
                     epoch: p.epoch,
+                    history_epoch: p.history_epoch,
                 };
                 (p.id.clone(), owner)
             })
@@ -243,6 +247,7 @@ mod tests {
     /// on b.
     fn map() -> ClusterMap {
         let part = |id: &str, node: &str, epoch| Partition {
+            history_epoch: 0,
             id: id.into(),
             node: node.into(),
             epoch,
@@ -361,6 +366,7 @@ mod tests {
                 node: "b".into(),
                 address: "127.0.0.1:7002".into(),
                 epoch: 2,
+                history_epoch: 0,
             })
         );
         assert_eq!(r.owner("p9"), None);

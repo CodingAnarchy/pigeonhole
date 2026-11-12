@@ -509,6 +509,7 @@ impl Router {
             new.map_version = map.map_version + 1;
             match node
                 .set_map(SetMapRequest {
+                    copies: Vec::new(),
                     expected_map_version: map.map_version,
                     map: Some(new),
                     force: false,
