@@ -93,6 +93,9 @@ pub(crate) struct Fences {
     pub(super) changing: tokio::sync::Mutex<()>,
     /// Partitions closed here ([`Node::close`]), with their files once hashed.
     pub(super) closed: Mutex<BTreeMap<String, super::close::Closed>>,
+    /// Partitions being opened while the node serves ([`Node::open_part`]): `Status` shows
+    /// them opening and doesn't read their files (#1770).
+    pub(super) opening: Mutex<BTreeSet<String>>,
 }
 
 impl Fences {
@@ -108,6 +111,14 @@ impl Fences {
         &self,
     ) -> std::sync::MutexGuard<'_, BTreeMap<String, super::close::Closed>> {
         self.closed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether partition `id` is being opened here.
+    pub(super) fn is_opening(&self, id: &str) -> bool {
+        self.opening
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id)
     }
 
     /// Partition `id` no longer served here: its gate goes with it.

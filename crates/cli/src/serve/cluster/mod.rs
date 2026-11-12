@@ -602,6 +602,14 @@ impl Node {
                 error: String::new(),
                 ..Default::default()
             };
+            // A partition being opened: no read of its file, whose read-only open would refuse
+            // the node's own open (#1770). It shows as opening.
+            if self.fences.is_opening(&named) {
+                lp.set_state(proto::LocalPartitionState::Opening);
+                lp.ok = true;
+                partitions.push(lp);
+                continue;
+            }
             let read = match open.get(&named) {
                 Some(part) => identity::read(&part.db),
                 None => identity::read_file(&path),
@@ -1714,8 +1722,21 @@ fn open_partition(
             path.display()
         )));
     }
-    let db = pigeonhole::Pigeonhole::open(&path, options)
-        .map_err(|e| Failure::db("open the partition", &e))?;
+    // A read-only open of the file (an operator's `phdb info`, say) holds the writer lock
+    // briefly and refuses this open: retried for a moment, rather than leaving the partition
+    // unopened until the next map (#1770).
+    let mut wait = std::time::Duration::from_millis(50);
+    let db = loop {
+        match pigeonhole::Pigeonhole::open(&path, options.clone()) {
+            Err(e)
+                if e.code() == pigeonhole::ErrorCode::WriterLocked && wait.as_millis() <= 800 =>
+            {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            opened => break opened.map_err(|e| Failure::db("open the partition", &e))?,
+        }
+    };
     let want = identity::Identity {
         cluster_id: cluster_id.to_owned(),
         partition_id: partition.to_owned(),
