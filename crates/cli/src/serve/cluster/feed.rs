@@ -214,7 +214,7 @@ pub(crate) async fn subscribe(
         states: Vec::new(),
         token: Vec::new(),
         scratch: Vec::new(),
-        tail: prost::bytes::BytesMut::new(),
+        tail: tail_buffer(),
         opens: tokio::task::JoinSet::new(),
     };
     merge.open_all().await?;
@@ -596,6 +596,17 @@ impl Merge {
         }
         Err(in_partition(&self.parts[i].partition, e))
     }
+}
+
+/// What a merge's tail buffer starts with ([`Merge::tail`]): each event's tail is split off
+/// it, and a buffer that started empty reallocates exactly to size after each split, then
+/// grows: 4 allocations an event against main's 2 for a client that's behind (cli692's S1
+/// on #1766, measured). Starting with room, it allocates about once per this many bytes of
+/// tails (0.02 an event at 8 KiB). Not `BytesMut::new()`: a test holds it.
+const TAIL_CAPACITY: usize = 8 << 10;
+
+fn tail_buffer() -> prost::bytes::BytesMut {
+    prost::bytes::BytesMut::with_capacity(TAIL_CAPACITY)
 }
 
 /// Polls every available part, from `turn` on so none starves, for its next event.
@@ -1261,6 +1272,29 @@ mod tests {
             partition: String::new(),
         };
         Bytes::from(prost::Message::encode_to_vec(&e))
+    }
+
+    #[test]
+    fn a_merge_s_tail_buffer_starts_with_room() {
+        // cli692's S1 on #1766: an empty start reallocates per event once tails are split
+        // off it. Tails split off a buffer with room share its allocation.
+        let mut tail = tail_buffer();
+        assert!(tail.capacity() >= 4 << 10, "{}", tail.capacity());
+        let before = tail.as_ptr();
+        put_field(&mut tail, PARTITION_FIELD, b"p1");
+        let first = tail.split().freeze();
+        put_field(&mut tail, PARTITION_FIELD, b"p2");
+        let second = tail.split().freeze();
+        assert_eq!(
+            first.as_ptr(),
+            before,
+            "the first tail is in the buffer's allocation"
+        );
+        assert_eq!(
+            second.as_ptr(),
+            before.wrapping_add(first.len()),
+            "and the next one right after it"
+        );
     }
 
     #[test]
