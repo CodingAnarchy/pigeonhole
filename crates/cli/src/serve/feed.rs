@@ -260,6 +260,126 @@ impl Entry {
     }
 }
 
+/// How an entry's changes stand against a client's row prefix ([`rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// Every change is to a matching row: the client's event is the shared one.
+    All,
+    /// No change is: nothing to send.
+    None,
+    /// Some are, or the encoding isn't one the walk reads: decode and filter it.
+    Mixed,
+}
+
+/// Where an encoded `FeedEvent`'s changes' rows stand against `prefix` (#1780), read off
+/// the encoding with no allocation: the commit's changes' `row` fields only, every other
+/// field stepped over by its wire type. A client whose prefix matches every row (perf287's
+/// g90: `w0` over writers `w000`-`w015`) then sends the shared encoding, as a client with
+/// no prefix does, instead of decoding and encoding each entry again for itself: 13 times
+/// the shared path's cost per event (cli692's micro-benchmark), on every client of a hub.
+/// Anything the walk doesn't expect (a truncated encoding, a group, a second commit field,
+/// another event) is [`Rows::Mixed`], so the decode decides, never a skip.
+fn rows(event: &[u8], prefix: &[u8]) -> Rows {
+    rows_of(event, prefix).unwrap_or(Rows::Mixed)
+}
+
+/// `FeedEvent.commit`, `FeedCommit.changes` and `Change.row`.
+const FEED_COMMIT: u64 = 2;
+const COMMIT_CHANGES: u64 = 3;
+const CHANGE_ROW: u64 = 4;
+
+fn rows_of(mut event: &[u8], prefix: &[u8]) -> Option<Rows> {
+    let mut commit = None;
+    while !event.is_empty() {
+        match field(&mut event)? {
+            (FEED_COMMIT, Some(c)) if commit.is_none() => commit = Some(c),
+            // Another commit field (prost would merge them), or another of the oneof's events
+            // (the planned catalog event, progress, partition state).
+            (FEED_COMMIT | 3 | 4 | 6, _) => return None,
+            _ => {}
+        }
+    }
+    let mut commit = commit?;
+    let (mut all, mut any) = (true, false);
+    while !commit.is_empty() {
+        match field(&mut commit)? {
+            (COMMIT_CHANGES, Some(change)) => {
+                let matches = row_of(change)?.starts_with(prefix);
+                all &= matches;
+                any |= matches;
+            }
+            (COMMIT_CHANGES, None) => return None,
+            _ => {}
+        }
+    }
+    Some(match (any, all) {
+        // No change at all is none matching, as the decode's filter leaves it.
+        (false, _) => Rows::None,
+        (true, true) => Rows::All,
+        (true, false) => Rows::Mixed,
+    })
+}
+
+/// An encoded `Change`'s row: its last `row` field, as prost decodes it, or empty without
+/// one (proto3's default, which only an empty prefix matches).
+fn row_of(mut change: &[u8]) -> Option<&[u8]> {
+    let mut row: &[u8] = &[];
+    while !change.is_empty() {
+        match field(&mut change)? {
+            (CHANGE_ROW, Some(r)) => row = r,
+            (CHANGE_ROW, None) => return None,
+            _ => {}
+        }
+    }
+    Some(row)
+}
+
+/// The next field of an encoded message: its number, and its bytes if it's length-delimited
+/// (`None` for a varint or fixed-width one, stepped over). `None` for anything else: a
+/// group, field 0, a key past `u32::MAX`, or a truncated encoding.
+fn field<'a>(buf: &mut &'a [u8]) -> Option<(u64, Option<&'a [u8]>)> {
+    let key = prost::encoding::decode_varint(buf).ok()?;
+    let number = key >> 3;
+    // As prost's decode refuses them (feedback from feed1248, N1 on #1783).
+    if number == 0 || key > u64::from(u32::MAX) {
+        return None;
+    }
+    let value = match key & 7 {
+        0 => {
+            prost::encoding::decode_varint(buf).ok()?;
+            None
+        }
+        1 => {
+            *buf = buf.get(8..)?;
+            None
+        }
+        5 => {
+            *buf = buf.get(4..)?;
+            None
+        }
+        2 => {
+            let len = usize::try_from(prost::encoding::decode_varint(buf).ok()?).ok()?;
+            let value = buf.get(..len)?;
+            *buf = &buf[len..];
+            Some(value)
+        }
+        _ => return None,
+    };
+    Some((number, value))
+}
+
+/// What a client with a (non-empty) `prefix` sends for entry `e`, if anything: the shared
+/// encoding when every change matches, nothing when none does, and the matching changes
+/// decoded off it otherwise (#1780). The same bytes the decode alone would send, in every
+/// case (`a_prefix_client_sends_what_the_decode_would_whatever_the_rows`).
+fn prefix_out(e: &Arc<Entry>, prefix: &[u8]) -> Option<Out> {
+    match rows(e.encoded()?, prefix) {
+        Rows::All => Some(Out::Shared(Arc::clone(e))),
+        Rows::None => None,
+        Rows::Mixed => e.for_prefix(prefix).map(Out::event),
+    }
+}
+
 /// A commit event: `c` with the token right after it.
 fn commit_event(token: Bytes, c: proto::FeedCommit) -> proto::FeedEvent {
     proto::FeedEvent {
@@ -1375,10 +1495,11 @@ impl Client {
             return self.send(Out::Shared(Arc::clone(e)), pos).await;
         }
         // A prefix: the entry's changes to matching rows, if any (a later progress event
-        // carries the position past one with none).
-        match e.for_prefix(&self.prefix) {
+        // carries the position past one with none), the shared encoding when they all
+        // match (#1780).
+        match prefix_out(e, &self.prefix) {
             Some(_) if self.skipping(e.seqno)? => Ok(()),
-            Some(event) => self.send(Out::event(event), pos).await,
+            Some(out) => self.send(out, pos).await,
             None => Ok(()),
         }
     }
@@ -2577,6 +2698,217 @@ mod tests {
         }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1780: a prefix client reads which rows an entry's changes are to off its encoding.
+    /// Whatever the rows, it sends the bytes the decode-and-filter path would send: the
+    /// shared encoding itself when every change matches, nothing when none does. Random
+    /// entries, seeded (`PHDB_ROWS_SEED`; the seed prints on failure), some with fields the
+    /// walk doesn't know; and any truncated encoding goes to the decode, never skipped.
+    #[test]
+    fn a_prefix_client_sends_what_the_decode_would_whatever_the_rows() {
+        use prost::encoding::{WireType, encode_key, encode_varint};
+        let seed: u64 = std::env::var("PHDB_ROWS_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x1780);
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // Short rows and prefixes over two letters, so they match, half match and miss.
+        fn word(next: &mut dyn FnMut() -> u64, min: u64) -> Vec<u8> {
+            let n = min + next() % (4 - min);
+            (0..n).map(|_| b"ab"[(next() % 2) as usize]).collect()
+        }
+        // The decode's verdict on an encoding: whether the prefix keeps all, none or some of
+        // its commit's changes. `None` if it doesn't decode as a commit.
+        fn judge(event: &[u8], prefix: &[u8]) -> Option<Rows> {
+            let ev = <proto::FeedEvent as prost::Message>::decode(event).ok()?;
+            let Some(proto::feed_event::Event::Commit(c)) = ev.event else {
+                return None;
+            };
+            let kept = c
+                .changes
+                .iter()
+                .filter(|ch| ch.row.starts_with(prefix))
+                .count();
+            Some(match kept {
+                0 => Rows::None,
+                k if k == c.changes.len() => Rows::All,
+                _ => Rows::Mixed,
+            })
+        }
+        let (mut seen_all, mut seen_none, mut seen_mixed) = (0, 0, 0);
+        for step in 0..5000 {
+            let unknown = next() % 4 == 0;
+            // Now and then a shape the walk leaves to the decode, or steps over (feed1248's N2
+            // on #1783): 0, another event after the commit; 1, an unknown field between
+            // changes; 2, a change field with a varint's wire type; 3, a key past u32::MAX.
+            let odd = match next() % 16 {
+                k @ 0..=3 => Some(k),
+                _ => None,
+            };
+            let token: Vec<u8> = (0..next() % 24).map(|_| next() as u8).collect();
+            let mut commit = Vec::new();
+            encode_varint(1 << 3, &mut commit);
+            encode_varint(next() % 1_000_000, &mut commit);
+            encode_varint(2 << 3, &mut commit);
+            encode_varint(next(), &mut commit);
+            for _ in 0..1 + next() % 4 {
+                let change = proto::Change {
+                    table: "busy".into(),
+                    family: "f".into(),
+                    kind: (1 + next() % 5) as i32,
+                    row: word(&mut next, 0).into(),
+                    qualifier: word(&mut next, 0).into(),
+                    timestamp: next() % 4,
+                    value: (next() % 2 == 0).then(|| proto::Value {
+                        kind: Some(proto::value::Kind::Bytes(word(&mut next, 0).into())),
+                    }),
+                };
+                let mut c = prost::Message::encode_to_vec(&change);
+                if unknown {
+                    // Fields 9-12, one of each wire type the walk steps over.
+                    encode_key(9, WireType::Varint, &mut c);
+                    encode_varint(next(), &mut c);
+                    encode_key(10, WireType::LengthDelimited, &mut c);
+                    encode_varint(2, &mut c);
+                    c.extend_from_slice(b"zz");
+                    encode_key(11, WireType::ThirtyTwoBit, &mut c);
+                    c.extend_from_slice(&[1, 2, 3, 4]);
+                    encode_key(12, WireType::SixtyFourBit, &mut c);
+                    c.extend_from_slice(&[0; 8]);
+                    // A second `row`: the decode takes the last one, so the walk must too.
+                    if next() % 2 == 0 {
+                        let row = word(&mut next, 0);
+                        encode_key(4, WireType::LengthDelimited, &mut c);
+                        encode_varint(row.len() as u64, &mut c);
+                        c.extend_from_slice(&row);
+                    }
+                }
+                encode_key(3, WireType::LengthDelimited, &mut commit);
+                encode_varint(c.len() as u64, &mut commit);
+                commit.extend_from_slice(&c);
+                if odd == Some(1) {
+                    encode_key(9, WireType::LengthDelimited, &mut commit);
+                    encode_varint(1, &mut commit);
+                    commit.push(b'x');
+                }
+            }
+            if odd == Some(2) {
+                encode_key(3, WireType::Varint, &mut commit);
+                encode_varint(7, &mut commit);
+            }
+            let mut event = Vec::new();
+            if odd == Some(3) {
+                encode_varint(1 << 35, &mut event);
+                encode_varint(1, &mut event);
+            }
+            if !token.is_empty() {
+                encode_key(1, WireType::LengthDelimited, &mut event);
+                encode_varint(token.len() as u64, &mut event);
+                event.extend_from_slice(&token);
+            }
+            encode_key(2, WireType::LengthDelimited, &mut event);
+            encode_varint(commit.len() as u64, &mut event);
+            event.extend_from_slice(&commit);
+            if unknown {
+                encode_key(9, WireType::Varint, &mut event);
+                encode_varint(next(), &mut event);
+            }
+            if odd == Some(0) {
+                // A progress or partition state event: the oneof's last field wins.
+                encode_key(
+                    if next() % 2 == 0 { 4 } else { 6 },
+                    WireType::LengthDelimited,
+                    &mut event,
+                );
+                encode_varint(0, &mut event);
+            }
+            let event = Bytes::from(event);
+            let e = Arc::new(Entry {
+                seqno: step,
+                token: Bytes::new(),
+                prev: 0,
+                bytes: 0,
+                encoded: Some(event.clone()),
+            });
+            // Mostly one letter, so every case comes up often.
+            let prefix = if next() % 4 == 0 {
+                word(&mut next, 1)
+            } else {
+                vec![b"ab"[(next() % 2) as usize]]
+            };
+            let why = format!("seed {seed}, step {step}, prefix {prefix:?}");
+            // The decode path: the matching changes, or none (an encoding that doesn't
+            // decode, or isn't a commit, sends nothing).
+            let all_changes = <proto::FeedEvent as prost::Message>::decode(event.clone())
+                .ok()
+                .and_then(|ev| match ev.event {
+                    Some(proto::feed_event::Event::Commit(c)) => Some(c.changes.len()),
+                    _ => None,
+                });
+            let decoded = e.for_prefix(&prefix);
+            let want = match &decoded {
+                None => Rows::None,
+                Some(ev) => match &ev.event {
+                    Some(proto::feed_event::Event::Commit(c))
+                        if Some(c.changes.len()) == all_changes =>
+                    {
+                        Rows::All
+                    }
+                    _ => Rows::Mixed,
+                },
+            };
+            // The walk's verdict is the decode's, except that a shape it leaves to the decode
+            // is `Mixed`.
+            let r = rows(&event, &prefix);
+            if matches!(odd, Some(0 | 2 | 3)) {
+                assert!(r == Rows::Mixed || r == want, "{why}: {r:?}, odd {odd:?}");
+            } else {
+                assert_eq!(r, want, "{why}");
+            }
+            let got = prefix_out(&e, &prefix);
+            match r {
+                Rows::All => {
+                    seen_all += 1;
+                    assert!(matches!(got, Some(Out::Shared(_))), "{why}");
+                }
+                Rows::None => {
+                    seen_none += 1;
+                    assert!(got.is_none(), "{why}");
+                }
+                Rows::Mixed => {
+                    seen_mixed += 1;
+                    assert!(got.is_none() || matches!(got, Some(Out::Event(_))), "{why}");
+                }
+            }
+            // The same bytes as the decode path's event (fields the encoder doesn't know
+            // aren't encoded again, so only without them).
+            if !unknown && odd != Some(1) {
+                assert_eq!(
+                    got.map(|o| o.to_bytes()),
+                    decoded.map(|ev| Bytes::from(prost::Message::encode_to_vec(&ev))),
+                    "{why}"
+                );
+            }
+            // Cut short anywhere: what the decode makes of it, or, if it can't, for it to judge.
+            // Only a cut between whole fields decodes (one before a trailing unknown field).
+            let cut = (next() % event.len() as u64) as usize;
+            let got = rows(&event[..cut], &prefix);
+            match judge(&event[..cut], &prefix) {
+                Some(want) => assert_eq!(got, want, "{why}, cut at {cut}"),
+                None => assert_eq!(got, Rows::Mixed, "{why}, cut at {cut}"),
+            }
+        }
+        assert!(
+            seen_all > 250 && seen_none > 250 && seen_mixed > 250,
+            "seed {seed}: all {seen_all}, none {seen_none}, mixed {seen_mixed}"
+        );
     }
 
     #[test]

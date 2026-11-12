@@ -615,7 +615,7 @@ A node writes a partition only while its newest map names it for the partition a
   - **`--timeout SECS`** (at least 1) bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
     - **The hash:** the map still gives P to the old node, closed there. Run the move again to go on waiting, or `unfence` P there.
     - **Serving:** the map already gives P to `ID`, so check that node.
-    
+
     The copy has no limit, since it takes as long as the files do. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
   - **Run it again** to resume a move that stopped. A copy picks up from what arrived. A move that's finished answers that the map already gives P to `ID`.
   - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P.
