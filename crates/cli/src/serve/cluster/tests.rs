@@ -3673,6 +3673,7 @@ mod charge;
 mod close;
 mod feed;
 mod fence;
+mod idle;
 mod metrics;
 mod open;
 mod several;

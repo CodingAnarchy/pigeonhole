@@ -25,12 +25,19 @@ pub(crate) struct Watched<T> {
 
 impl<T: Send + 'static> Watched<T> {
     /// `state`, watched from now: the client has until `idle` after its last take (or after
-    /// now, before the first). Spawns the watchdog on the current runtime.
-    pub(crate) fn new(state: T, idle: Duration) -> Self {
+    /// now, before the first). Spawns the watchdog on the current runtime; `expired` runs
+    /// once it drops the state (the count and the log line), never otherwise.
+    pub(crate) fn new(state: T, idle: Duration, expired: impl FnOnce() + Send + 'static) -> Self {
         let state = Arc::new(Mutex::new(Some(state)));
         let clock = Arc::new(TakeClock::new());
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        tokio::spawn(watch(Arc::clone(&state), Arc::clone(&clock), idle, stopped));
+        tokio::spawn(watch(
+            Arc::clone(&state),
+            Arc::clone(&clock),
+            idle,
+            stopped,
+            expired,
+        ));
         Self {
             state,
             clock,
@@ -40,12 +47,15 @@ impl<T: Send + 'static> Watched<T> {
 }
 
 impl<T> Watched<T> {
-    /// The client took something now.
+    /// The client took something now, or asked for something: every poll of the stream
+    /// counts, a `Pending` one too, so a client that reads a quiet subscription keeps it
+    /// (simp724's point 1).
     pub(crate) fn took(&self) {
         self.clock.took();
     }
 
-    /// The state: `None` once the watchdog dropped it.
+    /// The state: `None` once the watchdog dropped it. Never held across an `await`: the
+    /// watchdog takes the same lock (a stream's `poll_next` is sync).
     pub(crate) fn lock(&self) -> MutexGuard<'_, Option<T>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -59,6 +69,7 @@ async fn watch<T>(
     clock: Arc<TakeClock>,
     idle: Duration,
     mut stopped: tokio::sync::oneshot::Receiver<()>,
+    expired: impl FnOnce(),
 ) {
     let begun = tokio::time::Instant::now();
     loop {
@@ -70,7 +81,10 @@ async fn watch<T>(
                 if tokio::time::Instant::now() >= due {
                     // Out of the lock first, then dropped: a part's drop may take a while.
                     let gone = state.lock().unwrap_or_else(PoisonError::into_inner).take();
-                    drop(gone);
+                    if gone.is_some() {
+                        drop(gone);
+                        expired();
+                    }
                     return;
                 }
             }
@@ -125,7 +139,9 @@ mod tests {
             let idle = Duration::from_secs(5);
             let slots = Arc::new(tokio::sync::Semaphore::new(1));
             let (h, dropped) = held(&slots);
-            let w = Watched::new(h, idle);
+            let fired = Arc::new(AtomicBool::new(false));
+            let f = Arc::clone(&fired);
+            let w = Watched::new(h, idle, move || f.store(true, Ordering::SeqCst));
             // Nothing polls the stream: only the watchdog runs.
             after(idle - Duration::from_millis(1)).await;
             assert!(w.lock().is_some(), "not yet");
@@ -133,6 +149,7 @@ mod tests {
             after(Duration::from_millis(2)).await;
             assert!(w.lock().is_none(), "dropped at the limit");
             assert!(dropped.load(Ordering::SeqCst));
+            assert!(fired.load(Ordering::SeqCst), "counted and logged");
             assert_eq!(slots.available_permits(), 1, "its slot is free");
         });
     }
@@ -143,7 +160,9 @@ mod tests {
             let idle = Duration::from_secs(5);
             let slots = Arc::new(tokio::sync::Semaphore::new(1));
             let (h, dropped) = held(&slots);
-            let w = Watched::new(h, idle);
+            let fired = Arc::new(AtomicBool::new(false));
+            let f = Arc::clone(&fired);
+            let w = Watched::new(h, idle, move || f.store(true, Ordering::SeqCst));
             // A take every half limit, for four limits: never idle.
             for _ in 0..8 {
                 after(idle / 2).await;
@@ -163,13 +182,18 @@ mod tests {
         paused().block_on(async {
             let slots = Arc::new(tokio::sync::Semaphore::new(1));
             let (h, dropped) = held(&slots);
-            let w = Watched::new(h, Duration::from_secs(5));
+            let fired = Arc::new(AtomicBool::new(false));
+            let f = Arc::clone(&fired);
+            let w = Watched::new(h, Duration::from_secs(5), move || {
+                f.store(true, Ordering::SeqCst)
+            });
             drop(w);
             after(Duration::from_millis(1)).await;
             assert!(
                 dropped.load(Ordering::SeqCst),
                 "the state went with the stream"
             );
+            assert!(!fired.load(Ordering::SeqCst), "not an idle drop");
             assert_eq!(slots.available_permits(), 1);
         });
     }

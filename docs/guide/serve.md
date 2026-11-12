@@ -335,6 +335,7 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_request_duration_seconds{rpc}` | histogram | Each RPC's service time, from the decoded request to its answer (a stream's to its end). Buckets from 100 µs to 10 s. |
 | `pigeonhole_serve_shed_total` | counter | Requests refused at `--max-concurrent`, before they ran. |
 | `pigeonhole_serve_replies_lost_total` | counter | Writes that finished after their client went away. The write's outcome went to the log instead. |
+| `pigeonhole_serve_feed_idle_drops_total` | counter | Feed subscriptions ended at `--stream-idle-ms`, because the client left an event untaken that long (on a cluster: took nothing that long). Each one also ends its `Feed.Subscribe` with `DeadlineExceeded`. A cluster subscription counts once, on the node it entered. |
 | `pigeonhole_serve_connections`, `pigeonhole_serve_connections_max` | gauge | Open connections, and `--max-connections`. |
 | `pigeonhole_serve_connections_refused_total` | counter | Connections closed at the cap. |
 | `pigeonhole_serve_accept_errors_total` | counter | Failed accepts, such as running out of file descriptors (`EMFILE`). |
