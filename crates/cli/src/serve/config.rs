@@ -133,9 +133,11 @@ pub(crate) struct ServeArgs {
     /// Sessions one token may hold at once.
     #[arg(long, value_name = "N", default_value_t = 64)]
     pub max_sessions_per_token: usize,
-    /// Threads for the network side (default: the CPUs the shards don't use, at least 2).
-    /// With `--blocking-threads`'s default, the two together can be twice those CPUs: the
-    /// blocking threads compete only while blocking calls run.
+    /// Threads for the network side (default: the CPUs the shards don't use, less the feed
+    /// threads, at least 2). With `--blocking-threads`'s default, the two together can be
+    /// twice those CPUs: the blocking threads compete only while blocking calls run. With
+    /// the shards' SMT siblings in the network threads' mask, a node whose feed side keeps up
+    /// gains from raising it to count them too (the serving guide, #1745).
     #[arg(long, value_name = "N")]
     pub io_threads: Option<usize>,
     /// Threads for blocking calls (default: the CPUs the shards don't use, at least 2).
