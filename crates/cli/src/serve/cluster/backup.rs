@@ -219,7 +219,7 @@ impl Job {
         let last = loop {
             let req = request(
                 BackupDownloadRequest {
-                    fenced_file: String::new(),
+                    fenced_file: None,
                     durable,
                     backup_id: backup_id.clone(),
                     offset,

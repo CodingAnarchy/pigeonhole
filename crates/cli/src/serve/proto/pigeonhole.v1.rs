@@ -704,9 +704,10 @@ pub struct BackupDownloadRequest {
     /// after a fence, for a relocation by copy, named by its suffix after the partition's
     /// database path (`""` the main file, `-wal-<n>`, `-feed`). No backup is taken: the chunks
     /// are the file's bytes from `offset`, and `sha256` is the file's. Only for a partition in
-    /// state `closed`; `durable` and `replica` must be unset.
-    #[prost(string, tag = "6")]
-    pub fenced_file: ::prost::alloc::string::String,
+    /// state `closed`; `durable` and `replica` must be unset. Set, even to `""`, it asks for a
+    /// fenced file; unset, for a backup.
+    #[prost(string, optional, tag = "6")]
+    pub fenced_file: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BackupChunk {

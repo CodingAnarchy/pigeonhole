@@ -44,6 +44,28 @@ enum Hashing {
 }
 
 impl Closed {
+    /// File `name` of partition `id` (a suffix after its database path, ICR 0135: `""` the
+    /// main file, `-wal-<n>`, `-feed`) as hashed at this close: what a relocation by copy
+    /// downloads (D317 ticket 6). Only once the hash is done; a name it didn't list is
+    /// `NotFound`.
+    pub(crate) fn file(&self, id: &str, name: &str) -> Result<&PartitionFile, ApiError> {
+        match &self.files {
+            Hashing::Running => Err(ApiError::failed_precondition(format!(
+                "partition {id:?} is closed, and its files are still being hashed: wait for \
+                 `phdb cluster status` to list them"
+            ))),
+            Hashing::Failed(e) => Err(ApiError::failed_precondition(format!(
+                "partition {id:?}'s files' hash failed (close it again to retry): {e}"
+            ))),
+            Hashing::Done(files) => files.iter().find(|f| f.name == name).ok_or_else(|| {
+                let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+                ApiError::not_found(format!(
+                    "partition {id:?} closed here has no file {name:?}: its files are {names:?}"
+                ))
+            }),
+        }
+    }
+
     /// Its line in `Status`.
     pub(crate) fn describe(&self, lp: &mut LocalPartition) {
         lp.set_state(LocalPartitionState::Closed);
@@ -154,6 +176,29 @@ impl Node {
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);
         Ok(())
+    }
+
+    /// File `name` of partition `id`, closed here ([`Closed::file`]), and its path: what
+    /// `Admin.BackupDownload`'s `fenced_file` streams (D317 ticket 6). The name is one the
+    /// close's hash listed, so the path is one of the partition's own files.
+    pub(crate) fn closed_file(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<(PathBuf, PartitionFile), ApiError> {
+        let closed = self.fences.closed();
+        let file = closed
+            .get(id)
+            .ok_or_else(|| {
+                ApiError::failed_precondition(format!(
+                    "partition {id:?} isn't closed on this node: fence and close it first"
+                ))
+            })?
+            .file(id, name)?
+            .clone();
+        let mut path = self.dir.join(format!("{id}.phdb")).into_os_string();
+        path.push(&file.name);
+        Ok((PathBuf::from(path), file))
     }
 
     /// Hashes closed partition `id`'s files in a blocking task, keeping the outcome for
@@ -351,4 +396,46 @@ fn move_aside(dir: &Path, id: &str) -> Result<LocalPartition, ApiError> {
     };
     lp.set_state(LocalPartitionState::Unspecified);
     Ok(lp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closed(files: Hashing) -> Closed {
+        Closed {
+            epoch: 3,
+            files,
+            generation: 0,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_closed_file_is_given_only_once_its_hash_listed_it() {
+        let file = |name: &str| PartitionFile {
+            name: name.into(),
+            bytes: 7,
+            sha256: vec![1; 32].into(),
+        };
+        let e = closed(Hashing::Running).file("p1", "").unwrap_err();
+        assert_eq!(e.code, "FailedPrecondition");
+        assert!(e.message.contains("still being hashed"), "{}", e.message);
+        let e = closed(Hashing::Failed("disk".into()))
+            .file("p1", "")
+            .unwrap_err();
+        assert_eq!(e.code, "FailedPrecondition");
+        assert!(e.message.contains("close it again"), "{}", e.message);
+        assert!(e.message.contains("disk"), "{}", e.message);
+        let done = closed(Hashing::Done(vec![file(""), file("-wal-0"), file("-feed")]));
+        assert_eq!(done.file("p1", "").unwrap(), &file(""));
+        assert_eq!(done.file("p1", "-feed").unwrap(), &file("-feed"));
+        let e = done.file("p1", "-wal-1").unwrap_err();
+        assert_eq!(e.code, "NotFound");
+        assert!(
+            e.message.contains("-wal-0"),
+            "names the files it has: {}",
+            e.message
+        );
+    }
 }

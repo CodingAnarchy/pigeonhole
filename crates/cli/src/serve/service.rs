@@ -496,6 +496,17 @@ where
     loop {
         let path = kept.path.clone();
         let data = blocking(pool, move || super::backup::read_chunk(&path, at)).await?;
+        // A file that isn't its listed size any more (a closed partition's file, which goes
+        // as it lies, changed after its close) fails the download: short, an empty read
+        // would never reach `total`; long, bytes past it would go out (#1729).
+        let left = kept.total - at;
+        if (data.is_empty() && left > 0) || data.len() as u64 > left {
+            return Err(ApiError::failed_precondition(format!(
+                "the file changed after it was taken: it isn't its {} bytes any more (a \
+                 closed partition's file: close it again)",
+                kept.total
+            )));
+        }
         let next = at + data.len() as u64;
         let last = next >= kept.total;
         let chunk = proto::BackupChunk {
@@ -1707,7 +1718,7 @@ impl Service {
                 if !r.partition.is_empty() {
                     return Err(single_node_partition());
                 }
-                if !r.fenced_file.is_empty() {
+                if r.fenced_file.is_some() {
                     return Err(ApiError::invalid(
                         "fenced_file is a cluster node's (D317 ticket 6): a single node's \
                          download is a backup",

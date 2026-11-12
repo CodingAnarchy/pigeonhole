@@ -336,7 +336,7 @@ fn a_fenced_file_streams_as_it_lies_from_any_offset() {
     let fetch = |offset: u64, durable: bool| {
         let req = proto::BackupDownloadRequest {
             partition: "p1".into(),
-            fenced_file: "-feed".into(),
+            fenced_file: Some("-feed".into()),
             offset,
             durable,
             ..Default::default()
@@ -375,6 +375,21 @@ fn a_fenced_file_streams_as_it_lies_from_any_offset() {
     assert!(fetch(bytes.len() as u64 + 1, false).is_err());
     // A file goes as it lies: no durable copy of it.
     assert_eq!(fetch(0, true).unwrap_err().code, "InvalidArgument");
+    // A file that changed after its hash fails the download rather than streaming forever
+    // (shorter) or past its size (longer).
+    std::fs::write(&path, &bytes[..bytes.len() - 10]).unwrap();
+    let e = fetch(0, false).unwrap_err();
+    assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+    assert!(e.message.contains("changed after"), "{}", e.message);
+    let mut longer = bytes.clone();
+    longer.extend_from_slice(b"appended");
+    std::fs::write(&path, &longer).unwrap();
+    let e = fetch(0, false).unwrap_err();
+    assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+    assert_eq!(
+        fetch(bytes.len() as u64, false).unwrap_err().code,
+        "FailedPrecondition"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

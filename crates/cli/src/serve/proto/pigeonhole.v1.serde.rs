@@ -1080,7 +1080,7 @@ impl serde::Serialize for BackupDownloadRequest {
         if !self.partition.is_empty() {
             len += 1;
         }
-        if !self.fenced_file.is_empty() {
+        if self.fenced_file.is_some() {
             len += 1;
         }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.BackupDownloadRequest", len)?;
@@ -1101,8 +1101,8 @@ impl serde::Serialize for BackupDownloadRequest {
         if !self.partition.is_empty() {
             struct_ser.serialize_field("partition", &self.partition)?;
         }
-        if !self.fenced_file.is_empty() {
-            struct_ser.serialize_field("fenced_file", &self.fenced_file)?;
+        if let Some(v) = self.fenced_file.as_ref() {
+            struct_ser.serialize_field("fenced_file", v)?;
         }
         struct_ser.end()
     }
@@ -1222,7 +1222,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                             if fenced_file__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("fencedFile"));
                             }
-                            fenced_file__ = Some(map_.next_value()?);
+                            fenced_file__ = map_.next_value()?;
                         }
                     }
                 }
@@ -1232,7 +1232,7 @@ impl<'de> serde::Deserialize<'de> for BackupDownloadRequest {
                     offset: offset__.unwrap_or_default(),
                     replica: replica__.unwrap_or_default(),
                     partition: partition__.unwrap_or_default(),
-                    fenced_file: fenced_file__.unwrap_or_default(),
+                    fenced_file: fenced_file__,
                 })
             }
         }

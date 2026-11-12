@@ -116,8 +116,9 @@ message BackupDownloadRequest {
   // after a fence, for a relocation by copy, named by its suffix after the partition's
   // database path (`""` the main file, `-wal-<n>`, `-feed`). No backup is taken: the chunks
   // are the file's bytes from `offset`, and `sha256` is the file's. Only for a partition in
-  // state `closed`; `durable` and `replica` must be unset.
-  string fenced_file = 6;
+  // state `closed`; `durable` and `replica` must be unset. Set, even to `""`, it asks for a
+  // fenced file; unset, for a backup.
+  optional string fenced_file = 6;
 }
 
 message BackupChunk {
