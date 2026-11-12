@@ -18,6 +18,16 @@ class Semver(unittest.TestCase):
         self.assertLess(versions.semver("1.2.0-rc.1"), versions.semver("1.2.0"))
         self.assertLess(versions.semver("1.1.9"), versions.semver("1.2.0-rc.1"))
 
+    def test_pre_release_identifiers_compare_by_semver(self):
+        # ai1249's N1 on #1791: numeric identifiers as numbers, not strings.
+        self.assertLess(versions.semver("1.2.0-rc.9"), versions.semver("1.2.0-rc.10"))
+        # Numeric below alphanumeric; a longer list above its prefix; the spec's own order.
+        order = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta",
+                 "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0"]
+        keys = [versions.semver(v) for v in order]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(len(set(keys)), len(keys))
+
     def test_build_metadata_is_ignored(self):
         self.assertEqual(versions.semver("1.2.0+abc"), versions.semver("1.2.0"))
 

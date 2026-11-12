@@ -35,9 +35,10 @@
 whose crates changed since the last release but whose version did not move would ship the
 previous release's code under the new `pigeonhole` (perf287's S2 on #1196). A version below
 the tag's fails too, changed or not: `publish.sh` would skip it as published, and a TAG from a
-release branch (v1.1.2) can be ahead of `main` (1.1.0). Versions compare as numbers, a
-pre-release below its release. `release-check` counts what changes a crate's behaviour or dependencies: its `src/`, a `build.rs`, and its
-`Cargo.toml` other than the `version` line, plus the workspace `Cargo.toml`'s shared settings
+release branch (v1.1.2) can be ahead of `main` (1.1.0). Versions compare by semver's
+precedence (numbers as numbers, a pre-release below its release). `release-check` counts what
+changes a crate's behaviour or dependencies: its `src/`, a `build.rs`, and its `Cargo.toml`
+other than the `version` line, plus the workspace `Cargo.toml`'s shared settings
 (`[workspace.dependencies]` other than the crates' own pins, and `[workspace.package]` other
 than `version`), which every packaged manifest inherits. Tests, benches and docs don't count.
 
@@ -236,10 +237,15 @@ def changed(tag, d):
 
 
 def semver(v):
-    """`v` as a comparable key: `(major, minor, patch)`, then a release above its pre-releases
-    (`1.2.0-rc.1` < `1.2.0`). Build metadata is ignored."""
+    """`v` as a comparable key, by semver's precedence: `(major, minor, patch)`, then a release
+    above its pre-releases (`1.2.0-rc.1` < `1.2.0`), whose dot-separated identifiers compare
+    numerically when numeric (`rc.9` < `rc.10`, ai1249's N1 on #1791) and below alphanumeric
+    ones, a longer list above its prefix. Build metadata is ignored."""
     core, _, pre = v.split("+", 1)[0].partition("-")
-    return tuple(int(x) for x in core.split(".")), pre == "", pre
+    ids = tuple(
+        (0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split(".")
+    ) if pre else ()
+    return tuple(int(x) for x in core.split(".")), pre == "", ids
 
 
 def line_errors(label, tag, now, then, changed_what):
