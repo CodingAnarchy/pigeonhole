@@ -927,9 +927,11 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
     // an allocation (#1758); more only if the token sits between other fields.
     let mut first: Option<(usize, usize)> = None;
     let mut more: Vec<(usize, usize)> = Vec::new();
-    let mut buf = bytes.clone();
-    while buf.has_remaining() {
-        let start = bytes.len() - buf.remaining();
+    // Walks a plain slice, so the loop doesn't touch the refcount; only the outputs are
+    // `Bytes` slices (#1758).
+    let mut buf: &[u8] = &bytes;
+    while !buf.is_empty() {
+        let start = bytes.len() - buf.len();
         let key = prost::encoding::decode_varint(&mut buf).map_err(|e| e.to_string())?;
         let (field, wire) = ((key >> 3) as u32, key & 7);
         match wire {
@@ -939,14 +941,14 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
             2 => {
                 let len = prost::encoding::decode_varint(&mut buf).map_err(|e| e.to_string())?;
                 let len = usize::try_from(len).map_err(|e| e.to_string())?;
-                if buf.remaining() < len {
+                let Some(rest) = buf.get(len..) else {
                     return Err("truncated".to_owned());
-                }
-                let at = bytes.len() - buf.remaining();
+                };
                 if field == TOKEN_FIELD {
+                    let at = bytes.len() - buf.len();
                     token = bytes.slice(at..at + len);
                 }
-                buf.advance(len);
+                buf = rest;
             }
             w => return Err(format!("wire type {w}")),
         }
@@ -956,7 +958,7 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
             PROGRESS_FIELD => kind = Kind::Progress,
             _ => {}
         }
-        let end = bytes.len() - buf.remaining();
+        let end = bytes.len() - buf.len();
         match (more.last_mut(), &mut first) {
             (Some(last), _) if last.1 == start => last.1 = end,
             (Some(_), _) => more.push((start, end)),
