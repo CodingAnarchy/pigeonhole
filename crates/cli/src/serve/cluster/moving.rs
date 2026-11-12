@@ -302,8 +302,10 @@ pub(super) async fn run(
     ));
     loop {
         match new.local(partition).await {
-            // A node serves P only at the map's epoch for it, which is `e + 1` now. (`Status`
-            // can't read an open file's epoch: its read-only open is refused.)
+            // A node serves P only at the map's epoch for it, which is `e + 1` now. Until #1767,
+            // `Status` can't read an open file's epoch (its read-only open is refused), so
+            // the state is the check; once it lands, this can check `lp.epoch == e + 1` too
+            // (simp724's N1 on #1729).
             Ok(Some(lp)) if lp.state() == LocalPartitionState::Serving => break,
             Ok(Some(lp)) => wait.tick(&lp.error).await,
             Ok(None) => wait.tick("not listed yet").await,

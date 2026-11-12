@@ -448,7 +448,8 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
   - an unchanged epoch keeps the current map's value;
   - an epoch raised by a relocation by copy keeps it;
   - any other raise (a promotion, a restore) sets it to the new epoch;
-  - a new partition's is its epoch.
+  - a new partition's is its epoch;
+  - a node's first map, unless a peer's, is derived over an empty map, so each history starts at its epoch. A restore's forced map onto fresh nodes doesn't carry the backup map's old values (simp724's S1 on #1729).
   - **A forced map** (`SetMapRequest.force`, amendment 1) is derived the same way against the receiving node's map, as a change that copied nothing, and can't list `copies` (`InvalidArgument`): a copy is a planned move, made through the writer. Its epochs must be new, so no history value is used twice (simp724's F1 and F2 on #1729):
     - **The node** refuses (`InvalidArgument`) a forced map that lowers a partition's epoch or moves it to another node at the same epoch, against its own map. The table rules of a change don't apply.
     - **`phdb cluster set-map --force`** checks the same against every node it reaches, since the receiving node can be behind. It refuses, naming the node, and reports the nodes it couldn't reach as `unchecked`.
@@ -482,7 +483,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
 **`phdb cluster move P --to ID [--drop-source]`** (`cluster/moving.rs`) runs the whole move against the writer's map, where P is on OLD at epoch `e`:
 1. **Fence and close** P on OLD (skipping what's done), then poll OLD's `Status` until P's `files` are listed. A failed hash is closed again. A close the database itself reported an error for stops the move.
 2. **Copy** each file: `PartitionUploadStatus` on NEW for `received` and `max_chunk`, then `BackupDownload{fenced_file}` from OLD at `received`, re-chunked into `PartitionUpload{RELOCATE, epoch e, manifest = OLD's files}`. The upload id is the first 16 bytes, as hex, of a SHA-256 over the cluster, the partition, `e`, the file's name and its hash. So a rerun resumes its own uploads, and a re-close with other bytes starts new ones. The download's last chunk must carry the listed size and hash.
-3. **Stamp** NEW from `e` to `e + 1`. Compare the reply's `files` (the installed set, Q1) with OLD's closed `files`, by name, size and SHA-256. A mismatch stops the move before the map changes.
+3. **Stamp** NEW from `e` to `e + 1`. Compare the reply's `files` (the installed set, Q1) with OLD's closed `files`, by name, size and SHA-256. A mismatch stops the move before the map changes. The stamp itself refuses a staged set that doesn't match the manifest it was sent, so no test can produce a mismatch through the API: only `compare`'s unit test covers this check (simp724's N4).
 4. **The map:** `relocate --copy`. Its stamp is a no-op now (the file is at `e + 1`).
 5. **Serving:** poll NEW's `Status` until P is `serving`. A node serves P only at the map's epoch, so the state is enough.
 6. **`--drop-source`:** `drop-partition` on OLD, only after step 3 compared and matched.

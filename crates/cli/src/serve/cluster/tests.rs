@@ -162,6 +162,45 @@ async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
 }
 
 #[test]
+fn a_forced_first_map_starts_each_history_at_its_epoch() {
+    // simp724's S1 on #1729: a restore's forced map onto a fresh node carries the backup
+    // map's old `history_epoch`, which the restored files no longer hold. The node derives it.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = test_dir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let n = node(&dir, "a");
+    let _stop = serve(&rt, &n, listener);
+    rt.block_on(async {
+        let mut m = the_map(1, &[port, port + 1, port + 2]);
+        m.partitions[0].epoch = 7;
+        m.partitions[0].history_epoch = 3;
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                expected_map_version: 0,
+                map: Some(m),
+                copies: Vec::new(),
+                force: true,
+            })
+            .await
+            .unwrap();
+        let got = client(port)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p1 = &got.partitions[0];
+        assert_eq!((p1.id.as_str(), p1.epoch, p1.history_epoch), ("p1", 7, 7));
+    });
+}
+
+#[test]
 fn a_map_set_derives_each_partitions_history_and_its_peers_take_it() {
     // D317 ticket 6: `history_epoch` is derived where a map is set (`SetMapRequest.copies`
     // marks a relocation by copy), and peers take it as set.
@@ -210,8 +249,10 @@ fn a_map_set_derives_each_partitions_history_and_its_peers_take_it() {
         // A first map relocates nothing, so it can't mark a copy.
         let e = set(0, the_map(1, &ports), &["p3"]).await.unwrap_err();
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+        // A first map's histories start at its epochs, whatever it says (simp724's S1 on
+        // #1729): the_map sends 0.
         set(0, the_map(1, &ports), &[]).await.unwrap();
-        assert_eq!(p3(ports[0]).await, ("c".into(), 1, 0));
+        assert_eq!(p3(ports[0]).await, ("c".into(), 1, 1));
 
         // p3 copied from c to b at epoch 2: its history is kept, on every node.
         let mut v2 = the_map(2, &ports);
@@ -219,7 +260,7 @@ fn a_map_set_derives_each_partitions_history_and_its_peers_take_it() {
         v2.partitions[2].epoch = 2;
         set(1, v2.clone(), &["p3"]).await.unwrap();
         for port in ports {
-            assert_eq!(p3(port).await, ("b".into(), 2, 0), "node at {port}");
+            assert_eq!(p3(port).await, ("b".into(), 2, 1), "node at {port}");
         }
 
         // A mark on a change that isn't a move by one epoch is refused, and nothing changes.
@@ -230,7 +271,7 @@ fn a_map_set_derives_each_partitions_history_and_its_peers_take_it() {
         let e = set(2, v3.clone(), &["p3"]).await.unwrap_err();
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
         assert!(e.message().contains("marked as copied"), "{e:?}");
-        assert_eq!(p3(ports[0]).await, ("b".into(), 2, 0));
+        assert_eq!(p3(ports[0]).await, ("b".into(), 2, 1));
 
         // Unmarked (a promotion or a restore), the move starts another history, whatever
         // the map sent says.

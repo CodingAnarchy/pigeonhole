@@ -304,7 +304,8 @@ pub(crate) fn validate_epochs(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
 /// - **An epoch raised:** the new epoch (a promotion or a restore starts another history),
 ///   unless `copies` names the partition (`relocate --copy`): then `old`'s, since its files
 ///   were copied whole. A copy must move to another node at exactly `old`'s epoch + 1.
-/// - **A new partition:** its epoch.
+/// - **A new partition:** its epoch. So a first map, derived over an empty `old`, starts
+///   every history at its epoch.
 ///
 /// Run after [`validate_change`] has passed the step, or, for a forced map, after
 /// [`validate_epochs`].

@@ -314,7 +314,8 @@ impl Node {
     ) -> Result<u64, ApiError> {
         map::validate(map, self.loopback_only).map_err(ApiError::invalid)?;
         // A map set here, forced or not, gets its partitions' `history_epoch` derived from
-        // the current one (D317 ticket 6); a peer's arrives derived.
+        // the current one, or from none for a first map (D317 ticket 6); a peer's arrives
+        // derived.
         let mut derived = None;
         let _one = self
             .installing
@@ -337,7 +338,18 @@ impl Node {
                         "a first map can't mark a partition as copied: it relocates nothing",
                     ));
                 }
-                None => {}
+                // A first map set here (a new cluster, or a restore's forced map onto fresh
+                // nodes) starts every history at its epoch, whatever the map sent says: a
+                // backup's map carries its old values, which its files no longer hold
+                // (simp724's S1 on #1729). A peer's arrives derived.
+                None => {
+                    if !matches!(from, MapSource::Peer) {
+                        derived = Some(
+                            map::with_history(&ClusterMap::default(), map, &[])
+                                .map_err(ApiError::invalid)?,
+                        );
+                    }
+                }
                 Some((old, _)) => match from {
                     MapSource::Change(copies) => {
                         map::validate_change(old, map).map_err(ApiError::invalid)?;
