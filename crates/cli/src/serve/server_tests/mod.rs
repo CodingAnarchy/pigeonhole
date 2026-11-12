@@ -81,6 +81,7 @@ pub(super) fn limits() -> Limits {
         max_catch_up: 4,
         fanout_forwards: 8,
         feed_ring_bytes: 1 << 20,
+        bulk_load_bytes: 1 << 30,
         feed_quiet: Duration::from_secs(10),
         feed_client_events: super::feed::CLIENT_EVENTS,
         feed_client_bytes: super::feed::CLIENT_BYTES,

@@ -396,6 +396,74 @@ fn a_session_past_its_request_limit_gets_a_retryable_refusal() {
 }
 
 #[test]
+fn waiting_feed_polls_hold_no_blocking_pool_thread() {
+    // The audit's F7: a `feed_poll` with `wait_ms` waited up to 30 s on the blocking-pool
+    // thread its message ran on, so a few polls could hold the whole pool. Now the wait runs
+    // on the runtime first. With a pool of one, four waiting polls leave it free: another
+    // session's read answers at once, and a commit wakes every poll.
+    blocking_threads(1);
+    let s = Server::start("", limits());
+    let reader = session(&s, None);
+    let polls: Vec<_> = (0..4)
+        .map(|_| {
+            let (url, id) = (s.url.clone(), session(&s, None));
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut resp = agent()
+                    .post(format!("{url}/mcp"))
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("mcp-session-id", id.as_str())
+                    .send(
+                        request(
+                            "tools/call",
+                            json!({"name": "feed_poll",
+                                   "arguments": {"tables": ["t"], "wait_ms": 8000}}),
+                        )
+                        .to_string(),
+                    )
+                    .unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+                (resp.body_mut().read_to_string().unwrap(), started.elapsed())
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let (out, err) = call(
+        &s,
+        None,
+        &reader,
+        "read_row",
+        json!({"table": "t", "row": "r"}),
+    );
+    assert!(!err, "{out}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the read waited {:?} for the pool",
+        started.elapsed()
+    );
+    let (status, e) = s.post(
+        "Mutate",
+        &super::put("woke", "f", "q", json!({"bytes": b64(b"v")})),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    for p in polls {
+        let (body, took) = p.join().unwrap();
+        assert!(body.contains("\"isError\":false"), "{body}");
+        assert!(
+            body.contains("\"row\":\"woke\""),
+            "the poll returned the commit: {body}"
+        );
+        assert!(
+            took < Duration::from_secs(6),
+            "woken by the commit, not its wait: {took:?}"
+        );
+    }
+}
+
+#[test]
 fn an_initialize_without_an_answer_leaves_no_session() {
     let s = Server::start("", limits());
     // As a notification (no id), nothing answers it: the session it opened goes again.

@@ -9,10 +9,16 @@
 //!   front-end reads the next only once that one is taken. A loader slower than its client
 //!   stops the reading, and the transport's flow control (HTTP/2 windows, TCP) then stops the
 //!   client.
-//! - **The loader holds a working set of its own, outside the budget:** the crate clusters a
-//!   sample of the first max(50,000, expected / target list length) vectors before it writes
-//!   any, then keeps up to 256 vectors per list until each list's batch is written. **One load
-//!   runs at a time per server** (the slot), which bounds that to one load's.
+//! - **The loader holds a working set of its own, outside the in-flight budget, and bounded
+//!   by `--bulk-load-bytes`** (the audit's F7): the crate clusters a sample of the first
+//!   max(50,000, lists) vectors before it writes any, lists being expected / target list
+//!   length, then keeps up to 255 vectors per list until each list's batch of 256 is
+//!   written ([`need`]). A load whose worst case is over the flag is refused before it
+//!   starts, and a running one reserves its worst case from the node's budget, which a
+//!   cluster node's partitions share. **One load runs at a time per database** (the slot).
+//! - **A client that sends nothing for `--stream-idle-ms`** while the loader waits for it
+//!   ends the load there, the vectors before loaded, so a stalled client can't hold the
+//!   slot for its connection's life.
 //! - **The loader runs on a thread of its own** holding the slot, never on the blocking pool
 //!   (B1: a load runs for minutes), placed off the shards' CPUs (B2). The crate's k-means
 //!   runs on that thread, single-threaded.
@@ -21,7 +27,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pigeonhole_vector::{BulkStats, Index};
 use prost::Message;
@@ -238,6 +244,105 @@ fn misfit(spec: &pigeonhole::VectorSpec, e: &Elements) -> Option<String> {
     })
 }
 
+/// The crate's sample floor and batch size (`pigeonhole_vector`'s `BULK_SAMPLE` and
+/// `BULK_BATCH`, index.rs): a load clusters its first max([`SAMPLE_FLOOR`], lists) vectors
+/// before writing any, then each list's batch waits for 256 vectors, so up to 255 a list wait
+/// unwritten.
+const SAMPLE_FLOOR: u64 = 50_000;
+const PENDING_PER_LIST: u64 = 255;
+/// What a held vector costs beyond its elements and id: the id's `Bytes` and the elements'
+/// `Vec` headers, the pair, and a pending batch's entry for the id.
+const PER_VECTOR: u64 = 96;
+/// The id length the up-front check assumes; a longer id grows the reservation as it comes.
+const ID_ALLOWANCE: u64 = 32;
+
+/// What a bulk load holds at most, by the crate's design ([`SAMPLE_FLOOR`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Need {
+    /// ceil(expected / target list length), at least 1: the lists k-means makes.
+    pub(crate) lists: u64,
+    /// The sample's vectors: max(50,000, lists).
+    pub(crate) sample_vectors: u64,
+    /// The sample's bytes: each vector held, with the copy k-means clusters (`f32` but for a
+    /// bit index).
+    pub(crate) sample: u64,
+    /// The pending batches' bytes after it: 255 vectors a list.
+    pub(crate) pending: u64,
+}
+
+impl Need {
+    /// The most the load holds at once.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.sample.max(self.pending)
+    }
+}
+
+/// What a load of `expected` vectors into an index of `spec`, with lists of `target`
+/// vectors, holds at most, its ids `id` bytes long. Saturating: a huge `expected` comes out
+/// as `u64::MAX`, and is refused.
+pub(crate) fn need(spec: &pigeonhole::VectorSpec, target: u64, expected: u64, id: u64) -> Need {
+    use pigeonhole::Element as E;
+    let dim = u64::from(spec.dim());
+    // What a vector holds as sent, and its clustering copy. A half index takes `f32` vectors
+    // too (`misfit`), so it's counted at `f32`'s size.
+    let (held, placed) = match spec.element() {
+        E::I8 => (dim, dim * 4),
+        E::Bit => (dim.div_ceil(8), dim.div_ceil(8)),
+        _ => (dim * 4, dim * 4),
+    };
+    let each = held + id + PER_VECTOR;
+    let lists = expected.div_ceil(target.max(1)).max(1);
+    let sample_vectors = lists.max(SAMPLE_FLOOR);
+    Need {
+        lists,
+        sample_vectors,
+        sample: sample_vectors.saturating_mul(each + placed),
+        pending: lists.saturating_mul(PENDING_PER_LIST).saturating_mul(each),
+    }
+}
+
+/// `InvalidArgument`: a load whose worst case is over `--bulk-load-bytes`.
+fn too_large(n: &Need, spec: &pigeonhole::VectorSpec, expected: u64, limit: u64) -> ApiError {
+    let (what, bytes) = if n.sample >= n.pending {
+        (
+            format!("its sample of {} vectors", n.sample_vectors),
+            n.sample,
+        )
+    } else {
+        (
+            format!("{} lists' pending batches of up to 255 vectors", n.lists),
+            n.pending,
+        )
+    };
+    ApiError::invalid(format!(
+        "a BulkLoad of {expected} expected {}-dim {:?} vectors holds up to {bytes} bytes \
+         ({what}), more than --bulk-load-bytes ({limit}): raise --bulk-load-bytes to at least \
+         {bytes}, or load fewer vectors at once",
+        spec.dim(),
+        spec.element(),
+    ))
+}
+
+/// The budget a load reserves its worst case from, in KiB (a semaphore counts `u32`s).
+fn kib(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX)
+}
+
+/// The node's `--bulk-load-bytes`, which its loads reserve from, and how long a load waits
+/// for its client (`--stream-idle-ms`).
+pub(crate) struct Budget<'a> {
+    pub(crate) pool: &'a Arc<Semaphore>,
+    pub(crate) limit: u64,
+    pub(crate) idle: Duration,
+}
+
+/// The node's `--bulk-load-bytes` as a semaphore of KiB.
+pub(crate) fn budget_pool(bytes: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(
+        (kib(bytes as u64) as usize).min(Semaphore::MAX_PERMITS),
+    ))
+}
+
 /// A running load's gauges (B3): its phase, and the vectors and message bytes handed to it.
 /// Until the sample is clustered the load holds every vector handed to it, so `bytes` is an
 /// upper bound on what it holds.
@@ -248,6 +353,8 @@ pub(crate) struct Gauges {
     pub(crate) phase: AtomicU64,
     pub(crate) vectors: AtomicU64,
     pub(crate) bytes: AtomicU64,
+    /// The bytes of `--bulk-load-bytes` the load reserved: its worst case.
+    pub(crate) reserved: AtomicU64,
 }
 
 /// The server's bulk loads: one at a time, each on a thread of its own.
@@ -298,12 +405,24 @@ impl BulkLoads {
     /// On a cluster partition, `gate` is its write gate (D317 ticket 6): the load holds it
     /// until its thread ends, and checks it between messages, so a fence stops it there
     /// with `Fenced`, the vectors before loaded.
+    ///
+    /// A load whose worst case ([`need`]) is over `--bulk-load-bytes` is refused here, before
+    /// it takes anything; one that fits reserves it from the node's budget for its life.
     pub(crate) async fn run(
         &self,
         index: Arc<Index>,
         op: BulkLoadOp,
         gate: Option<&Arc<super::gate::WriteGate>>,
+        budget: Budget<'_>,
     ) -> Result<(), ApiError> {
+        let spec = index.spec();
+        // A list splits past twice its target (`Index::max_list_len`).
+        let target = (index.max_list_len() / 2).max(1);
+        let first = need(&spec, target, op.expected, ID_ALLOWANCE);
+        if first.bytes() > budget.limit {
+            return Err(too_large(&first, &spec, op.expected, budget.limit));
+        }
+        let started = Instant::now();
         let slot = match tokio::time::timeout(op.wait, Arc::clone(&self.slot).acquire_owned()).await
         {
             Ok(Ok(slot)) => slot,
@@ -314,6 +433,34 @@ impl BulkLoads {
                 ));
             }
         };
+        // Under the slot, so a load waiting for it reserves nothing. A cluster node's other
+        // partitions' loads share the budget.
+        let left = op.wait.saturating_sub(started.elapsed());
+        let reserved = match tokio::time::timeout(
+            left,
+            Arc::clone(budget.pool).acquire_many_owned(kib(first.bytes())),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(closed()),
+            Err(_) => {
+                return Err(ApiError::overloaded(
+                    "other bulk loads held --bulk-load-bytes past the deadline",
+                ));
+            }
+        };
+        let sizing = Sizing {
+            spec,
+            target,
+            expected: op.expected,
+            limit: budget.limit,
+            id: ID_ALLOWANCE,
+            need: first.bytes(),
+            pool: Arc::clone(budget.pool),
+            reserved,
+        };
+        let idle = budget.idle;
         let (tx, done) = oneshot::channel();
         let loader = Arc::clone(&self.loader);
         let placement = self.placement.clone();
@@ -341,6 +488,7 @@ impl BulkLoads {
                             p.enter();
                         }
                         gauges.phase.store(1, Ordering::Relaxed);
+                        gauges.reserved.store(sizing.need, Ordering::Relaxed);
                         let mut input = Input {
                             rx,
                             current: Vec::new().into_iter(),
@@ -350,6 +498,8 @@ impl BulkLoads {
                             gauges: &gauges,
                             stopping: &stopping,
                             gate,
+                            idle,
+                            sizing,
                         };
                         let r = loader(&index, expected, &mut input);
                         // The loader's own failure first; else the stream's.
@@ -358,7 +508,12 @@ impl BulkLoads {
                         drop(index);
                         // Its last write is done: a fence's drain may finish.
                         drop(held);
-                        for g in [&gauges.phase, &gauges.vectors, &gauges.bytes] {
+                        for g in [
+                            &gauges.phase,
+                            &gauges.vectors,
+                            &gauges.bytes,
+                            &gauges.reserved,
+                        ] {
                             g.store(0, Ordering::Relaxed);
                         }
                         // The slot before the result, as for a backup: a client that has
@@ -417,6 +572,62 @@ struct Input<'g> {
     stopping: &'g Stop,
     /// A cluster partition's write gate: a fence ends the input at the next message.
     gate: Option<Arc<super::gate::WriteGate>>,
+    /// How long the loader waits for its client's next message (`--stream-idle-ms`).
+    idle: Duration,
+    /// The load's worst case and its reservation, grown as longer ids come.
+    sizing: Sizing,
+}
+
+/// A running load's worst case ([`need`]) and what it reserved of `--bulk-load-bytes`.
+struct Sizing {
+    spec: pigeonhole::VectorSpec,
+    target: u64,
+    expected: u64,
+    limit: u64,
+    /// The longest id the worst case assumes.
+    id: u64,
+    /// The worst case's bytes, as reserved.
+    need: u64,
+    pool: Arc<Semaphore>,
+    /// Released with the input: when the loader returns, its working set is gone.
+    reserved: OwnedSemaphorePermit,
+}
+
+impl Sizing {
+    /// Takes an id of `len` bytes into the worst case: a longer one than assumed grows the
+    /// reservation, now or not at all. The error ends the input before that vector.
+    fn take_id(&mut self, len: u64, gauges: &Gauges) -> Result<(), ApiError> {
+        if len <= self.id {
+            return Ok(());
+        }
+        let n = need(&self.spec, self.target, self.expected, len);
+        if n.bytes() > self.limit {
+            return Err(ApiError::invalid(format!(
+                "a BulkLoad id of {len} bytes makes the load hold up to {} bytes, more than \
+                 --bulk-load-bytes ({}): the load stopped there, and the vectors before it \
+                 were loaded",
+                n.bytes(),
+                self.limit
+            )));
+        }
+        let more = kib(n.bytes()).saturating_sub(kib(self.need));
+        if more > 0 {
+            let extra = Arc::clone(&self.pool)
+                .try_acquire_many_owned(more)
+                .map_err(|_| {
+                    ApiError::overloaded(
+                        "a BulkLoad id longer than assumed needs more of --bulk-load-bytes than \
+                     other loads leave: the load stopped there, and the vectors before it \
+                     were loaded",
+                    )
+                })?;
+            self.reserved.merge(extra);
+        }
+        self.id = len;
+        self.need = n.bytes();
+        gauges.reserved.store(n.bytes(), Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// The shutdown flag, and the waker of a loader waiting for its next message. The loader
@@ -446,6 +657,8 @@ enum Next {
     Stopped,
     /// The partition was fenced (D317 ticket 6).
     Fenced,
+    /// The client sent nothing for `--stream-idle-ms`.
+    Idle,
 }
 
 /// How often a load waiting for its next message looks at its partition's fence.
@@ -457,6 +670,11 @@ impl Iterator for Input<'_> {
     fn next(&mut self) -> Option<Item> {
         loop {
             if let Some(item) = self.current.next() {
+                if let Err(e) = self.sizing.take_id(item.0.len() as u64, self.gauges) {
+                    self.current = Vec::new().into_iter();
+                    self.end(Some(e));
+                    return None;
+                }
                 if self.current.len() == 0 {
                     self.held = None;
                 }
@@ -484,6 +702,11 @@ impl Iterator for Input<'_> {
                      were loaded; resume from the last acknowledged one once it's unfenced or \
                      at its new node",
                 ))),
+                Next::Idle => self.end(Some(ApiError::deadline(format!(
+                    "the load's client sent nothing for {} ms (--stream-idle-ms): the load \
+                     stopped there, and the vectors before were loaded",
+                    self.idle.as_millis()
+                )))),
                 Next::Msg(Msg::End) => self.end(None),
                 Next::Msg(Msg::Failed(e)) => self.end(Some(e)),
                 // The front-end went away without ending the stream: its client is gone.
@@ -496,10 +719,12 @@ impl Iterator for Input<'_> {
 impl Input<'_> {
     /// The next message, or the shutdown flag, whichever comes first: the channel polled on
     /// this thread, which parks until the front-end sends or `stop` wakes it. The waker is
-    /// registered before the flag is read, so a `stop` in between is seen.
+    /// registered before the flag is read, so a `stop` in between is seen. Past `idle` with
+    /// nothing, the client has stalled.
     fn wait(&mut self) -> Next {
         let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
         let mut cx = std::task::Context::from_waker(&waker);
+        let deadline = Instant::now() + self.idle;
         loop {
             *self
                 .stopping
@@ -517,10 +742,16 @@ impl Input<'_> {
                 std::task::Poll::Ready(None) => return Next::Gone,
                 // A spurious unpark only loops. With a gate, the fence is looked at again
                 // every `FENCE_POLL`: nothing wakes a load when its partition is fenced.
-                std::task::Poll::Pending if self.gate.is_some() => {
-                    std::thread::park_timeout(FENCE_POLL);
+                std::task::Poll::Pending => {
+                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                        return Next::Idle;
+                    };
+                    std::thread::park_timeout(if self.gate.is_some() {
+                        left.min(FENCE_POLL)
+                    } else {
+                        left
+                    });
                 }
-                std::task::Poll::Pending => std::thread::park(),
             }
         }
     }
@@ -530,5 +761,38 @@ impl Input<'_> {
         self.failed = failed;
         self.held = None;
         self.gauges.phase.store(2, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pigeonhole::{Element, Metric, VectorSpec};
+
+    use super::{ID_ALLOWANCE, need};
+
+    #[test]
+    fn a_load_s_worst_case_is_its_sample_or_its_pending_batches() {
+        // serve.md's examples, at the default target list length of 1,000 and 1 GiB.
+        let gib = 1u64 << 30;
+        let f32s = |dim| VectorSpec::new(dim, Element::F32, Metric::L2).unwrap();
+        // 768-dim: the sample of 50,000 is about 314 MB, held and its clustering copy.
+        let n = need(&f32s(768), 1000, 1_000_000, ID_ALLOWANCE);
+        assert_eq!(n.lists, 1000);
+        assert_eq!(n.sample, 50_000 * (3072 + 32 + 96 + 3072));
+        assert!(n.bytes() < gib, "{n:?}");
+        // 1536-dim: a million vectors make 1,000 lists, whose pending batches are over.
+        let n = need(&f32s(1536), 1000, 1_000_000, ID_ALLOWANCE);
+        assert_eq!(n.pending, 1000 * 255 * (6144 + 32 + 96));
+        assert!(n.bytes() > gib, "{n:?}");
+        assert!(need(&f32s(1536), 1000, 500_000, ID_ALLOWANCE).bytes() < gib);
+        // Saturating, never overflowing.
+        let n = need(&f32s(4096), 1, u64::MAX, u64::MAX / 2);
+        assert_eq!(n.bytes(), u64::MAX);
+        // A bit index holds a vector's bytes, and clusters them as bits.
+        let bits = VectorSpec::new(1024, Element::Bit, Metric::Hamming).unwrap();
+        assert_eq!(
+            need(&bits, 1000, 1, ID_ALLOWANCE).sample,
+            50_000 * (128 + 32 + 96 + 128)
+        );
     }
 }
