@@ -336,11 +336,12 @@ fn row_of(mut change: &[u8]) -> Option<&[u8]> {
 
 /// The next field of an encoded message: its number, and its bytes if it's length-delimited
 /// (`None` for a varint or fixed-width one, stepped over). `None` for anything else: a
-/// group, field 0, or a truncated encoding.
+/// group, field 0, a key past `u32::MAX`, or a truncated encoding.
 fn field<'a>(buf: &mut &'a [u8]) -> Option<(u64, Option<&'a [u8]>)> {
     let key = prost::encoding::decode_varint(buf).ok()?;
     let number = key >> 3;
-    if number == 0 {
+    // As prost's decode refuses them (feedback from feed1248, N1 on #1783).
+    if number == 0 || key > u64::from(u32::MAX) {
         return None;
     }
     let value = match key & 7 {
@@ -2720,6 +2721,13 @@ mod tests {
         let (mut seen_all, mut seen_none, mut seen_mixed) = (0, 0, 0);
         for step in 0..5000 {
             let unknown = next() % 4 == 0;
+            // Now and then a shape the walk leaves to the decode, or steps over (feed1248's N2
+            // on #1783): 0, another event after the commit; 1, an unknown field between
+            // changes; 2, a change field with a varint's wire type; 3, a key past u32::MAX.
+            let odd = match next() % 16 {
+                k @ 0..=3 => Some(k),
+                _ => None,
+            };
             let token: Vec<u8> = (0..next() % 24).map(|_| next() as u8).collect();
             let mut commit = Vec::new();
             encode_varint(1 << 3, &mut commit);
@@ -2761,8 +2769,21 @@ mod tests {
                 encode_key(3, WireType::LengthDelimited, &mut commit);
                 encode_varint(c.len() as u64, &mut commit);
                 commit.extend_from_slice(&c);
+                if odd == Some(1) {
+                    encode_key(9, WireType::LengthDelimited, &mut commit);
+                    encode_varint(1, &mut commit);
+                    commit.push(b'x');
+                }
+            }
+            if odd == Some(2) {
+                encode_key(3, WireType::Varint, &mut commit);
+                encode_varint(7, &mut commit);
             }
             let mut event = Vec::new();
+            if odd == Some(3) {
+                encode_varint(1 << 35, &mut event);
+                encode_varint(1, &mut event);
+            }
             if !token.is_empty() {
                 encode_key(1, WireType::LengthDelimited, &mut event);
                 encode_varint(token.len() as u64, &mut event);
@@ -2774,6 +2795,15 @@ mod tests {
             if unknown {
                 encode_key(9, WireType::Varint, &mut event);
                 encode_varint(next(), &mut event);
+            }
+            if odd == Some(0) {
+                // A progress or partition state event: the oneof's last field wins.
+                encode_key(
+                    if next() % 2 == 0 { 4 } else { 6 },
+                    WireType::LengthDelimited,
+                    &mut event,
+                );
+                encode_varint(0, &mut event);
             }
             let event = Bytes::from(event);
             let e = Arc::new(Entry {
@@ -2790,27 +2820,36 @@ mod tests {
                 vec![b"ab"[(next() % 2) as usize]]
             };
             let why = format!("seed {seed}, step {step}, prefix {prefix:?}");
-            // The decode path: the matching changes, or none.
-            let all_changes = match <proto::FeedEvent as prost::Message>::decode(event.clone())
-                .unwrap()
-                .event
-            {
-                Some(proto::feed_event::Event::Commit(c)) => c.changes.len(),
-                _ => unreachable!(),
-            };
+            // The decode path: the matching changes, or none (an encoding that doesn't
+            // decode, or isn't a commit, sends nothing).
+            let all_changes = <proto::FeedEvent as prost::Message>::decode(event.clone())
+                .ok()
+                .and_then(|ev| match ev.event {
+                    Some(proto::feed_event::Event::Commit(c)) => Some(c.changes.len()),
+                    _ => None,
+                });
             let decoded = e.for_prefix(&prefix);
             let want = match &decoded {
                 None => Rows::None,
                 Some(ev) => match &ev.event {
-                    Some(proto::feed_event::Event::Commit(c)) if c.changes.len() == all_changes => {
+                    Some(proto::feed_event::Event::Commit(c))
+                        if Some(c.changes.len()) == all_changes =>
+                    {
                         Rows::All
                     }
                     _ => Rows::Mixed,
                 },
             };
-            assert_eq!(rows(&event, &prefix), want, "{why}");
+            // The walk's verdict is the decode's, except that a shape it leaves to the decode
+            // is `Mixed`.
+            let r = rows(&event, &prefix);
+            if matches!(odd, Some(0 | 2 | 3)) {
+                assert!(r == Rows::Mixed || r == want, "{why}: {r:?}, odd {odd:?}");
+            } else {
+                assert_eq!(r, want, "{why}");
+            }
             let got = prefix_out(&e, &prefix);
-            match want {
+            match r {
                 Rows::All => {
                     seen_all += 1;
                     assert!(matches!(got, Some(Out::Shared(_))), "{why}");
@@ -2821,12 +2860,12 @@ mod tests {
                 }
                 Rows::Mixed => {
                     seen_mixed += 1;
-                    assert!(matches!(got, Some(Out::Event(_))), "{why}");
+                    assert!(got.is_none() || matches!(got, Some(Out::Event(_))), "{why}");
                 }
             }
             // The same bytes as the decode path's event (fields the encoder doesn't know
             // aren't encoded again, so only without them).
-            if !unknown {
+            if !unknown && odd != Some(1) {
                 assert_eq!(
                     got.map(|o| o.to_bytes()),
                     decoded.map(|ev| Bytes::from(prost::Message::encode_to_vec(&ev))),
@@ -2843,7 +2882,7 @@ mod tests {
             }
         }
         assert!(
-            seen_all > 500 && seen_none > 500 && seen_mixed > 500,
+            seen_all > 250 && seen_none > 250 && seen_mixed > 250,
             "seed {seed}: all {seen_all}, none {seen_none}, mixed {seen_mixed}"
         );
     }
