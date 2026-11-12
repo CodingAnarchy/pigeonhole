@@ -155,10 +155,12 @@ impl Waiting {
 
     /// A call to the node, bounded by the time left: a node that never answers can't hold
     /// the wait past its limit. The outer error is the wait given up; the inner, the
-    /// call's own.
+    /// call's own. With no time left (the last poll slept up to the limit), it gives up
+    /// at once, with the node's last answer.
     async fn ask<T>(&mut self, call: impl Future<Output = T>) -> Result<T, Failure> {
         match self.left() {
             None => Ok(call.await),
+            Some(Duration::ZERO) => Err(self.gave_up()),
             Some(left) => match tokio::time::timeout(left, call).await {
                 Ok(r) => Ok(r),
                 Err(_) => {
@@ -805,6 +807,32 @@ mod tests {
                 .await
                 .expect("not given up");
             assert_eq!(r.unwrap_err().message(), "refused");
+        });
+    }
+
+    #[test]
+    fn a_wait_that_slept_to_its_limit_gives_up_with_the_node_s_last_answer() {
+        // The last poll's sleep ends at the limit: the next call isn't made, and the error
+        // keeps what the node said, not that it didn't answer.
+        paused().block_on(async {
+            let mut wait = Waiting::new(
+                "waiting".into(),
+                Some(Duration::from_millis(300)),
+                "".into(),
+            );
+            wait.tick("opening").await.unwrap();
+            wait.tick("opening: retrying").await.unwrap();
+            let e = wait
+                .ask(async {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    Ok::<_, Failure>(None::<LocalPartition>)
+                })
+                .await
+                .expect_err("no time left");
+            assert_eq!(
+                e.message(),
+                "gave up waiting after 300ms (--timeout): opening: retrying. "
+            );
         });
     }
 

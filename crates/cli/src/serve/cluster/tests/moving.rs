@@ -166,18 +166,18 @@ fn a_move_s_wait_for_the_new_node_gives_up_at_its_timeout() {
             &at,
             "p1",
             2,
-            Some(Duration::from_millis(600)),
+            Some(Duration::from_secs(3)),
         ))
         .await
         .expect_err("c never serves p1");
         let took = start.elapsed();
-        assert!(took >= Duration::from_millis(600), "{took:?}");
+        assert!(took >= Duration::from_secs(3), "{took:?}");
         assert!(took < Duration::from_secs(30), "{took:?}");
         assert_eq!(e.status(), crate::ExitStatus::ERROR);
         let m = e.message();
         assert!(
             m.starts_with(
-                "gave up waiting for node \"c\" to serve p1 at epoch 2 after 600ms (--timeout): \
+                "gave up waiting for node \"c\" to serve p1 at epoch 2 after 3s (--timeout): \
                  not listed yet. The map already gives p1 to node \"c\""
             ),
             "{m}"
