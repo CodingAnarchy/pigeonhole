@@ -399,7 +399,38 @@ impl Node {
         drop(st);
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
+        self.end_moved_feeds(version);
         Ok(version)
+    }
+
+    /// Ends the cluster feed components of every partition open here that the map,
+    /// installed at `version`, gives another node: a relocation that didn't close it here
+    /// (a fenced partition stays open) would otherwise leave them following this copy,
+    /// which takes no more writes. Their subscriptions open them again where the map puts
+    /// them (audit120's S-C5). After the routes are stored, so a component opened meanwhile
+    /// finds the new map when it checks it again ([`feed::serve`]).
+    fn end_moved_feeds(&self, version: u64) {
+        let Some(shared) = self.opener.get().and_then(|o| o.shared.upgrade()) else {
+            return;
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return;
+        };
+        let routes = self.routes();
+        let Some(routes) = routes.as_ref() else {
+            return;
+        };
+        for (id, service) in cluster.parts.load().iter() {
+            if routes.owner(id).is_some_and(|o| o.node == self.id) {
+                continue;
+            }
+            if let Ok(part) = service.part() {
+                part.feeds.end_parts(ApiError::wrong_partition(
+                    version,
+                    format!("map version {version} moved partition {id:?} off this node"),
+                ));
+            }
+        }
     }
 
     /// [`Node::install`] on a blocking thread.

@@ -709,6 +709,9 @@ pub(crate) struct Feeds {
     /// The node's live hubs, every partition's: the ring budget (`--feed-ring-bytes`) is
     /// split across them, and `--max-feed-hubs` counts them (D317 ticket 8a).
     live: Arc<AtomicU64>,
+    /// Ends every cluster component stream (`Spec::announce`) open on this partition, with
+    /// the error sent: the node's map no longer gives it the partition (audit120's S-C5).
+    parts_ended: watch::Sender<Option<ApiError>>,
 }
 
 /// A hub's place in the node's live count (`--max-feed-hubs`, D317 ticket 8a), taken before
@@ -801,7 +804,17 @@ impl Feeds {
             limits,
             stats: Arc::default(),
             live: Arc::clone(&shared.live),
+            parts_ended: watch::Sender::new(None),
         })
+    }
+
+    /// Ends every cluster component stream open on this partition now with `why`
+    /// (`WrongPartition`: the map moved the partition while it stayed open here, fenced), so
+    /// the subscriptions they belong to open it again where the map puts it (audit120's
+    /// S-C5). A client's own subscription, on a single node, is never ended this way. A
+    /// component opened after this checks the map itself.
+    pub(crate) fn end_parts(&self, why: ApiError) {
+        self.parts_ended.send_replace(Some(why));
     }
 
     /// Runs the clients' delivery on `runtime` and the hubs on `hubs` from now on, instead of
@@ -1081,6 +1094,7 @@ impl Feeds {
             Start::Now => self.db.durable_snapshot()?.seqno(),
             _ => 0,
         };
+        let spec_announce = spec.announce;
         let (sink, events, end_tx) = Sink::new(&self.limits);
         let tracker = Arc::new(Tracker::default());
         let joined = hub.join(&tracker);
@@ -1111,8 +1125,26 @@ impl Feeds {
                 Begin::Own(Box::new(feed), token)
             }
         };
+        let ended = spec_announce.then(|| self.parts_ended.subscribe());
         self.spawn(async move {
-            let outcome = match client.run(begin).await {
+            let run = client.run(begin);
+            let outcome = match ended {
+                None => run.await,
+                Some(mut ended) => tokio::select! {
+                    biased;
+                    r = run => r,
+                    why = async {
+                        // The partition's feeds dropped: nothing ends it this way any more.
+                        if ended.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        ended.borrow().clone()
+                    } => Err(why.unwrap_or_else(|| {
+                        ApiError::internal("the partition's feeds ended this stream")
+                    })),
+                },
+            };
+            let outcome = match outcome {
                 // The client went away: not a failure.
                 Err(_) if client.sink.is_closed() => Ok(()),
                 r => r,

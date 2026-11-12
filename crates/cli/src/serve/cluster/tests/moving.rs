@@ -346,3 +346,99 @@ fn a_close_by_hand_persists_the_fence_of_a_partition_fenced_since_its_node_start
         );
     });
 }
+
+/// audit120's S-C5: a relocation that leaves the partition open on its old node (fenced,
+/// not closed) must not leave a live subscription following that copy. The old node's
+/// component ends with `WrongPartition` once it takes the map, and the subscription opens
+/// the partition where the map puts it, from its position. Here c's copy predates a's
+/// reopen (a session c's copy doesn't have), so that position may be past c's history:
+/// the stream then ends with `FeedExpired`, as the guide says. Before the fix it did
+/// neither: it went on with progress events from the old copy, which takes no more writes.
+#[test]
+fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
+    use crate::serve::proto::feed_client::FeedClient;
+    use crate::serve::proto::{PartitionRequest, SubscribeRequest, feed_event::Event};
+    let t = Cluster::start();
+    let [a, b, c] = t.ports;
+    let p1 = || PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    t.rt.block_on(async {
+        // c holds a checked copy of p1 at the next epoch: a move that stopped after its
+        // stamp. Then p1 serves on a again.
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        let stopped = within(super::super::moving::run(&t.args, "p1", "c", false, None)).await;
+        assert!(stopped.is_err(), "the move stops after its stamp");
+        client(a).await.unfence(p1()).await.unwrap();
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut s = FeedClient::new(channel)
+            .subscribe(SubscribeRequest {
+                tables: vec!["users".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        // A commit of p1's on a, delivered: the subscription follows a's copy.
+        put(b, "amy", "1").await;
+        // The commit of `row`, or the error that ended the stream.
+        let commit_of = async |s: &mut tonic::Streaming<_>, row: &str| loop {
+            let e: crate::serve::proto::FeedEvent = match s.message().await {
+                Ok(e) => e.expect("the stream ended without an error"),
+                Err(e) => return Err(e),
+            };
+            if let Some(Event::Commit(c)) = &e.event
+                && c.changes.iter().any(|ch| ch.row.as_ref() == row.as_bytes())
+            {
+                return Ok(());
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), commit_of(&mut s, "amy"))
+            .await
+            .expect("amy's commit arrives")
+            .unwrap();
+
+        // The map moves p1 to c, keeping its history; a only fenced it, it never closed.
+        client(a).await.fence(p1()).await.unwrap();
+        within(super::super::cli::relocate(&t.args, "p1", "c", false, true))
+            .await
+            .unwrap();
+        let status = client(a)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            status.partitions.iter().any(|lp| lp.id == "p1"),
+            "p1 stays open on a: {status:?}"
+        );
+
+        // p1's next write, on c, reaches the subscription.
+        eventually("c takes p1's writes", async || {
+            data(b)
+                .await
+                .mutate(crate::serve::proto::MutateRequest {
+                    writes: Some(put_row("ann", "2")),
+                    durability: 0,
+                })
+                .await
+                .is_ok()
+        })
+        .await;
+        let followed = tokio::time::timeout(Duration::from_secs(20), commit_of(&mut s, "ann"))
+            .await
+            .expect("the subscription still follows p1's old copy on a");
+        if let Err(e) = followed {
+            assert_eq!(code(&e), "FeedExpired", "{e}");
+        }
+    });
+}
