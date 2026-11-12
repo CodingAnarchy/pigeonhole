@@ -54,6 +54,14 @@ const TOKEN_BYTES_PER_EVENT: usize = 150;
 /// the client going away) run.
 const DRAIN: usize = 64;
 
+/// Whether a merge's drain goes on to the next ready event after `drained` of them: not past
+/// [`DRAIN`], and not once a `PartitionState` event is queued (a part went unavailable), which
+/// goes out next, right after the event that failed, not behind the rest of the batch
+/// (simp724's N1 on #1772).
+fn keep_draining(drained: usize, states: &[proto::FeedEvent]) -> bool {
+    drained < DRAIN && states.is_empty()
+}
+
 /// How long an unavailable partition waits between attempts to open it again.
 const RETRY: Duration = Duration::from_secs(1);
 
@@ -465,7 +473,7 @@ impl Merge {
                             return Err(e);
                         }
                         drained += 1;
-                        if drained == DRAIN {
+                        if !keep_draining(drained, &self.states) {
                             break;
                         }
                         let ready = std::future::poll_fn(|cx| {
@@ -1290,6 +1298,16 @@ mod tests {
             assert_eq!(tokio::time::Instant::now(), later);
             assert_eq!(t.moves, 2);
         });
+    }
+
+    #[test]
+    fn a_drain_stops_at_its_bound_and_for_a_part_gone_unavailable() {
+        assert!(keep_draining(1, &[]));
+        assert!(keep_draining(DRAIN - 1, &[]));
+        assert!(!keep_draining(DRAIN, &[]), "at most DRAIN for one wake");
+        // A part's state queued: it goes out next, after the event that failed it.
+        let gone = state_event("p1", Some(&ApiError::partition_unavailable("gone")));
+        assert!(!keep_draining(1, &[gone]));
     }
 
     #[test]
