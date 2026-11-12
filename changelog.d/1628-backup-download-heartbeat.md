@@ -1,2 +1,0 @@
-### Fixed
-- `phdb serve`: a fresh `Admin.BackupDownload` over gRPC answers at once and sends a heartbeat every second while it writes its copy. A replica can now bootstrap from a primary whose copy takes any length of time: it used to give up after 10 minutes and start a new copy. A break during the copy resumes the same copy. An HTTP download still waits for the copy, because its size and SHA-256 are headers (#1611).

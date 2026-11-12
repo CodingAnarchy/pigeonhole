@@ -1,2 +1,0 @@
-### Added
-- `phdb serve --cluster` nodes serve data (D317 ticket 2, ICR 0117). Any node takes a single-row read or write, or a one-partition batch, and serves it or forwards it to the node that owns its row, over the new node-to-node `Cluster.Forward`. A batch across partitions is refused with `CrossPartition` before anything is written. New error codes: `WrongPartition`, `CrossPartition` and `PartitionUnavailable`.

@@ -1,2 +1,0 @@
-### Changed
-- `phdb serve`: the change feed's shared subscriptions (hubs) read the engine on threads of their own (`phdb-serve-feed-hub`, a quarter as many as `--feed-threads`, at least 1, on the same CPUs) instead of sharing the feed runtime with their streams' delivery. At 16 table sets × 16 streams the hubs, using about 5% of the CPU, fell about 20 s behind the database queued behind delivery and catch-up reads, and their streams fell off with them (#1397). The startup line lists the hub threads.

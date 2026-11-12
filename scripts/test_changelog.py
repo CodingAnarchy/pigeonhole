@@ -90,6 +90,15 @@ class Fold(unittest.TestCase):
         self.assertLess(added.index("Add 100a."), added.index("Add 100."))
         self.assertIn("  With a second paragraph.", added)
 
+    def test_an_upgrading_heading_in_unreleased_comes_first(self):
+        text = CHANGELOG.replace(
+            "## [Unreleased]\n", "## [Unreleased]\n\n### Upgrading from 0.2.x\n- Restart readers.\n", 1)
+        out = changelog.fold_text(text, [("1-x.md", "### Added\n- One.\n")], "0.3.0", "2026-10-10")
+        section = out[out.index("## [0.3.0] - 2026-10-10"):out.index("## [0.2.0]")]
+        headings = [l for l in section.splitlines() if l.startswith("### ")]
+        self.assertEqual(headings[0], "### Upgrading from 0.2.x")
+        self.assertIn("### Added", headings)
+
     def test_unreleased_is_left_empty_above_the_new_version(self):
         out = self.fold([("1-x.md", "### Added\n- One.\n")])
         self.assertIn("## [Unreleased]\n\n## [0.3.0] - 2026-10-10\n\n### Added\n", out)

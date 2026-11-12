@@ -4,6 +4,32 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Upgrading from 1.1.x
+- **Upgrade reader processes together with the writer.** The shared-memory layout is now version 9 (1.1.x used version 8): it adds the hold that keeps a feed of every table behind a catalog change it can't see yet (D315). A reader process against a writer from a build on another layout fails with `ShmVersionMismatch`, never misreading: restart the readers after the writer.
+- **Rolling back to 1.1.x after a schema change expires some change feeds.** After a 1.2 session that created, dropped or extended a table with the change feed on, a 1.1 build opening the database expires the feeds whose history runs across that change (`FeedExpired`), since 1.1 doesn't know the records 1.2 writes for schema changes. Nothing is skipped and no data is affected: start those feeds again from a snapshot. Without schema changes, 1.1 resumes a 1.2 feed. Files stay in format 4 and move freely between 1.1.x and 1.2.0.
+- **A replica's file opens read-only in 1.1.x.** A `phdb serve --replica-of` copy sets the file's `ro_compat` feature bit 0 (D315), so 1.1.x opens it read-only only. Promoting the replica clears the bit.
+- **The internal crates move to 3.0.0** (D295), for breaking changes to the engine's change-feed types. `pigeonhole` pins each internal crate exactly, so depending on `pigeonhole` alone, as recommended, is unaffected.
+- **Behaviour changes to know:**
+  - **Read-only opens:** `Options::read_only(true)` now opens the files read-only and takes the writer lock shared, so it works on read-only media and several run at once. A reader process can't attach to a read-only handle (#1348).
+  - **Ruby fibers:** under a `Fiber::Scheduler` (Async, Falcon), commits, feed and memory-watch waits and the memory store's calls now yield to the thread's other fibers, so finish snapshots and scans before a commit. `Pigeonhole.fiber_scheduler = false` keeps every call blocking (#1574).
+  - **Reserved table names:** creating a table whose name starts with `__pigeonhole.` fails with `InvalidArgument`; the engine keeps a replica's state in such a table.
+  - **Python `transact`:** `Database.transact` raises `TypeError` for an `async def` body; use `transact_async`.
+  - **`phdb` uses jemalloc** on every platform but Windows; building it needs a C compiler and `make` (D322).
+
+### Added
+- **`phdb serve`** (D313, ICR 0112, #1397), in a build with the `serve` feature: one process serves a database over gRPC and HTTP/JSON on one port (default `127.0.0.1:7448`). The API is `proto/pigeonhole/v1/*.proto`, with the HTTP/JSON mapping (`/v1`) and the error table, including which responses make a write safe to retry.
+  - **Data:** `Data`'s single-call RPCs, `Get`, `MultiGet`, `ReadRow` (paged by bytes), `Mutate`, `CheckAndMutate`, `Batch` and `MutateReturning`. Each write runs as its own task, so a client that disconnects loses only the reply. A read that fails on `Io` says it may be sent again (`retry_from: REQUEST`); a write's failure says its outcome is unknown.
+  - **Security:** TLS, bearer tokens with `read`, `write` and `admin` scopes from a file or the environment, and a non-loopback address refused without both unless explicitly opted out.
+  - **Limits and lifecycle:** request size, in-flight bytes and concurrency limits, with overload refused at once as `Overloaded`. The in-flight budget is reserved before a request's body is read, from a gRPC message's header or HTTP's `Content-Length`, and a client's `grpc-timeout` bounds that wait. An HTTP/1.1 request's deadline (`--request-timeout-ms`) starts when its head arrives, and the server reads a body of up to 64 KiB before answering, so an early answer isn't lost to a connection reset; send `Expect: 100-continue` with a larger body. `/v1/health`, `/metrics` with `pigeonhole_serve_request_duration_seconds` per RPC, and a graceful shutdown that closes the database.
+  - **Threads:** the default shard count is half the physical cores, on every open. On Linux with pinned shards, the network workers run on the shards' SMT siblings and the free cores, never on a shard's own CPU; the feed, blocking and background threads stay on the free cores. The startup line shows the placement. `--affinity off` keeps the same threads but no longer masks them off the shards' cores, for a host shared with other work.
+
+## [1.1.2] - 2026-11-10
+
+A fix for the size of backups. Upgrade if you back up databases with data still in memtables, or back up while writes continue. The file format and the shared-memory layout are unchanged, so a 1.1.2 writer and 1.1.0 or 1.1.1 reader processes work together, and files move freely between 1.1.x releases.
+
+### Fixed
+- A backup (`Pigeonhole::backup`, `backup_durable` and `phdb backup`) is about the size of what it holds again. Each SST it wrote from memtables, or rewrote without commits above its snapshot, took a 64 MiB-aligned slot of the copy, so a small database with several families made a copy of hundreds of MiB, nearly all free (#1595, backport of #1615).
+
 ## [1.1.1] - 2026-11-05
 
 A correctness fix for the async nearest-neighbour search. Upgrade if you combine it with a value filter and a column limit. The file format and the shared-memory layout are unchanged, so a 1.1.1 writer and 1.1.0 reader processes work together, and files move freely between 1.1.0 and 1.1.1.
@@ -753,7 +779,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.1.0
 [1.0.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.0.1

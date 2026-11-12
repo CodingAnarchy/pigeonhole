@@ -1,2 +1,0 @@
-### Added
-- `phdb serve`: on SIGUSR1 (Unix), the server writes a report of its change-feed hubs to stderr. For each hub it shows how far the hub's engine feed is behind the database, its ring against its share of `--feed-ring-bytes`, and where its streams are: on the ring (and how far behind its head), on their own catch-up streams, or waiting for a `--max-catch-up` slot. It's for diagnosing streams that fall behind (#1397).

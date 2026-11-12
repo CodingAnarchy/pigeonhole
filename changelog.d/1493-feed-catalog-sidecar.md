@@ -1,2 +1,0 @@
-### Changed
-- The change feed's sidecar records each catalog change (a table created or dropped, a family added) in its place in commit order, and shared memory's layout is version 9 (D315). A feed of every table resumes only from its own kind of token. This is groundwork for read replicas; nothing is delivered from these records yet. Internal crates take a breaking change in 1.2.0 (`FeedEntry` is non-exhaustive).
