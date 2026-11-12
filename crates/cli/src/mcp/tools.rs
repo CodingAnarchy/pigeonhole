@@ -664,6 +664,26 @@ impl Tools {
     }
 
     fn feed_poll(&self, a: Args<'_>) -> Outcome {
+        let p = self.feed_poll_open(&a)?;
+        self.feed_poll_gather(p)
+    }
+
+    /// For `phdb serve`'s `/mcp` (the audit's F7): the feed a `feed_poll` call with these
+    /// arguments reads, and how long it would wait for its first commit, so the server can
+    /// wait for that asynchronously (`Feed::poll_next`) and then run the call without a wait,
+    /// never holding a blocking-pool thread for it. `None` without a wait, or when the
+    /// arguments or the open fail: the call itself then reports that.
+    #[cfg(feature = "serve")]
+    pub(crate) fn feed_poll_waiter(
+        &self,
+        args: &Map<String, Value>,
+    ) -> Option<(pigeonhole::Feed, std::time::Duration)> {
+        let p = self.feed_poll_open(&Args(args)).ok()?;
+        (!p.wait.is_zero()).then_some((p.feed, p.wait))
+    }
+
+    /// `feed_poll`'s arguments checked, and its feed opened.
+    fn feed_poll_open(&self, a: &Args<'_>) -> Result<FeedPoll, Failure> {
         a.only(&[
             "tables",
             "prefix",
@@ -694,30 +714,7 @@ impl Tools {
         let visible = a.bool_or("visible", false)?;
         let max_commits = a.u64_or("max_commits", 100, 1, MAX_COMMITS)? as usize;
         let wait = std::time::Duration::from_millis(a.u64_or("wait_ms", 0, 0, MAX_WAIT_MS)?);
-        let max_value = self.max_value(&a)?;
-        let fail = |e: pigeonhole::Error| {
-            let f = Failure::db("feed_poll", &e);
-            match e.code() {
-                pigeonhole::ErrorCode::FeedExpired => f.hint(
-                    "the history this token needs is gone: re-read the tables (scan) and \
-                     call feed_poll again without a token",
-                ),
-                pigeonhole::ErrorCode::SnapshotExpired => f.hint(
-                    "the application is restarting under this reader: call feed_poll again \
-                     with the same token",
-                ),
-                pigeonhole::ErrorCode::NoWriter => f.hint(
-                    "the application isn't running: call feed_poll again with the same token \
-                     once it is",
-                ),
-                pigeonhole::ErrorCode::InvalidArgument => f.hint(
-                    "the database's change feed must be on (the application's, or \
-                     --change-feed) and follow these tables, and the token must come from this \
-                     database",
-                ),
-                _ => f,
-            }
-        };
+        let max_value = self.max_value(a)?;
         // As the writer or as a reader process (D310 PR 4, #1361): a reader follows the
         // writer's feed from shared memory, so `--read-only` serves it too.
         let mut handles = Vec::with_capacity(names.len());
@@ -747,7 +744,23 @@ impl Tools {
         if let Some(t) = token {
             b = b.resume(&pigeonhole::FeedToken::from_bytes(t));
         }
-        let mut feed = b.open().map_err(fail)?;
+        let feed = b.open().map_err(feed_failure)?;
+        Ok(FeedPoll {
+            feed,
+            max_commits,
+            wait,
+            max_value,
+        })
+    }
+
+    /// `feed_poll`'s commits from its open feed: the first waited for up to its wait.
+    fn feed_poll_gather(&self, p: FeedPoll) -> Outcome {
+        let FeedPoll {
+            mut feed,
+            max_commits,
+            wait,
+            max_value,
+        } = p;
         let mut budget = Budget::new(self.limits.result_bytes);
         let start = feed.token();
         let (commits, token, more) = gather(max_commits, &mut budget, start, |first| {
@@ -757,7 +770,7 @@ impl Tools {
             } else {
                 feed.try_next()
             };
-            let v = match next.map_err(fail)? {
+            let v = match next.map_err(feed_failure)? {
                 Some(c) => commit_json(c, max_value),
                 None => return Ok(None),
             };
@@ -1136,6 +1149,39 @@ fn cell_json(e: &CellEntry<'_>, max_value: usize) -> Value {
         "ts": e.cell.timestamp(),
         "value": value,
     })
+}
+
+/// A `feed_poll` call's open feed and its limits.
+struct FeedPoll {
+    feed: pigeonhole::Feed,
+    max_commits: usize,
+    wait: std::time::Duration,
+    max_value: usize,
+}
+
+/// A `feed_poll` failure, with a hint for the codes a caller can act on.
+fn feed_failure(e: pigeonhole::Error) -> Failure {
+    let f = Failure::db("feed_poll", &e);
+    match e.code() {
+        pigeonhole::ErrorCode::FeedExpired => f.hint(
+            "the history this token needs is gone: re-read the tables (scan) and \
+             call feed_poll again without a token",
+        ),
+        pigeonhole::ErrorCode::SnapshotExpired => f.hint(
+            "the application is restarting under this reader: call feed_poll again \
+             with the same token",
+        ),
+        pigeonhole::ErrorCode::NoWriter => f.hint(
+            "the application isn't running: call feed_poll again with the same token \
+             once it is",
+        ),
+        pigeonhole::ErrorCode::InvalidArgument => f.hint(
+            "the database's change feed must be on (the application's, or \
+             --change-feed) and follow these tables, and the token must come from this \
+             database",
+        ),
+        _ => f,
+    }
 }
 
 /// `feed_poll`'s loop: up to `max` commits from `pull` (`first` on the first call; each with

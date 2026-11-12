@@ -594,11 +594,158 @@ fn a_bulk_load_fills_an_empty_index_over_grpc_and_http() {
         None,
     );
     assert_eq!(hit_ids(&r), [b64(b"v00059")]);
-    // Every message's budget came back.
+    // Every message's budget came back, and every load's reservation of
+    // --bulk-load-bytes, whether it succeeded or failed (the audit's F7).
     assert_eq!(
         s.shared.router.service.inflight_available(),
         limits().inflight_bytes
     );
+    assert_bulk_budget_free(&s);
+}
+
+/// Every load's reservation of `--bulk-load-bytes` is back, and the gauge says none.
+fn assert_bulk_budget_free(s: &Server) {
+    let service = &s.shared.router.service;
+    assert_eq!(
+        service.bulk_budget_available(),
+        limits().bulk_load_bytes.div_ceil(1024)
+    );
+    assert_eq!(
+        service
+            .part()
+            .unwrap()
+            .bulk
+            .gauges
+            .reserved
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
+fn a_bulk_load_over_bulk_load_bytes_is_refused_before_it_starts() {
+    // The audit's F7: `expected` sizes the crate's sample and its lists, so a client could
+    // make the server hold without bound. A load whose worst case is over --bulk-load-bytes
+    // is refused before it takes anything, naming the bytes and the flag.
+    let s = Server::start("", limits());
+    assert_eq!(
+        s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None)
+            .0,
+        200
+    );
+    let mut client = vectors_client(&s);
+    for expected in [u64::MAX, 1 << 40] {
+        let err = s
+            .block_on(
+                client.bulk_load(tonic::codegen::tokio_stream::iter(vec![bulk_message(
+                    "ix", expected, 0, 10, 2,
+                )])),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        assert!(
+            err.message()
+                .contains("raise --bulk-load-bytes to at least"),
+            "{err:?}"
+        );
+        assert_eq!(verified(&s, "ix"), json!("0"), "nothing was loaded");
+    }
+    assert_bulk_budget_free(&s);
+    // The same index loads once `expected` fits.
+    s.block_on(
+        client.bulk_load(tonic::codegen::tokio_stream::iter(vec![bulk_message(
+            "ix", 10, 0, 10, 2,
+        )])),
+    )
+    .unwrap();
+    assert_eq!(verified(&s, "ix"), json!("10"));
+    assert_bulk_budget_free(&s);
+
+    // A smaller --bulk-load-bytes refuses even the sample of a small load: 50,000 2-dim
+    // vectors hold about 7 MB.
+    let mut l = limits();
+    l.bulk_load_bytes = 1 << 20;
+    let s = Server::start("", l);
+    assert_eq!(
+        s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None)
+            .0,
+        200
+    );
+    let mut client = vectors_client(&s);
+    let err = s
+        .block_on(
+            client.bulk_load(tonic::codegen::tokio_stream::iter(vec![bulk_message(
+                "ix", 10, 0, 10, 2,
+            )])),
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert!(
+        err.message().contains("its sample of 50000 vectors"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_768_dim_load_fits_the_default_bulk_load_bytes() {
+    // The default 1 GiB holds a 768-dim f32 load's sample (about 314 MB) and its pending
+    // batches up to about 1,300 lists. The reservation is the load's worst case while it
+    // runs, and comes back when it ends.
+    assert_eq!(limits().bulk_load_bytes, 1 << 30);
+    let s = Server::start("", limits());
+    let mut spec = index_spec("REBALANCE_INLINE");
+    spec["spec"]["dim"] = json!(768);
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    let mut client = vectors_client(&s);
+    let messages: Vec<_> = (0..4)
+        .map(|i| bulk_message(if i == 0 { "ix" } else { "" }, 400, i * 100, 100, 768))
+        .collect();
+    s.block_on(client.bulk_load(tonic::codegen::tokio_stream::iter(messages)))
+        .unwrap();
+    assert_eq!(verified(&s, "ix"), json!("400"));
+    assert_bulk_budget_free(&s);
+}
+
+#[test]
+fn a_bulk_load_whose_client_stalls_ends_after_stream_idle() {
+    // The audit's F7: a client that sends one message and then nothing held the one load
+    // slot for its connection's life. Past --stream-idle-ms the load ends there, what it
+    // took loaded, and the slot and the budget are free for the next.
+    let mut l = limits();
+    l.stream_idle = Duration::from_millis(300);
+    let s = Server::start("", l);
+    assert_eq!(
+        s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None)
+            .0,
+        200
+    );
+    let messages = tonic::codegen::tokio_stream::StreamExt::chain(
+        tonic::codegen::tokio_stream::iter(vec![bulk_message("ix", 100, 0, 10, 2)]),
+        tonic::codegen::tokio_stream::pending(),
+    );
+    let mut client = vectors_client(&s);
+    let started = std::time::Instant::now();
+    let err = s.block_on(client.bulk_load(messages)).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded, "{err:?}");
+    assert!(err.message().contains("--stream-idle-ms"), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(verified(&s, "ix"), json!("10"), "what it took is loaded");
+    assert_bulk_budget_free(&s);
+    let mut spec = index_spec("REBALANCE_INLINE");
+    spec["name"] = json!("ix2");
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    let mut second = vectors_client(&s);
+    s.block_on(
+        second.bulk_load(tonic::codegen::tokio_stream::iter(vec![bulk_message(
+            "ix2", 1, 0, 1, 2,
+        )])),
+    )
+    .unwrap();
+    assert_eq!(verified(&s, "ix2"), json!("1"));
 }
 
 #[test]

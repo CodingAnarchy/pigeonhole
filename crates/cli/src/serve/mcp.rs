@@ -298,16 +298,20 @@ impl Host for Gate<'_> {
         } else {
             None
         };
-        // A poll can wait up to 30 s: it holds a `--max-streams` place for that long, as a
-        // feed stream does (ai1249's note on 8c), though it needs no hub.
-        let _stream = if name == "feed_poll" {
-            match service.stream_slot() {
-                Ok(p) => Some(p),
+        // A poll holds a `--max-streams` place, as a feed stream does (ai1249's note on 8c),
+        // though it needs no hub. It never waits here, on the pool thread: `post` waited for
+        // its first commit before taking that thread (the audit's F7).
+        if name == "feed_poll" {
+            let _stream = match service.stream_slot() {
+                Ok(p) => p,
                 Err(e) => return Some(Err(failure(e))),
+            };
+            let mut args = args.clone();
+            if args.contains_key("wait_ms") {
+                args.insert("wait_ms".into(), 0.into());
             }
-        } else {
-            None
-        };
+            return self.session.tools.call(name, &args);
+        }
         self.session.tools.call(name, args)
     }
 }
@@ -438,6 +442,24 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     if session.catalog.swap(now, Ordering::AcqRel) != now {
         session.protocol.catalog_moved();
     }
+    // A `feed_poll` that waits waits here, on the runtime (the audit's F7): `Gate::call`
+    // then runs it on the pool without a wait, taking what's ready. One "from now" (no
+    // token) is pinned to where the waiting feed started, so the call reads what woke it.
+    let text = match feed_wait(&text) {
+        Some((mut message, args)) => {
+            let pin = !args.contains_key("token")
+                && args.get("from_oldest").and_then(Value::as_bool) != Some(true);
+            match poll_wait(service, &caller, &session, args).await {
+                Some(start) if pin => {
+                    message["params"]["arguments"]["token"] =
+                        crate::cmd::schema::base64_encode(start.as_bytes()).into();
+                    message.to_string()
+                }
+                _ => text,
+            }
+        }
+        None => text,
+    };
     // A memory tool runs under the memory sub-limit (M6), whose place is taken before the
     // pool's, as the RPCs take it: never the other way round (see `Service::memory_place`).
     let _memory = if calls_memory(&text) {
@@ -562,6 +584,52 @@ fn calls_memory(text: &str) -> bool {
         Ok(m) => call(&m),
         Err(_) => false,
     }
+}
+
+/// The arguments of a `feed_poll` that waits (`wait_ms` above 0), if `text` is one: a single
+/// message, not a batch, whose calls then don't wait (`Gate::call` drops their `wait_ms`).
+fn feed_wait(text: &str) -> Option<(Value, Map<String, Value>)> {
+    if !text.contains("feed_poll") {
+        return None;
+    }
+    let m = serde_json::from_str::<Value>(text).ok()?;
+    if m.get("method").and_then(Value::as_str) != Some("tools/call")
+        || m["params"]["name"].as_str() != Some("feed_poll")
+    {
+        return None;
+    }
+    let args = m["params"]["arguments"].as_object()?.clone();
+    (args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0) > 0).then_some((m, args))
+}
+
+/// Waits, on the runtime, for the first commit a `feed_poll` with `args` would read, up to
+/// its `wait_ms`, under a `--max-streams` place: the feed opened on the pool, then polled
+/// here (`Feed::poll_next`), holding no pool thread while it waits. Returns where the feed
+/// started. Whatever happens, the call then runs and reports: a caller it refuses, a busy
+/// server, a bad argument or a failed open just skip the wait.
+async fn poll_wait(
+    service: &super::service::Service,
+    caller: &Caller,
+    session: &Arc<McpSession>,
+    args: Map<String, Value>,
+) -> Option<pigeonhole::FeedToken> {
+    let admit = Admit {
+        what: "feed_poll",
+        scope: Scope::Read,
+        writes: false,
+        size: 0,
+    };
+    service.check(&admit, caller).ok()?;
+    let _place = service.stream_slot().ok()?;
+    let tools = Arc::clone(session);
+    let (mut feed, wait) = service
+        .run_blocking(move || Ok(tools.tools.feed_poll_waiter(&args)))
+        .await
+        .ok()??;
+    let start = feed.token();
+    let first = std::future::poll_fn(|cx| feed.poll_next(cx).map(|r| r.map(|_| ())));
+    let _ = tokio::time::timeout(wait, first).await;
+    Some(start)
 }
 
 /// Whether `text` is one `initialize` request (not a batch: 2025-03-26 forbids one there).

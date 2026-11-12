@@ -831,6 +831,9 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
         ("pigeonhole_serve_bulk_load_bytes", |g| {
             g.bytes.load(Ordering::Relaxed)
         }),
+        ("pigeonhole_serve_bulk_load_reserved_bytes", |g| {
+            g.reserved.load(Ordering::Relaxed)
+        }),
     ] {
         render_family(
             out,
@@ -999,6 +1002,9 @@ pub(crate) struct Service {
     blocking: Arc<Semaphore>,
     /// Scans streaming at once (`--max-scans`).
     scans: Arc<Semaphore>,
+    /// `--bulk-load-bytes`, in KiB: what the node's bulk loads hold at most, each its worst
+    /// case for its life (the audit's F7). A cluster node's partitions share it.
+    bulk_budget: Arc<Semaphore>,
     /// Transactions and pinned snapshots between requests (D313 §3).
     pub(crate) sessions: Arc<super::sessions::Sessions>,
     /// The node's session counts, shared by its partitions' tables (D317 ticket 8a).
@@ -1245,6 +1251,7 @@ impl Service {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
             scans: Arc::clone(&self.scans),
+            bulk_budget: Arc::clone(&self.bulk_budget),
             sessions: super::sessions::Sessions::sharing(
                 self.limits.leases,
                 Some(id.to_owned()),
@@ -1294,6 +1301,7 @@ impl Service {
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
+            bulk_budget: super::bulk::budget_pool(limits.bulk_load_bytes),
             sessions: super::sessions::Sessions::sharing(
                 limits.leases,
                 None,
@@ -1476,6 +1484,12 @@ impl Service {
     #[cfg(test)]
     pub(crate) fn inflight_available(&self) -> usize {
         self.inflight.available_permits()
+    }
+
+    /// `--bulk-load-bytes`' free KiB, for tests to check a load released its reservation.
+    #[cfg(test)]
+    pub(crate) fn bulk_budget_available(&self) -> usize {
+        self.bulk_budget.available_permits()
     }
 
     /// Takes `bytes` of the in-flight budget, waiting at most the request timeout: for a
@@ -1927,9 +1941,14 @@ impl Service {
             ServiceOp::VectorBulkLoad(op) => {
                 drop(budget);
                 let index = self.index(&op.index).await?;
+                let budget = super::bulk::Budget {
+                    pool: &self.bulk_budget,
+                    limit: self.limits.bulk_load_bytes as u64,
+                    idle: self.limits.stream_idle,
+                };
                 self.part()?
                     .bulk
-                    .run(index, op, self.gate.as_ref())
+                    .run(index, op, self.gate.as_ref(), budget)
                     .await
                     .map(|()| ServiceReply::Empty(proto::Empty {}))
             }

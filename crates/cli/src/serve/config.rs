@@ -103,6 +103,12 @@ pub(crate) struct ServeArgs {
     /// Outside `--inflight-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 256 << 20)]
     pub feed_ring_bytes: usize,
+    /// What the node's `Vectors.BulkLoad`s hold at most, in bytes, outside `--inflight-bytes`:
+    /// a load's sample of max(50,000, lists) vectors while it clusters them, then up to 255
+    /// unwritten vectors a list. A load whose worst case is more is refused before it starts;
+    /// one that fits reserves its worst case for its life.
+    #[arg(long, value_name = "BYTES", default_value_t = 1 << 30)]
+    pub bulk_load_bytes: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the
     /// server has submitted always answers its real outcome, however long it takes.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
@@ -110,6 +116,8 @@ pub(crate) struct ServeArgs {
     /// How long a scan waits for its client to take a page, in milliseconds. Past that, the
     /// stream ends with `DeadlineExceeded`, and the client resumes from its last page's
     /// `next`: a client that stops reading doesn't hold its scan slot and a page forever.
+    /// A `Vectors.BulkLoad` whose client sends nothing for this long ends the same way, the
+    /// vectors before loaded.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub stream_idle_ms: u64,
     /// How long a transaction may sit idle between calls, in milliseconds, before it expires
@@ -321,6 +329,8 @@ pub(crate) struct Limits {
     /// A fanned-out read's forwards at once (`--fanout-forwards`, D317 ticket 4b).
     pub fanout_forwards: usize,
     pub feed_ring_bytes: usize,
+    /// `--bulk-load-bytes` (the audit's F7).
+    pub bulk_load_bytes: usize,
     /// How long a quiet feed stream waits before a progress event (ICR 0112: about 10 s).
     pub feed_quiet: Duration,
     /// A feed client's buffer: events and their encoded bytes (not flags; tests shrink them).
@@ -357,6 +367,7 @@ impl ServeArgs {
             max_catch_up: self.max_catch_up.max(1),
             fanout_forwards: self.fanout_forwards.max(1),
             feed_ring_bytes: self.feed_ring_bytes.max(1 << 16),
+            bulk_load_bytes: self.bulk_load_bytes,
             feed_quiet: Duration::from_secs(10),
             feed_client_events: super::feed::CLIENT_EVENTS,
             feed_client_bytes: super::feed::CLIENT_BYTES,
