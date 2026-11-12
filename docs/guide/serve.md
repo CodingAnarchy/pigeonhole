@@ -226,7 +226,7 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 
 ## The change feed
 - **The change feed** (`Feed.Subscribe`) streams committed changes of some tables, in commit order, once each.
-  - **Turn the feed on with `--change-feed BYTES`:** the server then keeps up to that many bytes of history for subscribers (and replicas). Without the flag, a database whose feed is already on keeps it, and one whose feed is off answers `Unsupported`.
+  - **Turn the feed on with `--change-feed BYTES`:** the server then keeps up to that many bytes of history for subscribers (and replicas). Without the flag, a database whose feed is already on keeps it, and one whose feed is off answers `InvalidArgument` (400, "the change feed is off: open with it on to subscribe").
   - **The request** names `tables` (at least one), and optionally a row `prefix`, `visible` (deliver at visibility rather than durability), and one start: `from_oldest`, `from_snapshot` (a pinned snapshot's id) or `resume` (an earlier event's `token`). With no start, the stream begins at the next commit.
 
     ```sh
