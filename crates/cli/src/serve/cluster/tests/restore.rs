@@ -349,3 +349,32 @@ fn a_restore_run_again_skips_what_an_earlier_run_did() {
         assert_eq!(keys(c).await, rows);
     });
 }
+
+/// simp724's S3 on #1764: a backup whose directory takes no writes (a read-only snapshot)
+/// still restores, with a warning that a run again would redo it.
+#[test]
+fn a_restore_from_a_backup_it_cant_write_to_warns_and_goes_on() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, c) = (ports[0], ports[2]);
+    let mut rows = load(&rt, a, 6);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    // Every progress write fails, as on a read-only directory (and as root too).
+    std::fs::create_dir(out.join("restore-progress.json.tmp")).unwrap();
+    rt.block_on(async {
+        assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
+        assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
+        let report = restore(&args(a), &restore_args(&out)).await.unwrap();
+        let warning = report.document["warning"].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("redoes the whole restore"),
+            "{:?}",
+            report.document
+        );
+        assert!(!out.join("restore-progress.json").exists());
+        assert_eq!(epochs(&the_live_map(c).await), [2, 2, 2]);
+        assert_eq!(keys(c).await, rows);
+    });
+}

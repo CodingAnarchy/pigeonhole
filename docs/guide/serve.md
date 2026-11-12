@@ -426,7 +426,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - fencing, and relocation onto a node that holds the partition's files;
   - backups and restore;
   - several partitions per node.
-- **Still to come:** relocation by file copy (D317 ticket 6 PR 2). The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
+- **Still to come:** `relocate --copy` and `move` (#1729). The index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -653,7 +653,7 @@ A node writes a partition only while its newest map names it for the partition a
   - **`--map FILE`** installs an edited copy of the backup's map instead, for example with nodes at new addresses or other nodes holding the partitions. It must have the backup's partitions and exactly the backup's tables.
   - **`--cluster-id ID`** restores under another cluster id, onto nodes of no cluster yet, beside a live cluster: every file is stamped with it. A node in another cluster refuses the restore.
   - **History starts over.** A restored partition is its backup's main file alone. Its WAL and feed files are moved aside to `<file>.replaced-<time>`, never deleted: delete them once the restore is checked. Feed tokens from before the restore answer `FeedExpired`.
-  - **Run it again** after a failure. `DIR/restore-progress.json` records each partition installed and the map once set, and goes when the restore is done. A run again skips a partition already installed at its new epoch (no second upload), and if the map is already set and still places every partition so, it only lifts the fences. An unfinished upload resumes.
+  - **Run it again** after a failure. `DIR/restore-progress.json` records each partition installed and the map once set, and goes when the restore is done. A run again skips a partition already installed at its new epoch (no second upload), and if the map is already set and still places every partition so, it only lifts the fences. An unfinished upload resumes. If `DIR` can't be written to (a read-only snapshot), the restore warns and goes on without the file, and a run again after a failure redoes the whole restore.
   - **A node that held a partition and doesn't get it back** (the restored map, or `--map`, places it elsewhere) keeps its copy open and fenced, with its memory and CPUs, and its files. The report lists those nodes (`close_and_drop_on`). On each, `phdb cluster close P`, then `phdb cluster drop-partition P` once the restore is checked.
 
 ### Partitions per node

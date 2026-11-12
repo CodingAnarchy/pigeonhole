@@ -131,6 +131,24 @@ fn read_progress(dir: &Path) -> Option<Progress> {
     })
 }
 
+/// Records `p` in `dir`, unless an earlier write failed (`unwritable`). A backup that can't
+/// be written to (a read-only snapshot) still restores: the first failure is a warning, and
+/// a run again after a failure then redoes the whole restore (simp724's S3 on #1764).
+fn record(dir: &Path, p: &Progress, unwritable: &mut Option<String>) {
+    if unwritable.is_some() {
+        return;
+    }
+    if let Err(e) = write_progress(dir, p) {
+        let why = format!(
+            "{}: the restore's progress isn't recorded, so a run again after a failure redoes \
+             the whole restore",
+            e.message()
+        );
+        eprintln!("phdb cluster restore: warning: {why}");
+        *unwritable = Some(why);
+    }
+}
+
 /// Written whole and renamed in, so a crash leaves the last one.
 fn write_progress(dir: &Path, p: &Progress) -> Result<(), Failure> {
     let doc = json!({
@@ -376,6 +394,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             earlier,
         });
     }
+    let mut unwritable = None;
     let mut progress = progress.unwrap_or_else(|| Progress {
         cluster_id: target.clone(),
         live_map_version: live_version,
@@ -449,7 +468,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                 epoch: job.epoch,
             },
         );
-        write_progress(&r.dir, &progress)?;
+        record(&r.dir, &progress, &mut unwritable);
     }
     fault(&r.dir, "stamped")?;
     // The map, forced: tables exactly as the backup's.
@@ -461,7 +480,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     }
     let set = set_map(args, m, true).await?;
     progress.map_version = set.document.get("map_version").and_then(Value::as_u64);
-    write_progress(&r.dir, &progress)?;
+    record(&r.dir, &progress, &mut unwritable);
     fault(&r.dir, "mapped")?;
     // Each partition opens on its node with the map, still under the fence the operator
     // set before the restore (it's persisted): lifted here once it's open.
@@ -484,6 +503,9 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     // Their copies stay open there, fenced, and their files until dropped.
     out.document
         .insert("close_and_drop_on".into(), Value::Array(old_owners));
+    if let Some(why) = unwritable {
+        out.document.insert("warning".into(), json!(why));
+    }
     Ok(out)
 }
 
