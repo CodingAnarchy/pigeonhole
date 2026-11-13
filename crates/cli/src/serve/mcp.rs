@@ -517,8 +517,8 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
             None => StatusCode::ACCEPTED.into_response(),
         };
     }
-    // TODO(#1567): charge the reply to the in-flight budget until it's written, through
-    // #1661's charge layer once it lands (before 1.2.0 ships; noted on #1567).
+    // The reply isn't charged to the in-flight budget: a tool result is bounded by
+    // `--mcp-max-result-bytes` instead (serve.md, "What isn't counted").
     let mut resp = match (reply, note) {
         (None, None) => StatusCode::ACCEPTED.into_response(),
         (Some(reply), None) => body(&reply.to_string(), "application/json"),

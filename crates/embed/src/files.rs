@@ -114,9 +114,24 @@ pub(crate) fn store(path: &Path, file: &File, bytes: &[u8]) -> Result<()> {
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(io(dir))?;
-    let tmp = dir.join(format!(".{}.{}.part", file.name, std::process::id()));
+    // A name of its own for each call: two threads of one process storing the same file
+    // would otherwise write the same temporary file at once.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{call}.part", file.name, std::process::id()));
     check(path, file, bytes)?;
-    std::fs::write(&tmp, bytes).map_err(io(&tmp))?;
+    // Written and synced before the rename, so a crash never leaves a short file under the
+    // final name. A failed write or sync takes its partial file with it.
+    let written = (|| {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io(&tmp)(e));
+    }
     // Another process may have put the same verified file there first: the rename replaces
     // it with identical bytes.
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -429,6 +444,35 @@ mod tests {
         ));
         assert!(!path.exists());
         store(&path, &file, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["x.bin"]);
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn threads_storing_one_file_at_once_all_succeed() {
+        // One temporary name a process made two threads write and rename the same file: the
+        // second rename found it gone. Each call has its own name now.
+        let file = File {
+            name: "x.bin",
+            sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        };
+        let dir = scratch("store-threads");
+        let path = dir.join("x.bin");
+        for _ in 0..20 {
+            std::thread::scope(|s| {
+                let stores: Vec<_> = (0..8)
+                    .map(|_| s.spawn(|| store(&path, &file, b"hello")))
+                    .collect();
+                for t in stores {
+                    t.join().unwrap().unwrap();
+                }
+            });
+        }
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()

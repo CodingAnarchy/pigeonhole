@@ -709,6 +709,12 @@ async fn download(mut d: super::backup::Download) -> Response {
         }
     };
     let (total, offset) = (kept.total, d.offset);
+    // A copy that turned ready between the service's check (which saw it being written)
+    // and this loop's first look is checked by neither: `total - offset` below must not go
+    // under (audit120's N2).
+    if offset > total {
+        return super::service::past_the_copy(offset, total).into_response();
+    }
     let id = d.id.clone();
     let sha: String = kept.sha256.iter().map(|b| format!("{b:02x}")).collect();
     let mut resp = Body::from_stream(Data(first, d)).into_response();

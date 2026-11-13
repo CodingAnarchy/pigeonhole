@@ -315,11 +315,12 @@ pub(crate) fn expand(small: &[u8]) -> Result<Vec<u8>, String> {
     let session = take(&mut buf, 8)?;
     // At least two bytes a stream remain: refuse a count the bytes can't hold before sizing
     // anything by it.
-    if buf.len() < streams as usize * 2 {
+    if buf.len() < (streams_u32 as usize).saturating_mul(2) {
         return Err(bad("fewer streams than it says"));
     }
     let tail = if version == 2 { 16 } else { 0 };
-    let mut out = Vec::with_capacity(HEAD + streams as usize * 16 + tail);
+    // Bounded by the check above: a stream is at least two bytes of `buf`.
+    let mut out = Vec::with_capacity(HEAD + (streams_u32 as usize).saturating_mul(16) + tail);
     out.extend_from_slice(head);
     out.extend_from_slice(&streams_u32.to_le_bytes());
     out.extend_from_slice(&delivered.to_le_bytes());

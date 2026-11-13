@@ -43,8 +43,8 @@ embed = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs"]
 # `pigeonhole-embed` (candle, about 56 crates), off by default so `cargo install` doesn't
 # build candle unless asked (owner, D318 Q4).
 embed-local = ["dep:pigeonhole-embed"]
-# `phdb serve` (D313, #1397), off by default (owner, 2026-11-04). This build has only the
-# network API's generated types (ICR 0112); the server follows.
+# `phdb serve`, `phdb promote` and `phdb cluster` (D313, D317, #1397), off by default
+# (owner, 2026-11-04).
 serve = [
     "dep:prost", "dep:tonic", "dep:tonic-prost", "dep:pbjson", "dep:serde",
     "dep:tokio", "dep:axum", "dep:tower", "dep:hyper-util", "dep:tokio-rustls", "dep:rustls",

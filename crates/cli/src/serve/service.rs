@@ -550,7 +550,7 @@ where
     }
 }
 
-fn past_the_copy(offset: u64, total: u64) -> ApiError {
+pub(crate) fn past_the_copy(offset: u64, total: u64) -> ApiError {
     ApiError::invalid(format!(
         "offset {offset} is past the backup's {total} bytes"
     ))
