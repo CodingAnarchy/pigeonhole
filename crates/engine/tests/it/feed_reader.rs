@@ -2028,3 +2028,55 @@ fn a_capped_feed_of_every_table_delivers_a_catalog_change_after_the_commits_befo
     drop(r);
     db.close().unwrap();
 }
+
+/// A token's writer session: bytes 29..37 (after the version byte, the database id, the
+/// stream count and the last seqno delivered; `TokenHeader::parse`).
+fn token_session(token: &[u8]) -> u64 {
+    u64::from_le_bytes(token[29..37].try_into().unwrap())
+}
+
+#[test]
+fn a_token_across_a_writer_restart_names_the_later_session_whatever_its_id() {
+    // #1810: session ids are random, and the reader kept the larger one it read through, so
+    // a token that crossed a reopen named the older session about half the time. A resume
+    // on a copy that holds that session but not the later one then passed the history
+    // check and went on past records it never had. It must name the later session.
+    for seed in 3810u64..3874 {
+        let vfs = SimVfs::new(seed);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let first = single(&db, &a, b"one", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, first);
+        let token = r.token();
+        let s1 = token_session(&token);
+        drop(r);
+        db.close().unwrap();
+
+        let db = open(&vfs, Some(feed(1 << 20)));
+        // The reopen's session, as a feed that read only it names it.
+        let mut fresh = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let second = single(&db, &a, b"two", Durability::GroupSync);
+        assert_eq!(next(&mut fresh).seqno, second);
+        let s2 = token_session(&fresh.token());
+        assert_ne!(s1, s2, "seed {seed}: a reopen is a new session");
+        drop(fresh);
+        if s2 > s1 {
+            // Either rule names s2: try another seed for the case that tells them apart.
+            db.close().unwrap();
+            continue;
+        }
+        // From the first token: through "two", which the later, smaller session wrote.
+        let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+        assert_eq!(next(&mut r).seqno, second);
+        assert_eq!(
+            token_session(&r.token()),
+            s2,
+            "seed {seed}: the token names the later session ({s2:#x}), not the larger id \
+             ({s1:#x})"
+        );
+        db.close().unwrap();
+        return;
+    }
+    panic!("no seed in range drew a smaller id for the later session");
+}
