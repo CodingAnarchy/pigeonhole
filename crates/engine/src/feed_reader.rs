@@ -187,9 +187,6 @@ pub struct CatalogEvent {
     /// The name of each table the edits name without a `CreateTable` among them, as the
     /// catalog held it before them: every table an event names is named in the event.
     pub names: Vec<(TableId, String)>,
-    /// The writer session that made the change: delivering it (or passing over it) moves
-    /// the token's session as a record of that session does (audit120's P2-C5).
-    session: u64,
 }
 
 /// A mutation as read, before its commit's timestamp is known: its fixed fields, and its
@@ -529,8 +526,11 @@ pub struct FeedReader {
     /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
     /// delivered, in order; the last one delivered (its root sequence, in the token); how far
     /// the sidecar is read; and the tables dropped by delivered changes, whose later changes
-    /// are passed over (a commit routed before a drop can be logged after it).
-    catalog: VecDeque<CatalogEvent>,
+    /// are passed over (a commit routed before a drop can be logged after it). Each change
+    /// is queued with the writer session that made it: delivering it moves the token's
+    /// session as a record of that session does (audit120's P2-C5). Beside the event, not in
+    /// it: `CatalogEvent` is what a replica receives and encodes, and has no session.
+    catalog: VecDeque<(CatalogEvent, u64)>,
     catalog_seq: u64,
     /// A `Bound` start's bound (`Oldest`, `After`; 0 for `Now` and `Snapshot`, and a token's
     /// own): every catalog change with a ceiling at or below it is before the start, in every
@@ -1248,7 +1248,7 @@ impl FeedReader {
             seqno = seqno.min(key.saturating_sub(1));
         }
         if self.tables.is_empty()
-            && let Some(ev) = self.catalog.front()
+            && let Some((ev, _)) = self.catalog.front()
         {
             seqno = seqno.min(ev.seqno_ceiling.saturating_sub(1));
         }
@@ -1988,17 +1988,17 @@ impl FeedReader {
             // Up to the frontier, and under the read-ahead cap its cutoff (D320): every
             // record at or below both was kept.
             let limit = self.frontier.min(self.ahead.cutoff);
-            if let Some(ev) = self.catalog.front()
+            if let Some((ev, _)) = self.catalog.front()
                 && ev.seqno_ceiling <= limit.saturating_add(1)
                 && self
                     .ready
                     .first_key_value()
                     .is_none_or(|(&k, _)| k >= ev.seqno_ceiling)
             {
-                let ev = self.catalog.pop_front().expect("checked");
+                let (ev, session) = self.catalog.pop_front().expect("checked");
                 self.note_drops(&ev.edits);
                 self.catalog_seq = ev.sequence;
-                self.raise_session(ev.session);
+                self.raise_session(session);
                 self.out_catalog = ev;
                 return Ok(Emitted::Catalog);
             }
@@ -2414,14 +2414,16 @@ impl FeedReader {
                 self.raise_session(session);
                 continue;
             }
-            self.catalog.push_back(CatalogEvent {
-                seqno_ceiling,
-                timestamp,
-                sequence,
-                edits,
-                names,
+            self.catalog.push_back((
+                CatalogEvent {
+                    seqno_ceiling,
+                    timestamp,
+                    sequence,
+                    edits,
+                    names,
+                },
                 session,
-            });
+            ));
         }
         Ok(())
     }
