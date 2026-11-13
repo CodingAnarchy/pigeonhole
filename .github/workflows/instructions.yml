@@ -244,11 +244,28 @@ jobs:
             git diff --name-only "$base" HEAD -- crates/bench/examples > /tmp/examples-differ
             echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples; files that differ: $(tr '\n' ' ' < /tmp/examples-differ)"
             git -C /tmp/base checkout -q -- crates/bench/examples
-            (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
-              --target-dir "$GITHUB_WORKSPACE/target")
+            # Only the examples base has: an example new in this PR has no base count (its
+            # shapes show as new), and the target directory still holds the head's binary of
+            # it, which must not be copied as base's.
+            built=()
+            for e in $EXAMPLES; do
+              # Base's tree, not its directory: the head's copy of a new example is still
+              # there, untracked.
+              if git -C /tmp/base cat-file -e "HEAD:crates/bench/examples/$e.rs" 2>/dev/null; then
+                built+=("$e")
+              fi
+            done
+            if [ "${#built[@]}" -gt 0 ]; then
+              bflags=()
+              for e in "${built[@]}"; do bflags+=(--example "$e"); done
+              (cd /tmp/base && cargo build --release -p pigeonhole-bench "${bflags[@]}" \
+                --target-dir "$GITHUB_WORKSPACE/target")
+            fi
             touch /tmp/base-own-examples
+          else
+            built=($EXAMPLES)
           fi
-          for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-base/; done
+          for e in ${built[@]+"${built[@]}"}; do cp "target/release/examples/$e" /tmp/bin-base/; done
       - name: count
         shell: bash
         run: |
@@ -258,6 +275,8 @@ jobs:
             for g in $SHAPES; do
               # Base on its own examples: only the shapes base has a ceiling for.
               if [ "$side" = base ] && [ -e /tmp/base-own-examples ]; then
+                # An example base doesn't have (new in this PR): nothing to count.
+                [ -x "/tmp/bin-base/${g%%:*}" ] || continue
                 keep=()
                 IFS=, read -ra list <<< "${g#*:}"
                 for s in "${list[@]}"; do
@@ -285,7 +304,8 @@ jobs:
             [ "$HOTROW" = - ] && hot=-
             scripts/instructions-per-cell.sh "$hot" "${groups[@]}" > "/tmp/$side.txt"
           done
-          if [ ! -s /tmp/base.txt ] || [ ! -s /tmp/head.txt ]; then
+          # Base counts nothing only when every shape is new (its examples are all new).
+          if [ ! -s /tmp/head.txt ] || { [ ! -s /tmp/base.txt ] && [ ! -e /tmp/base-own-examples ]; }; then
             echo "a side counted nothing: base $(wc -l < /tmp/base.txt) lines, head $(wc -l < /tmp/head.txt)"
             exit 1
           fi
