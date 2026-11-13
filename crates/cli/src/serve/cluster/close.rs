@@ -25,7 +25,8 @@ const DRAIN: Duration = Duration::from_secs(30);
 /// A partition closed here: its file's epoch, and its files' hashes.
 #[derive(Debug, Clone)]
 pub(crate) struct Closed {
-    epoch: u64,
+    /// The file's epoch when it closed.
+    pub(super) epoch: u64,
     files: Hashing,
     /// Which close this is: a hash started for an earlier close of the same partition
     /// (reopened, written, closed again) never lands on this one (cli692's S2 on #1755).

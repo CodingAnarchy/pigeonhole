@@ -170,8 +170,7 @@ impl Forwarder {
         // deadline. That's after the send: a write's outcome is unknown (B3), a read's node
         // unavailable.
         request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        match tokio::time::timeout_at(deadline, ClusterClient::new(channel).forward(request)).await
-        {
+        match tokio::time::timeout_at(deadline, peer_client(channel).forward(request)).await {
             Ok(Ok(reply)) => Ok(reply.into_inner()),
             Ok(Err(status)) => Err(classify(&status, address, writes)),
             Err(_) => Err(classify(
@@ -194,7 +193,7 @@ impl Forwarder {
     ) -> Result<(tonic::Streaming<ScanPage>, StreamLease), ApiError> {
         let lease = self.stream_channel(address, open_within).await?;
         let request = self.node.request(req).map_err(ApiError::internal)?;
-        let mut client = ClusterClient::new(lease.channel());
+        let mut client = peer_client(lease.channel());
         match tokio::time::timeout(open_within, client.forward_scan(request)).await {
             Ok(Ok(reply)) => Ok((reply.into_inner(), lease)),
             Ok(Err(status)) => Err(classify(&status, address, false)),
@@ -267,6 +266,21 @@ pub(crate) fn stream_error(status: &tonic::Status, address: &str) -> ApiError {
 }
 
 /// What a failed forward answers the client (B3).
+/// A forward's envelope over the call it carries (the caller, the map version, the op's
+/// framing): the owner's decode limit is the node's `--max-request-bytes` plus this, so a
+/// call the entry node took isn't refused by the owner for its envelope (audit120's S-C2).
+pub(crate) const FORWARD_ENVELOPE: usize = 64 << 10;
+
+/// The `Cluster` client a node calls a peer with. Its replies aren't capped here (tonic's
+/// default is 4 MiB): a forwarded reply or page is as large as the owner's own limits let
+/// it be, a cell or a page up to 8 MiB among them, and a peer is a node of this cluster,
+/// as a replica trusts its primary (audit120's S-C2).
+pub(crate) fn peer_client(
+    channel: tonic::transport::Channel,
+) -> ClusterClient<tonic::transport::Channel> {
+    ClusterClient::new(channel).max_decoding_message_size(usize::MAX)
+}
+
 pub(crate) fn classify(status: &tonic::Status, address: &str, writes: bool) -> ApiError {
     // The owner answered: its error, as it gave it.
     if let Some(e) = ApiError::from_status(status) {
