@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use common::{V, check, exact, open};
 use pigeonhole::{Element, Metric, VectorSpec};
 use pigeonhole_vector::hooks::{self, Hold};
-use pigeonhole_vector::{Index, IndexOptions};
+use pigeonhole_vector::{Index, IndexOptions, Rebalance};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -280,4 +280,79 @@ fn a_crash_between_a_split_and_its_phase_2_leaves_a_consistent_index() {
         );
     }
     db.close().unwrap();
+}
+
+/// #1824: a list far longer than its split length (a skewed bulk load, or a list that outgrew
+/// a background rebalancer; here, writes made while rebalancing was skipped) is split from a
+/// sample and moved a page at a time. No read of the split or its phase 2 holds more than
+/// four split lengths, and the index ends within its bounds holding exactly the model.
+/// `clustered` puts the long list's vectors in two groups; otherwise they're all one point,
+/// which leaves the split nothing to separate (split by order).
+fn a_long_list_splits_without_reading_it_whole(clustered: bool) {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (index, mut rebalancer) = Index::create_with_rebalancer(
+        &db,
+        "idx",
+        spec(),
+        reassigning().rebalance(Rebalance::Background),
+    )
+    .unwrap();
+    let drain = |r: &mut pigeonhole_vector::Rebalancer| {
+        while r.run_once(std::time::Duration::from_secs(60)).unwrap() {}
+    };
+    let mut model = BTreeMap::new();
+    for i in 0..40 {
+        put(&index, &mut model, &format!("s{i:03}"), i as f32 * 10.0);
+    }
+    drain(&mut rebalancer);
+    let lists = index.verify().unwrap().list_lens.len();
+    let max = index.max_list_len();
+    hooks::skip_rebalance(true);
+    // 60 split lengths into the list nearest 200.
+    for i in 0..60 * max {
+        let x = match (clustered, i % 2) {
+            (false, _) => 200.0,
+            (true, 0) => 199.0 + (i % 7) as f32 * 0.01,
+            (true, _) => 201.0 + (i % 5) as f32 * 0.01,
+        };
+        put(&index, &mut model, &format!("l{i:05}"), x);
+    }
+    hooks::skip_rebalance(false);
+    let lens = index.verify().unwrap().list_lens;
+    assert_eq!(lens.len(), lists);
+    assert!(
+        lens.iter().any(|n| *n > 60 * max),
+        "one long list: {lens:?}"
+    );
+    hooks::take_split_held();
+    // The next write into it marks it for the rebalancer.
+    put(&index, &mut model, "trigger", 200.0);
+    drain(&mut rebalancer);
+    let held = hooks::take_split_held();
+    assert!(held > 0, "a split ran");
+    assert!(held as u64 <= 4 * max, "a read held {held} > {}", 4 * max);
+    check(&index, &model, "after the long list's split");
+    for q in [0.0, 200.0, 199.0, 201.0, 390.0] {
+        exact(
+            &index,
+            &model,
+            &V::F32(vec![q, 0.0]),
+            5,
+            &format!("query {q}"),
+        );
+    }
+    drop(rebalancer);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_long_list_of_two_groups_splits_without_reading_it_whole() {
+    a_long_list_splits_without_reading_it_whole(true);
+}
+
+#[test]
+fn a_long_list_of_one_point_splits_without_reading_it_whole() {
+    a_long_list_splits_without_reading_it_whole(false);
 }
