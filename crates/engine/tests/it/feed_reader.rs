@@ -2032,6 +2032,12 @@ fn a_capped_feed_of_every_table_delivers_a_catalog_change_after_the_commits_befo
 /// A token's writer session: bytes 29..37 (after the version byte, the database id, the
 /// stream count and the last seqno delivered; `TokenHeader::parse`).
 fn token_session(token: &[u8]) -> u64 {
+    // The layouts these offsets hold for (versions 1 and 2): a new one fails here rather
+    // than being misread.
+    assert!(
+        matches!(token.first(), Some(1 | 2)),
+        "a token layout this test doesn't know: {token:?}"
+    );
     u64::from_le_bytes(token[29..37].try_into().unwrap())
 }
 
