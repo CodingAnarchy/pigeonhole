@@ -533,6 +533,17 @@ pub(super) async fn relocate_as(
     // `--copy`: OLD's closed set, hashed, to check the copy NEW installs against. An open
     // partition's files aren't final, so it must be closed.
     let closed = if checks {
+        // In place, a copy keeps nothing an unfence doesn't: the node holds P's closed files
+        // already, and its stamp would drop the closed record the last check reads
+        // (audit120's question on #1838).
+        if p.node == to {
+            return Err(Failure::usage(&format!(
+                "--copy copies {partition}'s closed files to another node, and node {to:?} \
+                 already holds them: phdb cluster unfence {partition} there serves it again, \
+                 with its history. A relocation in place without --copy (a restore's files \
+                 staged there) starts a new history"
+            )));
+        }
         if old_state != Some(S::Closed) {
             return Err(Failure::usage(&format!(
                 "--copy checks the files node {to:?} installs against the ones node {:?} \

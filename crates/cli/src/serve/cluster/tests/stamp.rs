@@ -471,6 +471,17 @@ fn relocate_copy_refuses_a_copy_that_isnt_the_old_nodes_closed_files() {
         // A copy of one close staged on c; a then serves again and takes a write, and
         // closes again: c's staged set isn't a's closed set any more.
         client(a).await.close(req()).await.unwrap();
+        // In place (to a, which holds p1 closed): refused up front, the map unchanged
+        // (audit120's question on #1838).
+        let e = within(super::super::cli::relocate(&args, "p1", "a", false, true))
+            .await
+            .err()
+            .expect("refused")
+            .message()
+            .to_owned();
+        assert!(e.contains("already holds them"), "{e}");
+        assert!(e.contains("phdb cluster unfence p1"), "{e}");
+        assert_eq!(p1_in_map().await, ("a".to_owned(), 1));
         upload_set(c, "p1", &dirs[0].join("p1.phdb"), 2).await;
         client(a).await.unfence(req()).await.unwrap();
         eventually("a to serve p1 again", async || {
