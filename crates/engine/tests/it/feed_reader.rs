@@ -2149,3 +2149,47 @@ fn a_token_taken_before_any_record_names_the_session_and_a_gap_expires_it() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn an_oldest_start_from_an_earlier_session_names_it_before_any_record() {
+    // perf2's remainder of audit120's P2-C6: `Oldest` served from an earlier session still
+    // kept whole (#1465) left the token's session at 0 until a record was read, so a token
+    // taken there skipped the history check, as P2-C6's did. It names the session it starts
+    // in, and a feed-off session written in between expires it.
+    let vfs = SimVfs::new(3882);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    db.close().unwrap();
+    // The earlier session, with commits: `Oldest` starts in it later.
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let one = single(&db, &a, b"one", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, one);
+    let earlier = token_session(&r.token());
+    drop(r);
+    single(&db, &b, b"two", Durability::GroupSync);
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let token = r.token();
+    assert_eq!(
+        token_session(&token),
+        earlier,
+        "a token from an earlier-session start names that session before any record"
+    );
+    drop(r);
+    db.close().unwrap();
+    // A session with the feed off writes in between.
+    let db = open(&vfs, None);
+    single(&db, &a, b"unfed", Durability::GroupSync);
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "a gap is never skipped silently, whenever the token was taken"
+    );
+    drop(r);
+    db.close().unwrap();
+}

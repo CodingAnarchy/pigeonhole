@@ -870,8 +870,12 @@ impl FeedReader {
         };
         // Where each stream starts, and the bound below which nothing is delivered.
         let starts: Vec<(Lsn, Option<Lsn>)> = match (spec.start, earlier) {
-            (_, Some((bound, at))) => {
+            (_, Some((bound, at, session))) => {
                 this.delivered = bound;
+                // The earlier session it starts in, as a non-token start names its own
+                // (P2-C6): with 0 a token taken before any record skipped the history check.
+                // Records of later sessions move it on (`raise_session`).
+                this.session = session;
                 at.into_iter().map(|a| (a, None)).collect()
             }
             (FeedStart::Token(bytes), None) => match this.decode_token(&bytes, db_id)? {
@@ -2216,7 +2220,9 @@ impl FeedReader {
     ///
     /// `None` (the current history decides) when no earlier session qualifies or anything
     /// read fails: a later start only has a larger bound, so it is always safe (simp724).
-    fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>)> {
+    /// With the bound and the starts, the session they are in: a token taken before any
+    /// record is read names it (audit120's P2-C6, perf2's remainder).
+    fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>, u64)> {
         let shards = self.shared.shards;
         let open = |s: usize, at: Lsn| {
             FeedCursor::open(
@@ -2287,7 +2293,7 @@ impl FeedReader {
             // A session that logged nothing: the next one decides.
             let Some(first) = first else { continue };
             let at = firsts.iter().map(|f| Lsn::new(f[&session], 0)).collect();
-            return Some((first.saturating_sub(1), at));
+            return Some((first.saturating_sub(1), at, session));
         }
         None
     }
