@@ -6,8 +6,9 @@ publish = false
 
 [workspace]
 
-# 1.1.3's own code: release/1.1.x at its version commit (#1846). Pinned by revision, so the
-# entries regenerate exactly; the crates.io release is the same code.
+# 1.1.3's own code: the v1.1.3 tag's commit (#1846). Pinned by revision, so the entries were
+# written by the same code as the release (session ids are random, so a second run writes
+# other bytes); the crates.io release is the same code.
 [dependencies]
 # `__unstable-hooks` for `Options::wal_segment_size` (256 KiB segments keep the entries small).
 pigeonhole = { git = "https://github.com/CodingAnarchy/pigeonhole", rev = "e3a737b9e8a75d0ca877a01d6266e67548f0ab8e", features = ["__unstable-hooks"] }

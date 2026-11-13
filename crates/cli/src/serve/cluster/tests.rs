@@ -1023,6 +1023,15 @@ fn run_alone(module: &str, test: &str, body: fn()) {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("1 passed"), "{stdout}");
+    // A child that skipped (no pinning here, too few cores) says so in this test's output
+    // too, where the run shows it (--nocapture) (cli692's N1 on #1763). libtest prints
+    // "test <name> ... " before the test runs, so the skip may sit mid-line (cli692's S1 on
+    // #1855).
+    for line in stdout.lines() {
+        if let Some(i) = line.find("skipped:") {
+            println!("{}", &line[i..]);
+        }
+    }
 }
 
 /// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
