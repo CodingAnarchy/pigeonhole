@@ -58,6 +58,20 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
     pinned.sort_unstable();
     pinned.dedup();
     let masks = placement.reapply(&pinned);
+    // Every other thread too, the engines' unpinned ones and our long-running ones, at once
+    // (#1762): only the engines' own pins, the shards' and compaction's, stay where they are.
+    let mut engine_pins: Vec<usize> = parts
+        .values()
+        .filter_map(|s| s.part_opt())
+        .flat_map(|p| {
+            let mut cpus = p.db.pinned_shard_cpus();
+            cpus.extend(p.db.pinned_compaction_cpus());
+            cpus
+        })
+        .collect();
+    engine_pins.sort_unstable();
+    engine_pins.dedup();
+    let swept = placement.sweep(&engine_pins);
     // Each runtime's threads against its CPUs, so an operator sees how a shrunken mask
     // packs them (perf287's note 1 on #1755); the counts stay as the server started them.
     let on = |threads: usize, m: &Option<Vec<usize>>| match m {
@@ -75,8 +89,8 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
     };
     eprintln!(
         "phdb serve: {why}: off the shards' {} CPUs{unmasked}: request workers {}, feed {} \
-         and hub {}, blocking {}; the thread counts stay as the server started them (restart \
-         to size them again)",
+         and hub {}, blocking {}, and {swept} other threads moved to the blocking mask; the \
+         thread counts stay as the server started them (restart to size them again)",
         pinned.len(),
         on(placement.io_threads, &masks.network),
         on(placement.feed_threads, &masks.feed),

@@ -150,6 +150,130 @@ fn a_partition_opened_while_serving_pins_off_the_others_cores_or_is_refused() {
     );
 }
 
+/// #1762: the sweep after a reapply moves every thread that doesn't refresh itself onto the
+/// blocking mask, and leaves alone the threads that do (registered as they enter) and the
+/// engine's own pins. Linux only; alone in its process, as pin claims are process-wide.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_mask_sweep_moves_other_threads_and_leaves_the_engines_pins() {
+    run_alone(
+        module_path!(),
+        "the_mask_sweep_moves_other_threads_and_leaves_the_engines_pins",
+        mask_sweep_alone,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn mask_sweep_alone() {
+    use crate::serve::placement::Placement;
+    use std::sync::mpsc;
+    let affinity = || -> Vec<usize> {
+        let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+        (0..nix::sched::CpuSet::count())
+            .filter(|&c| set.is_set(c).unwrap_or(false))
+            .collect()
+    };
+    let set_mine = |cpus: &[usize]| {
+        let mut m = nix::sched::CpuSet::new();
+        for &c in cpus {
+            m.set(c).unwrap();
+        }
+        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &m).unwrap();
+    };
+    let all = affinity();
+    let dir = test_dir();
+    let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
+    let shards = p1.pinned_shard_cpus();
+    if shards.is_empty() {
+        println!("skipped: nothing pins here");
+        return;
+    }
+    let placement = Placement::plan(&[&p1], Some(2), Some(2), None, None, true);
+    let Some(blocking) = placement.masks.blocking.clone() else {
+        println!("skipped: too few free cores for a mask");
+        return;
+    };
+    let mut engine_pins = shards.clone();
+    engine_pins.extend(p1.pinned_compaction_cpus());
+    // Every thread's affinity now, by id: the engine's pinned threads among them.
+    let before: Vec<(i32, Vec<usize>)> = std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter_map(|tid: i32| {
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+            let cpus = (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect();
+            Some((tid, cpus))
+        })
+        .collect();
+
+    // Three threads, each set up, then held until the sweep has run:
+    // - `other`, of ours, that never entered (a backup's, say), on every CPU: moved;
+    // - `entered`, which entered as a blocking thread, then widened by hand: left to its
+    //   own refresh();
+    // - `pinned`, on the shard's CPU, as an engine's pin: left alone.
+    let shard = shards[0];
+    let (entered_tid, entered_tid_rx) = mpsc::channel();
+    // Each sets up, waits until all three have, then holds until the sweep has run.
+    let ready = std::sync::Barrier::new(4);
+    let go = std::sync::Barrier::new(4);
+    let (other, entered, pinned, moved) = std::thread::scope(|scope| {
+        let (ready, go, all, placement) = (&ready, &go, &all, &placement);
+        let held = move |setup: &dyn Fn()| {
+            setup();
+            ready.wait();
+            go.wait();
+            affinity()
+        };
+        let other = scope.spawn(move || held(&|| set_mine(all)));
+        let entered_tid = &entered_tid;
+        let entered = scope.spawn(move || {
+            held(&|| {
+                placement.enter();
+                entered_tid.send(nix::unistd::gettid().as_raw()).unwrap();
+                set_mine(all);
+            })
+        });
+        let pinned = scope.spawn(move || held(&|| set_mine(&[shard])));
+        ready.wait();
+        let moved = placement.sweep(&engine_pins);
+        go.wait();
+        (
+            other.join().unwrap(),
+            entered.join().unwrap(),
+            pinned.join().unwrap(),
+            moved,
+        )
+    });
+    assert!(moved >= 1, "the unregistered thread moved: {moved}");
+    assert_eq!(
+        other, blocking,
+        "a thread that doesn't refresh is moved to the blocking mask"
+    );
+    assert_eq!(entered, all, "a thread that refreshes itself is left to it");
+    assert_eq!(pinned, [shard], "an engine-style pin stays");
+    // Once a registered thread exits its ID is forgotten, since Linux reuses IDs.
+    let tid = entered_tid_rx.recv().unwrap();
+    assert!(
+        !placement.is_registered(tid),
+        "an exited thread's ID {tid} is no longer registered"
+    );
+    // The engine's own pinned threads (D235) are as they were.
+    for (tid, cpus) in before
+        .iter()
+        .filter(|(_, c)| c.iter().all(|x| engine_pins.contains(x)))
+    {
+        if let Ok(set) = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(*tid)) {
+            let now: Vec<usize> = (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect();
+            assert_eq!(&now, cpus, "engine thread {tid}'s pin is unchanged");
+        }
+    }
+    p1.close().unwrap();
+}
+
 #[cfg(target_os = "linux")]
 fn opened_off_the_others_cores_alone() {
     use crate::serve::placement::{Placement, siblings};
