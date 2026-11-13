@@ -1,6 +1,6 @@
 # Observability
 
-> **Status:** this guide describes `main`. `pigeonhole-otel` is new in 1.2.0 (D316, #1458, ICR 0115).
+> **Status:** this guide describes 1.2. `pigeonhole-otel` is new in 1.2.0 (D316, #1458, ICR 0115).
 
 `pigeonhole-otel` exports a database's engine metrics through [OpenTelemetry](https://opentelemetry.io), so they reach Prometheus and Grafana, or any OTLP backend, beside your application's own metrics. One call registers them with your `Meter`, and there's no polling loop to write.
 

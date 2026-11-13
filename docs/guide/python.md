@@ -1,6 +1,6 @@
 # Python
 
-> **Status:** this guide describes `main`. The bindings (`pigeonhole-db` on PyPI, `import pigeonhole`; D307, ICR 0102, #696) are new in 1.1.0. Every code block on this page runs as a test (`crates/python/tests/test_guide.py`).
+> **Status:** this guide describes 1.2. The bindings (`pigeonhole-db` on PyPI, `import pigeonhole`; D307, ICR 0102, #696) are new in 1.1.0. Every code block on this page runs as a test (`crates/python/tests/test_guide.py`).
 
 The Python bindings are built with PyO3 directly over the Rust `pigeonhole` crate, so Python gets the same engine, file format and guarantees as Rust. Every engine call releases the GIL.
 

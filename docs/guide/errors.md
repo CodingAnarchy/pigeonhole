@@ -1,6 +1,6 @@
 # Errors
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Codes are stable. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. Codes are stable. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every fallible call returns `pigeonhole::Result<T>` = `Result<T, pigeonhole::Error>`.
 

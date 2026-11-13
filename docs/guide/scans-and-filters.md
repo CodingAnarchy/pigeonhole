@@ -1,6 +1,6 @@
 # Scans and filters
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Semantics come from the spec and decision D22. `Scan::stream` (async) is new in 0.3.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. Semantics come from the spec and decision D22. `Scan::stream` (async) is new in 0.3.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Both `Table::row(key)` (a `RowRead`) and `Table::scan*` (a `Scan`) are builders. Nothing happens until you call `.read()` or `.iter()` (or `.read_async()` and `.stream()`; see [Async](async.md)). They share most of their methods.
 

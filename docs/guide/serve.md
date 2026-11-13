@@ -1,6 +1,6 @@
 # Serving a database: `phdb serve`
 
-> **Status:** this page describes `main`. `phdb serve` is new in 1.2.0 (D313, #1397), behind the `serve` feature. [ICR 0112](../design/icr/0112-network-api.md) is the full contract.
+> **Status:** this page describes 1.2. `phdb serve` is new in 1.2.0 (D313, #1397), behind the `serve` feature. [ICR 0112](../design/icr/0112-network-api.md) is the full contract.
 
 `phdb serve` owns one database file and serves it to other processes and hosts:
 - gRPC and HTTP/JSON on one port;
