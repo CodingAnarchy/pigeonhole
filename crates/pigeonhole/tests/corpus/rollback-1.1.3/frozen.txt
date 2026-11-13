@@ -1,0 +1,14 @@
+# The rollback corpus, written by 1.1.3's code (rollback-gen): path, length, xxh3-64.
+# Frozen: no file or line ever changes.
+landed/data.phdb 1310720 36b72db6f175e485
+landed/data.phdb-feed 365 a9c366676c1f3b4d
+landed/data.phdb-wal-0 524288 255bedf1947c054c
+landed_catalog/data.phdb 1310720 fd3b987e66609f86
+landed_catalog/data.phdb-feed 467 6d47cdef9fe3e001
+landed_catalog/data.phdb-wal-0 524288 4a1b27318f0b985d
+not_landed/data.phdb 1310720 3694f3533713dec9
+not_landed/data.phdb-feed 365 f530989963aad14b
+not_landed/data.phdb-wal-0 524288 60ca937e96373422
+not_landed_catalog/data.phdb 1310720 1f34b7cd100613c4
+not_landed_catalog/data.phdb-feed 365 3945b49e412bc295
+not_landed_catalog/data.phdb-wal-0 524288 11d69938bd2b625f

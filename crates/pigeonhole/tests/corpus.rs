@@ -2242,3 +2242,121 @@ fn real_options_without_merge() -> Options {
         .block_cache(8 << 20)
         .create_if_missing(false)
 }
+
+/// The rollback corpus (#1837): databases a 1.2 build left after a crash inside a root
+/// commit, then opened, written and closed by 1.1.3, in `tests/corpus/rollback-1.1.3/<entry>/`,
+/// written once by `tests/corpus/rollback-gen` from 1.1.3's own code and frozen. Each case is
+/// a root that landed or didn't, with or without the root's Catalog entry.
+const ROLLBACK_ENTRIES: [&str; 4] = [
+    "landed",
+    "landed_catalog",
+    "not_landed",
+    "not_landed_catalog",
+];
+
+/// 1.1.3's CHANGELOG and 1.2.0's upgrade note promise that a change feed survives a rollback
+/// to 1.1.3 and the move back: 1.1.3 resolves the intent 1.2's crash left, as 1.2 does, and
+/// keeps the feed, so this build reopens each entry without feed options (as `phdb` or a tool
+/// does), keeps the feed, and resumes the token taken before the rollback through both
+/// commits, the one before it and 1.1.3's, with nothing skipped. That includes the root whose
+/// Catalog entry 1.1.3 can't read and expires on: back on 1.2 the token resumes again.
+#[test]
+fn a_rollback_to_1_1_3_and_back_keeps_the_feed() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, decode_entries};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/rollback-1.1.3");
+    // Frozen, as a release corpus is: 1.1.3 wrote these bytes, and only a build that reads
+    // them proves the promise.
+    let listed: BTreeMap<String, (usize, u64)> = std::fs::read_to_string(root.join(FROZEN))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let mut f = l.split(' ');
+            let (path, len, hash) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+            (
+                path.to_owned(),
+                (len.parse().unwrap(), u64::from_str_radix(hash, 16).unwrap()),
+            )
+        })
+        .collect();
+    let mut on_disk = BTreeMap::new();
+    for entry in ROLLBACK_ENTRIES {
+        for f in std::fs::read_dir(root.join(entry)).unwrap() {
+            let f = f.unwrap();
+            let bytes = std::fs::read(f.path()).unwrap();
+            on_disk.insert(
+                format!("{entry}/{}", f.file_name().into_string().unwrap()),
+                (bytes.len(), pigeonhole_format::checksum::xxh3_64(&bytes)),
+            );
+        }
+    }
+    assert_eq!(on_disk, listed, "rollback-1.1.3 no longer matches {FROZEN}");
+    for entry in ROLLBACK_ENTRIES {
+        let src = root.join(entry);
+        let tmp = TempDir::new(&format!("rollback-{entry}"));
+        for f in std::fs::read_dir(&src).unwrap() {
+            let f = f.unwrap();
+            std::fs::copy(f.path(), tmp.0.join(f.file_name())).unwrap();
+        }
+        // 1.1.3 left no intent anywhere: one in front of its own Session entry would break
+        // the history here.
+        let sidecar = std::fs::read(tmp.0.join(format!("{DB}{FEED_SUFFIX}"))).unwrap();
+        let (entries, end) = decode_entries(&sidecar[FeedHeader::LEN..]);
+        assert_eq!(
+            FeedHeader::LEN + end,
+            sidecar.len(),
+            "{entry}: nothing torn"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, FeedEntry::RootIntent { .. })),
+            "{entry}: no intent left: {entries:?}"
+        );
+
+        // Unset shards: the open takes the feed's stream count from the sidecar, as it does
+        // its retention.
+        let options = Options::default()
+            .pin_threads(false)
+            .memtable_budget(8 << 20)
+            .create_if_missing(false);
+        let db = Pigeonhole::open(tmp.0.join(DB), options)
+            .unwrap_or_else(|err| panic!("{entry}: open: {err}"));
+        assert!(
+            db.info().unwrap().feed.is_some(),
+            "{entry}: the open kept the change feed"
+        );
+        let tokens = db.table("feed_tokens").unwrap().open().unwrap();
+        let get = |q: &[u8]| {
+            tokens
+                .get(b"events", "t", q)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{entry}: feed_tokens has {q:?}"))
+        };
+        let token = pigeonhole::FeedToken::from_bytes(get(b"token").value());
+        let want = [b"one".as_slice(), b"two".as_slice()].map(|q| get(q).as_i64().unwrap() as u64);
+        let events = db.table("events").unwrap().open().unwrap();
+        let mut feed = events
+            .feed()
+            .resume(&token)
+            .open()
+            .unwrap_or_else(|err| panic!("{entry}: resume: {err}"));
+        for (seqno, value) in want.iter().zip([b"one".as_slice(), b"two".as_slice()]) {
+            let c = feed
+                .next(FEED_WAIT)
+                .unwrap_or_else(|err| panic!("{entry}: the feed ended: {err}"))
+                .unwrap_or_else(|| panic!("{entry}: nothing within {FEED_WAIT:?}"));
+            assert_eq!(c.seqno(), *seqno, "{entry}: the commits in order");
+            let [ch] = c.changes() else {
+                panic!("{entry}: one change in seqno {seqno}")
+            };
+            assert!(
+                matches!(ch.value(), Some(Value::Bytes(b)) if b == value),
+                "{entry}: seqno {seqno}: {:?}",
+                ch.value()
+            );
+        }
+        drop(feed);
+        db.close().unwrap();
+    }
+}
