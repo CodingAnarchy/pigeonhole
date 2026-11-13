@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use super::cli::{NodeArgs, channel, report, request};
@@ -369,21 +368,10 @@ fn write_new(path: &PathBuf, bytes: &[u8]) -> Result<(), Failure> {
 }
 
 pub(super) fn digest(path: &Path) -> Result<[u8; 32], Failure> {
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(h.finalize().into())
+    std::fs::File::open(path)
+        .and_then(|mut f| crate::serve::backup::sha256_of(&mut f))
+        .map(|(_, sha)| sha)
+        .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
