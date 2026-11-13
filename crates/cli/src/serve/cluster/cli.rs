@@ -132,15 +132,16 @@ pub(crate) enum ClusterCommand {
         node: NodeArgs,
     },
     /// Lift a partition's fence on `--node` (a closed partition reopens first). Refused
-    /// unless the map names that node for it at its file's epoch. A partition fenced since
-    /// the node started is unfenced only once a peer's map confirms it, as at start.
+    /// unless the node's map names it for the partition at its file's epoch, and a peer's
+    /// map, at least as new, says the same: the node's own map may be behind, and a move
+    /// may have passed it by.
     Unfence {
         partition: String,
         #[command(flatten)]
         node: NodeArgs,
-        /// Lift a start fence that no peer's map confirms: only when no peer can answer and
-        /// you know the partition hasn't moved. A peer's newer map may have given it to
-        /// another node, and then both would take writes.
+        /// Lift a fence that no peer's map confirms: only when no peer can answer and you
+        /// know the partition hasn't moved. A peer's newer map may have given it to another
+        /// node, and then both would take writes.
         #[arg(long)]
         force: bool,
     },

@@ -687,7 +687,7 @@ A node writes a partition only while its newest map names it for the partition a
     2. It copies each file to `ID`: the main file, every WAL file a clean close keeps, and the feed's.
     3. It stamps P there at the next epoch, and checks the installed set against the closed one: each file's name, size and SHA-256.
     4. It sets the map (`relocate --copy`), and waits for `ID` to serve P.
-  - **A mismatch** stops the move before the map changes, so the old node still holds P: run the move again to copy the files again, or `unfence` P to serve it there again.
+  - **A mismatch** stops the move before the map changes, so the old node still holds P: run the move again to copy the files again, or `unfence` P to serve it there again (a peer's map must still give P to that node: see `unfence` below).
   - **Downtime:** writes answer `Fenced` from the fence until the map moves. Reads answer `PartitionUnavailable` from the close until `ID` serves, which is about as long as copying every file, one after another. Both grow with the files' size. With a change feed, that's the WAL files a clean close keeps for the feed's retention, so a long retention means a longer move. The report gives both durations and each file's size.
   - **`--timeout SECS`** (at least 1) bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
     - **The hash:** the map still gives P to the old node, closed there. Run the move again to go on waiting, or `unfence` P there.
@@ -706,8 +706,8 @@ A node writes a partition only while its newest map names it for the partition a
   - The fence is kept in `DIR/fenced.json`, so it outlasts a restart.
   - A fence is the copy's it was set on: when P's files are later installed on the node again (a move back), the fence is gone, and P serves there once a peer's map confirms it.
 - **A restarted node** opens every partition fenced, and unfences each one once a peer's map, at least as new as its own, still names it for the partition at the file's epoch. A node whose peers don't answer keeps them fenced: `phdb cluster status` shows `fenced (awaiting peer map)`, and `fenced (operator)` for a fence of yours. A one-node cluster unfences on its own map.
-- **`phdb cluster unfence P --node URL`** lifts either fence. It's refused unless the node's map names that node for P at its file's epoch.
-  - **A fence since the node started** lifts only once a peer's map, at least as new as the node's own, confirms it, as at start: the command asks the peers first. The node was down, and a move may have passed it by.
+- **`phdb cluster unfence P --node URL`** lifts either fence. It's refused unless the node's map names that node for P at its file's epoch, and a peer agrees.
+  - **The peers' newest map must confirm it,** whichever fence it is: the command asks every peer first, and lifts the fence only if the newest map among those that answer is at least as new as the node's own and still names the node for P at that epoch. One peer agreeing isn't enough: a peer that missed the same move holds the same old map. A peer that doesn't answer can't be counted, so if the only node that knows of a move is down, the others still confirm: check `phdb cluster status` on every node before you unfence the old node of a move. The node's own map isn't enough: it may have been down, or missed a push, while a move gave P to another node. That is most likely on the old node of a move, which the move fenced. A newer map a peer answers with is taken by the node at once. A cluster of one node confirms on its own map.
   - **`--force`** lifts it without a peer's map. Use it only when no peer can answer and you know P hasn't moved. If a peer's newer map gave P to another node, both would then take writes.
   - **Don't unfence P during a relocation.** Between `relocate`'s check and its map change, the old node's map still names it, so an unfence there resumes its writes.
 - **`phdb cluster close P --node URL`** closes a fenced partition. Its database closes, so its files are final, and its calls answer `PartitionUnavailable`. A call already running on it ends the same way.
@@ -715,7 +715,7 @@ A node writes a partition only while its newest map names it for the partition a
   - The partition's feed hubs end, and their clients resume from their tokens.
   - The command answers at once. `phdb cluster status` then lists the files with their SHA-256 once they're hashed.
   - A failed hash shows in the partition's error, and `close` again retries it.
-  - `unfence` reopens a closed partition.
+  - `unfence` reopens a closed partition, once its checks pass: a refused unfence leaves it closed.
 - **Copy the closed files to the new node** with `Admin.PartitionUpload`, taking each from the old node with `Admin.BackupDownload`'s `fenced_file` (its name in `status`'s list). They're staged in the new node's `DIR/.phdb-incoming`, and nothing serves them yet.
 - **`phdb cluster relocate P --to ID --node URL`** moves P to node `ID`, whose staging holds its files. (`--node` is the node the command talks to, as in every `phdb cluster` command.)
   - It checks that P is fenced or closed on the node serving it. `--old-unreachable` skips that check, for a node whose process you've stopped.
