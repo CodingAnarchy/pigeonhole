@@ -603,6 +603,14 @@ fn a_bulk_load_fills_an_empty_index_over_grpc_and_http() {
     assert_bulk_budget_free(&s);
 }
 
+/// A load that failed after loading part of its vectors says it isn't safe to send again,
+/// and what it loaded (the audit's P2-C9).
+fn assert_not_retry_safe(err: &tonic::Status) {
+    let detail = errors::ApiError::from_status(err).expect("a detail");
+    assert!(!detail.detail().retry_safe, "{err:?}");
+    assert!(err.message().contains("were loaded"), "{err:?}");
+}
+
 /// Every load's reservation of `--bulk-load-bytes` is back, and the gauge says none.
 fn assert_bulk_budget_free(s: &Server) {
     let service = &s.shared.router.service;
@@ -777,6 +785,9 @@ fn a_bulk_load_whose_client_stalls_ends_after_stream_idle() {
         started.elapsed()
     );
     assert_eq!(verified(&s, "ix"), json!("10"), "what it took is loaded");
+    // Part of it was applied, so it isn't safe to send again (the audit's P2-C9): BulkLoad
+    // needs an empty index.
+    assert_not_retry_safe(&err);
     assert_bulk_budget_free(&s);
     let mut spec = index_spec("REBALANCE_INLINE");
     spec["name"] = json!("ix2");
@@ -928,6 +939,7 @@ fn a_shutdown_stops_a_running_load_between_messages() {
     assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
     assert!(err.message().contains("interrupted"), "{err:?}");
     assert_eq!(verified(&s, "ix"), json!("10"), "what it took is loaded");
+    assert_not_retry_safe(&err);
     assert_eq!(bulk.gauges.phase.load(Ordering::Relaxed), 0, "no load");
     // No load starts once the server is stopping.
     let mut spec = index_spec("REBALANCE_INLINE");
@@ -943,6 +955,9 @@ fn a_shutdown_stops_a_running_load_between_messages() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
     assert_eq!(verified(&s, "ix2"), json!("0"));
+    // Nothing was applied: this one stays safe to send again.
+    let detail = errors::ApiError::from_status(&err).expect("a detail");
+    assert!(detail.detail().retry_safe, "{err:?}");
     assert_eq!(
         s.shared.router.service.inflight_available(),
         limits().inflight_bytes
