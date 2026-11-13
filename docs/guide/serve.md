@@ -164,6 +164,9 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 - `Admin.Health` needs no token;
 - `Info` (path, sizes, tables, version) and `Metrics` (the `/metrics` text) need read scope;
 - `Flush`, `Compact`, `Backup`, `BackupDownload` and `Promote` need admin scope, as does `Replication.Follow` (gRPC only), which replicas use.
+- **On a cluster node** (#1852), `Info`, `Flush` and `Compact` cover the partitions the node holds, answered there and never forwarded:
+  - `Info` lists each partition the map gives the node (`partitions`: its id, file, size, tables, and its state and fence reason as `phdb cluster status` shows them) and names the map's other partitions (`other_partitions`). Its `path` is the node's cluster directory, `file_bytes` the partitions' files together, and `tables` the map's.
+  - `Flush` and `Compact` act on the partitions `Info` lists that are open (serving or fenced), one after another, or on the one `partition` names. All of them are tried even when one fails, and the answer then carries the first failure's code and names every partition that failed. A copy the map moved away that's still open here (fenced until it's closed) isn't one of them. A partition another node holds is `WrongPartition`, and one closed or not open here is `PartitionUnavailable`. On a single node, `partition` must be empty.
 
 ### Backups
 - **Backups** need `--backup-dir`; without it they're off.
@@ -492,8 +495,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - a partition opened on a running node doesn't re-split the node's `--engine-memory`, `--shards` and `--compaction-threads`, and the running threads keep their old affinity mask (#1761, #1762);
   - `--change-feed` is each partition's, not the node's (#1786);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
-  - no read replicas: a cluster node refuses `--replica-of` and `Admin.Promote`, so a partition has one copy, and losing its node means a restore or [the lost-node recipe](#a-lost-node) (#1851);
-  - `Admin.Info`, `Admin.Flush` and `Admin.Compact` answer `Unsupported` on a cluster node (#1852).
+  - no read replicas: a cluster node refuses `--replica-of` and `Admin.Promote`, so a partition has one copy, and losing its node means a restore or [the lost-node recipe](#a-lost-node) (#1851).
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -568,7 +570,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
 - **Refused with `Unsupported`** on a cluster node in this release:
   - every IVF and full-text index call, not only the searches: `Vectors.CreateIndex`, `Insert`, `Delete`, `BulkLoad`, `Search` and `Verify`, and `Text.CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild` and `Verify` (#1722, 1.3.0). For vectors, `Vectors.Nearest` works and fans out across the partitions;
-  - `Admin.Info`, `Admin.Flush`, `Admin.Compact` and `Admin.Promote`. `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
+  - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
   - every `Memory` call (a cluster node refuses `--memory` at start) and `/mcp`.
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
 - **Errors a cluster adds:**

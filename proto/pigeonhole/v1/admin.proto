@@ -4,16 +4,19 @@ syntax = "proto3";
 
 package pigeonhole.v1;
 
+import "pigeonhole/v1/cluster.proto";
 import "pigeonhole/v1/common.proto";
 
 service Admin {
   // Liveness. Needs no token, and says nothing but that the server answers.
   rpc Health(Empty) returns (HealthResponse);
-  // The database's file, size and tables (read scope).
+  // The database's file, size and tables (read scope). On a cluster node (ICR 0117), each
+  // partition the node holds, and the map's partitions it doesn't (#1852).
   rpc Info(Empty) returns (InfoResponse);
-  // Admin scope from here on.
-  rpc Flush(Empty) returns (Empty);
-  rpc Compact(Empty) returns (Empty);
+  // Admin scope from here on. On a cluster node, every partition the node holds, or the one
+  // the request names (#1852).
+  rpc Flush(MaintenanceRequest) returns (Empty);
+  rpc Compact(MaintenanceRequest) returns (Empty);
   // Writes a consistent backup to `path`, inside the server's `--backup-dir`.
   rpc Backup(BackupRequest) returns (BackupResponse);
   // A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
@@ -84,6 +87,38 @@ message InfoResponse {
   string version = 5;
   // Set on a replica server (#1436).
   ReplicaInfo replica = 6;
+  // On a cluster node (ICR 0117, #1852): each partition the map gives this node, in id
+  // order. Then `path` is the node's cluster directory, `file_bytes` the partitions' files
+  // together, `free_bytes` the free space on the directory's disk, and `tables` the map's.
+  repeated PartitionInfo partitions = 7;
+  // On a cluster node: the map's partitions other nodes hold, in id order.
+  repeated string other_partitions = 8;
+}
+
+// One partition a cluster node holds, as `Admin.Info` reports it (ICR 0117, #1852).
+message PartitionInfo {
+  string id = 1;
+  // Its database file, as the node opened it.
+  string path = 2;
+  // Unset unless it's open (serving or fenced).
+  uint64 file_bytes = 3;
+  // Its tables, as its own file has them. Empty unless it's open.
+  repeated string tables = 4;
+  // As `Cluster.Status` reports it: serving, fenced, closed or opening. Unspecified for a
+  // partition the map places here that the node hasn't opened (no file, or a failed open).
+  LocalPartitionState state = 5;
+  // Why a fenced partition is fenced.
+  FenceReason fence_reason = 6;
+}
+
+// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
+// acts on every partition the map gives the node that's open (the ones `Info` lists), trying
+// each even after one fails, and answers the first failure's code with every failed
+// partition named. A partition named acts on that one (`WrongPartition` for one another
+// node holds, `PartitionUnavailable` for one closed or not open here). On a single node it
+// must be empty (`InvalidArgument`).
+message MaintenanceRequest {
+  string partition = 1;
 }
 
 message BackupRequest {

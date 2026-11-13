@@ -60,8 +60,8 @@ pub(crate) enum ServiceOp {
     DropTable(proto::DropTableRequest),
     DescribeTable(proto::DescribeTableRequest),
     Info(proto::Empty),
-    Flush(proto::Empty),
-    Compact(proto::Empty),
+    Flush(proto::MaintenanceRequest),
+    Compact(proto::MaintenanceRequest),
     Backup(proto::BackupRequest),
     BackupDownload(proto::BackupDownloadRequest),
     Metrics(proto::Empty),
@@ -482,6 +482,13 @@ pub(crate) const PARTITION_ATTRIBUTE: &str = "pigeonhole.partition";
 /// A backup's partition named on a single node, which has none (D317 ticket 8b).
 fn single_node_partition() -> ApiError {
     ApiError::invalid("this server isn't a cluster node: a backup names no partition here")
+}
+
+/// A flush or compaction's partition named on a single node, which has none (#1852).
+fn single_node_maintenance() -> ApiError {
+    ApiError::invalid(
+        "this server isn't a cluster node: a flush or compaction names no partition here",
+    )
 }
 
 /// A last chunk's identity fields (D317 ticket 8b), empty on a single node.
@@ -1745,15 +1752,25 @@ impl Service {
                     tables,
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                     replica: self.replica_info(),
+                    partitions: Vec::new(),
+                    other_partitions: Vec::new(),
                 }))
             }
-            ServiceOp::Flush(_) => {
+            // On a cluster node the router serves these across its partitions (#1852): one
+            // that reaches here is a single node's, or a partition's own.
+            ServiceOp::Flush(r) => {
                 drop(budget);
+                if !r.partition.is_empty() {
+                    return Err(single_node_maintenance());
+                }
                 self.part()?.db.flush_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
-            ServiceOp::Compact(_) => {
+            ServiceOp::Compact(r) => {
                 drop(budget);
+                if !r.partition.is_empty() {
+                    return Err(single_node_maintenance());
+                }
                 self.part()?.db.compact_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
