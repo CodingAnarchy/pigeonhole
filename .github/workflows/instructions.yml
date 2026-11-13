@@ -29,6 +29,7 @@ on:
       - 'crates/bench/examples/writepath.rs'
       - 'crates/bench/examples/ycsb.rs'
       - 'crates/bench/examples/textshapes.rs'
+      - 'crates/bench/examples/feedshapes.rs'
       - 'crates/text/**'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
@@ -131,10 +132,10 @@ jobs:
     # re-baseline of every ceiling in the same PR (#1795).
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # Two jobs in parallel (#1575): the read and write shapes, and the text-search shapes,
-    # which alone took about 20 minutes a side under valgrind and pushed one job to its
-    # 60-minute timeout. Each builds and counts only its own examples, and checks only its
-    # own shapes against the ceilings.
+    # Jobs in parallel (#1575): the read and write shapes; the text-search shapes, which
+    # alone took about 20 minutes a side under valgrind and pushed one job to its 60-minute
+    # timeout; and the feed and replication shapes (#1828). Each builds and counts only its
+    # own examples, and checks only its own shapes against the ceilings.
     strategy:
       fail-fast: false
       matrix:
@@ -155,8 +156,8 @@ jobs:
             # would make the shapes nondeterministic. The default spin is checked on wall
             # time instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
             shapes: >-
-              readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
-              writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,flush,compact
+              readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,wide-row-cells-async,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
+              writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,commit-put-previous-async,commit-if-returning-async,flush,compact
               ycsb:ycsb-c,ycsb-a
               scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
           - name: text search instructions per search (callgrind)
@@ -165,6 +166,15 @@ jobs:
             hotrow: '-'
             shapes: >-
               textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2
+          - name: feed and replication instructions per commit (callgrind)
+            # The change feed's drain and a replica's apply (#1828,
+            # crates/bench/examples/feedshapes.rs): commits written in setup, drained or
+            # applied in the measured part. `replicate-apply` last: its setup (a primary and
+            # its feed) is the fullest.
+            examples: feedshapes
+            hotrow: '-'
+            shapes: >-
+              feedshapes:feed-drain,feed-drain-all,replicate-apply
     env:
       EXAMPLES: ${{ matrix.examples }}
       SHAPES: ${{ matrix.shapes }}
