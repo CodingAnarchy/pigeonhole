@@ -371,7 +371,7 @@ impl Router {
             p.set_fence_reason(reason);
             if let Some(part) = open.get(id) {
                 let db = part.db.clone();
-                let info = self.service.run_blocking(move || Ok(db.info()?)).await?;
+                let info = self.service.blocking(move || Ok(db.info()?)).await?;
                 p.path = part.db.path().display().to_string();
                 p.file_bytes = info.file_bytes;
                 p.tables = part.0.user_tables();
