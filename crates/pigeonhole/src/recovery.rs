@@ -628,9 +628,10 @@ mod tests {
     }
 
     /// #966, perf287's S1 on #968: a commit that resolves after its call returned (a ticket,
-    /// an async commit), refused by the failed engine before it logged anything and looked
-    /// at only after the swap, is `Busy` (not committed, retry on the recovered engine), as a
-    /// sync commit refused there is once it waited for the swap.
+    /// an async commit, an async returning commit: audit P2-C8), refused by the failed engine
+    /// before it logged anything and looked at only after the swap, is `Busy` (not
+    /// committed, retry on the recovered engine), as a sync commit refused there is once it
+    /// waited for the swap.
     #[test]
     fn a_ticket_or_async_commit_refused_before_the_swap_is_busy_after_it() {
         let vfs = SimVfs::new(9662);
@@ -646,6 +647,7 @@ mod tests {
             .table("t")
             .unwrap()
             .family("f", Family::default())
+            .family("c", Family::counter())
             .create_if_missing()
             .unwrap();
         // Held until the refusals are in, so neither commit meets the closing engine.
@@ -669,6 +671,8 @@ mod tests {
         let ticket = wb.commit_with_ticket(crate::Durability::Buffered).unwrap();
         #[cfg(feature = "async")]
         let fut = t.mutate(b"z").put("f", b"q", b"3").commit_async();
+        #[cfg(feature = "async")]
+        let returning = t.mutate(b"n").incr("c", b"q", 1).commit_returning_async();
         // Let the supervisor go, and wait for the swap.
         db.db.supervision().unwrap().test_hold.release();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -689,6 +693,8 @@ mod tests {
         {
             let e = crate::doc_support::block_on(fut).unwrap_err();
             assert_eq!(e.code(), ErrorCode::Busy, "async: {e}");
+            let e = crate::doc_support::block_on(returning).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Busy, "async returning: {e}");
         }
         drop(t);
         db.close().unwrap();
