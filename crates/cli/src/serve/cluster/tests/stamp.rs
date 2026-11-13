@@ -404,3 +404,107 @@ fn a_move_run_again_after_its_stamp_copies_and_checks_the_set_again() {
         let _ = db.close();
     }
 }
+
+/// `relocate --copy` keeps the partition's history, so it must not serve a copy without
+/// writes the old node acknowledged since (the coordinator's call after audit120's F1). It
+/// changes the map only when the set the new node installs is the old node's closed set,
+/// file by file, and points at `move` otherwise.
+#[test]
+fn relocate_copy_refuses_a_copy_that_isnt_the_old_nodes_closed_files() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let [a, b, c] = ports;
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    let req = || PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    let p1_in_map = async || {
+        let m = client(b)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap().clone();
+        (p1.node, p1.epoch)
+    };
+    let relocate_copy = async || {
+        within(super::super::cli::relocate(&args, "p1", "c", false, true))
+            .await
+            .err()
+            .expect("refused")
+            .message()
+            .to_owned()
+    };
+    rt.block_on(async {
+        put(b, "alice", "1").await;
+        // Fenced, not closed: its files aren't final.
+        client(a).await.fence(req()).await.unwrap();
+        let e = relocate_copy().await;
+        assert!(e.contains("isn't closed there"), "{e}");
+        assert!(e.contains("phdb cluster move p1 --to c"), "{e}");
+        // A copy of one close staged on c; a then serves again and takes a write, and
+        // closes again: c's staged set isn't a's closed set any more.
+        client(a).await.close(req()).await.unwrap();
+        upload_set(c, "p1", &dirs[0].join("p1.phdb"), 2).await;
+        client(a).await.unfence(req()).await.unwrap();
+        eventually("a to serve p1 again", async || {
+            data(b)
+                .await
+                .mutate(crate::serve::proto::MutateRequest {
+                    writes: Some(put_row("alice", "2")),
+                    durability: 0,
+                })
+                .await
+                .is_ok()
+        })
+        .await;
+        client(a).await.fence(req()).await.unwrap();
+        client(a).await.close(req()).await.unwrap();
+        let e = relocate_copy().await;
+        assert!(e.contains("aren't the ones node \"a\" closed"), "{e}");
+        assert!(e.contains("The map is unchanged"), "{e}");
+        assert_eq!(p1_in_map().await, ("a".to_owned(), 1));
+        // Again: c's file is stamped already, and nothing is staged to check.
+        let e = relocate_copy().await;
+        assert!(e.contains("installed no staged copy"), "{e}");
+        assert_eq!(p1_in_map().await, ("a".to_owned(), 1));
+        // The safe path: move copies a's closed files itself, and the write is there.
+        within(super::super::moving::run(&args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the move: {}", e.message()));
+        eventually("c to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"2".to_vec())
+        })
+        .await;
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}

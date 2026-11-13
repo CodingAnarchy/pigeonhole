@@ -437,7 +437,29 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
             .lock()
             .unwrap()
             .push((t.dirs[2].clone(), wait));
-        within(super::super::cli::relocate(&t.args, "p1", "c", false, true))
+        // Set at the writer (a) by hand, marked as copied: `relocate --copy` now refuses a
+        // copy that isn't a's closed set, so this test sets the map a careless relocation
+        // used to (the coordinator's call on `relocate --copy` after audit120's F1).
+        let mut m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let version = m.map_version;
+        for q in m.partitions.iter_mut().filter(|q| q.id == "p1") {
+            q.node = "c".into();
+            q.epoch += 1;
+        }
+        m.map_version += 1;
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: version,
+                map: Some(m),
+                copies: vec!["p1".into()],
+            })
             .await
             .unwrap();
         let status = client(a)
@@ -477,5 +499,74 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
             .expect("the subscription from a's new session still follows p1's old copy on a")
             .expect_err("its position is past c's copy");
         assert_eq!(code(&ended), "FeedExpired", "{ended}");
+    });
+}
+
+#[test]
+fn a_moves_map_step_refuses_once_the_old_node_was_reopened_since_its_check() {
+    // audit120's P2-C3: a move compared its copy with a's closed set, then stalled before
+    // its map step. Meanwhile a was unfenced, took a write, and was fenced and closed again.
+    // The map step, resumed with the set it checked, finds a's closed files changed and
+    // leaves the map as it was, rather than serving the copy without the write.
+    let t = Cluster::start();
+    let [a, b, _] = t.ports;
+    let p1 = || crate::serve::proto::PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        let stopped = within(super::super::moving::run(&t.args, "p1", "c", false, None)).await;
+        assert!(
+            stopped.is_err(),
+            "the move stops after its stamp and compare"
+        );
+        let checked = client(a)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == "p1")
+            .unwrap()
+            .files;
+        assert!(!checked.is_empty(), "a's closed set, hashed");
+
+        client(a).await.unfence(p1()).await.unwrap();
+        put(b, "bob", "2").await;
+        client(a).await.fence(p1()).await.unwrap();
+        client(a).await.close(p1()).await.unwrap();
+
+        let e = within(super::super::cli::relocate_as(
+            &t.args,
+            "p1",
+            "c",
+            false,
+            super::super::cli::CopyCheck::Checked(checked),
+        ))
+        .await
+        .err()
+        .expect("refused");
+        assert!(e.message().contains("reopened since"), "{}", e.message());
+        let m = client(b)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!((p.node.as_str(), p.epoch), ("a", 1), "the map is unchanged");
+        // The move, run again, copies a's closed files again: bob is there.
+        within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the move: {}", e.message()));
+        eventually("c to serve p1 with bob", async || {
+            get_row(b, "bob").await.ok().flatten() == Some(b"2".to_vec())
+        })
+        .await;
     });
 }
