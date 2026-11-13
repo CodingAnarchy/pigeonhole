@@ -663,3 +663,53 @@ fn a_single_node_refuses_a_cluster_subscriptions_fields() {
         assert!(e.message.contains("cluster"), "{e:?}");
     }
 }
+
+#[test]
+fn a_refused_token_expires_even_where_the_ring_covers_its_seqno() {
+    // #1805's Windows run: a resume reads its own stream, and the engine reports a token it
+    // refused (here, a writer session the history doesn't hold) on that stream's first read.
+    // A client looked at the ring first, and a ring covering the token's seqno took it on
+    // without that read: the refusal was never seen and the stream went on. It must end
+    // with `FeedExpired` whatever the ring holds.
+    let s = Server::start("", limits());
+    // A live subscriber keeps the hub's ring around the commits below.
+    let mut live = direct_feed(&s, subscribe(&["t"], b""));
+    write_row(&s, b"r1");
+    let first = loop {
+        let e = next_event(&s, &mut live, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        if commit_of(&e).is_some() {
+            break e.token.to_vec();
+        }
+    };
+    write_row(&s, b"r2");
+    drain(&s, &mut live, Duration::from_millis(300));
+    // The token after r1, its writer session (bytes 29..37 of a D310 token) one the
+    // history doesn't hold.
+    assert!(
+        matches!(first.first(), Some(1 | 2)),
+        "a D310 token: {first:?}"
+    );
+    let mut forged = first.clone();
+    forged[29..37].copy_from_slice(&0x0bad_5e55_1011_u64.to_le_bytes());
+    let mut resumed = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(forged.into())),
+            ..subscribe(&["t"], b"")
+        },
+    );
+    let e = loop {
+        match next_event(&s, &mut resumed, Duration::from_secs(5))
+            .expect("the stream ends rather than waits")
+        {
+            Ok(e) => assert!(
+                commit_of(&e).is_none(),
+                "a commit after a refused token: {e:?}"
+            ),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(e.code, "FeedExpired", "{}", e.message);
+}
