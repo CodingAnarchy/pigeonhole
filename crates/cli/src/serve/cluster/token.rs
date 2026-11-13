@@ -14,7 +14,7 @@
 //!   make tokens larger, never wrong.
 
 use prost::bytes::Bytes;
-use prost::encoding::{decode_varint, encode_varint};
+use prost::encoding::decode_varint;
 
 /// The first byte of a cluster token: never a D310 token's version (1 or 2), so a single
 /// node's token sent to a cluster, or a cluster's to a single node, is recognised as such.
@@ -125,8 +125,23 @@ pub(crate) fn subscription_hash(tables: &[String], prefix: &[u8], visible: bool)
     h
 }
 
+/// `v` as a LEB128 varint, as `prost::encoding::encode_varint` writes it, straight into a
+/// `Vec`: a one-partition subscription's checkpoint writes about a dozen of them on every
+/// event (#1798 (b)).
+#[inline]
+fn put_varint(mut v: u64, out: &mut Vec<u8>) {
+    // Byte by byte: `push` inlines to a capacity check and a store, where a slice copy of
+    // one to ten bytes is a call to `memcpy` (most of the checkpoint's time in #1798's
+    // profile).
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    encode_varint(b.len() as u64, out);
+    put_varint(b.len() as u64, out);
     out.extend_from_slice(b);
 }
 
@@ -207,6 +222,14 @@ impl TokenCache {
             self.parts.resize_with(n, Default::default);
         }
         out.extend_from_slice(&self.prefix);
+        // One part: its position moves with every event, so a cached component would never
+        // be reused. It's built straight into `out` (#1798 (b)).
+        if n == 1 {
+            for (partition, epoch, at) in components {
+                put_component(partition, epoch, at, out, &mut self.scratch);
+            }
+            return;
+        }
         for ((partition, epoch, at), part) in components.zip(&mut self.parts) {
             if !matches!(&part.made_from, Some((e, a)) if *e == epoch && a == at) {
                 part.bytes.clear();
@@ -223,24 +246,38 @@ fn put_prefix(cluster_id: &str, map_version: u64, subscription: u64, n: usize, o
     out.push(MAGIC);
     out.push(VERSION);
     put_bytes(out, cluster_id.as_bytes());
-    encode_varint(map_version, out);
+    put_varint(map_version, out);
     out.extend_from_slice(&subscription.to_le_bytes());
-    encode_varint(n as u64, out);
+    put_varint(n as u64, out);
 }
 
-/// One component's bytes; `scratch` holds its compacted token on the way.
+/// One component's bytes; `scratch` holds a compacted token of 128 bytes or more on the way.
 fn put_component(partition: &str, epoch: u64, at: &At, out: &mut Vec<u8>, scratch: &mut Vec<u8>) {
     put_bytes(out, partition.as_bytes());
-    encode_varint(epoch, out);
+    put_varint(epoch, out);
     match at {
         At::Now => out.push(NOW),
         At::Oldest => out.push(OLDEST),
         At::Token(token) => {
-            scratch.clear();
-            if compact_into(token, scratch) {
-                out.push(COMPACT);
-                put_bytes(out, scratch);
+            // Compacted straight into `out` behind a one-byte length, patched after: a
+            // compacted token is under 128 bytes at any likely stream count, so the copy
+            // through `scratch` and its length varint are saved on every event (#1798 (b)).
+            // A longer one moves its bytes up for the wider length.
+            out.push(COMPACT);
+            let len_at = out.len();
+            out.push(0);
+            if compact_into(token, out) {
+                let n = out.len() - len_at - 1;
+                if n < 0x80 {
+                    out[len_at] = n as u8;
+                } else {
+                    scratch.clear();
+                    scratch.extend_from_slice(&out[len_at + 1..]);
+                    out.truncate(len_at);
+                    put_bytes(out, scratch);
+                }
             } else {
+                out.truncate(len_at - 1);
                 out.push(RAW);
                 put_bytes(out, token);
             }
@@ -271,20 +308,20 @@ fn compact_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
     }
     let from = out.len();
     out.extend_from_slice(&raw[..17]);
-    encode_varint(streams as u64, out);
-    encode_varint(u64_at(21), out);
+    put_varint(streams as u64, out);
+    put_varint(u64_at(21), out);
     out.extend_from_slice(&raw[29..37]);
     let mut prev = 0u64;
     for s in 0..streams {
         let (hint, end) = (u64_at(HEAD + s * 16), u64_at(HEAD + s * 16 + 8));
-        encode_varint(zigzag(hint.wrapping_sub(prev) as i64), out);
-        encode_varint(zigzag(end.wrapping_sub(hint) as i64), out);
+        put_varint(zigzag(hint.wrapping_sub(prev) as i64), out);
+        put_varint(zigzag(end.wrapping_sub(hint) as i64), out);
         prev = hint;
     }
     if version == 2 {
         let at = HEAD + streams * 16;
-        encode_varint(u64_at(at), out);
-        encode_varint(u64_at(at + 8), out);
+        put_varint(u64_at(at), out);
+        put_varint(u64_at(at + 8), out);
     }
     // Once the length matches the layout, every field is read whole and each step (a
     // varint, a zigzag of a wrapping difference) is exact, so the bytes come back as they
@@ -346,6 +383,30 @@ pub(crate) fn expand(small: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn put_varint_writes_what_prost_writes() {
+        // Every length's edges, and a seeded spread between them.
+        let mut values = vec![0u64, u64::MAX];
+        for bits in 1..64 {
+            let v = 1u64 << bits;
+            values.extend([v - 1, v, v + 1]);
+        }
+        let seed = 0x5eed_1798u64;
+        let mut x = seed;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            values.push(x >> (x % 64));
+        }
+        for v in values {
+            let (mut ours, mut theirs) = (vec![0xAA], vec![0xAA]);
+            put_varint(v, &mut ours);
+            prost::encoding::encode_varint(v, &mut theirs);
+            assert_eq!(ours, theirs, "{v} (seed {seed:#x})");
+        }
+    }
 
     /// A cluster token's bytes, appended to `out`, from its parts as a subscription holds them,
     /// so a checkpoint (one per event on a one-partition subscription) builds no
@@ -570,6 +631,39 @@ mod tests {
             };
             assert_eq!(ClusterToken::decode(&t.encode()).unwrap(), t);
         }
+    }
+
+    #[test]
+    fn a_component_compacted_in_place_round_trips_on_both_sides_of_a_one_byte_length() {
+        // #1798 (b): a component's compacted token is written straight into the output
+        // behind a one-byte length, and one of 128 bytes or more moves up for the wider
+        // length. Tokens around that edge, one part each, come back byte for byte.
+        let mut seen = std::collections::BTreeSet::new();
+        for streams in 0..40u32 {
+            let raw = d310(2, streams, 1 << 20);
+            let len = compact(&raw).expect("a known layout compacts").len();
+            seen.insert(len >= 0x80);
+            let t = ClusterToken {
+                cluster_id: "c1".into(),
+                map_version: 5,
+                subscription: 9,
+                components: vec![Component {
+                    partition: "p1".into(),
+                    epoch: 3,
+                    at: At::Token(Bytes::from(raw)),
+                }],
+            };
+            assert_eq!(
+                ClusterToken::decode(&t.encode()).unwrap(),
+                t,
+                "{streams} streams, compacted to {len} bytes"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "lengths on both sides of 128 were tried: {seen:?}"
+        );
     }
 
     #[test]
