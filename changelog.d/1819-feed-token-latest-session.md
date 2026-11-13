@@ -1,0 +1,2 @@
+### Fixed
+- **A change feed token that crossed a writer restart could name the older session** (#1810). Session ids are random, and the reader kept the larger one rather than the later one. Resumed on a copy of the database that held the older session but not the later one (a backup restored to before the reopen, or a cluster copy taken before it), the token wasn't refused, and the feed could go on past commits it never had. It now names the later session, so that resume expires.
