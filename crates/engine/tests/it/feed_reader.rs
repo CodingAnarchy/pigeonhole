@@ -886,3 +886,32 @@ fn a_rollback_from_1_2_after_a_crash_in_a_root_commit_keeps_the_feed_and_resolve
         db.close().unwrap();
     }
 }
+
+#[test]
+fn a_token_taken_before_any_record_names_the_session_and_a_gap_expires_it() {
+    // audit120's P2-C6: a feed that had read nothing yet handed out a token naming session
+    // 0, and a resume runs the history check only for a nonzero session. Here a session
+    // with the feed off writes in between, as in
+    // `a_session_without_the_feed_between_expires_a_token`, but the token predates every
+    // record: it must name its session and expire all the same.
+    let vfs = SimVfs::new(3881);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _) = tables(&db);
+    let token = db.feed(spec(&[&a], FeedStart::Now)).unwrap().token();
+    assert_ne!(
+        token_session(&token),
+        0,
+        "a token names its session from the open"
+    );
+    db.close().unwrap();
+    let db = open(&vfs, None);
+    single(&db, &a, b"unfed", Durability::GroupSync);
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "a gap is never skipped silently, whenever the token was taken"
+    );
+    db.close().unwrap();
+}

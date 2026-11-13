@@ -454,6 +454,10 @@ impl FeedReader {
                     FeedStart::Token(_) => unreachable!("handled above"),
                 };
                 this.delivered = bound;
+                // The bound and the starts are this session's state, so a token taken
+                // before any record is read names it: with 0 a resume skipped the history
+                // check (audit120's P2-C6).
+                this.session = this.current;
                 let mut starts = Vec::with_capacity(this.shared.shards);
                 for (s, m) in marks.iter().enumerate() {
                     // A reader process has no checkpoint history: from its checkpoint for
