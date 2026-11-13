@@ -12,8 +12,6 @@
 //! | `commit-overwrite` | 500 commits of one 100-byte cell over one of 2,000 existing rows (`ycsb-a`'s write) | commits |
 //! | `commit-put-previous` | `commit-overwrite`'s commits through `commit_returning`, each asking for the cell's previous value (get-and-set, D314 amendment 1): a point read per commit | commits |
 //! | `commit-if-returning` | `commit-overwrite`'s commits through `commit_if_returning` on the cell existing, which always holds (compare-and-set-then-read, D314 amendment 2): the condition's read, and the cell read again as of the commit | commits |
-//! | `commit-put-previous-async` | `commit-put-previous`'s commits through `commit_returning_async`, each awaited (#1828) | commits |
-//! | `commit-if-returning-async` | `commit-if-returning`'s commits through `commit_if_returning_async`, each awaited (#1828) | commits |
 //! | `commit-async` | 500 commits of one 100-byte cell through `commit_async`, each awaited (an uncontended async commit, D210) | commits |
 //! | `commit-at` | 500 timestamped appends of one 100-byte cell to a new row of a family with a TTL (`time-series-ttl`'s write) | commits |
 //! | `commit-incr` | 500 blind `incr`s of one counter, its base in an SST | commits |
@@ -96,11 +94,7 @@ fn main() {
             measure(&mut || shape_commit_sixteen(&t, &rows, &quals));
             rows.len()
         }
-        "commit-overwrite"
-        | "commit-put-previous"
-        | "commit-if-returning"
-        | "commit-put-previous-async"
-        | "commit-if-returning-async" => {
+        "commit-overwrite" | "commit-put-previous" | "commit-if-returning" => {
             // A fixed set of rows, written first; the measured commits overwrite them in a
             // scattered order, so each lands inside the memtable's existing keys.
             let set = rows("ow", 2_000);
@@ -110,16 +104,12 @@ fn main() {
             let order: Vec<Vec<u8>> = (0..500 * iters)
                 .map(|i| set[i * 7_919 % set.len()].clone())
                 .collect();
-            match shape.as_str() {
-                "commit-put-previous" => measure(&mut || shape_commit_put_previous(&t, &order)),
-                "commit-if-returning" => measure(&mut || shape_commit_if_returning(&t, &order)),
-                "commit-put-previous-async" => {
-                    measure(&mut || shape_commit_put_previous_async(&t, &order));
-                }
-                "commit-if-returning-async" => {
-                    measure(&mut || shape_commit_if_returning_async(&t, &order));
-                }
-                _ => measure(&mut || shape_commit_one(&t, &order)),
+            if shape == "commit-put-previous" {
+                measure(&mut || shape_commit_put_previous(&t, &order));
+            } else if shape == "commit-if-returning" {
+                measure(&mut || shape_commit_if_returning(&t, &order));
+            } else {
+                measure(&mut || shape_commit_one(&t, &order));
             }
             order.len()
         }
@@ -195,8 +185,7 @@ fn main() {
         }
         other => panic!(
             "unknown shape {other}: commit-one, commit-sixteen, commit-overwrite, \
-             commit-put-previous, commit-if-returning, commit-put-previous-async, \
-             commit-if-returning-async, commit-at, \
+             commit-put-previous, commit-if-returning, commit-at, \
              commit-async, commit-incr, commit-incr-returning, commit-incr-returning-spread, \
              flush or compact"
         ),
@@ -249,51 +238,6 @@ fn shape_commit_if_returning(t: &Table, rows: &[Vec<u8>]) {
             .put("f", b"q", &VALUE)
             .commit_if_returning(&exists)
             .unwrap()
-        {
-            pigeonhole::Checked::Applied(r) => {
-                n += r.current("f", b"q").unwrap().map_or(0, |c| c.value().len());
-            }
-            pigeonhole::Checked::NotApplied(_) => unreachable!("every row was written"),
-        }
-    }
-    std::hint::black_box(n);
-}
-
-#[inline(never)]
-fn shape_commit_put_previous_async(t: &Table, rows: &[Vec<u8>]) {
-    let _measured = Measured::start();
-    let mut n = 0usize;
-    for row in rows {
-        let r = pigeonhole::doc_support::block_on(
-            t.mutate(row)
-                .put("f", b"q", &VALUE)
-                .return_previous("f", b"q")
-                .commit_returning_async(),
-        )
-        .unwrap();
-        n += r
-            .previous("f", b"q")
-            .unwrap()
-            .map_or(0, |c| c.value().len());
-    }
-    std::hint::black_box(n);
-}
-
-#[inline(never)]
-fn shape_commit_if_returning_async(t: &Table, rows: &[Vec<u8>]) {
-    let exists = pigeonhole::Condition::Exists {
-        family: "f".into(),
-        qualifier: b"q".to_vec(),
-    };
-    let _measured = Measured::start();
-    let mut n = 0usize;
-    for row in rows {
-        match pigeonhole::doc_support::block_on(
-            t.mutate(row)
-                .put("f", b"q", &VALUE)
-                .commit_if_returning_async(&exists),
-        )
-        .unwrap()
         {
             pigeonhole::Checked::Applied(r) => {
                 n += r.current("f", b"q").unwrap().map_or(0, |c| c.value().len());
