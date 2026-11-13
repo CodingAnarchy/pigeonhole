@@ -249,3 +249,28 @@ fn a_restart_without_shards_keeps_the_servers_default_count() {
     assert_eq!(served_shards(&file, None), default);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_token_source_that_holds_no_token_fails_the_start() {
+    // audit120's S-S7: an empty token file on loopback started a server where every caller
+    // was an anonymous admin.
+    use super::tokens_from;
+    for (file, env) in [
+        (Some(""), None),
+        (Some("# only a comment\n\n"), None),
+        (None, Some("")),
+        (Some(""), Some("  \n")),
+    ] {
+        let e = tokens_from(file, env).unwrap_err();
+        assert!(
+            e.message().contains("holds no tokens"),
+            "{file:?} {env:?}: {}",
+            e.message()
+        );
+    }
+    // Neither given: no tokens, as before (the bind rule then allows only loopback).
+    assert!(!tokens_from(None, None).unwrap().any());
+    // A token in either source is enough.
+    assert!(tokens_from(Some("read r3ad\n"), Some("")).unwrap().any());
+    assert!(tokens_from(Some(""), Some("admin b0ss")).unwrap().any());
+}
