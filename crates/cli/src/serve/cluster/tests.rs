@@ -1024,9 +1024,13 @@ fn run_alone(module: &str, test: &str, body: fn()) {
     );
     assert!(stdout.contains("1 passed"), "{stdout}");
     // A child that skipped (no pinning here, too few cores) says so in this test's output
-    // too, rather than passing silently (cli692's N1 on #1763).
-    for line in stdout.lines().filter(|l| l.starts_with("skipped:")) {
-        println!("{line}");
+    // too, where the run shows it (--nocapture) (cli692's N1 on #1763). libtest prints
+    // "test <name> ... " before the test runs, so the skip may sit mid-line (cli692's S1 on
+    // #1855).
+    for line in stdout.lines() {
+        if let Some(i) = line.find("skipped:") {
+            println!("{}", &line[i..]);
+        }
     }
 }
 
