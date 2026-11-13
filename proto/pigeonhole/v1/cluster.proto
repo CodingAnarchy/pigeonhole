@@ -119,8 +119,9 @@ enum LocalPartitionState {
 // Why a partition is fenced (D317 ticket 6).
 enum FenceReason {
   FENCE_REASON_UNSPECIFIED = 0;
-  // `phdb cluster fence`: kept in the node's `fenced.json` across a restart, lifted only by
-  // `phdb cluster unfence`.
+  // `phdb cluster fence`, or a `close` (which makes any fence the operator's): kept in the
+  // node's `fenced.json` across a restart, lifted by `phdb cluster unfence`, or by a stamp
+  // that installs another copy of the partition (a move or relocation onto that node).
   FENCE_REASON_OPERATOR = 1;
   // Fenced since the node started, until a peer's map at least as new as the node's names
   // it for the partition at the file's epoch (or `phdb cluster unfence`).

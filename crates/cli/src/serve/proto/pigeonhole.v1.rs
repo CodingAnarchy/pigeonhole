@@ -615,8 +615,9 @@ pub struct ReplicaInfo {
     /// The primary's URL (`--replica-of`).
     #[prost(string, tag = "1")]
     pub primary: ::prost::alloc::string::String,
-    /// "starting", "bootstrapping", "following", "re-bootstrapping" or "retrying"
-    /// (after an error, which `last_error` gives).
+    /// "starting", "bootstrapping", "following", "re-bootstrapping", "retrying" (after an
+    /// error, which `last_error` gives) or "stopped" (a promote failed past its stop: the
+    /// replica follows nothing until it's restarted).
     #[prost(string, tag = "2")]
     pub state: ::prost::alloc::string::String,
     /// The primary's seqno the replica applied through.
@@ -1089,7 +1090,8 @@ pub mod admin_client {
         }
         /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
         /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
-        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
+        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
+        /// on one whose first bootstrap hasn't finished (it goes on bootstrapping).
         pub async fn promote(
             &mut self,
             request: impl tonic::IntoRequest<super::Empty>,
@@ -1230,7 +1232,8 @@ pub mod admin_server {
         ) -> std::result::Result<tonic::Response<super::MetricsResponse>, tonic::Status>;
         /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
         /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
-        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
+        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
+        /// on one whose first bootstrap hasn't finished (it goes on bootstrapping).
         async fn promote(
             &self,
             request: tonic::Request<super::Empty>,
@@ -6598,8 +6601,9 @@ impl LocalPartitionState {
 #[repr(i32)]
 pub enum FenceReason {
     Unspecified = 0,
-    /// `phdb cluster fence`: kept in the node's `fenced.json` across a restart, lifted only by
-    /// `phdb cluster unfence`.
+    /// `phdb cluster fence`, or a `close` (which makes any fence the operator's): kept in the
+    /// node's `fenced.json` across a restart, lifted by `phdb cluster unfence`, or by a stamp
+    /// that installs another copy of the partition (a move or relocation onto that node).
     Operator = 1,
     /// Fenced since the node started, until a peer's map at least as new as the node's names
     /// it for the partition at the file's epoch (or `phdb cluster unfence`).

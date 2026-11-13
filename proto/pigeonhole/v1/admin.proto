@@ -24,7 +24,8 @@ service Admin {
   rpc Metrics(Empty) returns (MetricsResponse);
   // Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
   // it stops following, takes writes, and returns the primary's token it stopped at (#1436).
-  // Nothing fences the old primary. FailedPrecondition on a server that isn't a replica.
+  // Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
+  // on one whose first bootstrap hasn't finished (it goes on bootstrapping).
   rpc Promote(Empty) returns (PromoteResponse);
   // On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
   // relocation by file copy. It's staged aside, never served; the stamp that relocates or
@@ -44,8 +45,9 @@ message PromoteResponse {
 message ReplicaInfo {
   // The primary's URL (`--replica-of`).
   string primary = 1;
-  // "starting", "bootstrapping", "following", "re-bootstrapping" or "retrying"
-  // (after an error, which `last_error` gives).
+  // "starting", "bootstrapping", "following", "re-bootstrapping", "retrying" (after an
+  // error, which `last_error` gives) or "stopped" (a promote failed past its stop: the
+  // replica follows nothing until it's restarted).
   string state = 2;
   // The primary's seqno the replica applied through.
   uint64 applied_primary_seqno = 3;

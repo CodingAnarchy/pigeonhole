@@ -502,5 +502,12 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
 
 Nothing is persisted client-side. The report gives the write downtime (fence to map, when this run fenced), the read downtime (close to serving), each file's size and bytes sent, whether the copy was verified, and what happened to the source.
 
+## Amendment: fences and moves after #1800 (1.2.0 audit)
+- **`Close` makes the fence the operator's, and persists it.** Whatever fenced the partition (`phdb cluster fence`, or the start fence), a close turns it into an operator's fence in `fenced.json`, so a closed partition doesn't reopen and lift its fence on a peer's map at a restart, mid-move.
+- **A stamp that installs a staged set clears the operator's fence** on that node: the files are another copy, at a new epoch (a move or relocation back onto a node that once held the partition). A stamp that installs nothing keeps the fence. A restore's stamps keep it, and the restore lifts it once its map is set.
+- **`move` step 1 fences P whenever it's open on OLD,** fenced already or not (a start fence isn't persisted), and refuses a partition that is still `opening` there: run the move again once it's open.
+- **The report's `verified`** is `true` for every move that copied: the installed set is always compared with OLD's closed files before the map changes. Only a run that finds the move already done reports `false`, since it compared nothing.
+- **`FENCE_REASON_OPERATOR`** (`cluster.proto`) says the same: set by `fence` or a `close`, lifted by `unfence` or by a stamp that installs a set.
+
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.

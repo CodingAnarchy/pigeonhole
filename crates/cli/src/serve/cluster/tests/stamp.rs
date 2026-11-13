@@ -299,6 +299,84 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
     }
 }
 
+/// The audit's P2-D3, the guide's recipe for a lost node: a partition whose node is gone
+/// comes back from a backup's copy of its file, placed by hand in the new node's `DIR`.
+/// The copy is at the map's epoch for the partition (nothing moved it since the backup), so
+/// `relocate --old-unreachable` stamps it to the next epoch and moves the map: what the
+/// backup held is served there, and the writes after the backup are lost.
+#[test]
+fn relocate_old_unreachable_serves_a_backup_copy_placed_by_hand() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    // b is lost, not a: a, the smallest id, writes the map (a down writer needs
+    // `set-map --force` first, as the guide says).
+    let [a, _, c] = ports;
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{a}"),
+        token_file: None,
+        ca: None,
+    };
+    // "zed" is past the split at "m": partition p2, on b.
+    rt.block_on(put(a, "zed", "1"));
+    // Last night's backup of p2 (`phdb cluster backup` writes the same copy).
+    let backup = test_dir().join("p2.phdb");
+    dbs[1].backup(&backup).unwrap();
+    rt.block_on(put(a, "zed", "2"));
+    // Node b is lost: its server stops and its files are gone with it.
+    drop(stops.remove(1));
+    dbs.remove(1).close().unwrap();
+    // The recipe: the copy into c's DIR as `p2.phdb`, then relocate --old-unreachable.
+    std::fs::copy(&backup, dirs[2].join("p2.phdb")).unwrap();
+    rt.block_on(async {
+        let r = within(async {
+            loop {
+                match super::super::cli::relocate(&args, "p2", "c", true, false).await {
+                    // b's server may still be closing: it answers until it has.
+                    Err(e) if e.message().contains("answers and serves") => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    r => break r,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        eventually("c to serve p2 from the backup", async || {
+            get_row(a, "zed").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+        assert_eq!(
+            get_row(c, "zed").await.unwrap(),
+            Some(b"1".to_vec()),
+            "the write after the backup is lost"
+        );
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
 /// A `phdb cluster move` run again after an earlier one stamped the new node but died
 /// before the map moved: it copies the old node's closed set again, the stamp installs it
 /// over the earlier copy (which moves aside), and the move compares it, so `--drop-source`
