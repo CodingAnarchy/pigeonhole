@@ -2397,6 +2397,10 @@ impl FeedReader {
             // A table of this commit the catalog doesn't have (#1853), checked in this pass:
             // a commit's changes run by table, so each run is checked once, and a run of the
             // table the last one ended with (`present_last`) costs no lookup at all.
+            // The order is deliberate (feed1248's N1 on #1874): the changes are taken in the
+            // same pass, so a commit with a missing table may end on its values first, a blob
+            // gone (`FeedExpired` too, worded for retention) or a read error. Checking before
+            // the values would bring back the second pass this replaces.
             let mut missing = false;
             if every {
                 let mut last = self.present_last;
