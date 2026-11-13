@@ -321,9 +321,10 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
     // The retry fires on time: the backoff doubled, from 2 s before the third failure to 4 s
     // after it. Each gap is checked against its nominal wait, not against the other: a
     // timer that woke late on the earlier gap (2.31 s on a loaded macOS runner, #1806) made
-    // a measured ratio fail on scheduling delay. A timer never fires early, and the bound
-    // above it keeps a wait that grew faster than doubling (8 s) failing, as a 2 s retry
-    // fails the 4 s floor.
+    // a measured ratio fail on scheduling delay. A timer never fires early, and each gap's
+    // bound above it keeps a backoff that doesn't double failing: a 2 s retry fails the
+    // 4 s floor, a wait that grew past doubling (8 s) the 6 s bound, and one already at 4 s
+    // before the third failure that stays there the 3 s bound.
     let deadline = Instant::now() + Duration::from_secs(30);
     while attempts(&failed.lock().unwrap()).len() < 4 {
         assert!(Instant::now() < deadline, "the backoff never retried");
@@ -332,7 +333,7 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
     let gap = attempts(&failed.lock().unwrap())[3].duration_since(third);
     let previous = third.duration_since(second);
     assert!(
-        previous >= Duration::from_secs(2)
+        (Duration::from_secs(2)..Duration::from_secs(3)).contains(&previous)
             && (Duration::from_secs(4)..Duration::from_secs(6)).contains(&gap),
         "retried {gap:?} after the third failure (4 s nominal), after {previous:?} before it \
          (2 s nominal)"
