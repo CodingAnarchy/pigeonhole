@@ -276,6 +276,100 @@ impl Router {
         self.service.metrics_text(&parts, &sessions)
     }
 
+    /// A cluster node's `Admin.Info`, `Flush` or `Compact` (ICR 0117, #1852), answered here
+    /// for the partitions this node holds and never forwarded, as a backup is. `Info` lists
+    /// each partition the map gives this node, with its state as `Cluster.Status` reports it,
+    /// and the map's other partitions. `Flush` and `Compact` act on every partition open
+    /// here (serving or fenced: a fenced partition's files still change), one after another,
+    /// or on the one the request names.
+    async fn cluster_admin(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<ServiceReply, ApiError> {
+        drop(self.service.admit(&op.admit(), caller, prepaid).await?);
+        let (r, compact) = match op {
+            ServiceOp::Info(_) => return self.cluster_info(cluster).await.map(ServiceReply::Info),
+            ServiceOp::Flush(r) => (r, false),
+            ServiceOp::Compact(r) => (r, true),
+            _ => return Err(ApiError::internal("not a maintenance call")),
+        };
+        let parts = if r.partition.is_empty() {
+            self.partitions()
+        } else {
+            vec![(r.partition.clone(), self.partition(&r.partition)?)]
+        };
+        for (id, part) in parts {
+            let done = if compact {
+                part.db.compact_async().await
+            } else {
+                part.db.flush_async().await
+            };
+            done.map_err(|e| {
+                let mut e = ApiError::from(e);
+                e.message = format!("partition {id}: {}", e.message);
+                e
+            })?;
+        }
+        Ok(ServiceReply::Empty(super::proto::Empty {}))
+    }
+
+    /// `Admin.Info` on a cluster node (#1852): see [`cluster_admin`](Self::cluster_admin).
+    async fn cluster_info(
+        &self,
+        cluster: &Cluster,
+    ) -> Result<super::proto::InfoResponse, ApiError> {
+        let routes = cluster.node.routes();
+        let Some(routes) = routes.as_ref() else {
+            return Err(ApiError::partition_unavailable(
+                "this cluster node has no map yet",
+            ));
+        };
+        let me = cluster.node.id();
+        let mut ids: Vec<&str> = routes.partitions_of(me).collect();
+        ids.sort_unstable();
+        let open: std::collections::BTreeMap<String, PartRef> =
+            self.partitions().into_iter().collect();
+        let (mut partitions, mut file_bytes, mut free_bytes) = (Vec::new(), 0u64, None);
+        for id in ids {
+            let (state, reason) = cluster.node.local_state(id);
+            let mut p = super::proto::PartitionInfo {
+                id: id.to_owned(),
+                path: cluster
+                    .node
+                    .dir()
+                    .join(format!("{id}.phdb"))
+                    .display()
+                    .to_string(),
+                ..Default::default()
+            };
+            p.set_state(state);
+            p.set_fence_reason(reason);
+            if let Some(part) = open.get(id) {
+                let db = part.db.clone();
+                let info = self.service.run_blocking(move || Ok(db.info()?)).await?;
+                p.path = part.db.path().display().to_string();
+                p.file_bytes = info.file_bytes;
+                p.tables = part.0.user_tables();
+                file_bytes += info.file_bytes;
+                free_bytes = free_bytes.or(info.free_bytes);
+            }
+            partitions.push(p);
+        }
+        Ok(super::proto::InfoResponse {
+            path: cluster.node.dir().display().to_string(),
+            file_bytes,
+            free_bytes: free_bytes.unwrap_or(0),
+            tables: routes.table_names(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            replica: None,
+            partitions,
+            other_partitions: routes.partitions_not_of(me),
+        })
+    }
+
     /// A cluster node's `Admin.Backup` or `BackupDownload` (D317 ticket 8b): of a partition
     /// this node holds, named by the request, and never forwarded. A backup's bytes don't
     /// take a hop: `phdb cluster backup` asks each partition's owner from the map.
@@ -410,6 +504,10 @@ impl Router {
                 // Served where the partition is, never forwarded (D317 ticket 8b).
                 ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
                     return self.backup(cluster, op, caller, prepaid).await;
+                }
+                // Across the partitions this node holds, never forwarded (ICR 0117, #1852).
+                ServiceOp::Info(_) | ServiceOp::Flush(_) | ServiceOp::Compact(_) => {
+                    return self.cluster_admin(cluster, op, caller, prepaid).await;
                 }
                 // This node's own, every partition it holds labelled (D317 ticket 8b).
                 ServiceOp::Metrics(_) => {

@@ -602,1216 +602,6 @@ impl RetryFrom {
         }
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PromoteResponse {
-    /// The primary's feed token stored with the last event the replica applied (empty if it
-    /// applied none). Opaque.
-    #[prost(bytes = "bytes", tag = "1")]
-    pub primary_token: ::prost::bytes::Bytes,
-}
-/// A replica server's state (#1436): unset on a primary.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReplicaInfo {
-    /// The primary's URL (`--replica-of`).
-    #[prost(string, tag = "1")]
-    pub primary: ::prost::alloc::string::String,
-    /// "starting", "bootstrapping", "following", "re-bootstrapping", "retrying" (after an
-    /// error, which `last_error` gives) or "stopped" (a promote failed after it stopped
-    /// following: `last_error` says why, and another Promote may succeed).
-    #[prost(string, tag = "2")]
-    pub state: ::prost::alloc::string::String,
-    /// The primary's seqno the replica applied through.
-    #[prost(uint64, tag = "3")]
-    pub applied_primary_seqno: u64,
-    /// The primary's durable frontier, as its last message said.
-    #[prost(uint64, tag = "4")]
-    pub primary_seqno: u64,
-    /// primary_seqno - applied_primary_seqno: the durable commits the replica hasn't applied
-    /// yet (0 when caught up). Commits the primary hasn't synced aren't counted.
-    #[prost(uint64, tag = "5")]
-    pub lag_commits: u64,
-    /// Milliseconds since the replica was last caught up, on its own clock; 0 when caught up.
-    #[prost(uint64, tag = "6")]
-    pub lag_ms: u64,
-    /// The last error the replica loop met, if it's in `error` or retrying.
-    #[prost(string, tag = "7")]
-    pub last_error: ::prost::alloc::string::String,
-    /// The step its bootstrap is at, or stopped at: "connecting", "waiting for the primary's
-    /// copy" (the primary writes the whole copy before sending any of it), "downloading",
-    /// "opening the copy" or "swapping". A bootstrap that failed keeps its last step beside
-    /// `last_error` until the next one starts; empty once one has finished.
-    #[prost(string, tag = "8")]
-    pub bootstrap_phase: ::prost::alloc::string::String,
-    /// The bytes of the primary's copy received, with `bootstrap_phase` (0 when that's empty).
-    #[prost(uint64, tag = "9")]
-    pub bootstrap_bytes: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct HealthResponse {
-    /// "ok" while the database is open and not failed.
-    #[prost(string, tag = "1")]
-    pub status: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct InfoResponse {
-    /// The path the server opened, as given.
-    #[prost(string, tag = "1")]
-    pub path: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub file_bytes: u64,
-    #[prost(uint64, tag = "3")]
-    pub free_bytes: u64,
-    #[prost(string, repeated, tag = "4")]
-    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// The server's version (`pigeonhole`'s).
-    #[prost(string, tag = "5")]
-    pub version: ::prost::alloc::string::String,
-    /// Set on a replica server (#1436).
-    #[prost(message, optional, tag = "6")]
-    pub replica: ::core::option::Option<ReplicaInfo>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackupRequest {
-    /// Relative to the server's backup directory; it must not exist.
-    #[prost(string, tag = "1")]
-    pub path: ::prost::alloc::string::String,
-    /// Only data durable at the writer's level (`backup_durable`).
-    #[prost(bool, tag = "2")]
-    pub durable: bool,
-    /// On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
-    /// (`WrongPartition` for one another node holds). Required there; empty on a single node.
-    #[prost(string, tag = "3")]
-    pub partition: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackupResponse {
-    #[prost(uint64, tag = "1")]
-    pub bytes: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackupDownloadRequest {
-    #[prost(bool, tag = "1")]
-    pub durable: bool,
-    /// Resume an earlier download: its `backup_id`, from `offset` bytes in. Unset: take a
-    /// fresh backup. An id the server no longer keeps is `NotFound`; start over.
-    #[prost(string, tag = "2")]
-    pub backup_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "3")]
-    pub offset: u64,
-    /// A replica's bootstrap (#1436): the backup is of a durable snapshot, and the stream
-    /// carries the token of a feed of every table opened from that same snapshot, which the
-    /// replica follows from. Refused on a server that is itself a replica.
-    #[prost(bool, tag = "4")]
-    pub replica: bool,
-    /// On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
-    /// (`WrongPartition` for one another node holds). Required there; empty on a single node.
-    /// A resume names the same partition its download was taken of.
-    #[prost(string, tag = "5")]
-    pub partition: ::prost::alloc::string::String,
-    /// On a cluster node (D317 ticket 6): one file of `partition` as it lies on disk, closed
-    /// after a fence, for a relocation by copy, named by its suffix after the partition's
-    /// database path (`""` the main file, `-wal-<n>`, `-feed`). No backup is taken: the chunks
-    /// are the file's bytes from `offset`, and `sha256` is the file's. Only for a partition in
-    /// state `closed`; `durable` and `replica` must be unset. Set, even to `""`, it asks for a
-    /// fenced file; unset, for a backup.
-    #[prost(string, optional, tag = "6")]
-    pub fenced_file: ::core::option::Option<::prost::alloc::string::String>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BackupChunk {
-    /// The next bytes of the backup file, in order, from `offset`.
-    #[prost(bytes = "bytes", tag = "1")]
-    pub data: ::prost::bytes::Bytes,
-    /// In the last chunk: the file's total size.
-    #[prost(uint64, tag = "2")]
-    pub total: u64,
-    /// In every chunk: the backup this is, for resuming. Opaque.
-    #[prost(string, tag = "3")]
-    pub backup_id: ::prost::alloc::string::String,
-    /// Where `data` starts in the file.
-    #[prost(uint64, tag = "4")]
-    pub offset: u64,
-    /// In the last chunk: the whole file's SHA-256, to check the copy before relying on it.
-    #[prost(bytes = "bytes", tag = "5")]
-    pub sha256: ::prost::bytes::Bytes,
-    /// With `replica`, in every chunk: the token the replica follows the primary from. Opaque.
-    #[prost(bytes = "bytes", tag = "6")]
-    pub feed_token: ::prost::bytes::Bytes,
-    /// On a cluster node (D317 ticket 8b), in the last chunk: the identity the copy holds,
-    /// read from the same snapshot the copy is of (`__phdb_cluster`), and the node's map
-    /// version when the backup started. A cluster backup checks them against its map.
-    #[prost(string, tag = "7")]
-    pub partition: ::prost::alloc::string::String,
-    #[prost(string, tag = "8")]
-    pub cluster_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "9")]
-    pub epoch: u64,
-    #[prost(uint64, tag = "10")]
-    pub map_version: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MetricsResponse {
-    #[prost(string, tag = "1")]
-    pub text: ::prost::alloc::string::String,
-}
-/// What a partition upload carries (D317, restore and relocation by file copy). An upload
-/// carries one file of a partition's set; the set is installed once every file its
-/// manifest names has arrived.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PartitionUploadHeader {
-    /// The partition the files are.
-    #[prost(string, tag = "1")]
-    pub partition: ::prost::alloc::string::String,
-    /// The identity the main file says it is (its `__phdb_cluster` row): the cluster, and the
-    /// epoch the copy is of. The install checks the staged set against them; the stamp that
-    /// relocates or restores the partition raises the epoch afterwards (D317 ticket 6).
-    #[prost(string, tag = "2")]
-    pub cluster_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "3")]
-    pub epoch: u64,
-    /// The client's id for this file's upload, 32 lower-case hex: sending it again resumes it.
-    #[prost(string, tag = "4")]
-    pub upload_id: ::prost::alloc::string::String,
-    #[prost(enumeration = "PartitionUploadPurpose", tag = "5")]
-    pub purpose: i32,
-    /// The file this upload carries: its name (a suffix of the partition's database path: ""
-    /// for the main file, "-wal-<n>", "-feed"), size and SHA-256.
-    #[prost(message, optional, tag = "6")]
-    pub file: ::core::option::Option<PartitionFile>,
-    /// Every file of the set, `file` among them. The set installs only once each has arrived,
-    /// and replaces the partition's whole file set.
-    #[prost(message, repeated, tag = "7")]
-    pub manifest: ::prost::alloc::vec::Vec<PartitionFile>,
-}
-/// The first message of an upload carries `header`, and each its next bytes from `offset`
-/// (up to `PartitionUploadStatusReply.max_chunk`, 512 KiB by default), contiguous from what
-/// the node holds. A message that doesn't come within `--stream-idle-ms` ends the upload,
-/// which then resumes.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PartitionUploadChunk {
-    #[prost(message, optional, tag = "1")]
-    pub header: ::core::option::Option<PartitionUploadHeader>,
-    #[prost(uint64, tag = "2")]
-    pub offset: u64,
-    #[prost(bytes = "bytes", tag = "3")]
-    pub data: ::prost::bytes::Bytes,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PartitionUploadReply {
-    /// The bytes the node holds of the file now.
-    #[prost(uint64, tag = "1")]
-    pub received: u64,
-    /// Every byte arrived, the SHA-256 matched and the file is synced, ready to install.
-    #[prost(bool, tag = "2")]
-    pub complete: bool,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PartitionUploadStatusRequest {
-    #[prost(string, tag = "1")]
-    pub upload_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PartitionUploadStatusReply {
-    /// The bytes the node holds of the upload; 0 for one it doesn't know.
-    #[prost(uint64, tag = "1")]
-    pub received: u64,
-    #[prost(bool, tag = "2")]
-    pub complete: bool,
-    /// The most one chunk may carry on this node (512 KiB, or less under a lower
-    /// `--max-request-bytes`): send chunks of at most this many bytes.
-    #[prost(uint64, tag = "3")]
-    pub max_chunk: u64,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PartitionUploadPurpose {
-    Unspecified = 0,
-    Restore = 1,
-    Relocate = 2,
-}
-impl PartitionUploadPurpose {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED",
-            Self::Restore => "PARTITION_UPLOAD_PURPOSE_RESTORE",
-            Self::Relocate => "PARTITION_UPLOAD_PURPOSE_RELOCATE",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED" => Some(Self::Unspecified),
-            "PARTITION_UPLOAD_PURPOSE_RESTORE" => Some(Self::Restore),
-            "PARTITION_UPLOAD_PURPOSE_RELOCATE" => Some(Self::Relocate),
-            _ => None,
-        }
-    }
-}
-/// Generated client implementations.
-pub mod admin_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    #[derive(Debug, Clone)]
-    pub struct AdminClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl<T> AdminClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> AdminClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            AdminClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        /// Liveness. Needs no token, and says nothing but that the server answers.
-        pub async fn health(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::HealthResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/Health",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Health"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// The database's file, size and tables (read scope).
-        pub async fn info(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::InfoResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/pigeonhole.v1.Admin/Info");
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Admin", "Info"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Admin scope from here on.
-        pub async fn flush(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/Flush",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Admin", "Flush"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn compact(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/Compact",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Compact"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Writes a consistent backup to `path`, inside the server's `--backup-dir`.
-        pub async fn backup(
-            &mut self,
-            request: impl tonic::IntoRequest<super::BackupRequest>,
-        ) -> std::result::Result<tonic::Response<super::BackupResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/Backup",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Backup"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
-        /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
-        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
-        pub async fn backup_download(
-            &mut self,
-            request: impl tonic::IntoRequest<super::BackupDownloadRequest>,
-        ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::BackupChunk>>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/BackupDownload",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "BackupDownload"));
-            self.inner.server_streaming(req, path, codec).await
-        }
-        /// The metrics in Prometheus text format, under D316's names (read scope).
-        pub async fn metrics(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<
-            tonic::Response<super::MetricsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/Metrics",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Metrics"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
-        /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
-        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
-        /// on one whose first bootstrap hasn't finished (it goes on bootstrapping).
-        pub async fn promote(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<
-            tonic::Response<super::PromoteResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/Promote",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Promote"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
-        /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
-        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
-        pub async fn partition_upload(
-            &mut self,
-            request: impl tonic::IntoStreamingRequest<
-                Message = super::PartitionUploadChunk,
-            >,
-        ) -> std::result::Result<
-            tonic::Response<super::PartitionUploadReply>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/PartitionUpload",
-            );
-            let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUpload"));
-            self.inner.client_streaming(req, path, codec).await
-        }
-        /// How many bytes of an upload the node holds, to resume it.
-        pub async fn partition_upload_status(
-            &mut self,
-            request: impl tonic::IntoRequest<super::PartitionUploadStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::PartitionUploadStatusReply>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Admin/PartitionUploadStatus",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUploadStatus"));
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-/// Generated server implementations.
-pub mod admin_server {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with AdminServer.
-    #[async_trait]
-    pub trait Admin: std::marker::Send + std::marker::Sync + 'static {
-        /// Liveness. Needs no token, and says nothing but that the server answers.
-        async fn health(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::HealthResponse>, tonic::Status>;
-        /// The database's file, size and tables (read scope).
-        async fn info(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::InfoResponse>, tonic::Status>;
-        /// Admin scope from here on.
-        async fn flush(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        async fn compact(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        /// Writes a consistent backup to `path`, inside the server's `--backup-dir`.
-        async fn backup(
-            &self,
-            request: tonic::Request<super::BackupRequest>,
-        ) -> std::result::Result<tonic::Response<super::BackupResponse>, tonic::Status>;
-        /// Server streaming response type for the BackupDownload method.
-        type BackupDownloadStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::BackupChunk, tonic::Status>,
-            >
-            + std::marker::Send
-            + 'static;
-        /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
-        /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
-        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
-        async fn backup_download(
-            &self,
-            request: tonic::Request<super::BackupDownloadRequest>,
-        ) -> std::result::Result<
-            tonic::Response<Self::BackupDownloadStream>,
-            tonic::Status,
-        >;
-        /// The metrics in Prometheus text format, under D316's names (read scope).
-        async fn metrics(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::MetricsResponse>, tonic::Status>;
-        /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
-        /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
-        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
-        /// on one whose first bootstrap hasn't finished (it goes on bootstrapping).
-        async fn promote(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::PromoteResponse>, tonic::Status>;
-        /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
-        /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
-        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
-        async fn partition_upload(
-            &self,
-            request: tonic::Request<tonic::Streaming<super::PartitionUploadChunk>>,
-        ) -> std::result::Result<
-            tonic::Response<super::PartitionUploadReply>,
-            tonic::Status,
-        >;
-        /// How many bytes of an upload the node holds, to resume it.
-        async fn partition_upload_status(
-            &self,
-            request: tonic::Request<super::PartitionUploadStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::PartitionUploadStatusReply>,
-            tonic::Status,
-        >;
-    }
-    #[derive(Debug)]
-    pub struct AdminServer<T> {
-        inner: Arc<T>,
-        accept_compression_encodings: EnabledCompressionEncodings,
-        send_compression_encodings: EnabledCompressionEncodings,
-        max_decoding_message_size: Option<usize>,
-        max_encoding_message_size: Option<usize>,
-    }
-    impl<T> AdminServer<T> {
-        pub fn new(inner: T) -> Self {
-            Self::from_arc(Arc::new(inner))
-        }
-        pub fn from_arc(inner: Arc<T>) -> Self {
-            Self {
-                inner,
-                accept_compression_encodings: Default::default(),
-                send_compression_encodings: Default::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
-        where
-            F: tonic::service::Interceptor,
-        {
-            InterceptedService::new(Self::new(inner), interceptor)
-        }
-        /// Enable decompressing requests with the given encoding.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.accept_compression_encodings.enable(encoding);
-            self
-        }
-        /// Compress responses with the given encoding, if the client supports it.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.send_compression_encodings.enable(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.max_decoding_message_size = Some(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.max_encoding_message_size = Some(limit);
-            self
-        }
-    }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for AdminServer<T>
-    where
-        T: Admin,
-        B: Body + std::marker::Send + 'static,
-        B::Error: Into<StdError> + std::marker::Send + 'static,
-    {
-        type Response = http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = BoxFuture<Self::Response, Self::Error>;
-        fn poll_ready(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            match req.uri().path() {
-                "/pigeonhole.v1.Admin/Health" => {
-                    #[allow(non_camel_case_types)]
-                    struct HealthSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
-                    for HealthSvc<T> {
-                        type Response = super::HealthResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::health(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = HealthSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/Info" => {
-                    #[allow(non_camel_case_types)]
-                    struct InfoSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
-                    for InfoSvc<T> {
-                        type Response = super::InfoResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::info(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = InfoSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/Flush" => {
-                    #[allow(non_camel_case_types)]
-                    struct FlushSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
-                    for FlushSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::flush(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = FlushSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/Compact" => {
-                    #[allow(non_camel_case_types)]
-                    struct CompactSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
-                    for CompactSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::compact(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = CompactSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/Backup" => {
-                    #[allow(non_camel_case_types)]
-                    struct BackupSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::BackupRequest>
-                    for BackupSvc<T> {
-                        type Response = super::BackupResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::BackupRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::backup(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = BackupSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/BackupDownload" => {
-                    #[allow(non_camel_case_types)]
-                    struct BackupDownloadSvc<T: Admin>(pub Arc<T>);
-                    impl<
-                        T: Admin,
-                    > tonic::server::ServerStreamingService<super::BackupDownloadRequest>
-                    for BackupDownloadSvc<T> {
-                        type Response = super::BackupChunk;
-                        type ResponseStream = T::BackupDownloadStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::BackupDownloadRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::backup_download(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = BackupDownloadSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.server_streaming(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/Metrics" => {
-                    #[allow(non_camel_case_types)]
-                    struct MetricsSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
-                    for MetricsSvc<T> {
-                        type Response = super::MetricsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::metrics(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = MetricsSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/Promote" => {
-                    #[allow(non_camel_case_types)]
-                    struct PromoteSvc<T: Admin>(pub Arc<T>);
-                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
-                    for PromoteSvc<T> {
-                        type Response = super::PromoteResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::promote(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PromoteSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/PartitionUpload" => {
-                    #[allow(non_camel_case_types)]
-                    struct PartitionUploadSvc<T: Admin>(pub Arc<T>);
-                    impl<
-                        T: Admin,
-                    > tonic::server::ClientStreamingService<super::PartitionUploadChunk>
-                    for PartitionUploadSvc<T> {
-                        type Response = super::PartitionUploadReply;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                tonic::Streaming<super::PartitionUploadChunk>,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::partition_upload(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PartitionUploadSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.client_streaming(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Admin/PartitionUploadStatus" => {
-                    #[allow(non_camel_case_types)]
-                    struct PartitionUploadStatusSvc<T: Admin>(pub Arc<T>);
-                    impl<
-                        T: Admin,
-                    > tonic::server::UnaryService<super::PartitionUploadStatusRequest>
-                    for PartitionUploadStatusSvc<T> {
-                        type Response = super::PartitionUploadStatusReply;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::PartitionUploadStatusRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Admin>::partition_upload_status(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PartitionUploadStatusSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
-            }
-        }
-    }
-    impl<T> Clone for AdminServer<T> {
-        fn clone(&self) -> Self {
-            let inner = self.inner.clone();
-            Self {
-                inner,
-                accept_compression_encodings: self.accept_compression_encodings,
-                send_compression_encodings: self.send_compression_encodings,
-                max_decoding_message_size: self.max_decoding_message_size,
-                max_encoding_message_size: self.max_encoding_message_size,
-            }
-        }
-    }
-    /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "pigeonhole.v1.Admin";
-    impl<T> tonic::server::NamedService for AdminServer<T> {
-        const NAME: &'static str = SERVICE_NAME;
-    }
-}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetRequest {
     #[prost(string, tag = "1")]
@@ -7793,6 +6583,1259 @@ pub mod cluster_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "pigeonhole.v1.Cluster";
     impl<T> tonic::server::NamedService for ClusterServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PromoteResponse {
+    /// The primary's feed token stored with the last event the replica applied (empty if it
+    /// applied none). Opaque.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub primary_token: ::prost::bytes::Bytes,
+}
+/// A replica server's state (#1436): unset on a primary.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplicaInfo {
+    /// The primary's URL (`--replica-of`).
+    #[prost(string, tag = "1")]
+    pub primary: ::prost::alloc::string::String,
+    /// "starting", "bootstrapping", "following", "re-bootstrapping", "retrying" (after an
+    /// error, which `last_error` gives) or "stopped" (a promote failed after it stopped
+    /// following: `last_error` says why, and another Promote may succeed).
+    #[prost(string, tag = "2")]
+    pub state: ::prost::alloc::string::String,
+    /// The primary's seqno the replica applied through.
+    #[prost(uint64, tag = "3")]
+    pub applied_primary_seqno: u64,
+    /// The primary's durable frontier, as its last message said.
+    #[prost(uint64, tag = "4")]
+    pub primary_seqno: u64,
+    /// primary_seqno - applied_primary_seqno: the durable commits the replica hasn't applied
+    /// yet (0 when caught up). Commits the primary hasn't synced aren't counted.
+    #[prost(uint64, tag = "5")]
+    pub lag_commits: u64,
+    /// Milliseconds since the replica was last caught up, on its own clock; 0 when caught up.
+    #[prost(uint64, tag = "6")]
+    pub lag_ms: u64,
+    /// The last error the replica loop met, if it's in `error` or retrying.
+    #[prost(string, tag = "7")]
+    pub last_error: ::prost::alloc::string::String,
+    /// The step its bootstrap is at, or stopped at: "connecting", "waiting for the primary's
+    /// copy" (the primary writes the whole copy before sending any of it), "downloading",
+    /// "opening the copy" or "swapping". A bootstrap that failed keeps its last step beside
+    /// `last_error` until the next one starts; empty once one has finished.
+    #[prost(string, tag = "8")]
+    pub bootstrap_phase: ::prost::alloc::string::String,
+    /// The bytes of the primary's copy received, with `bootstrap_phase` (0 when that's empty).
+    #[prost(uint64, tag = "9")]
+    pub bootstrap_bytes: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HealthResponse {
+    /// "ok" while the database is open and not failed.
+    #[prost(string, tag = "1")]
+    pub status: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InfoResponse {
+    /// The path the server opened, as given.
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub file_bytes: u64,
+    #[prost(uint64, tag = "3")]
+    pub free_bytes: u64,
+    #[prost(string, repeated, tag = "4")]
+    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The server's version (`pigeonhole`'s).
+    #[prost(string, tag = "5")]
+    pub version: ::prost::alloc::string::String,
+    /// Set on a replica server (#1436).
+    #[prost(message, optional, tag = "6")]
+    pub replica: ::core::option::Option<ReplicaInfo>,
+    /// On a cluster node (ICR 0117, #1852): each partition the map gives this node, in id
+    /// order. Then `path` is the node's cluster directory, `file_bytes` the partitions' files
+    /// together, `free_bytes` the free space on the directory's disk, and `tables` the map's.
+    #[prost(message, repeated, tag = "7")]
+    pub partitions: ::prost::alloc::vec::Vec<PartitionInfo>,
+    /// On a cluster node: the map's partitions other nodes hold, in id order.
+    #[prost(string, repeated, tag = "8")]
+    pub other_partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// One partition a cluster node holds, as `Admin.Info` reports it (ICR 0117, #1852).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionInfo {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Its database file, as the node opened it.
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// Unset unless it's open (serving or fenced).
+    #[prost(uint64, tag = "3")]
+    pub file_bytes: u64,
+    /// Its tables, as its own file has them. Empty unless it's open.
+    #[prost(string, repeated, tag = "4")]
+    pub tables: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// As `Cluster.Status` reports it: serving, fenced, closed or opening. Unspecified for a
+    /// partition the map places here that the node hasn't opened (no file, or a failed open).
+    #[prost(enumeration = "LocalPartitionState", tag = "5")]
+    pub state: i32,
+    /// Why a fenced partition is fenced.
+    #[prost(enumeration = "FenceReason", tag = "6")]
+    pub fence_reason: i32,
+}
+/// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
+/// acts on every partition the node holds that's open, and a partition named acts on that
+/// one (`WrongPartition` for one another node holds, `PartitionUnavailable` for one closed or
+/// not open here). On a single node it must be empty (`InvalidArgument`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MaintenanceRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupRequest {
+    /// Relative to the server's backup directory; it must not exist.
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    /// Only data durable at the writer's level (`backup_durable`).
+    #[prost(bool, tag = "2")]
+    pub durable: bool,
+    /// On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
+    /// (`WrongPartition` for one another node holds). Required there; empty on a single node.
+    #[prost(string, tag = "3")]
+    pub partition: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupResponse {
+    #[prost(uint64, tag = "1")]
+    pub bytes: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupDownloadRequest {
+    #[prost(bool, tag = "1")]
+    pub durable: bool,
+    /// Resume an earlier download: its `backup_id`, from `offset` bytes in. Unset: take a
+    /// fresh backup. An id the server no longer keeps is `NotFound`; start over.
+    #[prost(string, tag = "2")]
+    pub backup_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    /// A replica's bootstrap (#1436): the backup is of a durable snapshot, and the stream
+    /// carries the token of a feed of every table opened from that same snapshot, which the
+    /// replica follows from. Refused on a server that is itself a replica.
+    #[prost(bool, tag = "4")]
+    pub replica: bool,
+    /// On a cluster node (D317 ticket 8b): the partition to back up, one this node holds
+    /// (`WrongPartition` for one another node holds). Required there; empty on a single node.
+    /// A resume names the same partition its download was taken of.
+    #[prost(string, tag = "5")]
+    pub partition: ::prost::alloc::string::String,
+    /// On a cluster node (D317 ticket 6): one file of `partition` as it lies on disk, closed
+    /// after a fence, for a relocation by copy, named by its suffix after the partition's
+    /// database path (`""` the main file, `-wal-<n>`, `-feed`). No backup is taken: the chunks
+    /// are the file's bytes from `offset`, and `sha256` is the file's. Only for a partition in
+    /// state `closed`; `durable` and `replica` must be unset. Set, even to `""`, it asks for a
+    /// fenced file; unset, for a backup.
+    #[prost(string, optional, tag = "6")]
+    pub fenced_file: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BackupChunk {
+    /// The next bytes of the backup file, in order, from `offset`.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub data: ::prost::bytes::Bytes,
+    /// In the last chunk: the file's total size.
+    #[prost(uint64, tag = "2")]
+    pub total: u64,
+    /// In every chunk: the backup this is, for resuming. Opaque.
+    #[prost(string, tag = "3")]
+    pub backup_id: ::prost::alloc::string::String,
+    /// Where `data` starts in the file.
+    #[prost(uint64, tag = "4")]
+    pub offset: u64,
+    /// In the last chunk: the whole file's SHA-256, to check the copy before relying on it.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub sha256: ::prost::bytes::Bytes,
+    /// With `replica`, in every chunk: the token the replica follows the primary from. Opaque.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub feed_token: ::prost::bytes::Bytes,
+    /// On a cluster node (D317 ticket 8b), in the last chunk: the identity the copy holds,
+    /// read from the same snapshot the copy is of (`__phdb_cluster`), and the node's map
+    /// version when the backup started. A cluster backup checks them against its map.
+    #[prost(string, tag = "7")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "10")]
+    pub map_version: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MetricsResponse {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+/// What a partition upload carries (D317, restore and relocation by file copy). An upload
+/// carries one file of a partition's set; the set is installed once every file its
+/// manifest names has arrived.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionUploadHeader {
+    /// The partition the files are.
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The identity the main file says it is (its `__phdb_cluster` row): the cluster, and the
+    /// epoch the copy is of. The install checks the staged set against them; the stamp that
+    /// relocates or restores the partition raises the epoch afterwards (D317 ticket 6).
+    #[prost(string, tag = "2")]
+    pub cluster_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    /// The client's id for this file's upload, 32 lower-case hex: sending it again resumes it.
+    #[prost(string, tag = "4")]
+    pub upload_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "PartitionUploadPurpose", tag = "5")]
+    pub purpose: i32,
+    /// The file this upload carries: its name (a suffix of the partition's database path: ""
+    /// for the main file, "-wal-<n>", "-feed"), size and SHA-256.
+    #[prost(message, optional, tag = "6")]
+    pub file: ::core::option::Option<PartitionFile>,
+    /// Every file of the set, `file` among them. The set installs only once each has arrived,
+    /// and replaces the partition's whole file set.
+    #[prost(message, repeated, tag = "7")]
+    pub manifest: ::prost::alloc::vec::Vec<PartitionFile>,
+}
+/// The first message of an upload carries `header`, and each its next bytes from `offset`
+/// (up to `PartitionUploadStatusReply.max_chunk`, 512 KiB by default), contiguous from what
+/// the node holds. A message that doesn't come within `--stream-idle-ms` ends the upload,
+/// which then resumes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PartitionUploadChunk {
+    #[prost(message, optional, tag = "1")]
+    pub header: ::core::option::Option<PartitionUploadHeader>,
+    #[prost(uint64, tag = "2")]
+    pub offset: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub data: ::prost::bytes::Bytes,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionUploadReply {
+    /// The bytes the node holds of the file now.
+    #[prost(uint64, tag = "1")]
+    pub received: u64,
+    /// Every byte arrived, the SHA-256 matched and the file is synced, ready to install.
+    #[prost(bool, tag = "2")]
+    pub complete: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionUploadStatusRequest {
+    #[prost(string, tag = "1")]
+    pub upload_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PartitionUploadStatusReply {
+    /// The bytes the node holds of the upload; 0 for one it doesn't know.
+    #[prost(uint64, tag = "1")]
+    pub received: u64,
+    #[prost(bool, tag = "2")]
+    pub complete: bool,
+    /// The most one chunk may carry on this node (512 KiB, or less under a lower
+    /// `--max-request-bytes`): send chunks of at most this many bytes.
+    #[prost(uint64, tag = "3")]
+    pub max_chunk: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PartitionUploadPurpose {
+    Unspecified = 0,
+    Restore = 1,
+    Relocate = 2,
+}
+impl PartitionUploadPurpose {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED",
+            Self::Restore => "PARTITION_UPLOAD_PURPOSE_RESTORE",
+            Self::Relocate => "PARTITION_UPLOAD_PURPOSE_RELOCATE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PARTITION_UPLOAD_PURPOSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PARTITION_UPLOAD_PURPOSE_RESTORE" => Some(Self::Restore),
+            "PARTITION_UPLOAD_PURPOSE_RELOCATE" => Some(Self::Relocate),
+            _ => None,
+        }
+    }
+}
+/// Generated client implementations.
+pub mod admin_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct AdminClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> AdminClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> AdminClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            AdminClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Liveness. Needs no token, and says nothing but that the server answers.
+        pub async fn health(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::HealthResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Health",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Health"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// The database's file, size and tables (read scope). On a cluster node (ICR 0117), each
+        /// partition the node holds, and the map's partitions it doesn't (#1852).
+        pub async fn info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::InfoResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/pigeonhole.v1.Admin/Info");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Admin", "Info"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Admin scope from here on. On a cluster node, every partition the node holds, or the one
+        /// the request names (#1852).
+        pub async fn flush(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MaintenanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Flush",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Admin", "Flush"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn compact(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MaintenanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Compact",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Compact"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Writes a consistent backup to `path`, inside the server's `--backup-dir`.
+        pub async fn backup(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BackupRequest>,
+        ) -> std::result::Result<tonic::Response<super::BackupResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Backup",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Backup"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
+        /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+        pub async fn backup_download(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BackupDownloadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::BackupChunk>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/BackupDownload",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "BackupDownload"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// The metrics in Prometheus text format, under D316's names (read scope).
+        pub async fn metrics(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<
+            tonic::Response<super::MetricsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Metrics",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Metrics"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
+        /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
+        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
+        /// on one whose first bootstrap hasn't finished (it goes on bootstrapping).
+        pub async fn promote(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<
+            tonic::Response<super::PromoteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/Promote",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "Promote"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
+        /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        pub async fn partition_upload(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::PartitionUploadChunk,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadReply>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/PartitionUpload",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUpload"));
+            self.inner.client_streaming(req, path, codec).await
+        }
+        /// How many bytes of an upload the node holds, to resume it.
+        pub async fn partition_upload_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PartitionUploadStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadStatusReply>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Admin/PartitionUploadStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUploadStatus"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod admin_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with AdminServer.
+    #[async_trait]
+    pub trait Admin: std::marker::Send + std::marker::Sync + 'static {
+        /// Liveness. Needs no token, and says nothing but that the server answers.
+        async fn health(
+            &self,
+            request: tonic::Request<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::HealthResponse>, tonic::Status>;
+        /// The database's file, size and tables (read scope). On a cluster node (ICR 0117), each
+        /// partition the node holds, and the map's partitions it doesn't (#1852).
+        async fn info(
+            &self,
+            request: tonic::Request<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::InfoResponse>, tonic::Status>;
+        /// Admin scope from here on. On a cluster node, every partition the node holds, or the one
+        /// the request names (#1852).
+        async fn flush(
+            &self,
+            request: tonic::Request<super::MaintenanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        async fn compact(
+            &self,
+            request: tonic::Request<super::MaintenanceRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        /// Writes a consistent backup to `path`, inside the server's `--backup-dir`.
+        async fn backup(
+            &self,
+            request: tonic::Request<super::BackupRequest>,
+        ) -> std::result::Result<tonic::Response<super::BackupResponse>, tonic::Status>;
+        /// Server streaming response type for the BackupDownload method.
+        type BackupDownloadStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::BackupChunk, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
+        /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+        async fn backup_download(
+            &self,
+            request: tonic::Request<super::BackupDownloadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::BackupDownloadStream>,
+            tonic::Status,
+        >;
+        /// The metrics in Prometheus text format, under D316's names (read scope).
+        async fn metrics(
+            &self,
+            request: tonic::Request<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::MetricsResponse>, tonic::Status>;
+        /// Turns a replica server (`--replica-of`) into a primary at the last commit it applied:
+        /// it stops following, takes writes, and returns the primary's token it stopped at (#1436).
+        /// Nothing fences the old primary. FailedPrecondition on a server that isn't a replica, or
+        /// on one whose first bootstrap hasn't finished (it goes on bootstrapping).
+        async fn promote(
+            &self,
+            request: tonic::Request<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::PromoteResponse>, tonic::Status>;
+        /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
+        /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        async fn partition_upload(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::PartitionUploadChunk>>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadReply>,
+            tonic::Status,
+        >;
+        /// How many bytes of an upload the node holds, to resume it.
+        async fn partition_upload_status(
+            &self,
+            request: tonic::Request<super::PartitionUploadStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PartitionUploadStatusReply>,
+            tonic::Status,
+        >;
+    }
+    #[derive(Debug)]
+    pub struct AdminServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> AdminServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for AdminServer<T>
+    where
+        T: Admin,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Admin/Health" => {
+                    #[allow(non_camel_case_types)]
+                    struct HealthSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
+                    for HealthSvc<T> {
+                        type Response = super::HealthResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Empty>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::health(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = HealthSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Info" => {
+                    #[allow(non_camel_case_types)]
+                    struct InfoSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
+                    for InfoSvc<T> {
+                        type Response = super::InfoResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Empty>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::info(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Flush" => {
+                    #[allow(non_camel_case_types)]
+                    struct FlushSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::MaintenanceRequest>
+                    for FlushSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::MaintenanceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::flush(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = FlushSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Compact" => {
+                    #[allow(non_camel_case_types)]
+                    struct CompactSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::MaintenanceRequest>
+                    for CompactSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::MaintenanceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::compact(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CompactSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Backup" => {
+                    #[allow(non_camel_case_types)]
+                    struct BackupSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::BackupRequest>
+                    for BackupSvc<T> {
+                        type Response = super::BackupResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BackupRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::backup(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BackupSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/BackupDownload" => {
+                    #[allow(non_camel_case_types)]
+                    struct BackupDownloadSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::ServerStreamingService<super::BackupDownloadRequest>
+                    for BackupDownloadSvc<T> {
+                        type Response = super::BackupChunk;
+                        type ResponseStream = T::BackupDownloadStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BackupDownloadRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::backup_download(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BackupDownloadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Metrics" => {
+                    #[allow(non_camel_case_types)]
+                    struct MetricsSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
+                    for MetricsSvc<T> {
+                        type Response = super::MetricsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Empty>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::metrics(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = MetricsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/Promote" => {
+                    #[allow(non_camel_case_types)]
+                    struct PromoteSvc<T: Admin>(pub Arc<T>);
+                    impl<T: Admin> tonic::server::UnaryService<super::Empty>
+                    for PromoteSvc<T> {
+                        type Response = super::PromoteResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Empty>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::promote(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PromoteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/PartitionUpload" => {
+                    #[allow(non_camel_case_types)]
+                    struct PartitionUploadSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::ClientStreamingService<super::PartitionUploadChunk>
+                    for PartitionUploadSvc<T> {
+                        type Response = super::PartitionUploadReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::PartitionUploadChunk>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::partition_upload(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PartitionUploadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Admin/PartitionUploadStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct PartitionUploadStatusSvc<T: Admin>(pub Arc<T>);
+                    impl<
+                        T: Admin,
+                    > tonic::server::UnaryService<super::PartitionUploadStatusRequest>
+                    for PartitionUploadStatusSvc<T> {
+                        type Response = super::PartitionUploadStatusReply;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PartitionUploadStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Admin>::partition_upload_status(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PartitionUploadStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for AdminServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Admin";
+    impl<T> tonic::server::NamedService for AdminServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
