@@ -47,7 +47,9 @@ impl ShardHandler for PanicsInCallersTurn {
 /// as a server's per-request `catch_unwind` would) leaves that shard failed. Shutdown used
 /// to hang there for ever: the shard's driver kept the failed shard, never found itself
 /// empty, and never exited, and shutdown joins every driver. It now returns, and reports
-/// the panic as a shard's, as it does for one on a driver thread.
+/// the panic as a shard's, as it does for one on a driver thread (the engine's
+/// `blocking_waits::a_panicked_shard_thread_does_not_hang_close` covers that one, through
+/// `close`'s `shard_panicked`).
 #[test]
 fn a_panic_in_a_callers_turn_never_hangs_shutdown() {
     let mut config = RuntimeConfig::new(PreadVfs::new(1));
