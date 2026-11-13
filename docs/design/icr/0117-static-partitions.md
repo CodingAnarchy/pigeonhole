@@ -393,7 +393,10 @@
   - Thread counts stay as started (Tokio can't resize a runtime), so a mask that shrank has more threads per CPU (cli692 on #1745). The log line gives each runtime's threads against its CPUs, and says so when the masks fall back to none (too few free cores).
   - **The other threads (#1762, 1.3.0):** right after the reapply, a sweep of `/proc/self/task` moves every thread that doesn't refresh itself onto the blocking mask, or the process's CPUs when there's none. That covers the engines' unpinned threads, and the server's own long-running ones: a backup, a bulk load, an index build or rebalancer, a replica's follow, and candle's pool, whose `CANDLE_CPU_MASK` is read only once.
     - It leaves alone the threads that refresh themselves (registered by thread ID as they enter: names don't tell a network worker from a Tokio blocking thread), and any thread whose affinity lies within the open partitions' pinned shard and compaction CPUs: the engines' own pins (D235, ICR 0134).
-    - Two passes at most, the second only when threads started during the first. The log line counts the threads it moved.
+    - A thread whose affinity equals a mask in force before the reapply, or the process's CPUs, is moved even when the new pins cover it whole: on a narrow host, that's a thread still on the old free cores the new shards took (perf287's S1 on #1871).
+    - A thread is checked and masked under the lock a thread registers and masks itself under, so one entering mid-sweep keeps its own mask.
+    - It runs on the blocking pool, awaited by the open or close, never on a request worker (simp724's S1 on #1871).
+    - Two passes at most, the second only when threads started during the first. The log line counts the threads it moved. io_uring's `iou-wrk-*` workers refuse a new mask; they aren't counted, and are tried again at the next sweep.
     - Before 1.3.0 these threads kept the mask they started on, so a partition opened later could pin its shards where they ran.
 
 **Close (amendment 2):**

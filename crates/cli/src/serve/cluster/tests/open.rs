@@ -212,13 +212,28 @@ fn mask_sweep_alone() {
     // - `other`, of ours, that never entered (a backup's, say), on every CPU: moved;
     // - `entered`, which entered as a blocking thread, then widened by hand: left to its
     //   own refresh();
-    // - `pinned`, on the shard's CPU, as an engine's pin: left alone.
+    // - `pinned`, on the shard's CPU, as an engine's pin: left alone;
+    // - `stale`, on a mask in force before the reapply that the engine pins now cover whole
+    //   (a narrow host, #1762's own case): moved, though it looks like a pin (perf287's S1
+    //   on #1871). The sweep is told the pins cover one more CPU, `x`, to make that so.
     let shard = shards[0];
+    let Some(x) = all.iter().copied().find(|c| !engine_pins.contains(c)) else {
+        println!("skipped: no CPU off the engine's pins");
+        return;
+    };
+    let mut stale_mask = vec![shard, x];
+    stale_mask.sort_unstable();
+    let previous = crate::serve::placement::RuntimeMasks {
+        blocking: Some(stale_mask.clone()),
+        ..Default::default()
+    };
+    let mut covering = engine_pins.clone();
+    covering.push(x);
     let (entered_tid, entered_tid_rx) = mpsc::channel();
     // Each sets up, waits until all three have, then holds until the sweep has run.
-    let ready = std::sync::Barrier::new(4);
-    let go = std::sync::Barrier::new(4);
-    let (other, entered, pinned, moved) = std::thread::scope(|scope| {
+    let ready = std::sync::Barrier::new(5);
+    let go = std::sync::Barrier::new(5);
+    let (other, entered, pinned, stale, moved) = std::thread::scope(|scope| {
         let (ready, go, all, placement) = (&ready, &go, &all, &placement);
         let held = move |setup: &dyn Fn()| {
             setup();
@@ -236,23 +251,33 @@ fn mask_sweep_alone() {
             })
         });
         let pinned = scope.spawn(move || held(&|| set_mine(&[shard])));
+        let stale_mask = &stale_mask;
+        let stale = scope.spawn(move || held(&|| set_mine(stale_mask)));
         ready.wait();
-        let moved = placement.sweep(&engine_pins);
+        let moved = placement.sweep(&covering, &previous);
         go.wait();
         (
             other.join().unwrap(),
             entered.join().unwrap(),
             pinned.join().unwrap(),
+            stale.join().unwrap(),
             moved,
         )
     });
-    assert!(moved >= 1, "the unregistered thread moved: {moved}");
+    assert!(
+        moved >= 2,
+        "the unregistered and stale threads moved: {moved}"
+    );
     assert_eq!(
         other, blocking,
         "a thread that doesn't refresh is moved to the blocking mask"
     );
     assert_eq!(entered, all, "a thread that refreshes itself is left to it");
     assert_eq!(pinned, [shard], "an engine-style pin stays");
+    assert_eq!(
+        stale, blocking,
+        "a thread on an old mask the pins now cover is moved, not taken for a pin"
+    );
     // Once a registered thread exits its ID is forgotten, since Linux reuses IDs.
     let tid = entered_tid_rx.recv().unwrap();
     assert!(
@@ -443,6 +468,50 @@ fn opened_off_the_others_cores_alone() {
                 .collect::<Vec<usize>>()
         })
     };
+    // Every thread's CPUs, by thread ID.
+    let tasks = || -> Vec<(i32, Vec<usize>)> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter_map(|tid: i32| {
+                let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+                let cpus = (0..nix::sched::CpuSet::count())
+                    .filter(|&c| set.is_set(c).unwrap_or(false))
+                    .collect();
+                Some((tid, cpus))
+            })
+            .collect()
+    };
+    // The open's mask sweep, through the open path (simp724's S2 on #1871): a plain thread
+    // that never entered, on the process's CPUs, is moved to the new blocking mask, while
+    // p1's shard threads and p3's own keep their pins.
+    let (plain_go, plain_wait) = std::sync::mpsc::channel::<()>();
+    let (plain_ready, plain_readied) = std::sync::mpsc::channel::<()>();
+    let plain = {
+        let process = process.clone();
+        std::thread::spawn(move || {
+            let mut m = nix::sched::CpuSet::new();
+            for &c in &process {
+                m.set(c).unwrap();
+            }
+            nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &m).unwrap();
+            plain_ready.send(()).unwrap();
+            plain_wait.recv().unwrap();
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+            (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect::<Vec<usize>>()
+        })
+    };
+    plain_readied.recv().unwrap();
+    let p1_shards: Vec<(i32, Vec<usize>)> = tasks()
+        .into_iter()
+        .filter(|(_, cpus)| cpus.len() == 1 && held.contains(&cpus[0]))
+        .collect();
+    assert!(
+        !p1_shards.is_empty(),
+        "p1's shard thread pinned to {held:?}"
+    );
     rt.block_on(async {
         client(port)
             .await
@@ -494,6 +563,24 @@ fn opened_off_the_others_cores_alone() {
         };
         go.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), blocking);
+        // The sweep ran before p3 became visible: the plain thread is on the blocking mask
+        // already, and every engine pin stayed.
+        plain_go.send(()).unwrap();
+        assert_eq!(
+            plain.join().unwrap(),
+            blocking,
+            "a thread that never entered moves to the new blocking mask at the open"
+        );
+        let after = tasks();
+        for (tid, cpus) in &p1_shards {
+            if let Some((_, now)) = after.iter().find(|(t, _)| t == tid) {
+                assert_eq!(now, cpus, "p1's shard thread {tid} keeps its pin");
+            }
+        }
+        assert!(
+            after.iter().any(|(_, cpus)| *cpus == new),
+            "p3's shard thread keeps its pin on {new:?}"
+        );
         // The feed side's thread, busy delivering p1's commits (with one client the hub
         // reads on the feed runtime too, #1689), takes the new mask by its own refresh.
         let feed = now.feed.clone().unwrap_or_else(|| process.clone());

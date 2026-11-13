@@ -559,7 +559,6 @@ impl Placement {
     }
 
     /// The masks the threads take now: the start's, or the last reapply's.
-    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn current(&self) -> RuntimeMasks {
         (**self.live.masks.load()).clone()
     }
@@ -581,18 +580,22 @@ impl Placement {
             .live
             .generation
             .load(std::sync::atomic::Ordering::Acquire);
-        apply_to(&self.live.process, self.live.masks.load().of(role));
-        THREAD.with_borrow_mut(|t| *t = Some((Arc::clone(&self.live), role, now)));
         #[cfg(target_os = "linux")]
         {
             let tid = nix::unistd::gettid().as_raw();
-            // Drop any earlier entry first (it removes this tid), then insert.
+            // Drop any earlier entry first: its drop takes the lock below to remove this tid.
             REGISTERED.with_borrow_mut(|r| *r = None);
-            self.live
+            // Registered and masked under the lock a sweep holds while it checks and masks a
+            // thread, so a sweep never overwrites the mask of a thread entering meanwhile
+            // (perf287's N1 on #1871).
+            let mut registered = self
+                .live
                 .registered
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(tid);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.insert(tid);
+            apply_to(&self.live.process, self.live.masks.load().of(role));
+            drop(registered);
             REGISTERED.with_borrow_mut(|r| {
                 *r = Some(Registered {
                     live: Arc::clone(&self.live),
@@ -600,6 +603,9 @@ impl Placement {
                 });
             });
         }
+        #[cfg(not(target_os = "linux"))]
+        apply_to(&self.live.process, self.live.masks.load().of(role));
+        THREAD.with_borrow_mut(|t| *t = Some((Arc::clone(&self.live), role, now)));
     }
 
     /// After a [`reapply`](Self::reapply): moves every thread of the process that doesn't
@@ -614,10 +620,19 @@ impl Placement {
     /// - every thread whose affinity is a subset of `engine_pins`, the open partitions'
     ///   pinned shard and compaction CPUs: the engines' own pins (D235), one CPU or a
     ///   confined set (ICR 0134). This assumes an engine never pins a thread outside those.
+    ///   Except a thread whose affinity equals one of `previous`'s masks (the ones in force
+    ///   before the reapply) or the process's CPUs: that's a thread still on an old mask,
+    ///   which the new partition's pins may now cover whole, and it moves (perf287's S1 on
+    ///   #1871: on a narrow host, the case #1762 is about).
+    ///
+    /// A thread is checked and masked under the lock [`enter_as`](Self::enter_as) registers
+    /// and masks under, so one entering meanwhile keeps its own mask.
     ///
     /// Two passes at most: a second when the thread count changed during the first, then it
-    /// stops and says so (perf287's N1). The number of threads it moved.
-    pub(crate) fn sweep(&self, engine_pins: &[usize]) -> usize {
+    /// stops and says so (perf287's N1). The number of threads it moved; a thread that
+    /// refuses a mask (io_uring's `iou-wrk-*` workers) isn't counted, and is tried again at
+    /// the next sweep (simp724's N2 on #1871).
+    pub(crate) fn sweep(&self, engine_pins: &[usize], previous: &RuntimeMasks) -> usize {
         #[cfg(target_os = "linux")]
         {
             let target: Vec<usize> = self
@@ -629,6 +644,22 @@ impl Placement {
             if target.is_empty() {
                 return 0;
             }
+            // The old masks, each sorted as `affinity_of` reads a thread's.
+            let old: Vec<Vec<usize>> = [
+                &previous.network,
+                &previous.blocking,
+                &previous.feed,
+                &previous.hub,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .chain(std::iter::once(self.live.process.clone()))
+            .map(|mut m| {
+                m.sort_unstable();
+                m
+            })
+            .collect();
             let mut moved = 0;
             let mut seen = None;
             for _ in 0..2 {
@@ -637,20 +668,21 @@ impl Placement {
                     return moved;
                 }
                 seen = Some(tids.len());
-                let registered = self
-                    .live
-                    .registered
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
                 for tid in tids {
+                    let registered = self
+                        .live
+                        .registered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if registered.contains(&tid) {
                         continue;
                     }
                     let Some(now) = affinity_of(tid) else {
                         continue;
                     };
-                    if now == target || now.iter().all(|c| engine_pins.contains(c)) {
+                    let engine_pin =
+                        !old.contains(&now) && now.iter().all(|c| engine_pins.contains(c));
+                    if now == target || engine_pin {
                         continue;
                     }
                     if set_affinity_of(tid, &target) {
@@ -668,7 +700,7 @@ impl Placement {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = engine_pins;
+            let _ = (engine_pins, previous);
             0
         }
     }
