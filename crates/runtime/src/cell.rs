@@ -245,6 +245,11 @@ impl<H: ShardHandler> ShardCell<H> {
         self.run.caller_busy.swap(0, Ordering::Relaxed)
     }
 
+    /// A turn that panicked poisoned the token (`Turn::drop`): the core is gone for good.
+    pub(crate) fn failed(&self) -> bool {
+        self.core.is_poisoned()
+    }
+
     /// Shutdown: takes the core out for good, once any caller's turn ends. The cell holds
     /// nothing from then on. `None` for a shard whose turn panicked.
     pub(crate) fn close(&self) -> Option<ShardCore<H>> {
@@ -354,6 +359,10 @@ pub(crate) trait DriverShard<H: ShardHandler>: Send + Sized + 'static {
     /// A take that must have the shard: start, a move, close ([`ShardCell::driver_wait`]).
     fn wait(&mut self) -> Option<Self::Turn<'_>>;
 
+    /// A caller's turn panicked on the shard ([`ShardCell::failed`]): no take will ever
+    /// succeed again.
+    fn failed(&self) -> bool;
+
     /// Callers' turn time since the last call ([`ShardCell::take_caller_busy`]).
     fn take_caller_busy(&self) -> u64;
 
@@ -412,6 +421,11 @@ impl<H: ShardHandler> DriverShard<H> for ShardCore<H> {
         Some(self)
     }
 
+    #[inline(always)]
+    fn failed(&self) -> bool {
+        false
+    }
+
     fn take_caller_busy(&self) -> u64 {
         0
     }
@@ -464,6 +478,10 @@ impl<H: ShardHandler> DriverShard<H> for Arc<ShardCell<H>> {
 
     fn wait(&mut self) -> Option<Turn<'_, H>> {
         self.driver_wait()
+    }
+
+    fn failed(&self) -> bool {
+        ShardCell::failed(self)
     }
 
     fn take_caller_busy(&self) -> u64 {

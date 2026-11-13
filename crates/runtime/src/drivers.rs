@@ -572,10 +572,19 @@ impl Controller {
     }
 }
 
+/// What an engine-owned driver thread returns at shutdown.
+pub(crate) struct Exit<H> {
+    /// The handlers of the shards it held, with their ids.
+    pub(crate) handlers: Vec<(ShardId, H)>,
+    /// Shards it let go because a caller's turn on them panicked (caller-runs): their cores
+    /// went with the panic (`Turn::drop`), so they have no handler to return.
+    pub(crate) failed: Vec<ShardId>,
+}
+
 /// Body of an engine-owned driver thread `d` (D289): the turns of the shards it holds, one
 /// after another, then one spin and one park for all of them. With one shard it is that
 /// shard's thread, as before D289. Returns the handlers of the shards it held at shutdown,
-/// with their ids.
+/// with their ids, and the shards a caller's panic failed.
 ///
 /// `S` is how it holds its shards (D321): plain [`ShardCore`](crate::ShardCore)s with
 /// caller-runs off, which compiles the loop as it was before caller-runs, or
@@ -584,9 +593,10 @@ pub(crate) fn driver_main<H: ShardHandler, S: DriverShard<H>>(
     drivers: Arc<Drivers<H>>,
     d: usize,
     mut cores: Vec<S>,
-) -> Vec<(ShardId, H)> {
+) -> Exit<H> {
     let mut idle_park = sched::IdlePark::default();
     let mut done = Vec::new();
+    let mut failed = Vec::new();
     let vfs = Arc::clone(&drivers.vfs);
     // The driver reads the spin window from its first shard: every shard of a runtime
     // shares it.
@@ -647,6 +657,14 @@ pub(crate) fn driver_main<H: ShardHandler, S: DriverShard<H>>(
                     .fetch_add(cell.take_caller_busy(), Ordering::Relaxed);
             }
             let Some(mut core) = cell.look() else {
+                if S::CALLER_RUNS && cell.failed() {
+                    // A caller's turn panicked on this shard: its core went with the panic,
+                    // and no thread may take it again. Let it go, as a closed shard leaves,
+                    // or this driver would never find itself empty and exit at shutdown
+                    // (the 1.2.0 audit's S-E3); shutdown reports it as a shard's panic.
+                    failed.push(cores.swap_remove(i).id());
+                    continue;
+                }
                 // A caller runs it now. Announce sleep for the shard, as the turn's end would
                 // have, then try once more (`driver`: skipped, fence, retry). Either this
                 // thread gets the token after the caller released it, or the caller's release
@@ -738,7 +756,10 @@ pub(crate) fn driver_main<H: ShardHandler, S: DriverShard<H>>(
             let mut h = lock(&drivers.slots[d].handoff);
             if h.cores.is_empty() {
                 h.exited = true;
-                return done;
+                return Exit {
+                    handlers: done,
+                    failed,
+                };
             }
             continue;
         }
