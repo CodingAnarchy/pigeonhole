@@ -663,3 +663,226 @@ fn oldest_after_reopens_starts_at_the_oldest_session_kept() {
     drop(r);
     db.close().unwrap();
 }
+
+/// A token's writer session: bytes 29..37 (after the version byte, the database id, the
+/// stream count and the last seqno delivered; `TokenHeader::parse`).
+fn token_session(token: &[u8]) -> u64 {
+    // The layout these offsets hold for (version 1, the only one 1.1.x writes): a new one
+    // fails here rather than being misread.
+    assert!(
+        matches!(token.first(), Some(1)),
+        "a token layout this test doesn't know: {token:?}"
+    );
+    u64::from_le_bytes(token[29..37].try_into().unwrap())
+}
+
+#[test]
+fn a_token_across_a_writer_restart_names_the_later_session_whatever_its_id() {
+    // #1810: session ids are random, and the reader kept the larger one it read through, so
+    // a token that crossed a reopen named the older session about half the time. A resume
+    // on a copy that holds that session but not the later one then passed the history
+    // check and went on past records it never had. It must name the later session.
+    for seed in 3810u64..3874 {
+        let vfs = SimVfs::new(seed);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let first = single(&db, &a, b"one", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, first);
+        let token = r.token();
+        let s1 = token_session(&token);
+        drop(r);
+        db.close().unwrap();
+
+        let db = open(&vfs, Some(feed(1 << 20)));
+        // The reopen's session, as a feed that read only it names it.
+        let mut fresh = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let second = single(&db, &a, b"two", Durability::GroupSync);
+        assert_eq!(next(&mut fresh).seqno, second);
+        let s2 = token_session(&fresh.token());
+        assert_ne!(s1, s2, "seed {seed}: a reopen is a new session");
+        drop(fresh);
+        if s2 > s1 {
+            // Either rule names s2: try another seed for the case that tells them apart.
+            db.close().unwrap();
+            continue;
+        }
+        // From the first token: through "two", which the later, smaller session wrote.
+        let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+        assert_eq!(next(&mut r).seqno, second);
+        assert_eq!(
+            token_session(&r.token()),
+            s2,
+            "seed {seed}: the token names the later session ({s2:#x}), not the larger id \
+             ({s1:#x})"
+        );
+        db.close().unwrap();
+        return;
+    }
+    panic!("no seed in range drew a smaller id for the later session");
+}
+
+/// A framed sidecar entry: `len` u32, CRC32C u32, then the payload (FORMAT §10).
+fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(8 + payload.len());
+    f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    f.extend_from_slice(&pigeonhole_format::checksum::crc32c(payload).to_le_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// A 1.2 build's `RootIntent` (type 5): the new superblock's `sequence` and checksum.
+fn root_intent_1_2(sequence: u64, checksum: u64) -> Vec<u8> {
+    let mut p = vec![5u8];
+    p.extend_from_slice(&sequence.to_le_bytes());
+    p.extend_from_slice(&checksum.to_le_bytes());
+    frame(&p)
+}
+
+/// A 1.2 build's `Catalog` (type 4), as 1.2.0 wrote it for a `CreateTable` of
+/// `feed_tokens` with one family `t` (cli692's v1.2.0 corpus, `feed_catalog`), with its
+/// `session` and `sequence` set for this file.
+fn catalog_1_2(session: u64, sequence: u64) -> Vec<u8> {
+    const FRAMED: &str = "5e000000ce78949204847d748c7c55f5c6030000000000000001000000000000000000000000000000020000000110010000000b666565645f746f6b656e730325010000000100000001740103004000000a0000000000000000000000000010000000010000";
+    let bytes: Vec<u8> = (0..FRAMED.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&FRAMED[i..i + 2], 16).unwrap())
+        .collect();
+    let mut p = bytes[8..].to_vec();
+    assert_eq!(p[0], 4, "a Catalog entry");
+    p[1..9].copy_from_slice(&session.to_le_bytes());
+    p[9..17].copy_from_slice(&sequence.to_le_bytes());
+    frame(&p)
+}
+
+/// A rollback from 1.2 after a crash inside a root commit (the owner's 1.1.3 item, cli692's
+/// note on 1.2's sidecar): 1.2 left its intent, and maybe the root's Catalog entry, as the
+/// sidecar's last entries. This build opens without feed options, as `phdb` or a tool does
+/// (`feed_inherit`, shards unset), and:
+/// - keeps the feed on: its last session is still the one before the 1.2 entries;
+/// - resolves the intent as 1.2 does, so no intent is left in front of its own entry, where
+///   a later 1.2 open would read it as a break and expire the feed: the root landed (the
+///   superblock has the intent's sequence and checksum), so the intent became its Root;
+///   or it didn't, so the intent went, with that root's Catalog entry;
+/// - and a token from before resumes, unless a 1.2 Catalog entry stays in the history, which
+///   this build can't read (it expires, as 1.2's changelog says).
+#[test]
+fn a_rollback_from_1_2_after_a_crash_in_a_root_commit_keeps_the_feed_and_resolves_its_intent() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedEntry, FeedHeader, decode_entries};
+    use pigeonhole_io::{Vfs, VfsRef};
+    // (the root landed, a Catalog entry with it)
+    for (landed, catalog) in [(true, false), (true, true), (false, false), (false, true)] {
+        let what = format!("landed {landed}, catalog {catalog}");
+        let vfs = SimVfs::new(3811);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+        let first = single(&db, &a, b"one", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, first, "{what}");
+        let token = r.token();
+        drop(r);
+        db.close().unwrap();
+
+        // The superblock the next open reads, and the sidecar its close left: the last entry
+        // is the close's Root for that superblock.
+        let (sequence, checksum) = {
+            let v: VfsRef = vfs.clone();
+            let p = pigeonhole_pager::Pager::open(&v, Path::new(DB), false).unwrap();
+            (p.sequence(), p.checksum())
+        };
+        let path = format!("{DB}{FEED_SUFFIX}");
+        let file = vfs
+            .open(
+                Path::new(&path),
+                pigeonhole_io::OpenOptions::read_write_create(),
+            )
+            .unwrap();
+        let mut bytes = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(&mut bytes, 0).unwrap();
+        let (entries, _) = decode_entries(&bytes[FeedHeader::LEN..]);
+        let Some(&FeedEntry::Root {
+            session,
+            sequence: last,
+        }) = entries.last()
+        else {
+            panic!("{what}: {entries:?}");
+        };
+        assert_eq!(last, sequence, "{what}");
+        // What a 1.2 writer's crash leaves: for a root that landed, its Root entry not yet
+        // written over its intent (with the root's Catalog entry before it); for one that
+        // didn't, its intent (and Catalog) after the last Root, for the next sequence.
+        let mut tail = Vec::new();
+        let at = if landed {
+            if catalog {
+                tail.extend(catalog_1_2(session, sequence));
+            }
+            tail.extend(root_intent_1_2(sequence, checksum));
+            bytes.len() - 25
+        } else {
+            if catalog {
+                tail.extend(catalog_1_2(session, sequence + 1));
+            }
+            tail.extend(root_intent_1_2(sequence + 1, checksum ^ 1));
+            bytes.len()
+        };
+        file.set_len(at as u64).unwrap();
+        file.write_at(&tail, at as u64).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut o = options(&vfs, None);
+        o.feed_inherit = true;
+        o.shards = 0;
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let file = vfs
+            .open(Path::new(&path), pigeonhole_io::OpenOptions::read())
+            .unwrap();
+        let mut after = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(&mut after, 0).unwrap();
+        let (entries, end) = decode_entries(&after[FeedHeader::LEN..]);
+        assert_eq!(FeedHeader::LEN + end, after.len(), "{what}: nothing torn");
+        assert!(
+            !entries.contains(&FeedEntry::Unknown(5)),
+            "{what}: no intent left in front of this open's entry: {entries:?}"
+        );
+        let n = entries.len();
+        assert!(
+            matches!(entries[n - 1], FeedEntry::Session { .. }),
+            "{what}: the open inherited the feed: {entries:?}"
+        );
+        let before = if landed && catalog {
+            vec![FeedEntry::Unknown(4), FeedEntry::Root { session, sequence }]
+        } else {
+            vec![FeedEntry::Root { session, sequence }]
+        };
+        assert_eq!(
+            entries[n - 1 - before.len()..n - 1],
+            before[..],
+            "{what}: {entries:?}"
+        );
+
+        let a = db.table("a").unwrap();
+        let second = single(&db, &a, b"two", Durability::GroupSync);
+        let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+        if landed && catalog {
+            // The 1.2 Catalog entry stays in the history, which this build can't read: the
+            // token expires as any token past the history's start does (`FeedExpired` at the
+            // public API), never an error that reads as corruption.
+            match r.wait(WAIT).unwrap() {
+                Next::Expired(e) => {
+                    eprintln!("{what}: expired: {}", e.reason);
+                    assert!(
+                        !e.reason.to_lowercase().contains("corrupt"),
+                        "{what}: {}",
+                        e.reason
+                    );
+                }
+                other => panic!("{what}: across a 1.2 catalog change: {other:?}"),
+            }
+        } else {
+            assert_eq!(next(&mut r).seqno, second, "{what}");
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}

@@ -199,7 +199,8 @@ struct StreamRead {
     must_reach: Option<Lsn>,
 }
 
-/// The sessions whose segments the feed's history runs through (the mark rule).
+/// The sessions whose segments the feed's history runs through (the mark rule), newest
+/// first ([`chain`]'s order).
 #[derive(Debug)]
 struct History {
     sessions: Vec<u64>,
@@ -208,6 +209,18 @@ struct History {
 impl History {
     fn holds(&self, session: u64) -> bool {
         session != 0 && self.sessions.contains(&session)
+    }
+
+    /// Whether `session` came after `than` in the history: by the chain's order, never by
+    /// value, since session ids are random (#1810). Any held session is later than none
+    /// (0, a feed that has read nothing yet) and than one the history doesn't hold.
+    fn later(&self, session: u64, than: u64) -> bool {
+        let at = |s: u64| self.sessions.iter().position(|&x| x == s);
+        match (at(session), at(than)) {
+            (Some(a), Some(b)) => a < b,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
     }
 }
 
@@ -854,8 +867,11 @@ impl FeedReader {
                 }
             }
             let inside = self.history.holds(session);
-            if inside {
-                self.session = self.session.max(session);
+            // The token names the latest session read through, by the history's order: a
+            // resume on a copy without it must expire (#1810).
+            // Compared only when it differs, once per session crossed, not per record.
+            if inside && session != self.session && self.history.later(session, self.session) {
+                self.session = session;
             }
             match item {
                 Item::Single { seqno, ts, changes } => {
