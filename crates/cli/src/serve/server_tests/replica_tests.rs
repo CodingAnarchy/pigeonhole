@@ -1291,3 +1291,91 @@ fn a_promote_that_fails_after_the_stop_reports_a_replica_that_follows_nothing() 
     let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
     assert_eq!(status, 200, "{body}");
 }
+
+/// A replica whose primary's schema changed without a record in its feed (#1853): a 1.1.x
+/// session after a rollback writes no Catalog entry, so the feed delivers a commit to a table
+/// the replica was never told of, and its apply is refused for ever from the same token. The
+/// replica bootstraps again instead, and catches up with the new table. The 1.1.x session is
+/// made here as 1.1.x leaves the sidecar: 1.2's session with its Catalog entries cut (the
+/// pigeonhole crate's `schema-rollback-1.1.3` corpus is 1.1.3's own bytes for the same case).
+#[test]
+fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader};
+    let options = || {
+        Options::default()
+            .shards(1)
+            .change_feed(pigeonhole::FeedRetention::bytes(64 << 20))
+    };
+    let (pdir, rdir) = (test_dir(), test_dir());
+    std::fs::create_dir_all(&rdir).unwrap();
+    // A primary and a replica of it, caught up.
+    let primary = Pigeonhole::open(pdir.join("t.phdb"), options().create_if_missing(true)).unwrap();
+    let put = |db: &Pigeonhole, table: &str, value: &[u8]| {
+        db.table(table)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(b"r")
+            .put("f", b"q", value)
+            .commit()
+            .unwrap();
+    };
+    primary
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    put(&primary, "t", b"t0");
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, rdir.join("t.phdb")).unwrap();
+    let start = primary.feed().from_snapshot(&snap).open().unwrap().token();
+    drop(snap);
+    let replica = Pigeonhole::open(rdir.join("t.phdb"), Options::default()).unwrap();
+    replica.begin_replication(&start).unwrap();
+    replica.close().unwrap();
+    primary.close().unwrap();
+    let sidecar = pdir.join(format!("t.phdb{FEED_SUFFIX}"));
+    let recorded = std::fs::read(&sidecar).unwrap().len();
+
+    // The "1.1.x" session: a table created and written to, its Catalog entries cut.
+    let primary = Pigeonhole::open(pdir.join("t.phdb"), options()).unwrap();
+    primary
+        .table("c")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    put(&primary, "c", b"c1");
+    put(&primary, "t", b"t1");
+    primary.close().unwrap();
+    let bytes = std::fs::read(&sidecar).unwrap();
+    let mut kept = bytes[..recorded].to_vec();
+    let mut at = recorded;
+    let mut cut = 0;
+    while at < bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let frame = &bytes[at..at + 8 + len];
+        // Type 4: a Catalog entry.
+        if frame[8] == 4 {
+            cut += 1;
+        } else {
+            kept.extend_from_slice(frame);
+        }
+        at += 8 + len;
+    }
+    assert!(
+        recorded >= FeedHeader::LEN && cut == 1,
+        "one Catalog entry cut: {cut}"
+    );
+    std::fs::write(&sidecar, kept).unwrap();
+
+    let primary = Pigeonhole::open(pdir.join("t.phdb"), options()).unwrap();
+    let p = Server::serve(pdir, primary, "", limits(), None, |s| s);
+    let r = Server::start_replica(rdir, &p.url, None);
+    wait_replica(&r, "caught up again", caught_up(&p, None));
+    // Table `c` reaches the replica only in a new bootstrap's copy: the feed never delivered
+    // its create, and an apply of a commit to it is refused.
+    assert_eq!(get_value(&r, "c", "r", None), b64(b"c1"));
+    assert_eq!(get_value(&r, "t", "r", None), b64(b"t1"));
+}

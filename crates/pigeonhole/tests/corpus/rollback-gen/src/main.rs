@@ -15,6 +15,10 @@
 //! intent names the superblock the next open reads, in place of its Root entry) or one that
 //! didn't (the next sequence, after the last Root). The session before the crash is written
 //! by this build: its Session and Root entries are the same bytes 1.2 writes.
+//!
+//! `cargo run --release -- schema <dir>` is the second step of the schema-rollback corpus
+//! (#1853): 1.1.3 changes the schema of each case's primary, as `schema-rollback-gen` (1.2.0)
+//! wrote it, then `<dir>/frozen.txt` is written.
 
 use std::path::Path;
 
@@ -166,11 +170,107 @@ fn write(dir: &Path, landed: bool, with_catalog: bool) {
     );
 }
 
+/// The second step of the schema-rollback corpus (#1853): 1.1.3 opens each case's primary,
+/// as `schema-rollback-gen` (1.2.0) left it, without naming the feed (so it inherits it),
+/// changes the schema as the case says, commits, and closes.
+fn change_schema(dir: &Path, case: &str) {
+    let db = Pigeonhole::open(dir.join(DB), options()).unwrap();
+    assert!(db.info().unwrap().feed.is_some(), "1.1.3 kept the feed");
+    let put = |table: &str, family: &str, value: &[u8]| {
+        db.table(table)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(b"r")
+            .put(family, b"q", value)
+            .commit()
+            .unwrap();
+    };
+    match case {
+        // A table created and written to.
+        "created" => {
+            db.table("c")
+                .unwrap()
+                .family("g", Family::default())
+                .create()
+                .unwrap();
+            put("c", "g", b"c1");
+            put("a", "f", b"a2");
+        }
+        // A table created, nothing written to it.
+        "created_unwritten" => {
+            db.table("c")
+                .unwrap()
+                .family("g", Family::default())
+                .create()
+                .unwrap();
+            put("a", "f", b"a2");
+        }
+        // A table dropped.
+        "dropped" => {
+            db.drop_table("b").unwrap();
+            put("a", "f", b"a2");
+        }
+        // A family added to a table, and written to.
+        "family" => {
+            db.table("a")
+                .unwrap()
+                .family("g", Family::default())
+                .open()
+                .unwrap();
+            put("a", "g", b"g1");
+            put("a", "f", b"a2");
+        }
+        _ => panic!("no such case: {case}"),
+    }
+    db.close().unwrap();
+}
+
+/// `path length xxh3-64` lines for every file of `<out>/<case>/`.
+fn frozen_lines(out: &Path, name: &str) -> Vec<String> {
+    let dir = out.join(name);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|f| f.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .map(|f| {
+            let bytes = std::fs::read(dir.join(&f)).unwrap();
+            format!(
+                "{name}/{f} {} {:016x}",
+                bytes.len(),
+                pigeonhole_format::checksum::xxh3_64(&bytes)
+            )
+        })
+        .collect()
+}
+
 fn main() {
-    let out = std::env::args()
-        .nth(1)
-        .expect("usage: rollback-gen <out dir>");
-    let out = Path::new(&out);
+    let mut args = std::env::args().skip(1);
+    let first = args
+        .next()
+        .expect("usage: rollback-gen <out dir> | rollback-gen schema <dir>");
+    if first == "schema" {
+        let out = args.next().expect("usage: rollback-gen schema <dir>");
+        let out = Path::new(&out);
+        let mut frozen = vec![
+            "# The schema-rollback corpus: written by 1.2.0's code (schema-rollback-gen), then \
+             1.1.3's (rollback-gen schema): path, length, xxh3-64."
+                .to_owned(),
+            "# Frozen: no file or line ever changes.".to_owned(),
+        ];
+        for case in ["created", "created_unwritten", "dropped", "family"] {
+            change_schema(&out.join(case), case);
+            frozen.extend(frozen_lines(out, case));
+            println!("changed {}", out.join(case).display());
+        }
+        frozen.push(String::new());
+        std::fs::write(out.join("frozen.txt"), frozen.join("\n")).unwrap();
+        return;
+    }
+    let out = Path::new(&first);
     let mut frozen = vec![
         "# The rollback corpus, written by 1.1.3's code (rollback-gen): path, length, xxh3-64."
             .to_owned(),
@@ -189,19 +289,7 @@ fn main() {
             dir.display()
         );
         write(&dir, landed, with_catalog);
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|f| f.unwrap().file_name().into_string().unwrap())
-            .collect();
-        files.sort();
-        for f in files {
-            let bytes = std::fs::read(dir.join(&f)).unwrap();
-            frozen.push(format!(
-                "{name}/{f} {} {:016x}",
-                bytes.len(),
-                pigeonhole_format::checksum::xxh3_64(&bytes)
-            ));
-        }
+        frozen.extend(frozen_lines(out, &name));
         println!("wrote {}", dir.display());
     }
     frozen.push(String::new());

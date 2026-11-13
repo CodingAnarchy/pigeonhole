@@ -110,6 +110,36 @@ const STEADY: Duration = Duration::from_secs(30);
 /// short the stream idle limit (which bounds the waits for the copy's data).
 const BEAT_WAIT: Duration = Duration::from_secs(3);
 
+/// Whether an apply's refusal says the replica's tables aren't its primary's (#1853): a
+/// commit to a table or family it doesn't have, or a catalog change to one it lacks or
+/// already has under another id. Retrying from the stored token refuses again, for ever:
+/// only a new bootstrap brings the two back together. The primary's feed delivers every
+/// catalog change, so this follows a change its history never recorded: a 1.1.x session's,
+/// after a rollback of the primary.
+fn diverged(e: &pigeonhole::Error) -> bool {
+    matches!(
+        e.code(),
+        pigeonhole::ErrorCode::TableNotFound
+            | pigeonhole::ErrorCode::FamilyNotFound
+            | pigeonhole::ErrorCode::TableExists
+            | pigeonhole::ErrorCode::FamilyExists
+    )
+}
+
+/// An apply's refusal as the loop's halt: [`diverged`] bootstraps again, anything else
+/// retries.
+fn applying(what: &str, e: &pigeonhole::Error) -> Halt {
+    if diverged(e) {
+        Halt::Expired(format!(
+            "{what}: {e}; the replica's tables are no longer its primary's (a schema change \
+             the primary's feed didn't record, such as one made while it ran 1.1.x), so it \
+             bootstraps again"
+        ))
+    } else {
+        Halt::Failed(format!("{what}: {e}"))
+    }
+}
+
 // ---- The primary's side: `Replication.Follow` ----
 
 /// A `Follow` stream: batches as the follower's thread reads them, then its error if it
@@ -739,7 +769,7 @@ impl Replica {
                         // Promote or shutdown: what arrived is applied first.
                         return match self.apply_run(&db, &mut run).await {
                             Ok(()) => Halt::Stopped,
-                            Err(e) => Halt::Failed(e),
+                            Err(halt) => halt,
                         };
                     }
                 },
@@ -763,29 +793,29 @@ impl Replica {
                 };
                 if event.is_catalog() {
                     // D315: a catalog change applies on its own, between runs.
-                    if let Err(e) = self.apply_run(&db, &mut run).await {
-                        return Halt::Failed(e);
+                    if let Err(halt) = self.apply_run(&db, &mut run).await {
+                        return halt;
                     }
-                    if let Err(e) = self.apply_catalog(shared, event).await {
-                        return Halt::Failed(e);
+                    if let Err(halt) = self.apply_catalog(shared, event).await {
+                        return halt;
                     }
                     continue;
                 }
                 run.bytes += bytes.len();
                 run.events.push(event);
                 if (run.events.len() >= self.config.run_events.max(1) || run.bytes >= RUN_BYTES)
-                    && let Err(e) = self.apply_run(&db, &mut run).await
+                    && let Err(halt) = self.apply_run(&db, &mut run).await
                 {
-                    return Halt::Failed(e);
+                    return halt;
                 }
             }
             // The latency bound: no further message ready, so what arrived is applied now.
             if !run.events.is_empty() {
                 peeked = ready(&mut stream);
                 if peeked.is_none()
-                    && let Err(e) = self.apply_run(&db, &mut run).await
+                    && let Err(halt) = self.apply_run(&db, &mut run).await
                 {
-                    return Halt::Failed(e);
+                    return halt;
                 }
             }
             let mut s = self.status();
@@ -802,8 +832,9 @@ impl Replica {
         }
     }
 
-    /// Applies `run` (if any) in one call, with its last event's token.
-    async fn apply_run(&self, db: &Pigeonhole, run: &mut Run) -> Result<(), String> {
+    /// Applies `run` (if any) in one call, with its last event's token. A refusal that says
+    /// the replica's tables aren't its primary's ([`diverged`]) bootstraps again.
+    async fn apply_run(&self, db: &Pigeonhole, run: &mut Run) -> Result<(), Halt> {
         let Some(last) = run.events.last() else {
             return Ok(());
         };
@@ -819,28 +850,28 @@ impl Replica {
             }
         })
         .await
-        .map_err(|e| format!("applying a run: {e}"))?
-        .map_err(|e| format!("applying a run: {e}"))?;
+        .map_err(|e| Halt::Failed(format!("applying a run: {e}")))?
+        .map_err(|e| applying("applying a run", &e))?;
         self.set_applied(applied);
         Ok(())
     }
 
     /// Applies a catalog change, then drops the service's cached table handles: a table
     /// dropped (or dropped and made again) on the primary must not serve from its old one.
-    async fn apply_catalog(&self, shared: &Shared, event: ReplicatedEvent) -> Result<(), String> {
+    async fn apply_catalog(&self, shared: &Shared, event: ReplicatedEvent) -> Result<(), Halt> {
         let applied = event.primary_seqno();
         let db = shared
             .router
             .service
             .part()
-            .map_err(|e| e.message)?
+            .map_err(|e| Halt::Failed(e.message))?
             .db
             .clone();
         let outcome = tokio::task::spawn_blocking(move || db.apply_catalog(&event, event.token()))
             .await
-            .map_err(|e| format!("applying a catalog change: {e}"));
+            .map_err(|e| Halt::Failed(format!("applying a catalog change: {e}")));
         shared.router.service.tables_changed();
-        outcome?.map_err(|e| format!("applying a catalog change: {e}"))?;
+        outcome?.map_err(|e| applying("applying a catalog change", &e))?;
         let applied = applied.max(self.status().applied);
         self.set_applied(applied);
         Ok(())
