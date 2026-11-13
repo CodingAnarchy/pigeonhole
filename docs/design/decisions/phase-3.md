@@ -4791,3 +4791,40 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 - *Per-shard visibility.* That's #717 (b2), which is shelved.
 
 **Instead.** #1681's preallocation stays for 1.2.0. #1621's remaining stall goes to 1.3.0 as #1708: stay buffered, and start a fresh page while a sync is in flight. That's a design note first, since it raises format, space and replay questions.
+
+<a id="d325"></a>
+## D325 — Every-table feed tokens carry the catalog's table-id set and id counters (token version 3) (perf2, design; owner, 2026-11-13; feed, engine, pigeonhole, #1853, ICR 0136) · D315
+
+**Problem (#1853).** A 1.1.x session after a rollback from 1.2 records no catalog change in the feed. Its Session and Root entries are byte-identical to 1.2's. Back on 1.2, a feed of every table resumed from an earlier token delivers the commits without the create, the added family or the drop. A replica following that feed either refuses a commit for ever or falls silently behind its primary. Nothing 1.2.0 writes records what the catalog was at a token's position, so no check can decide it for a 1.2.0 token. #1857 (1.2.1) catches what it can without that record: a commit to a dropped table, and a replica's refused apply.
+
+**Decision.** A token of a feed of every table gets a new layout, version 3. It is version 2's layout followed by 16 bytes, all little-endian:
+- `tables`: an order-independent hash of the catalog's set of table ids at the token's position. It is the wrapping sum of xxh3-64 over each id's four bytes, so the reader can add and remove ids as catalog changes pass.
+- `next_table` (u32) and `next_family` (u32): the catalog's id counters at that position.
+
+**Why these three are enough.** The catalog changes a feed records are a table created with its families, a family added, and a table dropped (D315).
+- Ids are never reused, and the counters only rise. So a table created or a family added without a record always leaves a counter above what the recorded changes account for.
+- A drop without a record leaves the id set different.
+- A drop's Catalog entry carries its table id but not its families' names. An id set can be worked back from that entry; a digest of names couldn't.
+
+**On resume** (a version 3 token):
+1. The reader takes the live catalog's table ids and counters.
+2. It works back through the rooted Catalog entries the history holds after the token's catalog position: a create removes its id, a drop restores its id.
+3. If the result's hash isn't the token's `tables`, the resume answers `FeedExpired`. It also expires if a live counter isn't what the token's value and the recorded creates and added families account for: the larger of the token's value and one past the largest id they carry.
+4. While delivering, the reader applies each catalog change to its set and counters, so every token it hands out carries its own position's values.
+
+**What "the start" is.** The reference is the token's own last catalog change (`catalog_seq`): its model holds the changes up to it and none after. A change after it that the token's bound passes over is compared as after the start, then put in. That's a change appended after the token was taken, while its commit was already below the bound (simp724's F1 race on #1515). The view a start sees can lag the sidecar too: a reader process's view, or a change appended but not yet published. So changes before the start that the view doesn't reflect yet are put in, and changes after it are taken out only while the view reflects them, a prefix in order (`reflects`, D315).
+
+A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard only. A non-token start has no claimed catalog, so the reader takes the live catalog as its reference: a start sees nothing that came before it.
+
+**Across versions.**
+- 1.2.0 refuses a version 3 token (`InvalidArgument`, "not a change feed token"). After a rollback from 1.3 to 1.2.0, start feeds of every table again. The upgrade note says so.
+- **1.2.1 accepts a version 3 token** and resumes it as version 2, ignoring the 16 bytes: the owner's rule of 2026-11-13, so a rollback from 1.3 to 1.2.1 keeps its feeds. A token 1.2.1 then hands out is version 2. Back on 1.3, such a token has #1857's guard only.
+- Per-table tokens (version 1) don't change.
+- The sidecar doesn't change. A new entry type would have ended every feed's history on 1.2.x, and a longer Session entry is `Corrupt` there.
+
+**Rejected.**
+- *A digest of names and families.* It can't be worked back through a drop, whose entry doesn't name the dropped table's families.
+- *A per-session baseline in the sidecar.* A new entry type is `Unknown` to 1.2.x, and ends the history of every feed, per-table ones included.
+- *A 1.1.x patch marking catalog-changing roots.* 1.1.3 is already shipped, and a rollback to it is what this decision has to survive.
+
+**Owner's approval (2026-11-13).** Yes to the version 3 layout in 1.3.0, with the upgrade note saying a 1.3 every-table token is `InvalidArgument` on 1.2.0. 1.2.1 ships #1857, plus the parse of version 3 once its layout is settled on main.
