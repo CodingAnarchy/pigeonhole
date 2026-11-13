@@ -122,7 +122,9 @@ message VectorSearchStats {
 message VectorBulkLoadRequest {
   // In the first message only.
   string index = 1;
-  // In the first message only: about how many vectors follow, for sizing the lists.
+  // In the first message only: how many vectors follow, at most. It sizes the lists, and
+  // a load that sends more than they hold before they split (about twice this) ends with
+  // InvalidArgument, the vectors before it loaded.
   uint64 expected = 2;
   repeated VectorItem items = 3;
 }

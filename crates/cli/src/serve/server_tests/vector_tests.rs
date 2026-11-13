@@ -687,6 +687,49 @@ fn a_bulk_load_over_bulk_load_bytes_is_refused_before_it_starts() {
 }
 
 #[test]
+fn a_bulk_load_stops_past_what_its_expected_sized_its_lists_for() {
+    // The audit's P2-F2: `expected` sized the reservation but not the load, so `expected: 0`
+    // put every vector in one list without bound, and the rebalance's split then read that
+    // list whole. A load now stops once it has sent its lists' split length (lists × 2 ×
+    // target), the vectors before it loaded. Here lists of 8 and `expected` 0 make one list,
+    // so 16 vectors.
+    let s = Server::start("", limits());
+    let mut spec = index_spec("REBALANCE_INLINE");
+    spec["target_list_len"] = json!(8);
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    let mut client = vectors_client(&s);
+    let err = s
+        .block_on(client.bulk_load(tonic::codegen::tokio_stream::iter(vec![
+            bulk_message("ix", 0, 0, 50, 2),
+            bulk_message("", 0, 50, 50, 2),
+        ])))
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert!(
+        err.message().contains("sent more than 16 vectors"),
+        "{err:?}"
+    );
+    assert_eq!(
+        verified(&s, "ix"),
+        json!("16"),
+        "the vectors before it are loaded"
+    );
+    assert_bulk_budget_free(&s);
+    // An honest `expected` loads all it declared, and up to what its lists hold: 40 makes 5
+    // lists of up to 16, so 80.
+    let mut spec = index_spec("REBALANCE_INLINE");
+    spec["name"] = json!("ix2");
+    spec["target_list_len"] = json!(8);
+    assert_eq!(s.rpc("Vectors/CreateIndex", &spec, None).0, 200);
+    s.block_on(client.bulk_load(tonic::codegen::tokio_stream::iter(vec![
+        bulk_message("ix2", 40, 0, 50, 2),
+        bulk_message("", 0, 50, 30, 2),
+    ])))
+    .unwrap();
+    assert_eq!(verified(&s, "ix2"), json!("80"));
+}
+
+#[test]
 fn a_768_dim_load_fits_the_default_bulk_load_bytes() {
     // The default 1 GiB holds a 768-dim f32 load's sample (about 315 MB) and its pending
     // batches up to about 1,300 lists. The reservation is the load's worst case while it
