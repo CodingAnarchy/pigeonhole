@@ -257,6 +257,12 @@ const PENDING_PER_LIST: u64 = 255;
 const PER_VECTOR: u64 = 96;
 /// The id length the up-front check assumes; a longer id grows the reservation as it comes.
 const ID_ALLOWANCE: u64 = 32;
+/// How many times what its lists were sized for a load may send before it stops: lists ×
+/// the most a list holds before it splits (the audit's P2-F2). An honest `expected` sizes
+/// lists × that at twice `expected`, so this is four times what it declared; one that
+/// declared too few (0, say) stops here instead of growing one list without bound, which
+/// the rebalance's split then reads whole.
+const SIZED_FACTOR: u64 = 2;
 
 /// What a bulk load holds at most, by the crate's design ([`SAMPLE_FLOOR`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +276,9 @@ pub(crate) struct Need {
     pub(crate) sample: u64,
     /// The pending batches' bytes after it: 255 vectors a list.
     pub(crate) pending: u64,
+    /// The most vectors the load may send ([`SIZED_FACTOR`] × lists × the longest a list
+    /// grows before it splits, twice `target`).
+    pub(crate) vectors: u64,
 }
 
 impl Need {
@@ -299,6 +308,9 @@ pub(crate) fn need(spec: &pigeonhole::VectorSpec, target: u64, expected: u64, id
     let sample_vectors = lists.max(SAMPLE_FLOOR);
     Need {
         lists,
+        vectors: SIZED_FACTOR
+            .saturating_mul(lists)
+            .saturating_mul(target.max(1).saturating_mul(2)),
         sample_vectors,
         sample: sample_vectors.saturating_mul(each.saturating_add(placed)),
         pending: lists.saturating_mul(PENDING_PER_LIST).saturating_mul(each),
@@ -459,6 +471,9 @@ impl BulkLoads {
             limit: budget.limit,
             id: ID_ALLOWANCE,
             need: first.bytes(),
+            lists: first.lists,
+            vectors: first.vectors,
+            taken: 0,
             pool: Arc::clone(budget.pool),
             reserved,
         };
@@ -586,15 +601,34 @@ struct Sizing {
     id: u64,
     /// The worst case's bytes, as reserved.
     need: u64,
+    /// The lists `expected` makes, and the most vectors the load may send for them.
+    lists: u64,
+    vectors: u64,
+    /// The vectors handed to the loader so far.
+    taken: u64,
     pool: Arc<Semaphore>,
     /// Released with the input: when the loader returns, its working set is gone.
     reserved: OwnedSemaphorePermit,
 }
 
 impl Sizing {
-    /// Takes an id of `len` bytes into the worst case: a longer one than assumed grows the
+    /// Takes the next vector, its id `len` bytes long: past what its lists were sized for
+    /// the load stops (the audit's P2-F2), and an id longer than assumed grows the
     /// reservation, now or not at all. The error ends the input before that vector.
-    fn take_id(&mut self, len: u64, gauges: &Gauges) -> Result<(), ApiError> {
+    fn take(&mut self, len: u64, gauges: &Gauges) -> Result<(), ApiError> {
+        if self.taken >= self.vectors {
+            return Err(ApiError::invalid(format!(
+                "a BulkLoad that declared expected {} sent more than {} vectors, {SIZED_FACTOR} \
+                 × its {} lists of up to {} each: the load stopped there, and the vectors \
+                 before it were loaded. Set expected to the number of vectors you load, and \
+                 Insert the rest",
+                self.expected,
+                self.vectors,
+                self.lists,
+                2 * self.target
+            )));
+        }
+        self.taken += 1;
         if len <= self.id {
             return Ok(());
         }
@@ -666,7 +700,7 @@ impl Iterator for Input<'_> {
     fn next(&mut self) -> Option<Item> {
         loop {
             if let Some(item) = self.current.next() {
-                if let Err(e) = self.sizing.take_id(item.0.len() as u64, self.gauges) {
+                if let Err(e) = self.sizing.take(item.0.len() as u64, self.gauges) {
                     self.current = Vec::new().into_iter();
                     self.end(Some(e));
                     return None;
@@ -755,19 +789,35 @@ mod tests {
 
     #[test]
     fn a_load_s_worst_case_is_its_sample_or_its_pending_batches() {
-        // serve.md's examples, at the default target list length of 1,000 and 1 GiB.
+        // serve.md's examples at 1 GiB, at the target list lengths the crate gives these
+        // dimensions (P2-S3): 1,000 scaled down so twice it fits a 4 MiB list row, 682 at
+        // 768-dim f32 and 341 at 1,536-dim.
         let gib = 1u64 << 30;
         let f32s = |dim| VectorSpec::new(dim, Element::F32, Metric::L2).unwrap();
-        // 768-dim: the sample of 50,000 is about 315 MB, held and its clustering copy.
-        let n = need(&f32s(768), 1000, 1_000_000, ID_ALLOWANCE);
+        let fits = |dim, target, lists: u64| {
+            need(&f32s(dim), target, lists * target, ID_ALLOWANCE).bytes() <= gib
+        };
+        // 768-dim: the sample of 50,000 is about 315 MB, held and its clustering copy; the
+        // pending batches allow 1,302 lists, about 888,000 vectors.
+        let n = need(&f32s(768), 682, 682_000, ID_ALLOWANCE);
         assert_eq!(n.lists, 1000);
         assert_eq!(n.sample, 50_000 * (3072 + 64 + 96 + 3072));
-        assert!(n.bytes() < gib, "{n:?}");
-        // 1536-dim: a million vectors make 1,000 lists, whose pending batches are over.
-        let n = need(&f32s(1536), 1000, 1_000_000, ID_ALLOWANCE);
-        assert_eq!(n.pending, 1000 * 255 * (6144 + 64 + 96));
-        assert!(n.bytes() > gib, "{n:?}");
-        assert!(need(&f32s(1536), 1000, 500_000, ID_ALLOWANCE).bytes() < gib);
+        assert!(fits(768, 682, 1302) && !fits(768, 682, 1303));
+        assert_eq!(1302 * 682, 887_964);
+        // 1,536-dim: 667 lists, about 227,000 vectors. A million make 2,933 lists, whose
+        // pending batches need about 4.7 GB.
+        assert!(fits(1536, 341, 667) && !fits(1536, 341, 668));
+        assert_eq!(667 * 341, 227_447);
+        let n = need(&f32s(1536), 341, 1_000_000, ID_ALLOWANCE);
+        assert_eq!(n.lists, 2933);
+        assert_eq!(n.pending, 2933 * 255 * (6144 + 64 + 96));
+        // The most a load sends (P2-F2): twice its lists' split length. Declaring 0 makes one
+        // list, so 4 × target vectors.
+        assert_eq!(need(&f32s(768), 682, 0, ID_ALLOWANCE).vectors, 2 * 2 * 682);
+        assert_eq!(
+            need(&f32s(768), 682, 682_000, ID_ALLOWANCE).vectors,
+            4 * 682_000
+        );
         // Saturating, never overflowing.
         let n = need(&f32s(4096), 1, u64::MAX, u64::MAX);
         assert_eq!(n.bytes(), u64::MAX);
