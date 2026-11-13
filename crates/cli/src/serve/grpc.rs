@@ -665,11 +665,17 @@ impl proto::admin_server::Admin for AdminGrpc {
         unary!(&self.0, req, Info, Info)
     }
 
-    async fn flush(&self, req: Request<proto::Empty>) -> Result<Response<proto::Empty>, Status> {
+    async fn flush(
+        &self,
+        req: Request<proto::MaintenanceRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
         unary!(&self.0, req, Flush, Empty)
     }
 
-    async fn compact(&self, req: Request<proto::Empty>) -> Result<Response<proto::Empty>, Status> {
+    async fn compact(
+        &self,
+        req: Request<proto::MaintenanceRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
         unary!(&self.0, req, Compact, Empty)
     }
 

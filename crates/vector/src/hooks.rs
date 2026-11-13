@@ -1,19 +1,22 @@
 //! Hold and fault seams for tests (`__unstable-hooks` only). They pause or skip; they never run
 //! another path.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Where a test can hold an index operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Hold {
-    /// A split, after its 2-means snapshot read and before its transaction (rev 4 N1).
+    /// A split, after its 2-means snapshot read and before its transaction (rev 4 N1); for a
+    /// list split a page at a time (#1824), before its first page's transaction.
     SplitBeforeCommit,
     /// An insert's transaction, after its reads and writes and before its commit.
     PlaceBeforeCommit,
     /// A delete's transaction, after its reads and writes and before its commit.
     DeleteBeforeCommit,
-    /// A phase 2 transaction, after its reads and writes and before its commit.
+    /// A phase 2 transaction, or one moving a later page of a long list's split (#1824),
+    /// after its reads and writes and before its commit.
     ReassignBeforeCommit,
     /// A merge, after its commit and before it reloads the shared centroid cache: the
     /// cache still names the merged-away list (D311 T8's stale-cache writes).
@@ -38,6 +41,7 @@ pub struct Armed {
 static ARMED: Mutex<Option<(Hold, Gate)>> = Mutex::new(None);
 static SKIP_REBALANCE: Mutex<bool> = Mutex::new(false);
 static FAIL_AFTER_SPLIT: Mutex<bool> = Mutex::new(false);
+static SPLIT_HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// Holds the next operation that reaches `at` (one at a time, process-wide).
 pub fn arm(at: Hold) -> Armed {
@@ -126,6 +130,17 @@ pub(crate) fn failing_after_split() -> bool {
     *FAIL_AFTER_SPLIT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The most vectors one read of a split or its phase 2 has held at once (a list read
+/// whole, a sample or a page, #1824), process-wide since the last call, which resets it.
+/// Inspection only.
+pub fn take_split_held() -> usize {
+    SPLIT_HELD.swap(0, Ordering::Relaxed)
+}
+
+pub(crate) fn note_split_held(n: usize) {
+    SPLIT_HELD.fetch_max(n, Ordering::Relaxed);
 }
 
 /// Whether two handles share one index's state (its centroid cache, queue and rebalancer):
