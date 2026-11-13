@@ -30,6 +30,8 @@ on:
       - 'crates/bench/examples/ycsb.rs'
       - 'crates/bench/examples/textshapes.rs'
       - 'crates/bench/examples/feedshapes.rs'
+      - 'crates/bench/examples/serveshapes.rs'
+      - 'crates/cli/src/serve/**'
       - 'crates/text/**'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
@@ -134,7 +136,7 @@ jobs:
     timeout-minutes: 60
     # Jobs in parallel (#1575): the read and write shapes; the text-search shapes, which
     # alone took about 20 minutes a side under valgrind and pushed one job to its 60-minute
-    # timeout; and the feed and replication shapes (#1828). Each builds and counts only its
+    # timeout; the feed and replication shapes, and `phdb serve`'s calls (#1828). Each builds and counts only its
     # own examples, and checks only its own shapes against the ceilings.
     strategy:
       fail-fast: false
@@ -175,6 +177,15 @@ jobs:
             hotrow: '-'
             shapes: >-
               feedshapes:feed-drain,feed-drain-all,replicate-apply
+          - name: phdb serve instructions per call (callgrind)
+            # `phdb serve`'s gRPC calls through its router in process (#1828,
+            # crates/bench/examples/serveshapes.rs): the token check, prepay, decode,
+            # admission, handler, conversion and encode, not the shards' side. `serve-scan`
+            # last: its setup is the fullest (it warms the most rows).
+            examples: serveshapes
+            hotrow: '-'
+            shapes: >-
+              serveshapes:serve-get,serve-read-row,serve-mutate,serve-scan
     env:
       EXAMPLES: ${{ matrix.examples }}
       SHAPES: ${{ matrix.shapes }}
