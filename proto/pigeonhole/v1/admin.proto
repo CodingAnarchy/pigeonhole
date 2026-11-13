@@ -46,8 +46,8 @@ message ReplicaInfo {
   // The primary's URL (`--replica-of`).
   string primary = 1;
   // "starting", "bootstrapping", "following", "re-bootstrapping", "retrying" (after an
-  // error, which `last_error` gives) or "stopped" (a promote failed past its stop: the
-  // replica follows nothing until it's restarted).
+  // error, which `last_error` gives) or "stopped" (a promote failed after it stopped
+  // following: `last_error` says why, and another Promote may succeed).
   string state = 2;
   // The primary's seqno the replica applied through.
   uint64 applied_primary_seqno = 3;

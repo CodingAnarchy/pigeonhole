@@ -519,15 +519,23 @@ impl BulkLoads {
                             sizing,
                         };
                         let r = loader(&index, expected, &mut input);
-                        // The loader's own failure first; else the stream's.
-                        let r = r.and_then(|_| input.failed.take().map_or(Ok(()), Err));
                         // A load that took vectors and then failed left them loaded, so the
                         // index isn't empty and the call can't be sent again, whatever its
                         // code says of itself (the audit's P2-C9: a stall's DeadlineExceeded,
-                        // a shutdown's Closed, an id's Overloaded).
+                        // a shutdown's Closed, an id's Overloaded). The loader's own failure
+                        // first: one inside the crate mid-load drops the batches still
+                        // waiting, so only some of the vectors may be loaded. Else the
+                        // input's: it ended there, and the crate wrote everything before it
+                        // (audit120's S1 on #1839).
+                        let took = input.sizing.taken > 0;
                         let r = match r {
-                            Err(e) if input.sizing.taken > 0 => Err(e.applied_partly()),
-                            r => r,
+                            Err(e) if took => Err(e.applied_partly(false)),
+                            Err(e) => Err(e),
+                            Ok(_) => match input.failed.take() {
+                                Some(e) if took => Err(e.applied_partly(true)),
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            },
                         };
                         drop(input);
                         drop(index);

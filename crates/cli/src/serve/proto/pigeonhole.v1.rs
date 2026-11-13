@@ -616,8 +616,8 @@ pub struct ReplicaInfo {
     #[prost(string, tag = "1")]
     pub primary: ::prost::alloc::string::String,
     /// "starting", "bootstrapping", "following", "re-bootstrapping", "retrying" (after an
-    /// error, which `last_error` gives) or "stopped" (a promote failed past its stop: the
-    /// replica follows nothing until it's restarted).
+    /// error, which `last_error` gives) or "stopped" (a promote failed after it stopped
+    /// following: `last_error` says why, and another Promote may succeed).
     #[prost(string, tag = "2")]
     pub state: ::prost::alloc::string::String,
     /// The primary's seqno the replica applied through.
