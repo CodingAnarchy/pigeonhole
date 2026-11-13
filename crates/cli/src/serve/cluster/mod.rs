@@ -1732,7 +1732,21 @@ fn open_partitions(
             open_partition(dir, cluster_id, id, *epoch, o)
         };
         let mut db = match open(planned, &compaction_cpus) {
-            Ok(db) => db,
+            Ok(Some(db)) => db,
+            // Stamped past the map: a restore or relocation onto this node that stopped
+            // before its map was set. Not this map's copy, so not served, but the node
+            // starts: the rerun needs it, and the map that names that epoch opens it
+            // (audit120's P2-C4). Status shows the epochs.
+            Ok(None) => {
+                let _ = writeln!(
+                    stderr,
+                    "phdb serve: partition {id}: its file is stamped at an epoch above the \
+                     map's {epoch} (a restore or relocation that stopped before its map was \
+                     set): left unopened until a map names that epoch. Run the restore or \
+                     relocation again"
+                );
+                continue;
+            }
             Err(e) => return fail(opened, e),
         };
         // A partition whose change feed recorded a shard count keeps it, whatever its share
@@ -1760,7 +1774,15 @@ fn open_partitions(
                     return fail(opened, Failure::db("close the partition to resize it", &e));
                 }
                 db = match open(Some(resized), &compaction_cpus) {
-                    Ok(db) => db,
+                    Ok(Some(db)) => db,
+                    Ok(None) => {
+                        return fail(
+                            opened,
+                            Failure::usage(&format!(
+                                "partition {id}'s file changed epoch while it reopened"
+                            )),
+                        );
+                    }
                     Err(e) => return fail(opened, e),
                 };
                 resized
@@ -1870,13 +1892,15 @@ pub(crate) fn open_retrying(
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
+/// `None` for this cluster's and partition's file at an epoch **above** the map's: a stamp
+/// whose map didn't land yet, which isn't a reason to fail the node (audit120's P2-C4).
 fn open_partition(
     dir: &Path,
     cluster_id: &str,
     partition: &str,
     epoch: u64,
     options: pigeonhole::Options,
-) -> Result<pigeonhole::Pigeonhole, Failure> {
+) -> Result<Option<pigeonhole::Pigeonhole>, Failure> {
     // An install a crash interrupted is finished first: the partition never opens with its
     // marker there (D317 ticket 6, feed1248's F1).
     stamp::finish_install(dir, partition).map_err(|e| Failure::usage(&e.message))?;
@@ -1895,7 +1919,15 @@ fn open_partition(
         epoch,
     };
     match identity::read(&db) {
-        Ok(Some(id)) if id == want => Ok(db),
+        Ok(Some(id)) if id == want => Ok(Some(db)),
+        Ok(Some(id))
+            if id.cluster_id == want.cluster_id
+                && id.partition_id == want.partition_id
+                && id.epoch > epoch =>
+        {
+            let _ = db.close();
+            Ok(None)
+        }
         found => {
             let _ = db.close();
             let found = match found {
