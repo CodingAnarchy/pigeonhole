@@ -254,7 +254,7 @@ pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
         return;
     }
     let weak = Arc::downgrade(shared);
-    let run = move |map: &ClusterMap| -> Option<Vec<(String, Outcome)>> {
+    let run = move |map: &ClusterMap, unfencing: Option<&str>| -> Option<Vec<(String, Outcome)>> {
         let shared = weak.upgrade()?;
         let parts = shared.router.cluster.as_ref()?.parts.load_full();
         let mut outcomes = Vec::with_capacity(parts.len());
@@ -269,7 +269,9 @@ pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
             // first, then the fence read, so a fence's drain waits for a reconcile it
             // didn't stop.
             let held = service.gate().map(|g| g.hold());
-            if let Some((_, Some(crate::serve::gate::Fence::Operator))) = held {
+            if let Some((_, Some(crate::serve::gate::Fence::Operator))) = held
+                && unfencing != Some(partition.as_str())
+            {
                 continue;
             }
             // The partition's schema lock, as a single node's create and drop take it: no
@@ -298,18 +300,57 @@ pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
         Some(outcomes)
     };
     let _ = node.reconciler.set(super::Reconciler(Box::new(run)));
-    if let Ok(map) = node.get_map() {
-        node.reconcile(&map);
-    }
+    drop(node.reconcile_current(None));
 }
 
 impl Node {
+    /// Reconciles this node's partitions to its current map, under the lock an install
+    /// holds while it reconciles, so no install's reconcile runs between this one's map and
+    /// its end (audit120's F6: an open that reconciled to the map it started with dropped a
+    /// table created meanwhile, with its rows). `unfencing` names a partition whose
+    /// operator's fence is being lifted: it reconciles too. Returns the lock, for a caller
+    /// that must act before the next install's reconcile (`unfence` lifts the gate under
+    /// it). Blocking: run it on a blocking thread.
+    pub(crate) fn reconcile_current(
+        &self,
+        unfencing: Option<&str>,
+    ) -> std::sync::MutexGuard<'_, ()> {
+        let installing = self
+            .installing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(map) = self.get_map() {
+            self.reconcile_locked(&installing, &map, unfencing);
+        }
+        installing
+    }
+
     /// Reconciles this node's partitions to `map`, if a server attached them, and keeps each
-    /// one's outcome for `Status`.
-    pub(crate) fn reconcile(&self, map: &ClusterMap) {
-        if let Some(run) = self.reconciler.get()
-            && let Some(outcomes) = (run.0)(map)
-        {
+    /// one's outcome for `Status`. The caller holds `installing` (`_installing`), so
+    /// reconciles run one at a time, and a map older than the newest one reconciled is
+    /// refused: a stale map would drop the tables created since (audit120's F6).
+    pub(super) fn reconcile_locked(
+        &self,
+        _installing: &std::sync::MutexGuard<'_, ()>,
+        map: &ClusterMap,
+        unfencing: Option<&str>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let newest = self.reconciled_newest.load(Ordering::Relaxed);
+        if map.map_version < newest {
+            eprintln!(
+                "phdb serve: not reconciling to cluster map version {}: version {newest} is \
+                 reconciled already",
+                map.map_version
+            );
+            return;
+        }
+        let Some(run) = self.reconciler.get() else {
+            return;
+        };
+        self.reconciled_newest
+            .store(map.map_version, Ordering::Relaxed);
+        if let Some(outcomes) = (run.0)(map, unfencing) {
             let mut reconciled = self
                 .reconciled
                 .lock()

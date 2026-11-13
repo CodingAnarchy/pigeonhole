@@ -315,9 +315,11 @@ impl Node {
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
         remask(&opener.placement, &parts, &format!("partition {id} opened"));
         cluster.parts.store(Arc::new(parts));
-        // Its schema follows the map before it's unfenced (D317 ticket 5).
+        // Its schema follows the map before it's unfenced (D317 ticket 5): the node's map
+        // now, not the one the open began with, which a schema change may have passed while
+        // the engine opened (audit120's F6). The reconcile covers every open partition.
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || node.reconcile(&map))
+        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None)))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         Ok(())
