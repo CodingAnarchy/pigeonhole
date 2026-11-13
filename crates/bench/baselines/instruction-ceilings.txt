@@ -303,7 +303,10 @@ counter 8661 0.5
 rows 18847 0.3
 level-scans 13814 0.6
 short-scans 13068 0.3
-commit-one 8589 0.3
+# Raised by D195 (#1816, coordinator 2026-11-13): commit-one 8589 -> 8631 (+0.49%). CI's stable
+# toolchain moved to Rust 1.100; release/1.1.x's base counts 8610 (run 43356108022 on #1816, ubuntu-24.04, whose head matches base to 0.0%).
+# Base times 1.003 would be +0.55%, so the raise stops at 0.5%.
+commit-one 8631 0.3
 commit-sixteen 36382 0.3
 flush 2087 0.3
 compact 2615 0.5
@@ -316,11 +319,17 @@ commit-overwrite 10608 0.5
 # commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
 # wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
 # before treating a delta within 10 in the PR's base-vs-head table as cost.
-commit-at 9532 0.3
+# Raised by D195 (#1816, coordinator 2026-11-13): commit-at 9532 -> 9578 (+0.48%). CI's stable
+# toolchain moved to Rust 1.100; release/1.1.x's base counts 9549 (run 43356108022 on #1816, ubuntu-24.04, whose head matches base to 0.0%).
+# Base times 1.003.
+commit-at 9578 0.3
 scan-narrow 1381 0.3
 scan-small 1358 0.3
 scan-wide 1279 0.3
-commit-async 8713 0.3
+# Raised by D195 (#1816, coordinator 2026-11-13): commit-async 8713 -> 8743 (+0.34%). CI's
+# stable toolchain moved to Rust 1.100; release/1.1.x's base counts 8716 (run 43356108022 on #1816, ubuntu-24.04, whose head matches base to 0.0%).
+# Base times 1.003.
+commit-async 8743 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
 commit-incr 12706 0.3
