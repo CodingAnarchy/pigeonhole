@@ -1,2 +1,0 @@
-### Added
-- **`RowCells::next_async`, `RowCells::poll_next` and `RowCells::poll_seek`** (the `async` feature, #1625, ICR 0124). A walk over one wide row's cells, such as a graph hub's or a text index's posting row, that never blocks on a block it can fetch: the next block is fetched before each step, and a seek within the row fetches only the block it lands in. A walk built by `cells()` can start sync and go on async.

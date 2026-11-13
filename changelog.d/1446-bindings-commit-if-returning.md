@@ -1,2 +1,0 @@
-### Added
-- Python and Ruby: `Mutation.commit_if_returning(condition)` (and Python's `commit_if_returning_async`) commits only if the condition holds and returns a `Checked` either way: `returned` when it applied, with `current(family, qualifier)` as of the commit beside `previous` and the counters, or `seen` when it didn't, with `current` as the condition saw it. `Mutation.return_current(family, qualifier)` asks for more columns than the condition's; other commits refuse it with `InvalidArgument` (#1446, D314 amendment 2).

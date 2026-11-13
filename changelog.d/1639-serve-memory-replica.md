@@ -1,3 +1,0 @@
-### Added
-- **`phdb serve --memory NAME --replica-of URL`** (#1618, ICR 0112): a replica serves its memory store's `Recall` and `Watch` from what it has applied, with `x-pigeonhole-min-primary-seqno`, and refuses the memory writes with `ReadOnly`, naming the primary. It never creates the store and runs none of its background writers. A store the replica doesn't have yet answers `Unavailable` (`ReplicaBehind` while it bootstraps), a store pinned to another model answers `FailedPrecondition`, and a promote opens the store as the writer, creating it if missing.
-- **`OpenOptions::own_rebalancer` and `Store::take_rebalancer`** in `pigeonhole-memory` (ICR 0107): the application takes the store's IVF rebalancer, as `own_forgetter` hands it the forgetter.
