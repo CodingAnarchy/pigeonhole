@@ -67,8 +67,9 @@ pub(crate) struct ServeArgs {
     /// The largest request body, in bytes.
     #[arg(long, value_name = "BYTES", default_value_t = 16 << 20)]
     pub max_request_bytes: usize,
-    /// The bytes of request bodies held at once, across all requests: a request that can't
-    /// get its share within its deadline is refused (`Overloaded`).
+    /// The bytes of requests and replies held at once, across all requests: request bodies,
+    /// unary read replies and scan pages (#1567). A request that can't get its share within
+    /// its deadline is refused (`Overloaded`).
     #[arg(long, value_name = "BYTES", default_value_t = 256 << 20)]
     pub inflight_bytes: usize,
     /// Requests served at once; more are refused at once (`Overloaded`), not queued.
@@ -116,11 +117,12 @@ pub(crate) struct ServeArgs {
     /// server has submitted always answers its real outcome, however long it takes.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub request_timeout_ms: u64,
-    /// How long a scan waits for its client to take a page, in milliseconds. Past that, the
-    /// stream ends with `DeadlineExceeded`, and the client resumes from its last page's
-    /// `next`: a client that stops reading doesn't hold its scan slot and a page forever.
-    /// A `Vectors.BulkLoad` whose client sends nothing for this long ends the same way, the
-    /// vectors before loaded.
+    /// How long the server waits for a client that takes or sends nothing, in milliseconds:
+    /// a scan's next page, a feed stream's or memory watch's full buffer, an undelivered
+    /// reply, a `Vectors.BulkLoad`'s next message, and a replica's stalled download. Past it
+    /// the stream ends with `DeadlineExceeded` (a scan resumes from its last page's `next`, a
+    /// feed from its last token), so a client that stops doesn't hold a slot and its memory
+    /// forever.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     pub stream_idle_ms: u64,
     /// How long a transaction may sit idle between calls, in milliseconds, before it expires

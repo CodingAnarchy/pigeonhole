@@ -738,6 +738,40 @@ fn a_bulk_load_stops_past_what_its_expected_sized_its_lists_for() {
 }
 
 #[test]
+fn a_load_that_failed_inside_the_crate_says_only_some_may_have_loaded() {
+    // audit120's S1 on #1839: a failure inside the crate mid-load drops the batches still
+    // waiting, so its error can't say every vector before it was loaded, as an input that
+    // ended (a stall, a broken stream) does. Here the loader takes three vectors and fails.
+    let s = Server::start_custom("", limits(), 1, |mut svc| {
+        svc.part_mut().bulk.loader = Arc::new(|_index, _expected, input| {
+            let _ = input.take(3).count();
+            Err(super::errors::ApiError::internal(
+                "the crate failed mid-load",
+            ))
+        });
+        svc
+    });
+    assert_eq!(
+        s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None)
+            .0,
+        200
+    );
+    let mut client = vectors_client(&s);
+    let err = s
+        .block_on(
+            client.bulk_load(tonic::codegen::tokio_stream::iter(vec![bulk_message(
+                "ix", 10, 0, 10, 2,
+            )])),
+        )
+        .unwrap_err();
+    let detail = errors::ApiError::from_status(&err).expect("a detail");
+    assert!(!detail.detail().retry_safe, "{err:?}");
+    assert!(err.message().contains("may have been loaded"), "{err:?}");
+    assert!(!err.message().contains("were loaded"), "{err:?}");
+    assert_bulk_budget_free(&s);
+}
+
+#[test]
 fn a_768_dim_load_fits_the_default_bulk_load_bytes() {
     // The default 1 GiB holds a 768-dim f32 load's sample (about 315 MB) and its pending
     // batches up to about 1,300 lists. The reservation is the load's worst case while it

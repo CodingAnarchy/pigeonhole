@@ -49,17 +49,23 @@ impl ApiError {
     }
 
     /// The same error, for a call that applied part of what it carried before it failed (a
-    /// `Vectors.BulkLoad` that loaded the vectors before the failure): not safe to send
-    /// again, whatever the code says of itself, and the message says what was applied (the
-    /// audit's P2-C9).
-    pub(crate) fn applied_partly(mut self) -> Self {
+    /// `Vectors.BulkLoad` that took vectors before the failure): not safe to send again,
+    /// whatever the code says of itself, and the message says what was applied (the audit's
+    /// P2-C9). `all`: everything before the failure was applied (the load's input ended
+    /// there, and the crate wrote what it had); else only some may have been (a failure
+    /// inside the crate drops the batches still waiting, audit120's S1 on #1839).
+    pub(crate) fn applied_partly(mut self, all: bool) -> Self {
         self.retry_from = RetryFrom::Unspecified;
         self.retry_after_ms = 0;
         if !self.message.contains("were loaded") {
-            self.message.push_str(
+            self.message.push_str(if all {
                 "; the vectors before it were loaded, so the index is no longer empty: Insert \
-                 the rest, or drop it and load again",
-            );
+                 the rest, or drop it and load again"
+            } else {
+                "; some of the vectors before it may have been loaded, so the index may no \
+                 longer be empty: check it (Verify), then Insert the rest, or drop it and load \
+                 again"
+            });
         }
         self
     }
