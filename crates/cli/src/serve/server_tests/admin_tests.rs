@@ -663,3 +663,31 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
         );
     }
 }
+
+#[test]
+fn an_http_download_from_an_offset_past_a_copy_still_being_written_is_refused() {
+    // Over HTTP, an offset past a copy that is still being written when the request comes is
+    // refused once the copy's size is known (the download's task reports it), as one past a
+    // ready copy is refused up front. This doesn't reach audit120's N2 itself, which needs
+    // the copy to turn ready between the service's check and the reply's first look at it:
+    // there the reply computed `total - offset` unchecked, and `http::download` now checks.
+    let s = Server::start_slow_copies(Duration::from_millis(500), false);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = agent
+        .post(format!("{}/v1/Admin/BackupDownload", s.url))
+        .header("Range", "bytes=999999999999-")
+        .send_json(json!({}))
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.body_mut().read_json().unwrap();
+    assert_eq!(body["code"], "InvalidArgument", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("past the backup")),
+        "{body}"
+    );
+}

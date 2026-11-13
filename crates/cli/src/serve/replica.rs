@@ -258,7 +258,7 @@ fn send_within(
 // ---- The replica's side: `phdb serve --replica-of` ----
 
 /// `--replica-of` and its settings.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ReplicaConfig {
     /// The primary's URL, `http://` or `https://`.
     pub primary: String,
@@ -266,6 +266,17 @@ pub(crate) struct ReplicaConfig {
     pub token: Option<String>,
     /// A run's events, at most (`--replica-run`).
     pub run_events: usize,
+}
+
+/// Without the token: only whether one is set, so no log or panic message can carry it.
+impl std::fmt::Debug for ReplicaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicaConfig")
+            .field("primary", &self.primary)
+            .field("token", &self.token.as_ref().map(|_| "<set>"))
+            .field("run_events", &self.run_events)
+            .finish()
+    }
 }
 
 /// What `Admin.Info` and `/metrics` report.
@@ -1177,6 +1188,21 @@ fn side_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::Breaks;
+
+    #[test]
+    fn a_replica_config_never_formats_its_token() {
+        let c = super::ReplicaConfig {
+            primary: "https://primary:7448".into(),
+            token: Some("s3cret-token".into()),
+            run_events: 256,
+        };
+        let text = format!("{c:?}");
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(
+            text.contains("<set>") && text.contains("primary:7448"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn a_bootstrap_gives_up_with_the_first_break_since_its_last_progress() {

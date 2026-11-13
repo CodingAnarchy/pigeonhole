@@ -21,8 +21,9 @@ pub(crate) struct NodeArgs {
     /// A node's URL: `http://HOST:PORT` or `https://HOST:PORT`.
     #[arg(long, value_name = "URL")]
     pub node: String,
-    /// The bearer token to present (admin scope for `set-map`, read for the others), alone
-    /// in the file. Also from `PHDB_TOKEN`. Never a flag's value.
+    /// The bearer token to present (read scope for `status` and `show-map`, admin for every
+    /// command that changes something), alone in the file. Also from `PHDB_TOKEN`. Never a
+    /// flag's value.
     #[arg(long, value_name = "FILE")]
     pub token_file: Option<PathBuf>,
     /// A PEM file of CA certificates to trust beside the system's roots.

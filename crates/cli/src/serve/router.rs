@@ -1005,12 +1005,13 @@ fn forward_writes(op: &ServiceOp) -> bool {
     op.writes() || matches!(op, ServiceOp::Commit(_) | ServiceOp::Abort(_))
 }
 
-/// A partition the map gives this node that it doesn't have open: it opens partitions at
-/// start, and moving one in is D317's ticket 6.
+/// A partition the map gives this node that it doesn't have open: it is still opening (a
+/// map just gave it here), was closed by the operator, or failed to open.
 pub(crate) fn not_open(partition: &str) -> ApiError {
     ApiError::partition_unavailable(format!(
-        "the map gives this node partition {partition:?}, but it isn't open here: a node \
-         opens its partitions at start, and relocation comes with D317's ticket 6"
+        "the map gives this node partition {partition:?}, but it isn't open here: it is \
+         still opening, was closed (phdb cluster close), or failed to open; phdb cluster \
+         status shows which"
     ))
 }
 
