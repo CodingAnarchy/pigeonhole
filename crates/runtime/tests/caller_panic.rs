@@ -2,39 +2,44 @@
 //! returns, reporting the panic (the 1.2.0 audit's S-E3).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
 use pigeonhole_io::pread::PreadVfs;
 use pigeonhole_runtime::{Runtime, RuntimeConfig, ShardContext, ShardHandler, ShardId};
 
-/// Panics on every message a caller's turn handles; counts those its driver handled.
-struct PanicsInCallersTurn {
-    driver_handled: Arc<AtomicU32>,
+enum Msg {
+    /// Shard 0: panics in whichever turn handles it.
+    Boom,
+    /// Shard 1: holds its driver inside this turn until the test lets it go.
+    Hold,
 }
 
-impl ShardHandler for PanicsInCallersTurn {
-    type Msg = ();
+/// Shard 0's handler panics on `Boom`; shard 1's holds the driver on `Hold`, at the first
+/// barrier once it's inside the turn and at the second until the test releases it.
+struct Handler {
+    hold: Option<(Arc<Barrier>, Arc<Barrier>)>,
+}
 
-    fn handle(&mut self, _ctx: &mut ShardContext<'_, ()>, _msg: ()) {
-        // Driver threads are named `pigeonhole-shard-N` or `pigeonhole-driver-N`; the test's
-        // own thread, which runs the callers' turns, is named for the test.
-        if thread::current()
-            .name()
-            .is_some_and(|n| n.starts_with("pigeonhole-"))
-        {
-            self.driver_handled.fetch_add(1, Ordering::Relaxed);
-        } else {
-            panic!("a caller's turn panics");
+impl ShardHandler for Handler {
+    type Msg = Msg;
+
+    fn handle(&mut self, _ctx: &mut ShardContext<'_, Msg>, msg: Msg) {
+        match msg {
+            Msg::Boom => panic!("a caller's turn panics"),
+            Msg::Hold => {
+                let (inside, release) = self.hold.as_ref().expect("shard 1 holds");
+                inside.wait();
+                release.wait();
+            }
         }
     }
 
-    fn end_batch(&mut self, _ctx: &mut ShardContext<'_, ()>) {}
+    fn end_batch(&mut self, _ctx: &mut ShardContext<'_, Msg>) {}
 
-    fn caller_may_take(&self, _msg: &()) -> bool {
+    fn caller_may_take(&self, _msg: &Msg) -> bool {
         true
     }
 
@@ -50,36 +55,39 @@ impl ShardHandler for PanicsInCallersTurn {
 /// the panic as a shard's, as it does for one on a driver thread (the engine's
 /// `blocking_waits::a_panicked_shard_thread_does_not_hang_close` covers that one, through
 /// `close`'s `shard_panicked`).
+///
+/// Both shards run on one driver thread. Shard 1's turn holds that driver while the test
+/// submits to shard 0 and runs a caller's turn there, so the caller's turn, not the
+/// driver, takes the message: a race between the two (#1820) lost on a loaded runner,
+/// where the driver handled nearly every message first.
 #[test]
 fn a_panic_in_a_callers_turn_never_hangs_shutdown() {
     let mut config = RuntimeConfig::new(PreadVfs::new(1));
-    config.shards = 1;
+    config.shards = 2;
+    config.shard_threads = 1;
     config.caller_runs = true;
-    let driver_handled = Arc::new(AtomicU32::new(0));
+    let (inside, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
     let rt = Runtime::start(
         config,
-        vec![PanicsInCallersTurn {
-            driver_handled: Arc::clone(&driver_handled),
-        }],
+        vec![
+            Handler { hold: None },
+            Handler {
+                hold: Some((Arc::clone(&inside), Arc::clone(&release))),
+            },
+        ],
     )
     .unwrap();
+    rt.submitter(ShardId(1)).submit(Msg::Hold).unwrap();
+    inside.wait();
+    // The driver is inside shard 1's turn: nothing but this thread can run shard 0.
+    rt.submitter(ShardId(0)).submit(Msg::Boom).unwrap();
     let caller = rt.callers()[0].clone();
-    let submitter = rt.submitter(ShardId(0));
-    // The driver may handle a message before this thread's turn does: submit until a
-    // caller's turn takes one.
-    let mut panicked = false;
-    for _ in 0..10_000 {
-        submitter.submit(()).unwrap();
-        caller.note_sent();
-        if catch_unwind(AssertUnwindSafe(|| caller.try_run(&mut || false))).is_err() {
-            panicked = true;
-            break;
-        }
-    }
+    caller.note_sent();
+    let ran = catch_unwind(AssertUnwindSafe(|| caller.try_run(&mut || false)));
+    release.wait();
     assert!(
-        panicked,
-        "no caller's turn ran a message in 10,000 tries (the driver handled {})",
-        driver_handled.load(Ordering::Relaxed)
+        ran.is_err(),
+        "the caller's turn didn't take the message (it returned {ran:?})"
     );
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
