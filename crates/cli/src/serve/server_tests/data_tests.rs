@@ -793,6 +793,99 @@ fn grpc_reserves_the_budget_before_decoding_and_honors_grpc_timeout() {
 }
 
 #[test]
+fn grpc_checks_the_token_first_and_bounds_the_message_read() {
+    // audit120's S-S1: `prepay` reserved the in-flight budget before the token was
+    // checked, and waited for a message with no deadline.
+    use tower::ServiceExt as _;
+    /// A body that sends its bytes, then nothing more, never ending.
+    struct Stall(Option<axum::body::Bytes>);
+    impl futures_core::Stream for Stall {
+        type Item = Result<axum::body::Bytes, std::io::Error>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match self.0.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(b))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+    let mut l = limits();
+    l.request_timeout = Duration::from_millis(300);
+    let s = Server::start("read r3ad\n", l);
+    let service = &s.shared.router.service;
+    let framed = {
+        let msg = proto::GetRequest {
+            table: "t".into(),
+            row: b"r".to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut framed = vec![0];
+        framed.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&msg);
+        framed
+    };
+    // The grpc-status of a reply that ended before the handler (trailers-only), and how long
+    // it took.
+    let call = |path: &str, token: Option<&str>, body: axum::body::Body| {
+        let mut req = axum::http::Request::post(path)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers");
+        if let Some(t) = token {
+            req = req.header("authorization", format!("Bearer {t}"));
+        }
+        let req = req.body(body).unwrap();
+        let app = http::router(Arc::clone(&s.shared));
+        let started = std::time::Instant::now();
+        let resp = s.block_on(app.oneshot(req)).unwrap();
+        let status = resp
+            .headers()
+            .get("grpc-status")
+            .map(|v| v.to_str().unwrap().to_owned());
+        (status, started.elapsed())
+    };
+    let get = "/pigeonhole.v1.Data/Get";
+    // With the budget full, a call without a valid token is Unauthenticated (16) at once,
+    // not left waiting for bytes it may not use.
+    let all = s.block_on(service.reserve(l.inflight_bytes)).unwrap();
+    for token in [None, Some("wrong")] {
+        let (status, took) = call(get, token, axum::body::Body::from(framed.clone()));
+        assert_eq!(status.as_deref(), Some("16"), "{token:?}");
+        assert!(took < Duration::from_millis(200), "{token:?}: {took:?}");
+    }
+    drop(all);
+    // Health still takes no token.
+    // An empty message: its 5-byte header, length 0.
+    let (status, _) = call(
+        "/pigeonhole.v1.Admin/Health",
+        None,
+        axum::body::Body::from(vec![0u8; 5]),
+    );
+    assert_eq!(
+        status, None,
+        "a reply from the handler: its status is a trailer"
+    );
+    // A call whose header never comes, and one whose message stops after its header (a
+    // 1 MiB message, reserved): DeadlineExceeded (4) at the request timeout, and the
+    // reservation comes back.
+    let header = axum::body::Bytes::from(vec![0, 0, 0x10, 0, 0]);
+    for sent in [None, Some(header)] {
+        let (status, took) = call(
+            get,
+            Some("r3ad"),
+            axum::body::Body::from_stream(Stall(sent)),
+        );
+        assert_eq!(status.as_deref(), Some("4"));
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert_eq!(service.inflight_available(), l.inflight_bytes);
+    }
+}
+
+#[test]
 fn metrics_include_each_rpcs_durations() {
     let s = Server::start("", limits());
     let mut c = s.grpc();
@@ -858,4 +951,393 @@ fn a_table_open_overtaken_by_a_catalog_change_keeps_nothing() {
     let value = json!({"bytes": b64(b"v")});
     assert_eq!(s.post("Mutate", &put("r", "f", "q", value), None).0, 200);
     assert!(svc.table_cached("t"));
+}
+
+// ---- Aggregate queries (audit120's F4) ----
+
+/// Table `agg`: rows `r000`.. each with a quantile sketch (`q`) and a bloom filter (`b`),
+/// and row `wide` with `wide_columns` quantile columns.
+fn aggregate_rows(
+    s: &Server,
+    c: &mut DataClient<tonic::transport::Channel>,
+    rows: usize,
+    wide_columns: usize,
+) {
+    let spec = json!({"name": "agg", "if_missing": false, "families": [
+        {"name": "q", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
+        {"name": "b", "aggregate": {"kind": "AGGREGATION_KIND_BLOOM", "bloom_bits": 1024, "bloom_hashes": 3}},
+    ]});
+    let (status, body) = s.rpc("Schema/CreateTable", &spec, None);
+    assert_eq!(status, 200, "{body}");
+    let input = |family: &str, qualifier: &[u8], kind: proto::value::Kind| proto::Write {
+        op: Some(proto::write::Op::Aggregate(proto::AggregateInput {
+            family: family.into(),
+            qualifier: qualifier.to_vec().into(),
+            timestamp: None,
+            input: Some(proto::Value { kind: Some(kind) }),
+        })),
+    };
+    let mut mutate = |row: &[u8], writes: Vec<proto::Write>| {
+        s.block_on(c.mutate(proto::MutateRequest {
+            writes: Some(proto::RowWrites {
+                row: Some(proto::RowKey {
+                    table: "agg".into(),
+                    row: row.to_vec().into(),
+                }),
+                writes,
+            }),
+            durability: 0,
+        }))
+        .unwrap();
+    };
+    for i in 0..rows {
+        let row = format!("r{i:03}").into_bytes();
+        mutate(
+            &row,
+            vec![
+                input("q", b"x", proto::value::Kind::F64(i as f64)),
+                input("b", b"x", proto::value::Kind::I64(i as i64)),
+            ],
+        );
+    }
+    let wide = (0..wide_columns)
+        .map(|i| {
+            input(
+                "q",
+                format!("c{i:03}").as_bytes(),
+                proto::value::Kind::F64(1.0),
+            )
+        })
+        .collect();
+    mutate(b"wide", wide);
+}
+
+fn aggregate_query(quantiles: usize, bloom_i64: usize, bloom_bytes: usize) -> proto::Selection {
+    proto::Selection {
+        aggregate: Some(proto::AggregateQuery {
+            quantiles: (0..quantiles)
+                .map(|i| i as f64 / quantiles as f64)
+                .collect(),
+            bloom_i64: (0..bloom_i64 as i64).collect(),
+            bloom_bytes: (0..bloom_bytes)
+                .map(|i| format!("{i}").into_bytes().into())
+                .collect(),
+            set_members: false,
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_aggregate_query_over_its_probe_caps_is_refused_on_every_read() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    aggregate_rows(&s, &mut c, 2, 2);
+    let over = [
+        aggregate_query(1025, 0, 0),
+        aggregate_query(0, 1000, 25),
+        aggregate_query(0, 0, 1025),
+    ];
+    for sel in over {
+        let refused = |r: Result<tonic::Code, tonic::Status>| {
+            assert_eq!(
+                r.map_err(|e| e.code()),
+                Err(tonic::Code::InvalidArgument),
+                "{sel:?}"
+            )
+        };
+        let q = sel.aggregate.clone();
+        refused(
+            s.block_on(c.get(proto::GetRequest {
+                table: "agg".into(),
+                row: b"r000".to_vec().into(),
+                family: "q".into(),
+                qualifier: b"x".to_vec().into(),
+                aggregate: q,
+                ..Default::default()
+            }))
+            .map(|_| tonic::Code::Ok),
+        );
+        refused(
+            s.block_on(c.multi_get(proto::MultiGetRequest {
+                table: "agg".into(),
+                keys: vec![b"r000".to_vec().into()],
+                selection: Some(sel.clone()),
+                ..Default::default()
+            }))
+            .map(|_| tonic::Code::Ok),
+        );
+        refused(
+            s.block_on(c.read_row(proto::ReadRowRequest {
+                table: "agg".into(),
+                row: b"r000".to_vec().into(),
+                selection: Some(sel.clone()),
+                ..Default::default()
+            }))
+            .map(|_| tonic::Code::Ok),
+        );
+        refused(
+            s.block_on(c.scan(proto::ScanRequest {
+                table: "agg".into(),
+                selection: Some(sel.clone()),
+                ..Default::default()
+            }))
+            .map(|_| tonic::Code::Ok),
+        );
+    }
+    // At the caps, the answers come back: one per probe.
+    let at = aggregate_query(1024, 1000, 24);
+    let row = s
+        .block_on(c.read_row(proto::ReadRowRequest {
+            table: "agg".into(),
+            row: b"r000".to_vec().into(),
+            selection: Some(at),
+            ..Default::default()
+        }))
+        .unwrap()
+        .into_inner()
+        .row
+        .unwrap();
+    let view = |f: &str| {
+        row.cells
+            .iter()
+            .find(|c| c.family == f)
+            .and_then(|c| c.aggregate.clone())
+            .unwrap()
+    };
+    assert_eq!(view("q").quantiles.unwrap().values.len(), 1024);
+    assert_eq!(view("b").bloom.unwrap().contains.len(), 1024);
+}
+
+#[test]
+fn aggregate_answers_count_against_a_pages_budget() {
+    // 200 rows of a quantile sketch and a bloom filter are a few hundred bytes each, so
+    // without the answers one 64 KiB page would hold them all, and with 1,024 quantiles and
+    // 1,024 bloom probes on each the reply would be about 1.8 MB.
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    aggregate_rows(&s, &mut c, 200, 40);
+    let budget = 64 << 10;
+    let sel = aggregate_query(1024, 512, 512);
+    // A page may go over by one column (D308): a quantile column's answers are 8 KiB.
+    let bounded = |bytes: u64, encoded: usize| {
+        assert!(
+            bytes <= budget,
+            "a page's bytes stay within its budget: {bytes}"
+        );
+        assert!(
+            encoded as u64 <= budget + (8 << 10),
+            "a page's reply stays near its budget: {encoded}"
+        );
+    };
+    let names = |rows: &[proto::Row]| rows.iter().map(|r| r.key.to_vec()).collect::<Vec<_>>();
+    let want: Vec<Vec<u8>> = (0..200).map(|i| format!("r{i:03}").into_bytes()).collect();
+
+    let (mut after, mut seen, mut pages) = (Vec::new(), Vec::new(), 0);
+    loop {
+        let page = s
+            .block_on(c.multi_get(proto::MultiGetRequest {
+                table: "agg".into(),
+                keys: want.iter().map(|k| k.clone().into()).collect(),
+                selection: Some(sel.clone()),
+                page_bytes: budget,
+                after: after.clone().into(),
+                ..Default::default()
+            }))
+            .unwrap()
+            .into_inner();
+        pages += 1;
+        bounded(page.bytes, prost::Message::encoded_len(&page));
+        for row in &page.rows {
+            if seen.last() != Some(&row.key.to_vec()) {
+                seen.push(row.key.to_vec());
+            }
+        }
+        if page.next.is_empty() {
+            break;
+        }
+        after = page.next.to_vec();
+    }
+    assert!(pages >= 20, "about 9 KiB of answers a row: {pages} pages");
+    assert_eq!(seen, want, "every row once, in order");
+
+    let scan = grpc_scan(
+        &s,
+        &mut c,
+        proto::ScanRequest {
+            table: "agg".into(),
+            range: Some(proto::KeyRange {
+                range: Some(proto::key_range::Range::Prefix(b"r".to_vec().into())),
+            }),
+            selection: Some(sel.clone()),
+            page_bytes: budget,
+            ..Default::default()
+        },
+    );
+    assert!(scan.len() >= 20, "{} pages", scan.len());
+    for page in &scan {
+        bounded(page.bytes, prost::Message::encoded_len(page));
+    }
+    let mut keys = Vec::new();
+    for page in &scan {
+        for k in names(&page.rows) {
+            if keys.last() != Some(&k) {
+                keys.push(k);
+            }
+        }
+    }
+    assert_eq!(keys, want, "every row once, in order");
+
+    // A wide row's columns: its pages end early too.
+    let (mut after, mut columns) = (Vec::new(), 0);
+    loop {
+        let page = s
+            .block_on(c.read_row(proto::ReadRowRequest {
+                table: "agg".into(),
+                row: b"wide".to_vec().into(),
+                selection: Some(sel.clone()),
+                page_bytes: budget,
+                after: after.clone().into(),
+                ..Default::default()
+            }))
+            .unwrap()
+            .into_inner();
+        bounded(page.bytes, prost::Message::encoded_len(&page));
+        columns += page.row.map_or(0, |r| r.cells.len());
+        if page.next.is_empty() {
+            break;
+        }
+        after = page.next.to_vec();
+    }
+    assert_eq!(columns, 40, "every column once");
+}
+
+#[test]
+fn a_sets_members_come_back_only_when_asked_and_only_aggregate_families_have_views() {
+    // audit120's S-S8: every read expanded a set's members, about 32 times its stored size,
+    // uncounted, and read any plain value that parsed as a set, sketch or filter as one.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    let t = db
+        .table("sets")
+        .unwrap()
+        .family("s", Family::aggregate(pigeonhole::Aggregation::Set))
+        .family("p", Family::default())
+        .create()
+        .unwrap();
+    // A dense set: 65,536 members in an 8 KiB container.
+    let mut m = t.mutate(b"r");
+    for x in 0..65_536u32 {
+        m = m.set_add("s", b"x", x);
+    }
+    m.commit().unwrap();
+    // A plain value that parses as a quantile sketch (D298's encoding, 5 bytes).
+    t.mutate(b"r")
+        .put(
+            "p",
+            b"x",
+            &[pigeonhole_format::buckets::QUANTILES_ENCODING, 7, 1, 0, 0],
+        )
+        .commit()
+        .unwrap();
+    let c = s.grpc();
+    let read = |set_members: bool, page_bytes: u64| {
+        let selection = proto::Selection {
+            aggregate: Some(proto::AggregateQuery {
+                quantiles: vec![0.5],
+                set_members,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        s.block_on(c.clone().read_row(proto::ReadRowRequest {
+            table: "sets".into(),
+            row: b"r".to_vec().into(),
+            selection: Some(selection),
+            page_bytes,
+            ..Default::default()
+        }))
+        .unwrap()
+        .into_inner()
+    };
+    let cells = |page: &proto::ReadRowResponse| page.row.clone().unwrap().cells;
+    // Not asked: no members, and the page is the stored size.
+    let page = read(false, 64 << 10);
+    assert!(page.bytes < 16 << 10, "{}", page.bytes);
+    for cell in cells(&page) {
+        assert!(
+            cell.aggregate.is_none(),
+            "{}: no view (a set's members weren't asked for; a plain value has none)",
+            cell.family
+        );
+    }
+    // Asked: every member, and the page counts them.
+    let page = read(true, 1 << 20);
+    let set = cells(&page).into_iter().find(|c| c.family == "s").unwrap();
+    assert_eq!(set.aggregate.unwrap().set_members.len(), 65_536);
+    // About 184 KiB of packed members, against the 8 KiB stored set.
+    assert!(page.bytes > 128 << 10, "the members count: {}", page.bytes);
+    let plain = cells(&page).into_iter().find(|c| c.family == "p").unwrap();
+    assert!(
+        plain.aggregate.is_none(),
+        "a plain family's value isn't a sketch"
+    );
+}
+
+#[test]
+fn a_page_converts_no_more_than_its_budget_and_one_column() {
+    // audit120's S1 on #1812: MultiGet and Scan converted the whole engine page, every
+    // aggregate view built, before cutting it to the budget: about 300 MB a request at the
+    // default page. 2,000 small sketches fit one 1 MiB engine page; with 1,024 quantiles each
+    // view is 8 KiB, so converting them all would build about 16 MB.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    let t = db
+        .table("many")
+        .unwrap()
+        .family(
+            "q",
+            Family::aggregate(pigeonhole::Aggregation::Quantiles(Default::default())),
+        )
+        .create()
+        .unwrap();
+    for i in 0..2_000 {
+        t.mutate(format!("r{i:05}").as_bytes())
+            .aggregate_f64("q", b"x", f64::from(i))
+            .commit()
+            .unwrap();
+    }
+    let page = t.scan_prefix(b"r").read_within(1 << 20).unwrap();
+    assert_eq!(page.rows().len(), 2_000, "one engine page holds them all");
+    let query = proto::AggregateQuery {
+        quantiles: (0..1024).map(|i| f64::from(i) / 1024.0).collect(),
+        ..Default::default()
+    };
+    let kinds = crate::serve::convert::Kinds::new(&t);
+    let budget = 64 << 10;
+    crate::serve::convert::BUILT.with(|b| b.set(0));
+    let cut = crate::serve::convert::rows_within(page.rows(), &kinds, Some(&query), budget)
+        .expect_err("the views take the page over its budget");
+    let built = crate::serve::convert::BUILT.with(std::cell::Cell::get);
+    // One column here is a key, a 5-byte qualifier and value, and an 8 KiB view.
+    assert!(
+        built <= budget + (9 << 10),
+        "built {built} bytes for a {budget}-byte page"
+    );
+    // Read again within the cut, the page converts whole, within the budget.
+    let page = t.scan_prefix(b"r").read_within(cut).unwrap();
+    let rows =
+        crate::serve::convert::rows_within(page.rows(), &kinds, Some(&query), budget).unwrap();
+    let bytes: u64 = rows
+        .iter()
+        .map(|r| {
+            r.key.len() as u64
+                + r.cells
+                    .iter()
+                    .map(crate::serve::convert::cell_bytes)
+                    .sum::<u64>()
+        })
+        .sum();
+    assert!(bytes <= budget, "{bytes}");
+    assert!(rows.len() >= 5, "{} rows", rows.len());
 }

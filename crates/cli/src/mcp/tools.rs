@@ -108,6 +108,9 @@ pub(crate) struct Tools {
     runs: AtomicU64,
     /// `--memory`: the agent memory tools (D311 T7).
     memory: Option<super::memory::Memory>,
+    /// Whether the data tools are listed: not for a `phdb serve` token limited to
+    /// namespaces, which reaches only the memory tools (audit120's F5).
+    data: bool,
 }
 
 /// A traversal result kept for its cursors.
@@ -130,6 +133,7 @@ impl Tools {
             writable,
             limits,
             memory,
+            data: true,
             traversal: Mutex::new(None),
             runs: AtomicU64::new(
                 std::time::SystemTime::now()
@@ -137,6 +141,14 @@ impl Tools {
                     .map_or(1, |d| d.as_nanos() as u64),
             ),
         }
+    }
+
+    /// The memory tools alone: a `phdb serve` token limited to namespaces is offered no
+    /// data tools, and the service refuses them (audit120's F5).
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn memory_only(mut self) -> Self {
+        self.data = false;
+        self
     }
 
     pub(super) fn close(self) -> Result<(), Failure> {
@@ -155,6 +167,17 @@ impl Tools {
     /// tools only when it is writable. (`nearest` answers a call either way, for a vector
     /// family created after the list.)
     pub(super) fn list(&self) -> Vec<Value> {
+        let mut tools = Vec::new();
+        if self.data {
+            tools.extend(self.data_tools());
+        }
+        if let Some(m) = &self.memory {
+            tools.extend(m.list());
+        }
+        tools
+    }
+
+    fn data_tools(&self) -> Vec<Value> {
         let mut tools = vec![list_tables(), read_row(), scan(), traverse()];
         if self.has_vector_family() {
             tools.push(nearest());
@@ -168,9 +191,6 @@ impl Tools {
         }
         if self.writable {
             tools.extend([write(), create_table()]);
-        }
-        if let Some(m) = &self.memory {
-            tools.extend(m.list());
         }
         tools
     }

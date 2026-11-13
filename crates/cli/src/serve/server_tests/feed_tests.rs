@@ -713,3 +713,47 @@ fn a_refused_token_expires_even_where_the_ring_covers_its_seqno() {
     };
     assert_eq!(e.code, "FeedExpired", "{}", e.message);
 }
+
+#[test]
+fn a_refused_token_at_the_ring_s_tail_expires_rather_than_waits() {
+    // audit120's tail-token probe on #1805: the refused token is the last one delivered,
+    // at the ring's tail. A resume there has nothing to read yet, so rejoining the ring
+    // first would leave it waiting, its refusal unseen, for the next commit and past it.
+    // It must end with `FeedExpired` at once.
+    let s = Server::start("", limits());
+    let mut live = direct_feed(&s, subscribe(&["t"], b""));
+    write_row(&s, b"r1");
+    write_row(&s, b"r2");
+    let got = drain(&s, &mut live, Duration::from_millis(300));
+    assert_eq!(got.len(), 2, "both commits arrive");
+    let tail = got.last().unwrap().2.clone();
+    assert!(
+        matches!(tail.first(), Some(1 | 2)),
+        "a D310 token: {tail:?}"
+    );
+    // Its writer session (bytes 29..37) one the history doesn't hold.
+    let mut forged = tail;
+    forged[29..37].copy_from_slice(&0x0bad_5e55_1011_u64.to_le_bytes());
+    let mut resumed = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(forged.into())),
+            ..subscribe(&["t"], b"")
+        },
+    );
+    let e = loop {
+        match next_event(&s, &mut resumed, Duration::from_secs(5))
+            .expect("the stream ends rather than waits")
+        {
+            Ok(e) => assert!(
+                commit_of(&e).is_none(),
+                "a commit after a refused token: {e:?}"
+            ),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(e.code, "FeedExpired", "{}", e.message);
+    // A later commit doesn't reach it either: it has ended.
+    write_row(&s, b"r3");
+    assert!(next_event(&s, &mut resumed, Duration::from_millis(300)).is_none());
+}

@@ -57,6 +57,16 @@ impl Prepaid {
 ///
 /// A client stream (`Vectors.BulkLoad`) reserves each later message the same way, from its
 /// header, as tonic reads on ([`Metered`]); its handler takes the reservations in order.
+///
+/// **The token is checked first** (audit120's should 1): a request without a valid token is
+/// `Unauthenticated` before any of its body is read or any budget reserved, so it can't hold
+/// either (`Admin.Health` takes no token). The handler checks the scope later, as for HTTP.
+/// **The message's read is bounded** by the request's one deadline (the request timeout, or
+/// a shorter `grpc-timeout`): `prepay` reads the header, reserves, then reads the rest of
+/// the first message before tonic decodes it, so a client that sends a call's headers but
+/// not its message gets `DeadlineExceeded` instead of holding its `--max-concurrent` place
+/// and its bytes (audit120's S-S1). A client stream's later messages each come within
+/// `--stream-idle-ms` of the last chunk ([`Metered`]).
 pub(crate) async fn prepay(
     State(shared): State<Arc<Shared>>,
     req: HttpRequest,
@@ -64,26 +74,32 @@ pub(crate) async fn prepay(
 ) -> HttpResponse {
     let arrived = Instant::now();
     let (parts, body) = req.into_parts();
+    let token = parts
+        .headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if parts.uri.path() != HEALTH
+        && let Err(e) = shared.caller(token)
+    {
+        return status(e);
+    }
+    let limits = shared.limits;
+    let deadline = grpc_timeout(&parts.headers);
+    let wait = deadline.map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
+    // The request's one deadline: the header, the reservation and the first message all
+    // come within it.
+    let until = arrived + wait;
     let mut data = body.into_data_stream();
     let mut head = Vec::new();
-    while head.len() < 5 {
-        match std::future::poll_fn(|cx| Pin::new(&mut data).poll_next(cx)).await {
-            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
-            Some(Err(_)) => {
-                return status(ApiError::invalid("the request body broke off"));
-            }
-            // A body shorter than a header: tonic answers that.
-            None => break,
-        }
+    if let Err(e) = read_to(&mut data, &mut head, 5, until).await {
+        return status(e);
     }
     let length = head
         .get(1..5)
         .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize);
-    let limits = shared.limits;
-    let deadline = grpc_timeout(&parts.headers);
-    let wait = deadline.map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
     let bytes = length.min(limits.max_request_bytes);
-    let permit = match shared.router.service.reserve_within(bytes, wait).await {
+    let left = until.saturating_duration_since(Instant::now());
+    let permit = match shared.router.service.reserve_within(bytes, left).await {
         Ok(p) => p,
         // The client's own deadline ran out first.
         Err(_) if deadline.is_some_and(|d| d <= limits.request_timeout) => {
@@ -91,6 +107,13 @@ pub(crate) async fn prepay(
         }
         Err(e) => return status(e),
     };
+    // The first message's bytes, once their share is reserved; one longer than
+    // `--max-request-bytes` is left for tonic to refuse from its header.
+    if length <= limits.max_request_bytes
+        && let Err(e) = read_to(&mut data, &mut head, 5 + length, until).await
+    {
+        return status(e);
+    }
     let rest = Rest {
         head: Some(Bytes::from(head)),
         rest: data,
@@ -106,6 +129,8 @@ pub(crate) async fn prepay(
             head: Vec::new(),
             held: Bytes::new(),
             reserving: None,
+            idle: Box::pin(tokio::time::sleep(limits.stream_idle)),
+            idle_for: limits.stream_idle,
         })
     } else {
         Body::from_stream(rest)
@@ -118,6 +143,9 @@ pub(crate) async fn prepay(
     // A unary read's reply charge (#1567) moves into its body here, on the way out.
     super::charge::hold(next.run(req).await, limits.stream_idle)
 }
+
+/// `Admin.Health`, which takes no token.
+const HEALTH: &str = "/pigeonhole.v1.Admin/Health";
 
 /// The client stream whose messages are each reserved as they arrive.
 const BULK_LOAD: &str = "/pigeonhole.v1.Vectors/BulkLoad";
@@ -168,6 +196,10 @@ struct Metered {
     /// Bytes read, not yet passed.
     held: Bytes,
     reserving: Option<Reserving>,
+    /// When the client has sent nothing for `idle_for` (`--stream-idle-ms`), the stream
+    /// ends with `DeadlineExceeded` (audit120's S-S1).
+    idle: Pin<Box<tokio::time::Sleep>>,
+    idle_for: Duration,
 }
 
 impl Stream for Metered {
@@ -195,7 +227,23 @@ impl Stream for Metered {
             }
             if this.held.is_empty() {
                 match Pin::new(&mut this.inner).poll_next(cx) {
-                    Poll::Ready(Some(Ok(b))) => this.held = b,
+                    Poll::Ready(Some(Ok(b))) => {
+                        this.held = b;
+                        let next = tokio::time::Instant::now() + this.idle_for;
+                        this.idle.as_mut().reset(next);
+                    }
+                    Poll::Pending => {
+                        if this.idle.as_mut().poll(cx).is_ready() {
+                            this.meter.lock().1 = Some(ApiError::deadline(format!(
+                                "the client sent nothing for --stream-idle-ms ({} ms)",
+                                this.idle_for.as_millis()
+                            )));
+                            return Poll::Ready(Some(Err(axum::Error::new(
+                                "the client stream went idle",
+                            ))));
+                        }
+                        return Poll::Pending;
+                    }
                     other => return other,
                 }
                 continue;
@@ -221,6 +269,29 @@ impl Stream for Metered {
             }
         }
     }
+}
+
+/// Reads `data` into `buf` until it holds `n` bytes or the body ends (tonic answers a short
+/// one), by `until`: past it, `DeadlineExceeded`, as every deadline in `phdb serve` is.
+async fn read_to(
+    data: &mut BodyDataStream,
+    buf: &mut Vec<u8>,
+    n: usize,
+    until: Instant,
+) -> Result<(), ApiError> {
+    let read = async {
+        while buf.len() < n {
+            match std::future::poll_fn(|cx| Pin::new(&mut *data).poll_next(cx)).await {
+                Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                Some(Err(_)) => return Err(ApiError::invalid("the request body broke off")),
+                None => break,
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout_at(until.into(), read)
+        .await
+        .unwrap_or_else(|_| Err(ApiError::deadline_exceeded()))
 }
 
 fn status(e: ApiError) -> HttpResponse {
