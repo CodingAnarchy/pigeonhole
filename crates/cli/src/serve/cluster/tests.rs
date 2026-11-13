@@ -630,6 +630,10 @@ fn a_forward_from_a_peer_with_a_newer_map_takes_that_map_first() {
         md
     };
     rt.block_on(async {
+        // a says 5 but gives 3: still behind the sender's version, so refused, though 3 is
+        // newer than b's (audit120's S1 on #1817).
+        let e = b.catch_up(&caller, &headers(5, "a")).await.unwrap_err();
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
         b.catch_up(&caller, &headers(3, "a")).await.unwrap();
         assert_eq!(b.state().version(), 3, "b took a's map before the call");
         // No newer: nothing to do.
@@ -642,6 +646,52 @@ fn a_forward_from_a_peer_with_a_newer_map_takes_that_map_first() {
     });
     let _ = std::fs::remove_dir_all(&da);
     let _ = std::fs::remove_dir_all(&db);
+}
+
+/// audit120's S-C3 through `Cluster.Forward` itself: a forward whose sender says its map is
+/// newer, from a listed node that's down, is refused `PartitionUnavailable` before it runs:
+/// the write isn't applied.
+#[test]
+fn a_forward_from_a_newer_peer_that_cant_give_its_map_writes_nothing() {
+    use super::proto::{ForwardRequest, cluster_client::ClusterClient, forward_request};
+    let mut t = Three::start(["", "", ""]);
+    let [a, _, c] = t.ports;
+    drop(t.stops.remove(2));
+    t.rt.block_on(async {
+        eventually("c to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", c))
+                .await
+                .is_err()
+        })
+        .await;
+        let caller =
+            super::forward::forwarded_caller(&crate::serve::auth::Caller::anonymous()).unwrap();
+        let mut req = tonic::Request::new(ForwardRequest {
+            map_version: 99,
+            caller: Some(caller),
+            fanout_part: false,
+            op: Some(forward_request::Op::Mutate(super::proto::MutateRequest {
+                writes: Some(put_row("bob", "1")),
+                durability: 0,
+            })),
+        });
+        let md = req.metadata_mut();
+        md.insert(super::MAP_VERSION_HEADER, "99".parse().unwrap());
+        md.insert(super::NODE_ID_HEADER, "c".parse().unwrap());
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{a}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let e = ClusterClient::new(ch).forward(req).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("nothing ran"), "{e}");
+        assert_eq!(
+            get_row(a, "bob").await.unwrap(),
+            None,
+            "the write wasn't applied"
+        );
+    });
 }
 
 /// audit120's S-C2: a forwarded reply over tonic's default 4 MiB reaches the entry node, and

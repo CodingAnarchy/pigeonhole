@@ -913,7 +913,9 @@ impl Node {
                 "this node's map doesn't list that node to take it from",
             ));
         };
-        self.pull_now(from, &address, mine)
+        // At least the sender's version, not just newer than this node's: another pull may
+        // have installed a map between the two (audit120's S1 on #1817).
+        self.pull_now(from, &address, version - 1)
             .await
             .map_err(|e| behind(&format!("taking it failed: {e}")))
     }
