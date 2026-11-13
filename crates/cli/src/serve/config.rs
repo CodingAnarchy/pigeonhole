@@ -250,8 +250,9 @@ pub(crate) struct ServeArgs {
     pub replica_run: usize,
     /// Serve as a node of a partitioned cluster (D317, ICR 0117): DIR holds the node's
     /// partition map (`cluster-map.json`) and its partitions' files (`<partition>.phdb`). One
-    /// server per DIR. So far the node keeps and distributes the map (`phdb cluster`); serving
-    /// the partitions' data comes with D317's next ticket.
+    /// server per DIR. The node serves the partitions the map gives it, routes every other
+    /// call to the node that holds its partition, and keeps and distributes the map
+    /// (`phdb cluster`).
     #[arg(long, value_name = "DIR", requires = "node_id")]
     pub cluster: Option<PathBuf>,
     /// This node's id in the cluster's map (`[a-z0-9_-]`, up to 64).

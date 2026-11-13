@@ -108,7 +108,7 @@ Eight tools, each with a JSON schema and a description written for the agent. `t
 | `write` | Up to 10,000 operations in one atomic `WriteBatch`: `put`, `incr` (counter families), `aggregate` (other aggregate families) and `delete` (a row, a family, a column, or one version with `ts`). All commit, or none. An `aggregate` value is read by the family's kind: any number for the f64 kinds, a non-negative integer for the bitwise ones, an integer or a string for `hll` and `bloom`. |
 | `create_table` | A table and its families, if missing. A family is a name, or an object in `list_tables`' shape (`{"name": "hits", "aggregation": "sum"}`). |
 
-**Encoding.** Values use [`phdb dump`](cli.md#phdb-dump)'s JSON shapes. Row keys, qualifiers and byte values are JSON strings when they are UTF-8, else `{"base64": "..."}`. Integer and float cells are `{"i64": n}` and `{"f64": x}`. Timestamps are microseconds since the Unix epoch. A cell in a result is `{"family", "qualifier", "ts", "value"}`.
+**Encoding.** Values use [`phdb dump`](cli.md#phdb-dump-and-phdb-load)'s JSON shapes. Row keys, qualifiers and byte values are JSON strings when they are UTF-8, else `{"base64": "..."}`. Integer and float cells are `{"i64": n}` and `{"f64": x}`. Timestamps are microseconds since the Unix epoch. A cell in a result is `{"family", "qualifier", "ts", "value"}`.
 
 **Errors.** A tool that fails returns a result with `isError` and `{"error": {"code", "code_num", "message"}}`, with the [`ErrorCode`](errors.md) name when the database refused the call (`TableNotFound`, `FamilyNotFound`, `ReadOnly`, ...) and `Usage` for a bad argument. The agent sees it and can correct the call. An unknown argument is an error, not ignored, so a misspelt `limt` doesn't silently scan 100 rows.
 

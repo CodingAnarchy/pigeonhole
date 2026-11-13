@@ -2086,3 +2086,110 @@ fn a_token_across_a_writer_restart_names_the_later_session_whatever_its_id() {
     }
     panic!("no seed in range drew a smaller id for the later session");
 }
+
+#[test]
+fn a_token_across_a_writer_restart_through_a_catalog_change_names_the_later_session() {
+    // audit120's P2-C5: #1810's fix raised the token's session for WAL records only. A feed
+    // of every table whose only step into the new session is a catalog change (a migration
+    // right after the reopen, before any commit) kept naming the older session, with the
+    // newer session's `catalog_seq`: on a copy without the newer session it resumed rather
+    // than expired.
+    let vfs = SimVfs::new(3880);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let one = single(&db, &a, b"one", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, one);
+    let token = r.token();
+    let s1 = token_session(&token);
+    drop(r);
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    // The reopen's session: a feed opened now names it (P2-C6).
+    let s2 = token_session(&db.feed(spec(&[&a], FeedStart::Now)).unwrap().token());
+    assert_ne!(s1, s2, "a reopen is a new session");
+    let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+    db.create_table("c", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    catalog_within(&mut r, WAIT);
+    assert_eq!(
+        token_session(&r.token()),
+        s2,
+        "after the new session's catalog change, the token names it ({s2:#x}), not {s1:#x}"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn a_token_taken_before_any_record_names_the_session_and_a_gap_expires_it() {
+    // audit120's P2-C6: a feed that had read nothing yet handed out a token naming session
+    // 0, and a resume runs the history check only for a nonzero session. Here a session
+    // with the feed off writes in between, as in
+    // `a_session_without_the_feed_between_expires_a_token`, but the token predates every
+    // record: it must name its session and expire all the same.
+    let vfs = SimVfs::new(3881);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _) = tables(&db);
+    let token = db.feed(spec(&[&a], FeedStart::Now)).unwrap().token();
+    assert_ne!(
+        token_session(&token),
+        0,
+        "a token names its session from the open"
+    );
+    db.close().unwrap();
+    let db = open(&vfs, None);
+    single(&db, &a, b"unfed", Durability::GroupSync);
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "a gap is never skipped silently, whenever the token was taken"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn an_oldest_start_from_an_earlier_session_names_it_before_any_record() {
+    // perf2's remainder of audit120's P2-C6: `Oldest` served from an earlier session still
+    // kept whole (#1465) left the token's session at 0 until a record was read, so a token
+    // taken there skipped the history check, as P2-C6's did. It names the session it starts
+    // in, and a feed-off session written in between expires it.
+    let vfs = SimVfs::new(3882);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    db.close().unwrap();
+    // The earlier session, with commits: `Oldest` starts in it later.
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let one = single(&db, &a, b"one", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, one);
+    let earlier = token_session(&r.token());
+    drop(r);
+    single(&db, &b, b"two", Durability::GroupSync);
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let token = r.token();
+    assert_eq!(
+        token_session(&token),
+        earlier,
+        "a token from an earlier-session start names that session before any record"
+    );
+    drop(r);
+    db.close().unwrap();
+    // A session with the feed off writes in between.
+    let db = open(&vfs, None);
+    single(&db, &a, b"unfed", Durability::GroupSync);
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "a gap is never skipped silently, whenever the token was taken"
+    );
+    drop(r);
+    db.close().unwrap();
+}
