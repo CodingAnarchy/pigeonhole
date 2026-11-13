@@ -1432,10 +1432,12 @@ impl Client {
                         pos.seqno = Some(at);
                         pos.token = token_of(&stream);
                     }
-                    if pos.last_event.elapsed() >= self.feeds.limits.quiet {
-                        self.progress(pos).await?;
-                    }
                 }
+            }
+            // After either arm: commits that keep arriving, none matching the prefix, would
+            // otherwise win every round and the token would never advance (audit120).
+            if pos.last_event.elapsed() >= self.feeds.limits.quiet {
+                self.progress(pos).await?;
             }
         }
     }
