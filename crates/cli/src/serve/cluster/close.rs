@@ -213,14 +213,20 @@ impl Node {
             part.indexes.close();
             part.db.clone().close()
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await;
+        // The database's close is over either way, its task's join failing included: the
+        // record stops saying it's still closing, so Status shows its error rather than
+        // waiting on it for ever (cli692's nit on #1769).
+        let joined = closed.as_ref().err().map(ToString::to_string);
         if let Some(c) = self.fences.closed().get_mut(id) {
             c.db_open = false;
-            if let Err(e) = &closed {
-                c.error = Some(e.to_string());
+            match (&closed, &joined) {
+                (_, Some(e)) => c.error = Some(format!("the close's task failed: {e}")),
+                (Ok(Err(e)), None) => c.error = Some(e.to_string()),
+                _ => {}
             }
         }
+        let closed = closed.map_err(|e| ApiError::internal(e.to_string()))?;
         if let Err(e) = closed {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
         }

@@ -1023,6 +1023,11 @@ fn run_alone(module: &str, test: &str, body: fn()) {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("1 passed"), "{stdout}");
+    // A child that skipped (no pinning here, too few cores) says so in this test's output
+    // too, rather than passing silently (cli692's N1 on #1763).
+    for line in stdout.lines().filter(|l| l.starts_with("skipped:")) {
+        println!("{line}");
+    }
 }
 
 /// A test partition's file in `dir`: created, stamped as partition `p` of cluster `c1` at
