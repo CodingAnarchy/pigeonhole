@@ -845,10 +845,24 @@ fn a_rollback_from_1_2_after_a_crash_in_a_root_commit_keeps_the_feed_and_resolve
             !entries.contains(&FeedEntry::Unknown(5)),
             "{what}: no intent left in front of this open's entry: {entries:?}"
         );
-        let n = entries.len();
-        assert!(
-            matches!(entries[n - 1], FeedEntry::Session { .. }),
+        // This open's Session entry: it inherited the feed. Its own root commits may follow
+        // it already (the open's own, on some platforms), and nothing else may.
+        let n = entries
+            .iter()
+            .rposition(|e| matches!(e, FeedEntry::Session { .. }))
+            .expect("a Session entry");
+        let FeedEntry::Session { session: new, .. } = entries[n] else {
+            unreachable!()
+        };
+        assert_ne!(
+            new, session,
             "{what}: the open inherited the feed: {entries:?}"
+        );
+        assert!(
+            entries[n + 1..]
+                .iter()
+                .all(|e| matches!(e, FeedEntry::Root { session: s, .. } if *s == new)),
+            "{what}: only this open's roots after its entry: {entries:?}"
         );
         let before = if landed && catalog {
             vec![FeedEntry::Unknown(4), FeedEntry::Root { session, sequence }]
@@ -856,7 +870,7 @@ fn a_rollback_from_1_2_after_a_crash_in_a_root_commit_keeps_the_feed_and_resolve
             vec![FeedEntry::Root { session, sequence }]
         };
         assert_eq!(
-            entries[n - 1 - before.len()..n - 1],
+            entries[n - before.len()..n],
             before[..],
             "{what}: {entries:?}"
         );
