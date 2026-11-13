@@ -1283,3 +1283,61 @@ fn a_sets_members_come_back_only_when_asked_and_only_aggregate_families_have_vie
         "a plain family's value isn't a sketch"
     );
 }
+
+#[test]
+fn a_page_converts_no_more_than_its_budget_and_one_column() {
+    // audit120's S1 on #1812: MultiGet and Scan converted the whole engine page, every
+    // aggregate view built, before cutting it to the budget: about 300 MB a request at the
+    // default page. 2,000 small sketches fit one 1 MiB engine page; with 1,024 quantiles each
+    // view is 8 KiB, so converting them all would build about 16 MB.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    let t = db
+        .table("many")
+        .unwrap()
+        .family(
+            "q",
+            Family::aggregate(pigeonhole::Aggregation::Quantiles(Default::default())),
+        )
+        .create()
+        .unwrap();
+    for i in 0..2_000 {
+        t.mutate(format!("r{i:05}").as_bytes())
+            .aggregate_f64("q", b"x", f64::from(i))
+            .commit()
+            .unwrap();
+    }
+    let page = t.scan_prefix(b"r").read_within(1 << 20).unwrap();
+    assert_eq!(page.rows().len(), 2_000, "one engine page holds them all");
+    let query = proto::AggregateQuery {
+        quantiles: (0..1024).map(|i| f64::from(i) / 1024.0).collect(),
+        ..Default::default()
+    };
+    let kinds = crate::serve::convert::Kinds::new(&t);
+    let budget = 64 << 10;
+    crate::serve::convert::BUILT.with(|b| b.set(0));
+    let cut = crate::serve::convert::rows_within(page.rows(), &kinds, Some(&query), budget)
+        .expect_err("the views take the page over its budget");
+    let built = crate::serve::convert::BUILT.with(std::cell::Cell::get);
+    // One column here is a key, a 5-byte qualifier and value, and an 8 KiB view.
+    assert!(
+        built <= budget + (9 << 10),
+        "built {built} bytes for a {budget}-byte page"
+    );
+    // Read again within the cut, the page converts whole, within the budget.
+    let page = t.scan_prefix(b"r").read_within(cut).unwrap();
+    let rows =
+        crate::serve::convert::rows_within(page.rows(), &kinds, Some(&query), budget).unwrap();
+    let bytes: u64 = rows
+        .iter()
+        .map(|r| {
+            r.key.len() as u64
+                + r.cells
+                    .iter()
+                    .map(crate::serve::convert::cell_bytes)
+                    .sum::<u64>()
+        })
+        .sum();
+    assert!(bytes <= budget, "{bytes}");
+    assert!(rows.len() >= 5, "{} rows", rows.len());
+}

@@ -2854,8 +2854,9 @@ impl Service {
                 };
                 let q = select.aggregate();
                 let kinds = convert::Kinds::new(&table);
-                // Read again with a smaller budget while the aggregate views take the page
-                // over its budget (audit120's F4): each read keeps fewer columns.
+                // Converted a column at a time, stopping at the first that doesn't fit with its
+                // aggregate view, then read again to end the page there (audit120's F4 and its
+                // S1 on #1812): no more than the budget and one column is ever built.
                 let mut within = budget;
                 let (page, rows) = loop {
                     let mut read = select.keys(table.keys(&keys))?;
@@ -2863,14 +2864,11 @@ impl Service {
                         read = read.resume_after(after);
                     }
                     let page = read.read_within(within)?;
-                    let rows: Vec<proto::Row> = page
-                        .rows()
-                        .iter()
-                        .map(|row| convert::row(row.view(), &kinds, q))
-                        .collect();
-                    match convert::probe_cut(&rows, budget) {
-                        Some(cut) if cut < within => within = cut,
-                        _ => break (page, rows),
+                    match convert::rows_within(page.rows(), &kinds, q, budget) {
+                        Ok(rows) => break (page, rows),
+                        // The columns that fit are fewer than the page's, so each read keeps
+                        // fewer; `min` keeps that true even if the measures ever differ.
+                        Err(cut) => within = cut.min(within.saturating_sub(1)),
                     }
                 };
                 let bytes = rows.iter().map(row_bytes).sum();
@@ -4245,8 +4243,9 @@ impl ScanTask {
                 let select = convert::Select::new(req.selection.as_ref())?.at(at);
                 let q = select.aggregate();
                 let kinds = convert::Kinds::new(&table);
-                // Read again with a smaller budget while the aggregate views take the page
-                // over its budget (audit120's F4): each read keeps fewer columns.
+                // Converted a column at a time, stopping at the first that doesn't fit with its
+                // aggregate view, then read again to end the page there (audit120's F4 and its
+                // S1 on #1812): no more than the budget and one column is ever built.
                 let mut within = budget;
                 loop {
                     let mut scan = select.scan(&table, req.range.as_ref())?;
@@ -4257,17 +4256,13 @@ impl ScanTask {
                         scan = scan.resume_after(p);
                     }
                     let page = scan.read_within(within)?;
-                    let rows: Vec<proto::Row> = page
-                        .rows()
-                        .iter()
-                        .map(|row| convert::row(row.view(), &kinds, q))
-                        .collect();
-                    match convert::probe_cut(&rows, budget) {
-                        Some(cut) if cut < within => within = cut,
-                        _ => {
+                    match convert::rows_within(page.rows(), &kinds, q, budget) {
+                        Ok(rows) => {
                             let bytes = rows.iter().map(row_bytes).sum();
                             break Ok((rows, page.resume().cloned(), bytes, page.cut_by_budget()));
                         }
+                        // As MultiGet's: each read keeps fewer columns.
+                        Err(cut) => within = cut.min(within.saturating_sub(1)),
                     }
                 }
             })

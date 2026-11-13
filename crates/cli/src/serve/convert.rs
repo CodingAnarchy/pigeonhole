@@ -913,37 +913,72 @@ pub(crate) fn view_bytes(c: &proto::Cell) -> u64 {
     c.aggregate.as_ref().map_or(0, |a| a.encoded_len() as u64)
 }
 
-/// For a page read within `budget` whose aggregate views ([`view_bytes`]) take it over
-/// `budget`: the engine budget whose read keeps only the longest prefix of whole columns
-/// that fits with its answers, always the first, so reading again with it ends the page
-/// early (audit120's F4). D308 counts each row's key once, with its first column. `None`
-/// when the page fits, or when it is one column over the budget on its own.
-pub(crate) fn probe_cut(rows: &[proto::Row], budget: u64) -> Option<u64> {
-    let (mut engine, mut total) = (0u64, 0u64);
-    let mut first = true;
+#[cfg(test)]
+thread_local! {
+    /// Test inspection: the bytes [`rows_within`] has converted on this thread, by D308's
+    /// measure with the views.
+    pub(crate) static BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A page's rows converted while they fit `budget` with their aggregate views
+/// ([`view_bytes`]), a whole column at a time, the first column always. `Ok` when every
+/// column fit. Otherwise `Err` with the engine budget of the columns that fit, as soon as a
+/// column doesn't, converting nothing past it: a read again with that budget ends the page
+/// there (audit120's F4, and its S1 on #1812: converting the whole page first built every
+/// view, up to hundreds of MB, before cutting it). D308 counts each row's key once, with
+/// its first column.
+pub(crate) fn rows_within(
+    rows: &[pigeonhole::Row],
+    kinds: &Kinds<'_>,
+    q: Option<&proto::AggregateQuery>,
+    budget: u64,
+) -> std::result::Result<Vec<proto::Row>, u64> {
+    let mut out = Vec::with_capacity(rows.len());
+    let (mut engine, mut total, mut first) = (0u64, 0u64, true);
     for row in rows {
-        let mut key = row.key.len() as u64;
+        let r = row.view();
+        let mut key = r.key().len() as u64;
+        let mut cells = Vec::with_capacity(r.len());
         let mut i = 0;
-        while i < row.cells.len() {
-            let column = (&row.cells[i].family, &row.cells[i].qualifier);
-            let (mut own, mut probes) = (std::mem::take(&mut key), 0);
-            while let Some(c) = row.cells.get(i)
-                && (&c.family, &c.qualifier) == column
-            {
-                let p = view_bytes(c);
-                own += cell_bytes(c) - p;
-                probes += p;
+        while i < r.len() {
+            let Some(head) = r.entry(i) else {
                 i += 1;
+                continue;
+            };
+            let (family, qualifier) = (head.family, head.qualifier);
+            let kind = kinds.of(family);
+            let (mut own, mut views) = (std::mem::take(&mut key), 0);
+            let at = cells.len();
+            while i < r.len() {
+                match r.entry(i) {
+                    Some(e) if e.family == family && e.qualifier == qualifier => {
+                        let c = cell(e.family, e.qualifier, &e.cell, kind, q);
+                        let v = view_bytes(&c);
+                        own += cell_bytes(&c) - v;
+                        views += v;
+                        cells.push(c);
+                        i += 1;
+                    }
+                    Some(_) => break,
+                    None => i += 1,
+                }
             }
-            if !first && total + own + probes > budget {
-                return Some(engine);
+            #[cfg(test)]
+            BUILT.with(|b| b.set(b.get() + own + views));
+            if !first && total + own + views > budget {
+                cells.truncate(at);
+                return Err(engine);
             }
             first = false;
             engine += own;
-            total += own + probes;
+            total += own + views;
         }
+        out.push(proto::Row {
+            key: r.key().to_vec().into(),
+            cells,
+        });
     }
-    None
+    Ok(out)
 }
 
 // ---- Schema (D313 ticket 6): families in and out ----
