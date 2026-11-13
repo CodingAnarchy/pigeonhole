@@ -179,6 +179,7 @@ impl Node {
             },
         );
         // Its users end and its database closes, off the async threads.
+        let id_for_feeds = id.to_owned();
         #[cfg(test)]
         let dir = self.dir.clone();
         let closed = tokio::task::spawn_blocking(move || {
@@ -196,6 +197,14 @@ impl Node {
             let Some(part) = service.part_opt() else {
                 return Ok(());
             };
+            // Its cluster feed components end as a partition that went away, which a
+            // subscription with `allow_partial` waits out and opens again where the map
+            // then puts it; not with the engine's `Closed` from the close below, which ends
+            // every subscription (audit120's S-C5).
+            part.feeds
+                .end_parts(ApiError::partition_unavailable(format!(
+                    "partition {id_for_feeds:?} closed on this node"
+                )));
             part.feeds.fail_all();
             part.bulk.stop();
             part.bulk.close();

@@ -990,6 +990,7 @@ fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
 type Opened = Result<(Events, u64), ApiError>;
 
 /// What opening one component sends.
+#[derive(Clone)]
 struct Open {
     partition: String,
     request: proto::SubscribeRequest,
@@ -1021,6 +1022,7 @@ impl Ctx {
     /// request timeout too). The open checks the partition's history against the epoch the
     /// part's position is from.
     async fn reopen(self: Arc<Self>, mut open: Open, pull: Option<super::route::Owner>) -> Opened {
+        let moved = pull.is_some();
         if let Some(o) = pull {
             let within = self.service.request_timeout();
             let _ = tokio::time::timeout(
@@ -1032,7 +1034,39 @@ impl Ctx {
         if let Some(r) = self.node.routes().as_ref() {
             open.map_version = open.map_version.max(r.map_version());
         }
-        self.open(open).await
+        if !moved {
+            return self.open(open).await;
+        }
+        // The partition moved (its old node answered `WrongPartition`): its new node may
+        // still be opening it, so `PartitionUnavailable` is tried again before it counts,
+        // every try within what's left of one request timeout (audit120's S-C5). A client
+        // that goes away needs no check here: dropping its merge drops `opens`, which
+        // aborts this task (simp724's N2 on #1805).
+        let within = self.service.request_timeout();
+        let until = tokio::time::Instant::now() + within;
+        let mut pause = Duration::from_millis(50);
+        loop {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let tried = tokio::time::timeout(left, Arc::clone(&self).open_now(open.clone()))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ApiError::partition_unavailable(format!(
+                        "partition {:?} moved, and its new node didn't serve it within {} ms",
+                        open.partition,
+                        within.as_millis()
+                    )))
+                });
+            match tried {
+                Err(e)
+                    if e.code == "PartitionUnavailable"
+                        && tokio::time::Instant::now() + pause < until =>
+                {
+                    tokio::time::sleep(pause).await;
+                    pause = (pause * 2).min(RETRY);
+                }
+                r => return r,
+            }
+        }
     }
 
     /// Opens part `open` where the map puts it now, returning its events and the epoch it
@@ -1067,6 +1101,7 @@ impl Ctx {
             let events = here
                 .subscribe_part(open.request, &self.caller, open.skip, true)
                 .await?;
+            still_owner(&self.node, &open.partition)?;
             return Ok((Box::pin(LocalEvents(events)), epoch));
         }
         let channel = self.channel(&owner.address).await?;
@@ -1254,9 +1289,28 @@ pub(crate) async fn serve(
         };
         service
     };
-    service
+    let events = service
         .subscribe_part(r, &caller, req.skip_through, true)
-        .await
+        .await?;
+    still_owner(node, &req.partition)?;
+    Ok(events)
+}
+
+/// After a component subscribed on this node: `WrongPartition` if a map installed since
+/// the check before it gives the partition to another node. That install's
+/// [`Feeds::end_parts`](crate::serve::feed::Feeds::end_parts) may have run before the
+/// component was there to end, and its routes were stored before it ran, so this sees them
+/// (audit120's S-C5).
+fn still_owner(node: &Node, partition: &str) -> Result<(), ApiError> {
+    let routes = node.routes();
+    let routes = routes.as_ref();
+    if routes.is_some_and(|r| r.owner(partition).is_some_and(|o| o.node == node.id())) {
+        return Ok(());
+    }
+    Err(ApiError::wrong_partition(
+        routes.map_or(0, |r| r.map_version()),
+        format!("the map moved partition {partition:?} off this node"),
+    ))
 }
 
 /// `Cluster.ForwardSubscribe` over gRPC, routed by hand as `Feed.Subscribe` is: a ring entry
