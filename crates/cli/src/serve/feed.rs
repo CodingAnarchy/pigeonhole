@@ -1334,7 +1334,7 @@ impl Client {
         self.tracker.set(WAITING, 0);
         tokio::select! {
             // A client that leaves while queued gives up its place.
-            () = self.sink.closed() => Err(ApiError::internal("the client went away")),
+            () = self.sink.closed() => Err(gone()),
             slot = sem.acquire_owned() => {
                 slot.map_err(|_| ApiError::internal("the catch-up slots closed"))
             }
@@ -1383,7 +1383,7 @@ impl Client {
                 tokio::select! {
                     // A client that went away ends here, even one whose prefix never
                     // matches (it would otherwise hold its stream slot until a send failed).
-                    () = self.sink.closed() => return Err(ApiError::internal("the client went away")),
+                    () = self.sink.closed() => return Err(gone()),
                     changed = head.changed() => {
                         if changed.is_err() {
                             return Err(ApiError::internal("the feed's hub ended"));
@@ -1467,7 +1467,7 @@ impl Client {
             // client gives its catch-up slot back as soon as it can rejoin.
             let tick = tokio::time::sleep(REJOIN_TICK.min(self.feeds.limits.quiet));
             tokio::select! {
-                () = self.sink.closed() => return Err(ApiError::internal("the client went away")),
+                () = self.sink.closed() => return Err(gone()),
                 item = next(&mut stream) => match item {
                     Some(Ok(commit)) => {
                         let token = token_of(&stream);

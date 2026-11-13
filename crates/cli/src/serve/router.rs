@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use super::auth::Caller;
 use super::cluster::forward::{self, Forwarder};
-use super::cluster::route::Routes;
+use super::cluster::route::{Routes, prefix_end};
 use super::errors::ApiError;
 use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection, routing_key};
 use super::replica::ReadDeadline;
@@ -674,7 +674,7 @@ impl Cluster {
 /// its rows are in one, and a transaction's or snapshot's (D317 ticket 3): its `route` when
 /// it begins, then the partition its id names, with every row it reads or writes checked to
 /// be in it (`CrossPartition`). The owner routes a forwarded call again, so it checks too.
-/// Everything else is refused until its D317 ticket.
+/// Everything else is refused.
 pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
     let one = |table: &str, row: &[u8]| {
         routes
@@ -822,7 +822,7 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
                     ))),
                 }
             }
-            None => Err(later("a read across partitions", 4)),
+            None => Err(unrouted()),
         },
         ServiceOp::Nearest(r) if !r.snapshot_id.is_empty() => Err(ApiError::unsupported(
             "a nearest-neighbour search at a snapshot isn't supported on a cluster",
@@ -833,27 +833,22 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         // One partition's part of a `Nearest` another node fans out (D317 ticket 4b): its
         // keys, or a range clipped to the partition. A client's fans out before it gets here.
         ServiceOp::Nearest(r) => nearest_partition(routes, r),
-        ServiceOp::Traverse(_) => Err(ApiError::internal(
-            "a fanned-out read isn't routed to one partition",
-        )),
         // An index lives in one partition's file, and no D317 ticket routes a search to it
         // (#1722, 1.3.0).
         ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
             "indexed vector and text search isn't supported on a cluster in this release: use \
              Vectors.Nearest, which fans out across the partitions",
         )),
-        ServiceOp::ListTables(_)
+        // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
+        // read that fans out, a schema call (the map's), a subscription and a backup.
+        ServiceOp::Traverse(_)
+        | ServiceOp::ListTables(_)
         | ServiceOp::CreateTable(_)
         | ServiceOp::DropTable(_)
-        | ServiceOp::DescribeTable(_) => Err(ApiError::internal(
-            "a schema call is answered from the cluster map, not routed to a partition",
-        )),
-        // A cluster subscription is routed before this ([`Router::subscribe`]).
-        ServiceOp::Subscribe(_) => Err(ApiError::internal("a subscription isn't routed by key")),
-        // A backup is served before this ([`Router::backup`]).
-        ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
-            Err(ApiError::internal("a backup isn't routed by key"))
-        }
+        | ServiceOp::DescribeTable(_)
+        | ServiceOp::Subscribe(_)
+        | ServiceOp::Backup(_)
+        | ServiceOp::BackupDownload(_) => Err(unrouted()),
         _ => Err(ApiError::unsupported(
             "this call isn't served by a cluster node (D317)",
         )),
@@ -984,19 +979,6 @@ fn scan_span<'a>(routes: &'a Routes, r: &ScanRequest) -> Result<Vec<&'a str>, Ap
         .ok_or_else(|| ApiError::not_found(format!("table {:?} isn't in the cluster map", r.table)))
 }
 
-/// The first key after every key starting with `prefix`; `None` when there is none (all
-/// `0xff`, or empty).
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last < 0xff {
-            end.push(last + 1);
-            return Some(end);
-        }
-    }
-    None
-}
-
 /// Whether a forward of `op` that fails after it was sent leaves an outcome unknown (B3):
 /// a write, and a transaction's buffered writes, commit and abort (ticket 3).
 fn forward_writes(op: &ServiceOp) -> bool {
@@ -1015,9 +997,7 @@ pub(crate) fn not_open(partition: &str) -> ApiError {
     ))
 }
 
-/// A call a later D317 ticket brings to a cluster.
-pub(crate) fn later(what: &str, ticket: u32) -> ApiError {
-    ApiError::unsupported(format!(
-        "{what} in a cluster comes with D317's ticket {ticket}"
-    ))
+/// The answer of [`route`] to a call no caller brings it: one answered before it's routed.
+fn unrouted() -> ApiError {
+    ApiError::internal("this call isn't routed to one partition")
 }

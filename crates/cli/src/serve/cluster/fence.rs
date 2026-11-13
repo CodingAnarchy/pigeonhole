@@ -199,7 +199,7 @@ impl Node {
         let _one = self.fences.changing.lock().await;
         let (gate, _) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
         // The flag first (S4): from here no write is admitted, whatever happens next.
-        gate.fence(Fence::Operator);
+        gate.fence();
         let mut fenced = self.fences.operator().clone();
         if fenced.insert(id.to_owned()) {
             self.persist_fences(fenced).await?;
@@ -280,8 +280,7 @@ impl Node {
             let _installing = node.reconcile_current(Some(&part));
             gate.unfence();
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await?;
         eprintln!("phdb serve: partition {id} unfenced: it takes writes");
         Ok(())
     }
@@ -290,8 +289,7 @@ impl Node {
         let dir = self.dir.clone();
         let written = fenced.clone();
         tokio::task::spawn_blocking(move || write_fenced(&dir, &written))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+            .await?
             .map_err(|e| ApiError::internal(format!("persist {FENCED_FILE}: {e}")))?;
         *self.fences.operator() = fenced;
         Ok(())
