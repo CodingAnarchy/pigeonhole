@@ -187,6 +187,9 @@ pub struct CatalogEvent {
     /// The name of each table the edits name without a `CreateTable` among them, as the
     /// catalog held it before them: every table an event names is named in the event.
     pub names: Vec<(TableId, String)>,
+    /// The writer session that made the change: delivering it (or passing over it) moves
+    /// the token's session as a record of that session does (audit120's P2-C5).
+    session: u64,
 }
 
 /// A mutation as read, before its commit's timestamp is known: its fixed fields, and its
@@ -917,6 +920,10 @@ impl FeedReader {
                     FeedStart::Token(_) => unreachable!("handled above"),
                 };
                 this.delivered = bound;
+                // The bound and the starts are this session's state, so a token taken
+                // before any record is read names it: with 0 a resume skipped the history
+                // check (audit120's P2-C6).
+                this.session = this.current;
                 let mut starts = Vec::with_capacity(this.shared.shards);
                 for (s, m) in marks.iter().enumerate() {
                     // A reader process has no checkpoint history: from its checkpoint for
@@ -1702,8 +1709,8 @@ impl FeedReader {
             // Compared only when it differs: once per session crossed, and per record only
             // for a stream still in the older session while streams straddle a restart (a
             // scan of the history's few entries).
-            if inside && session != self.session && self.history.later(session, self.session) {
-                self.session = session;
+            if inside {
+                self.raise_session(session);
             }
             match item {
                 Item::Single { seqno, ts, changes } => {
@@ -1991,6 +1998,7 @@ impl FeedReader {
                 let ev = self.catalog.pop_front().expect("checked");
                 self.note_drops(&ev.edits);
                 self.catalog_seq = ev.sequence;
+                self.raise_session(ev.session);
                 self.out_catalog = ev;
                 return Ok(Emitted::Catalog);
             }
@@ -2403,6 +2411,7 @@ impl FeedReader {
             if before_start {
                 self.note_drops(&edits);
                 self.catalog_seq = self.catalog_seq.max(sequence);
+                self.raise_session(session);
                 continue;
             }
             self.catalog.push_back(CatalogEvent {
@@ -2411,9 +2420,20 @@ impl FeedReader {
                 sequence,
                 edits,
                 names,
+                session,
             });
         }
         Ok(())
+    }
+
+    /// The token's session from now on: `session`'s, if it came later in the history than
+    /// the one it names (#1810; by the chain's order, never by value). For a record, a
+    /// catalog change delivered, and one passed over (audit120's P2-C5): each puts the
+    /// position in its writer's session.
+    fn raise_session(&mut self, session: u64) {
+        if session != self.session && self.history.later(session, self.session) {
+            self.session = session;
+        }
     }
 
     /// The tables `edits` drop: their later changes are passed over.
