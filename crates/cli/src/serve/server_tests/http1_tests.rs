@@ -215,3 +215,58 @@ fn a_body_without_a_length_is_refused_before_it_is_read() {
     assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
     assert!(reply.contains("Content-Length"), "{reply}");
 }
+
+#[test]
+fn max_concurrent_is_one_limit_across_the_routes() {
+    // audit120's should 2: each route had its own `--max-concurrent` semaphore. With 2
+    // places, one request held on `/v1` and one on `/mcp` take both, so a third route sheds.
+    let mut l = limits();
+    l.max_concurrent = 2;
+    let s = Server::start("", l);
+    let _v1 = hold_a_slot(&s);
+    let _mcp = raw(
+        &s.url,
+        "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 100000\r\n\r\n{",
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut tables = agent.get(format!("{}/v1/tables", s.url)).call().unwrap();
+    let body = tables.body_mut().read_to_string().unwrap();
+    assert_eq!(tables.status().as_u16(), 503, "{body}");
+    assert!(body.contains("Overloaded"), "{body}");
+}
+
+#[test]
+fn a_body_that_stops_coming_ends_at_the_request_timeout() {
+    // audit120's S-S1: past the pre-read's 64 KiB, `/v1` and `/mcp` waited for a body with
+    // no deadline, holding a `--max-concurrent` place and the body's reserved bytes.
+    let mut l = limits();
+    l.request_timeout = Duration::from_millis(300);
+    let s = Server::start("", l);
+    for path in ["/v1/Data/Get", "/mcp"] {
+        let started = std::time::Instant::now();
+        let mut tcp = raw(
+            &s.url,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: 100000\r\n\r\n{{"
+            ),
+        );
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (head, body) = read_answer(&mut tcp).unwrap();
+        assert!(head.starts_with("HTTP/1.1 504"), "{path}: {head}{body}");
+        assert!(body.contains("DeadlineExceeded"), "{path}: {body}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "{path}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            s.shared.router.service.inflight_available(),
+            l.inflight_bytes,
+            "{path}"
+        );
+    }
+}

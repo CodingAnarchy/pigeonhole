@@ -161,7 +161,12 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
                     },
                 ))
                 .load_shed()
-                .concurrency_limit(limits.max_concurrent),
+                // One limit for the whole server, as documented: `concurrency_limit` would
+                // give each route its own (audit120's should 2), since the router layers
+                // every route separately.
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+                    limits.max_concurrent,
+                )),
         );
     let app = axum::Router::new()
         .route("/v1/health", get(health))
@@ -290,6 +295,9 @@ async fn metrics(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respo
         Ok(c) => c,
         Err(_) => return ApiError::unauthenticated().into_response(),
     };
+    if caller.memory_only() {
+        return super::service::namespaced_denied("read metrics").into_response();
+    }
     if !caller.scope.allows(Scope::Read) {
         return ApiError::permission_denied("read metrics").into_response();
     }
@@ -346,12 +354,20 @@ async fn call(
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let body = match axum::body::to_bytes(req.into_body(), length).await {
-        Ok(b) => b,
-        Err(_) => {
-            return ApiError::invalid("the body is longer than its Content-Length").into_response();
-        }
-    };
+    // Within the request's one deadline (audit120's S-S1): a body that doesn't come holds
+    // its `--max-concurrent` place and its bytes only until then.
+    let until = arrived + shared.limits.request_timeout;
+    let body =
+        match tokio::time::timeout_at(until.into(), axum::body::to_bytes(req.into_body(), length))
+            .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => {
+                return ApiError::invalid("the body is longer than its Content-Length")
+                    .into_response();
+            }
+            Err(_) => return ApiError::deadline_exceeded().into_response(),
+        };
     let started = Instant::now();
     let mut op = match decode(&service, &method, &body) {
         Ok(op) => op,
@@ -824,7 +840,19 @@ impl NdjsonLines {
             if self.buf.len() > limit {
                 return Err(too_long());
             }
-            let chunk = std::future::poll_fn(|cx| Pin::new(&mut self.body).poll_next(cx)).await;
+            // Each chunk within `--stream-idle-ms` of the last (audit120's S-S1).
+            let idle = self.shared.limits.stream_idle;
+            let chunk = tokio::time::timeout(
+                idle,
+                std::future::poll_fn(|cx| Pin::new(&mut self.body).poll_next(cx)),
+            )
+            .await
+            .map_err(|_| {
+                ApiError::deadline(format!(
+                    "the client sent nothing for --stream-idle-ms ({} ms)",
+                    idle.as_millis()
+                ))
+            })?;
             match chunk {
                 Some(Ok(chunk)) if chunk.is_empty() => {}
                 Some(Ok(chunk)) => {

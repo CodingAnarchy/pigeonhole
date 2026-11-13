@@ -165,6 +165,9 @@ impl serde::Serialize for AggregateQuery {
         if !self.bloom_bytes.is_empty() {
             len += 1;
         }
+        if self.set_members {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.AggregateQuery", len)?;
         if !self.quantiles.is_empty() {
             struct_ser.serialize_field("quantiles", &self.quantiles)?;
@@ -174,6 +177,9 @@ impl serde::Serialize for AggregateQuery {
         }
         if !self.bloom_bytes.is_empty() {
             struct_ser.serialize_field("bloom_bytes", &self.bloom_bytes.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
+        }
+        if self.set_members {
+            struct_ser.serialize_field("set_members", &self.set_members)?;
         }
         struct_ser.end()
     }
@@ -190,6 +196,8 @@ impl<'de> serde::Deserialize<'de> for AggregateQuery {
             "bloomI64",
             "bloom_bytes",
             "bloomBytes",
+            "set_members",
+            "setMembers",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -197,6 +205,7 @@ impl<'de> serde::Deserialize<'de> for AggregateQuery {
             Quantiles,
             BloomI64,
             BloomBytes,
+            SetMembers,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -221,6 +230,7 @@ impl<'de> serde::Deserialize<'de> for AggregateQuery {
                             "quantiles" => Ok(GeneratedField::Quantiles),
                             "bloomI64" | "bloom_i64" => Ok(GeneratedField::BloomI64),
                             "bloomBytes" | "bloom_bytes" => Ok(GeneratedField::BloomBytes),
+                            "setMembers" | "set_members" => Ok(GeneratedField::SetMembers),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -243,6 +253,7 @@ impl<'de> serde::Deserialize<'de> for AggregateQuery {
                 let mut quantiles__ = None;
                 let mut bloom_i64__ = None;
                 let mut bloom_bytes__ = None;
+                let mut set_members__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Quantiles => {
@@ -272,12 +283,19 @@ impl<'de> serde::Deserialize<'de> for AggregateQuery {
                                     .into_iter().map(|x| x.0).collect())
                             ;
                         }
+                        GeneratedField::SetMembers => {
+                            if set_members__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("setMembers"));
+                            }
+                            set_members__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(AggregateQuery {
                     quantiles: quantiles__.unwrap_or_default(),
                     bloom_i64: bloom_i64__.unwrap_or_default(),
                     bloom_bytes: bloom_bytes__.unwrap_or_default(),
+                    set_members: set_members__.unwrap_or_default(),
                 })
             }
         }

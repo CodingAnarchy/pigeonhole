@@ -75,8 +75,8 @@ pub(crate) struct Caller {
     /// Whose sessions it may use, and whose per-token cap it counts against.
     pub principal: Principal,
     pub scope: Scope,
-    /// `None`: every namespace. Used by the memory calls (ticket 8).
-    #[allow(dead_code)]
+    /// `None`: every namespace. `Some`: a token limited to these memory namespaces, which
+    /// reaches only the memory calls ([`memory_only`](Self::memory_only)).
     pub namespaces: Option<Vec<String>>,
     /// The reply goes back as HTTP/JSON, larger than its protobuf: a read reserves twice its
     /// cap for it (#1567, cli692's D2). Set by the HTTP front-end.
@@ -84,6 +84,14 @@ pub(crate) struct Caller {
 }
 
 impl Caller {
+    /// Whether the caller's token is limited to memory namespaces (`ns=`): it reaches only
+    /// the memory calls, `Memory`'s RPCs and `/mcp`'s memory tools, and every other call
+    /// answers `PermissionDenied` (audit120's F5). Its namespaces bound only the memory
+    /// store, so the rest of the database would otherwise be open to it whole.
+    pub(crate) fn memory_only(&self) -> bool {
+        self.namespaces.is_some()
+    }
+
     /// The caller when no tokens are configured (a loopback server): everything.
     pub(crate) fn anonymous() -> Self {
         Self {

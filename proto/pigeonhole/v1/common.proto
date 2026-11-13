@@ -96,7 +96,8 @@ message Row {
 }
 
 // What an aggregate family's cell reads as (D294, D298). Which field is set follows the
-// family's kind; `quantiles` and `bloom` answer the request's `AggregateQuery`.
+// family's kind, and only an aggregate family's cells have one; `quantiles`, `bloom` and
+// `set_members` answer the request's `AggregateQuery`.
 message AggregateView {
   optional uint64 hll_estimate = 1;
   MeanVar mean_var = 2;
@@ -124,11 +125,16 @@ message BloomReading {
   repeated bool contains = 2;
 }
 
-// Questions for aggregate cells, answered in `AggregateView`.
+// Questions for aggregate cells, answered in `AggregateView`. At most 1,024 quantiles,
+// and at most 1,024 bloom probes (`bloom_i64` and `bloom_bytes` together); more is
+// `InvalidArgument`. Every answer counts against a page's `page_bytes`.
 message AggregateQuery {
   repeated double quantiles = 1;
   repeated sint64 bloom_i64 = 2;
   repeated bytes bloom_bytes = 3;
+  // A set family's members (`AggregateView.set_members`), which are left out unless asked
+  // for: they can be about 32 times the stored value.
+  bool set_members = 4;
 }
 
 // A commit's result.

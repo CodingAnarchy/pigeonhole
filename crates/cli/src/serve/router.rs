@@ -180,6 +180,9 @@ impl Router {
         &self,
         caller: &Caller,
     ) -> Result<&Arc<super::cluster::upload::Uploads>, ApiError> {
+        if caller.memory_only() {
+            return Err(super::service::namespaced_denied("call PartitionUpload"));
+        }
         if !caller.scope.allows(super::auth::Scope::Admin) {
             return Err(ApiError::permission_denied("call PartitionUpload"));
         }

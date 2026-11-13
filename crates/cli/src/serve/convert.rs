@@ -584,6 +584,7 @@ pub(crate) struct Select<'s> {
 
 impl<'s> Select<'s> {
     pub(crate) fn new(s: Option<&'s proto::Selection>) -> Result<Self> {
+        check_aggregate(s.and_then(|s| s.aggregate.as_ref()))?;
         Ok(Self { s, snapshot: None })
     }
 
@@ -719,6 +720,7 @@ pub(crate) fn cell(
     family: &str,
     qualifier: &[u8],
     c: &impl Readable,
+    kind: View,
     q: Option<&proto::AggregateQuery>,
 ) -> proto::Cell {
     let typed = match c.typed() {
@@ -737,49 +739,112 @@ pub(crate) fn cell(
         timestamp: c.timestamp(),
         value: c.value().to_vec().into(),
         typed: typed.map(|k| proto::Value { kind: Some(k) }),
-        aggregate: aggregate(c, q),
+        aggregate: aggregate(c, kind, q),
     }
 }
 
-fn aggregate(c: &impl Readable, q: Option<&proto::AggregateQuery>) -> Option<proto::AggregateView> {
-    let mut v = proto::AggregateView {
-        hll_estimate: c.hll_estimate(),
-        mean_var: c.mean_var().map(|m| proto::MeanVar {
-            count: m.count(),
-            mean: m.mean(),
-            variance: m.variance(),
-        }),
-        histogram_counts: c.histogram_counts().unwrap_or_default(),
-        quantiles: None,
-        bloom: None,
-        set_members: c.set_members().unwrap_or_default(),
-    };
-    if let Some(count) = c.quantiles_count() {
-        let values = q
-            .map(|q| {
-                q.quantiles
-                    .iter()
-                    .map(|&p| c.quantile(p).unwrap_or(f64::NAN))
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.quantiles = Some(proto::QuantileReading { count, values });
+/// How a family's cells read as an `AggregateView` (audit120's S-S8): by the family's
+/// aggregation only, so a plain value that happens to parse as a sketch, filter or set is
+/// returned as its bytes, never expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum View {
+    /// No view: an ordinary family, or an aggregation whose value reads as itself.
+    None,
+    Hll,
+    MeanVar,
+    Histogram,
+    Quantiles,
+    Bloom,
+    Set,
+}
+
+/// The [`View`] of each family of a table a reply meets, looked up once a family.
+pub(crate) struct Kinds<'t> {
+    table: &'t Table,
+    seen: std::cell::RefCell<Vec<(String, View)>>,
+}
+
+impl<'t> Kinds<'t> {
+    pub(crate) fn new(table: &'t Table) -> Self {
+        Self {
+            table,
+            seen: std::cell::RefCell::new(Vec::new()),
+        }
     }
-    if let Some(fill) = c.bloom_fill() {
-        let contains = q
-            .map(|q| {
-                q.bloom_i64
-                    .iter()
-                    .map(|&n| c.bloom_contains(n).unwrap_or(false))
-                    .chain(
-                        q.bloom_bytes
+
+    pub(crate) fn of(&self, family: &str) -> View {
+        if let Some((_, v)) = self.seen.borrow().iter().find(|(f, _)| f == family) {
+            return *v;
+        }
+        use pigeonhole::Aggregation as A;
+        let view = match self.table.family_info(family).and_then(|i| i.aggregation) {
+            Some(A::Hll) => View::Hll,
+            Some(A::MeanVar) => View::MeanVar,
+            Some(A::Histogram(_)) => View::Histogram,
+            Some(A::Quantiles(_)) => View::Quantiles,
+            Some(A::Bloom(_)) => View::Bloom,
+            Some(A::Set) => View::Set,
+            _ => View::None,
+        };
+        self.seen.borrow_mut().push((family.to_owned(), view));
+        view
+    }
+}
+
+fn aggregate(
+    c: &impl Readable,
+    kind: View,
+    q: Option<&proto::AggregateQuery>,
+) -> Option<proto::AggregateView> {
+    let mut v = proto::AggregateView::default();
+    match kind {
+        View::None => return None,
+        View::Hll => v.hll_estimate = c.hll_estimate(),
+        View::MeanVar => {
+            v.mean_var = c.mean_var().map(|m| proto::MeanVar {
+                count: m.count(),
+                mean: m.mean(),
+                variance: m.variance(),
+            });
+        }
+        View::Histogram => v.histogram_counts = c.histogram_counts().unwrap_or_default(),
+        View::Quantiles => {
+            v.quantiles = c.quantiles_count().map(|count| proto::QuantileReading {
+                count,
+                values: q
+                    .map(|q| {
+                        q.quantiles
                             .iter()
-                            .map(|b| c.bloom_contains_bytes(b).unwrap_or(false)),
-                    )
-                    .collect()
-            })
-            .unwrap_or_default();
-        v.bloom = Some(proto::BloomReading { fill, contains });
+                            .map(|&p| c.quantile(p).unwrap_or(f64::NAN))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        View::Bloom => {
+            v.bloom = c.bloom_fill().map(|fill| proto::BloomReading {
+                fill,
+                contains: q
+                    .map(|q| {
+                        q.bloom_i64
+                            .iter()
+                            .map(|&n| c.bloom_contains(n).unwrap_or(false))
+                            .chain(
+                                q.bloom_bytes
+                                    .iter()
+                                    .map(|b| c.bloom_contains_bytes(b).unwrap_or(false)),
+                            )
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        // A set's members only when the request asks: they can be about 32 times the
+        // stored value (audit120's S-S8).
+        View::Set if q.is_some_and(|q| q.set_members) => {
+            v.set_members = c.set_members().unwrap_or_default();
+        }
+        View::Set => {}
     }
     let empty = v.hll_estimate.is_none()
         && v.mean_var.is_none()
@@ -791,11 +856,15 @@ fn aggregate(c: &impl Readable, q: Option<&proto::AggregateQuery>) -> Option<pro
 }
 
 /// A row as the API returns it.
-pub(crate) fn row(r: pigeonhole::RowRef<'_>, q: Option<&proto::AggregateQuery>) -> proto::Row {
+pub(crate) fn row(
+    r: pigeonhole::RowRef<'_>,
+    kinds: &Kinds<'_>,
+    q: Option<&proto::AggregateQuery>,
+) -> proto::Row {
     let mut cells = Vec::with_capacity(r.len());
     for i in 0..r.len() {
         if let Some(e) = r.entry(i) {
-            cells.push(cell(e.family, e.qualifier, &e.cell, q));
+            cells.push(cell(e.family, e.qualifier, &e.cell, kinds.of(e.family), q));
         }
     }
     proto::Row {
@@ -804,9 +873,112 @@ pub(crate) fn row(r: pigeonhole::RowRef<'_>, q: Option<&proto::AggregateQuery>) 
     }
 }
 
-/// D308's size of a cell: its qualifier, its value and 16 bytes.
+/// The most quantiles one request's `AggregateQuery` asks each quantile cell for.
+pub(crate) const MAX_QUANTILE_PROBES: usize = 1024;
+
+/// The most bloom probes (`bloom_i64` and `bloom_bytes` together) one request's
+/// `AggregateQuery` asks each bloom cell.
+pub(crate) const MAX_BLOOM_PROBES: usize = 1024;
+
+/// `InvalidArgument` for an `AggregateQuery` over [`MAX_QUANTILE_PROBES`] or
+/// [`MAX_BLOOM_PROBES`]: every aggregate cell a read returns answers each probe, so the
+/// probes multiply a reply's size by the cells (audit120's F4).
+pub(crate) fn check_aggregate(q: Option<&proto::AggregateQuery>) -> Result<()> {
+    let Some(q) = q else { return Ok(()) };
+    if q.quantiles.len() > MAX_QUANTILE_PROBES {
+        return Err(ApiError::invalid(format!(
+            "an aggregate query asks at most {MAX_QUANTILE_PROBES} quantiles, not {}",
+            q.quantiles.len()
+        )));
+    }
+    let bloom = q.bloom_i64.len() + q.bloom_bytes.len();
+    if bloom > MAX_BLOOM_PROBES {
+        return Err(ApiError::invalid(format!(
+            "an aggregate query has at most {MAX_BLOOM_PROBES} bloom probes, not {bloom}"
+        )));
+    }
+    Ok(())
+}
+
+/// D308's size of a cell: its qualifier, its value and 16 bytes, plus its aggregate view
+/// ([`view_bytes`]), so a page counts what the view adds: the answers to the request's
+/// probes, a histogram's counts, a set's members (audit120's F4, S-S8).
 pub(crate) fn cell_bytes(c: &proto::Cell) -> u64 {
-    (c.qualifier.len() + c.value.len() + 16) as u64
+    (c.qualifier.len() + c.value.len() + 16) as u64 + view_bytes(c)
+}
+
+/// A cell's aggregate view, as its encoded size.
+pub(crate) fn view_bytes(c: &proto::Cell) -> u64 {
+    use prost::Message as _;
+    c.aggregate.as_ref().map_or(0, |a| a.encoded_len() as u64)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test inspection: the bytes [`rows_within`] has converted on this thread, by D308's
+    /// measure with the views.
+    pub(crate) static BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A page's rows converted while they fit `budget` with their aggregate views
+/// ([`view_bytes`]), a whole column at a time, the first column always. `Ok` when every
+/// column fit. Otherwise `Err` with the engine budget of the columns that fit, as soon as a
+/// column doesn't, converting nothing past it: a read again with that budget ends the page
+/// there (audit120's F4, and its S1 on #1812: converting the whole page first built every
+/// view, up to hundreds of MB, before cutting it). D308 counts each row's key once, with
+/// its first column.
+pub(crate) fn rows_within(
+    rows: &[pigeonhole::Row],
+    kinds: &Kinds<'_>,
+    q: Option<&proto::AggregateQuery>,
+    budget: u64,
+) -> std::result::Result<Vec<proto::Row>, u64> {
+    let mut out = Vec::with_capacity(rows.len());
+    let (mut engine, mut total, mut first) = (0u64, 0u64, true);
+    for row in rows {
+        let r = row.view();
+        let mut key = r.key().len() as u64;
+        let mut cells = Vec::with_capacity(r.len());
+        let mut i = 0;
+        while i < r.len() {
+            let Some(head) = r.entry(i) else {
+                i += 1;
+                continue;
+            };
+            let (family, qualifier) = (head.family, head.qualifier);
+            let kind = kinds.of(family);
+            let (mut own, mut views) = (std::mem::take(&mut key), 0);
+            let at = cells.len();
+            while i < r.len() {
+                match r.entry(i) {
+                    Some(e) if e.family == family && e.qualifier == qualifier => {
+                        let c = cell(e.family, e.qualifier, &e.cell, kind, q);
+                        let v = view_bytes(&c);
+                        own += cell_bytes(&c) - v;
+                        views += v;
+                        cells.push(c);
+                        i += 1;
+                    }
+                    Some(_) => break,
+                    None => i += 1,
+                }
+            }
+            #[cfg(test)]
+            BUILT.with(|b| b.set(b.get() + own + views));
+            if !first && total + own + views > budget {
+                cells.truncate(at);
+                return Err(engine);
+            }
+            first = false;
+            engine += own;
+            total += own + views;
+        }
+        out.push(proto::Row {
+            key: r.key().to_vec().into(),
+            cells,
+        });
+    }
+    Ok(out)
 }
 
 // ---- Schema (D313 ticket 6): families in and out ----

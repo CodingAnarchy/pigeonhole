@@ -150,7 +150,9 @@ A code an older client doesn't know follows its `retry_safe` and `retry_from`.
 - **Clients must accept** unknown enum values, unknown fields, and unknown `code`s (falling back to `retry_safe` and `retry_from`).
 - **An existing code's statuses, `retry_safe` and `retry_from` never change in v1.** Clients key retries on them, so changing one is breaking even though no field changes.
 - **A breaking change is `pigeonhole.v2`,** served beside v1 for at least one minor release.
-- **One correction before the first release:** `AggregateView.set_members` changed from `repeated bytes` to `repeated uint32` (#1501), the engine's set members (D298). No release had shipped the old type, so it isn't a v1 break.
+- **Corrections before the first release** (no release had shipped the old forms, so none is a v1 break):
+  - `AggregateView.set_members` changed from `repeated bytes` to `repeated uint32` (#1501), the engine's set members (D298).
+  - A set's members come back only when `AggregateQuery.set_members` asks for them, only an aggregate family's cells have an `AggregateView`, and an `AggregateQuery` asks at most 1,024 quantiles and 1,024 bloom probes (audit120's F4 and S-S8).
 
 ## The listener
 - **One port for both protocols** (owner, Q5): gRPC (HTTP/2, `application/grpc`) and HTTP/JSON (HTTP/1.1 and HTTP/2), routed by content type.

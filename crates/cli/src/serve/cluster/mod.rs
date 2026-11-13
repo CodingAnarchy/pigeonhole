@@ -291,7 +291,9 @@ impl Node {
     /// loopback cluster, `--insecure-no-tls-no-auth`) everyone may do everything, pushing a
     /// map included.
     fn allowed(&self, caller: &Caller, scopes: &[Scope], what: &str) -> Result<(), ApiError> {
-        if !self.tokens.any() || scopes.iter().any(|&s| caller.scope.allows(s)) {
+        if caller.memory_only() {
+            Err(super::service::namespaced_denied(what))
+        } else if !self.tokens.any() || scopes.iter().any(|&s| caller.scope.allows(s)) {
             Ok(())
         } else {
             Err(ApiError::permission_denied(what))
