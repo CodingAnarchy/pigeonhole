@@ -594,6 +594,15 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
     t.stop(2);
     t.restart(0);
     t.restart(1);
+    // c only once b has settled: a restarted node asks its peers for their maps until its
+    // partitions are confirmed, and takes a newer one from any that answers. With c back
+    // before b's p2 was confirmed (by a's version 1), b's next round took version 2 from c,
+    // and "b missed the move too" no longer held (#1821's Linux run).
+    let b = t.ports[1];
+    t.rt.block_on(eventually(
+        "b's p2 to be confirmed by a, which ends b's asking",
+        async || state(b, "p2").await == LocalPartitionState::Serving,
+    ));
     t.restart(2);
     t.rt.block_on(async {
         eventually("c to answer with its map", async || {

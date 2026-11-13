@@ -1089,14 +1089,7 @@ impl RowMutation<'_> {
 
     /// Submits as an async returning commit (D314, D210).
     #[cfg(feature = "async")]
-    pub(crate) fn submit_returning_async(
-        self,
-    ) -> Result<(
-        pigeonhole_engine::PendingReturning,
-        Arc<pigeonhole_engine::TableInfo>,
-        usize,
-        usize,
-    )> {
+    pub(crate) fn submit_returning_async(self) -> Result<SubmittedReturning> {
         let watch = self.table.db.watch();
         let max_value = self.table.db.max_value;
         let info = Arc::clone(&self.table.info);
@@ -1107,7 +1100,13 @@ impl RowMutation<'_> {
         };
         self.builder
             .submit_returning(&self.table.engine(), max_value, self.durability, previous)
-            .map(|(p, largest)| (p, info, largest, max_value))
+            .map(|(pending, largest_value)| SubmittedReturning {
+                pending,
+                info,
+                largest_value,
+                max_value,
+                watch,
+            })
             .map_err(|e| watch.refused(e))
     }
 
@@ -1357,6 +1356,39 @@ impl SubmittedCheck {
         } else {
             None
         })
+    }
+}
+
+/// An async returning commit, submitted ([`RowMutation::commit_returning_async`]).
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub(crate) struct SubmittedReturning {
+    pub(crate) pending: pigeonhole_engine::PendingReturning,
+    info: Arc<pigeonhole_engine::TableInfo>,
+    largest_value: usize,
+    max_value: usize,
+    /// As [`Submitted`]'s: a refusal by the failed engine reads as the other commit forms
+    /// report it (audit P2-C8).
+    watch: crate::db::Watch,
+}
+
+#[cfg(feature = "async")]
+impl SubmittedReturning {
+    /// The public result of the engine's outcome, with the previous values a
+    /// `return_previous` commit asked for.
+    pub(crate) fn outcome(
+        &mut self,
+        r: pigeonhole_engine::Result<(
+            pigeonhole_engine::CommitInfo,
+            Vec<pigeonhole_engine::Returned>,
+        )>,
+    ) -> Result<Returned> {
+        let previous = self.pending.take_previous();
+        let (info, cells) = r.map_err(|e| {
+            self.watch
+                .refused(commit_error(e, self.largest_value, self.max_value))
+        })?;
+        Ok(Returned::new(CommitInfo::from_engine(info), &self.info, cells).with_previous(previous))
     }
 }
 

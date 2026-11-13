@@ -326,6 +326,61 @@ fn a_partition_that_fails_to_open_fails_the_node_and_closes_the_others() {
 }
 
 #[test]
+fn a_partition_stamped_past_the_maps_epoch_is_left_unopened_and_the_node_starts() {
+    // audit120's P2-C4: an in-place restore stamped p3 to epoch 2 here and stopped before
+    // its map was set (the map still says 1). The node starts with p1, leaves p3 unopened
+    // and says so, so the restore's rerun can reach it. A file behind the map's epoch still
+    // fails the node (cli692's M2): that copy was moved past.
+    let dir = test_dir();
+    test_partition(&dir, "p1").close().unwrap();
+    let p3 = test_partition(&dir, "p3");
+    super::super::identity::write(
+        &p3,
+        &super::super::identity::Identity {
+            cluster_id: "c1".into(),
+            partition_id: "p3".into(),
+            epoch: 2,
+        },
+    )
+    .unwrap();
+    p3.close().unwrap();
+    let shares = crate::serve::placement::split(2, 2, 2);
+    let open = |mine: &[(String, u64)], log: &mut Vec<u8>| {
+        super::super::open_partitions(
+            &dir,
+            Some("c1"),
+            mine,
+            super::super::Budget {
+                shares: &shares,
+                reserved: None,
+                memories: None,
+            },
+            |_, _| pigeonhole::Options::default(),
+            log,
+        )
+    };
+    let mut log = Vec::new();
+    let opened = open(&[("p1".to_owned(), 1), ("p3".to_owned(), 1)], &mut log)
+        .unwrap_or_else(|e| panic!("the node failed to start: {e:?}"));
+    let ids: Vec<&str> = opened.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["p1"]);
+    let log = String::from_utf8(log).unwrap();
+    assert!(
+        log.contains("partition p3: its file is stamped at an epoch above the map's 1"),
+        "{log}"
+    );
+    for o in opened {
+        o.db.close().unwrap();
+    }
+    // Behind the map (it says 3): still a failure.
+    let mut log = Vec::new();
+    let Err(e) = open(&[("p1".to_owned(), 1), ("p3".to_owned(), 3)], &mut log) else {
+        panic!("a file behind the map's epoch opened");
+    };
+    assert!(format!("{e:?}").contains("p3"), "{e:?}");
+}
+
+#[test]
 fn a_partitions_share_of_the_budget_keeps_its_feeds_shard_count() {
     // ICR 0132 through 8a's split: a partition whose change feed recorded 3 shards keeps
     // them under a share of 1, rather than being resharded and its feed's history ended.

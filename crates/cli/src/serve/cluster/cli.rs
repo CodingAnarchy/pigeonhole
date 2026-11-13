@@ -397,6 +397,19 @@ pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
     }
 }
 
+/// Whether a relocation keeps P's feed history, and who checked the copy that lets it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) enum CopyCheck {
+    /// Not a copy: P starts a new history on NEW.
+    No,
+    /// `--copy`: the set NEW's stamp installs must be OLD's closed files, file by file, or
+    /// the map doesn't change (the coordinator's call after audit120's F1).
+    Check,
+    /// `phdb cluster move`'s map step: the move compared the set its own stamp installed
+    /// with OLD's closed set, these files.
+    Checked(Vec<proto::PartitionFile>),
+}
+
 /// `phdb cluster relocate P --to NEW` (D317 ticket 6): stamp NEW from the map's epoch `e`
 /// to `e + 1`, then set the map with P on NEW at `e + 1` through the writer, marked as
 /// copied (`SetMapRequest.copies`) with `copy`, so P keeps its feed history. Run again once
@@ -408,6 +421,28 @@ pub(crate) async fn relocate(
     old_unreachable: bool,
     copy: bool,
 ) -> Result<Report, Failure> {
+    let copy = if copy {
+        CopyCheck::Check
+    } else {
+        CopyCheck::No
+    };
+    relocate_as(args, partition, to, old_unreachable, copy).await
+}
+
+/// [`relocate`], with who checks a copy ([`CopyCheck`]).
+pub(super) async fn relocate_as(
+    args: &NodeArgs,
+    partition: &str,
+    to: &str,
+    old_unreachable: bool,
+    copy: CopyCheck,
+) -> Result<Report, Failure> {
+    let checks = copy == CopyCheck::Check;
+    let checked = match &copy {
+        CopyCheck::Checked(files) => Some(files.clone()),
+        _ => None,
+    };
+    let copy = copy != CopyCheck::No;
     if copy && old_unreachable {
         return Err(Failure::usage(
             "--copy needs the old node's closed files, so it can't be unreachable: a move \
@@ -436,6 +471,12 @@ pub(crate) async fn relocate(
         return Err(Failure::usage(&format!("the map has no node {to:?}")));
     };
     let old_url = address(&p.node).unwrap_or_default();
+    let old_address = m
+        .nodes
+        .iter()
+        .find(|n| n.id == p.node)
+        .map(|n| n.address.clone())
+        .unwrap_or_default();
     // The partition on the node serving it now: fenced or closed (cli692's S7). An
     // in-place restore (the same node) needs it closed.
     let probe = async {
@@ -491,6 +532,34 @@ pub(crate) async fn relocate(
             p.node
         )));
     }
+    // `--copy`: OLD's closed set, hashed, to check the copy NEW installs against. An open
+    // partition's files aren't final, so it must be closed.
+    let closed = if checks {
+        // In place, a copy keeps nothing an unfence doesn't: the node holds P's closed files
+        // already, and its stamp would drop the closed record the last check reads
+        // (audit120's question on #1838).
+        if p.node == to {
+            return Err(Failure::usage(&format!(
+                "--copy copies {partition}'s closed files to another node, and node {to:?} \
+                 already holds them: phdb cluster unfence {partition} there serves it again, \
+                 with its history. A relocation in place without --copy (a restore's files \
+                 staged there) starts a new history"
+            )));
+        }
+        if old_state != Some(S::Closed) {
+            return Err(Failure::usage(&format!(
+                "--copy checks the files node {to:?} installs against the ones node {:?} \
+                 closed, and {partition} isn't closed there: close it first (phdb cluster \
+                 close), or use phdb cluster move {partition} --to {to}, which fences, closes, \
+                 copies and checks it",
+                p.node
+            )));
+        }
+        let old = super::moving::At::new(args, &p.node, &old_address).await?;
+        Some(super::moving::closed_files(&old, partition, None).await?)
+    } else {
+        None
+    };
     let (mut new, new_token) = connect(args, &new_url).await?;
     let stamped = new
         .stamp(request(
@@ -507,11 +576,70 @@ pub(crate) async fn relocate(
         .await
         .map_err(|s| Failure::usage(&format!("{new_url}: stamp: {}", s.message())))?
         .into_inner();
+    if let Some(closed) = &closed {
+        // The map changes only for a copy that is OLD's closed set: a staged set from
+        // another close, or a file stamped earlier, would serve without writes OLD
+        // acknowledged since, and keep the history all the same.
+        let unchanged = format!(
+            "The map is unchanged: it still gives {partition} to node {:?} at epoch {}. Use \
+             phdb cluster move {partition} --to {to}, which copies the closed files itself and \
+             checks them",
+            p.node, p.epoch
+        );
+        if stamped.files.is_empty() {
+            return Err(Failure::usage(&format!(
+                "node {to:?} installed no staged copy of {partition} at the stamp, so there is \
+                 nothing to check against node {:?}'s closed files. {unchanged}",
+                p.node
+            )));
+        }
+        super::moving::compare(&stamped.files, closed).map_err(|why| {
+            Failure::usage(&format!(
+                "node {to:?} installed files that aren't the ones node {:?} closed ({why}). \
+                 {unchanged}",
+                p.node
+            ))
+        })?;
+    }
     for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
         q.epoch = p.epoch + 1;
     }
     m.map_version += 1;
+    // Last, just before the map: OLD still holds P closed with exactly the files the copy
+    // was checked against. A reopen rewrites them (FORMAT §10.1, §10.4), so an unfence and
+    // a fence again on OLD since the check, with writes acknowledged between, is caught
+    // here, not served from the copy that lacks them (audit120's P2-C3).
+    if let Some(expected) = closed.as_ref().or(checked.as_ref()) {
+        let unchanged = format!(
+            "The map is unchanged: it still gives {partition} to node {:?} at epoch {}",
+            p.node, p.epoch
+        );
+        let now = {
+            let (mut c, token) = connect(args, &old_url).await?;
+            c.status(request(StatusRequest {}, token.as_deref())?)
+                .await
+                .map_err(|s| Failure::usage(&format!("{old_url}: {}", s.message())))?
+                .into_inner()
+                .partitions
+                .into_iter()
+                .find(|lp| lp.id == partition)
+        };
+        let still = now.as_ref().is_some_and(|lp| {
+            lp.state() == S::Closed && super::moving::compare(&lp.files, expected).is_ok()
+        });
+        if !still {
+            return Err(Failure::usage(&format!(
+                "partition {partition} on node {:?} isn't closed with the files the copy on \
+                 node {to:?} was checked against any more ({}): it was reopened since. \
+                 {unchanged}. Run phdb cluster move {partition} --to {to} again, which copies \
+                 its closed files again",
+                p.node,
+                now.as_ref()
+                    .map_or_else(|| "not listed".to_owned(), state_text)
+            )));
+        }
+    }
     let copies = if copy {
         vec![partition.to_owned()]
     } else {
