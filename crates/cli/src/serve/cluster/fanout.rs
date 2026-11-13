@@ -26,7 +26,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use super::forward;
 use super::position::{Kind, Position};
-use super::route::{PartRange, Routes};
+use super::route::{PartRange, Routes, prefix_end};
 use crate::serve::auth::Caller;
 use crate::serve::config::Limits;
 use crate::serve::errors::ApiError;
@@ -180,7 +180,7 @@ fn skippable(e: &ApiError) -> bool {
 fn span(range: Option<&proto::KeyRange>) -> (Vec<u8>, Option<Vec<u8>>) {
     use proto::key_range::Range;
     match range.and_then(|r| r.range.as_ref()) {
-        Some(Range::Prefix(p)) => (p.to_vec(), successor(p)),
+        Some(Range::Prefix(p)) => (p.to_vec(), prefix_end(p)),
         Some(Range::Bounds(b)) => (
             b.start.as_ref().map(|s| s.key.to_vec()).unwrap_or_default(),
             b.end.as_ref().map(|e| {
@@ -193,18 +193,6 @@ fn span(range: Option<&proto::KeyRange>) -> (Vec<u8>, Option<Vec<u8>>) {
         ),
         None => (Vec::new(), None),
     }
-}
-
-/// The least key above every key with `prefix`; `None` when there's none (all `0xff`).
-fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut k = prefix.to_vec();
-    while let Some(last) = k.pop() {
-        if last < 0xff {
-            k.push(last + 1);
-            return Some(k);
-        }
-    }
-    None
 }
 
 type Read<'a> = Pin<Box<dyn Future<Output = Result<MultiGetResponse, ApiError>> + Send + 'a>>;
@@ -718,7 +706,7 @@ async fn bounded<'a, T, S>(
     .await
 }
 
-/// A scan range's bounds as `Bound`s (a prefix as `[prefix, successor)`), `None` for no
+/// A scan range's bounds as `Bound`s (a prefix as `[prefix, prefix_end)`), `None` for no
 /// bound.
 fn bounds_of(range: Option<&proto::KeyRange>) -> (Option<proto::Bound>, Option<proto::Bound>) {
     use proto::key_range::Range;
@@ -728,7 +716,7 @@ fn bounds_of(range: Option<&proto::KeyRange>) -> (Option<proto::Bound>, Option<p
                 key: p.clone(),
                 inclusive: true,
             }),
-            successor(p).map(|k| proto::Bound {
+            prefix_end(p).map(|k| proto::Bound {
                 key: k.into(),
                 inclusive: false,
             }),
@@ -1555,14 +1543,14 @@ async fn hold_after_part_page(inflight: &Semaphore) {
 
 #[cfg(test)]
 mod tests {
-    use super::{span, successor};
+    use super::{prefix_end, span};
     use crate::serve::proto::{Bound, Bounds, KeyRange, key_range::Range};
 
     #[test]
     fn a_ranges_span_covers_every_row_it_can_hold() {
-        assert_eq!(successor(b"ab"), Some(b"ac".to_vec()));
-        assert_eq!(successor(b"a\xff"), Some(b"b".to_vec()));
-        assert_eq!(successor(b"\xff\xff"), None);
+        assert_eq!(prefix_end(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_end(b"a\xff"), Some(b"b".to_vec()));
+        assert_eq!(prefix_end(b"\xff\xff"), None);
         let prefix = KeyRange {
             range: Some(Range::Prefix(b"m".to_vec().into())),
         };

@@ -188,9 +188,7 @@ impl Node {
         }
         let dir = self.dir.clone();
         let restore = req.restore;
-        let installed = tokio::task::spawn_blocking(move || stamp_files(&dir, &req))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))??;
+        let installed = tokio::task::spawn_blocking(move || stamp_files(&dir, &req)).await??;
         // An operator's fence here was on the copy this node held before (a move away
         // fences it): a set installed now is another copy, at another epoch. It opens
         // fenced, and serves once the map gives it here. A stamp that installs nothing

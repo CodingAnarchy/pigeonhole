@@ -234,7 +234,7 @@ impl Routes {
 
 /// The first key after every key starting with `prefix`; `None` when there's none (an
 /// empty prefix, or one of `0xff` bytes only).
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
         if last < 0xff {
