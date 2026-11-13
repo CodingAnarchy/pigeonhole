@@ -161,12 +161,7 @@ impl RowMutation<'_> {
     pub fn commit_returning_async(self) -> ReturningFuture {
         ReturningFuture {
             state: match self.submit_returning_async() {
-                Ok((pending, table, largest, max)) => ReturningState::Pending {
-                    pending,
-                    table,
-                    largest,
-                    max,
-                },
+                Ok(s) => ReturningState::Pending(s),
                 Err(e) => ReturningState::Ready(Some(Err(e))),
             },
         }
@@ -182,12 +177,9 @@ pub struct ReturningFuture {
 
 #[derive(Debug)]
 enum ReturningState {
-    Pending {
-        pending: pigeonhole_engine::PendingReturning,
-        table: std::sync::Arc<pigeonhole_engine::TableInfo>,
-        largest: usize,
-        max: usize,
-    },
+    /// Submitted (or waiting for room, D210), not resolved.
+    Pending(crate::write::SubmittedReturning),
+    /// Refused before submission; `None` once taken.
     Ready(Option<Result<crate::Returned>>),
 }
 
@@ -196,20 +188,9 @@ impl Future for ReturningFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut self.state {
-            ReturningState::Pending {
-                pending,
-                table,
-                largest,
-                max,
-            } => match Pin::new(&mut *pending).poll(cx) {
+            ReturningState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
                 Poll::Ready(r) => {
-                    let previous = pending.take_previous();
-                    let out = r
-                        .map(|(info, cells)| {
-                            crate::Returned::new(CommitInfo::from_engine(info), table, cells)
-                                .with_previous(previous)
-                        })
-                        .map_err(|e| crate::write::commit_error(e, *largest, *max));
+                    let out = s.outcome(r);
                     self.state = ReturningState::Ready(None);
                     Poll::Ready(out)
                 }
