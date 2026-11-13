@@ -88,7 +88,10 @@ env:
 jobs:
   instructions:
     name: hotrow instructions per cell (callgrind)
-    runs-on: ubuntu-latest
+    # A fixed image, never ubuntu-latest: callgrind counts depend on the image's glibc and
+    # valgrind, and the ceilings were measured on ubuntu-24.04 (backport of #1796; on 26.04
+    # main's get-sst counted +0.7% and commit-one -1.6% on identical code).
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
