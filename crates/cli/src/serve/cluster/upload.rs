@@ -200,12 +200,15 @@ impl Uploads {
                 max_chunk: self.max_chunk as u64,
             });
         }
-        // Complete: a ready file whose header names it.
-        if let Some(h) = self
-            .ready_headers()
-            .into_iter()
-            .find(|h| h.upload_id == upload_id)
-        {
+        // Complete: a ready file whose header names it. The file itself must be there: an
+        // install that stopped after its renames may leave the header alone, and a rerun that
+        // took it for complete would send nothing and stamp nothing (#1848).
+        if let Some(h) = self.ready_headers().into_iter().find(|h| {
+            h.upload_id == upload_id
+                && h.file
+                    .as_ref()
+                    .is_some_and(|f| self.dir.join(ready_name(&h.partition, &f.name)).exists())
+        }) {
             let bytes = h.file.as_ref().map_or(0, |f| f.bytes);
             return Ok(PartitionUploadStatusReply {
                 received: bytes,

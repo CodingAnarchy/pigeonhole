@@ -1404,3 +1404,90 @@ fn grpc_health_reserves_nothing_and_refuses_a_long_message() {
     });
     assert_eq!(service.inflight_available(), l.inflight_bytes);
 }
+
+/// #1848: a page's read again (the columns that fit with their aggregate views) read at a
+/// snapshot of its own, so a write between the two reads that grew the first column left
+/// it over the read's budget: an empty page with a position, which ends a scan's stream.
+/// Both reads now share one snapshot. A write lands between them here (the hold seam).
+#[test]
+fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    let spec = json!({"name": "grow", "if_missing": false, "families": [
+        {"name": "q", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
+        {"name": "r", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
+    ]});
+    let (status, body) = s.rpc("Schema/CreateTable", &spec, None);
+    assert_eq!(status, 200, "{body}");
+    let put = |values: &[f64]| proto::MutateRequest {
+        writes: Some(proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: "grow".into(),
+                row: b"a".to_vec().into(),
+            }),
+            writes: ["q", "r"]
+                .iter()
+                .flat_map(|f| {
+                    values.iter().map(move |v| proto::Write {
+                        op: Some(proto::write::Op::Aggregate(proto::AggregateInput {
+                            family: (*f).into(),
+                            qualifier: b"x".to_vec().into(),
+                            timestamp: None,
+                            input: Some(proto::Value {
+                                kind: Some(proto::value::Kind::F64(*v)),
+                            }),
+                        })),
+                    })
+                })
+                .collect(),
+        }),
+        durability: 0,
+    };
+    s.block_on(c.mutate(put(&[1.0]))).unwrap();
+    // 1,024 quantiles make each column's view 8 KiB: the first fits a 4 KiB page alone (one
+    // column always does), the second doesn't, so the page is read again for the first.
+    let sel = aggregate_query(1024, 0, 0);
+    // Between the reads, the first column's sketch grows well past its old size.
+    let url = s.url.clone();
+    let wide: Vec<f64> = (0..400).map(|i| f64::from(i) * 977.0 + 1.0).collect();
+    super::super::service::BETWEEN_READS.lock().unwrap().push((
+        "grow".into(),
+        Box::new(move || {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let ch = tonic::transport::Endpoint::from_shared(url)
+                        .unwrap()
+                        .connect()
+                        .await
+                        .unwrap();
+                    let mut c = proto::data_client::DataClient::new(ch);
+                    c.mutate(put(&wide)).await.unwrap();
+                });
+            })
+            .join()
+            .unwrap();
+        }),
+    ));
+    let page = s
+        .block_on(c.multi_get(proto::MultiGetRequest {
+            table: "grow".into(),
+            keys: vec![b"a".to_vec().into()],
+            selection: Some(sel),
+            page_bytes: 4096,
+            ..Default::default()
+        }))
+        .unwrap()
+        .into_inner();
+    assert!(
+        super::super::service::BETWEEN_READS
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(t, _)| t != "grow"),
+        "the page was read again, with the write between"
+    );
+    assert_eq!(page.rows.len(), 1, "{page:?}");
+    assert_eq!(page.rows[0].cells.len(), 1, "the first column alone");
+    assert!(!page.next.is_empty(), "the second column is next");
+}

@@ -141,9 +141,10 @@ fn install(
         }
     }
     upload::sync_dir(dir);
-    std::fs::remove_file(marker(dir, partition))
-        .map_err(|e| ApiError::internal(format!("remove the install's marker: {e}")))?;
-    // The set's headers, and the partition's other staged files and headers (N2).
+    // The set's headers, and the partition's other staged files and headers (N2), before
+    // the marker: a stop between the two then leaves the marker, whose finish finds the
+    // files renamed and matching, rather than headers that say an upload is complete with
+    // no file behind them, which a move's rerun would skip for good (#1848).
     if let Ok(entries) = std::fs::read_dir(&incoming) {
         let prefix = format!("{partition}.phdb");
         for e in entries.flatten() {
@@ -154,6 +155,9 @@ fn install(
             }
         }
     }
+    upload::sync_dir(&incoming);
+    std::fs::remove_file(marker(dir, partition))
+        .map_err(|e| ApiError::internal(format!("remove the install's marker: {e}")))?;
     upload::sync_dir(&incoming);
     Ok(header.manifest.clone())
 }
