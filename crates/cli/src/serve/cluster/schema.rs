@@ -50,6 +50,9 @@ pub(crate) struct Outcome {
     /// Hand-made tables a create through the map took over (simp724's nit): the map now owns
     /// them, a later drop included.
     pub adopted: Vec<String>,
+    /// Tables already here that took a family the map added (a create with `if_missing`):
+    /// a cached handle of one lists its families as they were (audit120's P2-C1).
+    pub altered: Vec<String>,
     /// Tables in the file the map doesn't place: made by hand, left alone.
     pub unmapped: Vec<String>,
     pub errors: Vec<String>,
@@ -194,6 +197,15 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
         if !exists && families.is_empty() {
             continue;
         }
+        // An existing table's families before the create, to see whether it added one.
+        let had: BTreeSet<String> = if exists {
+            db.table(name)
+                .and_then(|t| t.open())
+                .map(|t| t.families().into_iter().map(str::to_owned).collect())
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
         let mut b = match db.table(name) {
             Ok(b) => b,
             Err(e) => {
@@ -211,6 +223,9 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
                 continue;
             }
         };
+        if exists && table.families().iter().any(|f| !had.contains(*f)) {
+            o.altered.push((*name).to_owned());
+        }
         for want in &t.families {
             if let Some(info) = table.family_info(&want.name)
                 && !agrees(want, &crate::serve::convert::family_out(&info))
@@ -278,7 +293,12 @@ pub(crate) fn attach(node: &Arc<Node>, shared: &Arc<crate::serve::Shared>) {
             // create or drop of its own runs across a reconcile.
             let _schema = part.schema.blocking_lock();
             let outcome = reconcile(&part.db, partition, map);
-            if !outcome.created.is_empty() || !outcome.dropped.is_empty() {
+            // A family added to a table here changes it as much as a create: the service's
+            // cached handles list the old families (audit120's P2-C1).
+            if !outcome.created.is_empty()
+                || !outcome.dropped.is_empty()
+                || !outcome.altered.is_empty()
+            {
                 service.tables_changed();
             }
             for name in &outcome.adopted {
@@ -771,14 +791,22 @@ mod tests {
             ),
         );
         assert_eq!(
-            (again.created.len(), again.dropped.len()),
-            (0, 0),
+            (
+                again.created.len(),
+                again.dropped.len(),
+                again.altered.len()
+            ),
+            (0, 0, 0),
             "{again:?}"
         );
         assert_eq!(tables(&db), ["manual", "orders"]);
         // A family added through the map.
         let o = reconcile(&db, "p1", &map(4, &[("orders", 2, &["f", "g"], "p1")]));
         assert!(o.errors.is_empty(), "{o:?}");
+        // Reported, so the service forgets its handles of it (audit120's P2-C1); once.
+        assert_eq!(o.altered, ["orders"], "{o:?}");
+        let again = reconcile(&db, "p1", &map(5, &[("orders", 2, &["f", "g"], "p1")]));
+        assert!(again.altered.is_empty(), "{again:?}");
         let t = db.table("orders").unwrap().open().unwrap();
         assert!(t.families().contains(&"g"));
         drop(t);

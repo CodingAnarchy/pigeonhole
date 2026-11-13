@@ -765,6 +765,105 @@ fn a_large_reply_and_a_request_at_the_limit_pass_through_a_forward() {
     });
 }
 
+/// audit120's P2-C1: a family added to a table that already exists (a create with
+/// `if_missing`) changes the table as a create does. The node that read the table before
+/// cached its handle, whose family list is the old one; its reconcile forgets it, so a read
+/// of the new aggregate family comes back with its view.
+#[test]
+fn a_family_added_to_a_cached_table_reads_with_its_aggregate_view() {
+    use super::proto::{
+        Aggregation, AggregationKind, CreateTableRequest, FamilySpec, family_spec,
+        schema_client::SchemaClient,
+    };
+    let t = Three::start(["", "", ""]);
+    let [a, _, _] = t.ports;
+    t.rt.block_on(async {
+        // a serves alice (p1) and caches `users`' handle.
+        put(a, "alice", "1").await;
+        assert_eq!(get_row(a, "alice").await.unwrap(), Some(b"1".to_vec()));
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{a}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        SchemaClient::new(channel)
+            .create_table(CreateTableRequest {
+                name: "users".into(),
+                families: vec![FamilySpec {
+                    name: "q".into(),
+                    kind: Some(family_spec::Kind::Aggregate(Aggregation {
+                        kind: AggregationKind::Quantiles as i32,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                if_missing: true,
+                placement: None,
+            })
+            .await
+            .unwrap();
+        let want = version(a).await;
+        eventually("a's p1 to reconcile to the map with q", async || {
+            client(a)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p1" && lp.reconciled_version == want)
+        })
+        .await;
+        data(a)
+            .await
+            .mutate(super::proto::MutateRequest {
+                writes: Some(super::proto::RowWrites {
+                    row: Some(super::proto::RowKey {
+                        table: "users".into(),
+                        row: b"alice".to_vec().into(),
+                    }),
+                    writes: vec![super::proto::Write {
+                        op: Some(super::proto::write::Op::Aggregate(
+                            super::proto::AggregateInput {
+                                family: "q".into(),
+                                qualifier: b"x".to_vec().into(),
+                                timestamp: None,
+                                input: Some(super::proto::Value {
+                                    kind: Some(super::proto::value::Kind::F64(2.0)),
+                                }),
+                            },
+                        )),
+                    }],
+                }),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        let got = data(a)
+            .await
+            .get(super::proto::GetRequest {
+                table: "users".into(),
+                row: b"alice".to_vec().into(),
+                family: "q".into(),
+                qualifier: b"x".to_vec().into(),
+                aggregate: Some(super::proto::AggregateQuery {
+                    quantiles: vec![0.5],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let view = got
+            .cell
+            .and_then(|c| c.aggregate)
+            .expect("the new family's cell comes back with its view");
+        assert_eq!(view.quantiles.map(|q| q.values.len()), Some(1));
+    });
+}
+
 #[test]
 fn a_cluster_token_alone_pushes_and_an_admin_token_alone_sets() {
     use crate::serve::auth::{Scope, Tokens};
