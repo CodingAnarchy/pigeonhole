@@ -1699,7 +1699,9 @@ impl FeedReader {
             let inside = self.history.holds(session);
             // The token names the latest session read through, by the history's order: a
             // resume on a copy without it must expire (#1810).
-            // Compared only when it differs, once per session crossed, not per record.
+            // Compared only when it differs: once per session crossed, and per record only
+            // for a stream still in the older session while streams straddle a restart (a
+            // scan of the history's few entries).
             if inside && session != self.session && self.history.later(session, self.session) {
                 self.session = session;
             }
