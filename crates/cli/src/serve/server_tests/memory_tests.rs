@@ -977,7 +977,7 @@ fn a_namespace_scoped_token_reaches_nothing_but_the_memory_calls() {
             json!({"table": "t", "family": "v", "k": 1}),
         ),
         ("Vectors/Search", json!({"index": "i", "k": 1})),
-        ("Text/Search", json!({"index": "i", "query": "x"})),
+        ("Text/Search", json!({"index": "i", "k": 1})),
         ("Admin/Info", json!({})),
         ("Admin/Metrics", json!({})),
         ("Admin/Flush", json!({})),

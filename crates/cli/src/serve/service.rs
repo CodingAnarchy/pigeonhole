@@ -1970,7 +1970,6 @@ impl Service {
                 let budget = super::bulk::Budget {
                     pool: &self.bulk_budget,
                     limit: self.limits.bulk_load_bytes as u64,
-                    idle: self.limits.stream_idle,
                 };
                 self.part()?
                     .bulk

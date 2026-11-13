@@ -1275,7 +1275,8 @@ fn a_sets_members_come_back_only_when_asked_and_only_aggregate_families_have_vie
     let page = read(true, 1 << 20);
     let set = cells(&page).into_iter().find(|c| c.family == "s").unwrap();
     assert_eq!(set.aggregate.unwrap().set_members.len(), 65_536);
-    assert!(page.bytes > 256 << 10, "the members count: {}", page.bytes);
+    // About 184 KiB of packed members, against the 8 KiB stored set.
+    assert!(page.bytes > 128 << 10, "the members count: {}", page.bytes);
     let plain = cells(&page).into_iter().find(|c| c.family == "p").unwrap();
     assert!(
         plain.aggregate.is_none(),

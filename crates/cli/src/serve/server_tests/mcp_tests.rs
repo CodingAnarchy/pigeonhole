@@ -814,6 +814,10 @@ fn a_namespace_scoped_token_gets_only_the_memory_tools_on_mcp() {
             ("scan", json!({"table": "t"})),
             ("write", json!({"table": "t", "writes": []})),
             ("create_table", json!({"table": "x", "families": ["f"]})),
+            // #1802's feed_poll returns early from the gate, after the check; a waiting
+            // one waits in `post` first, which checks too.
+            ("feed_poll", json!({"tables": ["t"]})),
+            ("feed_poll", json!({"tables": ["t"], "wait_ms": 200})),
         ] {
             let (e, err) = call(&s, Some(token), &id, tool, args);
             assert!(err, "{token} {tool}: {e}");

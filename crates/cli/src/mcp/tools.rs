@@ -145,6 +145,7 @@ impl Tools {
 
     /// The memory tools alone: a `phdb serve` token limited to namespaces is offered no
     /// data tools, and the service refuses them (audit120's F5).
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn memory_only(mut self) -> Self {
         self.data = false;
         self

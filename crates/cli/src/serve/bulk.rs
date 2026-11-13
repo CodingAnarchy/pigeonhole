@@ -16,9 +16,10 @@
 //!   written ([`need`]). A load whose worst case is over the flag is refused before it
 //!   starts, and a running one reserves its worst case from the node's budget, which a
 //!   cluster node's partitions share. **One load runs at a time per database** (the slot).
-//! - **A client that sends nothing for `--stream-idle-ms`** while the loader waits for it
-//!   ends the load there, the vectors before loaded, so a stalled client can't hold the
-//!   slot for its connection's life.
+//! - **A client that sends nothing for `--stream-idle-ms`** ends the load there, the
+//!   vectors before loaded, so a stalled client can't hold the slot for its connection's
+//!   life. The front-ends bound each chunk's wait (`grpc::Metered`, `http::NdjsonLines`,
+//!   audit120's S-S1), and their error reaches the loader as `Msg::Failed`.
 //! - **The loader runs on a thread of its own** holding the slot, never on the blocking pool
 //!   (B1: a load runs for minutes), placed off the shards' CPUs (B2). The crate's k-means
 //!   runs on that thread, single-threaded.
@@ -328,12 +329,10 @@ fn kib(bytes: u64) -> u32 {
     u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX)
 }
 
-/// The node's `--bulk-load-bytes`, which its loads reserve from, and how long a load waits
-/// for its client (`--stream-idle-ms`).
+/// The node's `--bulk-load-bytes`, which its loads reserve from.
 pub(crate) struct Budget<'a> {
     pub(crate) pool: &'a Arc<Semaphore>,
     pub(crate) limit: u64,
-    pub(crate) idle: Duration,
 }
 
 /// The node's `--bulk-load-bytes` as a semaphore of KiB.
@@ -460,7 +459,6 @@ impl BulkLoads {
             pool: Arc::clone(budget.pool),
             reserved,
         };
-        let idle = budget.idle;
         let (tx, done) = oneshot::channel();
         let loader = Arc::clone(&self.loader);
         let placement = self.placement.clone();
@@ -498,7 +496,6 @@ impl BulkLoads {
                             gauges: &gauges,
                             stopping: &stopping,
                             gate,
-                            idle,
                             sizing,
                         };
                         let r = loader(&index, expected, &mut input);
@@ -572,8 +569,6 @@ struct Input<'g> {
     stopping: &'g Stop,
     /// A cluster partition's write gate: a fence ends the input at the next message.
     gate: Option<Arc<super::gate::WriteGate>>,
-    /// How long the loader waits for its client's next message (`--stream-idle-ms`).
-    idle: Duration,
     /// The load's worst case and its reservation, grown as longer ids come.
     sizing: Sizing,
 }
@@ -657,8 +652,6 @@ enum Next {
     Stopped,
     /// The partition was fenced (D317 ticket 6).
     Fenced,
-    /// The client sent nothing for `--stream-idle-ms`.
-    Idle,
 }
 
 /// How often a load waiting for its next message looks at its partition's fence.
@@ -702,11 +695,6 @@ impl Iterator for Input<'_> {
                      were loaded; resume from the last acknowledged one once it's unfenced or \
                      at its new node",
                 ))),
-                Next::Idle => self.end(Some(ApiError::deadline(format!(
-                    "the load's client sent nothing for {} ms (--stream-idle-ms): the load \
-                     stopped there, and the vectors before were loaded",
-                    self.idle.as_millis()
-                )))),
                 Next::Msg(Msg::End) => self.end(None),
                 Next::Msg(Msg::Failed(e)) => self.end(Some(e)),
                 // The front-end went away without ending the stream: its client is gone.
@@ -719,12 +707,10 @@ impl Iterator for Input<'_> {
 impl Input<'_> {
     /// The next message, or the shutdown flag, whichever comes first: the channel polled on
     /// this thread, which parks until the front-end sends or `stop` wakes it. The waker is
-    /// registered before the flag is read, so a `stop` in between is seen. Past `idle` with
-    /// nothing, the client has stalled.
+    /// registered before the flag is read, so a `stop` in between is seen.
     fn wait(&mut self) -> Next {
         let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
         let mut cx = std::task::Context::from_waker(&waker);
-        let deadline = Instant::now() + self.idle;
         loop {
             *self
                 .stopping
@@ -742,16 +728,10 @@ impl Input<'_> {
                 std::task::Poll::Ready(None) => return Next::Gone,
                 // A spurious unpark only loops. With a gate, the fence is looked at again
                 // every `FENCE_POLL`: nothing wakes a load when its partition is fenced.
-                std::task::Poll::Pending => {
-                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                        return Next::Idle;
-                    };
-                    std::thread::park_timeout(if self.gate.is_some() {
-                        left.min(FENCE_POLL)
-                    } else {
-                        left
-                    });
+                std::task::Poll::Pending if self.gate.is_some() => {
+                    std::thread::park_timeout(FENCE_POLL);
                 }
+                std::task::Poll::Pending => std::thread::park(),
             }
         }
     }

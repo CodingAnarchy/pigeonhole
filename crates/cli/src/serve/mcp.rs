@@ -631,6 +631,7 @@ async fn poll_wait(
         scope: Scope::Read,
         writes: false,
         size: 0,
+        memory: false,
     };
     service.check(&admit, caller).ok()?;
     let _place = service.stream_slot().ok()?;
