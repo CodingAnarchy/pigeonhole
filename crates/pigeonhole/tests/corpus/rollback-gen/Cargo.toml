@@ -1,0 +1,16 @@
+[package]
+name = "rollback-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+# 1.1.3's own code: release/1.1.x at its version commit (#1846). Pinned by revision, so the
+# entries regenerate exactly; the crates.io release is the same code.
+[dependencies]
+# `__unstable-hooks` for `Options::wal_segment_size` (256 KiB segments keep the entries small).
+pigeonhole = { git = "https://github.com/CodingAnarchy/pigeonhole", rev = "e3a737b9e8a75d0ca877a01d6266e67548f0ab8e", features = ["__unstable-hooks"] }
+pigeonhole-format = { git = "https://github.com/CodingAnarchy/pigeonhole", rev = "e3a737b9e8a75d0ca877a01d6266e67548f0ab8e" }
+pigeonhole-io = { git = "https://github.com/CodingAnarchy/pigeonhole", rev = "e3a737b9e8a75d0ca877a01d6266e67548f0ab8e" }
+pigeonhole-pager = { git = "https://github.com/CodingAnarchy/pigeonhole", rev = "e3a737b9e8a75d0ca877a01d6266e67548f0ab8e" }

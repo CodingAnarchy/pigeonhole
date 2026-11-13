@@ -43,6 +43,13 @@ The check copies each entry to a temporary directory, opens it with the real fil
 - **Writing it:** at the release, `scripts/release-corpus.sh <version>` runs `generate_corpus` from the release build with `PIGEONHOLE_CORPUS_RELEASE=<version>`. That writes every entry `tests/corpus.rs` has then, plus `frozen.txt` with each file's length and xxh3-64. The generator refuses a version other than the build's own, and refuses to rewrite a corpus that has a `frozen.txt`.
 - **The check:** `release_corpus_entries_open_read_check_and_write` checks every release corpus. Its files must match `frozen.txt` byte for byte, and each entry must pass the same open, read, write and check as `format4/`, with its `expected-extra.txt` where it has one. Entries are never removed from `tests/corpus.rs`, so every release corpus's entries are the current build's. A build that fails it breaks the promise: fix the build, never the corpus.
 
+## Rollback corpus
+
+`rollback-1.1.3/` holds the 1.1.3 rollback (#1837): a database a 1.2 build left after a crash inside a root commit, then opened, written and closed by 1.1.3. 1.1.3's CHANGELOG and 1.2.0's upgrade note promise that the change feed survives the rollback and the move back.
+- **The entries:** `landed` and `not_landed` (the crash came after the root's superblock landed, or before), each also `_catalog` (the root changed the catalog, so 1.2 also left its Catalog entry). Each holds the database's files and a `feed_tokens` table with a token for `events` taken before its first commit, and the seqnos of the commit before the rollback (`one`) and 1.1.3's (`two`).
+- **Writing it:** `cargo run --release -- <new dir>` in `rollback-gen/`, a cargo project of its own pinned to 1.1.3's commit on `release/1.1.x` by revision. It runs 1.1.3's own code. What a 1.2 crash leaves is written into the sidecar by hand, as 1.2 writes it (FORMAT §10; the Catalog entry is a real one from a 1.2.0 sidecar). The session before the crash is written by 1.1.3: its Session and Root entries are the same bytes 1.2 writes. The generator also writes `frozen.txt`. Written once and frozen.
+- **The check:** `a_rollback_to_1_1_3_and_back_keeps_the_feed` checks the files against `frozen.txt` byte for byte, then reopens each entry without feed options (as `phdb` or a tool does). The open must keep the feed, and the stored token must resume through `one` and `two` with nothing skipped, including across the Catalog entry 1.1.3 itself expires on.
+
 ## Newer files with the published releases
 
 Two separate cargo projects, each its own workspace, check main's files with a published release. `cargo run --release -- <dir>` checks a directory of entries that main wrote with `PIGEONHOLE_CORPUS_OUT`:
