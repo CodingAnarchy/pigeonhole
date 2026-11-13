@@ -16,10 +16,11 @@
 //! 6. **`--drop-source`:** only after a comparison that matched, OLD's files move aside
 //!    (`drop-partition`). Nothing is deleted.
 //!
-//! A rerun after the stamp (the move died between the stamp and the end) finds P stamped on
-//! NEW. The stamp then installs nothing, so there is no set to compare: the move finishes,
-//! says the copy isn't re-verified, and drops nothing. The `drop-partition` command is in
-//! its report.
+//! A rerun never trusts a copy an earlier run left on NEW: it copies OLD's closed set again
+//! (an upload still staged is resumed, one already installed is sent whole), and the stamp
+//! installs it over the earlier copy, which moves aside. OLD may have been unfenced and
+//! written to between the runs, and nothing else ties NEW's stamped file to what OLD closed
+//! this time. So every move that sets the map compared the copy it serves.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -302,48 +303,53 @@ pub(super) async fn run(
                 old.id
             ))
         })?;
-    let mut fenced_here = None;
-    if lp.state() == LocalPartitionState::Serving {
-        old.call(partition, "fence").await?;
-        fenced_here = Some(Instant::now());
+    // Fenced by this move whenever P is open here, already fenced or not: a fence since
+    // the node started isn't persisted, and a restart of OLD mid-move would lift it on a
+    // peer's map, which names OLD until step 4.
+    if lp.state() == LocalPartitionState::Opening {
+        return Err(Failure::usage(&format!(
+            "partition {partition} is still opening on node {:?}: run the move again once \
+             it's open there (phdb cluster status --node {})",
+            old.id, old.args.node
+        )));
     }
+    let mut fenced_here = None;
     let closed_at = Instant::now();
     if lp.state() != LocalPartitionState::Closed {
+        old.call(partition, "fence").await?;
+        if lp.state() == LocalPartitionState::Serving {
+            fenced_here = Some(Instant::now());
+        }
         old.call(partition, "close").await?;
     }
     let files = closed_files(&old, partition, timeout).await?;
     stop_after(args, Step::Closed)?;
 
-    // 2 and 3. Copied and stamped, unless an earlier run stamped it already.
-    let stamped_earlier = new
-        .local(partition)
-        .await?
-        .is_some_and(|lp| lp.epoch == e + 1);
+    // 2 and 3. Copied, stamped and compared, whatever an earlier run left on NEW (the
+    // module docs).
     let mut sent = Vec::new();
-    let verified = if stamped_earlier {
-        false
-    } else {
-        for f in &files {
-            sent.push(copy_file(&old, &new, &m.cluster_id, partition, e, f, &files).await?);
-        }
-        stop_after(args, Step::Copied)?;
-        let installed = stamp(&new, &m.cluster_id, partition, e).await?;
-        if installed.is_empty() {
-            // Stamped meanwhile by another run: nothing of this one's to compare.
-            false
-        } else {
-            compare(&installed, &files).map_err(|why| {
-                Failure::usage(&format!(
-                    "node {to:?} installed files that aren't the ones node {:?} closed \
-                     ({why}). The map still gives {partition} to {:?} at epoch {e}: check \
-                     {to:?}'s files; phdb cluster unfence {partition} on {:?} serves it there \
-                     again",
-                    old.id, old.id, old.id
-                ))
-            })?;
-            true
-        }
-    };
+    for f in &files {
+        sent.push(copy_file(&old, &new, &m.cluster_id, partition, e, f, &files).await?);
+    }
+    stop_after(args, Step::Copied)?;
+    let installed = stamp(&new, &m.cluster_id, partition, e).await?;
+    if installed.is_empty() {
+        // The set this run staged is gone: another run's stamp took it.
+        return Err(Failure::usage(&format!(
+            "node {to:?} installed nothing at the stamp: another move of {partition} is \
+             running. The map still gives {partition} to {:?} at epoch {e}: run the move \
+             again once the other has ended",
+            old.id
+        )));
+    }
+    compare(&installed, &files).map_err(|why| {
+        Failure::usage(&format!(
+            "node {to:?} installed files that aren't the ones node {:?} closed ({why}). The \
+             map still gives {partition} to {:?} at epoch {e}: run the move again to copy \
+             them again, or phdb cluster unfence {partition} on {:?} serves it there again",
+            old.id, old.id, old.id
+        ))
+    })?;
 
     stop_after(args, Step::Stamped)?;
     // 4. The map, marked as copied.
@@ -356,12 +362,12 @@ pub(super) async fn run(
     let serving_at = Instant::now();
     stop_after(args, Step::Serving)?;
 
-    // 6. OLD's files aside, only after a comparison that matched.
+    // 6. OLD's files aside: the comparison matched.
     let drop_command = format!(
         "phdb cluster drop-partition {partition} --node {}",
         old.args.node
     );
-    let dropped = if drop_source && verified {
+    let dropped = if drop_source {
         Some(old.call(partition, "drop").await?)
     } else {
         None
@@ -376,7 +382,7 @@ pub(super) async fn run(
         ("epoch", json!(e + 1)),
         ("files", json!(files.len())),
         ("bytes", json!(bytes)),
-        ("verified", json!(verified)),
+        ("verified", json!(true)),
         (
             // Writes answer `Fenced` from the fence until the map gives NEW the partition.
             "writes_down_ms",
@@ -394,14 +400,9 @@ pub(super) async fn run(
     ];
     summary.push((
         "source",
-        match (&dropped, verified) {
-            (Some(lp), _) => json!(format!("moved aside on node {}: {}", old.id, lp.file)),
-            (None, true) => json!(format!("kept on node {}: {drop_command}", old.id)),
-            (None, false) => json!(format!(
-                "kept on node {}: copied by an earlier run, not re-verified; check node {to}'s \
-                 copy, then {drop_command}",
-                old.id
-            )),
+        match &dropped {
+            Some(lp) => json!(format!("moved aside on node {}: {}", old.id, lp.file)),
+            None => json!(format!("kept on node {}: {drop_command}", old.id)),
         },
     ));
     let mut r = report("cluster move", summary, Value::Null);
@@ -701,7 +702,7 @@ async fn copy_file(
     Ok(sent)
 }
 
-/// Stamps NEW from `e` to `e + 1`: the set it installed, or none if it was stamped already.
+/// Stamps NEW from `e` to `e + 1`: the set it installed, none if it found no set staged.
 async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<PartitionFile>, Failure> {
     let (mut c, _) = connect(&new.args, &new.args.node).await?;
     Ok(c.stamp(request(

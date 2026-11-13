@@ -40,6 +40,8 @@ phdb serve: serving app.phdb on 127.0.0.1:7448 (no TLS, no tokens; 8 network, 2 
 ### Security
 - **TLS:** `--tls-cert` and `--tls-key` take PEM files; every connection is then TLS.
 - **Tokens:** `--token-file`, or the `PHDB_SERVE_TOKENS` environment variable, holds one token per line: `read|write|admin [ns=a,b] <token>`, or `sha256:<hex>` for the token's digest. Requests carry `Authorization: Bearer <token>`. Tokens are never a flag's value.
+  - With both set, the server takes the file's tokens and the variable's.
+  - **Tokens are read once, at start.** To add, change or retire a token, change the file (or the variable) and restart the server. To rotate without refusing anyone, list the old and the new token, restart, move the clients over, then remove the old one and restart again.
 - **The bind rule:** an address other hosts can reach needs both TLS and tokens, or the server refuses to start. `--insecure-no-tls-no-auth` overrides that for a trusted private network. A loopback address needs neither.
 
 A token file:
@@ -164,9 +166,31 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
 ### Backups
 - **Backups** need `--backup-dir`; without it they're off.
   - `Admin.Backup` writes a consistent backup inside it, at a path relative to it that doesn't exist yet and doesn't lead out of it through a link.
-  - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers. Its copy waits in `<backup-dir>/.phdb-serve-downloads` (private to the server) for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). At most two copies are kept.
+  - `Admin.BackupDownload` streams one: over gRPC as chunks ending with the file's SHA-256, over HTTP as the file with its id and SHA-256 in headers (`x-pigeonhole-backup-id`, `x-pigeonhole-backup-sha256`). Its copy waits in `<backup-dir>/.phdb-serve-downloads` (private to the server) for 5 minutes after the last read, so a broken download resumes from an offset (over HTTP, `Range: bytes=<offset>-` and `?backup_id=`). At most two copies are kept.
   - **Allow for the silence before the first byte:** the server backs up and hashes first. A stream that ends without its final chunk (the one with the size and SHA-256) is incomplete: resume it. Check the SHA-256 before relying on the copy.
   - **One at a time:** backups run one at a time by default (`--max-backups`), off the threads reads use.
+  - **Taking one and putting it back:**
+
+    ```sh
+    phdb serve app.phdb --backup-dir /var/backups/phdb     # admin token, if the server has tokens
+
+    # A backup kept on the server: /var/backups/phdb/nightly/app.phdb
+    curl -s localhost:7448/v1/Admin/Backup -H 'Content-Type: application/json' \
+      -d '{"path": "nightly/app.phdb"}'
+    # {"bytes":"524288"}
+
+    # Or a backup streamed to you, with its id and SHA-256 in the headers.
+    curl -s -D headers.txt -o copy.phdb localhost:7448/v1/Admin/BackupDownload \
+      -H 'Content-Type: application/json' -d '{}'
+    # x-pigeonhole-backup-id: 1f2a3fd9...   x-pigeonhole-backup-sha256: a03d5a8f...
+    sha256sum copy.phdb                                    # must equal the header
+
+    # A broken download goes on from the bytes you have (206), within 5 minutes.
+    curl -s -o rest.part 'localhost:7448/v1/Admin/BackupDownload?backup_id=1f2a3fd9...' \
+      -H 'Content-Type: application/json' -H 'Range: bytes=1000-' -d '{}'
+    ```
+
+    A backup is a whole database in one file. **To restore,** stop the server, put the copy where the database was (or anywhere), and start `phdb serve` on it. A copy taken from a replica needs `phdb promote` first ([Replicas](#replicas)). A backup holds the data, not the change feed's history, and it is a database of its own: a feed token from the original answers `InvalidArgument` ("the token is another database's") on the restored file, so start its subscribers again from a snapshot, with `--change-feed` on.
 
 ## Graphs, vectors and text
 - **Graph and vector reads** run on the request's task, holding no blocking thread, and take a `snapshot_id` as the other reads do.
@@ -183,13 +207,13 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
     - **The index must be empty,** so a failed load can't simply be resumed with `BulkLoad`: `Insert` the rest, or drop the index and load again.
     - Each message (each line over HTTP) holds its share of `--inflight-bytes` until the load takes its last vector, and the server reads one message ahead of the load at most. A client that sends faster than the index loads is held back by the transport's flow control, not buffered. A line longer than `--max-request-bytes` is refused.
     - **The load holds a working set of its own, outside `--inflight-bytes` and bounded by `--bulk-load-bytes`** (1 GiB). `expected` sets the lists: `expected` / target list length (1,000 by default), at least 1. The load clusters a sample of its first max(50,000, lists) vectors before it writes any, then keeps up to 255 vectors per list until each list's batch of 256 is written. So it holds at most the larger of:
-      - **the sample:** max(50,000, lists) × (a vector's bytes + its clustering copy, `f32` but for a bit index + its id + about 96 bytes);
-      - **the pending batches:** lists × 255 × (a vector's bytes + its id + about 96 bytes).
+      - **the sample:** max(50,000, lists) × (a vector's bytes + its clustering copy, `f32` but for a bit index + twice its id + about 96 bytes);
+      - **the pending batches:** lists × 255 × (a vector's bytes + twice its id + about 96 bytes).
 
-      A vector's bytes are dimensions × 4 for `f32`, and for a half index too, which takes `f32` vectors; × 1 for `i8`; and dimensions / 8 for bits. Ids are counted at 32 bytes up front.
+      A vector's bytes are dimensions × 4 for `f32`; × 1 for `i8`; and dimensions / 8 for bits. A half index (`f16`, `bf16`) is counted at `f32`'s size, whichever element type the client sends, since it takes `f32` vectors too. Ids are counted at 32 bytes up front.
     - **A load over `--bulk-load-bytes` is refused before it starts,** with `InvalidArgument` naming the bytes it needs. Raise `--bulk-load-bytes` to that, or load in parts: `Insert` the rest after a smaller load. At the default 1 GiB:
-      - **768-dim `f32`:** the sample is about 314 MB, and each list's pending batch about 0.8 MB, so up to about 1,300 lists: about 1.3 million vectors at the default list length.
-      - **1,536-dim `f32`:** the sample is about 621 MB, and each list's pending batch about 1.6 MB, so up to about 670 lists: about 670,000 vectors. A million needs `--bulk-load-bytes` of about 1.6 GB.
+      - **768-dim `f32`:** the sample is about 315 MB, and each list's pending batch about 0.8 MB, so up to about 1,300 lists: about 1.3 million vectors at the default list length.
+      - **1,536-dim `f32`:** the sample is about 622 MB, and each list's pending batch about 1.6 MB, so up to about 670 lists: about 670,000 vectors. A million needs `--bulk-load-bytes` of about 1.6 GB.
     - **A running load reserves its worst case** from the node's `--bulk-load-bytes` until it ends, succeeded or failed; a cluster node's partitions share it. A load whose ids are longer than 32 bytes grows its reservation as they come, and stops there, the vectors before it loaded, if that's over the flag or other loads hold the rest.
     - **One load runs at a time per database;** another waits for it, up to the request timeout or its own deadline. A load whose client sends nothing for `--stream-idle-ms` while the load waits for it ends with `DeadlineExceeded`, the vectors before it loaded, so a stalled client can't hold the slot. `/metrics` shows the running load's phase, the vectors and bytes handed to it, and its reservation.
     - The load runs on a thread of its own (`phdb-serve-bulk-load`), off the shards' cores where the engine pinned them, as the rebalancers do. Its writes still fill memtables quickly, so other writers can meet room and pacing stalls while it runs. The server's shutdown waits for a running load to write what it received.
@@ -210,7 +234,24 @@ The rules a client keys on (D313 B3, [ICR 0112's error table](../design/icr/0112
   - The writes answer their real outcome even if the client goes away.
 
 ## The change feed
-- **The change feed** (`Feed.Subscribe`) streams committed changes of some tables, in commit order, once each (the database needs `Options::change_feed` on for them).
+- **The change feed** (`Feed.Subscribe`) streams committed changes of some tables, in commit order, once each.
+  - **Turn the feed on with `--change-feed BYTES`:** the server then keeps up to that many bytes of history for subscribers (and replicas). Without the flag, a database whose feed is already on keeps it, and one whose feed is off answers `InvalidArgument` (400, "the change feed is off: open with it on to subscribe").
+  - **The request** names `tables` (at least one), and optionally a row `prefix`, `visible` (deliver at visibility rather than durability), and one start: `from_oldest`, `from_snapshot` (a pinned snapshot's id) or `resume` (an earlier event's `token`). With no start, the stream begins at the next commit.
+
+    ```sh
+    phdb serve app.phdb --change-feed 67108864        # keep up to 64 MiB of history
+
+    # Everything the history holds, then new commits as they land (one JSON event per line).
+    curl -sN localhost:7448/v1/Feed/Subscribe -H 'Content-Type: application/json' \
+      -d '{"tables": ["users"], "from_oldest": true}'
+    # {"token":"AcLz...","commit":{"seqno":"1","timestamp":"...","changes":[{"table":"users","family":"profile","kind":"CHANGE_KIND_PUT","row":"dXNlcjox","qualifier":"bmFtZQ==","timestamp":"...","value":{"bytes":"QWRh"}}]}}
+
+    # Later, from any process: go on after the last event you handled.
+    curl -sN localhost:7448/v1/Feed/Subscribe -H 'Content-Type: application/json' \
+      -d '{"tables": ["users"], "resume": "AcLz..."}'
+    ```
+
+    Keep the last handled event's `token` with your own state, and send it as `resume` after a disconnect. `FeedExpired` means the history no longer reaches back to the token: read the tables again (a scan at a pinned snapshot, then `from_snapshot` with its id) and go on from there.
   - **Feed clients should turn on HTTP/2 adaptive flow control** (tonic's `Endpoint::http2_adaptive_window(true)`; grpc-go and grpc-java estimate the bandwidth-delay product unless a fixed window is set). With fixed windows, events queue in flight ahead of each subscriber. At 16 subscribers that was about 18 ms of delivery lag, which adaptive windows took to 0.5 ms p50 (perf287 on #1397). Larger fixed windows made it worse. `--http2-send-buffer` bounds what the server queues per stream.
   - Over gRPC it's a server stream. Over HTTP it's NDJSON, or server-sent events whose `id:` is each event's token, so an SSE client's `Last-Event-ID` resumes it.
   - Every event's `token` resumes right after it, from any server process. A stream that delivers nothing for about 10 s, while its position moved past commits its `prefix` skipped, sends a `progress` event with the new token.
@@ -440,7 +481,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - whole moves (`phdb cluster move`, `relocate --copy`), which keep the partition's change-feed history;
   - backups and restore;
   - several partitions per node.
-- **Still to come:** the index searches across partitions aren't supported on a cluster in this release (#1722, 1.3.0). Each section below says which of its parts are still to come.
+- **Still to come:** the IVF and full-text indexes (building them as well as searching them), agent memory and `/mcp` aren't served by a cluster node in this release (#1722, 1.3.0); [How calls are routed](#how-calls-are-routed) lists every call a node refuses. Each section below says which of its parts are still to come.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -451,7 +492,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
 
 ### Running a cluster
-1. **Stamp each partition's file** before its node starts: `phdb cluster init-partition DIR/P.phdb --cluster-id C --partition P`. `DIR` is the node's cluster directory, and the file must be named `<partition>.phdb`.
+1. **Stamp each partition's file** before its node starts: `phdb cluster init-partition DIR/P.phdb --cluster-id C --partition P`. `DIR` is the node's cluster directory, and the file must be named `<partition>.phdb`. The file is stamped at epoch 1, the epoch a first map gives a partition; `--epoch N` stamps another.
 2. **Tables** are made through the cluster once it runs (see [Schema through the cluster](#schema-through-the-cluster)): `Schema.CreateTable` with a `placement`. You can also place a table in the first map below and create its families through the cluster afterwards. Tables made by hand in a partition's file (`phdb shell DIR/P.phdb -c "create users profile"`), as before schema came to the cluster, still work: the map takes one over when it places a table of that name.
 3. **Write the map** as JSON (`ClusterMap`):
 
@@ -478,7 +519,9 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
    Put the first map in every node's `DIR` as `cluster-map.json` before the nodes start: a node opens the partition its map gives it only at start. `phdb cluster show-map --file MAP.json` checks that it parses.
 4. **Start each node:** `phdb serve --cluster DIR --node-id ID`. One server runs per `DIR`.
    - `--cluster-token-file` is the token a node presents to the others. List it as `cluster <token>` in every node's `--token-file`. The `cluster` scope is only for node-to-node calls.
-   - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`.
+   - To rotate it, list the old and new tokens on every node, then switch each node's `--cluster-token-file`. A node reads its tokens at start, so each of those steps is a restart of each node.
+   - `--cluster-ca PEM` names the CA certificates a node trusts for its peers' TLS, beside the system's roots. A cluster whose certificates come from a private CA needs it on every node, or node-to-node calls fail their handshake.
+   - `--cluster-push-timeout-ms` (2,000) is how long a map change waits for each other node to take the new map. A node that doesn't in time pulls it later.
    - **Every node lists the same tokens** (`--token-file`). A call forwarded to another node runs as your token there, with the scope and namespaces that node lists for it, and sessions and feeds are bound to it.
 5. **Change the map** on a running cluster with `phdb cluster set-map MAP.json --node URL`, a compare-and-set against the current version. Raise `map_version` in the file.
    - **The map's writer** is the node with the smallest id in the map, and it alone changes the map, so two changes can't make two different maps of one version (D317 amendment 1). `set-map` reads the map from `--node` and sends yours to the writer. A `SetMap` sent straight to another node answers `WrongPartition`, naming the writer.
@@ -494,6 +537,12 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
      - No partition's epoch may go back, or stay the same with another node, against the receiving node's map or any node's that `phdb cluster` reaches. Give each moved partition an epoch above every node's. The report lists the nodes it couldn't reach as `unchecked`; read their map files (`phdb cluster show-map --file`) if they may be newer.
      - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
 6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. A row per partition gives its state on its node: `serving`, `fenced (operator)`, `fenced (awaiting peer map)` or `closed`. `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
+7. **Give `phdb cluster` its token.** Every `phdb cluster` command that talks to a node takes these beside `--node`:
+   - `--token-file FILE`: a file holding the bearer token alone. Without the flag, the `PHDB_TOKEN` environment variable. A token is never a flag's value. The same token goes to every node a command talks to (`move`, `backup`, `restore` and `status` reach each node at the map's address), so list it on every node.
+   - `--ca PEM`: CA certificates to trust beside the system's roots, for nodes whose certificates come from a private CA.
+   - **Scopes:** `status` and `show-map` need `read`. Every command that changes something needs `admin`: `set-map`, `fence`, `unfence`, `close`, `drop-partition`, `relocate`, `move`, `backup` and `restore`.
+   - A cluster on addresses other hosts reach requires TLS and tokens ([Security](#security)), so there every command needs a token: `phdb cluster status --node https://10.0.0.1:7448 --token-file admin.token`. The examples in this section leave the two flags out.
+   - `init-partition` and `show-map --file` work on local files and take neither.
 
 **Flags:** a cluster node takes `--shard-spin`, `--no-wal-preallocate`, `--shm-dir`, `--change-feed`, `--backup-dir` and `--max-backups` as a single node does, for each of its partitions. Each partition writes its logs in full when it opens, including a partition the map attaches while the node serves; `--change-feed` is per partition ([Partitions per node](#partitions-per-node) has the disk this takes). `--shards`, `--compaction-threads` and `--engine-memory` are the node's totals, split across its partitions ([Partitions per node](#partitions-per-node)). `--max-uploads` (1) caps the partition files it takes in at once (`Admin.PartitionUpload`), for a restore or a move by file copy. An upload is staged in `DIR/.phdb-incoming` until `phdb cluster relocate` or `phdb cluster restore` installs it. An upload doesn't check for free space first: a full disk fails it, and it resumes once there's room. `--memory`, `--create` and `--replica-of` are refused until the steps that bring them.
 
@@ -504,7 +553,10 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Served by row:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
 - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
-- **Refused with `Unsupported`:** the index searches (`Vectors.Search`, `Text.Search`), which aren't supported on a cluster in this release (for vectors, use `Vectors.Nearest`, which fans out), and, naming the step that brings each, `Info` and `/mcp`.
+- **Refused with `Unsupported`** on a cluster node in this release:
+  - every IVF and full-text index call, not only the searches: `Vectors.CreateIndex`, `Insert`, `Delete`, `BulkLoad`, `Search` and `Verify`, and `Text.CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild` and `Verify` (#1722, 1.3.0). For vectors, `Vectors.Nearest` works and fans out across the partitions;
+  - `Admin.Info`, `Admin.Flush`, `Admin.Compact` and `Admin.Promote`. `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
+  - every `Memory` call (a cluster node refuses `--memory` at start) and `/mcp`.
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
@@ -514,7 +566,16 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 
 ### Schema through the cluster
 Tables and their families live in the cluster map (D317 ticket 5). `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes: `write` to create (`if_missing` included), `admin` to drop, `read` to list and describe. Every node makes its partitions' files follow the map.
-- **A create names its placement:** `placement` gives the table's split keys and partitions (or a placement group), as the map would. Without one, a create on a cluster is refused unless the map already places the table. `if_missing` adds the families a table lacks; an existing family keeps its options, even when the request gives others, as on a single node.
+- **A create names its placement:** `placement` gives the table's split keys and partitions (or a placement group), as the map would. In a request the split keys are bytes, so base64 in JSON, not the map file's `{"text": ...}` form:
+
+  ```sh
+  # orders: rows below "m" (bQ==) in p1, the rest in p2.
+  curl -s localhost:7448/v1/Schema/CreateTable -H 'Content-Type: application/json' -d '{
+    "name": "orders", "families": [{"name": "f"}],
+    "placement": {"splits": ["bQ=="], "partitions": ["p1", "p2"]}}'
+  ```
+
+  Without one, a create on a cluster is refused unless the map already places the table. `if_missing` adds the families a table lacks; an existing family keeps its options, even when the request gives others, as on a single node.
 - **A drop** removes the table from the map, and each partition drops it. Sessions and feeds on the table end as they do on a single node.
 - **The map's writer makes every change.** A create or drop through another node is forwarded to it ([Running a cluster](#running-a-cluster)). Concurrent changes through different nodes all land, one after another. A forwarded create or drop whose answer is lost after it was sent answers `OutcomeUnknown`: a create with `if_missing` is safe to send again, and a drop that went through answers `TableNotFound` the second time.
 - **The window:** the writer sets the map and pushes it, and each node brings each of its partitions' files up to date before it routes by the new map. Until a node has, a call through it can answer `TableNotFound`. Nothing was applied, so retry it. A schema call returns once the writer has set the map and pushed it, not once every node has reconciled: the reply's `unreconciled` lists partitions whose node the push missed, which catch up when their node pulls the map. `phdb cluster status` shows each partition's reconcile (its `reconciled_version`).
@@ -544,7 +605,7 @@ Scans and multi-gets read across the partitions, in key order, and return what o
   - **Snapshots:** a traversal reads each hop at its own time, and each partition at its own snapshot, rather than at one snapshot for the whole traversal.
   - **Latency:** each hop is a round trip to the partitions' nodes, so a deep traversal of a graph spread across nodes costs hops × that round trip. Keep a graph's tables in one partition where you can.
   - **With `allow_partial`:** a `Nearest` result is exact over the partitions reached. A traversal skips an unreachable partition's frontier nodes, so it doesn't follow their edges, and the later hops and the ranking are exact only over what was reached. `missing` names what was skipped.
-- **The index searches** (`Vectors.Search`, `Text.Search`) aren't supported on a cluster in this release (#1722, 1.3.0). For vectors, `Nearest` fans out.
+- **The IVF and full-text indexes** (`Vectors.CreateIndex`, `Vectors.Search`, `Text.Search` and the rest) aren't supported on a cluster in this release (#1722, 1.3.0). For vectors, `Nearest` fans out.
 
 ### Feeds
 `Feed.Subscribe` works the same through any node. The node you call follows every partition that holds the subscription's tables, opening a single-node subscription on each partition's node, and merges them into one stream. With a `prefix`, only the partitions whose key ranges can hold such rows are followed.
@@ -623,16 +684,16 @@ A node writes a partition only while its newest map names it for the partition a
     2. It copies each file to `ID`: the main file, every WAL file a clean close keeps, and the feed's.
     3. It stamps P there at the next epoch, and checks the installed set against the closed one: each file's name, size and SHA-256.
     4. It sets the map (`relocate --copy`), and waits for `ID` to serve P.
-  - **A mismatch** stops the move before the map changes, so the old node still holds P: `unfence` serves it there again.
+  - **A mismatch** stops the move before the map changes, so the old node still holds P: run the move again to copy the files again, or `unfence` P to serve it there again.
   - **Downtime:** writes answer `Fenced` from the fence until the map moves. Reads answer `PartitionUnavailable` from the close until `ID` serves, which is about as long as copying every file, one after another. Both grow with the files' size. With a change feed, that's the WAL files a clean close keeps for the feed's retention, so a long retention means a longer move. The report gives both durations and each file's size.
   - **`--timeout SECS`** (at least 1) bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
     - **The hash:** the map still gives P to the old node, closed there. Run the move again to go on waiting, or `unfence` P there.
     - **Serving:** the map already gives P to `ID`, so check that node.
 
     The copy has no limit, since it takes as long as the files do. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
-  - **Run it again** to resume a move that stopped. A copy picks up from what arrived. A move that's finished answers that the map already gives P to `ID`.
-  - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P.
-    - A rerun after the stamp can't check the copy again, because the stamp installs nothing the second time. It finishes the move, says the copy isn't re-verified, and drops nothing. Its report gives the `drop-partition` command to run once you've checked.
+  - **Run it again** to resume a move that stopped. A move that's finished answers that the map already gives P to `ID`.
+    - A rerun before the map changed copies and checks the files again, whatever an earlier run left on `ID`: a copy still staged there is picked up from what arrived, and one already installed is sent whole and installed over the earlier one, which moves aside (`<file>.replaced-<time>`). So if you unfenced P on the old node between two runs, the second run moves the writes it took since.
+  - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P. A rerun that finds the map already changed drops nothing; its report gives the `drop-partition` command.
   - **The old node must answer.** For a node that's down, promote another with `relocate --old-unreachable`, below. That starts a new feed history.
 
 - **`phdb cluster fence P --node URL`** (admin scope) fences P on the node that serves it.
@@ -640,12 +701,14 @@ A node writes a partition only while its newest map names it for the partition a
   - Reads go on, and so do its flushes and compactions.
   - The command answers once the writes admitted before the fence have finished. Past 30 s it answers `FailedPrecondition`, naming how many still run.
   - The fence is kept in `DIR/fenced.json`, so it outlasts a restart.
+  - A fence is the copy's it was set on: when P's files are later installed on the node again (a move back), the fence is gone, and P serves there once a peer's map confirms it.
 - **A restarted node** opens every partition fenced, and unfences each one once a peer's map, at least as new as its own, still names it for the partition at the file's epoch. A node whose peers don't answer keeps them fenced: `phdb cluster status` shows `fenced (awaiting peer map)`, and `fenced (operator)` for a fence of yours. A one-node cluster unfences on its own map.
 - **`phdb cluster unfence P --node URL`** lifts either fence. It's refused unless the node's map names that node for P at its file's epoch.
   - **A fence since the node started** lifts only once a peer's map, at least as new as the node's own, confirms it, as at start: the command asks the peers first. The node was down, and a move may have passed it by.
   - **`--force`** lifts it without a peer's map. Use it only when no peer can answer and you know P hasn't moved. If a peer's newer map gave P to another node, both would then take writes.
   - **Don't unfence P during a relocation.** Between `relocate`'s check and its map change, the old node's map still names it, so an unfence there resumes its writes.
 - **`phdb cluster close P --node URL`** closes a fenced partition. Its database closes, so its files are final, and its calls answer `PartitionUnavailable`. A call already running on it ends the same way.
+  - A close keeps the partition's fence in `DIR/fenced.json`, whichever fence it was: a closed partition stays fenced across a restart until `unfence`.
   - The partition's feed hubs end, and their clients resume from their tokens.
   - The command answers at once. `phdb cluster status` then lists the files with their SHA-256 once they're hashed.
   - A failed hash shows in the partition's error, and `close` again retries it.
@@ -654,6 +717,7 @@ A node writes a partition only while its newest map names it for the partition a
 - **`phdb cluster relocate P --to ID --node URL`** moves P to node `ID`, whose staging holds its files. (`--node` is the node the command talks to, as in every `phdb cluster` command.)
   - It checks that P is fenced or closed on the node serving it. `--old-unreachable` skips that check, for a node whose process you've stopped.
   - The new node installs the files and takes the next epoch. Then the map gives it P, and it serves at once.
+  - **If you once fenced P on the new node** (it held P before, and P moved away), a relocation that installs staged files there clears that fence, since the files are another copy. One that installs nothing, onto the copy the node kept, leaves it: P opens `fenced (operator)`, safe but taking no writes, until `phdb cluster unfence P` there.
   - An install interrupted by a crash finishes the next time the node is stamped or opens P.
   - Run again once done, `relocate` answers that the map already gives P to that node. Run again after a map change that didn't land, it stamps again (the file is already at the new epoch, so that does nothing) and sets the map.
   - `--old-unreachable` still asks the old node briefly, and refuses if it answers and serves P.

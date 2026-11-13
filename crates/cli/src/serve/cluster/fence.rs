@@ -103,7 +103,7 @@ impl Fences {
         self.served.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn operator(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+    pub(super) fn operator(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
         self.operator.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -250,22 +250,23 @@ impl Node {
         if fenced.remove(id) {
             self.persist_fences(fenced).await?;
         }
-        // The schema an operator's fence held back, before the first write.
+        // The schema an operator's fence held back, before the first write: this partition
+        // reconciles to the node's current map although its gate is still fenced, and the
+        // gate lifts under the install lock, so a schema change can't land between the two
+        // and skip it (audit120's F6 and its first should). The flag last (S4).
         let node = Arc::clone(self);
+        let part = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            if let Ok(map) = node.get_map() {
-                node.reconcile(&map);
-            }
+            let _installing = node.reconcile_current(Some(&part));
+            gate.unfence();
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-        // The flag last (S4).
-        gate.unfence();
         eprintln!("phdb serve: partition {id} unfenced: it takes writes");
         Ok(())
     }
 
-    async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
+    pub(super) async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
         let dir = self.dir.clone();
         let written = fenced.clone();
         tokio::task::spawn_blocking(move || write_fenced(&dir, &written))

@@ -457,7 +457,7 @@ end
   - A feed or watch `next` loses nothing: a commit it had already taken is the next one any call returns, and `token` still points before it.
   - A memory write ends as a stopped `transact` does. `recall` stopped while it runs finishes on its worker, and its result is dropped.
   - A `ConsolidateLoop#run_once` stopped while it waits for new memories loses nothing: the next step reads them. Stopped during its passes, it raises once the pass has ended, as an interrupt does, and the loop is ready for the next step.
-- **One consumer per feed or watch at a time.** A second fiber's `next` while one waits raises `Pigeonhole::Error`, and so does a thread's `next` while a fiber waits on the same feed, or a fiber's while a thread does. `token`, `try_next` and `close` from anywhere stay fine.
+- **One consumer per feed or watch at a time.** A second fiber's `next` while one waits raises `Pigeonhole::Error`, and so does a thread's `next` while a fiber waits on the same feed, or a fiber's while a thread does. `try_next` raises the same way while another fiber or thread waits. `token` and `close` from anywhere stay fine.
 - **Threads and processes:** each thread's fibers share one small bridge (a pipe and its file descriptors). A forked child makes its own and leaves the parent's open.
 
 ## Readers, threads and processes

@@ -195,6 +195,16 @@ impl FiberBridge {
         make: impl FnOnce() -> Fut + Send,
     ) -> Result<FiberOp, Error> {
         let shared = Arc::clone(bridge.0.get(ruby)?);
+        #[cfg(feature = "test-hooks")]
+        if hooks::refused() {
+            // As a pending interrupt refuses it: `make` dropped unrun, on this thread.
+            drop(make);
+            return Err(crate::error::uncoded(
+                ruby,
+                "Error",
+                "a refused start (test hook)",
+            ));
+        }
         let s = Arc::clone(&shared);
         let op = without_gvl(ruby, move || {
             let fut = make();
@@ -292,6 +302,22 @@ pub(crate) mod hooks {
 
     use super::{FiberBridge, FiberOp, Out};
     use crate::convert::lock;
+
+    std::thread_local! {
+        static REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// `Pigeonhole::Native.refuse_next_bridge_start`: the thread's next
+    /// [`FiberBridge::start`] fails before it runs `make`, as one does when an interrupt is
+    /// pending at its start (`without_gvl` raises it, the audit's S-B1), deterministically.
+    pub(crate) fn refuse_next_start() {
+        REFUSE.with(|r| r.set(true));
+    }
+
+    /// Whether this start is the one refused (and the refusal is used up).
+    pub(super) fn refused() -> bool {
+        REFUSE.with(|r| r.replace(false))
+    }
 
     #[derive(Default)]
     struct State {

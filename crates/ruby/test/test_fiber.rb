@@ -277,6 +277,28 @@ module FiberCases
     feed.close
   end
 
+  # The audit's S-B1: an interrupt pending as a fiber's `next` starts its wait is raised by
+  # the bridge's start before the wait exists (the test hook refuses the start the same
+  # way). The stream must not stay marked "waiting": the next call works.
+  def test_a_feed_wait_refused_at_its_start_leaves_the_feed_usable
+    skip "needs the test-hooks build (PIGEONHOLE_TEST_HOOKS=1 rake compile)" unless Pigeonhole::Native.respond_to?(:refuse_next_bridge_start)
+
+    t = fdb.table("t").family("f").create
+    feed = t.feed
+    raised = after = nil
+    on_scheduler do
+      Pigeonhole::Native.refuse_next_bridge_start
+      feed.next(timeout: 5)
+    rescue Pigeonhole::Error => e
+      raised = e
+      t.put("r", "f", "q", "v")
+      after = feed.next(timeout: 5)
+    end
+    assert_match(/refused start/, raised&.message.to_s)
+    assert_equal ["r"], after.changes.map(&:row)
+    feed.close
+  end
+
   # A stopped waiter loses no commit: whichever way the race goes (it took the commit before
   # it was stopped, or the commit waits in the slot), the commit is delivered exactly once.
   # Under the minimal scheduler the order is fixed: the commit's wake is in the pipe before
@@ -519,6 +541,27 @@ module FiberCases
     end
     assert_kind_of Pigeonhole::Error, raised
     assert_operator took, :<, 1.0
+    s.close
+  end
+
+  # The audit's S-B2: a step whose wait is refused at its start (as above) gives the loop
+  # back, rather than leaving it "waiting" for ever.
+  def test_a_loop_step_refused_at_its_start_gives_the_loop_back
+    skip "needs the test-hooks build (PIGEONHOLE_TEST_HOOKS=1 rake compile)" unless Pigeonhole::Native.respond_to?(:refuse_next_bridge_start)
+
+    s = Pigeonhole::Memory::Store.create(fdb, "agents")
+    lp = s.consolidate_loop("main") { |_| [] }
+    lp.run_once(0)
+    raised = nil
+    on_scheduler do
+      Pigeonhole::Native.refuse_next_bridge_start
+      lp.run_once(5)
+    rescue Pigeonhole::Error => e
+      raised = e
+    end
+    assert_match(/refused start/, raised&.message.to_s)
+    lp.run_once(0.1) # the loop is back: no "a fiber's step of this loop is waiting"
+    lp.close
     s.close
   end
 

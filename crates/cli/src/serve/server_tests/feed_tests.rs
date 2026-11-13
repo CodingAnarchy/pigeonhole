@@ -82,6 +82,69 @@ fn a_quiet_feed_moves_its_token_with_a_progress_event() {
 }
 
 #[test]
+fn a_catch_up_stream_reading_only_passed_over_commits_still_sends_progress() {
+    // audit120: a client on its own stream whose commits keep coming, none under its prefix,
+    // took a commit every round and never reached the quiet check: its token stood still
+    // until the stream ran dry. A backlog of such commits, read back to back, shows it.
+    let mut l = limits();
+    l.feed_quiet = Duration::from_millis(1);
+    l.feed_ring_bytes = 2048; // a few entries: the backlog is read from the client's own feed
+    let s = Server::start("", l);
+    let mut first = direct_feed(&s, subscribe(&["t"], b"a"));
+    write_row(&s, b"a0");
+    let token = loop {
+        let e = next_event(&s, &mut first, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        if commit_of(&e).is_some() {
+            break e.token;
+        }
+    };
+    drop(first);
+    let t = s
+        .shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .table("t")
+        .unwrap()
+        .open()
+        .unwrap();
+    for i in 0..3000u32 {
+        t.mutate(format!("b{i}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let mut resumed = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(token)),
+            ..subscribe(&["t"], b"a")
+        },
+    );
+    let mut progress = std::collections::BTreeSet::new();
+    while let Some(e) = next_event(&s, &mut resumed, Duration::from_millis(300)) {
+        let e = e.unwrap();
+        assert!(commit_of(&e).is_none(), "nothing matches: {e:?}");
+        progress.insert(e.token.to_vec());
+    }
+    let stats = &s.shared.router.service.part().unwrap().feeds.stats;
+    assert!(
+        stats.rejoined.load(Ordering::Relaxed) >= 1,
+        "the backlog was read from its own feed"
+    );
+    // Before the fix: one, once the backlog ran dry.
+    assert!(
+        progress.len() >= 2,
+        "progress while the backlog was read: {} tokens",
+        progress.len()
+    );
+}
+
+#[test]
 fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
     // feed1248's (2) on ticket 5: a client that falls off the ring, where the commits around
     // its position are ones its prefix passes over, goes on from its own token and rejoins
@@ -599,4 +662,54 @@ fn a_single_node_refuses_a_cluster_subscriptions_fields() {
         assert_eq!(e.code, "InvalidArgument", "{r:?}: {e:?}");
         assert!(e.message.contains("cluster"), "{e:?}");
     }
+}
+
+#[test]
+fn a_refused_token_expires_even_where_the_ring_covers_its_seqno() {
+    // #1805's Windows run: a resume reads its own stream, and the engine reports a token it
+    // refused (here, a writer session the history doesn't hold) on that stream's first read.
+    // A client looked at the ring first, and a ring covering the token's seqno took it on
+    // without that read: the refusal was never seen and the stream went on. It must end
+    // with `FeedExpired` whatever the ring holds.
+    let s = Server::start("", limits());
+    // A live subscriber keeps the hub's ring around the commits below.
+    let mut live = direct_feed(&s, subscribe(&["t"], b""));
+    write_row(&s, b"r1");
+    let first = loop {
+        let e = next_event(&s, &mut live, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        if commit_of(&e).is_some() {
+            break e.token.to_vec();
+        }
+    };
+    write_row(&s, b"r2");
+    drain(&s, &mut live, Duration::from_millis(300));
+    // The token after r1, its writer session (bytes 29..37 of a D310 token) one the
+    // history doesn't hold.
+    assert!(
+        matches!(first.first(), Some(1 | 2)),
+        "a D310 token: {first:?}"
+    );
+    let mut forged = first.clone();
+    forged[29..37].copy_from_slice(&0x0bad_5e55_1011_u64.to_le_bytes());
+    let mut resumed = direct_feed(
+        &s,
+        proto::SubscribeRequest {
+            start: Some(proto::subscribe_request::Start::Resume(forged.into())),
+            ..subscribe(&["t"], b"")
+        },
+    );
+    let e = loop {
+        match next_event(&s, &mut resumed, Duration::from_secs(5))
+            .expect("the stream ends rather than waits")
+        {
+            Ok(e) => assert!(
+                commit_of(&e).is_none(),
+                "a commit after a refused token: {e:?}"
+            ),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(e.code, "FeedExpired", "{}", e.message);
 }

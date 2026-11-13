@@ -295,14 +295,17 @@ impl<S: Source> Waits<S> {
             (generation, token)
         };
         let (generation, token) = begun;
-        crate::fiber::FiberBridge::start(ruby, bridge, move || {
-            Box::pin(NextWait {
-                state,
-                generation,
-                token,
-                finished: false,
-            })
-        })
+        // Built before the start and moved into `make` (the audit's S-B1): a start refused
+        // before `make` runs (an interrupt pending, which `without_gvl` raises) drops it
+        // unfinished, and its `Drop` clears `waiting`, which would otherwise stay set for
+        // the stream's life.
+        let wait = NextWait {
+            state,
+            generation,
+            token,
+            finished: false,
+        };
+        crate::fiber::FiberBridge::start(ruby, bridge, move || Box::pin(wait))
     }
 }
 

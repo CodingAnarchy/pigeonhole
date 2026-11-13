@@ -302,6 +302,18 @@ pub(crate) struct Replica {
     applied: watch::Sender<u64>,
 }
 
+/// The fault seam: in the tests, a promote of the database at this path fails after the
+/// loop stopped, as a failed `Pigeonhole::promote` would.
+#[cfg(test)]
+pub(crate) static FAIL_PROMOTE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// `Admin.Promote`'s answer before the first bootstrap has finished.
+fn not_bootstrapped() -> ApiError {
+    ApiError::failed_precondition(
+        "the replica hasn't finished its bootstrap: there is nothing to promote",
+    )
+}
+
 /// Why following stopped.
 enum Halt {
     /// `Admin.Promote` or shutdown.
@@ -516,28 +528,53 @@ impl Replica {
         }
         let promoted = self.promote_once(db).await;
         if promoted.is_err() {
-            // The loop is stopped either way: a failed promote leaves a replica that no
-            // longer follows (Info says so), and another Promote may try again.
+            // Another Promote may try again.
             self.promoting.store(false, Ordering::Release);
         }
         promoted
     }
 
     async fn promote_once(&self, db: &Pigeonhole) -> Result<Vec<u8>, ApiError> {
+        // Refused before the loop stops: during the first bootstrap there is nothing to
+        // promote, and a stopped loop would leave the replica bootstrapping until a restart
+        // (audit120). Once a bootstrap has stored a position, every later copy has one too.
+        let check = db.clone();
+        let bootstrapped = tokio::task::spawn_blocking(move || check.replicated_seqno())
+            .await
+            .map_err(|e| ApiError::internal(format!("promote: {e}")))??
+            .is_some();
+        if !bootstrapped {
+            return Err(not_bootstrapped());
+        }
         self.stop().await;
         let db = db.clone();
-        let token = tokio::task::spawn_blocking(move || {
+        let token = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             if db.replicated_seqno()?.is_none() {
                 return Ok(None);
             }
-            db.promote().map(Some)
+            #[cfg(test)]
+            if FAIL_PROMOTE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_deref()
+                == Some(db.path())
+            {
+                return Err(ApiError::internal("the test's fault in the promote"));
+            }
+            Ok(Some(db.promote()?))
         })
         .await
-        .map_err(|e| ApiError::internal(format!("promote: {e}")))??;
-        let Some(token) = token else {
-            return Err(ApiError::failed_precondition(
-                "the replica hasn't finished its bootstrap: there is nothing to promote",
-            ));
+        .map_err(|e| ApiError::internal(format!("promote: {e}")))
+        .flatten()
+        .and_then(|t| t.ok_or_else(not_bootstrapped));
+        let token = match token {
+            Ok(token) => token,
+            Err(e) => {
+                // Past the stop, a failed promote leaves a replica that follows nothing:
+                // Info and the `following` gauge say so (audit120's S1 on #1801).
+                self.fail("stopped", format!("promote failed: {}", e.message));
+                return Err(e);
+            }
         };
         self.promoted.store(true, Ordering::Release);
         // A primary now: every read waiting for a seqno passes (the loop is stopped, so

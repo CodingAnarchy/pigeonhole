@@ -1225,15 +1225,20 @@ fn a_progress_sink_reaches_the_visible_seqno_on_a_caught_up_feed() {
 /// - between the superblock and the Root entry (#1504's own window): the root landed, and
 ///   the open adopts the intent as its Root, so a create is delivered once.
 ///
-/// For a flush's root and a catalog change's alike.
+/// For a flush's root and a catalog change's alike, and reopened either with the feed's
+/// options or with none (`feed_inherit` and an unset shard count, as `phdb` and any tool
+/// open): the intent the crash left last is still the last session's, so the open inherits
+/// the feed rather than turning it off (the 1.2.0 audit's S-E1).
 #[test]
 fn a_process_crash_around_a_root_commit_never_expires_a_durable_feed() {
     use pigeonhole_io::sim::CrashKind;
-    for (i, (landed, create)) in [(false, false), (true, false), (false, true), (true, true)]
+    let cases = [(false, false), (true, false), (false, true), (true, true)];
+    for (i, (inherit, (landed, create))) in [false, true]
         .into_iter()
+        .flat_map(|inherit| cases.into_iter().map(move |c| (inherit, c)))
         .enumerate()
     {
-        let what = format!("superblock landed {landed}, create {create}");
+        let what = format!("superblock landed {landed}, create {create}, inherit {inherit}");
         let vfs = SimVfs::new(3190 + i as u64);
         let db = open(&vfs, Some(feed(1 << 20)));
         let (a, _b) = tables(&db);
@@ -1263,7 +1268,14 @@ fn a_process_crash_around_a_root_commit_never_expires_a_durable_feed() {
         commit.join().unwrap();
         drop(db);
 
-        let db = open(&vfs, Some(feed(1 << 20)));
+        let db = if inherit {
+            let mut o = options(&vfs, None);
+            o.feed_inherit = true;
+            o.shards = 0;
+            Engine::open(Path::new(DB), o).unwrap()
+        } else {
+            open(&vfs, Some(feed(1 << 20)))
+        };
         assert_eq!(
             db.table("c").is_some(),
             create && landed,

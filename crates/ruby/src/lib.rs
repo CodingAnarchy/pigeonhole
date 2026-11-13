@@ -136,6 +136,10 @@ fn fiber_classes(ruby: &Ruby, m: RModule, native: RModule) -> Result<(), Error> 
         c.define_method("op", method!(Gate::op, 1))?;
         c.define_method("open", method!(Gate::open, 0))?;
         c.define_method("counts", method!(Gate::counts, 0))?;
+        native.define_singleton_method(
+            "refuse_next_bridge_start",
+            function!(fiber::hooks::refuse_next_start, 0),
+        )?;
     }
 
     let c = m.const_get::<_, RClass>("Mutation")?;

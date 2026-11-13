@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use super::Node;
 use crate::serve::errors::ApiError;
+use crate::serve::gate::Fence;
 use crate::serve::proto::{LocalPartition, LocalPartitionState, PartitionFile};
 
 /// How long a close waits for the writes a fence admitted to finish.
@@ -131,6 +132,15 @@ impl Node {
                 "partition {id:?} is serving writes: fence it first (phdb cluster fence)"
             )));
         }
+        // Its fence is the operator's from here, and persisted, as `fence`'s is (simp724's S1
+        // on #1800): a fence since the node started is kept nowhere, and a closed partition
+        // reopens at a restart while the map still names this node. A peer's map would then
+        // lift that fence, in the middle of a move that copied the closed files.
+        gate.fence(Fence::Operator);
+        let mut fenced = self.fences.operator().clone();
+        if fenced.insert(id.to_owned()) {
+            self.persist_fences(fenced).await?;
+        }
         gate.drained(DRAIN).await.map_err(|n| {
             ApiError::failed_precondition(format!(
                 "partition {id:?}: {n} writes admitted before its fence still run after {}s; \
@@ -169,6 +179,7 @@ impl Node {
             },
         );
         // Its users end and its database closes, off the async threads.
+        let id_for_feeds = id.to_owned();
         #[cfg(test)]
         let dir = self.dir.clone();
         let closed = tokio::task::spawn_blocking(move || {
@@ -186,6 +197,14 @@ impl Node {
             let Some(part) = service.part_opt() else {
                 return Ok(());
             };
+            // Its cluster feed components end as a partition that went away, which a
+            // subscription with `allow_partial` waits out and opens again where the map
+            // then puts it; not with the engine's `Closed` from the close below, which ends
+            // every subscription (audit120's S-C5).
+            part.feeds
+                .end_parts(ApiError::partition_unavailable(format!(
+                    "partition {id_for_feeds:?} closed on this node"
+                )));
             part.feeds.fail_all();
             part.bulk.stop();
             part.bulk.close();

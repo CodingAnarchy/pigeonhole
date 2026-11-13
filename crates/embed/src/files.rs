@@ -164,6 +164,8 @@ mod download {
     const MAX_REDIRECTS: usize = 5;
     /// The largest file accepted (the weights are 133 MB).
     const MAX_BYTES: u64 = 1 << 30;
+    /// How long a download may go without receiving anything before it fails.
+    const STALL: Duration = Duration::from_secs(60);
 
     /// Whether `host` is Hugging Face's: `huggingface.co`, `hf.co`, or a subdomain of either.
     pub(super) fn trusted(host: &str) -> bool {
@@ -203,7 +205,10 @@ mod download {
             .build();
         Ok(ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_body(Some(Duration::from_secs(60)))
+            // A stall, not a total (the audit's S-B3): ureq's body timeout is for the whole
+            // body, and the weights are 133 MB, so a link under about 18 Mbit/s could never
+            // finish. Each read may wait `STALL`; `MAX_BYTES` bounds the size.
+            .timeout_per_read(Some(STALL))
             // Redirects are followed here, each checked against `trusted`.
             .max_redirects(0)
             .http_status_as_error(false)
@@ -261,6 +266,25 @@ mod download {
             return Ok(body);
         }
         Err(fail(format!("more than {MAX_REDIRECTS} redirects")))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{STALL, agent};
+
+        /// The agent's timeouts, pinned (audit120's note on #1811): a stall of `STALL` on
+        /// each read fails a download, and nothing bounds its total, so a slow link only
+        /// takes longer. ureq's `recv_body` is a total for the whole body (the audit's S-B3).
+        #[test]
+        fn a_download_times_out_on_a_stall_never_on_its_total() {
+            let agent = agent("https://huggingface.co/x").expect("the system's root certificates");
+            let config = agent.config();
+            assert_eq!(config.timeout_per_read(), Some(STALL));
+            let t = config.timeouts();
+            assert_eq!(t.recv_body, None, "no total for the body");
+            assert_eq!(t.global, None, "no total for the call");
+            assert_eq!(t.per_call, None, "no total for the call");
+        }
     }
 }
 
