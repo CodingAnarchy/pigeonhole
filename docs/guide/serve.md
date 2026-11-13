@@ -687,7 +687,7 @@ A node writes a partition only while its newest map names it for the partition a
     1. It fences and closes P on the node serving it, and waits for the close to hash its files.
     2. It copies each file to `ID`: the main file, every WAL file a clean close keeps, and the feed's.
     3. It stamps P there at the next epoch, and checks the installed set against the closed one: each file's name, size and SHA-256.
-    4. It sets the map (`relocate --copy`), and waits for `ID` to serve P.
+    4. It checks once more that P is still closed on the old node with exactly the files it compared, then sets the map (`relocate --copy`), and waits for `ID` to serve P. If P was unfenced and closed again there meanwhile, its files changed: the map stays as it was, and a rerun copies the new files.
   - **A mismatch** stops the move before the map changes, so the old node still holds P: run the move again to copy the files again, or `unfence` P to serve it there again (a peer's map must still give P to that node: see `unfence` below).
   - **Downtime:** writes answer `Fenced` from the fence until the map moves. Reads answer `PartitionUnavailable` from the close until `ID` serves, which is about as long as copying every file, one after another. Both grow with the files' size. With a change feed, that's the WAL files a clean close keeps for the feed's retention, so a long retention means a longer move. The report gives both durations and each file's size.
   - **`--timeout SECS`** (at least 1) bounds each of its two waits: the old node hashing its closed files, and `ID` serving P. A wait that runs out ends the move with exit 1. The error names the step, the node's last `status` line for P, and where that leaves P:
@@ -726,9 +726,10 @@ A node writes a partition only while its newest map names it for the partition a
   - Run again once done, `relocate` answers that the map already gives P to that node. Run again after a map change that didn't land, it stamps again (the file is already at the new epoch, so that does nothing) and sets the map.
   - `--old-unreachable` still asks the old node briefly, and refuses if it answers and serves P.
   - **`--copy`** says the staged files are P's own, copied whole from the node serving it, as `move` copies them. P then keeps its feed history, and tokens from before resume on the new node.
+    - **It's checked:** P must be closed on the old node. The set the new node installs at the stamp must be the old node's closed files, each file's name, size and SHA-256, and just before the map changes the old node must still hold P closed with those files. Otherwise `relocate` refuses and the map stays as it was. That includes a stamp that installs nothing, such as files already stamped by an earlier run, since there's nothing to check. The error names `phdb cluster move`, which copies the closed files itself.
     - Without `--copy`, the move starts a new history (a promotion, a restore), and older tokens answer `FeedExpired`.
     - `--copy` is refused with `--old-unreachable`: a copy is taken from that node's closed files.
-    - Use it only for files copied whole from the partition as it closed. Tokens taken before the move then name changes the new files have.
+    - **`--old-unreachable` can lose acknowledged writes:** nothing compares the new node's files with a node that doesn't answer. Writes the old node acknowledged after your copy was taken aren't in it. Use it only when that node is gone, with the newest copy you have.
 - **`phdb cluster drop-partition P --node URL`** moves P's files on the old node into `DIR/.phdb-dropped/<P>-<epoch>-<time>/`. It's refused while the map still places P on that node, or while P is open there, so close it first.
   - Nothing is deleted, and nothing is freed until you delete that directory, once you've checked the move.
 - **A node opens a partition while it serves** when a map gives it one. Its share of the node's `--shards` and `--compaction-threads` is the share it would get at start for the new set of partitions, and the partitions already open keep theirs.

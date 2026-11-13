@@ -30,7 +30,7 @@ use prost::bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::cli::{NodeArgs, channel, connect, relocate, report, request, url_of};
+use super::cli::{CopyCheck, NodeArgs, channel, connect, relocate_as, report, request, url_of};
 use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{
@@ -353,7 +353,14 @@ pub(super) async fn run(
 
     stop_after(args, Step::Stamped)?;
     // 4. The map, marked as copied.
-    let set = relocate(args, partition, to, false, true).await?;
+    let set = relocate_as(
+        args,
+        partition,
+        to,
+        false,
+        CopyCheck::Checked(files.clone()),
+    )
+    .await?;
     let map_at = Instant::now();
     stop_after(args, Step::Mapped)?;
 
@@ -498,7 +505,7 @@ pub(super) async fn serving(
 }
 
 /// OLD's closed files once their hash is done: a failed hash is retried by closing again.
-async fn closed_files(
+pub(super) async fn closed_files(
     old: &At,
     p: &str,
     timeout: Option<Duration>,
@@ -724,7 +731,7 @@ async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<Partition
 
 /// Whether the set NEW installed is OLD's closed set: the same names, each with the same
 /// size and SHA-256. The difference otherwise.
-fn compare(installed: &[PartitionFile], closed: &[PartitionFile]) -> Result<(), String> {
+pub(super) fn compare(installed: &[PartitionFile], closed: &[PartitionFile]) -> Result<(), String> {
     let key = |f: &PartitionFile| (f.name.clone(), f.bytes, f.sha256.clone());
     let mut a: Vec<_> = installed.iter().map(key).collect();
     let mut b: Vec<_> = closed.iter().map(key).collect();
