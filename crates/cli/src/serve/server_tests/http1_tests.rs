@@ -270,3 +270,40 @@ fn a_body_that_stops_coming_ends_at_the_request_timeout() {
         );
     }
 }
+
+#[test]
+fn grpc_health_answers_while_requests_are_shed() {
+    // audit120's P2-F3: `Admin.Health` over gRPC sat under --max-concurrent, so a probe was
+    // shed (UNAVAILABLE) exactly when the server was busiest. It's apart now, as
+    // `/v1/health` is.
+    let mut l = limits();
+    l.max_concurrent = 1;
+    let s = Server::start("", l);
+    let _held = hold_a_slot(&s);
+    std::thread::sleep(Duration::from_millis(200));
+    let (status, body) = s.post(
+        "Get",
+        &json!({"table": "t", "row": b64(b"r"), "family": "f", "qualifier": b64(b"q")}),
+        None,
+    );
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("Overloaded")),
+        "{body}"
+    );
+    let url = s.url.clone();
+    let health = s
+        .block_on(async move {
+            let channel = tonic::transport::Channel::from_shared(url)
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            proto::admin_client::AdminClient::new(channel)
+                .health(proto::Empty {})
+                .await
+        })
+        .unwrap()
+        .into_inner();
+    assert_eq!(health.status, "ok");
+}

@@ -1341,3 +1341,66 @@ fn a_page_converts_no_more_than_its_budget_and_one_column() {
     assert!(bytes <= budget, "{bytes}");
     assert!(rows.len() >= 5, "{} rows", rows.len());
 }
+
+#[test]
+fn grpc_health_reserves_nothing_and_refuses_a_long_message() {
+    // audit120's P2-F3: `Admin.Health` takes no token, yet `prepay` reserved its declared
+    // length (up to --max-request-bytes) and waited for the body, so header-only calls to it
+    // held the in-flight budget without a token.
+    use tower::ServiceExt as _;
+    /// A body that sends its bytes, then nothing more, never ending.
+    struct Stall(Option<axum::body::Bytes>);
+    impl futures_core::Stream for Stall {
+        type Item = Result<axum::body::Bytes, std::io::Error>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match self.0.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(b))),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+    let mut l = limits();
+    l.request_timeout = Duration::from_millis(400);
+    let s = Server::start("read r3ad\n", l);
+    let service = &s.shared.router.service;
+    let health = |declared: u32| {
+        let mut head = vec![0];
+        head.extend_from_slice(&declared.to_be_bytes());
+        let req = axum::http::Request::post("/pigeonhole.v1.Admin/Health")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(axum::body::Body::from_stream(Stall(Some(head.into()))))
+            .unwrap();
+        http::router(Arc::clone(&s.shared)).oneshot(req)
+    };
+    let status = |resp: axum::response::Response| {
+        resp.headers()
+            .get("grpc-status")
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+    // A declared 1 MiB message: refused from its header (InvalidArgument, 3), at once.
+    let started = std::time::Instant::now();
+    let resp = s.block_on(health(1 << 20)).unwrap();
+    assert_eq!(status(resp).as_deref(), Some("3"));
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        started.elapsed()
+    );
+    // A short one that never comes holds nothing while it waits, then DeadlineExceeded (4).
+    s.block_on(async {
+        let call = tokio::spawn(health(2));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            service.inflight_available(),
+            l.inflight_bytes,
+            "nothing reserved while it waits"
+        );
+        let resp = call.await.unwrap().unwrap();
+        assert_eq!(status(resp).as_deref(), Some("4"));
+    });
+    assert_eq!(service.inflight_available(), l.inflight_bytes);
+}
