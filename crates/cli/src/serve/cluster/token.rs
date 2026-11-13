@@ -497,7 +497,10 @@ mod tests {
                         let raw = if next() % 5 == 0 {
                             (0..40).map(|_| next() as u8).collect()
                         } else {
-                            d310(1, 4, next() % 5000)
+                            // 2 to 30 streams: compacted tokens on both sides of a
+                            // one-byte length, so one part's path takes both branches
+                            // too (simp724's N1 on #1854).
+                            d310(1, 2 + (next() % 29) as u32, next() % 5000)
                         };
                         comps[i].2 = At::Token(Bytes::from(raw));
                         "position"
