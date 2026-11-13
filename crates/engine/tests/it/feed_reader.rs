@@ -845,10 +845,24 @@ fn a_rollback_from_1_2_after_a_crash_in_a_root_commit_keeps_the_feed_and_resolve
             !entries.contains(&FeedEntry::Unknown(5)),
             "{what}: no intent left in front of this open's entry: {entries:?}"
         );
-        let n = entries.len();
-        assert!(
-            matches!(entries[n - 1], FeedEntry::Session { .. }),
+        // This open's Session entry: it inherited the feed. Its own root commits may follow
+        // it already (the open's own, on some platforms), and nothing else may.
+        let n = entries
+            .iter()
+            .rposition(|e| matches!(e, FeedEntry::Session { .. }))
+            .expect("a Session entry");
+        let FeedEntry::Session { session: new, .. } = entries[n] else {
+            unreachable!()
+        };
+        assert_ne!(
+            new, session,
             "{what}: the open inherited the feed: {entries:?}"
+        );
+        assert!(
+            entries[n + 1..]
+                .iter()
+                .all(|e| matches!(e, FeedEntry::Root { session: s, .. } if *s == new)),
+            "{what}: only this open's roots after its entry: {entries:?}"
         );
         let before = if landed && catalog {
             vec![FeedEntry::Unknown(4), FeedEntry::Root { session, sequence }]
@@ -856,7 +870,7 @@ fn a_rollback_from_1_2_after_a_crash_in_a_root_commit_keeps_the_feed_and_resolve
             vec![FeedEntry::Root { session, sequence }]
         };
         assert_eq!(
-            entries[n - 1 - before.len()..n - 1],
+            entries[n - before.len()..n],
             before[..],
             "{what}: {entries:?}"
         );
@@ -913,5 +927,49 @@ fn a_token_taken_before_any_record_names_the_session_and_a_gap_expires_it() {
         matches!(r.try_next().unwrap(), Next::Expired(_)),
         "a gap is never skipped silently, whenever the token was taken"
     );
+    db.close().unwrap();
+}
+
+#[test]
+fn an_oldest_start_from_an_earlier_session_names_it_before_any_record() {
+    // perf2's remainder of audit120's P2-C6: `Oldest` served from an earlier session still
+    // kept whole (#1465) left the token's session at 0 until a record was read, so a token
+    // taken there skipped the history check, as P2-C6's did. It names the session it starts
+    // in, and a feed-off session written in between expires it.
+    let vfs = SimVfs::new(3882);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    db.close().unwrap();
+    // The earlier session, with commits: `Oldest` starts in it later.
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let one = single(&db, &a, b"one", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, one);
+    let earlier = token_session(&r.token());
+    drop(r);
+    single(&db, &b, b"two", Durability::GroupSync);
+    db.close().unwrap();
+
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let token = r.token();
+    assert_eq!(
+        token_session(&token),
+        earlier,
+        "a token from an earlier-session start names that session before any record"
+    );
+    drop(r);
+    db.close().unwrap();
+    // A session with the feed off writes in between.
+    let db = open(&vfs, None);
+    single(&db, &a, b"unfed", Durability::GroupSync);
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "a gap is never skipped silently, whenever the token was taken"
+    );
+    drop(r);
     db.close().unwrap();
 }
