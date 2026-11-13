@@ -1,0 +1,3 @@
+### Fixed
+- **A change feed token taken before the feed delivered anything could resume past a gap** (audit P2-C6). The token named no writer session, so the resume skipped the check that the database's history still holds it. Resumed after a session that wrote with the change feed off, it went on without `FeedExpired`, and that session's commits were never delivered. A token now names its session from the moment the feed opens.
+- **A token whose only step into a new writer session was a catalog change kept naming the older session** (audit P2-C5): the same failure as #1810 on a copy of the database without the newer session, for a feed of every table. Delivering a catalog change, or passing over one, now moves the token's session as a commit does.
