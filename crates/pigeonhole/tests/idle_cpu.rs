@@ -318,7 +318,12 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
         cpu.as_secs_f64() < wall.as_secs_f64() * 0.01,
         "{cpu:?} of CPU in {wall:?} of backoff (issue #92)"
     );
-    // The retry fires on time: twice the previous wait after the third failure.
+    // The retry fires on time: the backoff doubled, from 2 s before the third failure to 4 s
+    // after it. Each gap is checked against its nominal wait, not against the other: a
+    // timer that woke late on the earlier gap (2.31 s on a loaded macOS runner, #1806) made
+    // a measured ratio fail on scheduling delay. A timer never fires early, and the bound
+    // above it keeps a wait that grew faster than doubling (8 s) failing, as a 2 s retry
+    // fails the 4 s floor.
     let deadline = Instant::now() + Duration::from_secs(30);
     while attempts(&failed.lock().unwrap()).len() < 4 {
         assert!(Instant::now() < deadline, "the backoff never retried");
@@ -326,10 +331,11 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
     }
     let gap = attempts(&failed.lock().unwrap())[3].duration_since(third);
     let previous = third.duration_since(second);
-    let ratio = gap.as_secs_f64() / previous.as_secs_f64();
     assert!(
-        gap >= Duration::from_secs(4) && (1.8..2.2).contains(&ratio),
-        "retried {gap:?} after the third failure, after {previous:?} before it"
+        previous >= Duration::from_secs(2)
+            && (Duration::from_secs(4)..Duration::from_secs(6)).contains(&gap),
+        "retried {gap:?} after the third failure (4 s nominal), after {previous:?} before it \
+         (2 s nominal)"
     );
     fail.store(false, Ordering::Release);
     drop((t, fifo));
