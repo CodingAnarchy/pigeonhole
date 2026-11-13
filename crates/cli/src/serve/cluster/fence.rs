@@ -214,31 +214,46 @@ impl Node {
     }
 
     /// `Cluster.Unfence`: P takes writes again. Refused unless this node's map names it for
-    /// P at its file's epoch: a write would break rule 1 or 2 anyway. P first takes the
-    /// map's schema it skipped while fenced.
+    /// P at its file's epoch (a write would break rule 1 or 2 anyway), and unless a peer's
+    /// map, at least as new, says the same (or `force`): this node's map alone may be
+    /// behind. P first takes the map's schema it skipped while fenced.
     pub(crate) async fn unfence(self: &Arc<Self>, id: &str, force: bool) -> Result<(), ApiError> {
         let _one = self.fences.changing.lock().await;
-        // A closed partition reopens first, still fenced (D317 amendment 2).
-        if self.fences.closed().contains_key(id) {
-            self.open_part(id).await?;
-        }
-        let (gate, epoch) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
+        // The checks first, at the epoch of the open partition or of the closed one's file:
+        // a refused unfence leaves a closed partition closed, its hashes kept (simp724's N1
+        // on #1826).
+        let closed = self.fences.closed().get(id).map(|c| c.epoch);
+        let (epoch, start_fenced) = match closed {
+            Some(epoch) => (epoch, false),
+            None => {
+                let (gate, epoch) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
+                (epoch, gate.fenced() == Some(Fence::Start))
+            }
+        };
         let map = self.get_map()?;
-        // A start fence stands because this node's own map may be stale: it was down, and a
-        // move may have passed it by. So a peer's map must confirm it first, as at start,
-        // unless the operator forces it (cli692's S1 on #1755).
-        if gate.fenced() == Some(Fence::Start)
-            && !force
-            && !self.peer_confirms(&map, id, epoch).await
-        {
+        // This node's own map may be stale, whichever fence it is: it was down or missed a
+        // push, and a move may have passed it by. So its peers' newest map must confirm the
+        // partition first, as at start, unless the operator forces it (cli692's S1 on
+        // #1755). An operator's fence needs that as much as a start fence does (audit120's
+        // P2-F1): a move fences its old node as the operator, and that node is the one whose
+        // map is behind when it misses the move's map.
+        if !force && !self.peer_confirms(&map, id, epoch).await {
+            let since = if start_fenced {
+                "fenced since this node started"
+            } else {
+                "fenced"
+            };
             return Err(ApiError::failed_precondition(format!(
-                "partition {id:?} is fenced since this node started, and no peer's map (at \
-                 least as new as this node's) confirms it's still this node's at epoch \
-                 {epoch}: a peer that holds a newer map may have moved it, and unfencing would \
-                 give it two writers. Wait for a peer to answer, or pass --force only if no \
-                 peer can and you know the partition hasn't moved"
+                "partition {id:?} is {since}, and no peer's map confirms it's still this \
+                 node's at epoch {epoch}: the newest map among the peers that answer must be \
+                 at least as new as this node's and name it. A peer that holds a newer map \
+                 may have moved the partition, and unfencing would give it two writers. \
+                 Wait for a peer to answer, or pass --force only if no peer can and you \
+                 know the partition hasn't moved"
             )));
         }
+        // The node's map as it is now: the peers' newest was taken if it was newer.
+        let map = self.get_map()?;
         if !names(&map, &self.id, id, epoch) {
             return Err(ApiError::failed_precondition(format!(
                 "the cluster map (version {}) doesn't name this node for partition {id:?} at \
@@ -246,6 +261,11 @@ impl Node {
                 map.map_version
             )));
         }
+        // A closed partition reopens, still fenced (D317 amendment 2).
+        if closed.is_some() {
+            self.open_part(id).await?;
+        }
+        let (gate, _) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
         let mut fenced = self.fences.operator().clone();
         if fenced.remove(id) {
             self.persist_fences(fenced).await?;
@@ -300,28 +320,45 @@ impl Node {
         }
     }
 
-    /// Whether a map confirms partition `id` at `epoch` is still this node's: its own, in a
-    /// cluster of one, or a peer's at least as new as `map`, asked now (a newer one is taken).
+    /// Whether partition `id` at `epoch` is still this node's by its peers' word: its own
+    /// map, in a cluster of one; else the NEWEST map among the peers that answer, which
+    /// must be at least as new as `map` and name this node. Every peer is asked, at once:
+    /// the first one to agree isn't enough, since a peer that missed the same move holds the
+    /// same stale map (simp724's S1 on #1826). The newest map is taken here if it's newer.
+    /// A peer that doesn't answer can't be counted: with the one peer that knows of a move
+    /// down, the others still confirm (a quorum is for 1.3.0, ICR 0117).
     async fn peer_confirms(self: &Arc<Self>, map: &ClusterMap, id: &str, epoch: u64) -> bool {
         if map.nodes.iter().all(|n| n.id == self.id) {
             return names(map, &self.id, id, epoch);
         }
+        let mut asks = tokio::task::JoinSet::new();
         for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let fetched =
-                tokio::time::timeout(self.peers.push_timeout, self.fetch_map(&n.address)).await;
-            let Ok(Ok(theirs)) = fetched else {
-                continue;
-            };
-            if theirs.map_version > self.state().version() {
-                let _ = self
-                    .push_map_async(theirs.clone(), Some(n.id.clone()))
-                    .await;
-            }
-            if theirs.map_version >= map.map_version && names(&theirs, &self.id, id, epoch) {
-                return true;
+            let (node, peer, address) = (Arc::clone(self), n.id.clone(), n.address.clone());
+            asks.spawn(async move {
+                tokio::time::timeout(node.peers.push_timeout, node.fetch_map(&address))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|theirs| (peer, theirs))
+            });
+        }
+        let mut newest: Option<(String, ClusterMap)> = None;
+        while let Some(answer) = asks.join_next().await {
+            if let Ok(Some((peer, theirs))) = answer
+                && newest
+                    .as_ref()
+                    .is_none_or(|(_, n)| theirs.map_version > n.map_version)
+            {
+                newest = Some((peer, theirs));
             }
         }
-        false
+        let Some((peer, theirs)) = newest else {
+            return false;
+        };
+        if theirs.map_version > self.state().version() {
+            let _ = self.push_map_async(theirs.clone(), Some(peer)).await;
+        }
+        theirs.map_version >= map.map_version && names(&theirs, &self.id, id, epoch)
     }
 
     /// At start, after [`Node::sync_on_start`]'s round: while a partition is still fenced
