@@ -267,6 +267,25 @@ mod download {
         }
         Err(fail(format!("more than {MAX_REDIRECTS} redirects")))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{STALL, agent};
+
+        /// The agent's timeouts, pinned (audit120's note on #1811): a stall of `STALL` on
+        /// each read fails a download, and nothing bounds its total, so a slow link only
+        /// takes longer. ureq's `recv_body` is a total for the whole body (the audit's S-B3).
+        #[test]
+        fn a_download_times_out_on_a_stall_never_on_its_total() {
+            let agent = agent("https://huggingface.co/x").expect("the system's root certificates");
+            let config = agent.config();
+            assert_eq!(config.timeout_per_read(), Some(STALL));
+            let t = config.timeouts();
+            assert_eq!(t.recv_body, None, "no total for the body");
+            assert_eq!(t.global, None, "no total for the call");
+            assert_eq!(t.per_call, None, "no total for the call");
+        }
+    }
 }
 
 #[cfg(test)]
