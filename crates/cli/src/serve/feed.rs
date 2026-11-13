@@ -1130,9 +1130,10 @@ impl Feeds {
             let run = client.run(begin);
             let outcome = match ended {
                 None => run.await,
+                // The end first: a close sends it just before the database closes, and the
+                // run, woken by both, would otherwise end with the engine's `Closed`.
                 Some(mut ended) => tokio::select! {
                     biased;
-                    r = run => r,
                     why = async {
                         // The partition's feeds dropped: nothing ends it this way any more.
                         if ended.changed().await.is_err() {
@@ -1142,6 +1143,7 @@ impl Feeds {
                     } => Err(why.unwrap_or_else(|| {
                         ApiError::internal("the partition's feeds ended this stream")
                     })),
+                    r = run => r,
                 },
             };
             let outcome = match outcome {

@@ -1038,12 +1038,25 @@ impl Ctx {
             return self.open(open).await;
         }
         // The partition moved (its old node answered `WrongPartition`): its new node may
-        // still be opening it, so `PartitionUnavailable` is tried again, for up to the
-        // request timeout, before it counts (audit120's S-C5).
-        let until = tokio::time::Instant::now() + self.service.request_timeout();
+        // still be opening it, so `PartitionUnavailable` is tried again before it counts,
+        // every try within what's left of one request timeout (audit120's S-C5). A client
+        // that goes away needs no check here: dropping its merge drops `opens`, which
+        // aborts this task (simp724's N2 on #1805).
+        let within = self.service.request_timeout();
+        let until = tokio::time::Instant::now() + within;
         let mut pause = Duration::from_millis(50);
         loop {
-            match Arc::clone(&self).open(open.clone()).await {
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            let tried = tokio::time::timeout(left, Arc::clone(&self).open_now(open.clone()))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ApiError::partition_unavailable(format!(
+                        "partition {:?} moved, and its new node didn't serve it within {} ms",
+                        open.partition,
+                        within.as_millis()
+                    )))
+                });
+            match tried {
                 Err(e)
                     if e.code == "PartitionUnavailable"
                         && tokio::time::Instant::now() + pause < until =>

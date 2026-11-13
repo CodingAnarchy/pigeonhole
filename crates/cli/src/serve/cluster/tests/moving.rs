@@ -350,64 +350,90 @@ fn a_close_by_hand_persists_the_fence_of_a_partition_fenced_since_its_node_start
 /// audit120's S-C5: a relocation that leaves the partition open on its old node (fenced,
 /// not closed) must not leave a live subscription following that copy. The old node's
 /// component ends with `WrongPartition` once it takes the map, and the subscription opens
-/// the partition where the map puts it, from its position. Here c's copy predates a's
-/// reopen (a session c's copy doesn't have), so that position may be past c's history:
-/// the stream then ends with `FeedExpired`, as the guide says. Before the fix it did
-/// neither: it went on with progress events from the old copy, which takes no more writes.
+/// the partition where the map puts it, from its position, waiting for the new node to
+/// finish opening it (held here) rather than ending with `PartitionUnavailable`. Before
+/// the fix the subscriptions went on with progress events from the old copy, which takes
+/// no more writes.
+///
+/// c's copy is of a's files as the move closed them; a then opened p1 again, a session the
+/// copy doesn't hold, and took a write in it (the stale copy `relocate --copy` trusts). So a
+/// subscription whose position is still before that session carries on at c, and one whose
+/// position is in it ends with `FeedExpired`.
 #[test]
 fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
     use crate::serve::proto::feed_client::FeedClient;
-    use crate::serve::proto::{PartitionRequest, SubscribeRequest, feed_event::Event};
+    use crate::serve::proto::{FeedEvent, PartitionRequest, SubscribeRequest, feed_event::Event};
     let t = Cluster::start();
     let [a, b, c] = t.ports;
     let p1 = || PartitionRequest {
         partition: "p1".into(),
         ..Default::default()
     };
+    let subscribe = async |allow_partial: bool, prefix: &[u8]| {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        FeedClient::new(channel)
+            .subscribe(SubscribeRequest {
+                tables: vec!["users".into()],
+                allow_partial,
+                prefix: prefix.to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    // The commit of `row`, or the error that ended the stream.
+    let commit_of = async |s: &mut tonic::Streaming<FeedEvent>, row: &str| loop {
+        let e = match s.message().await {
+            Ok(e) => e.expect("the stream ended without an error"),
+            Err(e) => return Err(e),
+        };
+        if let Some(Event::Commit(c)) = &e.event
+            && c.changes.iter().any(|ch| ch.row.as_ref() == row.as_bytes())
+        {
+            return Ok(());
+        }
+    };
+    let ten = Duration::from_secs(10);
     t.rt.block_on(async {
+        // Before the move: a subscription that sees a commit of p1's on a. With
+        // `allow_partial`, the move's close of p1 on a leaves it waiting, not ended. Rows
+        // under "a" only, so a's later write in its new session isn't delivered to it, and
+        // its position stays before that session (a progress event would move it, after the
+        // 10 s quiet interval, longer than this test).
+        let mut before = subscribe(true, b"a").await;
+        put(b, "amy", "1").await;
+        tokio::time::timeout(ten, commit_of(&mut before, "amy"))
+            .await
+            .expect("amy's commit arrives")
+            .unwrap();
+
         // c holds a checked copy of p1 at the next epoch: a move that stopped after its
-        // stamp. Then p1 serves on a again.
+        // stamp. Then p1 opens on a again (a new session), takes a write, and is fenced
+        // there, open.
         STOP.lock()
             .unwrap()
             .push((t.args.node.clone(), Step::Stamped));
         let stopped = within(super::super::moving::run(&t.args, "p1", "c", false, None)).await;
         assert!(stopped.is_err(), "the move stops after its stamp");
         client(a).await.unfence(p1()).await.unwrap();
-
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
-            .unwrap()
-            .connect()
+        // One that starts now, and sees the write in a's new session.
+        let mut after = subscribe(false, b"").await;
+        put(b, "bob", "1").await;
+        tokio::time::timeout(ten, commit_of(&mut after, "bob"))
             .await
+            .expect("bob's commit arrives")
             .unwrap();
-        let mut s = FeedClient::new(channel)
-            .subscribe(SubscribeRequest {
-                tables: vec!["users".into()],
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        // A commit of p1's on a, delivered: the subscription follows a's copy.
-        put(b, "amy", "1").await;
-        // The commit of `row`, or the error that ended the stream.
-        let commit_of = async |s: &mut tonic::Streaming<_>, row: &str| loop {
-            let e: crate::serve::proto::FeedEvent = match s.message().await {
-                Ok(e) => e.expect("the stream ended without an error"),
-                Err(e) => return Err(e),
-            };
-            if let Some(Event::Commit(c)) = &e.event
-                && c.changes.iter().any(|ch| ch.row.as_ref() == row.as_bytes())
-            {
-                return Ok(());
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(10), commit_of(&mut s, "amy"))
-            .await
-            .expect("amy's commit arrives")
-            .unwrap();
-
-        // The map moves p1 to c, keeping its history; a only fenced it, it never closed.
         client(a).await.fence(p1()).await.unwrap();
+
+        // The map moves p1 to c, keeping its history; a never closed it. c's open of p1 is
+        // held a while, so the subscriptions find it opening.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        *super::super::open::HOLD_OPEN.lock().unwrap() = Some((t.dirs[2].clone(), wait));
         within(super::super::cli::relocate(&t.args, "p1", "c", false, true))
             .await
             .unwrap();
@@ -421,8 +447,10 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
             status.partitions.iter().any(|lp| lp.id == "p1"),
             "p1 stays open on a: {status:?}"
         );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        release.send(()).unwrap();
 
-        // p1's next write, on c, reaches the subscription.
+        // p1's next write, on c.
         eventually("c takes p1's writes", async || {
             data(b)
                 .await
@@ -434,11 +462,17 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
                 .is_ok()
         })
         .await;
-        let followed = tokio::time::timeout(Duration::from_secs(20), commit_of(&mut s, "ann"))
+        // The one from before carries on at c.
+        tokio::time::timeout(Duration::from_secs(20), commit_of(&mut before, "ann"))
             .await
-            .expect("the subscription still follows p1's old copy on a");
-        if let Err(e) = followed {
-            assert_eq!(code(&e), "FeedExpired", "{e}");
-        }
+            .expect("the subscription from before still follows p1's old copy on a")
+            .expect("the subscription from before carries on at c");
+        // The one in a's new session ends: c's copy doesn't hold it. Not with
+        // `PartitionUnavailable` from c's open, which it waited out.
+        let ended = tokio::time::timeout(Duration::from_secs(20), commit_of(&mut after, "ann"))
+            .await
+            .expect("the subscription from a's new session still follows p1's old copy on a")
+            .expect_err("its position is past c's copy");
+        assert_eq!(code(&ended), "FeedExpired", "{ended}");
     });
 }
