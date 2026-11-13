@@ -4,6 +4,17 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-11-13
+
+Change feed and storage fixes, and the release to roll back to from 1.2. Upgrade if you use the change feed (a token resumed across a restart, or taken before the feed delivered anything), run `shrink` after `compact`, or may move a database back from 1.2 with the change feed on: 1.1.3 keeps the feed on and leaves the sidecar so 1.2 still reads its history on the way back. The file format and the shared-memory layout are unchanged, so a 1.1.3 writer and 1.1.0 to 1.1.2 reader processes work together, and files move freely between 1.1.x releases.
+
+### Fixed
+- **An unknown WAL segment feature bit now fails the open** (#1735). A segment header from a newer build that sets a `features` bit this build doesn't know is refused with `UnsupportedFeature`, as `phdb check` already did, so the open no longer skips that segment and its records as a blank slot. No build sets such a bit yet.
+- **`shrink` called right after `compact` could leave the file at its pre-compaction length** (#1765). The compaction reported itself done while it still pinned the input SSTs it had just retired, so `shrink` could not reclaim them or move the manifest below them. A compaction now releases its inputs before `compact` returns.
+- **A change feed token that crossed a writer restart could name the older session** (#1810). Session ids are random, and the reader kept the larger one rather than the later one. Resumed on a copy of the database that held the older session but not the later one (a backup restored to before the reopen), the token wasn't refused, and the feed could go on past commits it never had. It now names the later session, so that resume expires.
+- **A change feed token taken before the feed delivered anything could resume past a gap** (#1833, backported as #1841 and #1844). The token named no writer session, so the resume skipped the check that the database's history still holds it. Resumed after a session that wrote with the change feed off, it went on without `FeedExpired`, and that session's commits were never delivered. A token now names its session from the moment the feed opens.
+- **After running 1.2, a 1.1.x open that doesn't name the change feed (`phdb`, a tool) could turn it off** (#1837). It kept the feed on only if 1.2's last sidecar entries were plain roots: after a 1.2 schema change, or a 1.2 crash inside a root commit, it recorded the feed off, and every token and replica expired. It now steps over 1.2's catalog and intent entries, and resolves a 1.2 crash's intent as 1.2 does, so returning to 1.2 keeps the feed too. Tokens taken before a 1.2 schema change still expire under 1.1.x, which can't read the change: they end with `FeedExpired`, never `Corruption` or another error, and resume again once back on 1.2.
+
 ## [1.1.2] - 2026-11-10
 
 A fix for the size of backups. Upgrade if you back up databases with data still in memtables, or back up while writes continue. The file format and the shared-memory layout are unchanged, so a 1.1.2 writer and 1.1.0 or 1.1.1 reader processes work together, and files move freely between 1.1.x releases.
@@ -760,7 +771,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.3...HEAD
+[1.1.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.1.0
