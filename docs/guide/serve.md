@@ -164,6 +164,9 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 - `Admin.Health` needs no token;
 - `Info` (path, sizes, tables, version) and `Metrics` (the `/metrics` text) need read scope;
 - `Flush`, `Compact`, `Backup`, `BackupDownload` and `Promote` need admin scope, as does `Replication.Follow` (gRPC only), which replicas use.
+- **On a cluster node** (#1852), `Info`, `Flush` and `Compact` cover the partitions the node holds, answered there and never forwarded:
+  - `Info` lists each partition the map gives the node (`partitions`: its id, file, size, tables, and its state and fence reason as `phdb cluster status` shows them) and names the map's other partitions (`other_partitions`). Its `path` is the node's cluster directory, `file_bytes` the partitions' files together, and `tables` the map's.
+  - `Flush` and `Compact` act on the partitions `Info` lists that are open (serving or fenced), one after another, or on the one `partition` names. All of them are tried even when one fails, and the answer then carries the first failure's code and names every partition that failed. A copy the map moved away that's still open here (fenced until it's closed) isn't one of them. A partition another node holds is `WrongPartition`, and one closed or not open here is `PartitionUnavailable`. On a single node, `partition` must be empty.
 
 ### Backups
 - **Backups** need `--backup-dir`; without it they're off.
@@ -217,7 +220,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
       - **768-dim `f32`** (lists of 682): the sample is about 315 MB, and each list's pending batch about 0.8 MB, so up to about 1,300 lists: about 888,000 vectors. A million needs about 1.2 GB.
       - **1,536-dim `f32`** (lists of 341): the sample is about 622 MB, and each list's pending batch about 1.6 MB, so up to about 670 lists: about 227,000 vectors. A million needs about 4.7 GB.
     - **`expected` is an upper bound:** a load stops once it has sent what its lists hold before they split, lists × twice the target (about twice `expected`), with `InvalidArgument`, the vectors before it loaded. Declaring too few (0, say) would otherwise grow one list without bound. `Insert` the rest (the index is no longer empty), or drop it and load again with the right `expected`.
-    - **Not counted in `--bulk-load-bytes`: the split after a load.** The rebalance after a load reads a list whole, so a load whose vectors all fall in one list (a write client sending one vector repeated, say) makes it read the whole load: up to about twice `expected`'s vectors. At 768-dim `f32` under the default 1 GiB that's about 5.5 GB, and about 2.8 GB at 1,536-dim, outside the flag. Size the host for it, or give `write` tokens only to clients you trust with that, until [#1824](https://github.com/CodingAnarchy/pigeonhole/issues/1824) (1.3.0) splits a list without reading it whole.
+    - **The split after a load stays small, however the vectors fall.** The rebalance after a load splits a list that grew past four times its split length from a sample, and moves it a page at a time ([#1824](https://github.com/CodingAnarchy/pigeonhole/issues/1824)), so even a load whose vectors all fall in one list (a write client sending one vector repeated, say) holds at most four lists' vectors at once, outside the flag: at most 16 MiB of `f32` vectors (a split holds `f16` and `bf16` vectors as `f32`, so up to 32 MiB, and `i8` up to 64 MiB). Such a load still takes longer, since each split reads the list it splits.
     - **A running load reserves its worst case** from the node's `--bulk-load-bytes` until it ends, succeeded or failed. A load whose ids are longer than 32 bytes grows its reservation as they come, and stops there, the vectors before it loaded, if that's over the flag or other loads hold the rest.
     - **One load runs at a time per database;** another waits for it, up to the request timeout or its own deadline. A load whose client sends nothing for `--stream-idle-ms` while the load waits for it ends with `DeadlineExceeded`, the vectors before it loaded, so a stalled client can't hold the slot. `/metrics` shows the running load's phase, the vectors and bytes handed to it, and its reservation.
     - The load runs on a thread of its own (`phdb-serve-bulk-load`), off the shards' cores where the engine pinned them, as the rebalancers do. Its writes still fill memtables quickly, so other writers can meet room and pacing stalls while it runs. The server's shutdown waits for a running load to write what it received.
@@ -492,8 +495,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - a partition opened on a running node doesn't re-split the node's `--engine-memory`, `--shards` and `--compaction-threads`, and the running threads keep their old affinity mask (#1761, #1762);
   - `--change-feed` is each partition's, not the node's (#1786);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
-  - no read replicas: a cluster node refuses `--replica-of` and `Admin.Promote`, so a partition has one copy, and losing its node means a restore or [the lost-node recipe](#a-lost-node) (#1851);
-  - `Admin.Info`, `Admin.Flush` and `Admin.Compact` answer `Unsupported` on a cluster node (#1852).
+  - no read replicas: a cluster node refuses `--replica-of` and `Admin.Promote`, so a partition has one copy, and losing its node means a restore or [the lost-node recipe](#a-lost-node) (#1851).
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -568,7 +570,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
 - **Refused with `Unsupported`** on a cluster node in this release:
   - every IVF and full-text index call, not only the searches: `Vectors.CreateIndex`, `Insert`, `Delete`, `BulkLoad`, `Search` and `Verify`, and `Text.CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild` and `Verify` (#1722, 1.3.0). For vectors, `Vectors.Nearest` works and fans out across the partitions;
-  - `Admin.Info`, `Admin.Flush`, `Admin.Compact` and `Admin.Promote`. `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
+  - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
   - every `Memory` call (a cluster node refuses `--memory` at start) and `/mcp`.
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
 - **Errors a cluster adds:**

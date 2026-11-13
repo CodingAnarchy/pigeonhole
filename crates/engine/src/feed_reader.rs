@@ -547,6 +547,13 @@ pub struct FeedReader {
     /// The sidecar, once opened ([`FeedReader::load_catalog`]).
     sidecar_file: Option<pigeonhole_io::FileRef>,
     dropped_tables: HashSet<TableId>,
+    /// Every table a catalog change in the sidecar drops, read so far: rooted or not yet,
+    /// delivered, passed over or queued (#1853). A feed of every table delivering a change to
+    /// a table the catalog no longer has, and none of these drops, expires.
+    recorded_drops: HashSet<TableId>,
+    /// Every table a catalog change in the sidecar creates, read so far: a reader process's
+    /// view can lag the writer's manifest, and miss a table this feed already has a commit to.
+    recorded_creates: HashSet<TableId>,
     out_catalog: CatalogEvent,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
@@ -598,15 +605,6 @@ enum Rooted {
     Yes,
     Pending,
     Never,
-}
-
-/// Which catalog changes are before a feed of every table's start, at open (D315), beside
-/// the reader's `catalog_bound` for `Oldest` and `After`.
-#[derive(Clone, Copy)]
-enum CatalogStart<'a> {
-    /// Those the start's catalog reflects: `Now` (the view's), `Snapshot` (its view's). Its
-    /// view was loaded before the sidecar was read, so no later entry can be reflected.
-    Reflected(&'a crate::catalog::Catalog),
 }
 
 /// Whether `catalog` reflects every one of a catalog change's `edits`. Ids only grow and are
@@ -850,6 +848,8 @@ impl FeedReader {
             catalog_roots_seen: 0,
             sidecar_file: None,
             dropped_tables: HashSet::new(),
+            recorded_drops: HashSet::new(),
+            recorded_creates: HashSet::new(),
             out_catalog: CatalogEvent::default(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
@@ -971,7 +971,7 @@ impl FeedReader {
         // drops kept (D315). A token says the last one delivered; another start, its bound.
         if this.tables.is_empty() && this.expired.is_none() {
             let start = match &start_catalog {
-                Some(catalog) => Some(CatalogStart::Reflected(catalog)),
+                Some(catalog) => Some(&**catalog),
                 None if token_start => None,
                 None => {
                     this.catalog_bound = this.delivered;
@@ -2081,6 +2081,47 @@ impl FeedReader {
                 Packs::One(r) => std::slice::from_ref(r),
                 Packs::Many(v) => v,
             };
+            // A feed of every table (#1853): a table the catalog no longer has was dropped,
+            // and every drop appends its catalog change to the sidecar before the catalog
+            // loses the table. A change to a table no recorded drop explains, after the file
+            // is read again for one that raced this view, was dropped by a session that
+            // records no catalog changes: a 1.1.x session after a rollback. Catalog changes
+            // are then missing from the history (that session's creates too), so the feed
+            // expires rather than deliver a commit it can't name and go on without them.
+            // In a reader process, whose view can lag the writer's manifest, a table a
+            // recorded change created may be missing from the view without a drop.
+            if self.tables.is_empty() {
+                let lagging = self.writer.is_none();
+                let unexplained = |this: &Self| {
+                    // A commit's changes run by table: each run is looked up once.
+                    let mut last = None;
+                    packs
+                        .iter()
+                        .flat_map(Raws::iter)
+                        .map(|r| r.table)
+                        .find(|&t| {
+                            if last.replace(t) == Some(t) {
+                                return false;
+                            }
+                            view.catalog.table(t).is_none()
+                                && !this.recorded_drops.contains(&t)
+                                && !(lagging && this.recorded_creates.contains(&t))
+                        })
+                };
+                if unexplained(self).is_some() {
+                    self.load_catalog(None)?;
+                }
+                if let Some(table) = unexplained(self) {
+                    self.expired = Some(expiry(format!(
+                        "seqno {key} changes table id {}, which the catalog no longer has and \
+                         no catalog change in the feed's history dropped: a session that \
+                         records no catalog changes (a 1.1.x build's, after a rollback) \
+                         changed the tables, so the feed can't deliver those changes",
+                        table.0
+                    )));
+                    return Ok(Emitted::Nothing);
+                }
+            }
             let dropped = &self.dropped_tables;
             let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
             if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
@@ -2302,10 +2343,12 @@ impl FeedReader {
     /// changes of the feed's history not yet delivered. Called after the frontier F is
     /// loaded: the catalog hold keeps F below a change's ceiling until its entry is appended,
     /// so every change with a ceiling at most F + 1 is in the file by then. At open, `start`
-    /// says which changes are before a non-token start (a token says the last one delivered
-    /// instead). A passed-over or delivered change's drops are kept, so a dropped table's
-    /// later changes are passed over.
-    fn load_catalog(&mut self, start: Option<CatalogStart<'_>>) -> Result<()> {
+    /// is the catalog a `Now` or `Snapshot` start reflects (the view's, loaded before the
+    /// sidecar was read, so no later entry can be reflected): the changes it reflects are
+    /// before the start, beside the reader's `catalog_bound` for `Oldest` and `After`. A
+    /// token says the last change delivered instead. A passed-over or delivered change's
+    /// drops are kept, so a dropped table's later changes are passed over.
+    fn load_catalog(&mut self, start: Option<&crate::catalog::Catalog>) -> Result<()> {
         // Before the file is read: a change counted after this is loaded next time.
         if let Some(feed) = &self.writer {
             self.catalog_roots_seen = feed.catalog_roots();
@@ -2345,6 +2388,24 @@ impl FeedReader {
         // Up to the first torn entry: the rest is read again once it's whole.
         let (entries, used) = decode_entries_at(&bytes);
         self.sidecar_pos = from + used as u64;
+        // Every create and drop the file records, whatever its state (#1853): what explains
+        // a table missing from the catalog. Entries past a pending one are read again next
+        // time; the sets don't mind.
+        for (_, e) in &entries {
+            if let FeedEntry::Catalog { edits, .. } = e {
+                for edit in edits {
+                    match edit {
+                        pigeonhole_format::manifest::Edit::DropTable { table } => {
+                            self.recorded_drops.insert(*table);
+                        }
+                        pigeonhole_format::manifest::Edit::CreateTable { table, .. } => {
+                            self.recorded_creates.insert(*table);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // A catalog change counts once its root commit's Root entry follows it (D315
         // amendment): its entry is appended with the commit's intent, before the commit
         // writes, and a commit that then fails is cut off at the next open, so until the
@@ -2408,7 +2469,7 @@ impl FeedReader {
             }
             let before_start = seqno_ceiling <= self.catalog_bound
                 || match start {
-                    Some(CatalogStart::Reflected(catalog)) => {
+                    Some(catalog) => {
                         reflecting = reflecting && reflects(catalog, &edits);
                         reflecting
                     }

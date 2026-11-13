@@ -527,7 +527,6 @@ pub(crate) fn single<'a>(
         placement,
         tls,
         serving: args.db_file().display().to_string(),
-        dbs: vec![db],
         replica,
         start: None,
     })
@@ -541,9 +540,6 @@ pub(crate) struct Serving<'a> {
     pub(crate) tls: Option<tokio_rustls::TlsAcceptor>,
     /// What the startup line says is served: the file, or a cluster node's partition.
     pub(crate) serving: String,
-    /// The databases to close last: a single node's one, a cluster node's partitions'
-    /// (D317 ticket 8a), none on a cluster node that only routes.
-    pub(crate) dbs: Vec<Pigeonhole>,
     pub(crate) replica: Option<Arc<replica::Replica>>,
     /// Run on the request runtime once the server listens (a cluster node's map sync).
     pub(crate) start: Option<Box<dyn FnOnce() + Send>>,
@@ -560,7 +556,6 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         placement,
         tls,
         serving,
-        dbs,
         replica,
         start,
     } = s;
@@ -718,13 +713,10 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         part.texts.close();
         part.indexes.close();
     }
-    // A cluster node closes the partitions open now: those it opened while serving too, and
-    // not those it closed (D317 ticket 6).
-    let dbs: Vec<Pigeonhole> = if shared.router.cluster.is_some() {
-        shared.router.parts().iter().map(|p| p.db.clone()).collect()
-    } else {
-        dbs
-    };
+    // The databases to close last: a single node's one, or the partitions a cluster node has
+    // open now (those it opened while serving too, and not those it closed, D317 ticket 6);
+    // none on a cluster node that only routes.
+    let dbs: Vec<Pigeonhole> = shared.router.parts().iter().map(|p| p.db.clone()).collect();
     let closed = match dbs.len() {
         0 => {
             let _ = writeln!(stderr, "phdb serve: stopped");

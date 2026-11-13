@@ -55,8 +55,16 @@ where
         return Err("a primary only, not --replica-of".to_owned());
     }
     let serving = super::single(&cli, args, stderr).map_err(|e| format!("{e:?}"))?;
+    // The databases to close, as `serve_shared` finds them (#1862).
+    let dbs = serving
+        .shared
+        .router
+        .parts()
+        .iter()
+        .map(|p| p.db.clone())
+        .collect();
     Ok(Router {
         router: super::http::router(serving.shared),
-        dbs: serving.dbs,
+        dbs,
     })
 }

@@ -364,7 +364,7 @@ impl Merging {
                 && let Poll::Ready(Some(done)) = self.merge.opens.poll_join_next(cx)
             {
                 let opened = done
-                    .map_err(|e| ApiError::internal(e.to_string()))
+                    .map_err(ApiError::from)
                     .and_then(|(i, result)| self.merge.opened(i, result));
                 if let Err(e) = opened {
                     self.end(e);
@@ -533,7 +533,7 @@ impl Merge {
             let Some(done) = set.join_next().await else {
                 break;
             };
-            let (i, result) = done.map_err(|e| ApiError::internal(e.to_string()))?;
+            let (i, result) = done?;
             opened[i] = Some(result);
         }
         for (i, result) in opened.into_iter().enumerate() {
@@ -1576,6 +1576,58 @@ mod tests {
             partition: String::new(),
         };
         Bytes::from(prost::Message::encode_to_vec(&e))
+    }
+
+    /// A D310 version-2 token of 4 streams at `n`: what a one-partition subscription's part
+    /// carries on every event.
+    fn d310_token(n: u64) -> Vec<u8> {
+        let mut t = vec![2u8];
+        t.extend_from_slice(&[7u8; 16]);
+        t.extend_from_slice(&4u32.to_le_bytes());
+        t.extend_from_slice(&(1_000_000 + n).to_le_bytes());
+        t.extend_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        for s in 0..4u64 {
+            let hint = (3u64 << 40) + 4096 * (n + s);
+            t.extend_from_slice(&hint.to_le_bytes());
+            t.extend_from_slice(&(hint + 512).to_le_bytes());
+        }
+        t.extend_from_slice(&5u64.to_le_bytes());
+        t.extend_from_slice(&9u64.to_le_bytes());
+        t
+    }
+
+    /// Times a one-partition merge's per-event work (#1798 (b)): `cover` of a commit, with
+    /// its checkpoint token. Run by hand: `cargo test --release ... -- --ignored
+    /// one_partition_cover_cost --nocapture`.
+    #[test]
+    #[ignore = "a timing, run by hand"]
+    fn one_partition_cover_cost() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (_feed, events) = fed();
+        let mut m = merging(vec![Some(events)], QUIET, IDLE);
+        let batch: Vec<Bytes> = (0..10_000u64)
+            .map(|n| event(&d310_token(n), Some(n + 1)))
+            .collect();
+        let mut sink = 0usize;
+        for e in &batch {
+            sink += m.merge.cover(0, e.clone()).unwrap().is_some() as usize;
+        }
+        // More rounds for a profiler (`COVER_ROUNDS`).
+        let rounds: u32 = std::env::var("COVER_ROUNDS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(50);
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for e in &batch {
+                if let Some(Out::Spliced { tail, .. }) = m.merge.cover(0, e.clone()).unwrap() {
+                    sink += tail.len();
+                }
+            }
+        }
+        let per = started.elapsed() / (rounds * batch.len() as u32);
+        eprintln!("one-partition cover: {per:?} an event ({sink})");
     }
 
     #[test]

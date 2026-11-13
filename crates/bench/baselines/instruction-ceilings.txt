@@ -418,3 +418,14 @@ text-two-terms-k100 52001738 0.3
 text-fuzzy 59386475 0.3
 text-phrase 126670191 0.3
 text-phrase-slop2 131159719 0.3
+# #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 1985d9889 (main
+# a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it, and
+# #1862's feed_reader.rs simplifications, which moved nothing here), three identical-code runs,
+# 43519083591, 43519095899 and 43523753054 (ubuntu-24.04). The highest count of each shape (base
+# and head) times 1.003. Spread across the runs: 0-2 per unit (replicate-apply 6743-6745).
+wide-row-cells-async 1676 0.3
+commit-put-previous-async 22209 0.3
+commit-if-returning-async 29379 0.3
+feed-drain 6154 0.3
+feed-drain-all 6416 0.3
+replicate-apply 6766 0.3

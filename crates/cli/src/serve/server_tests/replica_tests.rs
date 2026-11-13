@@ -588,6 +588,12 @@ fn a_swap_ends_the_old_copy_s_feed_streams_with_an_error() {
 /// it. The primary's background sync is set far off, so a `Buffered` commit reaches the
 /// replica only when a later `GroupSync` commit syncs it: a replica held behind for as long
 /// as the test likes, with no hook.
+///
+/// Two replicas (#1858): `r`, with a 500 ms request timeout, for the reads that wait out
+/// their deadline; `wait`, with a long one, for the reads that must succeed. A successful
+/// read returns once its seqno is applied, so the long timeout costs nothing when the
+/// replica is quick, and a slow runner's catch-up no longer has to fit in what's left of
+/// 500 ms.
 #[test]
 fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let dir = test_dir();
@@ -611,6 +617,10 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     short.request_timeout = Duration::from_millis(500);
     let r = Server::start_replica_with(test_dir(), &p.url, None, short);
     wait_replica(&r, "caught up", caught_up(&p, None));
+    let mut long = limits();
+    long.request_timeout = Duration::from_secs(60);
+    let wait = Server::start_replica_with(test_dir(), &p.url, None, long);
+    wait_replica(&wait, "caught up", caught_up(&p, None));
 
     let mut w = put("x", "f", "q", json!({"bytes": b64(b"mine")}));
     w["durability"] = json!("DURABILITY_BUFFERED");
@@ -633,11 +643,11 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let (status, body) = r.post("Get", &get, None);
     assert_eq!((status, body.get("cell").is_none()), (200, true), "{body}");
 
-    // A read that waits, while the primary syncs: a GroupSync commit covers `x`.
+    // A read that waits, while the primary syncs: a GroupSync commit covers `x`. On the
+    // long-timeout replica, so it ends when the replica applies `x`, however slow the runner.
     let started = std::time::Instant::now();
     let (status, body) = std::thread::scope(|scope| {
-        // Within the replica's 500 ms request timeout.
-        let read = scope.spawn(|| r.rpc_with("Data/Get", &get, None, &header));
+        let read = scope.spawn(|| wait.rpc_with("Data/Get", &get, None, &header));
         std::thread::sleep(Duration::from_millis(200));
         assert!(!read.is_finished(), "the read waits for the replica");
         let sync = put("y", "f", "q", json!({"bytes": b64(b"sync")}));
@@ -652,8 +662,8 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     );
     assert!(started.elapsed() >= Duration::from_millis(200));
 
-    // Over gRPC, as metadata.
-    let mut client = r.grpc();
+    // Over gRPC, as metadata: on `wait` too, which has applied `x` by now.
+    let mut client = wait.grpc();
     let mut req = tonic::Request::new(proto::GetRequest {
         table: "t".into(),
         row: b"x".to_vec().into(),
@@ -666,7 +676,9 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let got = r.block_on(client.get(req)).unwrap().into_inner();
     assert!(got.cell.is_some());
 
-    // A seqno far ahead: ReplicaBehind over gRPC too (UNAVAILABLE).
+    // A seqno far ahead: ReplicaBehind over gRPC too (UNAVAILABLE), on `r`, which gives up
+    // after 500 ms.
+    let mut client = r.grpc();
     let mut req = tonic::Request::new(proto::GetRequest {
         table: "t".into(),
         row: b"x".to_vec().into(),
@@ -1290,4 +1302,92 @@ fn a_promote_that_fails_after_the_stop_reports_a_replica_that_follows_nothing() 
     // Another Promote goes through.
     let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
     assert_eq!(status, 200, "{body}");
+}
+
+/// A replica whose primary's schema changed without a record in its feed (#1853): a 1.1.x
+/// session after a rollback writes no Catalog entry, so the feed delivers a commit to a table
+/// the replica was never told of, and its apply is refused for ever from the same token. The
+/// replica bootstraps again instead, and catches up with the new table. The 1.1.x session is
+/// made here as 1.1.x leaves the sidecar: 1.2's session with its Catalog entries cut (the
+/// pigeonhole crate's `schema-rollback-1.1.3` corpus is 1.1.3's own bytes for the same case).
+#[test]
+fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
+    use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader};
+    let options = || {
+        Options::default()
+            .shards(1)
+            .change_feed(pigeonhole::FeedRetention::bytes(64 << 20))
+    };
+    let (pdir, rdir) = (test_dir(), test_dir());
+    std::fs::create_dir_all(&rdir).unwrap();
+    // A primary and a replica of it, caught up.
+    let primary = Pigeonhole::open(pdir.join("t.phdb"), options().create_if_missing(true)).unwrap();
+    let put = |db: &Pigeonhole, table: &str, value: &[u8]| {
+        db.table(table)
+            .unwrap()
+            .open()
+            .unwrap()
+            .mutate(b"r")
+            .put("f", b"q", value)
+            .commit()
+            .unwrap();
+    };
+    primary
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    put(&primary, "t", b"t0");
+    let snap = primary.durable_snapshot().unwrap();
+    primary.backup_at(&snap, rdir.join("t.phdb")).unwrap();
+    let start = primary.feed().from_snapshot(&snap).open().unwrap().token();
+    drop(snap);
+    let replica = Pigeonhole::open(rdir.join("t.phdb"), Options::default()).unwrap();
+    replica.begin_replication(&start).unwrap();
+    replica.close().unwrap();
+    primary.close().unwrap();
+    let sidecar = pdir.join(format!("t.phdb{FEED_SUFFIX}"));
+    let recorded = std::fs::read(&sidecar).unwrap().len();
+
+    // The "1.1.x" session: a table created and written to, its Catalog entries cut.
+    let primary = Pigeonhole::open(pdir.join("t.phdb"), options()).unwrap();
+    primary
+        .table("c")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    put(&primary, "c", b"c1");
+    put(&primary, "t", b"t1");
+    primary.close().unwrap();
+    let bytes = std::fs::read(&sidecar).unwrap();
+    let mut kept = bytes[..recorded].to_vec();
+    let mut at = recorded;
+    let mut cut = 0;
+    while at < bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let frame = &bytes[at..at + 8 + len];
+        // Type 4: a Catalog entry.
+        if frame[8] == 4 {
+            cut += 1;
+        } else {
+            kept.extend_from_slice(frame);
+        }
+        at += 8 + len;
+    }
+    assert!(
+        recorded >= FeedHeader::LEN && cut == 1,
+        "one Catalog entry cut: {cut}"
+    );
+    std::fs::write(&sidecar, kept).unwrap();
+
+    let primary = Pigeonhole::open(pdir.join("t.phdb"), options()).unwrap();
+    let p = Server::serve(pdir, primary, "", limits(), None, |s| s);
+    let r = Server::start_replica(rdir, &p.url, None);
+    wait_replica(&r, "caught up again", caught_up(&p, None));
+    // Table `c` reaches the replica only in a new bootstrap's copy: the feed never delivered
+    // its create, and an apply of a commit to it is refused.
+    assert_eq!(get_value(&r, "c", "r", None), b64(b"c1"));
+    assert_eq!(get_value(&r, "t", "r", None), b64(b"t1"));
 }
