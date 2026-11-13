@@ -279,9 +279,9 @@ impl Router {
     /// A cluster node's `Admin.Info`, `Flush` or `Compact` (ICR 0117, #1852), answered here
     /// for the partitions this node holds and never forwarded, as a backup is. `Info` lists
     /// each partition the map gives this node, with its state as `Cluster.Status` reports it,
-    /// and the map's other partitions. `Flush` and `Compact` act on every partition open
-    /// here (serving or fenced: a fenced partition's files still change), one after another,
-    /// or on the one the request names.
+    /// and the map's other partitions. `Flush` and `Compact` act on every partition the map
+    /// gives this node that's open here (serving or fenced: a fenced partition's files still
+    /// change), one after another, trying each, or on the one the request names.
     async fn cluster_admin(
         &self,
         cluster: &Cluster,
@@ -297,23 +297,45 @@ impl Router {
             _ => return Err(ApiError::internal("not a maintenance call")),
         };
         let parts = if r.partition.is_empty() {
-            self.partitions()
+            // The partitions the map gives this node, as `Info` lists them: not a copy the map
+            // moved away that's still open here, fenced until it's closed (simp724's N1).
+            let routes = cluster.node.routes();
+            let mine: std::collections::BTreeSet<&str> = routes
+                .as_ref()
+                .map(|r| r.partitions_of(cluster.node.id()).collect())
+                .unwrap_or_default();
+            let mut parts = self.partitions();
+            parts.retain(|(id, _)| mine.contains(id.as_str()));
+            parts.sort_by(|a, b| a.0.cmp(&b.0));
+            parts
         } else {
             vec![(r.partition.clone(), self.partition(&r.partition)?)]
         };
+        // Every one is tried, so one that fails doesn't leave the rest undone; the answer is
+        // the first failure's code, naming every partition that failed (simp724's N2).
+        let mut failed: Vec<ApiError> = Vec::new();
         for (id, part) in parts {
             let done = if compact {
                 part.db.compact_async().await
             } else {
                 part.db.flush_async().await
             };
-            done.map_err(|e| {
+            if let Err(e) = done {
                 let mut e = ApiError::from(e);
                 e.message = format!("partition {id}: {}", e.message);
-                e
-            })?;
+                failed.push(e);
+            }
         }
-        Ok(ServiceReply::Empty(super::proto::Empty {}))
+        match failed.len() {
+            0 => Ok(ServiceReply::Empty(super::proto::Empty {})),
+            1 => Err(failed.remove(0)),
+            _ => {
+                let all: Vec<String> = failed.iter().map(|e| e.message.clone()).collect();
+                let mut first = failed.remove(0);
+                first.message = all.join("; ");
+                Err(first)
+            }
+        }
     }
 
     /// `Admin.Info` on a cluster node (#1852): see [`cluster_admin`](Self::cluster_admin).

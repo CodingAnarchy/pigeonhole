@@ -6685,9 +6685,11 @@ pub struct PartitionInfo {
     pub fence_reason: i32,
 }
 /// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
-/// acts on every partition the node holds that's open, and a partition named acts on that
-/// one (`WrongPartition` for one another node holds, `PartitionUnavailable` for one closed or
-/// not open here). On a single node it must be empty (`InvalidArgument`).
+/// acts on every partition the map gives the node that's open (the ones `Info` lists), trying
+/// each even after one fails, and answers the first failure's code with every failed
+/// partition named. A partition named acts on that one (`WrongPartition` for one another
+/// node holds, `PartitionUnavailable` for one closed or not open here). On a single node it
+/// must be empty (`InvalidArgument`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MaintenanceRequest {
     #[prost(string, tag = "1")]

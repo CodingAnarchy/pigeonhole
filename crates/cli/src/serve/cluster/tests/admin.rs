@@ -130,6 +130,47 @@ fn info_flush_and_compact_cover_the_nodes_own_partitions() {
         admin_a.flush(named("")).await.unwrap();
         let e = admin_a.flush(named("p1")).await.unwrap_err();
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+
+        // A map that moves p2 to a, while b still has p2's copy open (simp724's N1): b's Info
+        // lists what the map gives it, which is nothing now, and its Flush agrees, leaving the
+        // old copy alone; a lists p2, which it hasn't opened.
+        let mut v2 = map.clone();
+        v2.map_version = 2;
+        for p in &mut v2.partitions {
+            if p.id == "p2" {
+                p.node = "a".into();
+                p.epoch = 2;
+            }
+        }
+        for port in [a, b] {
+            client(port)
+                .await
+                .push_map(crate::serve::proto::PushMapRequest {
+                    map: Some(v2.clone()),
+                })
+                .await
+                .unwrap();
+        }
+        let i = info(b).await;
+        assert!(i.partitions.is_empty() && i.file_bytes == 0, "{i:?}");
+        assert_eq!(i.other_partitions, ["p1", "p2"], "{i:?}");
+        admin(b).await.flush(named("")).await.unwrap();
+        let e = admin(b).await.flush(named("p2")).await.unwrap_err();
+        assert_eq!(code(&e), "WrongPartition", "{e}");
+        let i = info(a).await;
+        let states: Vec<(&str, LocalPartitionState)> = i
+            .partitions
+            .iter()
+            .map(|p| (p.id.as_str(), p.state()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("p1", LocalPartitionState::Closed),
+                ("p2", LocalPartitionState::Unspecified)
+            ],
+            "{i:?}"
+        );
     });
     drop(stops);
 }

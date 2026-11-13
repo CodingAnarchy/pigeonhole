@@ -166,7 +166,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 - `Flush`, `Compact`, `Backup`, `BackupDownload` and `Promote` need admin scope, as does `Replication.Follow` (gRPC only), which replicas use.
 - **On a cluster node** (#1852), `Info`, `Flush` and `Compact` cover the partitions the node holds, answered there and never forwarded:
   - `Info` lists each partition the map gives the node (`partitions`: its id, file, size, tables, and its state and fence reason as `phdb cluster status` shows them) and names the map's other partitions (`other_partitions`). Its `path` is the node's cluster directory, `file_bytes` the partitions' files together, and `tables` the map's.
-  - `Flush` and `Compact` act on every partition open on the node (serving or fenced), one after another, or on the one `partition` names. A partition another node holds is `WrongPartition`, and one closed or not open here is `PartitionUnavailable`. On a single node, `partition` must be empty.
+  - `Flush` and `Compact` act on the partitions `Info` lists that are open (serving or fenced), one after another, or on the one `partition` names. All of them are tried even when one fails, and the answer then carries the first failure's code and names every partition that failed. A copy the map moved away that's still open here (fenced until it's closed) isn't one of them. A partition another node holds is `WrongPartition`, and one closed or not open here is `PartitionUnavailable`. On a single node, `partition` must be empty.
 
 ### Backups
 - **Backups** need `--backup-dir`; without it they're off.
