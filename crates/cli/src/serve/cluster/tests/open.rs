@@ -810,3 +810,94 @@ fn a_table_created_while_another_partition_opens_keeps_its_rows() {
         let _ = db.close();
     }
 }
+
+/// audit120's P2-C2: a partition opened on the map's writer was confirmed with the map its
+/// open began with. A map set at the writer meanwhile (here a plain version step) made that
+/// one older than the node's, so the confirm did nothing, and the newer map's own pass
+/// skipped the partition as already open: it stayed fenced "awaiting peer map" with no peer
+/// to push one. a is the writer; it opens p3 (held before its confirm) while version 3
+/// lands, and must serve p3 once released.
+#[test]
+fn a_partition_opened_on_the_writer_serves_though_another_map_lands_before_its_confirm() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    test_partition_with(&dirs[0], "p3", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let a = ports[0];
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    super::super::open::HOLD_CONFIRM
+        .lock()
+        .unwrap()
+        .push((dirs[0].clone(), wait));
+    let with_p3_on_a = |version: u64| {
+        let mut m = the_map(version, &ports);
+        for p in &mut m.partitions {
+            if p.id == "p3" {
+                p.node = "a".into();
+            }
+        }
+        m
+    };
+    rt.block_on(async {
+        // Version 2 gives a (the writer) partition p3: it opens, and holds before its confirm.
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(with_p3_on_a(2)),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        eventually("a's p3 to be open, fenced since it opened", async || {
+            part_on(a, "p3")
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Fenced)
+        })
+        .await;
+        // Version 3 lands at a meanwhile.
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 2,
+                map: Some(with_p3_on_a(3)),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(version(a).await, 3);
+        release.send(()).unwrap();
+        eventually("a's p3 to serve", async || {
+            part_on(a, "p3")
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Serving)
+        })
+        .await;
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}

@@ -124,6 +124,25 @@ pub(crate) static HOLD_OPEN: std::sync::Mutex<
     Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(Vec::new());
 
+/// A hold seam (tests): `open_missing` in each listed cluster directory waits after its next
+/// partition opened, before it confirms it, until the sender sends or is dropped.
+#[cfg(test)]
+pub(crate) static HOLD_CONFIRM: std::sync::Mutex<
+    Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn hold_confirm(dir: &std::path::Path) {
+    let mut armed = HOLD_CONFIRM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(i) = armed.iter().position(|(d, _)| d == dir) {
+        let (_, wait) = armed.swap_remove(i);
+        drop(armed);
+        let _ = wait.recv();
+    }
+}
+
 #[cfg(test)]
 fn hold_open(dir: &std::path::Path) {
     let mut armed = HOLD_OPEN
@@ -326,8 +345,24 @@ impl Node {
         Ok(())
     }
 
+    /// Confirms this node's start-fenced partitions on its current map, after a partition
+    /// opened here. Not the map the open began with: a map installed here since (a table
+    /// created at the writer, say) makes that one older than the node's, which
+    /// [`confirm`](Self::confirm) ignores, and the newer map's own `open_missing` skipped
+    /// the partition because it was already open. Nothing else confirms a map set at this
+    /// node, so the partition stayed fenced until a peer's push or an `unfence` (audit120's
+    /// P2-C2). Read again if yet another map landed meanwhile.
+    fn confirm_current(&self) {
+        while let Ok(map) = self.get_map() {
+            self.confirm(&map);
+            if self.state().version() <= map.map_version {
+                break;
+            }
+        }
+    }
+
     /// Opens every partition the newest map gives this node that isn't open here, each
-    /// unfenced once that map confirms it (a relocation's new owner serves at once). A
+    /// unfenced once the node's map confirms it (a relocation's new owner serves at once). A
     /// partition that fails to open is reported and left to the next map, or the operator.
     pub(crate) async fn open_missing(self: &Arc<Self>) {
         if self.opener.get().is_none() {
@@ -353,7 +388,9 @@ impl Node {
                         "phdb serve: partition {id} opened on map version {}",
                         map.map_version
                     );
-                    self.confirm(&map);
+                    #[cfg(test)]
+                    hold_confirm(&self.dir);
+                    self.confirm_current();
                 }
                 Err(e) => eprintln!(
                     "phdb serve: partition {id}: map version {} gives it to this node, and it \
