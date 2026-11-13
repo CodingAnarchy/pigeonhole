@@ -313,7 +313,7 @@ with ph.open(path, create=True, change_feed=64 << 20) as db:
   - **A cancelled recall:** one still queued never runs. One already running finishes on its thread, and its result is dropped.
   - **Against `asyncio.to_thread(store.recall, ...)`:** at one caller they take the same time. With many callers, `to_thread` runs more recalls a second (its default executor has up to 32 threads), but the event loop stalls meanwhile: commits awaited beside the recalls took 2 ms at p99 with 16 callers, and 1.9 ms at p50 with 32. `recall_async` kept them near 80 µs at p99. Pick `to_thread` for recall throughput alone, `recall_async` when the same loop also commits or serves requests.
 
-    Measured on the 16-core reference machine (#1657, g45), 50,000 memories, with an 8-thread pool:
+    Measured on the reference machine, a 16-core AX102 (#1657), 50,000 memories, with an 8-thread pool:
 
     | callers | `to_thread` recalls/s | `recall_async` recalls/s | commit p99 meanwhile: `to_thread` / `recall_async` |
     |---|---|---|---|

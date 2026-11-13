@@ -292,7 +292,7 @@ assert_eq!(stats.ivf_namespaces, 0);
 - **Cost:** a second copy of each embedding (about 159 MB per 100k memories at `f32`, 82 MB at `f16`), and the index's lists to maintain as memories arrive. The index rebalances in the background.
 - **It's fixed at create.** To add an index to an existing store, create a new store with it and remember the memories into it.
 
-On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157 memories in one namespace and 10,000 in another, remembered interleaved so the second is spread thinly over the index's lists. The latency is warm and single-threaded at the default `nprobe`, p50 over LongMemEval-M's 50 questions:
+On the reference machine, a 16-core AX102 (`memrecall … ivf`, [D311](../design/decisions/phase-3.md#d311), #1342), one f32 store held 89,157 memories in one namespace and 10,000 in another, remembered interleaved so the second is spread thinly over the index's lists. The latency is warm and single-threaded at the default `nprobe`, p50 over LongMemEval-M's 50 questions:
 
 | | exact | IVF | IVF's recall@10 of the exact vector ranking |
 |---|---|---|---|
@@ -301,7 +301,7 @@ On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157
 | 10k namespace, vector only | 3.4 ms | 2.3 ms | 0.97 |
 | 10k namespace, fused | 15.3 ms | 13.7 ms | |
 
-- **IVF takes off part of the vector search's cost, not the keyword search's:** about 28 ms of the large namespace's fused recall is keyword search (T5's split).
+- **IVF takes off part of the vector search's cost, not the keyword search's:** about 28 ms of the large namespace's fused recall is keyword search (the split measured below, #1339).
 - **Writers gain up to 16 threads, with or without the index, though less past 8.** Threads remembering into the large namespace, 8 s per thread count, three runs (`memrecall … ivf` and `… flat`, the same store without the index, #1477):
 
   | writers | memories/s with the index | without it | remember p99 with the index |
@@ -316,7 +316,7 @@ On the reference AX102 (`memrecall … ivf`, D311 T8), one f32 store held 89,157
   - **How many to use:** up to 8 writers when remember latency matters (p99 under about 8 ms), and 16 for bulk imports. More than 16 wasn't measured.
   - **The index costs about 10–20% of write throughput,** for the vector copy and list upkeep.
   - **Writers rarely collide:** one that meets a list mid-split retries its transaction inside `remember`, 1–27 times per 8 s at 4–16 writers, out of 26,000–67,000 memories. A list's version only changes when it splits.
-- **Building it:** the 99k memories took 60 s, about the same rate as T5's builds without the index.
+- **Building it:** the 99k memories took 60 s, about the same rate as the builds without the index measured below.
 
 ## Watching for new memories
 `store.watch(&[namespaces])` follows the store's memory events through the database's change feed, so another part of the application, or another process, learns that a memory arrived without polling. The database must be opened with the change feed on (`Options::change_feed`), following the store's table `mem_{name}` (every table by default):
@@ -396,7 +396,7 @@ assert!(step.passes.is_empty()); // nothing is an hour old yet
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.
 
 ## How well it recalls
-These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX102 (D311 T5, #1339). The memories and questions come from two public benchmarks, embedded once with `BAAI/bge-small-en-v1.5` (384 dimensions). `crates/bench/baselines/memory/fixture.py` downloads and embeds them, and pins the files' hashes and the model's revision. The published vectors were embedded with sentence-transformers 3.3.1 on transformers 4.57.6. The script now pins 5.6.1 on transformers 5.22.1 (security fixes, #1422), which embeds the same texts to within 3e-7 per component and leaves every query's top 10 unchanged on a 2,000-memory sample, so the numbers below weren't re-run.
+These numbers come from `crates/bench/examples/memrecall.rs` on the reference machine, a 16-core AX102 ([D311](../design/decisions/phase-3.md#d311), #1339). The memories and questions come from two public benchmarks, embedded once with `BAAI/bge-small-en-v1.5` (384 dimensions). `crates/bench/baselines/memory/fixture.py` downloads and embeds them, and pins the files' hashes and the model's revision. The published vectors were embedded with sentence-transformers 3.3.1 on transformers 4.57.6. The script now pins 5.6.1 on transformers 5.22.1 (security fixes, #1422), which embeds the same texts to within 3e-7 per component and leaves every query's top 10 unchanged on a 2,000-memory sample, so the numbers below weren't re-run.
 - **LongMemEval-S** (Wu et al., 2024): 470 questions, each over its own namespace of about 250 memories, one per user turn and the reply after it. A question counts at `k` when a hit comes from one of its answer sessions.
 - **LoCoMo** (Maharana et al., 2024): 1,531 questions over 10 conversations of about 590 turns each. A question counts when a hit is one of its evidence turns.
 
@@ -428,7 +428,7 @@ Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks
 | ~2,400 (LongMemEval-M) | 7.9 ms | 14.6 ms | 15.9 / 37 ms |
 | 94,000 in one namespace | 68 ms | 107 ms | |
 
-At 94,000 memories, the exact vector search is 37 ms of that (p50) and the keyword search 28 ms (slowest 66 ms). Both grow with the namespace. Per-user or per-agent namespaces of a few thousand memories stay well under 20 ms. In a single namespace of 100,000, an approximate vector index (IVF, D311 T8) would take the vector part off, but not the keyword part.
+At 94,000 memories, the exact vector search is 37 ms of that (p50) and the keyword search 28 ms (slowest 66 ms). Both grow with the namespace. Per-user or per-agent namespaces of a few thousand memories stay well under 20 ms. In a single namespace of 100,000, an approximate vector index (IVF, [D311](../design/decisions/phase-3.md#d311), #1342) would take the vector part off, but not the keyword part.
 
 **Size,** per 100,000 LongMemEval memories (about 2 KB of text each, 1.1 KB once compressed), in use after a full compaction:
 
