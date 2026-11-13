@@ -214,8 +214,9 @@ impl Node {
     }
 
     /// `Cluster.Unfence`: P takes writes again. Refused unless this node's map names it for
-    /// P at its file's epoch: a write would break rule 1 or 2 anyway. P first takes the
-    /// map's schema it skipped while fenced.
+    /// P at its file's epoch (a write would break rule 1 or 2 anyway), and unless a peer's
+    /// map, at least as new, says the same (or `force`): this node's map alone may be
+    /// behind. P first takes the map's schema it skipped while fenced.
     pub(crate) async fn unfence(self: &Arc<Self>, id: &str, force: bool) -> Result<(), ApiError> {
         let _one = self.fences.changing.lock().await;
         // A closed partition reopens first, still fenced (D317 amendment 2).
@@ -224,19 +225,24 @@ impl Node {
         }
         let (gate, epoch) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
         let map = self.get_map()?;
-        // A start fence stands because this node's own map may be stale: it was down, and a
-        // move may have passed it by. So a peer's map must confirm it first, as at start,
-        // unless the operator forces it (cli692's S1 on #1755).
-        if gate.fenced() == Some(Fence::Start)
-            && !force
-            && !self.peer_confirms(&map, id, epoch).await
-        {
+        // This node's own map may be stale, whichever fence it is: it was down or missed a
+        // push, and a move may have passed it by. So a peer's map must confirm the partition
+        // first, as at start, unless the operator forces it (cli692's S1 on #1755). An
+        // operator's fence needs that as much as a start fence does (audit120's P2-F1): a
+        // move fences its old node as the operator, and that node is the one whose map is
+        // behind when it misses the move's map.
+        if !force && !self.peer_confirms(&map, id, epoch).await {
+            let since = if gate.fenced() == Some(Fence::Start) {
+                "fenced since this node started"
+            } else {
+                "fenced"
+            };
             return Err(ApiError::failed_precondition(format!(
-                "partition {id:?} is fenced since this node started, and no peer's map (at \
-                 least as new as this node's) confirms it's still this node's at epoch \
-                 {epoch}: a peer that holds a newer map may have moved it, and unfencing would \
-                 give it two writers. Wait for a peer to answer, or pass --force only if no \
-                 peer can and you know the partition hasn't moved"
+                "partition {id:?} is {since}, and no peer's map (at least as new as this \
+                 node's) confirms it's still this node's at epoch {epoch}: a peer that holds a \
+                 newer map may have moved it, and unfencing would give it two writers. Wait \
+                 for a peer to answer, or pass --force only if no peer can and you know the \
+                 partition hasn't moved"
             )));
         }
         if !names(&map, &self.id, id, epoch) {
