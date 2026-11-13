@@ -166,6 +166,12 @@ impl TakeClock {
         self.last.store(nanos.max(1), Ordering::Relaxed);
     }
 
+    /// The last take, or the clock's start (the stream's) before the first: what an idle
+    /// limit counts from (#1798 (a)'s merge task).
+    pub(crate) fn last_or_start(&self) -> tokio::time::Instant {
+        self.last().unwrap_or(self.base)
+    }
+
     /// When the last take was, or `None` before the first.
     pub(crate) fn last(&self) -> Option<tokio::time::Instant> {
         match self.last.load(Ordering::Relaxed) {

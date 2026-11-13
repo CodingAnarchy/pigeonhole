@@ -692,9 +692,11 @@ pub(crate) struct Metrics {
     pub(crate) shed: AtomicU64,
     pub(crate) replies_lost: AtomicU64,
     /// Feed subscriptions ended at `--stream-idle-ms`: a client that left an event untaken
-    /// (a single node), or took nothing (a cluster subscription's watchdog, #1758's B).
+    /// that long, on a single node or a cluster (the merge task's take clock, #1798 (a)).
     /// A cluster subscription's parts aren't counted: the subscription is, once.
     pub(crate) feed_idle_drops: AtomicU64,
+    /// Cluster subscriptions' merge tasks running now, on the feed runtime (#1798 (a)).
+    pub(crate) cluster_merges: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -706,6 +708,7 @@ impl Default for Metrics {
             shed: AtomicU64::new(0),
             replies_lost: AtomicU64::new(0),
             feed_idle_drops: AtomicU64::new(0),
+            cluster_merges: AtomicU64::new(0),
         }
     }
 }
@@ -799,6 +802,12 @@ impl Metrics {
             out,
             "pigeonhole_serve_feed_idle_drops_total {}",
             self.feed_idle_drops.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "# TYPE pigeonhole_serve_feed_cluster_merges gauge");
+        let _ = writeln!(
+            out,
+            "pigeonhole_serve_feed_cluster_merges {}",
+            self.cluster_merges.load(Ordering::Relaxed)
         );
         out
     }

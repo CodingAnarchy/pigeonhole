@@ -404,6 +404,14 @@ impl Node {
         }
     }
 
+    /// The server's feed delivery runtime, once it set one (`run_on`): where a cluster
+    /// subscription's merge runs, off the threads that serve requests (#1798 (a)). `None`
+    /// before the server is built, or without an opener (some tests): the caller's runtime.
+    pub(crate) fn feed_runtime(&self) -> Option<tokio::runtime::Handle> {
+        let shared = self.opener.get()?.shared.upgrade()?;
+        shared.feed_runtimes.get().map(|(feed, _)| feed.clone())
+    }
+
     /// [`open_missing`](Self::open_missing) in a task, after an install, when a server
     /// serves this node.
     pub(crate) fn open_missing_soon(&self) {

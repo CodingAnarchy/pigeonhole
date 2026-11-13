@@ -391,7 +391,7 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_request_duration_seconds{rpc}` | histogram | Each RPC's service time, from the decoded request to its answer (a stream's to its end). Buckets from 100 µs to 10 s. |
 | `pigeonhole_serve_shed_total` | counter | Requests refused at `--max-concurrent`, before they ran. |
 | `pigeonhole_serve_replies_lost_total` | counter | Writes that finished after their client went away. The write's outcome went to the log instead. |
-| `pigeonhole_serve_feed_idle_drops_total` | counter | Feed subscriptions ended at `--stream-idle-ms`, because the client left an event untaken that long (on a cluster: took nothing that long). Each one also ends its `Feed.Subscribe` with `DeadlineExceeded`. A cluster subscription counts once, on the node it entered. |
+| `pigeonhole_serve_feed_idle_drops_total` | counter | Feed subscriptions ended at `--stream-idle-ms`, because the client left an event untaken that long. Each one also ends its `Feed.Subscribe` with `DeadlineExceeded`. A cluster subscription counts once, on the node it entered. |
 | `pigeonhole_serve_connections`, `pigeonhole_serve_connections_max` | gauge | Open connections, and `--max-connections`. |
 | `pigeonhole_serve_connections_refused_total` | counter | Connections closed at the cap. |
 | `pigeonhole_serve_accept_errors_total` | counter | Failed accepts, such as running out of file descriptors (`EMFILE`). |
@@ -408,6 +408,7 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_feed_hub_threads` | gauge | The threads that read the engine's feed into the shared subscriptions (`--feed-hub-threads`). |
 | `pigeonhole_serve_feed_solo_hubs` | gauge | Shared subscriptions with a single stream, running on the feed threads beside it. |
 | `pigeonhole_serve_feed_hub_moves_total` | counter | Shared subscriptions that moved between the feed threads and the hub threads as their second stream joined or their last but one left. |
+| `pigeonhole_serve_feed_cluster_merges` | gauge | Cluster feed subscriptions entered on this node whose merge is running now, on the feed threads (`phdb-serve-feed`). |
 | `pigeonhole_serve_feed_hub_failures_total` | counter | Shared subscriptions that failed. Their streams end with the error. |
 | `pigeonhole_serve_bulk_load_phase` | gauge | A `Vectors.BulkLoad`'s phase: 0 none, 1 receiving, 2 writing and rebalancing. |
 | `pigeonhole_serve_bulk_load_vectors`, `pigeonhole_serve_bulk_load_bytes` | gauge | The vectors and message bytes handed to the running load. |
@@ -676,7 +677,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 
 #### Limits
 - **Stream slots:** a subscription holds a `--max-streams` place on the node it entered, and one on each followed partition's node. An entry node that serves one of the partitions itself holds two.
-- **Memory:** it buffers up to 256 KiB on each partition's node, so partitions × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed. The entry node buffers nothing of its own: it merges the partitions' events as its client reads them.
+- **Memory:** it buffers up to 256 KiB on each partition's node, so partitions × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed. The entry node merges the partitions' events on its feed threads (`phdb-serve-feed`, not the threads that serve requests) and buffers up to the client's own 256 KiB, as a single node's stream does.
 - **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens: on a cluster the limit counts the client's reads, not the events it gets, so it ends a client that stopped reading, never one that's waiting for a commit.
 
 #### Expiry and what isn't supported
