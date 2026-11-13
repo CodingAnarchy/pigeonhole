@@ -258,11 +258,13 @@ const PER_VECTOR: u64 = 96;
 /// The id length the up-front check assumes; a longer id grows the reservation as it comes.
 const ID_ALLOWANCE: u64 = 32;
 /// How many times what its lists were sized for a load may send before it stops: lists ×
-/// the most a list holds before it splits (the audit's P2-F2). An honest `expected` sizes
-/// lists × that at twice `expected`, so this is four times what it declared; one that
-/// declared too few (0, say) stops here instead of growing one list without bound, which
-/// the rebalance's split then reads whole.
-const SIZED_FACTOR: u64 = 2;
+/// the most a list holds before it splits (the audit's P2-F2; 1, the coordinator's call on
+/// #1825). `expected` is an upper bound: lists × that is about twice `expected`, rounded up
+/// to whole lists, so an honest load never reaches it, and one that declared too few (0,
+/// say) stops here instead of growing one list without bound, which the rebalance's split
+/// then reads whole. What's left: a load whose vectors all fall in one list makes the split
+/// read about twice `expected` vectors (#1824).
+const SIZED_FACTOR: u64 = 1;
 
 /// What a bulk load holds at most, by the crate's design ([`SAMPLE_FLOOR`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,7 +279,7 @@ pub(crate) struct Need {
     /// The pending batches' bytes after it: 255 vectors a list.
     pub(crate) pending: u64,
     /// The most vectors the load may send ([`SIZED_FACTOR`] × lists × the longest a list
-    /// grows before it splits, twice `target`).
+    /// grows before it splits, twice `target`): about twice `expected`.
     pub(crate) vectors: u64,
 }
 
@@ -618,10 +620,10 @@ impl Sizing {
     fn take(&mut self, len: u64, gauges: &Gauges) -> Result<(), ApiError> {
         if self.taken >= self.vectors {
             return Err(ApiError::invalid(format!(
-                "a BulkLoad that declared expected {} sent more than {} vectors, {SIZED_FACTOR} \
-                 × its {} lists of up to {} each: the load stopped there, and the vectors \
-                 before it were loaded. Set expected to the number of vectors you load, and \
-                 Insert the rest",
+                "a BulkLoad that declared expected {} sent more than {} vectors, what its {} \
+                 lists hold before they split ({} each): expected is an upper bound. The load \
+                 stopped there, and the vectors before it were loaded: Insert the rest (the \
+                 index is no longer empty), or drop it and load again with the right expected",
                 self.expected,
                 self.vectors,
                 self.lists,
@@ -811,12 +813,12 @@ mod tests {
         let n = need(&f32s(1536), 341, 1_000_000, ID_ALLOWANCE);
         assert_eq!(n.lists, 2933);
         assert_eq!(n.pending, 2933 * 255 * (6144 + 64 + 96));
-        // The most a load sends (P2-F2): twice its lists' split length. Declaring 0 makes one
-        // list, so 4 × target vectors.
-        assert_eq!(need(&f32s(768), 682, 0, ID_ALLOWANCE).vectors, 2 * 2 * 682);
+        // The most a load sends (P2-F2): its lists' split length. Declaring 0 makes one list,
+        // so 2 × target vectors; an honest expected, about twice it.
+        assert_eq!(need(&f32s(768), 682, 0, ID_ALLOWANCE).vectors, 2 * 682);
         assert_eq!(
             need(&f32s(768), 682, 682_000, ID_ALLOWANCE).vectors,
-            4 * 682_000
+            2 * 682_000
         );
         // Saturating, never overflowing.
         let n = need(&f32s(4096), 1, u64::MAX, u64::MAX);
