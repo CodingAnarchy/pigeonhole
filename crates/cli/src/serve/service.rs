@@ -2862,12 +2862,14 @@ impl Service {
         self.blocking(move || {
             let reply = (|| -> Result<proto::MultiGetResponse, ApiError> {
                 // One snapshot for the page's reads, the request's or one taken now, so a
-                // read again ends exactly where the first measured (#1848).
+                // read again ends exactly where the first measured (#1848). Only a selection
+                // with an aggregate query is ever read again (its views count against the
+                // budget), so a plain one reads now, at no snapshot's cost (audit120's S1).
                 let at = match &pinned {
-                    Some(p) => p.snapshot().clone(),
-                    None => db.snapshot()?,
+                    Some(p) => Some(p.snapshot().clone()),
+                    None if has_aggregate(r.selection.as_ref()) => Some(db.snapshot()?),
+                    None => None,
                 };
-                let at = Some(at);
                 let select = convert::Select::new(r.selection.as_ref())?.at(at);
                 let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
                 let after = if r.after.is_empty() {
@@ -4140,8 +4142,15 @@ async fn held<T: Send + 'static>(
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
 }
 
+/// Whether `selection` has an aggregate query: the only selections whose page can be cut by
+/// its views and read again, so the only ones a page's snapshot is taken for (#1848).
+fn has_aggregate(selection: Option<&proto::Selection>) -> bool {
+    selection.is_some_and(|s| s.aggregate.is_some())
+}
+
 /// A hold seam (tests): runs, once, what a test armed for `table` between a page's two reads
-/// (MultiGet's and Scan's read again), as a write landing there would (#1848).
+/// (MultiGet's and Scan's read again), as a write landing there would (#1848). Process-wide
+/// and keyed by table name only: each test that arms it uses a table name of its own.
 #[cfg(test)]
 pub(crate) static BETWEEN_READS: std::sync::Mutex<Vec<BetweenReads>> =
     std::sync::Mutex::new(Vec::new());
@@ -4298,12 +4307,14 @@ impl ScanTask {
                 .await
                 .map_err(|_| ApiError::internal("the scan threads closed"))?;
             let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
-                // One snapshot for the page's reads, as MultiGet's (#1848).
+                // One snapshot for the page's reads, as MultiGet's (#1848), when it can be
+                // read again.
                 let at = match pinned_at {
-                    Some(s) => s,
-                    None => db.snapshot()?,
+                    Some(s) => Some(s),
+                    None if has_aggregate(req.selection.as_ref()) => Some(db.snapshot()?),
+                    None => None,
                 };
-                let select = convert::Select::new(req.selection.as_ref())?.at(Some(at));
+                let select = convert::Select::new(req.selection.as_ref())?.at(at);
                 let q = select.aggregate();
                 let kinds = convert::Kinds::new(&table);
                 // Converted a column at a time, stopping at the first that doesn't fit with its

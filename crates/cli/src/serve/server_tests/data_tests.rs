@@ -1405,24 +1405,12 @@ fn grpc_health_reserves_nothing_and_refuses_a_long_message() {
     assert_eq!(service.inflight_available(), l.inflight_bytes);
 }
 
-/// #1848: a page's read again (the columns that fit with their aggregate views) read at a
-/// snapshot of its own, so a write between the two reads that grew the first column left
-/// it over the read's budget: an empty page with a position, which ends a scan's stream.
-/// Both reads now share one snapshot. A write lands between them here (the hold seam).
-#[test]
-fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
-    let s = Server::start("", limits());
-    let mut c = s.grpc();
-    let spec = json!({"name": "grow", "if_missing": false, "families": [
-        {"name": "q", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
-        {"name": "r", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
-    ]});
-    let (status, body) = s.rpc("Schema/CreateTable", &spec, None);
-    assert_eq!(status, 200, "{body}");
-    let put = |values: &[f64]| proto::MutateRequest {
+/// One write to row "a" of `table`: each value into `q:x` and `r:x`, two quantile columns.
+fn grow_put(table: &str, values: &[f64]) -> proto::MutateRequest {
+    proto::MutateRequest {
         writes: Some(proto::RowWrites {
             row: Some(proto::RowKey {
-                table: "grow".into(),
+                table: table.into(),
                 row: b"a".to_vec().into(),
             }),
             writes: ["q", "r"]
@@ -1442,16 +1430,28 @@ fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
                 .collect(),
         }),
         durability: 0,
-    };
-    s.block_on(c.mutate(put(&[1.0]))).unwrap();
-    // 1,024 quantiles make each column's view 8 KiB: the first fits a 4 KiB page alone (one
-    // column always does), the second doesn't, so the page is read again for the first.
-    let sel = aggregate_query(1024, 0, 0);
-    // Between the reads, the first column's sketch grows well past its old size.
+    }
+}
+
+/// #1848's setup: `table` with two quantile columns in row "a", one value each, and a write
+/// armed between a page's two reads that grows the first column's sketch well past its old
+/// size. 1,024 quantiles make each column's view 8 KiB: at a 4 KiB page the first fits alone
+/// (one column always does) and the second doesn't, so the page is read again for the first.
+/// The selection to read with.
+fn grow_between_reads(s: &Server, table: &str) -> proto::Selection {
+    let mut c = s.grpc();
+    let spec = json!({"name": table, "if_missing": false, "families": [
+        {"name": "q", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
+        {"name": "r", "aggregate": {"kind": "AGGREGATION_KIND_QUANTILES"}},
+    ]});
+    let (status, body) = s.rpc("Schema/CreateTable", &spec, None);
+    assert_eq!(status, 200, "{body}");
+    s.block_on(c.mutate(grow_put(table, &[1.0]))).unwrap();
     let url = s.url.clone();
     let wide: Vec<f64> = (0..400).map(|i| f64::from(i) * 977.0 + 1.0).collect();
+    let owned = table.to_owned();
     super::super::service::BETWEEN_READS.lock().unwrap().push((
-        "grow".into(),
+        table.into(),
         Box::new(move || {
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1462,13 +1462,34 @@ fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
                         .await
                         .unwrap();
                     let mut c = proto::data_client::DataClient::new(ch);
-                    c.mutate(put(&wide)).await.unwrap();
+                    c.mutate(grow_put(&owned, &wide)).await.unwrap();
                 });
             })
             .join()
             .unwrap();
         }),
     ));
+    aggregate_query(1024, 0, 0)
+}
+
+/// Whether the write armed for `table` ran: the page was read again, with it between.
+fn read_again_with_the_write_between(table: &str) -> bool {
+    super::super::service::BETWEEN_READS
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(t, _)| t != table)
+}
+
+/// #1848: a page's read again (the columns that fit with their aggregate views) read at a
+/// snapshot of its own, so a write between the two reads that grew the first column left
+/// it over the read's budget: an empty page with a position. Both reads now share one
+/// snapshot. A write lands between them here (the hold seam). MultiGet's page.
+#[test]
+fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    let sel = grow_between_reads(&s, "grow");
     let page = s
         .block_on(c.multi_get(proto::MultiGetRequest {
             table: "grow".into(),
@@ -1479,15 +1500,54 @@ fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
         }))
         .unwrap()
         .into_inner();
-    assert!(
-        super::super::service::BETWEEN_READS
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(t, _)| t != "grow"),
-        "the page was read again, with the write between"
-    );
+    assert!(read_again_with_the_write_between("grow"));
     assert_eq!(page.rows.len(), 1, "{page:?}");
     assert_eq!(page.rows[0].cells.len(), 1, "the first column alone");
     assert!(!page.next.is_empty(), "the second column is next");
+}
+
+/// #1848, Scan's half (audit120's S2 on #1872): there an empty page with a position ended
+/// the stream, and a client that took the stream's end for the scan's stopped early. Its
+/// first page holds the first column, and the next page the second.
+#[test]
+fn a_write_between_a_scan_pages_two_reads_doesnt_end_the_scan() {
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    let sel = grow_between_reads(&s, "grow-scan");
+    let pages: Vec<proto::ScanPage> = s.block_on(async {
+        let mut stream = c
+            .scan(proto::ScanRequest {
+                table: "grow-scan".into(),
+                selection: Some(sel),
+                page_bytes: 4096,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut pages = Vec::new();
+        while let Some(p) = stream.message().await.unwrap() {
+            pages.push(p);
+        }
+        pages
+    });
+    assert!(read_again_with_the_write_between("grow-scan"));
+    let cells: Vec<Vec<String>> = pages
+        .iter()
+        .map(|p| {
+            p.rows
+                .iter()
+                .flat_map(|r| r.cells.iter().map(|c| c.family.clone()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        cells.first().map(Vec::as_slice),
+        Some(&["q".to_owned()][..]),
+        "the first page holds the first column alone: {cells:?}"
+    );
+    assert!(
+        cells.iter().flatten().any(|f| f == "r"),
+        "the scan goes on to the second column: {cells:?}"
+    );
 }

@@ -739,10 +739,11 @@ impl proto::admin_server::Admin for AdminGrpc {
             .get("authorization")
             .and_then(|v| v.to_str().ok());
         let caller = self.0.caller(header)?;
-        let reply = self
-            .0
-            .router
-            .partition_upload_status(&caller, &req.get_ref().upload_id)?;
+        let reply = self.0.router.partition_upload_status(
+            &caller,
+            &req.get_ref().upload_id,
+            &req.get_ref().partition,
+        )?;
         Ok(Response::new(reply))
     }
 }

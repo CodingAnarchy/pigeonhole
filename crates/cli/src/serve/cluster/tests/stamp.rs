@@ -124,7 +124,10 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
         // Staged, then an install that fails after its first rename, as a crash would
         // leave it: the marker stays, and the next stamp finishes it.
         let manifest = upload_set(c, "p3", &main, 1).await;
-        *super::super::stamp::FAIL_AFTER_FIRST_RENAME.lock().unwrap() = Some(dirs[2].clone());
+        super::super::stamp::FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(dirs[2].clone());
         let e = stamp(c, 1, 2, false).await.unwrap_err();
         assert!(e.message().contains("after the first rename"), "{e}");
         assert!(dirs[2].join(".phdb-incoming/p3.installing").exists());
@@ -637,6 +640,7 @@ fn an_upload_is_complete_only_while_its_staged_file_is_there() {
                 .await
                 .partition_upload_status(PartitionUploadStatusRequest {
                     upload_id: id.clone(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap()

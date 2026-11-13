@@ -14747,6 +14747,9 @@ impl serde::Serialize for PartitionUploadStatusReply {
         if self.max_chunk != 0 {
             len += 1;
         }
+        if self.installing {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadStatusReply", len)?;
         if self.received != 0 {
             #[allow(clippy::needless_borrow)]
@@ -14760,6 +14763,9 @@ impl serde::Serialize for PartitionUploadStatusReply {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("max_chunk", ToString::to_string(&self.max_chunk).as_str())?;
+        }
+        if self.installing {
+            struct_ser.serialize_field("installing", &self.installing)?;
         }
         struct_ser.end()
     }
@@ -14775,6 +14781,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
             "complete",
             "max_chunk",
             "maxChunk",
+            "installing",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -14782,6 +14789,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
             Received,
             Complete,
             MaxChunk,
+            Installing,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -14806,6 +14814,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
                             "received" => Ok(GeneratedField::Received),
                             "complete" => Ok(GeneratedField::Complete),
                             "maxChunk" | "max_chunk" => Ok(GeneratedField::MaxChunk),
+                            "installing" => Ok(GeneratedField::Installing),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14828,6 +14837,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
                 let mut received__ = None;
                 let mut complete__ = None;
                 let mut max_chunk__ = None;
+                let mut installing__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Received => {
@@ -14852,12 +14862,19 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusReply {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Installing => {
+                            if installing__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("installing"));
+                            }
+                            installing__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(PartitionUploadStatusReply {
                     received: received__.unwrap_or_default(),
                     complete: complete__.unwrap_or_default(),
                     max_chunk: max_chunk__.unwrap_or_default(),
+                    installing: installing__.unwrap_or_default(),
                 })
             }
         }
@@ -14875,9 +14892,15 @@ impl serde::Serialize for PartitionUploadStatusRequest {
         if !self.upload_id.is_empty() {
             len += 1;
         }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionUploadStatusRequest", len)?;
         if !self.upload_id.is_empty() {
             struct_ser.serialize_field("upload_id", &self.upload_id)?;
+        }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
         }
         struct_ser.end()
     }
@@ -14891,11 +14914,13 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusRequest {
         const FIELDS: &[&str] = &[
             "upload_id",
             "uploadId",
+            "partition",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             UploadId,
+            Partition,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -14918,6 +14943,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusRequest {
                     {
                         match value {
                             "uploadId" | "upload_id" => Ok(GeneratedField::UploadId),
+                            "partition" => Ok(GeneratedField::Partition),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14938,6 +14964,7 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusRequest {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut upload_id__ = None;
+                let mut partition__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::UploadId => {
@@ -14946,10 +14973,17 @@ impl<'de> serde::Deserialize<'de> for PartitionUploadStatusRequest {
                             }
                             upload_id__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(PartitionUploadStatusRequest {
                     upload_id: upload_id__.unwrap_or_default(),
+                    partition: partition__.unwrap_or_default(),
                 })
             }
         }

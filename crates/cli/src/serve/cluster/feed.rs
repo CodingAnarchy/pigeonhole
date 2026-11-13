@@ -1352,7 +1352,7 @@ fn still_served(
         return Ok(());
     }
     Err(ApiError::partition_unavailable(format!(
-        "partition {partition:?} closed on this node"
+        "partition {partition:?} closed or reopened on this node"
     )))
 }
 

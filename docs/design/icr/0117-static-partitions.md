@@ -429,7 +429,7 @@
 - **`phdb cluster status`** gives each partition's state, for example `fenced (operator)`.
 
 ## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)
-**`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id }`** says how many bytes of an upload the node holds, so a client can resume. Both answer `Unsupported` on a single node.
+**`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id = 1; partition = 2 }`** says how many bytes of an upload the node holds, so a client can resume, and whether an install of `partition`'s set is in progress there (#1848, 1.3.0; empty `partition`, from an older client: false). Both answer `Unsupported` on a single node.
 - **A partition is a set of files,** named by their suffix of the partition's database path: `""` for the main file, `-wal-<n>` for a WAL sidecar, `-feed` for the change feed's sidecar. Each node maps a name onto its own path. **`PartitionFile { name = 1; bytes = 2; sha256 = 3 }`** (common.proto) describes one.
 - **`PartitionUploadHeader`:**
   - `partition` (1), and `cluster_id` (2) and `epoch` (3): what the main file says it is, so the epoch the copy is *of*;
@@ -438,7 +438,9 @@
   - `file` (6): the file this upload carries;
   - `manifest` (7): every file of the set, `file` among them, with the main file required.
 - **`PartitionUploadChunk { header = 1; offset = 2; data = 3 }`:** the first message carries the header. Each message's data starts where the node's bytes end, and is at most the node's `max_chunk`. That's 512 KiB, or less on a node whose `--max-request-bytes` is lower: min(512 KiB, the limit − 16 KiB), at least 1 KiB (cli692's F3 on #1728). A message that doesn't come within `--stream-idle-ms` ends the upload with `DeadlineExceeded`, which frees its place; it then resumes (cli692's F1).
-- **Replies:** `PartitionUploadReply { received = 1; complete = 2 }`, and `PartitionUploadStatusReply { received = 1; complete = 2; max_chunk = 3 }`. A client asks the status first, for `max_chunk`.
+- **Replies:** `PartitionUploadReply { received = 1; complete = 2 }`, and `PartitionUploadStatusReply { received = 1; complete = 2; max_chunk = 3; installing = 4 }`. A client asks the status first, for `max_chunk`.
+  - `complete` holds only while the file is staged: an install renames it away.
+  - `installing` holds while the partition's install marker is staged. The node then takes no upload of the partition, and a file the install already renamed isn't complete. A relocation or a restore run again over an interrupted install therefore sends nothing and goes on to its stamp, which finishes the install (#1848).
 - **A full disk or quota** answers `NoSpace` (`ResourceExhausted`, 507): free space, then resume from the status. Nothing written is lost (cli692's F2).
 - **Accepted only while the partition isn't open on the node,** with one upload of a given file of it at a time, and at most `--max-uploads` (default 1) at once; more are `Overloaded`. A resume must send the same header (`InvalidArgument` otherwise).
 - **Staged, never served:**
@@ -490,7 +492,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
 
 **`phdb cluster move P --to ID [--drop-source]`** (`cluster/moving.rs`) runs the whole move against the writer's map, where P is on OLD at epoch `e`:
 1. **Fence and close** P on OLD (skipping what's done), then poll OLD's `Status` until P's `files` are listed. A failed hash is closed again. A close the database itself reported an error for stops the move.
-2. **Copy** each file: `PartitionUploadStatus` on NEW for `received` and `max_chunk`, then `BackupDownload{fenced_file}` from OLD at `received`, re-chunked into `PartitionUpload{RELOCATE, epoch e, manifest = OLD's files}`. The upload id is the first 16 bytes, as hex, of a SHA-256 over the cluster, the partition, `e`, the file's name and its hash. So a rerun resumes its own uploads, and a re-close with other bytes starts new ones. The download's last chunk must carry the listed size and hash.
+2. **Copy** each file: `PartitionUploadStatus` on NEW for `received` and `max_chunk` (nothing is sent for a complete file, or while NEW reports the partition's install in progress: the stamp finishes it), then `BackupDownload{fenced_file}` from OLD at `received`, re-chunked into `PartitionUpload{RELOCATE, epoch e, manifest = OLD's files}`. The upload id is the first 16 bytes, as hex, of a SHA-256 over the cluster, the partition, `e`, the file's name and its hash. So a rerun resumes its own uploads, and a re-close with other bytes starts new ones. The download's last chunk must carry the listed size and hash.
 3. **Stamp** NEW from `e` to `e + 1`. Compare the reply's `files` (the installed set, Q1) with OLD's closed `files`, by name, size and SHA-256. A mismatch stops the move before the map changes. The stamp itself refuses a staged set that doesn't match the manifest it was sent, so no test can produce a mismatch through the API: only `compare`'s unit test covers this check (simp724's N4).
 4. **The map:** `relocate --copy`. Its stamp is a no-op now (the file is at `e + 1`).
 5. **Serving:** poll NEW's `Status` until P is `serving`. A node serves P only at the map's epoch, so the state is enough.
