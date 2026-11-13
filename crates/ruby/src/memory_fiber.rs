@@ -331,12 +331,14 @@ impl ConsolidateLoop {
             *g = LoopSlot::Waiting(None);
             Box::new(s)
         };
-        FiberBridge::start(ruby, bridge, move || {
-            Box::pin(LoopWait {
-                home,
-                state: Some(state),
-            }) as Fut
-        })
+        // Built before the start and moved into `make` (the audit's S-B2): a start refused
+        // before `make` runs drops it unrun, and its `Drop` puts the loop back in the slot,
+        // which would otherwise stay `Waiting(None)` with the loop dropped.
+        let wait = LoopWait {
+            home,
+            state: Some(state),
+        };
+        FiberBridge::start(ruby, bridge, move || Box::pin(wait) as Fut)
     }
 
     /// `native_run_once_fiber(bridge, waited, block)`: the step after a fiber's waits that
