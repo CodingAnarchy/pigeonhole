@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use common::{V, check, exact, open};
 use pigeonhole::{Element, Metric, VectorSpec};
 use pigeonhole_vector::hooks::{self, Hold};
-use pigeonhole_vector::{Index, IndexOptions};
+use pigeonhole_vector::{Index, IndexOptions, Rebalance};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -279,5 +279,202 @@ fn a_crash_between_a_split_and_its_phase_2_leaves_a_consistent_index() {
             &format!("query {q}"),
         );
     }
+    db.close().unwrap();
+}
+
+/// #1824: a list far longer than its split length (a skewed bulk load, or a list that outgrew
+/// a background rebalancer; here, writes made while rebalancing was skipped) is split from a
+/// sample and moved a page at a time. No read of the split or its phase 2 holds more than
+/// four split lengths, and the index ends within its bounds holding exactly the model.
+/// The long list's vectors: two groups, or all one point, which leaves the split nothing to
+/// separate (split by order).
+#[derive(Clone, Copy)]
+enum Shape {
+    TwoGroups,
+    OnePoint,
+}
+
+fn a_long_list_splits_without_reading_it_whole(shape: Shape) {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (index, mut rebalancer) = Index::create_with_rebalancer(
+        &db,
+        "idx",
+        spec(),
+        reassigning().rebalance(Rebalance::Background),
+    )
+    .unwrap();
+    let drain = |r: &mut pigeonhole_vector::Rebalancer| {
+        while r.run_once(std::time::Duration::from_secs(60)).unwrap() {}
+    };
+    let mut model = BTreeMap::new();
+    for i in 0..40 {
+        put(&index, &mut model, &format!("s{i:03}"), i as f32 * 10.0);
+    }
+    drain(&mut rebalancer);
+    let lists = index.verify().unwrap().list_lens.len();
+    let max = index.max_list_len();
+    hooks::skip_rebalance(true);
+    // 60 split lengths into the list nearest 200.
+    for i in 0..60 * max {
+        let x = match (shape, i % 2) {
+            (Shape::OnePoint, _) => 200.0,
+            (Shape::TwoGroups, 0) => 199.0 + (i % 7) as f32 * 0.01,
+            (Shape::TwoGroups, _) => 201.0 + (i % 5) as f32 * 0.01,
+        };
+        put(&index, &mut model, &format!("l{i:05}"), x);
+    }
+    hooks::skip_rebalance(false);
+    let lens = index.verify().unwrap().list_lens;
+    assert_eq!(lens.len(), lists);
+    assert!(
+        lens.iter().any(|n| *n > 60 * max),
+        "one long list: {lens:?}"
+    );
+    hooks::take_split_held();
+    // The next write into it marks it for the rebalancer.
+    put(&index, &mut model, "trigger", 200.0);
+    drain(&mut rebalancer);
+    let held = hooks::take_split_held();
+    assert!(held > 0, "a split ran");
+    assert!(held as u64 <= 4 * max, "a read held {held} > {}", 4 * max);
+    check(&index, &model, "after the long list's split");
+    for q in [0.0, 200.0, 199.0, 201.0, 390.0] {
+        exact(
+            &index,
+            &model,
+            &V::F32(vec![q, 0.0]),
+            5,
+            &format!("query {q}"),
+        );
+    }
+    drop(rebalancer);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_long_list_of_two_groups_splits_without_reading_it_whole() {
+    a_long_list_splits_without_reading_it_whole(Shape::TwoGroups);
+}
+
+#[test]
+fn a_long_list_of_one_point_splits_without_reading_it_whole() {
+    a_long_list_splits_without_reading_it_whole(Shape::OnePoint);
+}
+
+/// Inline mode until every list is within its bounds: each write runs a bounded number of
+/// queued splits and merges, so write (into `model` too) until none is left.
+fn settle(index: &Index, model: &mut BTreeMap<Vec<u8>, V>, ctx: &str) {
+    let (min, max) = (index.min_list_len(), index.max_list_len());
+    for n in 0..500 {
+        let lens = index.verify().unwrap().list_lens;
+        let several = lens.len() > 1;
+        if lens.iter().all(|l| *l <= max && (*l >= min || !several)) {
+            return;
+        }
+        put(
+            index,
+            model,
+            &format!("settle{n:03}"),
+            10.0 + n as f32 * 0.001,
+        );
+    }
+    panic!("{ctx}: not settled");
+}
+
+/// #1824, inside a paged split (audit120's S2 on #1861): held at its second page with
+/// movers, after the first page committed the split. Mid-pass the index holds every vector
+/// exactly once (`verify`, and exact searches over every list). A copy taken there (the
+/// state a crash leaves) opens and rebalances to within bounds. And an inline writer's
+/// insert into the new list, short with the first page's one mover, doesn't merge it away
+/// (S1: the pass claims it).
+#[test]
+fn a_paged_split_is_consistent_between_its_pages() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let opts = IndexOptions::new()
+        .target_list_len(16)
+        .reassign_neighbours(1);
+    let index = Index::create(&db, "idx", spec(), opts).unwrap();
+    let max = index.max_list_len();
+    let mut model = BTreeMap::new();
+    // One list (the bootstrap's, centred on 0.0) of 30 split lengths: group A near 0.0 and
+    // group B near 10.0, half each, except that the first page in id order holds one A.
+    // The split's first centroid is the vector farthest from 0.0, so B stays and A moves:
+    // the first page's commit leaves the new list with one vector.
+    let a = |i: u64| i == 5 || (i >= max && i.is_multiple_of(2));
+    let x = |i: u64| {
+        if a(i) {
+            i as f32 * 0.0001
+        } else {
+            10.0 + i as f32 * 0.0001
+        }
+    };
+    hooks::skip_rebalance(true);
+    put(&index, &mut model, "p00005", x(5));
+    for i in (0..30 * max).filter(|i| *i != 5) {
+        put(&index, &mut model, &format!("p{i:05}"), x(i));
+    }
+    hooks::skip_rebalance(false);
+    assert_eq!(index.verify().unwrap().list_lens.len(), 1);
+    let held = hooks::arm(Hold::ReassignBeforeCommit);
+    model.insert(b"trigger".to_vec(), V::F32(vec![10.5, 0.0]));
+    let splitter = {
+        let index = index.clone();
+        std::thread::spawn(move || index.insert_f32(b"trigger", &[10.5, 0.0]))
+    };
+    assert!(
+        held.wait_for(std::time::Duration::from_secs(30)),
+        "the pass reached its second page with movers"
+    );
+    let stats = index.verify().unwrap();
+    assert_eq!(stats.vectors, model.len() as u64, "mid-pass: vectors");
+    assert_eq!(stats.list_lens.len(), 2, "mid-pass: {:?}", stats.list_lens);
+    assert!(
+        stats.list_lens.contains(&1),
+        "the new list holds the first page's one mover: {:?}",
+        stats.list_lens
+    );
+    for q in [0.0, 0.05, 5.0, 10.0, 10.5] {
+        exact(
+            &index,
+            &model,
+            &V::F32(vec![q, 0.0]),
+            5,
+            &format!("mid-pass {q}"),
+        );
+    }
+    let copy = dir.join("copy.phdb");
+    db.backup(&copy).unwrap();
+    let mut copied = model.clone();
+    // S1: an insert into the short new list, whose inline merge would undo the pass.
+    put(&index, &mut model, "late", 0.0);
+    let lens = index.verify().unwrap().list_lens;
+    assert_eq!(lens.len(), 2, "the new list survived the insert: {lens:?}");
+    held.release();
+    splitter.join().unwrap().unwrap();
+    settle(&index, &mut model, "after the pass");
+    check(&index, &model, "after the pass");
+    for q in [0.0, 5.0, 10.0] {
+        exact(
+            &index,
+            &model,
+            &V::F32(vec![q, 0.0]),
+            5,
+            &format!("after {q}"),
+        );
+    }
+    db.close().unwrap();
+
+    // The copy: the crash state between pages opens, verifies, and rebalances.
+    let db = pigeonhole::Pigeonhole::open(&copy, pigeonhole::Options::default().shards(2)).unwrap();
+    let index = Index::open(&db, "idx").unwrap();
+    let stats = index.verify().unwrap();
+    assert_eq!(stats.vectors, copied.len() as u64, "the copy: vectors");
+    settle(&index, &mut copied, "the copy");
+    check(&index, &copied, "the copy");
+    exact(&index, &copied, &V::F32(vec![0.0, 0.0]), 5, "the copy");
     db.close().unwrap();
 }

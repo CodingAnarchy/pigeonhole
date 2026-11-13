@@ -242,6 +242,11 @@ fn admin_reports_maintains_and_answers_health_without_a_token() {
     assert_eq!(info["tables"], json!(["t"]));
     assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
     assert!(info["path"].as_str().unwrap().ends_with("t.phdb"), "{info}");
+    // A single node has no partitions to list (#1852).
+    assert!(
+        info.get("partitions").is_none() && info.get("other_partitions").is_none(),
+        "{info}"
+    );
     let (status, m) = s.rpc("Admin/Metrics", &json!({}), Some("r3ad"));
     assert_eq!(status, 200);
     assert!(
@@ -259,6 +264,13 @@ fn admin_reports_maintains_and_answers_health_without_a_token() {
             "{rpc}: {e}"
         );
         assert_eq!(s.rpc(rpc, &json!({}), Some("adm1n")).0, 200, "{rpc}");
+        // A partition named on a single node, which has none (#1852).
+        let (status, e) = s.rpc(rpc, &json!({"partition": "p1"}), Some("adm1n"));
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (400, Some("InvalidArgument")),
+            "{rpc}: {e}"
+        );
     }
 }
 

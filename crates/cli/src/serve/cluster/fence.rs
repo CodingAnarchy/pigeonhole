@@ -187,6 +187,21 @@ impl Node {
         })
     }
 
+    /// Partition `id`'s state as `Status` reports it, for `Admin.Info` (#1852): open
+    /// ([`part_state`](Self::part_state)), else closed, else being opened. Unspecified for one
+    /// the node hasn't opened (no file, or a failed open).
+    pub(crate) fn local_state(&self, id: &str) -> (LocalPartitionState, FenceReason) {
+        if let Some(state) = self.part_state(id) {
+            state
+        } else if self.fences.closed().contains_key(id) {
+            (LocalPartitionState::Closed, FenceReason::Unspecified)
+        } else if self.fences.is_opening(id) {
+            (LocalPartitionState::Opening, FenceReason::Unspecified)
+        } else {
+            (LocalPartitionState::Unspecified, FenceReason::Unspecified)
+        }
+    }
+
     /// Why partition `id` is fenced here, for the startup line and the log.
     pub(crate) fn fence_of(&self, id: &str) -> Option<Fence> {
         self.fences.gate(id).and_then(|(g, _)| g.fenced())
@@ -199,7 +214,7 @@ impl Node {
         let _one = self.fences.changing.lock().await;
         let (gate, _) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
         // The flag first (S4): from here no write is admitted, whatever happens next.
-        gate.fence(Fence::Operator);
+        gate.fence();
         let mut fenced = self.fences.operator().clone();
         if fenced.insert(id.to_owned()) {
             self.persist_fences(fenced).await?;
@@ -280,8 +295,7 @@ impl Node {
             let _installing = node.reconcile_current(Some(&part));
             gate.unfence();
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await?;
         eprintln!("phdb serve: partition {id} unfenced: it takes writes");
         Ok(())
     }
@@ -290,8 +304,7 @@ impl Node {
         let dir = self.dir.clone();
         let written = fenced.clone();
         tokio::task::spawn_blocking(move || write_fenced(&dir, &written))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+            .await?
             .map_err(|e| ApiError::internal(format!("persist {FENCED_FILE}: {e}")))?;
         *self.fences.operator() = fenced;
         Ok(())

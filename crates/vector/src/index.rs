@@ -1,6 +1,7 @@
 //! The index (D306): writes, inline split and merge, search, and verification.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -28,6 +29,11 @@ const RELOADS: usize = 32;
 /// Splits and merges one insert or delete runs after its commit, at most; the rest stay
 /// queued for the next call.
 const MAINTENANCE_PER_CALL: usize = 16;
+/// A split reads its list whole while the list holds at most this many times its split
+/// length ([`Index::max_list_len`]). A longer list (a skewed bulk load, or a list that
+/// outgrew a background rebalancer) is split from a sample of that many vectors and moved a
+/// page of one split length at a time (#1824).
+const SPLIT_WHOLE_LISTS: u64 = 4;
 
 /// An index's options, fixed when it is created ([`Index::create`]) and stored with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -809,6 +815,101 @@ fn kmeans(cen: &VectorSpec, points: &[Point], k: usize) -> Result<Vec<Point>> {
         }
     }
     Ok(centroids)
+}
+
+/// What a split read of its list ([`Index::split_read`]).
+enum SplitRead {
+    /// The list whole: its ids and points, in id order.
+    Whole(Vec<Vec<u8>>, Vec<Point>),
+    /// A uniform sample of the `seen` vectors the list held.
+    Sample { points: Vec<Point>, seen: u64 },
+}
+
+/// Which vectors a split from a sample moves to the new list ([`Index::split_paged`]): those
+/// nearer `go` than `stay` by more than the sample's cut, the cut that moves the share of
+/// the sample `two_means` moved (with its bound on each side). Or, where `two_means` fell
+/// back to splitting by order (no two centroids, or too few to keep both sides in bounds),
+/// the second half of the list in id order.
+enum Rule {
+    /// `tied`: when the sample's margins tie at the cut (duplicate vectors, from which
+    /// `two_means` filled a short side by index), the share of those at the cut that move,
+    /// spread over the list by position (audit120's N1 on #1861).
+    Margin {
+        stay: Vector,
+        go: Vector,
+        cut: f64,
+        tied: Option<f64>,
+    },
+    Order {
+        half: u64,
+    },
+}
+
+impl Rule {
+    fn of(cen: &VectorSpec, sample: &[Point], plan: &Plan, seen: u64) -> Result<Rule> {
+        let k = plan.moving.len();
+        if plan.stay == plan.go || k == 0 || k >= sample.len() {
+            return Ok(Rule::Order { half: seen / 2 });
+        }
+        let dim = cen.dim();
+        let (stay, go) = (plan.stay.to_vector(dim)?, plan.go.to_vector(dim)?);
+        let mut margins = sample
+            .iter()
+            .map(|p| Ok(distance(cen, p, &go)? - distance(cen, p, &stay)?))
+            .collect::<Result<Vec<f64>>>()?;
+        margins.sort_by(f64::total_cmp);
+        if margins[k - 1] == margins[k] {
+            let cut = margins[k];
+            let below = margins.partition_point(|m| *m < cut);
+            let at = margins[below..].partition_point(|m| *m == cut);
+            return Ok(Rule::Margin {
+                stay,
+                go,
+                cut,
+                tied: Some((k - below) as f64 / at as f64),
+            });
+        }
+        let cut = (margins[k - 1] + margins[k]) / 2.0;
+        Ok(Rule::Margin {
+            stay,
+            go,
+            cut,
+            tied: None,
+        })
+    }
+
+    /// Whether `p`, the `position`th vector of the list in id order, moves.
+    fn moves(&self, cen: &VectorSpec, p: &Point, position: u64) -> Result<bool> {
+        Ok(match self {
+            Rule::Margin {
+                stay,
+                go,
+                cut,
+                tied,
+            } => {
+                let m = distance(cen, p, go)? - distance(cen, p, stay)?;
+                match tied {
+                    // Every vector at the cut whose position steps `share × position` up a
+                    // whole number: that share of them, evenly through the list.
+                    Some(share) if m == *cut => {
+                        let at = |i: u64| (i as f64 * share).floor();
+                        at(position + 1) > at(position)
+                    }
+                    _ => m < *cut,
+                }
+            }
+            Rule::Order { half } => position >= *half,
+        })
+    }
+}
+
+/// SplitMix64: the reservoir sample's generator, deterministic per list.
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Removes its list from the in-flight set when the split or merge ends, however it ends.
@@ -1937,17 +2038,75 @@ impl Index {
         fresh.then(|| Claim { set, list })
     }
 
-    /// The ids and points of `list` at `s`, in id order.
-    fn members(&self, s: &Snapshot, list: u32) -> Result<(Vec<Vec<u8>>, Vec<Point>)> {
+    /// Reads `list` for its split, at a snapshot dropped before anything commits (#1497):
+    /// whole while it holds at most `cap` vectors, else a uniform sample of `cap` of them
+    /// (reservoir sampling, seeded by the list id and `version`, so a split that moved
+    /// nothing draws another sample next time), so a split never holds more than `cap`
+    /// vectors however long the list has grown (#1824).
+    fn split_read(&self, list: u32, version: u64, cap: u64) -> Result<SplitRead> {
+        let s = self.inner.db.snapshot()?;
         let mut cells = self
             .inner
             .table
             .row(&list_row(list))
             .family(VEC)
-            .snapshot(s)
+            .snapshot(&s)
             .cells()?;
         let (mut ids, mut points) = (Vec::new(), Vec::new());
+        let mut seen = 0u64;
+        let mut rng = u64::from(list) ^ version.rotate_left(32);
         while let Some(e) = cells.next()? {
+            let v = e
+                .cell
+                .as_vector()
+                .ok_or_else(|| corrupt("a list column is not a vector"))?;
+            seen += 1;
+            if seen <= cap {
+                ids.push(e.qualifier.to_vec());
+                points.push(Point::of(v));
+                continue;
+            }
+            if seen == cap + 1 {
+                ids = Vec::new();
+            }
+            // Algorithm R: the `seen`th vector replaces a sampled one with chance cap / seen.
+            let j = splitmix(&mut rng) % seen;
+            if j < cap {
+                points[j as usize] = Point::of(v);
+            }
+        }
+        #[cfg(feature = "__unstable-hooks")]
+        crate::hooks::note_split_held(points.len());
+        Ok(if seen <= cap {
+            SplitRead::Whole(ids, points)
+        } else {
+            SplitRead::Sample { points, seen }
+        })
+    }
+
+    /// Up to `n` of `list`'s ids and points after the id `after`, in id order, read at a
+    /// snapshot dropped before the caller commits (#1497, as in `split_read`).
+    fn page(
+        &self,
+        list: u32,
+        after: Option<&[u8]>,
+        n: usize,
+    ) -> Result<(Vec<Vec<u8>>, Vec<Point>)> {
+        let s = self.inner.db.snapshot()?;
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut cells = self
+            .inner
+            .table
+            .row(&list_row(list))
+            .family(VEC)
+            .qualifier_bounds(start, Bound::Unbounded)
+            .snapshot(&s)
+            .cells()?;
+        let (mut ids, mut points) = (Vec::new(), Vec::new());
+        while ids.len() < n {
+            let Some(e) = cells.next()? else {
+                break;
+            };
             let v = e
                 .cell
                 .as_vector()
@@ -1955,15 +2114,20 @@ impl Index {
             ids.push(e.qualifier.to_vec());
             points.push(Point::of(v));
         }
+        #[cfg(feature = "__unstable-hooks")]
+        crate::hooks::note_split_held(points.len());
         Ok((ids, points))
     }
 
     /// Splits `list` (D306 §3): 2-means on a snapshot read, then one transaction moving
     /// what it reads itself (rev 3 S1, rev 4 N1); then phase 2 over its neighbours.
+    /// A list longer than [`SPLIT_WHOLE_LISTS`] split lengths is split from a sample, a page
+    /// at a time ([`split_paged`](Self::split_paged), #1824).
     fn split(&self, list: u32) -> Result<()> {
         let Some(_claim) = self.claim(list) else {
             return Ok(());
         };
+        let cap = SPLIT_WHOLE_LISTS.saturating_mul(self.max_list_len());
         for _ in 0..ATTEMPTS {
             // The loser of a duplicate split re-checks the length before splitting the
             // fresh half (rev 3 S2).
@@ -1978,12 +2142,17 @@ impl Index {
                 return Ok(());
             };
             // The 2-means input, read at a snapshot that is dropped before anything commits
-            // (#1497): `members` copies the ids and points out (owned), so nothing below
+            // (#1497): `split_read` copies the ids and points out (owned), so nothing below
             // reads through it. A snapshot held across this thread's own commits pins the
             // memtables it saw, so a commit waiting for arena room would wait on room only
             // its own snapshot keeps, until the stall timeout. The commits validate on their
             // own reads (the list's version row and each moved vector, D306), not on it.
-            let (ids, points) = self.members(&self.inner.db.snapshot()?, list)?;
+            let (ids, points) = match self.split_read(list, current.version, cap)? {
+                SplitRead::Whole(ids, points) => (ids, points),
+                SplitRead::Sample { points, seen } => {
+                    return self.split_paged(list, &current.point, &points, seen);
+                }
+            };
             if ids.len() as u64 <= self.max_list_len() {
                 return Ok(());
             }
@@ -2010,6 +2179,102 @@ impl Index {
         }
         // Lost every attempt: the next write into the list triggers it again.
         Ok(())
+    }
+
+    /// Splits a list too long to read whole (#1824): 2-means on `sample` (drawn from the
+    /// `seen` vectors the list held), then one pass over the list a page at a time, at a
+    /// fresh snapshot per page. A page's vectors on the new side ([`Rule`]) move in a
+    /// transaction of the page's own that reads each of them itself (rev 4 N1): the first
+    /// page with any commits the split ([`split_commit`](Self::split_commit): both
+    /// centroids and the new list), and each later page moves its own into the new list as
+    /// phase 2 moves a neighbour's ([`move_out`](Self::move_out)). So the split holds at
+    /// most a sample or a page, and no transaction moves more than a page.
+    ///
+    /// Until the pass ends, the list still holds vectors nearer the new centroid: searches
+    /// lose some recall meanwhile, not correctness. A page that loses every attempt to
+    /// conflicts stays where it is, as a phase 2 neighbour does. The two lists are queued
+    /// afterwards, so a half still too long splits again.
+    fn split_paged(&self, list: u32, current: &Point, sample: &[Point], seen: u64) -> Result<()> {
+        let inn = &*self.inner;
+        // The bound on each side, scaled to the sample.
+        let min = self
+            .min_list_len()
+            .saturating_mul(sample.len() as u64)
+            .div_ceil(seen.max(1));
+        let plan = two_means(
+            &inn.cen,
+            sample,
+            current,
+            usize::try_from(min).unwrap_or(usize::MAX),
+        )?;
+        let rule = Rule::of(&inn.cen, sample, &plan, seen)?;
+        let page = usize::try_from(self.max_list_len()).unwrap_or(usize::MAX);
+        let mut new = None;
+        // The new list is claimed for the pass (audit120's S1 on #1861): it may hold only
+        // the first page's few movers, and a writer's inline merge of it would undo the pass.
+        let mut new_claim = None;
+        let pass = (|| -> Result<()> {
+            let (mut after, mut position) = (None::<Vec<u8>>, 0u64);
+            loop {
+                let start = position;
+                let mut attempt = 0;
+                let last = loop {
+                    position = start;
+                    let (ids, points) = self.page(list, after.as_deref(), page)?;
+                    let Some(last) = ids.last().cloned() else {
+                        return Ok(());
+                    };
+                    let mut moving = Vec::new();
+                    for (id, p) in ids.iter().zip(&points) {
+                        if rule.moves(&inn.cen, p, position)? {
+                            moving.push(id.as_slice());
+                        }
+                        position += 1;
+                    }
+                    let r = match (moving.is_empty(), new) {
+                        (true, _) => Ok(()),
+                        (false, None) => {
+                            #[cfg(feature = "__unstable-hooks")]
+                            crate::hooks::hold(crate::hooks::Hold::SplitBeforeCommit);
+                            self.split_commit(list, &plan, &moving).map(|n| {
+                                new = Some(n);
+                                new_claim = self.claim(n);
+                            })
+                        }
+                        (false, Some(n)) => {
+                            let moves: Vec<(&[u8], u32)> =
+                                moving.iter().map(|id| (*id, n)).collect();
+                            self.move_out(list, &moves, &[n])
+                        }
+                    };
+                    match r {
+                        // Stale: nothing on this page was left to move, or a list is gone
+                        // (the next page then reads nothing, or moves nothing).
+                        Ok(()) | Err(Tx::Stale) => break last,
+                        Err(e) if is_conflict(&e) => {
+                            attempt += 1;
+                            if attempt == ATTEMPTS {
+                                break last;
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+                after = Some(last);
+            }
+        })();
+        drop(new_claim);
+        let Some(new) = new else {
+            return pass;
+        };
+        self.queue([list, new]);
+        pass?;
+        let layout = self.reload()?;
+        #[cfg(feature = "__unstable-hooks")]
+        if crate::hooks::failing_after_split() {
+            return Ok(());
+        }
+        self.reassign(&layout, list, new, &plan)
     }
 
     fn split_commit(
@@ -2058,6 +2323,9 @@ impl Index {
                     .incr(t, &count_row(new), CNT, b"", moved)
                     .put_u64(t, GLOBAL, META, NEXT, next + 1)
                     .put_u64(t, GLOBAL, META, LAYOUT, layout + 1);
+                // A paged split's list may still be long after this, its first page: the
+                // pass queues both lists in the process when it ends or fails, and `open`
+                // queues by the count rows, not the markers.
                 if inn.opts.rebalance == Rebalance::Background {
                     tx.delete_row(t, &queue_row(list));
                 }
@@ -2072,83 +2340,111 @@ impl Index {
     /// clustering, not correctness.
     fn reassign(&self, layout: &Layout, list: u32, new: u32, plan: &Plan) -> Result<()> {
         let inn = &*self.inner;
-        let t = &inn.table;
         let r = inn.opts.reassign as usize;
         if r == 0 {
             return Ok(());
         }
         let dim = inn.cen.dim();
         let (stay, go) = (plan.stay.to_vector(dim)?, plan.go.to_vector(dim)?);
+        let page = usize::try_from(self.max_list_len()).unwrap_or(usize::MAX);
         for nbr in layout.nearest(&inn.cen, &plan.stay, r, &[list, new])? {
             let Some(n) = layout.list(nbr) else {
                 continue;
             };
-            // Read at a snapshot dropped before this neighbour's transaction commits (#1497,
-            // as in `split`): the transaction validates on its own reads.
-            let (ids, points) = self.members(&inn.db.snapshot()?, nbr)?;
-            let mut moves: Vec<(&[u8], u32)> = Vec::new();
-            for (id, p) in ids.iter().zip(&points) {
-                let here = distance(&inn.cen, p, &n.centroid)?;
-                let (ds, dg) = (distance(&inn.cen, p, &stay)?, distance(&inn.cen, p, &go)?);
-                let (d, dest) = if dg < ds { (dg, new) } else { (ds, list) };
-                if d < here {
-                    moves.push((id, dest));
+            // A page at a time, so a neighbour that outgrew its bound is never read whole
+            // (#1824); each read at a snapshot dropped before its transaction commits
+            // (#1497, as in `split`): the transaction validates on its own reads.
+            let mut after = None::<Vec<u8>>;
+            loop {
+                let (ids, points) = self.page(nbr, after.as_deref(), page)?;
+                let Some(last) = ids.last().cloned() else {
+                    break;
+                };
+                let mut moves: Vec<(&[u8], u32)> = Vec::new();
+                for (id, p) in ids.iter().zip(&points) {
+                    let here = distance(&inn.cen, p, &n.centroid)?;
+                    let (ds, dg) = (distance(&inn.cen, p, &stay)?, distance(&inn.cen, p, &go)?);
+                    let (d, dest) = if dg < ds { (dg, new) } else { (ds, list) };
+                    if d < here {
+                        moves.push((id, dest));
+                    }
                 }
-            }
-            if moves.is_empty() {
-                continue;
-            }
-            let done = inn
-                .db
-                .transact(&RetryPolicy::default().max_attempts(1), |tx| {
-                    let Some(version) = read_version(tx, t, nbr)? else {
-                        return Err(Tx::Stale);
-                    };
-                    if read_version(tx, t, list)?.is_none() || read_version(tx, t, new)?.is_none() {
-                        return Err(Tx::Stale);
+                if !moves.is_empty() {
+                    match self.move_out(nbr, &moves, &[list, new]) {
+                        Ok(()) => self.queue([nbr, list, new]),
+                        Err(Tx::Stale) => {}
+                        Err(e) if is_conflict(&e) => {}
+                        Err(e) => return Err(e.into()),
                     }
-                    let from = list_row(nbr);
-                    let mut gained: HashMap<u32, i64> = HashMap::new();
-                    for (id, dest) in &moves {
-                        let Some(stored) = read_stored(tx, t, &from, id)? else {
-                            continue;
-                        };
-                        stored.input().put(tx, t, &list_row(*dest), id);
-                        tx.delete_column(t, &from, VEC, id).put_u64(
-                            t,
-                            &map_row(id),
-                            MAP,
-                            LIST,
-                            u64::from(*dest),
-                        );
-                        *gained.entry(*dest).or_default() += 1;
-                    }
-                    let lost: i64 = gained.values().sum();
-                    if lost == 0 {
-                        return Err(Tx::Stale);
-                    }
-                    tx.incr(t, &count_row(nbr), CNT, b"", -lost).put_u64(
-                        t,
-                        &centroid_row(nbr),
-                        META,
-                        VERSION,
-                        version + 1,
-                    );
-                    for (dest, n) in &gained {
-                        tx.incr(t, &count_row(*dest), CNT, b"", *n);
-                    }
-                    #[cfg(feature = "__unstable-hooks")]
-                    crate::hooks::hold(crate::hooks::Hold::ReassignBeforeCommit);
-                    Ok(())
-                });
-            match done {
-                Ok(_) => self.queue([nbr, list, new]),
-                Err(Tx::Stale) => {}
-                Err(e) if is_conflict(&e) => {}
-                Err(e) => return Err(e.into()),
+                }
+                if ids.len() < page {
+                    break;
+                }
+                after = Some(last);
             }
         }
         Ok(())
+    }
+
+    /// Moves `moves` (each an id and the list it goes to) out of the list `from`, in one
+    /// transaction that bumps `from`'s version (rev 3 S3) and reads each vector itself,
+    /// skipping one deleted or moved away since the caller's read (rev 4 N1). `Stale` when
+    /// `from` or one of `dests` (every destination) is gone, or nothing was left to move.
+    /// Phase 2 moves a page of a neighbour with it, and a long list's split each page after
+    /// its first ([`split_paged`](Self::split_paged)).
+    fn move_out(
+        &self,
+        from: u32,
+        moves: &[(&[u8], u32)],
+        dests: &[u32],
+    ) -> std::result::Result<(), Tx> {
+        let inn = &*self.inner;
+        let t = &inn.table;
+        inn.db
+            .transact(&RetryPolicy::default().max_attempts(1), |tx| {
+                let Some(version) = read_version(tx, t, from)? else {
+                    return Err(Tx::Stale);
+                };
+                for d in dests {
+                    if read_version(tx, t, *d)?.is_none() {
+                        return Err(Tx::Stale);
+                    }
+                }
+                let row = list_row(from);
+                let mut gained: HashMap<u32, i64> = HashMap::new();
+                for (id, dest) in moves {
+                    let Some(stored) = read_stored(tx, t, &row, id)? else {
+                        continue;
+                    };
+                    stored.input().put(tx, t, &list_row(*dest), id);
+                    tx.delete_column(t, &row, VEC, id).put_u64(
+                        t,
+                        &map_row(id),
+                        MAP,
+                        LIST,
+                        u64::from(*dest),
+                    );
+                    *gained.entry(*dest).or_default() += 1;
+                }
+                let lost: i64 = gained.values().sum();
+                if lost == 0 {
+                    return Err(Tx::Stale);
+                }
+                tx.incr(t, &count_row(from), CNT, b"", -lost).put_u64(
+                    t,
+                    &centroid_row(from),
+                    META,
+                    VERSION,
+                    version + 1,
+                );
+                for (dest, n) in &gained {
+                    tx.incr(t, &count_row(*dest), CNT, b"", *n);
+                }
+                #[cfg(feature = "__unstable-hooks")]
+                crate::hooks::hold(crate::hooks::Hold::ReassignBeforeCommit);
+                Ok(())
+            })
+            .map(|_| ())
     }
 
     /// Merges `list` into its nearest neighbour (D306 §3): one transaction that reads the
@@ -2675,6 +2971,26 @@ impl<'a> Search<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// audit120's N1 on #1861: a sample whose short side `two_means` filled from duplicates
+    /// ties its margins at the cut. The rule then moves the plan's share of the vectors at
+    /// the cut, spread by position, not none of them.
+    #[test]
+    fn a_rule_cut_at_tied_duplicates_moves_the_plans_share_of_them() {
+        let cen = VectorSpec::new(2, Element::F32, pigeonhole::Metric::L2).unwrap();
+        let mut sample = vec![Point::F32(vec![0.0, 0.0]); 30];
+        sample.extend([Point::F32(vec![10.0, 0.0]), Point::F32(vec![10.0, 0.0])]);
+        let plan = two_means(&cen, &sample, &Point::F32(vec![0.0, 0.0]), 8).unwrap();
+        // The far pair stays, and is filled to 8 from the duplicates: 24 of 30 move.
+        assert_eq!(plan.moving.len(), 24);
+        let rule = Rule::of(&cen, &sample, &plan, 32_000).unwrap();
+        let (dup, far) = (&sample[0], &sample[30]);
+        let moved = (0..1000)
+            .filter(|i| rule.moves(&cen, dup, *i).unwrap())
+            .count();
+        assert_eq!(moved, 800, "24 / 30 of the duplicates");
+        assert!((0..1000).all(|i| !rule.moves(&cen, far, i).unwrap()));
+    }
 
     fn layout(seqno: u64, version: u64) -> Layout {
         Layout {

@@ -4439,6 +4439,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
     });
 }
 
+mod admin;
 mod backup;
 mod charge;
 mod close;

@@ -60,8 +60,8 @@ pub(crate) enum ServiceOp {
     DropTable(proto::DropTableRequest),
     DescribeTable(proto::DescribeTableRequest),
     Info(proto::Empty),
-    Flush(proto::Empty),
-    Compact(proto::Empty),
+    Flush(proto::MaintenanceRequest),
+    Compact(proto::MaintenanceRequest),
     Backup(proto::BackupRequest),
     BackupDownload(proto::BackupDownloadRequest),
     Metrics(proto::Empty),
@@ -482,6 +482,13 @@ pub(crate) const PARTITION_ATTRIBUTE: &str = "pigeonhole.partition";
 /// A backup's partition named on a single node, which has none (D317 ticket 8b).
 fn single_node_partition() -> ApiError {
     ApiError::invalid("this server isn't a cluster node: a backup names no partition here")
+}
+
+/// A flush or compaction's partition named on a single node, which has none (#1852).
+fn single_node_maintenance() -> ApiError {
+    ApiError::invalid(
+        "this server isn't a cluster node: a flush or compaction names no partition here",
+    )
 }
 
 /// A last chunk's identity fields (D317 ticket 8b), empty on a single node.
@@ -1513,10 +1520,11 @@ impl Service {
         self.bulk_budget.available_permits()
     }
 
-    /// Takes `bytes` of the in-flight budget, waiting at most the request timeout: for a
-    /// front-end that knows a request's size before reading it (HTTP's `Content-Length`).
+    /// Takes `bytes` of the in-flight budget, waiting at most the request timeout: a call's
+    /// own, or for a front-end that knows a request's size before reading it (HTTP's
+    /// `Content-Length`).
     pub(crate) async fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
-        self.budget(bytes).await
+        budget_within(&self.inflight, bytes, self.limits.request_timeout).await
     }
 
     /// `reserve`, waiting at most `wait`.
@@ -1602,7 +1610,7 @@ impl Service {
         self.check(call, caller)?;
         match prepaid {
             Some(p) => Ok(p),
-            None => self.budget(call.size).await,
+            None => self.reserve(call.size).await,
         }
     }
 
@@ -1745,15 +1753,25 @@ impl Service {
                     tables,
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                     replica: self.replica_info(),
+                    partitions: Vec::new(),
+                    other_partitions: Vec::new(),
                 }))
             }
-            ServiceOp::Flush(_) => {
+            // On a cluster node the router serves these across its partitions (#1852): one
+            // that reaches here is a single node's, or a partition's own.
+            ServiceOp::Flush(r) => {
                 drop(budget);
+                if !r.partition.is_empty() {
+                    return Err(single_node_maintenance());
+                }
                 self.part()?.db.flush_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
-            ServiceOp::Compact(_) => {
+            ServiceOp::Compact(r) => {
                 drop(budget);
+                if !r.partition.is_empty() {
+                    return Err(single_node_maintenance());
+                }
                 self.part()?.db.compact_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
@@ -2192,10 +2210,6 @@ impl Service {
         ServiceReply::Charged(Box::new(reply), charge)
     }
 
-    async fn budget(&self, size: usize) -> Result<OwnedSemaphorePermit, ApiError> {
-        budget_within(&self.inflight, size, self.limits.request_timeout).await
-    }
-
     /// The table `name`, opened on first use. A miss opens it on the blocking pool (an open
     /// is a sync call, D196) and swaps in a new map.
     ///
@@ -2445,11 +2459,7 @@ impl Service {
                 "a replica can't be followed: follow its primary",
             ));
         }
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         super::replica::follow(
             &self.part()?.db,
             r.token.to_vec(),
@@ -2504,11 +2514,7 @@ impl Service {
         map_version: Option<u64>,
     ) -> Result<super::backup::Download, ApiError> {
         use super::backup::{Copy, CopyIdentity, Taken};
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         if r.replica && self.replica_info().is_some() {
             // No cascading replicas in 1.2.0 (simp724's P2 on #1436): this copy would carry
             // this server's own replication state.
@@ -2700,11 +2706,7 @@ impl Service {
         if r.offset > kept.total {
             return Err(past_the_copy(r.offset, kept.total));
         }
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         let (tx, rx) = mpsc::channel(1);
         let (pool, idle) = (Arc::clone(&self.blocking), self.limits.stream_idle);
         let metrics = Arc::clone(&self.metrics);
@@ -2743,21 +2745,13 @@ impl Service {
         })
     }
 
-    /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once.
-    async fn blocking<T: Send + 'static>(
+    /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once: a
+    /// call's own, or a `/mcp` request's messages, whose tools make sync database calls.
+    pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         blocking(&self.blocking, f).await
-    }
-
-    /// Runs `f` on the blocking pool, within its limit: a `/mcp` request's messages, whose
-    /// tools make sync database calls.
-    pub(crate) async fn run_blocking<T: Send + 'static>(
-        &self,
-        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
-    ) -> Result<T, ApiError> {
-        self.blocking(f).await
     }
 
     /// A `--max-streams` place, now or `Overloaded`: a feed or watch stream's, or a `/mcp`
@@ -3626,11 +3620,7 @@ impl Service {
                 "this server has no memory store (phdb serve --memory NAME)",
             ));
         };
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         super::memory::watch(
             core,
             crate::memcore::Scope(caller.namespaces.as_deref()),
