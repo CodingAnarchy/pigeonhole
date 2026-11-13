@@ -2110,7 +2110,7 @@ mod tests {
         (
             rt(1, None),
             rt(delivery_threads, Some("phdb-serve-feed")),
-            rt(1, Some("phdb-serve-feed-hub")),
+            rt(1, Some("phdb-serve-hub")),
         )
     }
 
