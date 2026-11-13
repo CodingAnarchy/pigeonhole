@@ -1,0 +1,2 @@
+### Fixed
+- **A change feed token taken before the feed delivered anything could resume past a gap** (audit P2-C6). The token named no writer session, so the resume skipped the check that the database's history still holds it. Resumed after a session that wrote with the change feed off, it went on without `FeedExpired`, and that session's commits were never delivered. A token now names its session from the moment the feed opens.
