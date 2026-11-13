@@ -607,15 +607,6 @@ enum Rooted {
     Never,
 }
 
-/// Which catalog changes are before a feed of every table's start, at open (D315), beside
-/// the reader's `catalog_bound` for `Oldest` and `After`.
-#[derive(Clone, Copy)]
-enum CatalogStart<'a> {
-    /// Those the start's catalog reflects: `Now` (the view's), `Snapshot` (its view's). Its
-    /// view was loaded before the sidecar was read, so no later entry can be reflected.
-    Reflected(&'a crate::catalog::Catalog),
-}
-
 /// Whether `catalog` reflects every one of a catalog change's `edits`. Ids only grow and are
 /// never reused, and an id is counted only once its change is published: a created table or
 /// family is reflected once the counter passed its id, a drop once the table is gone. That
@@ -980,7 +971,7 @@ impl FeedReader {
         // drops kept (D315). A token says the last one delivered; another start, its bound.
         if this.tables.is_empty() && this.expired.is_none() {
             let start = match &start_catalog {
-                Some(catalog) => Some(CatalogStart::Reflected(catalog)),
+                Some(catalog) => Some(&**catalog),
                 None if token_start => None,
                 None => {
                     this.catalog_bound = this.delivered;
@@ -2352,10 +2343,12 @@ impl FeedReader {
     /// changes of the feed's history not yet delivered. Called after the frontier F is
     /// loaded: the catalog hold keeps F below a change's ceiling until its entry is appended,
     /// so every change with a ceiling at most F + 1 is in the file by then. At open, `start`
-    /// says which changes are before a non-token start (a token says the last one delivered
-    /// instead). A passed-over or delivered change's drops are kept, so a dropped table's
-    /// later changes are passed over.
-    fn load_catalog(&mut self, start: Option<CatalogStart<'_>>) -> Result<()> {
+    /// is the catalog a `Now` or `Snapshot` start reflects (the view's, loaded before the
+    /// sidecar was read, so no later entry can be reflected): the changes it reflects are
+    /// before the start, beside the reader's `catalog_bound` for `Oldest` and `After`. A
+    /// token says the last change delivered instead. A passed-over or delivered change's
+    /// drops are kept, so a dropped table's later changes are passed over.
+    fn load_catalog(&mut self, start: Option<&crate::catalog::Catalog>) -> Result<()> {
         // Before the file is read: a change counted after this is loaded next time.
         if let Some(feed) = &self.writer {
             self.catalog_roots_seen = feed.catalog_roots();
@@ -2476,7 +2469,7 @@ impl FeedReader {
             }
             let before_start = seqno_ceiling <= self.catalog_bound
                 || match start {
-                    Some(CatalogStart::Reflected(catalog)) => {
+                    Some(catalog) => {
                         reflecting = reflecting && reflects(catalog, &edits);
                         reflecting
                     }

@@ -133,6 +133,7 @@ impl Uploads {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
+                // `.part.header` was written by 1.2 and never read; this run writes none.
                 if name.ends_with(".part")
                     || name.ends_with(".part.header")
                     || name.ends_with(".tmp")
@@ -243,7 +244,6 @@ impl Uploads {
         for id in stale {
             entries.remove(&id);
             let _ = std::fs::remove_file(self.dir.join(format!("{id}.part")));
-            let _ = std::fs::remove_file(self.dir.join(format!("{id}.part.header")));
         }
     }
 
@@ -320,10 +320,6 @@ impl Uploads {
             None => {
                 std::fs::File::create(&part)
                     .map_err(|e| ApiError::internal(format!("create {}: {e}", part.display())))?;
-                write_header(
-                    &self.dir.join(format!("{}.part.header", header.upload_id)),
-                    &header,
-                )?;
                 entries.insert(
                     header.upload_id.clone(),
                     Entry {
@@ -455,7 +451,6 @@ impl Writing {
             return Err(e);
         }
         sync_dir(dir);
-        let _ = std::fs::remove_file(dir.join(format!("{}.part.header", self.header.upload_id)));
         self.uploads.lock().remove(&self.header.upload_id);
         self.done = true;
         Ok(PartitionUploadReply {
@@ -468,11 +463,6 @@ impl Writing {
     fn forget(&mut self) {
         self.uploads.lock().remove(&self.header.upload_id);
         let _ = std::fs::remove_file(&self.part);
-        let _ = std::fs::remove_file(
-            self.uploads
-                .dir
-                .join(format!("{}.part.header", self.header.upload_id)),
-        );
         self.done = true;
     }
 }
