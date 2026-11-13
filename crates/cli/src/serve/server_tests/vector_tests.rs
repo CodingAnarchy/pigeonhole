@@ -608,7 +608,10 @@ fn a_bulk_load_fills_an_empty_index_over_grpc_and_http() {
 fn assert_not_retry_safe(err: &tonic::Status) {
     let detail = errors::ApiError::from_status(err).expect("a detail");
     assert!(!detail.detail().retry_safe, "{err:?}");
-    assert!(err.message().contains("were loaded"), "{err:?}");
+    assert!(
+        err.message().contains("were loaded") || err.message().contains("may have been loaded"),
+        "{err:?}"
+    );
 }
 
 /// Every load's reservation of `--bulk-load-bytes` is back, and the gauge says none.

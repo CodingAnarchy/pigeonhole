@@ -55,10 +55,14 @@ impl ApiError {
     pub(crate) fn applied_partly(mut self) -> Self {
         self.retry_from = RetryFrom::Unspecified;
         self.retry_after_ms = 0;
+        // The server's own stops say "the vectors before it were loaded": it ended the input
+        // there, and the crate wrote what it had. A failure inside the crate mid-load drops
+        // the batches still waiting, so only "some" is known (audit120's nit on #1835).
         if !self.message.contains("were loaded") {
             self.message.push_str(
-                "; the vectors before it were loaded, so the index is no longer empty: Insert \
-                 the rest, or drop it and load again",
+                "; some of the vectors before it may have been loaded, so the index may no \
+                 longer be empty: check it (Verify), then Insert the rest, or drop it and load \
+                 again",
             );
         }
         self
