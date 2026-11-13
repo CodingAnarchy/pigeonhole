@@ -633,8 +633,10 @@ enum CatalogStart<'a> {
 
 /// Whether `catalog` reflects every one of a catalog change's `edits`. Ids only grow and are
 /// never reused, and an id is counted only once its change is published: a created table or
-/// family is reflected once the counter passed its id, a drop once the table is gone. That
-/// holds for a prefix of the changes, checked in order.
+/// family is reflected once the counter passed its id, a drop once the table is gone and its
+/// id was counted (a catalog from before the table's create lacks it too: feed1248's S1 on
+/// #1870). That holds for a prefix of the changes, checked in order, and for each change on
+/// its own.
 fn reflects(
     catalog: &crate::catalog::Catalog,
     edits: &[pigeonhole_format::manifest::Edit],
@@ -643,7 +645,9 @@ fn reflects(
     edits.iter().all(|e| match e {
         Edit::CreateTable { table, .. } => table.0 < catalog.counters.next_table,
         Edit::PutFamily { family, .. } => family.0 < catalog.counters.next_family,
-        Edit::DropTable { table } => catalog.table(*table).is_none(),
+        Edit::DropTable { table } => {
+            table.0 < catalog.counters.next_table && catalog.table(*table).is_none()
+        }
         _ => true,
     })
 }
@@ -1615,8 +1619,11 @@ impl FeedReader {
         if h.all_tables {
             self.catalog_seq = h.catalog_seq;
             self.catalog_bound = h.catalog_bound;
-            self.claim = h.catalog;
-            self.claim_known = Some(h.catalog_seq);
+            // Checked only by a feed of every table (`deriving`).
+            if self.tables.is_empty() {
+                self.claim = h.catalog;
+                self.claim_known = Some(h.catalog_seq);
+            }
         }
         self.delivered = delivered;
         self.session = session;
@@ -3039,6 +3046,115 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pigeonhole_format::manifest::Edit;
+
+    /// A catalog with tables `ids` and the counters given (feed1248's S2 on #1870: `Derive`
+    /// on hand-built catalogs).
+    fn catalog(ids: &[u32], next_table: u32, next_family: u32) -> Arc<crate::catalog::Catalog> {
+        let mut c = crate::catalog::Catalog::default();
+        for &id in ids {
+            c.apply(
+                &Edit::CreateTable {
+                    table: TableId(id),
+                    name: format!("t{id}"),
+                },
+                1,
+            )
+            .unwrap();
+        }
+        c.counters.next_table = next_table;
+        c.counters.next_family = next_family;
+        Arc::new(c)
+    }
+
+    fn create(id: u32, family: u32) -> Vec<Edit> {
+        vec![
+            Edit::CreateTable {
+                table: TableId(id),
+                name: format!("t{id}"),
+            },
+            Edit::PutFamily {
+                table: TableId(id),
+                family: FamilyId(family),
+                name: "f".into(),
+                options: Default::default(),
+            },
+        ]
+    }
+
+    fn drop_table(id: u32) -> Vec<Edit> {
+        vec![Edit::DropTable { table: TableId(id) }]
+    }
+
+    #[test]
+    fn derive_puts_in_what_a_lagging_view_lacks_before_the_start() {
+        // The start's catalog: tables 1 and 2, counters past both. The view lags table 2's
+        // create, which is before the start.
+        let start = catalog(&[1, 2], 3, 3);
+        let mut d = Derive::new(catalog(&[1], 2, 2), None);
+        d.before(&create(1, 1));
+        d.before(&create(2, 2));
+        assert_eq!(d.finish(None).unwrap(), CatalogModel::of(&start));
+    }
+
+    #[test]
+    fn derive_leaves_out_a_create_and_drop_a_lagging_view_never_saw() {
+        // S1: the view lags table 2's create and its drop, both before the start. The drop
+        // isn't reflected by a view that never counted table 2.
+        let start = catalog(&[1], 3, 3);
+        let mut d = Derive::new(catalog(&[1], 2, 2), None);
+        d.before(&create(2, 2));
+        d.before(&drop_table(2));
+        let model = d.finish(None).unwrap();
+        assert_eq!(model.tables, CatalogModel::of(&start).tables);
+        // With the start's claim, no false expiry.
+        let mut d = Derive::new(catalog(&[1], 2, 2), None);
+        d.before(&create(2, 2));
+        d.before(&drop_table(2));
+        assert_eq!(
+            d.finish(Some(CatalogModel::of(&start))),
+            Ok(CatalogModel::of(&start))
+        );
+    }
+
+    #[test]
+    fn derive_takes_out_a_change_after_the_start_the_view_reflects_in_order() {
+        let at_start = catalog(&[1], 2, 2);
+        // A pending change the view already reflects is taken out (the `Rooted::Pending`
+        // arm's call).
+        let mut d = Derive::new(catalog(&[1, 2], 3, 3), None);
+        d.after(&create(2, 2));
+        assert_eq!(d.finish(None).unwrap(), CatalogModel::of(&at_start));
+        // The prefix stops at the first change the view doesn't reflect: a later one isn't
+        // taken out, though on its own it looks reflected (table 3 counted and absent).
+        let mut d = Derive::new(catalog(&[1], 4, 4), None);
+        d.after(&create(5, 5));
+        d.after(&drop_table(3));
+        let model = d.finish(None).unwrap();
+        assert_eq!(model.tables, CatalogModel::of(&at_start).tables);
+    }
+
+    #[test]
+    fn derive_checks_a_claim() {
+        let claim = CatalogModel::of(&catalog(&[1], 2, 2));
+        // Equal, with a recorded create after the start the view reflects.
+        let mut d = Derive::new(catalog(&[1, 2], 3, 3), None);
+        d.after(&create(2, 2));
+        assert_eq!(d.check(Some(claim)), Ok(claim));
+        // An extra table no change recorded.
+        let d = Derive::new(catalog(&[1, 2], 3, 3), None);
+        assert!(d.check(Some(claim)).unwrap_err().contains("tables"));
+        // A table counter no recorded change accounts for (a create and drop unrecorded).
+        let d = Derive::new(catalog(&[1], 3, 2), None);
+        assert!(
+            d.check(Some(claim))
+                .unwrap_err()
+                .contains("table was created")
+        );
+        // A family counter, likewise (a family added unrecorded).
+        let d = Derive::new(catalog(&[1], 2, 3), None);
+        assert!(d.check(Some(claim)).unwrap_err().contains("family"));
+    }
 
     fn session(session: u64, opened_at: u64) -> FeedEntry {
         FeedEntry::Session {

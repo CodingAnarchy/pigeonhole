@@ -4809,7 +4809,7 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 **On resume** (a version 3 token):
 1. The reader takes the live catalog's table ids and counters.
 2. It works back through the rooted Catalog entries the history holds after the token's catalog position: a create removes its id, a drop restores its id.
-3. If the result's hash isn't the token's `tables`, the resume answers `FeedExpired`. It also expires if a live counter is above both the token's value and one past the largest id a recorded create or added family carries.
+3. If the result's hash isn't the token's `tables`, the resume answers `FeedExpired`. It also expires if a live counter isn't what the token's value and the recorded creates and added families account for: the larger of the token's value and one past the largest id they carry.
 4. While delivering, the reader applies each catalog change to its set and counters, so every token it hands out carries its own position's values.
 
 **What "the start" is.** The reference is the token's own last catalog change (`catalog_seq`): its model holds the changes up to it and none after. A change after it that the token's bound passes over is compared as after the start, then put in. That's a change appended after the token was taken, while its commit was already below the bound (simp724's F1 race on #1515). The view a start sees can lag the sidecar too: a reader process's view, or a change appended but not yet published. So changes before the start that the view doesn't reflect yet are put in, and changes after it are taken out only while the view reflects them, a prefix in order (`reflects`, D315).
