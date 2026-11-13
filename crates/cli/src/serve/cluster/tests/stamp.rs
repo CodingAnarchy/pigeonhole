@@ -300,11 +300,11 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
 }
 
 /// A `phdb cluster move` run again after an earlier one stamped the new node but died
-/// before the map moved: it finishes the move, but can't compare the set again (the stamp
-/// installs nothing this time), so it says the copy isn't re-verified and keeps the old
-/// node's files even with `--drop-source`.
+/// before the map moved: it copies the old node's closed set again, the stamp installs it
+/// over the earlier copy (which moves aside), and the move compares it, so `--drop-source`
+/// drops the old node's files.
 #[test]
-fn a_move_run_again_after_its_stamp_finishes_but_drops_nothing() {
+fn a_move_run_again_after_its_stamp_copies_and_checks_the_set_again() {
     use crate::serve::proto::PartitionRequest;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let listeners: Vec<std::net::TcpListener> = (0..3)
@@ -373,12 +373,21 @@ fn a_move_run_again_after_its_stamp_finishes_but_drops_nothing() {
         let r = within(super::super::moving::run(&args, "p1", "c", true, None))
             .await
             .unwrap();
-        assert_eq!(r.document["verified"], false, "{:?}", r.document);
+        assert_eq!(r.document["verified"], true, "{:?}", r.document);
         let source = r.document["source"].as_str().unwrap();
-        assert!(source.contains("not re-verified"), "{source}");
-        assert!(source.contains("drop-partition p1"), "{source}");
-        assert!(!r.document.contains_key("dropped"), "{:?}", r.document);
-        assert!(dirs[0].join("p1.phdb").exists(), "a's files stay");
+        assert!(source.starts_with("moved aside"), "{source}");
+        assert!(r.document.contains_key("dropped"), "{:?}", r.document);
+        assert!(!dirs[0].join("p1.phdb").exists(), "a's files went aside");
+        // The earlier copy on c went aside, never deleted.
+        let aside = std::fs::read_dir(&dirs[2])
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with("p1.phdb.replaced-")
+            })
+            .count();
+        assert_eq!(aside, 1, "c's earlier copy of the main file");
         // The move itself finished: c serves p1, with its history kept.
         assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
         let m = client(b)
