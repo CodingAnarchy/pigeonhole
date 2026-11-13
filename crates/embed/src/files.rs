@@ -132,12 +132,26 @@ pub(crate) fn store(path: &Path, file: &File, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(io(&tmp)(e));
     }
-    // Another process may have put the same verified file there first: the rename replaces
-    // it with identical bytes.
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        io(path)(e)
-    })
+    // Another thread or process may have put the same verified file there first: the rename
+    // replaces it with identical bytes.
+    let Err(e) = std::fs::rename(&tmp, path) else {
+        return Ok(());
+    };
+    let _ = std::fs::remove_file(&tmp);
+    // A rename that lost to another one of the same file isn't a failure (cli692's S1 on
+    // #1821): Windows refuses to replace a file another rename or a reader holds at that
+    // moment ("access denied"), where Unix replaces it. If the file under the final name
+    // is the verified one, this store has what it came for. The other rename may still be
+    // finishing, so the look is repeated for a moment before the error stands.
+    for attempt in 0..10 {
+        if std::fs::read(path).is_ok_and(|there| check(path, file, &there).is_ok()) {
+            return Ok(());
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    Err(io(path)(e))
 }
 
 #[cfg(feature = "download")]
@@ -456,7 +470,9 @@ mod tests {
     #[test]
     fn threads_storing_one_file_at_once_all_succeed() {
         // One temporary name a process made two threads write and rename the same file: the
-        // second rename found it gone. Each call has its own name now.
+        // second rename found it gone. Each call has its own name now. And a rename that
+        // loses to another's on Windows ("access denied" while the target is being replaced)
+        // succeeds once the verified file is there: that half only shows on Windows.
         let file = File {
             name: "x.bin",
             sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
