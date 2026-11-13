@@ -552,3 +552,88 @@ fn a_node_whose_map_is_behind_cant_unfence_a_partition_its_peers_moved() {
         assert_ne!(code(&e), "", "a write a refused: {e}");
     });
 }
+
+#[test]
+fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
+    // simp724's S1 on #1826: the first peer whose map named the node was enough, so a peer
+    // that missed the same move confirmed the unfence while another peer's newer map had
+    // moved the partition. a and b hold version 1; c holds version 2, which gives p1 to c.
+    // The newest answer counts: the unfence on a is refused.
+    let mut t = Rig::start();
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async { fence(a, "p1").await.unwrap() });
+    t.stop(0);
+    t.stop(1);
+    // With a and b down, c alone takes a map that gives it every partition.
+    t.rt.block_on(async {
+        let mut m = client(c)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.nodes.retain(|n| n.id == "c");
+        for p in m.partitions.iter_mut().filter(|p| p.node != "c") {
+            p.node = "c".into();
+            p.epoch += 1;
+        }
+        client(c)
+            .await
+            .set_map(SetMapRequest {
+                force: true,
+                expected_map_version: 0,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+    });
+    // a and b come back while c is away, so neither learns version 2; c comes back with a
+    // map that lists only itself, so it tells nobody.
+    t.stop(2);
+    t.restart(0);
+    t.restart(1);
+    t.restart(2);
+    t.rt.block_on(async {
+        eventually("c to answer with its map", async || {
+            client(c)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .is_ok_and(|m| m.into_inner().map_version == 2)
+        })
+        .await;
+        assert_eq!(version(t.ports[1]).await, 1, "b missed the move too");
+        assert_eq!(reason(a, "p1").await, FenceReason::Operator);
+        let e = unfence(a, "p1").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert_ne!(state(a, "p1").await, LocalPartitionState::Serving);
+    });
+}
+
+#[test]
+fn a_refused_unfence_leaves_a_closed_partition_closed() {
+    // simp724's N1 on #1826: the closed partition reopened before the peer check, so a
+    // refused unfence left it open, its files' hashes gone.
+    let mut t = Rig::start();
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        fence(a, "p1").await.unwrap();
+        client(a)
+            .await
+            .close(PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    });
+    t.stop(1);
+    t.stop(2);
+    t.rt.block_on(async {
+        let e = unfence(a, "p1").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert_eq!(state(a, "p1").await, LocalPartitionState::Closed);
+    });
+}
