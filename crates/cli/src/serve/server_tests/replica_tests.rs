@@ -1293,13 +1293,25 @@ fn a_promote_that_fails_after_the_stop_reports_a_replica_that_follows_nothing() 
 }
 
 /// A replica whose primary's schema changed without a record in its feed (#1853): a 1.1.x
-/// session after a rollback writes no Catalog entry, so the feed delivers a commit to a table
-/// the replica was never told of, and its apply is refused for ever from the same token. The
-/// replica bootstraps again instead, and catches up with the new table. The 1.1.x session is
-/// made here as 1.1.x leaves the sidecar: 1.2's session with its Catalog entries cut (the
-/// pigeonhole crate's `schema-rollback-1.1.3` corpus is 1.1.3's own bytes for the same case).
+/// session after a rollback writes no Catalog entry. The replica bootstraps again, and
+/// catches up with the primary's tables:
+/// - `created` (a table created and written to): the primary's feed resumes from the
+///   replica's token no further (its catalog check, D325), and an apply of a commit to the
+///   table would be refused (a replica of 1.2, whose token has no catalog to check);
+/// - `dropped`: only the primary's check sees it; with no commit to the dropped table, the
+///   replica would apply on and keep it.
+///
+/// The 1.1.x session is made here as 1.1.x leaves the sidecar: 1.2's session with its Catalog
+/// entries cut (the pigeonhole crate's `schema-rollback-1.1.3` corpus is 1.1.3's own bytes for
+/// the same cases).
 #[test]
 fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
+    for case in ["created", "dropped"] {
+        replica_across_an_unrecorded_schema_change(case);
+    }
+}
+
+fn replica_across_an_unrecorded_schema_change(case: &str) {
     use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader};
     let options = || {
         Options::default()
@@ -1320,12 +1332,14 @@ fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
             .commit()
             .unwrap();
     };
-    primary
-        .table("t")
-        .unwrap()
-        .family("f", Family::default())
-        .create()
-        .unwrap();
+    for table in ["t", "d"] {
+        primary
+            .table(table)
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+    }
     put(&primary, "t", b"t0");
     let snap = primary.durable_snapshot().unwrap();
     primary.backup_at(&snap, rdir.join("t.phdb")).unwrap();
@@ -1338,15 +1352,21 @@ fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
     let sidecar = pdir.join(format!("t.phdb{FEED_SUFFIX}"));
     let recorded = std::fs::read(&sidecar).unwrap().len();
 
-    // The "1.1.x" session: a table created and written to, its Catalog entries cut.
+    // The "1.1.x" session: its schema change, then a commit; its Catalog entries cut.
     let primary = Pigeonhole::open(pdir.join("t.phdb"), options()).unwrap();
-    primary
-        .table("c")
-        .unwrap()
-        .family("f", Family::default())
-        .create()
-        .unwrap();
-    put(&primary, "c", b"c1");
+    match case {
+        "created" => {
+            primary
+                .table("c")
+                .unwrap()
+                .family("f", Family::default())
+                .create()
+                .unwrap();
+            put(&primary, "c", b"c1");
+        }
+        "dropped" => primary.drop_table("d").unwrap(),
+        _ => unreachable!(),
+    }
     put(&primary, "t", b"t1");
     primary.close().unwrap();
     let bytes = std::fs::read(&sidecar).unwrap();
@@ -1366,7 +1386,7 @@ fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
     }
     assert!(
         recorded >= FeedHeader::LEN && cut == 1,
-        "one Catalog entry cut: {cut}"
+        "{case}: one Catalog entry cut: {cut}"
     );
     std::fs::write(&sidecar, kept).unwrap();
 
@@ -1374,8 +1394,13 @@ fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
     let p = Server::serve(pdir, primary, "", limits(), None, |s| s);
     let r = Server::start_replica(rdir, &p.url, None);
     wait_replica(&r, "caught up again", caught_up(&p, None));
-    // Table `c` reaches the replica only in a new bootstrap's copy: the feed never delivered
-    // its create, and an apply of a commit to it is refused.
-    assert_eq!(get_value(&r, "c", "r", None), b64(b"c1"));
-    assert_eq!(get_value(&r, "t", "r", None), b64(b"t1"));
+    assert_eq!(get_value(&r, "t", "r", None), b64(b"t1"), "{case}");
+    // Only a new bootstrap's copy brings the change: the feed never delivered it.
+    let mut tables = r.shared.router.service.part().unwrap().db.tables();
+    tables.sort();
+    match case {
+        "created" => assert_eq!(get_value(&r, "c", "r", None), b64(b"c1")),
+        "dropped" => assert_eq!(tables, ["t"], "{case}: the drop"),
+        _ => unreachable!(),
+    }
 }

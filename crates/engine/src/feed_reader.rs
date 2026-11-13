@@ -49,6 +49,12 @@ const TOKEN_VERSION: u8 = 1;
 /// resuming every table from it would skip them. A build that doesn't know this version
 /// refuses the token as not one (`InvalidArgument`), never misreading it.
 const TOKEN_VERSION_ALL: u8 = 2;
+/// A token from a feed of every table that also carries the catalog at its position
+/// ([`CatalogModel`], D325, ICR 0136): version 2's layout, then 16 bytes. A resume checks it
+/// against the live catalog, so a schema change no catalog entry recorded (a 1.1.x session's,
+/// after a rollback) expires the feed. 1.2.0 refuses it (`InvalidArgument`); 1.2.1 reads it as
+/// version 2.
+const TOKEN_VERSION_ALL_CATALOG: u8 = 3;
 
 /// Where a feed starts.
 #[derive(Debug, Clone)]
@@ -554,6 +560,15 @@ pub struct FeedReader {
     /// Every table a catalog change in the sidecar creates, read so far: a reader process's
     /// view can lag the writer's manifest, and miss a table this feed already has a commit to.
     recorded_creates: HashSet<TableId>,
+    /// A feed of every table: the catalog at its position (D325), which its tokens carry.
+    /// `None` until the open works it out, and for a feed of some tables.
+    model: Option<CatalogModel>,
+    /// What a version 3 token says the catalog was at its position, checked at open.
+    claim: Option<CatalogModel>,
+    /// A token's last catalog change (its `catalog_seq`), for the check at open.
+    claim_known: Option<u64>,
+    /// At open, until the first sidecar load: the catalog the start sees.
+    deriving: Option<Arc<crate::catalog::Catalog>>,
     out_catalog: CatalogEvent,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
@@ -631,6 +646,207 @@ fn reflects(
         Edit::DropTable { table } => catalog.table(*table).is_none(),
         _ => true,
     })
+}
+
+/// The catalog at a feed of every table's position, as its token carries it (D325): an
+/// order-independent hash of its table ids and its id counters. The catalog changes a feed
+/// records are a table created with its families, a family added and a table dropped
+/// (D315). Ids are never reused and the counters only rise, so a create or an added family
+/// no change recorded raises a counter past what the recorded ones account for, and a drop
+/// no change recorded changes the set. The replica's state table (reserved, D315 PR 3) is
+/// left out: it comes and goes without a catalog change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CatalogModel {
+    /// The wrapping sum of xxh3-64 over each table id's little-endian bytes.
+    tables: u64,
+    next_table: u32,
+    next_family: u32,
+}
+
+impl CatalogModel {
+    /// The bytes it adds to a token.
+    const LEN: usize = 16;
+
+    fn table_hash(table: TableId) -> u64 {
+        pigeonhole_format::checksum::xxh3_64(&table.0.to_le_bytes())
+    }
+
+    fn of(catalog: &crate::catalog::Catalog) -> Self {
+        let tables = catalog
+            .tables()
+            .map(|t| t.id)
+            .filter(|t| !crate::engine::is_reserved_table(*t))
+            .fold(0u64, |h, t| h.wrapping_add(Self::table_hash(t)));
+        Self {
+            tables,
+            next_table: catalog.counters.next_table,
+            next_family: catalog.counters.next_family,
+        }
+    }
+
+    /// Moves it past a catalog change.
+    fn apply(&mut self, edits: &[pigeonhole_format::manifest::Edit]) {
+        use pigeonhole_format::manifest::Edit;
+        for e in edits {
+            match e {
+                Edit::CreateTable { table, .. } if !crate::engine::is_reserved_table(*table) => {
+                    self.tables = self.tables.wrapping_add(Self::table_hash(*table));
+                    self.next_table = self.next_table.max(table.0 + 1);
+                }
+                Edit::PutFamily { family, .. } => {
+                    self.next_family = self.next_family.max(family.0 + 1);
+                }
+                Edit::DropTable { table } if !crate::engine::is_reserved_table(*table) => {
+                    self.tables = self.tables.wrapping_sub(Self::table_hash(*table));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.tables.to_le_bytes());
+        out.extend_from_slice(&self.next_table.to_le_bytes());
+        out.extend_from_slice(&self.next_family.to_le_bytes());
+    }
+
+    fn decode(b: &[u8]) -> Self {
+        Self {
+            tables: u64::from_le_bytes(b[..8].try_into().unwrap()),
+            next_table: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            next_family: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+        }
+    }
+}
+
+/// The catalog model at a feed of every table's start, worked out at open from the catalog
+/// it sees there and the sidecar's catalog changes (D325). `v` is loaded before the sidecar
+/// is read, so it reflects a prefix of the changes, all with their entries in the file.
+/// Changes after the start that `v` reflects are taken back out; changes before the start
+/// that it doesn't reflect yet (a reader process's view can lag, or a change can be
+/// appended but not yet published) are put in.
+struct Derive {
+    v: Arc<crate::catalog::Catalog>,
+    /// `v`'s model, with the changes before the start it lacks put in.
+    model: CatalogModel,
+    /// Whether the changes after the start seen so far are all reflected by `v`.
+    reflecting: bool,
+    /// The smallest table and family ids a change after the start that `v` reflects
+    /// created, and the largest: the counters at the start were at most the smallest, and
+    /// the live ones are one past the largest at least.
+    created_tables: Option<(u32, u32)>,
+    created_families: Option<(u32, u32)>,
+    /// A token's last catalog change: its model holds those up to it and no later one. A
+    /// later change its bound passes over (one appended after the token was taken) is
+    /// compared as after the start, then put in.
+    known: Option<u64>,
+    late: Vec<Vec<pigeonhole_format::manifest::Edit>>,
+}
+
+impl Derive {
+    fn new(v: Arc<crate::catalog::Catalog>, known: Option<u64>) -> Self {
+        let model = CatalogModel::of(&v);
+        Self {
+            v,
+            model,
+            reflecting: true,
+            created_tables: None,
+            created_families: None,
+            known,
+            late: Vec::new(),
+        }
+    }
+
+    /// A change the start passes over: before the start, unless a token's model can't hold
+    /// it yet.
+    fn passed_over(&mut self, sequence: u64, edits: &[pigeonhole_format::manifest::Edit]) {
+        if self.known.is_some_and(|k| sequence > k) {
+            self.after(edits);
+            self.late.push(edits.to_vec());
+        } else {
+            self.before(edits);
+        }
+    }
+
+    /// A change before the start.
+    fn before(&mut self, edits: &[pigeonhole_format::manifest::Edit]) {
+        if !reflects(&self.v, edits) {
+            self.model.apply(edits);
+        }
+    }
+
+    /// A change after the start, in order (D315: reflected as a prefix).
+    fn after(&mut self, edits: &[pigeonhole_format::manifest::Edit]) {
+        use pigeonhole_format::manifest::Edit;
+        self.reflecting = self.reflecting && reflects(&self.v, edits);
+        if !self.reflecting {
+            return;
+        }
+        let widen = |r: &mut Option<(u32, u32)>, id: u32| {
+            *r = Some(r.map_or((id, id), |(lo, hi)| (lo.min(id), hi.max(id))));
+        };
+        for e in edits {
+            match e {
+                Edit::CreateTable { table, .. } if !crate::engine::is_reserved_table(*table) => {
+                    self.model.tables = self
+                        .model
+                        .tables
+                        .wrapping_sub(CatalogModel::table_hash(*table));
+                    widen(&mut self.created_tables, table.0);
+                }
+                Edit::PutFamily { family, .. } => widen(&mut self.created_families, family.0),
+                Edit::DropTable { table } if !crate::engine::is_reserved_table(*table) => {
+                    self.model.tables = self
+                        .model
+                        .tables
+                        .wrapping_add(CatalogModel::table_hash(*table));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The model at the start: `claim`'s (a version 3 token's), if the catalog agrees with
+    /// it, else the reason it doesn't; with no claim, the one worked out here.
+    fn finish(mut self, claim: Option<CatalogModel>) -> std::result::Result<CatalogModel, String> {
+        let late = std::mem::take(&mut self.late);
+        let mut model = self.check(claim)?;
+        for edits in &late {
+            model.apply(edits);
+        }
+        Ok(model)
+    }
+
+    fn check(self, claim: Option<CatalogModel>) -> std::result::Result<CatalogModel, String> {
+        let live = self.model;
+        let Some(claim) = claim else {
+            return Ok(CatalogModel {
+                tables: live.tables,
+                next_table: self
+                    .created_tables
+                    .map_or(live.next_table, |(lo, _)| lo.min(live.next_table)),
+                next_family: self
+                    .created_families
+                    .map_or(live.next_family, |(lo, _)| lo.min(live.next_family)),
+            });
+        };
+        let expect =
+            |at: u32, created: Option<(u32, u32)>| created.map_or(at, |(_, hi)| at.max(hi + 1));
+        if live.tables != claim.tables {
+            return Err(
+                "the catalog's tables aren't the token's with the recorded changes \
+                        since: a table was created or dropped"
+                    .into(),
+            );
+        }
+        if live.next_table != expect(claim.next_table, self.created_tables) {
+            return Err("a table was created".into());
+        }
+        if live.next_family != expect(claim.next_family, self.created_families) {
+            return Err("a family was added".into());
+        }
+        Ok(claim)
+    }
 }
 
 /// A reader process's first and longest waits between polls: it watches the writer's
@@ -859,6 +1075,10 @@ impl FeedReader {
             dropped_tables: HashSet::new(),
             recorded_drops: HashSet::new(),
             recorded_creates: HashSet::new(),
+            model: None,
+            claim: None,
+            claim_known: None,
+            deriving: None,
             out_catalog: CatalogEvent::default(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
@@ -979,6 +1199,11 @@ impl FeedReader {
         // A feed of every table: the catalog changes before its start are passed over, their
         // drops kept (D315). A token says the last one delivered; another start, its bound.
         if this.tables.is_empty() && this.expired.is_none() {
+            // The catalog the start sees, before the sidecar is read (D325).
+            this.deriving = Some(match &start_catalog {
+                Some(catalog) => Arc::clone(catalog),
+                None => Arc::clone(&(this.view)()?.catalog),
+            });
             let start = match &start_catalog {
                 Some(catalog) => Some(CatalogStart::Reflected(catalog)),
                 None if token_start => None,
@@ -1288,7 +1513,9 @@ impl FeedReader {
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
     /// commit [`FeedReader::try_next`] returned, never inside one (§2.5).
     pub fn token(&self) -> Vec<u8> {
-        let mut t = Vec::with_capacity(1 + 16 + 4 + 8 + 8 + 16 * self.streams.len() + 16);
+        let mut t = Vec::with_capacity(
+            1 + 16 + 4 + 8 + 8 + 16 * self.streams.len() + 16 + CatalogModel::LEN,
+        );
         t.push(if self.tables.is_empty() {
             TOKEN_VERSION_ALL
         } else {
@@ -1307,6 +1534,11 @@ impl FeedReader {
         if self.tables.is_empty() {
             t.extend_from_slice(&self.catalog_seq.to_le_bytes());
             t.extend_from_slice(&self.catalog_bound.to_le_bytes());
+            // The catalog at the position (D325), once the open worked it out.
+            if let Some(m) = &self.model {
+                t[0] = TOKEN_VERSION_ALL_CATALOG;
+                m.encode(&mut t);
+            }
         }
         t
     }
@@ -1383,6 +1615,8 @@ impl FeedReader {
         if h.all_tables {
             self.catalog_seq = h.catalog_seq;
             self.catalog_bound = h.catalog_bound;
+            self.claim = h.catalog;
+            self.claim_known = Some(h.catalog_seq);
         }
         self.delivered = delivered;
         self.session = session;
@@ -2009,6 +2243,9 @@ impl FeedReader {
                     .is_none_or(|(&k, _)| k >= ev.seqno_ceiling)
             {
                 let (ev, session) = self.catalog.pop_front().expect("checked");
+                if let Some(m) = &mut self.model {
+                    m.apply(&ev.edits);
+                }
                 self.note_drops(&ev.edits);
                 self.catalog_seq = ev.sequence;
                 self.raise_session(session);
@@ -2092,11 +2329,12 @@ impl FeedReader {
             };
             // A feed of every table (#1853): a table the catalog no longer has was dropped,
             // and every drop appends its catalog change to the sidecar before the catalog
-            // loses the table. A change to a table no recorded drop explains, after the file
-            // is read again for one that raced this view, was dropped by a session that
-            // records no catalog changes: a 1.1.x session after a rollback. Catalog changes
-            // are then missing from the history (that session's creates too), so the feed
-            // expires rather than deliver a commit it can't name and go on without them.
+            // loses the table. If no recorded drop explains a table missing from the view,
+            // even after reading the sidecar again (a drop can race the view), the table was
+            // dropped by a session that records no catalog changes: a 1.1.x session after a
+            // rollback. Catalog changes are then missing from the history (that session's
+            // creates too), so the feed expires rather than deliver a commit it can't name
+            // and go on without them.
             // In a reader process, whose view can lag the writer's manifest, a table a
             // recorded change created may be missing from the view without a drop.
             if self.tables.is_empty() {
@@ -2117,8 +2355,19 @@ impl FeedReader {
                                 && !(lagging && this.recorded_creates.contains(&t))
                         })
                 };
+                // A cheap check first: most commits never read the sidecar again.
                 if unexplained(self).is_some() {
                     self.load_catalog(None)?;
+                    // The re-read finds only a change that raced the view, whose ceiling is
+                    // above this commit: the catalog hold (D315) kept this commit from being
+                    // emittable while any change at or below it was unloaded (feed1248's Q1
+                    // on #1857).
+                    debug_assert!(
+                        self.catalog
+                            .front()
+                            .is_none_or(|(ev, _)| ev.seqno_ceiling > key),
+                        "a catalog change at or below seqno {key} was loaded after it was popped"
+                    );
                 }
                 if let Some(table) = unexplained(self) {
                     self.expired = Some(expiry(format!(
@@ -2356,6 +2605,37 @@ impl FeedReader {
     /// instead). A passed-over or delivered change's drops are kept, so a dropped table's
     /// later changes are passed over.
     fn load_catalog(&mut self, start: Option<CatalogStart<'_>>) -> Result<()> {
+        // At open, the catalog model at the start is worked out from this first load (D325)
+        // and checked against a version 3 token's.
+        // A token's start knows the changes up to its last one (`catalog_seq`, set from it).
+        let known = self.claim_known;
+        let mut derive = self.deriving.take().map(|v| Derive::new(v, known));
+        let loaded = self.load_catalog_entries(start, &mut derive);
+        if let Some(d) = derive {
+            match d.finish(self.claim.take()) {
+                Ok(model) => self.model = Some(model),
+                Err(why) => {
+                    if self.expired.is_none() {
+                        self.expired = Some(expiry(format!(
+                            "the catalog changed since the token without a record in the \
+                             feed ({why}): a session that records no catalog changes (a \
+                             1.1.x build's, after a rollback) changed the tables, so the feed \
+                             can't deliver those changes"
+                        )));
+                    }
+                }
+            }
+        }
+        loaded
+    }
+
+    /// [`load_catalog`](Self::load_catalog)'s read of the sidecar, each catalog change also
+    /// given to `derive` at open.
+    fn load_catalog_entries(
+        &mut self,
+        start: Option<CatalogStart<'_>>,
+        derive: &mut Option<Derive>,
+    ) -> Result<()> {
         // Before the file is read: a change counted after this is loaded next time.
         if let Some(feed) = &self.writer {
             self.catalog_roots_seen = feed.catalog_roots();
@@ -2463,6 +2743,10 @@ impl FeedReader {
             match rooted[i] {
                 Rooted::Yes => {}
                 Rooted::Pending => {
+                    // It may be published already, and seen by the start (D325).
+                    if let Some(d) = derive {
+                        d.after(&edits);
+                    }
                     self.sidecar_pos = from + at as u64;
                     break;
                 }
@@ -2483,10 +2767,19 @@ impl FeedReader {
                     None => sequence <= self.catalog_seq,
                 };
             if before_start {
+                // Before the position: in its catalog model (D325).
+                match (derive.as_mut(), self.model.as_mut()) {
+                    (Some(d), _) => d.passed_over(sequence, &edits),
+                    (None, Some(m)) => m.apply(&edits),
+                    (None, None) => {}
+                }
                 self.note_drops(&edits);
                 self.catalog_seq = self.catalog_seq.max(sequence);
                 self.raise_session(session);
                 continue;
+            }
+            if let Some(d) = derive {
+                d.after(&edits);
             }
             self.catalog.push_back((
                 CatalogEvent {
@@ -2674,20 +2967,35 @@ struct TokenHeader<'a> {
     /// A feed of every table's last catalog change delivered, and its start's bound (D315).
     catalog_seq: u64,
     catalog_bound: u64,
+    /// Version 3's catalog at the position (D325).
+    catalog: Option<CatalogModel>,
 }
 
 impl<'a> TokenHeader<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self> {
         let bad = || Error::InvalidArgument("not a change feed token".into());
         let (&version, rest) = bytes.split_first().ok_or_else(bad)?;
-        if !matches!(version, TOKEN_VERSION | TOKEN_VERSION_ALL) || rest.len() < 16 + 4 + 8 + 8 {
+        if !matches!(
+            version,
+            TOKEN_VERSION | TOKEN_VERSION_ALL | TOKEN_VERSION_ALL_CATALOG
+        ) || rest.len() < 16 + 4 + 8 + 8
+        {
             return Err(bad());
         }
         let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-        let all_tables = version == TOKEN_VERSION_ALL;
+        let all_tables = version != TOKEN_VERSION;
         let streams = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
         let mut per = &rest[36..];
         let (mut catalog_seq, mut catalog_bound) = (0, 0);
+        let mut catalog = None;
+        // Version 3: the catalog at the position, last (D325).
+        if version == TOKEN_VERSION_ALL_CATALOG {
+            let Some(split) = per.len().checked_sub(CatalogModel::LEN) else {
+                return Err(bad());
+            };
+            catalog = Some(CatalogModel::decode(&per[split..]));
+            per = &per[..split];
+        }
         if all_tables {
             // The last catalog change delivered and the start's bound, after the streams'
             // positions (D315).
@@ -2710,6 +3018,7 @@ impl<'a> TokenHeader<'a> {
             per,
             catalog_seq,
             catalog_bound,
+            catalog,
         })
     }
 }
