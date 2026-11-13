@@ -1041,7 +1041,7 @@ pub struct Pinning {
 }
 
 /// A started driver: its handle (its shards' handlers come back at shutdown) and start ack.
-type Spawned<H> = (JoinHandle<Vec<(ShardId, H)>>, Receiver<bool>);
+type Spawned<H> = (JoinHandle<drivers::Exit<H>>, Receiver<bool>);
 
 /// Starts `k` engine-owned drivers on `shards`, each holding its shards as `S` (D321), and
 /// returns their handles and start acks in driver order.
@@ -1118,7 +1118,7 @@ fn spawn_confined<T: Send + 'static>(
 pub struct Runtime<H: ShardHandler> {
     submitters: Arc<[Submitter<H::Msg>]>,
     /// The driver threads, each returning the handlers of the shards it held (D289).
-    shards: Vec<JoinHandle<Vec<(ShardId, H)>>>,
+    shards: Vec<JoinHandle<drivers::Exit<H>>>,
     /// Their shared state: the target, handoffs and the controller's counters.
     drivers: Arc<drivers::Drivers<H>>,
     /// The background workers' pool and their threads (engine-owned, D252, D284).
@@ -1461,11 +1461,23 @@ impl<H: ShardHandler> Runtime<H> {
         }
         let mut handlers = Vec::with_capacity(self.submitters.len());
         let mut panic = None;
+        let mut failed = Vec::new();
         for t in self.shards.drain(..) {
             match t.join() {
-                Ok(hs) => handlers.extend(hs),
+                Ok(exit) => {
+                    handlers.extend(exit.handlers);
+                    failed.extend(exit.failed);
+                }
                 Err(p) => panic = panic.or(Some(p)),
             }
+        }
+        // A caller's turn that panicked (caller-runs) unwound the caller's thread, not a
+        // driver's: report it as a shard's panic all the same.
+        if panic.is_none()
+            && let Some(id) = failed.first()
+        {
+            let msg = format!("shard {} panicked in a caller's turn", id.0);
+            panic = Some(Box::new(msg) as Box<dyn std::any::Any + Send>);
         }
         handlers.sort_unstable_by_key(|&(id, _)| id.0);
         let handlers = handlers.into_iter().map(|(_, h)| h).collect();
