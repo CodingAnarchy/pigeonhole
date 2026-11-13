@@ -244,9 +244,80 @@ fn a_newer_wal_segment_is_refused_not_skipped() {
     }
 }
 
+/// A WAL segment header with a `features` bit this build doesn't know, its checksum passing,
+/// was written by a newer build (FORMAT §10.2: "a reader refuses a segment with a bit it
+/// does not know"). The open refuses with `UnsupportedFeature`, as `phdb check` does; it
+/// used to read the slot as blank and replay without the segment's commits, as #496 PR 2's
+/// version case did. From slot 0 and from slot 1, as there.
+#[test]
+fn a_wal_segment_with_an_unknown_feature_bit_is_refused_not_skipped() {
+    let unknown = !pigeonhole_format::wal::KNOWN_SEGMENT_FEATURES & (1 << 31);
+    assert_ne!(unknown, 0, "pick a bit this build doesn't know");
+    for first in [0, 1] {
+        let vfs = SimVfs::new(4964);
+        let o = common::options(Arc::clone(&vfs), 1, 16 << 20);
+        let db = Engine::open(Path::new(DB), o.clone()).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        // 4 KiB values across more than one 256 KiB segment.
+        for i in 0..128u32 {
+            db.commit(
+                put(&i.to_be_bytes(), &[7; 4096], &t),
+                Some(Durability::Buffered),
+            )
+            .unwrap();
+        }
+        // The process dies with the commits only in the WAL.
+        vfs.crash(pigeonhole_io::sim::CrashKind::Process);
+        drop(db);
+
+        let patched = patch_segments(&vfs, first, |header| {
+            let features = u32::from_le_bytes(header[56..60].try_into().unwrap()) | unknown;
+            header[56..60].copy_from_slice(&features.to_le_bytes());
+        });
+        assert!(patched > 0, "no segment header from slot {first}");
+
+        let v: pigeonhole_io::VfsRef = Arc::clone(&vfs) as _;
+        match Engine::check(
+            &v,
+            Path::new(DB),
+            &pigeonhole_engine::CheckOptions::default(),
+        ) {
+            Err(pigeonhole_engine::Error::UnsupportedFeature(why)) => {
+                assert!(why.contains("feature"), "check, from slot {first}: {why}");
+            }
+            other => panic!("check, from slot {first}: {other:?}"),
+        }
+        match Engine::open(Path::new(DB), o) {
+            Err(pigeonhole_engine::Error::UnsupportedFeature(why)) => {
+                assert!(why.contains("feature"), "open, from slot {first}: {why}");
+            }
+            Ok(_) => panic!(
+                "from slot {first}: a segment with an unknown feature bit was skipped and the \
+                 open went on"
+            ),
+            Err(e) => panic!("open, from slot {first}: {e:?}"),
+        }
+    }
+}
+
 /// Rewrites every segment header in stream 0 from slot `first` on at a newer version, its
 /// CRC fixed; returns how many it rewrote.
 fn make_segments_newer(vfs: &SimVfs, first: u64) -> usize {
+    patch_segments(vfs, first, |header| {
+        let newer = FormatVersion::CURRENT.0 + 1;
+        header[8..12].copy_from_slice(&newer.to_le_bytes());
+    })
+}
+
+/// Rewrites every segment header in stream 0 from slot `first` on with `patch`, its CRC
+/// fixed; returns how many it rewrote.
+fn patch_segments(
+    vfs: &SimVfs,
+    first: u64,
+    patch: impl Fn(&mut [u8; pigeonhole_format::wal::SEGMENT_HEADER_LEN]),
+) -> usize {
     use pigeonhole_format::checksum::crc32c;
     let mut opts = OpenOptions::read();
     opts.write = true;
@@ -263,8 +334,7 @@ fn make_segments_newer(vfs: &SimVfs, first: u64) -> usize {
         if &header[..8] != b"PHDBWALS" {
             continue;
         }
-        let newer = FormatVersion::CURRENT.0 + 1;
-        header[8..12].copy_from_slice(&newer.to_le_bytes());
+        patch(&mut header);
         let crc = crc32c(&header[..124]);
         header[124..128].copy_from_slice(&crc.to_le_bytes());
         wal.write_at(&header, at).unwrap();
