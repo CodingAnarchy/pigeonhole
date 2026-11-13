@@ -49,6 +49,20 @@ The check copies each entry to a temporary directory, opens it with the real fil
 - **The entries:** `landed` and `not_landed` (the crash came after the root's superblock landed, or before), each also `_catalog` (the root changed the catalog, so 1.2 also left its Catalog entry). Each holds the database's files and a `feed_tokens` table with a token for `events` taken before its first commit, and the seqnos of the commit before the rollback (`one`) and 1.1.3's (`two`).
 - **Writing it:** `cargo run --release -- <new dir>` in `rollback-gen/`, a cargo project of its own pinned to 1.1.3's commit on `release/1.1.x` by revision. It runs 1.1.3's own code. What a 1.2 crash leaves is written into the sidecar by hand, as 1.2 writes it (FORMAT §10; the Catalog entry is a real one from a 1.2.0 sidecar). The session before the crash is written by 1.1.3: its Session and Root entries are the same bytes 1.2 writes. The generator also writes `frozen.txt`. Written once and frozen.
 - **The check:** `a_rollback_to_1_1_3_and_back_keeps_the_feed` checks the files against `frozen.txt` byte for byte, then reopens each entry without feed options (as `phdb` or a tool does). The open must keep the feed, and the stored token must resume through `one` and `two` with nothing skipped, including across the Catalog entry 1.1.3 itself expires on.
+- **`landed_catalog`'s Catalog entry is there for its framing.** It is a `CreateTable` of `feed_tokens` lifted from another database's sidecar, placed at this root's sequence, so it doesn't describe this database: never read it with a feed of every table (`Pigeonhole::feed()`).
+
+## Schema-rollback corpus
+
+`schema-rollback-1.1.3/` holds a schema change made under 1.1.3 after a rollback from 1.2 (#1853). 1.1.x records no catalog change in the feed, so a feed of every table, and a replica following one, can miss it.
+- **The entries:** `created` (a table created and written to), `created_unwritten` (created, nothing written), `dropped` (a table dropped) and `family` (a family added to a table and written to). Each holds the primary (`data.phdb` with its WAL and feed sidecar) and a replica of it (`replica.phdb`):
+  - the primary has tables `a`, `b` and `feed_tokens`; `feed_tokens` row `all` holds a token of the feed of every table taken before the first commit;
+  - the replica was bootstrapped from a backup and a feed of one snapshot, as `phdb serve --replica-of` does, and applied every commit up to the rollback.
+- **Writing it** takes two steps, each with a release's own code:
+  1. `cargo run --release -- <new dir>` in `schema-rollback-gen/`, pinned to the v1.2.0 tag's commit, writes the primary, its token and the replica.
+  2. `cargo run --release -- schema <same dir>` in `rollback-gen/` (1.1.3) opens each primary without feed options, makes the entry's change, commits, closes, and writes `frozen.txt`.
+  
+  Written once and frozen. Session ids are random, so a second run writes other bytes.
+- **The checks:** `a_feed_of_every_table_expires_across_a_drop_1_1_3_made` and `a_replica_following_across_a_1_1_3_schema_change_is_refused_or_behind`. Both check the files against `frozen.txt`, then resume the stored token and follow from the replica's token.
 
 ## Newer files with the published releases
 

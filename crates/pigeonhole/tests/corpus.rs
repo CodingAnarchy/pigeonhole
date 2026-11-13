@@ -1898,6 +1898,218 @@ fn generate_corpus() {
     }
 }
 
+/// The schema-rollback corpus (#1853): a primary with a feed of every table's token and a
+/// replica, written by 1.2.0's own code (`tests/corpus/schema-rollback-gen`), then the
+/// primary's schema changed by 1.1.3's (`rollback-gen schema`), which records no catalog
+/// change in the feed. In `tests/corpus/schema-rollback-1.1.3/<entry>/`, frozen. Each entry is
+/// one change: a table created and written to, one created and left empty, one dropped, a
+/// family added and written to.
+const SCHEMA_ROLLBACK_ENTRIES: [&str; 4] = ["created", "created_unwritten", "dropped", "family"];
+
+/// Copies a schema-rollback entry to a temporary directory named for `test` too: the tests
+/// run in parallel in one process.
+fn schema_rollback_copy(test: &str, entry: &str) -> TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/schema-rollback-1.1.3");
+    let tmp = TempDir::new(&format!("schema-rollback-{test}-{entry}"));
+    for f in std::fs::read_dir(root.join(entry)).unwrap() {
+        let f = f.unwrap();
+        std::fs::copy(f.path(), tmp.0.join(f.file_name())).unwrap();
+    }
+    tmp
+}
+
+fn schema_rollback_options() -> Options {
+    Options::default()
+        .pin_threads(false)
+        .memtable_budget(8 << 20)
+        .create_if_missing(false)
+}
+
+/// A feed of every table, resumed from a 1.2.0 token across a 1.1.3 session that changed the
+/// schema. That session recorded no catalog change, and nothing 1.2.0 wrote says what the
+/// catalog was at the token, so only a drop can be seen: a commit to the dropped table, made
+/// before the rollback, names a table the catalog no longer has and no recorded change
+/// dropped. The feed expires there rather than deliver it nameless and go on without the
+/// drop. The other three resume as before, without the change (1.2.0's upgrade note's
+/// caveat): asserted as they are, so a change either way is seen.
+#[test]
+fn a_feed_of_every_table_expires_across_a_drop_1_1_3_made() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/schema-rollback-1.1.3");
+    check_frozen(&root, &SCHEMA_ROLLBACK_ENTRIES);
+    // What each entry's feed delivers from the token, after the token's own `feed_tokens`
+    // commit.
+    let after_token = |entry: &str| -> &[&str] {
+        match entry {
+            "created" => &["a/f=a0", "b/f=b0", "a/f=a1", "c/g=c1", "a/f=a2"],
+            "created_unwritten" => &["a/f=a0", "b/f=b0", "a/f=a1", "a/f=a2"],
+            // Up to the commit to the dropped table.
+            "dropped" => &["a/f=a0"],
+            "family" => &["a/f=a0", "b/f=b0", "a/f=a1", "a/g=g1", "a/f=a2"],
+            _ => unreachable!(),
+        }
+    };
+    for entry in SCHEMA_ROLLBACK_ENTRIES {
+        let tmp = schema_rollback_copy("feed", entry);
+        let db = Pigeonhole::open(tmp.0.join(DB), schema_rollback_options())
+            .unwrap_or_else(|err| panic!("{entry}: open: {err}"));
+        assert!(db.info().unwrap().feed.is_some(), "{entry}: the feed is on");
+        let token = pigeonhole::FeedToken::from_bytes(
+            db.table("feed_tokens")
+                .unwrap()
+                .open()
+                .unwrap()
+                .get(b"all", "t", b"token")
+                .unwrap()
+                .unwrap_or_else(|| panic!("{entry}: the stored token"))
+                .value(),
+        );
+        let mut feed = db
+            .feed()
+            .resume(&token)
+            .open()
+            .unwrap_or_else(|err| panic!("{entry}: resume: {err}"));
+        let mut seen = Vec::new();
+        let end = loop {
+            match feed.next_event(Duration::from_millis(500)) {
+                Ok(Some(pigeonhole::FeedEvent::Commit(c))) => {
+                    for ch in c.changes() {
+                        let value = match ch.value() {
+                            Some(Value::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+                            other => format!("{other:?}"),
+                        };
+                        seen.push(format!("{}/{}={value}", ch.table(), ch.family()));
+                    }
+                }
+                Ok(Some(other)) => panic!("{entry}: no catalog change was recorded: {other:?}"),
+                Ok(None) => break None,
+                Err(err) => break Some(err),
+            }
+        };
+        assert_eq!(
+            seen.first().map(|s| &s[..14]),
+            Some("feed_tokens/t="),
+            "{entry}"
+        );
+        assert_eq!(&seen[1..], after_token(entry), "{entry}: delivered");
+        match (entry, end) {
+            ("dropped", Some(err)) => {
+                assert_eq!(
+                    err.code(),
+                    pigeonhole::ErrorCode::FeedExpired,
+                    "{entry}: {err}"
+                );
+                assert!(
+                    err.to_string().contains("1.1.x"),
+                    "{entry}: says why: {err}"
+                );
+            }
+            ("dropped", None) => panic!("{entry}: the feed went on without the drop"),
+            (_, Some(err)) => panic!("{entry}: {err}"),
+            (_, None) => {}
+        }
+        drop(feed);
+        db.close().unwrap();
+    }
+}
+
+/// A replica of the same primary, made under 1.2.0 and following it again from its stored
+/// token after the 1.1.3 session (#1853). A commit to a table or family the replica was never
+/// told of is refused with the code `phdb serve` takes as "the tables diverged" and
+/// bootstraps again on (`replica::diverged`); a drop, or a create nothing writes to, applies
+/// and leaves the replica's tables behind its primary's, which only a check of the two
+/// catalogs can see (#1853's part C2).
+#[cfg(feature = "__unstable-replication")]
+#[test]
+fn a_replica_following_across_a_1_1_3_schema_change_is_refused_or_behind() {
+    use pigeonhole::replication::ReplicatedEvent;
+    for entry in SCHEMA_ROLLBACK_ENTRIES {
+        let tmp = schema_rollback_copy("replica", entry);
+        let primary = Pigeonhole::open(tmp.0.join(DB), schema_rollback_options()).unwrap();
+        let replica =
+            Pigeonhole::open(tmp.0.join("replica.phdb"), schema_rollback_options()).unwrap();
+        let token = replica
+            .replicated_token()
+            .unwrap()
+            .unwrap_or_else(|| panic!("{entry}: the replica's token"));
+        let mut feed = primary
+            .feed()
+            .resume(&token)
+            .open()
+            .unwrap_or_else(|err| panic!("{entry}: follow: {err}"));
+        let mut events: Vec<ReplicatedEvent> = Vec::new();
+        while feed
+            .next_event(Duration::from_millis(500))
+            .unwrap_or_else(|err| panic!("{entry}: follow: {err}"))
+            .is_some()
+        {
+            events.push(feed.replicated().unwrap());
+        }
+        assert!(!events.iter().any(ReplicatedEvent::is_catalog), "{entry}");
+        let applied = replica.apply_replicated(&events, events.last().unwrap().token());
+        let mut primary_tables = primary.tables();
+        primary_tables.sort();
+        let mut replica_tables = replica.tables();
+        replica_tables.sort();
+        match entry {
+            "created" | "family" => {
+                let err = applied.expect_err(entry);
+                assert_eq!(
+                    err.code(),
+                    pigeonhole::ErrorCode::FamilyNotFound,
+                    "{entry}: {err}"
+                );
+            }
+            "created_unwritten" | "dropped" => {
+                applied.unwrap_or_else(|err| panic!("{entry}: {err}"));
+                assert_ne!(
+                    replica_tables, primary_tables,
+                    "{entry}: behind its primary"
+                );
+            }
+            _ => unreachable!(),
+        }
+        drop(feed);
+        replica.close().unwrap();
+        primary.close().unwrap();
+    }
+}
+
+/// Checks a frozen generated corpus (`rollback-1.1.3`, `schema-rollback-1.1.3`): every file of
+/// each entry's directory, and nothing else, is listed in its `frozen.txt` with its length
+/// and xxh3-64.
+fn check_frozen(root: &Path, entries: &[&str]) {
+    let listed: BTreeMap<String, (usize, u64)> = std::fs::read_to_string(root.join(FROZEN))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let mut f = l.split(' ');
+            let (path, len, hash) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+            (
+                path.to_owned(),
+                (len.parse().unwrap(), u64::from_str_radix(hash, 16).unwrap()),
+            )
+        })
+        .collect();
+    let mut on_disk = BTreeMap::new();
+    for entry in entries {
+        for f in std::fs::read_dir(root.join(entry)).unwrap() {
+            let f = f.unwrap();
+            let bytes = std::fs::read(f.path()).unwrap();
+            on_disk.insert(
+                format!("{entry}/{}", f.file_name().into_string().unwrap()),
+                (bytes.len(), pigeonhole_format::checksum::xxh3_64(&bytes)),
+            );
+        }
+    }
+    assert_eq!(
+        on_disk,
+        listed,
+        "{} no longer matches {FROZEN}",
+        root.display()
+    );
+}
+
 /// A temporary directory removed on drop.
 struct TempDir(PathBuf);
 
@@ -2266,31 +2478,7 @@ fn a_rollback_to_1_1_3_and_back_keeps_the_feed() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/rollback-1.1.3");
     // Frozen, as a release corpus is: 1.1.3 wrote these bytes, and only a build that reads
     // them proves the promise.
-    let listed: BTreeMap<String, (usize, u64)> = std::fs::read_to_string(root.join(FROZEN))
-        .unwrap()
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let mut f = l.split(' ');
-            let (path, len, hash) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
-            (
-                path.to_owned(),
-                (len.parse().unwrap(), u64::from_str_radix(hash, 16).unwrap()),
-            )
-        })
-        .collect();
-    let mut on_disk = BTreeMap::new();
-    for entry in ROLLBACK_ENTRIES {
-        for f in std::fs::read_dir(root.join(entry)).unwrap() {
-            let f = f.unwrap();
-            let bytes = std::fs::read(f.path()).unwrap();
-            on_disk.insert(
-                format!("{entry}/{}", f.file_name().into_string().unwrap()),
-                (bytes.len(), pigeonhole_format::checksum::xxh3_64(&bytes)),
-            );
-        }
-    }
-    assert_eq!(on_disk, listed, "rollback-1.1.3 no longer matches {FROZEN}");
+    check_frozen(&root, &ROLLBACK_ENTRIES);
     for entry in ROLLBACK_ENTRIES {
         let src = root.join(entry);
         let tmp = TempDir::new(&format!("rollback-{entry}"));
