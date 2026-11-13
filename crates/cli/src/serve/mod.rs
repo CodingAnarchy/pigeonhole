@@ -113,16 +113,40 @@ impl Shared {
 
 /// The tokens from `--token-file` and `PHDB_SERVE_TOKENS`, together.
 fn tokens(args: &ServeArgs) -> Result<auth::Tokens, Failure> {
+    let file = match &args.token_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?,
+        ),
+        None => None,
+    };
+    tokens_from(
+        file.as_deref(),
+        std::env::var("PHDB_SERVE_TOKENS").ok().as_deref(),
+    )
+}
+
+/// [`tokens`] from the file's text and the variable's, each `None` when not given. A source
+/// that is given but holds no token (an empty file, only comments, an empty variable) fails
+/// the start: without tokens a loopback server lets every caller do everything, which a
+/// named token source never means (audit120's S-S7: a secret mounted empty behind a proxy).
+fn tokens_from(file: Option<&str>, env: Option<&str>) -> Result<auth::Tokens, Failure> {
     let mut text = String::new();
-    if let Some(path) = &args.token_file {
-        text = std::fs::read_to_string(path)
-            .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?;
+    if let Some(f) = file {
+        text.push_str(f);
         text.push('\n');
     }
-    if let Ok(env) = std::env::var("PHDB_SERVE_TOKENS") {
-        text.push_str(&env);
+    if let Some(e) = env {
+        text.push_str(e);
     }
-    auth::Tokens::parse(&text, "the tokens").map_err(|e| Failure::usage(&e))
+    let tokens = auth::Tokens::parse(&text, "the tokens").map_err(|e| Failure::usage(&e))?;
+    if (file.is_some() || env.is_some()) && !tokens.any() {
+        return Err(Failure::usage(
+            "--token-file or PHDB_SERVE_TOKENS is set but holds no tokens; a server without \
+             tokens lets every caller do everything, so give at least one, or unset both",
+        ));
+    }
+    Ok(tokens)
 }
 
 /// `--replica-of`'s settings, with the token from its file or `PHDB_REPLICA_TOKEN`.

@@ -7,6 +7,9 @@
 //!   `SessionBusy`, never a queue. Snapshot reads take `&Snapshot`, so they run in parallel.
 //! - **Leases:** each session has an idle lease, renewed at a call's start and end, and a hard
 //!   lifetime. A session with a call in flight never expires; it does once the call ends.
+//!   A stream at a pinned snapshot (a scan's pages) is the exception: its next page past the
+//!   hard lifetime fails, so a slowly read stream can't keep the snapshot past
+//!   `--snapshot-lifetime-ms` (audit120's S-S3), and the snapshot goes when the stream ends.
 //!   Expiry is checked on every call as well as by the reaper, so a lease is exact whatever
 //!   the reaper's period.
 //! - **The tombstone** (B1): once `Commit` has run, the session holds its outcome, and a
@@ -583,14 +586,22 @@ impl Sessions {
     fn end_read(&self, id: &Id) {
         let now = Instant::now();
         let mut t = self.lock();
-        if let Some(e) = t.map.get_mut(id) {
+        let past = t.map.get_mut(id).is_some_and(|e| {
             e.busy = e.busy.saturating_sub(1);
             e.renew(now);
+            now >= e.hard
+        });
+        // Past its hard lifetime (a long stream's), the session goes now rather than at the
+        // reaper's next pass (audit120's S-S3).
+        if past {
+            t.expire(id, now, &self.leases);
         }
     }
 
+    /// Whether the session is there and within its hard lifetime: a stream's next page asks.
     fn alive(&self, id: &Id) -> bool {
-        self.lock().map.contains_key(id)
+        let now = Instant::now();
+        self.lock().map.get(id).is_some_and(|e| now < e.hard)
     }
 }
 
@@ -712,8 +723,9 @@ impl SnapshotGuard {
         &self.snapshot
     }
 
-    /// For a stream's next page: `NotFound` once the snapshot was released (pages already
-    /// running finish; later ones don't start).
+    /// For a stream's next page: `NotFound` once the snapshot was released or is past its
+    /// hard lifetime, `--snapshot-lifetime-ms` (pages already running finish; later ones
+    /// don't start).
     pub(crate) fn check(&self) -> Result<(), ApiError> {
         if self.sessions.alive(&self.id) {
             Ok(())
@@ -974,6 +986,44 @@ mod tests {
         assert!(matches!(s.take(&id, p(1)), Ok(Taken::Done(Ok(c))) if c.seqno == info.seqno));
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(31)), 1);
         assert_eq!(s.take(&id, p(1)).err().unwrap().code, "NotFound");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stream_at_a_pinned_snapshot_ends_at_its_hard_lifetime() {
+        // audit120's S-S3: a stream's read kept the session busy, and a busy session never
+        // lapsed, so a scan paged slowly held its snapshot past --snapshot-lifetime-ms.
+        let (db, dir) = db("lifetime");
+        let mut l = leases();
+        l.snapshot_lifetime = Duration::from_millis(100);
+        let s = Sessions::sharing(l, None, Arc::default());
+        let snap = s.open_snapshot(p(1), db.snapshot().unwrap()).unwrap();
+        let read = s.snapshot(&snap, p(1)).unwrap();
+        // A page every 30 ms, with the reaper running: well inside the idle lease.
+        let started = Instant::now();
+        while read.check().is_ok() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the stream never ended"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+            s.sweep(Instant::now());
+        }
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(read.check().unwrap_err().code, "NotFound");
+        assert_eq!(
+            s.stats(Instant::now()).snapshots,
+            1,
+            "held while the stream runs"
+        );
+        drop(read);
+        assert_eq!(
+            s.stats(Instant::now()).snapshots,
+            0,
+            "gone once the stream ends"
+        );
+        assert_eq!(s.snapshot(&snap, p(1)).err().unwrap().code, "NotFound");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
