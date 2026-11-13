@@ -423,11 +423,11 @@ impl Ring {
         if covered_from > seqno || self.passed < seqno {
             return None;
         }
-        let i = self
-            .entries
-            .iter()
-            .position(|e| e.seqno > seqno)
-            .unwrap_or(self.entries.len());
+        // The entries are in seqno order (the hub pushes its feed's commits as they come),
+        // so the first one after `seqno` is found by bisection. A scan from the front walked
+        // nearly the whole ring, with its lock held, for a client that rejoins near the
+        // head: 2.2 ms at a million entries (audit120's pass 2).
+        let i = self.entries.partition_point(|e| e.seqno <= seqno);
         Some(self.base + i as u64)
     }
 }
