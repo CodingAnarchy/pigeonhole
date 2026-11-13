@@ -270,6 +270,16 @@ impl OpenedPager {
         self.superblock.sequence
     }
 
+    /// The newest valid superblock's checksum (FORMAT §8.2: its bytes 120..128, the xxh3-64
+    /// of bytes 0..120), before any root commit of this open: what a 1.2 build's change feed
+    /// recorded in a root commit's intent (`RootIntent`, D315 amendment, #1504), which this
+    /// open resolves.
+    pub fn checksum(&self) -> u64 {
+        let mut page = [0u8; PAGE_SIZE];
+        self.superblock.encode(&mut page);
+        u64::from_le_bytes(page[120..128].try_into().expect("8 bytes"))
+    }
+
     /// Whether the last writer closed cleanly. The flag stays set until the next root
     /// commit, which clears it.
     pub fn clean_shutdown(&self) -> bool {

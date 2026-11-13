@@ -969,6 +969,13 @@ impl Engine {
         // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
         // root commit of this open.
         let opened_at = opened.sequence();
+        // And its checksum: a trailing RootIntent a 1.2 build's crash left in the sidecar is
+        // decided by both (D315 amendment, #1504; resolved as 1.2 does, so a later 1.2 open
+        // still chains through it).
+        let opened_root = crate::feed::OpenedRoot {
+            sequence: opened_at,
+            checksum: opened.checksum(),
+        };
         // The clean flag is informational only: WAL replay is never skipped (decision D57).
         let _clean = opened.clean_shutdown();
         let (mut catalog, manifest_extents) =
@@ -1025,7 +1032,7 @@ impl Engine {
         let feed = if no_writes {
             None
         } else {
-            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_at)?
+            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_root)?
         };
         if let Some(f) = &feed {
             let weak = Arc::downgrade(f);

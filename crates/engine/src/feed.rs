@@ -90,6 +90,7 @@ pub(crate) fn open_sidecar(
     db_id: [u8; 16],
     entry: &FeedEntry,
     create: bool,
+    opened: OpenedRoot,
 ) -> Result<Option<Sidecar>> {
     let path = sidecar_path(db);
     let exists = vfs.exists(&path)?;
@@ -105,7 +106,12 @@ pub(crate) fn open_sidecar(
     let valid = match FeedHeader::decode(&bytes) {
         Ok(h) if h.db_id == db_id => {
             let (_, end) = decode_entries(&bytes[FeedHeader::LEN..]);
-            Some(FeedHeader::LEN + end)
+            Some(resolve_intent(
+                &file,
+                &bytes,
+                FeedHeader::LEN + end,
+                opened,
+            )?)
         }
         // Another database's, or a torn or damaged header: its history is not ours. A reader
         // finds no session for the segments' marks and expires.
@@ -148,6 +154,99 @@ pub(crate) fn open_sidecar(
     Ok(Some(sidecar))
 }
 
+/// The superblock an open read, before any root commit of its own: its `sequence` and
+/// checksum (FORMAT §8.2), which decide a trailing `RootIntent` (D315 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenedRoot {
+    pub(crate) sequence: u64,
+    pub(crate) checksum: u64,
+}
+
+/// A 1.2 build's sidecar entry types this build reads as `FeedEntry::Unknown` (FORMAT §10
+/// on 1.2): a root commit's catalog change, and a root commit's intent.
+const CATALOG: u8 = 4;
+const ROOT_INTENT: u8 = 5;
+
+/// Resolves a `RootIntent` a 1.2 build left as the sidecar's last entry, before this open
+/// appends anything, as 1.2's own open does (D315 amendment, #1504): a process crash came
+/// between that root commit's intent and its Root entry. Returns where the valid entries
+/// now end. Left in place, the intent would sit before this open's own entry, and a later
+/// 1.2 open reads an intent anywhere but last as a break in the feed's history: the feed
+/// would survive the rollback to this build and expire on the move back.
+///
+/// - The root landed (the superblock this open read has the intent's sequence and
+///   checksum): the intent becomes that session's `Root`, written over it in place (the two
+///   frames are the same length), as if no crash happened.
+/// - It didn't (its sequence is one past the superblock's): the intent goes, with the
+///   `Catalog` entry of the same root before it, if any, cut off as a torn tail is. So does
+///   a lone `Catalog` entry at the end for a root one past the superblock's.
+/// - Anything else: left alone.
+///
+/// `bytes` is the whole file and `end` where its valid entries end.
+fn resolve_intent(file: &FileRef, bytes: &[u8], end: usize, opened: OpenedRoot) -> Result<usize> {
+    // Each valid frame's offset and payload: `len` u32, CRC32C u32, then the payload, whose
+    // first byte is its type (the framing every build shares).
+    let mut frames: Vec<(usize, &[u8])> = Vec::new();
+    let mut at = FeedHeader::LEN;
+    while at + 8 <= end {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
+        let payload = &bytes[at + 8..at + 8 + len];
+        frames.push((at, payload));
+        at += 8 + len;
+    }
+    // A u64 field of a payload, after its type byte.
+    let field = |p: &[u8], i: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(
+            p.get(1 + 8 * i..9 + 8 * i)?.try_into().ok()?,
+        ))
+    };
+    let Some(&(last_at, last)) = frames.last() else {
+        return Ok(end);
+    };
+    match last.first() {
+        // A Catalog's fields: session, sequence, ...
+        Some(&CATALOG) if field(last, 1) == Some(opened.sequence + 1) => {
+            file.set_len(last_at as u64)?;
+            Ok(last_at)
+        }
+        Some(&ROOT_INTENT) => {
+            let (Some(sequence), Some(checksum)) = (field(last, 0), field(last, 1)) else {
+                return Ok(end);
+            };
+            if sequence == opened.sequence && checksum == opened.checksum {
+                // The session that wrote it: the last Session entry before it.
+                let (entries, _) = decode_entries(&bytes[FeedHeader::LEN..end]);
+                let session = entries.iter().rev().find_map(|e| match e {
+                    FeedEntry::Session { session, .. } => Some(*session),
+                    _ => None,
+                });
+                if let Some(session) = session {
+                    let mut root = Vec::with_capacity(32);
+                    FeedEntry::Root { session, sequence }.encode(&mut root);
+                    if root.len() == 8 + last.len() {
+                        file.write_at(&root, last_at as u64)?;
+                    }
+                }
+                Ok(end)
+            } else if sequence == opened.sequence + 1 {
+                let cut = match frames.iter().rev().nth(1) {
+                    Some(&(before, p))
+                        if p.first() == Some(&CATALOG) && field(p, 1) == Some(sequence) =>
+                    {
+                        before
+                    }
+                    _ => last_at,
+                };
+                file.set_len(cut as u64)?;
+                Ok(cut)
+            } else {
+                Ok(end)
+            }
+        }
+        _ => Ok(end),
+    }
+}
+
 /// What an open inherits from the sidecar's last session (the D310 amendment, the owner
 /// 2026-11-02): its retention, age, stream count and fed tables, so an open that doesn't
 /// mention the feed (a tool's, `phdb`'s) continues its history instead of ending it.
@@ -161,7 +260,8 @@ pub(crate) struct LastSession {
 
 /// The sidecar's last session, read-only: `None` without a sidecar, with another database's
 /// or a damaged header, or when the last open recorded "fed: none" (or an entry this build
-/// doesn't know, which fails closed). Root entries after the session don't change it.
+/// doesn't know, which fails closed). Root entries after the session don't change it, nor
+/// do a 1.2 build's Catalog and RootIntent entries.
 pub(crate) fn last_session(
     vfs: &VfsRef,
     db: &Path,
@@ -186,7 +286,10 @@ pub(crate) fn last_session(
 pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
     for e in entries.iter().rev() {
         match e {
-            FeedEntry::Root { .. } => continue,
+            // A 1.2 build's catalog change (type 4) and root-commit intent (type 5) are its
+            // session's, as its Root entries are: they never change what it fed. So an open
+            // that inherits the feed after 1.2 (a rollback to this build) keeps it on.
+            FeedEntry::Root { .. } | FeedEntry::Unknown(CATALOG | ROOT_INTENT) => continue,
             FeedEntry::Session {
                 retention_bytes,
                 retention_age_secs,
@@ -217,8 +320,9 @@ pub(crate) fn open_session(
     catalog: &Catalog,
     options: &EngineOptions,
     shards: usize,
-    opened_at: u64,
+    opened: OpenedRoot,
 ) -> Result<Option<Arc<Feed>>> {
+    let opened_at = opened.sequence;
     let Some(cfg) = &options.feed else {
         open_sidecar(
             vfs,
@@ -228,6 +332,7 @@ pub(crate) fn open_session(
                 sequence: opened_at,
             },
             false,
+            opened,
         )?;
         return Ok(None);
     };
@@ -263,7 +368,7 @@ pub(crate) fn open_session(
         streams: streams as u32,
         tables: tables.clone(),
     };
-    let sidecar = open_sidecar(vfs, path, db_id, &entry, true)?
+    let sidecar = open_sidecar(vfs, path, db_id, &entry, true, opened)?
         .ok_or_else(|| Error::Corruption("the feed sidecar could not be created".into()))?;
     let mut feed = Feed::new(session, retain, cfg.max_age_micros, tables, shards);
     feed.retain_bytes_per_stream = cfg.retention_bytes / streams;
@@ -951,6 +1056,21 @@ mod tests {
         );
         // An entry this build doesn't know: fail closed.
         assert_eq!(last_of(&[session(3), FeedEntry::Unknown(0xee)]), None);
+        // A 1.2 build's Catalog and RootIntent entries are its session's (a rollback from
+        // 1.2 after a crash inside a root commit leaves both last).
+        assert_eq!(
+            last_of(&[
+                session(3),
+                FeedEntry::Unknown(CATALOG),
+                FeedEntry::Root {
+                    session: 1,
+                    sequence: 2,
+                },
+                FeedEntry::Unknown(CATALOG),
+                FeedEntry::Unknown(ROOT_INTENT),
+            ]),
+            Some(want.clone())
+        );
         // A feed-off open, then a feeding one: that one.
         assert_eq!(
             last_of(&[FeedEntry::Unfed { sequence: 1 }, session(3)]),
