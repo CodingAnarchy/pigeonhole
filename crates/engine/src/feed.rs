@@ -249,7 +249,8 @@ pub(crate) struct LastSession {
 
 /// The sidecar's last session, read-only: `None` without a sidecar, with another database's
 /// or a damaged header, or when the last open recorded "fed: none" (or an entry this build
-/// doesn't know, which fails closed). Root entries after the session don't change it.
+/// doesn't know, which fails closed). Root, Catalog and RootIntent entries after the session
+/// don't change it: an intent a process crash left last is still that session's.
 pub(crate) fn last_session(
     vfs: &VfsRef,
     db: &Path,
@@ -299,8 +300,12 @@ fn entries_of(bytes: &[u8], db_id: [u8; 16]) -> Option<(Vec<(usize, FeedEntry)>,
 pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
     for e in entries.iter().rev() {
         match e {
-            // A catalog change's entry (D315) is its session's, as its Root entry is.
-            FeedEntry::Root { .. } | FeedEntry::Catalog { .. } => continue,
+            // A catalog change's entry (D315) is its session's, as its Root entry is, and so
+            // is a root commit's intent: a process crash between the two leaves it last
+            // (#1504), and it never changes what the session fed.
+            FeedEntry::Root { .. } | FeedEntry::Catalog { .. } | FeedEntry::RootIntent { .. } => {
+                continue;
+            }
             FeedEntry::Session {
                 retention_bytes,
                 retention_age_secs,
@@ -1294,6 +1299,26 @@ mod tests {
         );
         // An entry this build doesn't know: fail closed.
         assert_eq!(last_of(&[session(3), FeedEntry::Unknown(0xee)]), None);
+        // A root commit's intent a process crash left last (#1504, the 1.2.0 audit's S-E1):
+        // still the session's, so an open that inherits keeps the feed on.
+        assert_eq!(
+            last_of(&[
+                session(3),
+                FeedEntry::Catalog {
+                    session: 1,
+                    sequence: 2,
+                    seqno_ceiling: 5,
+                    timestamp: 5,
+                    edits: Vec::new(),
+                    names: Vec::new(),
+                },
+                FeedEntry::RootIntent {
+                    sequence: 2,
+                    checksum: 7,
+                },
+            ]),
+            Some(want.clone())
+        );
         // A feed-off open, then a feeding one: that one.
         assert_eq!(
             last_of(&[FeedEntry::Unfed { sequence: 1 }, session(3)]),

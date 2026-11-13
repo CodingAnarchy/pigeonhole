@@ -365,7 +365,11 @@ scan-wide 1279 0.3
 commit-async 8770 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
-commit-incr 12706 0.3
+# Raised by D195 (#1804, coordinator 2026-11-12): commit-incr 12706 -> 12767 (+0.48%). Main
+# itself counts 12703, 3 under the old ceiling, and identical commit-path code reads a few apart
+# from run to run (#1804's head 12707: its change is on the open path, not the commit path;
+# run 43327505525, ubuntu-24.04). Base times 1.005.
+commit-incr 12767 0.3
 commit-incr-returning 17519 0.3
 commit-incr-returning-spread 34610 0.5
 # D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
