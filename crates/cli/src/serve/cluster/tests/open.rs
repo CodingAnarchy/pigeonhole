@@ -598,7 +598,10 @@ fn a_partition_being_opened_shows_opening_and_status_leaves_its_file_alone() {
     } = three_with_p3_on_c();
     let c = ports[2];
     let (release, wait) = std::sync::mpsc::channel::<()>();
-    *super::super::open::HOLD_OPEN.lock().unwrap() = Some((dirs[2].clone(), wait));
+    super::super::open::HOLD_OPEN
+        .lock()
+        .unwrap()
+        .push((dirs[2].clone(), wait));
     rt.block_on(async {
         give_c_p3(&ports).await;
         eventually("p3 to be opening", async || {

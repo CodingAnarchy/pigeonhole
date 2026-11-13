@@ -433,7 +433,10 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
         // The map moves p1 to c, keeping its history; a never closed it. c's open of p1 is
         // held a while, so the subscriptions find it opening.
         let (release, wait) = std::sync::mpsc::channel::<()>();
-        *super::super::open::HOLD_OPEN.lock().unwrap() = Some((t.dirs[2].clone(), wait));
+        super::super::open::HOLD_OPEN
+            .lock()
+            .unwrap()
+            .push((t.dirs[2].clone(), wait));
         within(super::super::cli::relocate(&t.args, "p1", "c", false, true))
             .await
             .unwrap();

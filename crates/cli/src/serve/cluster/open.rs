@@ -116,20 +116,21 @@ impl Drop for Opening<'_> {
     }
 }
 
-/// A hold seam (tests): the next open in this cluster directory waits, marked as opening,
-/// before its engine opens, until the sender sends or is dropped.
+/// A hold seam (tests): the next open in each listed cluster directory waits, marked as
+/// opening, before its engine opens, until the sender sends or is dropped. One entry per
+/// directory, so tests running at once don't take each other's.
 #[cfg(test)]
 pub(crate) static HOLD_OPEN: std::sync::Mutex<
-    Option<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
-> = std::sync::Mutex::new(None);
+    Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn hold_open(dir: &std::path::Path) {
     let mut armed = HOLD_OPEN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if armed.as_ref().is_some_and(|(d, _)| d == dir) {
-        let (_, wait) = armed.take().expect("armed");
+    if let Some(i) = armed.iter().position(|(d, _)| d == dir) {
+        let (_, wait) = armed.swap_remove(i);
         drop(armed);
         let _ = wait.recv();
     }
