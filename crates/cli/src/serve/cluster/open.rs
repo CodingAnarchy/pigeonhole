@@ -296,9 +296,12 @@ impl Node {
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-        let mut opened = opened?
-            .pop()
-            .ok_or_else(|| ApiError::internal("the open returned no partition"))?;
+        let mut opened = opened?.pop().ok_or_else(|| {
+            ApiError::failed_precondition(format!(
+                "partition {id}'s file is stamped at an epoch above the map's {epoch}: a \
+                 restore or relocation that stopped before its map was set. Run it again"
+            ))
+        })?;
         // Pinned on the free cores, or not opened: never on an existing shard's sibling, and
         // never unpinned where pinning works.
         if opener.placement.masked() && opened.pinning.shards_unpinned() > 0 {
