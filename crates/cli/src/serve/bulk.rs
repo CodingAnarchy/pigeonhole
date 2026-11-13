@@ -521,6 +521,14 @@ impl BulkLoads {
                         let r = loader(&index, expected, &mut input);
                         // The loader's own failure first; else the stream's.
                         let r = r.and_then(|_| input.failed.take().map_or(Ok(()), Err));
+                        // A load that took vectors and then failed left them loaded, so the
+                        // index isn't empty and the call can't be sent again, whatever its
+                        // code says of itself (the audit's P2-C9: a stall's DeadlineExceeded,
+                        // a shutdown's Closed, an id's Overloaded).
+                        let r = match r {
+                            Err(e) if input.sizing.taken > 0 => Err(e.applied_partly()),
+                            r => r,
+                        };
                         drop(input);
                         drop(index);
                         // Its last write is done: a fence's drain may finish.

@@ -48,6 +48,22 @@ impl ApiError {
         self
     }
 
+    /// The same error, for a call that applied part of what it carried before it failed (a
+    /// `Vectors.BulkLoad` that loaded the vectors before the failure): not safe to send
+    /// again, whatever the code says of itself, and the message says what was applied (the
+    /// audit's P2-C9).
+    pub(crate) fn applied_partly(mut self) -> Self {
+        self.retry_from = RetryFrom::Unspecified;
+        self.retry_after_ms = 0;
+        if !self.message.contains("were loaded") {
+            self.message.push_str(
+                "; the vectors before it were loaded, so the index is no longer empty: Insert \
+                 the rest, or drop it and load again",
+            );
+        }
+        self
+    }
+
     fn after(mut self, ms: u32) -> Self {
         self.retry_after_ms = ms;
         self
