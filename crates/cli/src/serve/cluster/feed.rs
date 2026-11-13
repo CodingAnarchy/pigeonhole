@@ -1904,7 +1904,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let (_feed, events) = fed();
-        let mut m = merging(vec![Some(events)], QUIET, IDLE);
+        let mut m = merging(vec![Some(events)], QUIET);
         let batch: Vec<Bytes> = (0..10_000u64)
             .map(|n| event(&d310_token(n), Some(n + 1)))
             .collect();
