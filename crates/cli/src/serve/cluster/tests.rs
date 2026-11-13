@@ -1175,7 +1175,7 @@ fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sende
         assert_eq!(version(c).await, 1);
         // c routes "zed" to b by its v1. b's v2 says p2 is a's: WrongPartition, though b
         // still has p2's file open, so b writes nothing. c pulls v2 from b and routes to a,
-        // whose v2 gives it p2, which it hasn't open (relocation is ticket 6).
+        // whose v2 gives it p2, which it hasn't open (its files are still b's).
         let e = data(c)
             .await
             .mutate(super::proto::MutateRequest {
@@ -1185,7 +1185,7 @@ fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sende
             .await
             .unwrap_err();
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
-        assert!(e.message().contains("ticket 6"), "{e}");
+        assert!(e.message().contains("isn't open here"), "{e}");
         assert_eq!(version(c).await, 2, "c pulled the newer map");
         // A direct call to b is refused the same way: its map moved p2 away.
         let e = get_row(b, "zed").await.unwrap_err();
