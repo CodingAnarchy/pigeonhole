@@ -1,6 +1,6 @@
 # Vectors
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Vector families (D303), `nearest_*` (D296) and the `pigeonhole-vector` IVF index (D306) are new in 1.1.0. Code samples run as doctests of the `pigeonhole-vector` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. Vector families (D303), `nearest_*` (D296) and the `pigeonhole-vector` IVF index (D306) are new in 1.1.0. Code samples run as doctests of the `pigeonhole-vector` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole stores embeddings in **vector families** and finds the vectors nearest a query in two ways:
 - **Exact search** (`nearest_f32` and its forms) scores every vector a read covers, inside the engine. It's right for a few thousand vectors per query, or a set already narrowed by a row range or a key set.

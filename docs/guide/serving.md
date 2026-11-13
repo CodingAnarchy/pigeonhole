@@ -1,6 +1,6 @@
 # Sharing a database across processes and hosts
 
-> **Status:** this page describes `main`. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](serve.md), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is new in 1.2.0, behind the `serve` feature: use it unless you want to own the server and its API.
+> **Status:** this page describes 1.2. It's the first step of #1397 (D313): a reference pattern you run and own. [`phdb serve`](serve.md), a supported server speaking gRPC, HTTP/JSON and remote MCP (`/mcp`), is new in 1.2.0, behind the `serve` feature: use it unless you want to own the server and its API.
 
 Pigeonhole is embedded: one process opens the file and writes it. When several containers or hosts need the same data (a job queue, workflow state, coordination between workers), **one process owns the database and serves it over the network, and the others call it.** This page shows that pattern with a runnable example, [`examples/serving`](../../examples/serving), and covers what makes it correct under failures:
 - paging that resumes anywhere;
@@ -60,7 +60,7 @@ app.jobs.mutate(id).put("spec", b"body", spec).put("state", b"status", b"queued"
 A worker claims a job, so that no other worker runs it at the same time. If the worker dies, the claim must expire on its own.
 - **Claim:** `commit_if(Absent lease:holder)` writes the lease, in a family with a TTL (`Family::default().ttl(..)`). An expired lease reads as absent, so an abandoned job becomes claimable again with no cleanup process.
 - **The lease's value is a fencing token** unique to this claim: `worker/claim_id`, where the worker makes the claim id, a random id per claim. The worker gets the token back from the claim.
-- **A claim can be retried.** If a claim's reply is lost, the worker doesn't know whether it holds the job, so it sends the same claim again, with the same claim id. A claim that finds its own token already in the lease returns success with it; any other token is `409 Claimed`. Without the worker's claim id, the retry would be refused by its own invisible lease, and the job would sit held by nobody who knows it until the TTL (simp724's L1 on #1491). `Client::claim` does this.
+- **A claim can be retried.** If a claim's reply is lost, the worker doesn't know whether it holds the job, so it sends the same claim again, with the same claim id. A claim that finds its own token already in the lease returns success with it; any other token is `409 Claimed`. Without the worker's claim id, the retry would be refused by its own invisible lease, and the job would sit held by nobody who knows it until the TTL (#1491). `Client::claim` does this.
 - **Every later write for the job is conditioned on the lease still holding that exact token.** That covers renewing it and completing the job (`commit_if(Value lease:holder == token)`).
 - **Renewal is a fresh put of the same token,** so the TTL counts from the renewal. A renewal fails once the TTL has passed, even if nobody else claimed the job, because the expired cell is invisible to the condition. The worker must then stop and treat the job as lost.
 - **Renew at least every third of the TTL,** and treat a renewal that fails *or gets no answer* as lost. A renewal whose outcome is unknown may not have extended the claim, and the safe reading is "stop".
@@ -135,7 +135,7 @@ The example serves on Tokio with axum.
 - **To restore,** stop the server, put the copy in place, and start the server again. Commits after the backup's point are lost, so take backups as often as you can afford to lose work.
 
 ## The limits
-- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)); partitioning across nodes (D317) is on `main`, with what's still to come listed under [Clusters](serve.md#clusters).
+- **One writer node,** so no failover or high availability of your own server. Backup and restore is the recovery story. `phdb serve` has read replicas with manual promotion ([Replicas](serve.md#replicas)), and clusters that split a database across nodes by key range, each partition with one writer node (D317, [Clusters](serve.md#clusters)).
 - **The file is on the server's local disk.** Network filesystems are refused at open.
 - **Throughput is one machine's.**
 - **Your server is your API.** Versioning, auth beyond a token, and rate limits are yours to add. `phdb serve` has a versioned API ([ICR 0112](../design/icr/0112-network-api.md)), scoped tokens and TLS, and limits on connections, requests and sessions ([Limits](serve.md#limits)).

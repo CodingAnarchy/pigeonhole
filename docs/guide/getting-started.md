@@ -1,6 +1,6 @@
 # Getting started
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). [The last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). [The last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:

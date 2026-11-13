@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it.
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 

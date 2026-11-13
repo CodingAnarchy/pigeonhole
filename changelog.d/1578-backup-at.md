@@ -1,2 +1,0 @@
-### Added
-- **`Pigeonhole::backup_at(&snapshot, dest)`** (#1436, ICR 0125): a backup of a given snapshot. The copy holds exactly what the snapshot sees, so a change feed opened `from_snapshot` on the same snapshot starts at the first commit the copy doesn't hold: seed a copy elsewhere, then keep it current from the feed, with nothing missed or repeated. Back up a `durable_snapshot()` for a copy of durable commits only.

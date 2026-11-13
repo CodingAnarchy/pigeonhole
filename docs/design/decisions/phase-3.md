@@ -3118,6 +3118,7 @@ The ring tests that need their reads on a ring turn the switch off: `uring.rs`'s
 
 CI's ext4 runners cover hits. The podman VM's overlay mount covers refusals.
 
+<a id="d293"></a>
 ## D293 — A scan its row limit leaves short starts its readahead later (ctr274, 2026-10-28; engine, sst, #712, #974; refines D222)
 **Why.** ycsb-e's scans (1–100 rows, 16 clients) were ahead of RocksDB on throughput after #975's ramp but 1.27× on p99, against the 1.2× floor. A per-phase profile of each scan (#712 c6475482356) put the largest part of the p99 band in waits on readahead still in flight: 66% at 16 clients and 38% at 4 (VM). A short scan ends within a few blocks, and the ramp starts after two of them, so the readahead has no lead: the scan reaches the block it just asked for while the fetch is still in flight, and it waits. With readahead off, the VM's p99 dropped from 1649 to 135 µs at 16 clients and from 182 to 131 µs at 4, and throughput rose 11–13%.
 
@@ -4742,6 +4743,7 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 **Note for the serve benches:** `serve_feed_load` and `serve_read_load` run the `phdb` binary, so from this change on their server side runs on jemalloc. Compare their results only with runs from builds on the same side of it.
 
 
+<a id="d323"></a>
 ## D323 — `phdb serve`'s `/metrics` carries the engine's metrics under D316's names, through a backend-neutral `pigeonhole-otel` collector (cli692, design; coordinator, 2026-11-10; cli, otel, D313 ticket 9, ICR 0131)
 
 **Problem.** `phdb serve`'s `/metrics` had the server's own metrics: requests, durations, sessions, connections, shedding, feed hubs, bulk loads and the replica. Of the engine's, it had only `async_sync_reads`. An operator couldn't see a write stall, compaction debt, the caches, the file or a recovery. Those are D316's metrics, which `pigeonhole-otel` maps and carries, but only onto an application's OpenTelemetry `Meter`.

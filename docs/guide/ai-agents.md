@@ -1,6 +1,6 @@
 # Using Pigeonhole from AI agents
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)).
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)).
 
 `phdb mcp` serves a Pigeonhole database to AI agents over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Add it to an MCP client (Claude Code, Claude Desktop, an editor, an agent framework) and the agent can list tables, read rows, scan, traverse graphs, find nearest vectors and write in atomic batches, with no glue code. Agent code written in Python can use the [Python bindings](python.md) directly instead.
 
@@ -71,7 +71,7 @@ or, for a project, a `.mcp.json` at its root:
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
 ## Remote MCP (`phdb serve`)
-> **Status:** on `main` for 1.2.0 (#1397).
+> **Status:** new in 1.2.0 (#1397).
 
 [`phdb serve`](serve.md) serves the same tools over MCP's Streamable HTTP transport at `/mcp`, beside its gRPC and HTTP/JSON API. Use it when several agents, or agents on other machines, share one database, or when your application already runs `phdb serve` as the database's one writer. That's the setup the stdio section recommends, without a reader process of your own.
 

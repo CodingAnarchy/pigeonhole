@@ -1,6 +1,6 @@
 # Graphs
 
-> **Status:** this guide describes `main`; the [status page](../status.md) names the current release, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Wide-row walks (D297), multi-get (D299) and traversal (D304) are new in 1.1.0. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes 1.2; the [status page](../status.md) names the current release. Wide-row walks (D297), multi-get (D299) and traversal (D304) are new in 1.1.0. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole stores a graph as adjacency rows: one row per node, one column per edge. Four reads cover the usual access patterns:
 - a node's neighbours: one row read;

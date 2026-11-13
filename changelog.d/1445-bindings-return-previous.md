@@ -1,2 +1,0 @@
-### Added
-- Python and Ruby: `Mutation.return_previous(family, qualifier)` and `previous(family, qualifier)` on `commit_returning`'s result. They return a column's newest version from just before the commit, as a `Cell` (`None`/`nil` if it had none). `commit` and `commit_if` refuse a mutation with requests (`InvalidArgument`), and a read that failed after the commit raises `ReturnedValueError`. `Returned` (`pigeonhole.Returned`, `Pigeonhole::Returned`) is the same class as `Incremented` (#1445, ICR 0113).

@@ -2148,7 +2148,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pigeonhole"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-arrow"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-bench"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "pigeonhole",
  "pigeonhole-arrow",
@@ -2211,14 +2211,14 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-capi"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "pigeonhole",
 ]
 
 [[package]]
 name = "pigeonhole-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arc-swap",
  "arrow-ipc",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-example-serving"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "axum",
  "futures-core",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memory"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-core",
  "getrandom 0.3.4",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-python"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "pigeonhole",
  "pigeonhole-arrow",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-text"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-core",
  "levenshtein_automata",
@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-vector"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-core",
  "pigeonhole",
