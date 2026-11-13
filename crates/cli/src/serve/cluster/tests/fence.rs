@@ -336,3 +336,59 @@ fn status_shows_a_served_partitions_identity_from_its_handle() {
         }
     });
 }
+
+/// audit120's first cluster should: `unfence` reconciled before lifting an operator's fence,
+/// and the reconcile skips a partition the operator fenced, so a table created during the
+/// fence stayed missing there once it took writes again.
+#[test]
+fn a_table_created_during_an_operators_fence_is_there_once_unfenced() {
+    use crate::serve::proto::{
+        CreateTableRequest, FamilySpec, TablePlacementRequest, schema_client::SchemaClient,
+    };
+    let t = Three::start(["", "", ""]);
+    let [a, b, _] = t.ports;
+    t.rt.block_on(async {
+        fence(b, "p2").await.unwrap();
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{a}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        SchemaClient::new(channel)
+            .create_table(CreateTableRequest {
+                name: "items".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                if_missing: false,
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: Vec::new(),
+                    partitions: vec!["p2".into()],
+                }),
+            })
+            .await
+            .unwrap();
+        let want = version(a).await;
+        eventually("b to take the map with items", async || {
+            version(b).await == want
+        })
+        .await;
+        // Fenced by the operator: its files wait for the unfence.
+        assert!(local(b, "p2").await.reconciled_version < want);
+        let lp = unfence(b, "p2").await.unwrap();
+        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        assert_eq!(local(b, "p2").await.reconciled_version, want);
+        let mut w = put_row("pen", "1");
+        w.row.as_mut().unwrap().table = "items".into();
+        data(a)
+            .await
+            .mutate(crate::serve::proto::MutateRequest {
+                writes: Some(w),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+    });
+}

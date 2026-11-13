@@ -658,3 +658,149 @@ fn an_open_retries_while_a_read_only_open_holds_the_file() {
         let _ = db.close();
     }
 }
+
+/// Creates table `items` (family `f`) placed on partition `p` alone, through node `port`.
+async fn create_items_on(port: u16, p: &str) {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    SchemaClient::new(channel)
+        .create_table(CreateTableRequest {
+            name: "items".into(),
+            families: vec![FamilySpec {
+                name: "f".into(),
+                ..Default::default()
+            }],
+            if_missing: false,
+            placement: Some(TablePlacementRequest {
+                group: String::new(),
+                splits: Vec::new(),
+                partitions: vec![p.into()],
+            }),
+        })
+        .await
+        .unwrap();
+}
+
+/// Partition `p`'s line in node `port`'s Status, if it has one.
+async fn part_on(port: u16, p: &str) -> Option<crate::serve::proto::LocalPartition> {
+    client(port)
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == p)
+}
+
+/// audit120's F6: a partition's open reconciled every open partition of its node to the
+/// map it began with, so a table created on another of them while the engine opened was
+/// dropped, with its acknowledged rows. b serves p2 and opens p3 (held); `items` is made on
+/// p2 and written meanwhile; the row is still there once p3 serves.
+#[test]
+fn a_table_created_while_another_partition_opens_keeps_its_rows() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    test_partition_with(&dirs[1], "p3", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let [a, b, _] = ports;
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    *super::super::open::HOLD_OPEN.lock().unwrap() = Some((dirs[1].clone(), wait));
+    rt.block_on(async {
+        // Version 2 gives b partition p3; its open holds.
+        let mut v2 = the_map(2, &ports);
+        for p in &mut v2.partitions {
+            if p.id == "p3" {
+                p.node = "b".into();
+            }
+        }
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(v2),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        eventually("b's p3 to be opening", async || {
+            part_on(b, "p3")
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Opening)
+        })
+        .await;
+        // Meanwhile, `items` on p2, and a row in it.
+        create_items_on(a, "p2").await;
+        let want = version(a).await;
+        eventually("b's p2 to reconcile to the map with items", async || {
+            part_on(b, "p2")
+                .await
+                .is_some_and(|lp| lp.reconciled_version == want)
+        })
+        .await;
+        let mut w = put_row("pen", "1");
+        w.row.as_mut().unwrap().table = "items".into();
+        data(a)
+            .await
+            .mutate(crate::serve::proto::MutateRequest {
+                writes: Some(w),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        eventually("b's p3 to serve", async || {
+            part_on(b, "p3")
+                .await
+                .is_some_and(|lp| lp.state() == LocalPartitionState::Serving)
+        })
+        .await;
+        // Serving: the open, its reconcile included, has returned, and the map confirmed it.
+        for p in ["p2", "p3"] {
+            let lp = part_on(b, p).await.unwrap();
+            assert_eq!(lp.reconciled_version, want, "{lp:?}");
+        }
+        let got = data(b)
+            .await
+            .get(crate::serve::proto::GetRequest {
+                table: "items".into(),
+                row: b"pen".to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.cell.map(|c| c.value.to_vec()), Some(b"1".to_vec()));
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}

@@ -165,6 +165,10 @@ pub(crate) struct Node {
     /// Each partition's last reconcile, by id: the map version, and its outcome, for
     /// `Status`.
     reconciled: Mutex<std::collections::BTreeMap<String, (u64, schema::Outcome)>>,
+    /// The newest map version reconciled here, written under `installing`: an older map is
+    /// never reconciled after it, so a stale one can't drop a table a newer one created
+    /// (audit120's F6).
+    reconciled_newest: std::sync::atomic::AtomicU64,
     /// Whether this node has taken its peers' newer maps since it started (cleared by
     /// [`run`] for a node that restarts with a map, set by [`Node::sync_on_start`]). The
     /// map's writer changes the map only once it has (D317 amendment 1): a writer back from
@@ -188,8 +192,10 @@ pub(crate) struct Node {
 
 /// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
 /// server is gone.
+/// The second argument names a partition whose operator's fence is being lifted, which
+/// reconciles although its gate still says fenced.
 pub(crate) type Reconcile =
-    dyn Fn(&ClusterMap) -> Option<Vec<(String, schema::Outcome)>> + Send + Sync;
+    dyn Fn(&ClusterMap, Option<&str>) -> Option<Vec<(String, schema::Outcome)>> + Send + Sync;
 
 /// [`Reconcile`], boxed for [`Node::reconciler`].
 pub(crate) struct Reconciler(pub(crate) Box<Reconcile>);
@@ -243,6 +249,7 @@ impl Node {
             pulling: tokio::sync::Mutex::new(()),
             reconciler: std::sync::OnceLock::new(),
             reconciled: Mutex::new(std::collections::BTreeMap::new()),
+            reconciled_newest: std::sync::atomic::AtomicU64::new(0),
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
             fences: fence::Fences::default(),
@@ -380,7 +387,7 @@ impl Node {
         // The partition's files take the map's schema before its routes serve (D317 ticket
         // 5): a call routed by this map finds its table, or `TableNotFound` while a node
         // that hasn't taken it yet catches up.
-        self.reconcile(&canonical);
+        self.reconcile_locked(&_one, &canonical, None);
         let routes = Arc::new(route::Routes::new(&canonical));
         let mut st = self.state();
         st.map = Some((canonical, json));
