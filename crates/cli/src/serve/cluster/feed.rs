@@ -1078,7 +1078,8 @@ impl Ctx {
             skip_through: open.skip,
         };
         let request = self.node.request(req).map_err(ApiError::internal)?;
-        let mut grpc = tonic::client::Grpc::new(channel);
+        // A commit's event can be larger than tonic's default 4 MiB cap (audit120's S-C2).
+        let mut grpc = tonic::client::Grpc::new(channel).max_decoding_message_size(usize::MAX);
         let address = owner.address.clone();
         let failed = |status: tonic::Status| super::forward::classify(&status, &address, false);
         grpc.ready()
@@ -1308,6 +1309,7 @@ impl tonic::server::ServerStreamingService<proto::ForwardSubscribeRequest> for F
                 "forward a subscription",
             )?;
             this.node.maybe_pull(&caller, req.metadata());
+            this.node.catch_up(&caller, req.metadata()).await?;
             let events = this
                 .shared
                 .router
@@ -1336,7 +1338,10 @@ where
         let max = self.max_request_bytes;
         Box::pin(async move {
             let mut grpc = tonic::server::Grpc::new(ForwardSubscribeCodec)
-                .apply_max_message_size_config(Some(max), Some(usize::MAX));
+                .apply_max_message_size_config(
+                    Some(max.saturating_add(super::forward::FORWARD_ENVELOPE)),
+                    Some(usize::MAX),
+                );
             Ok(grpc.server_streaming(svc, req).await)
         })
     }

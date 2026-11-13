@@ -783,7 +783,7 @@ impl Node {
             .connect()
             .await
             .map_err(|e| format!("connecting to {address}: {e}"))?;
-        Ok(proto::cluster_client::ClusterClient::new(channel))
+        Ok(forward::peer_client(channel))
     }
 
     /// How this node dials the peer at `address` (the map's `host:port`): its TLS settings,
@@ -866,6 +866,56 @@ impl Node {
                 .map_err(|_| "the node id isn't a valid header value".to_owned())?,
         );
         Ok(req)
+    }
+
+    /// A forwarded call from a peer whose map is newer than this node's: take that map from
+    /// the peer first, and wait for it, so the call is served under it (audit120's S-C3).
+    /// Served under the older map, a write could land in a table the newer one dropped and
+    /// made again, which this node's next reconcile drops with the write. A peer whose map
+    /// can't be taken in time answers `PartitionUnavailable`: nothing ran, so a retry is
+    /// safe. Anyone else's headers are ignored, as [`Node::maybe_pull`] ignores them.
+    pub(crate) async fn catch_up(
+        self: &Arc<Self>,
+        caller: &Caller,
+        md: &tonic::metadata::MetadataMap,
+    ) -> Result<(), ApiError> {
+        if caller.scope != Scope::Cluster && self.tokens.any() {
+            return Ok(());
+        }
+        let header = |k: &str| md.get(k).and_then(|v| v.to_str().ok());
+        let (Some(version), Some(from)) = (
+            header(MAP_VERSION_HEADER).and_then(|v| v.parse::<u64>().ok()),
+            header(NODE_ID_HEADER),
+        ) else {
+            return Ok(());
+        };
+        let (mine, address) = {
+            let st = self.state();
+            let address = st.map.as_ref().and_then(|(m, _)| {
+                m.nodes
+                    .iter()
+                    .find(|n| n.id == from)
+                    .map(|n| n.address.clone())
+            });
+            (st.version(), address)
+        };
+        if version <= mine {
+            return Ok(());
+        }
+        let behind = |why: &str| {
+            ApiError::partition_unavailable(format!(
+                "this node's cluster map (version {mine}) is behind node {from}'s ({version}), \
+                 which forwarded the call, and {why}: nothing ran"
+            ))
+        };
+        let Some(address) = address else {
+            return Err(behind(
+                "this node's map doesn't list that node to take it from",
+            ));
+        };
+        self.pull_now(from, &address, mine)
+            .await
+            .map_err(|e| behind(&format!("taking it failed: {e}")))
     }
 
     /// A call from a peer (a `cluster`-scope caller) that says its map is newer: fetch it
@@ -1090,10 +1140,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         &self,
         req: Request<proto::ForwardRequest>,
     ) -> Result<tonic::Response<proto::ForwardResponse>, Status> {
-        self.caller(&req, &[Scope::Cluster], "forward a call")?;
+        let peer = self.caller(&req, &[Scope::Cluster], "forward a call")?;
         let Some(shared) = &self.1 else {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
+        self.0.catch_up(&peer, req.metadata()).await?;
         let msg = req.into_inner();
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
@@ -1142,10 +1193,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         &self,
         req: Request<proto::ForwardScanRequest>,
     ) -> Result<tonic::Response<Self::ForwardScanStream>, Status> {
-        self.caller(&req, &[Scope::Cluster], "forward a scan")?;
+        let peer = self.caller(&req, &[Scope::Cluster], "forward a scan")?;
         let Some(shared) = &self.1 else {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
+        self.0.catch_up(&peer, req.metadata()).await?;
         let msg = req.into_inner();
         let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
         let scan = msg
@@ -1228,8 +1280,10 @@ pub(crate) fn routes(
         shared: Arc::clone(shared),
         max_request_bytes,
     });
+    // A forward carries a call the entry node took within its `--max-request-bytes`, inside
+    // an envelope (audit120's S-C2).
     let grpc = proto::cluster_server::ClusterServer::new(ClusterGrpc(Arc::clone(&node), shared))
-        .max_decoding_message_size(max_request_bytes);
+        .max_decoding_message_size(max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE));
     let mut app = axum::Router::new()
         .route("/v1/cluster/map", get(http_get_map).post(http_set_map))
         .route("/v1/cluster/status", get(http_status))

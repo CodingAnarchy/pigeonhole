@@ -595,6 +595,126 @@ fn a_node_that_missed_a_drop_and_a_recreate_still_catches_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// audit120's S-C3: a forwarded call from a peer whose map is newer than this node's takes
+/// that map first, and waits for it, so the call isn't served under a schema the newer map
+/// dropped. A peer that can't give it answers `PartitionUnavailable`, nothing run.
+#[test]
+fn a_forward_from_a_peer_with_a_newer_map_takes_that_map_first() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let pa = listener.local_addr().unwrap().port();
+    // Nothing listens on c's port.
+    let pc = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let ports = [pa, 7002, pc];
+    let (da, db) = (test_dir(), test_dir());
+    let a = node(&da, "a");
+    a.push_map(the_map(1, &ports), None).unwrap();
+    let mut v3 = the_map(3, &ports);
+    v3.tables[0].splits = vec![text("q")];
+    a.push_map(v3, Some("b")).unwrap();
+    let _stop = serve(&rt, &a, listener);
+    let b = node(&db, "b");
+    b.push_map(the_map(1, &ports), None).unwrap();
+    let caller = b.caller(None).unwrap();
+    let headers = |version: u64, from: &str| {
+        let mut md = tonic::metadata::MetadataMap::new();
+        md.insert(
+            super::MAP_VERSION_HEADER,
+            version.to_string().parse().unwrap(),
+        );
+        md.insert(super::NODE_ID_HEADER, from.parse().unwrap());
+        md
+    };
+    rt.block_on(async {
+        b.catch_up(&caller, &headers(3, "a")).await.unwrap();
+        assert_eq!(b.state().version(), 3, "b took a's map before the call");
+        // No newer: nothing to do.
+        b.catch_up(&caller, &headers(2, "a")).await.unwrap();
+        // c says it's newer, and can't be reached: refused, b's map as it was.
+        let e = b.catch_up(&caller, &headers(9, "c")).await.unwrap_err();
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+        assert!(e.message.contains("nothing ran"), "{}", e.message);
+        assert_eq!(b.state().version(), 3);
+    });
+    let _ = std::fs::remove_dir_all(&da);
+    let _ = std::fs::remove_dir_all(&db);
+}
+
+/// audit120's S-C2: a forwarded reply over tonic's default 4 MiB reaches the entry node, and
+/// a call the entry node took within its `--max-request-bytes` isn't refused by the owner
+/// for the forward's envelope.
+#[test]
+fn a_large_reply_and_a_request_at_the_limit_pass_through_a_forward() {
+    use prost::Message;
+    let t = Three::start(["", "", ""]);
+    let [a, b, _] = t.ports;
+    // 5 MiB in one cell of p1 (a's), written to its file: more than one request may carry.
+    let big = vec![7u8; 5 << 20];
+    users(&t.dbs[0])
+        .mutate(b"alice")
+        .put("f", b"q", &big)
+        .commit()
+        .unwrap();
+    t.rt.block_on(async {
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{b}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let got = super::proto::data_client::DataClient::new(channel)
+            .max_decoding_message_size(usize::MAX)
+            .get(super::proto::GetRequest {
+                table: "users".into(),
+                row: b"alice".to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("the read through b: {e}"))
+            .into_inner();
+        assert_eq!(got.cell.map(|c| c.value.len()), Some(big.len()));
+        // A write to p1 through b whose request is one byte under b's limit (the rig's
+        // 1 MiB): the forward adds its envelope.
+        let limit = crate::serve::server_tests::limits().max_request_bytes;
+        let request = |n: usize| super::proto::MutateRequest {
+            writes: Some(put_row("bob", &"x".repeat(n))),
+            durability: 0,
+        };
+        let mut n = limit - 64;
+        while request(n + 1).encoded_len() < limit {
+            n += 1;
+        }
+        assert_eq!(request(n).encoded_len(), limit - 1);
+        data(b)
+            .await
+            .mutate(request(n))
+            .await
+            .unwrap_or_else(|e| panic!("the write through b: {e}"));
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{a}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let got = super::proto::data_client::DataClient::new(channel)
+            .get(super::proto::GetRequest {
+                table: "users".into(),
+                row: b"bob".to_vec().into(),
+                family: "f".into(),
+                qualifier: b"q".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.cell.map(|c| c.value.len()), Some(n));
+    });
+}
+
 #[test]
 fn a_cluster_token_alone_pushes_and_an_admin_token_alone_sets() {
     use crate::serve::auth::{Scope, Tokens};
