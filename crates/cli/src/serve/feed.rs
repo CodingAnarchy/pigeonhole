@@ -1419,6 +1419,25 @@ impl Client {
         pos: &mut Position,
     ) -> Result<Source, ApiError> {
         let mut hub_retry: Option<Instant> = None;
+        // Its stream is read once, without waiting, before the client may rejoin the ring: a
+        // resume whose token the engine refused (another history, retention passed) reports
+        // that on the first read, and a ring that happens to cover the token's seqno would
+        // otherwise take the client on without it (#1805's Windows run: a stale copy's token
+        // went on). Nothing ready yet: it may rejoin at once.
+        let first =
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *stream).poll_next(cx))).await;
+        match first {
+            Poll::Ready(Some(Ok(commit))) => {
+                let token = token_of(&stream);
+                self.cover(&commit, &token, pos).await?;
+                pos.seqno = Some(stream.position().seqno());
+            }
+            Poll::Ready(Some(Err(e))) => return Err(e.into()),
+            Poll::Ready(None) => {
+                return Err(ApiError::internal("the feed ended without an error"));
+            }
+            Poll::Pending => {}
+        }
         loop {
             super::placement::refresh();
             // A failed hub: take the key's current one, opening a new one if none (F2), at
