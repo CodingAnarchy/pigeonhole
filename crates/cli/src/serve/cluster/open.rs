@@ -298,8 +298,7 @@ impl Node {
                     .map_err(|f| ApiError::failed_precondition(f.message().to_owned()))
             })
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await?;
         let mut opened = opened?.pop().ok_or_else(|| {
             ApiError::failed_precondition(format!(
                 "partition {id}'s file is stamped at an epoch above the map's {epoch}: a \
@@ -346,9 +345,7 @@ impl Node {
         // now, not the one the open began with, which a schema change may have passed while
         // the engine opened (audit120's F6). The reconcile covers every open partition.
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None)))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None))).await?;
         Ok(())
     }
 

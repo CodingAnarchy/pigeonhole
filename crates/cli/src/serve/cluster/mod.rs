@@ -449,8 +449,7 @@ impl Node {
                 .map_or(MapSource::Forced, MapSource::Change);
             node.install(&map, from, check)
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .await?
     }
 
     /// `Cluster.SetMap`: compare-and-set on the version, then push to the others. Only the
@@ -617,9 +616,7 @@ impl Node {
         from: Option<String>,
     ) -> Result<PushMapResponse, ApiError> {
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || node.push_map(map, from.as_deref()))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        tokio::task::spawn_blocking(move || node.push_map(map, from.as_deref())).await?
     }
 
     /// `Cluster.PushMap`: a peer's newer map. `from`: the pushing node's id, if it said.
@@ -852,16 +849,7 @@ impl Node {
         if self.state().version() > past {
             return Ok(());
         }
-        let pulled = async {
-            let mut client = self.client(address).await?;
-            let req = self.request(GetMapRequest {})?;
-            client
-                .get_map(req)
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|s| s.message().to_owned())
-        };
-        let map = tokio::time::timeout(self.peers.push_timeout, pulled)
+        let map = tokio::time::timeout(self.peers.push_timeout, self.fetch_map(address))
             .await
             .map_err(|_| "timed out".to_owned())??;
         if map.map_version <= past {
@@ -987,15 +975,7 @@ impl Node {
         };
         let (node, from) = (Arc::clone(self), from.to_owned());
         tokio::spawn(async move {
-            let pulled = async {
-                let mut client = node.client(&address).await?;
-                let req = node.request(GetMapRequest {})?;
-                client
-                    .get_map(req)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| s.message().to_owned())
-            };
+            let pulled = node.fetch_map(&address);
             let result = match tokio::time::timeout(node.peers.push_timeout, pulled).await {
                 Ok(Ok(map)) => node
                     .push_map_async(map, Some(from.clone()))
@@ -1044,9 +1024,7 @@ impl ClusterGrpc {
     /// Partition `id`'s line of `Status`.
     async fn local(&self, id: &str) -> Result<LocalPartition, ApiError> {
         let node = Arc::clone(&self.0);
-        let status = tokio::task::spawn_blocking(move || node.status())
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let status = tokio::task::spawn_blocking(move || node.status()).await?;
         status
             .partitions
             .into_iter()
@@ -1164,7 +1142,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let node = Arc::clone(&self.0);
         let status = tokio::task::spawn_blocking(move || node.status())
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
         Ok(tonic::Response::new(status))
     }
 
@@ -1254,10 +1232,7 @@ fn http_caller(
     scopes: &[Scope],
     what: &str,
 ) -> Result<(), ApiError> {
-    let header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let caller = node.caller(header)?;
+    let caller = node.caller(crate::serve::http::auth_header(headers))?;
     node.allowed(&caller, scopes, what)
 }
 
@@ -1613,7 +1588,6 @@ pub(crate) fn run(
             placement,
             tls,
             serving,
-            dbs: opened.into_iter().map(|o| o.db).collect(),
             replica: None,
             start,
         },
