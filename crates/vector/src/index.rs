@@ -831,8 +831,18 @@ enum SplitRead {
 /// back to splitting by order (no two centroids, or too few to keep both sides in bounds),
 /// the second half of the list in id order.
 enum Rule {
-    Margin { stay: Vector, go: Vector, cut: f64 },
-    Order { half: u64 },
+    /// `tied`: when the sample's margins tie at the cut (duplicate vectors, from which
+    /// `two_means` filled a short side by index), the share of those at the cut that move,
+    /// spread over the list by position (audit120's N1 on #1861).
+    Margin {
+        stay: Vector,
+        go: Vector,
+        cut: f64,
+        tied: Option<f64>,
+    },
+    Order {
+        half: u64,
+    },
 }
 
 impl Rule {
@@ -848,15 +858,45 @@ impl Rule {
             .map(|p| Ok(distance(cen, p, &go)? - distance(cen, p, &stay)?))
             .collect::<Result<Vec<f64>>>()?;
         margins.sort_by(f64::total_cmp);
+        if margins[k - 1] == margins[k] {
+            let cut = margins[k];
+            let below = margins.partition_point(|m| *m < cut);
+            let at = margins[below..].partition_point(|m| *m == cut);
+            return Ok(Rule::Margin {
+                stay,
+                go,
+                cut,
+                tied: Some((k - below) as f64 / at as f64),
+            });
+        }
         let cut = (margins[k - 1] + margins[k]) / 2.0;
-        Ok(Rule::Margin { stay, go, cut })
+        Ok(Rule::Margin {
+            stay,
+            go,
+            cut,
+            tied: None,
+        })
     }
 
     /// Whether `p`, the `position`th vector of the list in id order, moves.
     fn moves(&self, cen: &VectorSpec, p: &Point, position: u64) -> Result<bool> {
         Ok(match self {
-            Rule::Margin { stay, go, cut } => {
-                distance(cen, p, go)? - distance(cen, p, stay)? < *cut
+            Rule::Margin {
+                stay,
+                go,
+                cut,
+                tied,
+            } => {
+                let m = distance(cen, p, go)? - distance(cen, p, stay)?;
+                match tied {
+                    // Every vector at the cut whose position steps `share × position` up a
+                    // whole number: that share of them, evenly through the list.
+                    Some(share) if m == *cut => {
+                        let at = |i: u64| (i as f64 * share).floor();
+                        at(position + 1) > at(position)
+                    }
+                    _ => m < *cut,
+                }
             }
             Rule::Order { half } => position >= *half,
         })
@@ -2000,9 +2040,10 @@ impl Index {
 
     /// Reads `list` for its split, at a snapshot dropped before anything commits (#1497):
     /// whole while it holds at most `cap` vectors, else a uniform sample of `cap` of them
-    /// (reservoir sampling, seeded by the list id), so a split never holds more than `cap`
+    /// (reservoir sampling, seeded by the list id and `version`, so a split that moved
+    /// nothing draws another sample next time), so a split never holds more than `cap`
     /// vectors however long the list has grown (#1824).
-    fn split_read(&self, list: u32, cap: u64) -> Result<SplitRead> {
+    fn split_read(&self, list: u32, version: u64, cap: u64) -> Result<SplitRead> {
         let s = self.inner.db.snapshot()?;
         let mut cells = self
             .inner
@@ -2013,7 +2054,7 @@ impl Index {
             .cells()?;
         let (mut ids, mut points) = (Vec::new(), Vec::new());
         let mut seen = 0u64;
-        let mut rng = u64::from(list);
+        let mut rng = u64::from(list) ^ version.rotate_left(32);
         while let Some(e) = cells.next()? {
             let v = e
                 .cell
@@ -2106,7 +2147,7 @@ impl Index {
             // memtables it saw, so a commit waiting for arena room would wait on room only
             // its own snapshot keeps, until the stall timeout. The commits validate on their
             // own reads (the list's version row and each moved vector, D306), not on it.
-            let (ids, points) = match self.split_read(list, cap)? {
+            let (ids, points) = match self.split_read(list, current.version, cap)? {
                 SplitRead::Whole(ids, points) => (ids, points),
                 SplitRead::Sample { points, seen } => {
                     return self.split_paged(list, &current.point, &points, seen);
@@ -2169,6 +2210,9 @@ impl Index {
         let rule = Rule::of(&inn.cen, sample, &plan, seen)?;
         let page = usize::try_from(self.max_list_len()).unwrap_or(usize::MAX);
         let mut new = None;
+        // The new list is claimed for the pass (audit120's S1 on #1861): it may hold only
+        // the first page's few movers, and a writer's inline merge of it would undo the pass.
+        let mut new_claim = None;
         let pass = (|| -> Result<()> {
             let (mut after, mut position) = (None::<Vec<u8>>, 0u64);
             loop {
@@ -2194,6 +2238,7 @@ impl Index {
                             crate::hooks::hold(crate::hooks::Hold::SplitBeforeCommit);
                             self.split_commit(list, &plan, &moving).map(|n| {
                                 new = Some(n);
+                                new_claim = self.claim(n);
                             })
                         }
                         (false, Some(n)) => {
@@ -2218,6 +2263,7 @@ impl Index {
                 after = Some(last);
             }
         })();
+        drop(new_claim);
         let Some(new) = new else {
             return pass;
         };
@@ -2277,6 +2323,9 @@ impl Index {
                     .incr(t, &count_row(new), CNT, b"", moved)
                     .put_u64(t, GLOBAL, META, NEXT, next + 1)
                     .put_u64(t, GLOBAL, META, LAYOUT, layout + 1);
+                // A paged split's list may still be long after this, its first page: the
+                // pass queues both lists in the process when it ends or fails, and `open`
+                // queues by the count rows, not the markers.
                 if inn.opts.rebalance == Rebalance::Background {
                     tx.delete_row(t, &queue_row(list));
                 }
@@ -2922,6 +2971,26 @@ impl<'a> Search<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// audit120's N1 on #1861: a sample whose short side `two_means` filled from duplicates
+    /// ties its margins at the cut. The rule then moves the plan's share of the vectors at
+    /// the cut, spread by position, not none of them.
+    #[test]
+    fn a_rule_cut_at_tied_duplicates_moves_the_plans_share_of_them() {
+        let cen = VectorSpec::new(2, Element::F32, pigeonhole::Metric::L2).unwrap();
+        let mut sample = vec![Point::F32(vec![0.0, 0.0]); 30];
+        sample.extend([Point::F32(vec![10.0, 0.0]), Point::F32(vec![10.0, 0.0])]);
+        let plan = two_means(&cen, &sample, &Point::F32(vec![0.0, 0.0]), 8).unwrap();
+        // The far pair stays, and is filled to 8 from the duplicates: 24 of 30 move.
+        assert_eq!(plan.moving.len(), 24);
+        let rule = Rule::of(&cen, &sample, &plan, 32_000).unwrap();
+        let (dup, far) = (&sample[0], &sample[30]);
+        let moved = (0..1000)
+            .filter(|i| rule.moves(&cen, dup, *i).unwrap())
+            .count();
+        assert_eq!(moved, 800, "24 / 30 of the duplicates");
+        assert!((0..1000).all(|i| !rule.moves(&cen, far, i).unwrap()));
+    }
 
     fn layout(seqno: u64, version: u64) -> Layout {
         Layout {
