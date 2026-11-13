@@ -60,7 +60,8 @@ impl Prepaid {
 ///
 /// **The token is checked first** (audit120's should 1): a request without a valid token is
 /// `Unauthenticated` before any of its body is read or any budget reserved, so it can't hold
-/// either (`Admin.Health` takes no token). The handler checks the scope later, as for HTTP.
+/// either. (`Admin.Health` takes no token, on a route of its own: [`health_prepay`].) The
+/// handler checks the scope later, as for HTTP.
 /// **The message's read is bounded** by the request's one deadline (the request timeout, or
 /// a shorter `grpc-timeout`): `prepay` reads the header, reserves, then reads the rest of
 /// the first message before tonic decodes it, so a client that sends a call's headers but
@@ -78,9 +79,7 @@ pub(crate) async fn prepay(
         .headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if parts.uri.path() != HEALTH
-        && let Err(e) = shared.caller(token)
-    {
+    if let Err(e) = shared.caller(token) {
         return status(e);
     }
     let limits = shared.limits;
@@ -144,8 +143,53 @@ pub(crate) async fn prepay(
     super::charge::hold(next.run(req).await, limits.stream_idle)
 }
 
-/// `Admin.Health`, which takes no token.
-const HEALTH: &str = "/pigeonhole.v1.Admin/Health";
+/// `Admin.Health`, which takes no token: routed apart, through [`health_prepay`].
+pub(crate) const HEALTH: &str = "/pigeonhole.v1.Admin/Health";
+
+/// The longest message `Admin.Health` takes. Its request is `Empty`, so this is room only
+/// for fields a later version might add.
+const HEALTH_MESSAGE: usize = 64;
+
+/// Middleware on `Admin.Health`'s own route, outside `--max-concurrent` as `/v1/health` is,
+/// so a probe answers while requests are shed (audit120's P2-F3). It takes no token, so it
+/// reserves nothing: a declared message over [`HEALTH_MESSAGE`] bytes is refused from its
+/// header, and the message is read within the request's deadline. So header-only calls to
+/// it, without a token, can't hold the in-flight budget or a request place.
+pub(crate) async fn health_prepay(
+    State(shared): State<Arc<Shared>>,
+    req: HttpRequest,
+    next: Next,
+) -> HttpResponse {
+    let arrived = Instant::now();
+    let (parts, body) = req.into_parts();
+    let limits = shared.limits;
+    let wait = grpc_timeout(&parts.headers)
+        .map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
+    let until = arrived + wait;
+    let mut data = body.into_data_stream();
+    let mut head = Vec::new();
+    if let Err(e) = read_to(&mut data, &mut head, 5, until).await {
+        return status(e);
+    }
+    let length = head
+        .get(1..5)
+        .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    if length > HEALTH_MESSAGE {
+        return status(ApiError::invalid(format!(
+            "Admin.Health takes an empty message, not {length} bytes"
+        )));
+    }
+    if let Err(e) = read_to(&mut data, &mut head, 5 + length, until).await {
+        return status(e);
+    }
+    let body = Body::from_stream(Rest {
+        head: Some(Bytes::from(head)),
+        rest: data,
+    });
+    let mut req = HttpRequest::from_parts(parts, body);
+    req.extensions_mut().insert(Arrived(arrived));
+    next.run(req).await
+}
 
 /// The client stream whose messages are each reserved as they arrive.
 const BULK_LOAD: &str = "/pigeonhole.v1.Vectors/BulkLoad";

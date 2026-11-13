@@ -5370,7 +5370,9 @@ pub struct VectorBulkLoadRequest {
     /// In the first message only.
     #[prost(string, tag = "1")]
     pub index: ::prost::alloc::string::String,
-    /// In the first message only: about how many vectors follow, for sizing the lists.
+    /// In the first message only: how many vectors follow, at most. It sizes the lists, and
+    /// a load that sends more than they hold before they split (about twice this) ends with
+    /// InvalidArgument, the vectors before it loaded.
     #[prost(uint64, tag = "2")]
     pub expected: u64,
     #[prost(message, repeated, tag = "3")]

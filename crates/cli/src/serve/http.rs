@@ -78,6 +78,15 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
     .max_decoding_message_size(limits.max_request_bytes)
     .max_encoding_message_size(usize::MAX);
     let prepay = || axum::middleware::from_fn_with_state(Arc::clone(&shared), super::grpc::prepay);
+    // `Admin.Health` over gRPC on a route of its own, beside `/v1/health`: no token, nothing
+    // reserved, and outside the concurrency limit, so a probe answers under overload
+    // (audit120's P2-F3). It wins over the `Admin` route's wildcard.
+    let health_grpc = tower::ServiceBuilder::new()
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&shared),
+            super::grpc::health_prepay,
+        ))
+        .service(admin.clone());
     let shed = Arc::clone(&shared);
     let limited = axum::Router::new()
         .route("/v1/{service}/{method}", post(call))
@@ -170,6 +179,7 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         );
     let app = axum::Router::new()
         .route("/v1/health", get(health))
+        .route_service(super::grpc::HEALTH, health_grpc)
         .route("/metrics", get(metrics))
         .with_state(Arc::clone(&shared))
         .merge(limited);
