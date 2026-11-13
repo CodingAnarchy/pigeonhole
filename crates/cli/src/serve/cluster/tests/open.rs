@@ -819,7 +819,15 @@ fn a_table_created_while_another_partition_opens_keeps_its_rows() {
 /// lands, and must serve p3 once released.
 #[test]
 fn a_partition_opened_on_the_writer_serves_though_another_map_lands_before_its_confirm() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Bounded (#1865): it hung on CI when its hold stopped a runtime worker, and `eventually`
+    // bounds only how often it asks, not a call that never answers.
+    bounded(Duration::from_secs(120), || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        another_map_lands_before_the_confirm(&rt);
+    });
+}
+
+fn another_map_lands_before_the_confirm(rt: &tokio::runtime::Runtime) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -839,7 +847,7 @@ fn a_partition_opened_on_the_writer_serves_though_another_map_lands_before_its_c
             .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
     {
         super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        let (stop, db) = data_node_tokens(rt, dir, id, local, l, "");
         stops.push(stop);
         dbs.extend(db);
     }
