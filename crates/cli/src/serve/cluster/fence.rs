@@ -122,11 +122,12 @@ impl Fences {
             .map(|s| (Arc::clone(&s.gate), s.epoch))
     }
 
-    /// Partitions still fenced since the node started.
-    pub(crate) fn start_fenced(&self) -> Vec<String> {
+    /// Partitions the peers haven't confirmed since they opened here, operator-fenced or not
+    /// (#1829: an operator's fence no longer hides the wait).
+    pub(crate) fn unconfirmed(&self) -> Vec<String> {
         self.served()
             .iter()
-            .filter(|(_, s)| s.gate.fenced() == Some(Fence::Start))
+            .filter(|(_, s)| s.gate.awaiting_peers())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -146,16 +147,13 @@ impl Node {
         Ok(())
     }
 
-    /// Partition `id`'s gate, at its file's `epoch`, as it opens here: fenced, by the
-    /// operator if `fenced.json` lists it, else until a peer's map confirms it (rule 3: a
-    /// node that was down may have missed the partition's move).
+    /// Partition `id`'s gate, at its file's `epoch`, as it opens here: unconfirmed until
+    /// the peers' maps confirm it (rule 3: a node that was down may have missed the
+    /// partition's move), and fenced by the operator as well if `fenced.json` lists it. The
+    /// two are separate flags (#1829), so an operator's fence doesn't hide the wait.
     pub(crate) fn open_gate(&self, id: &str, epoch: u64) -> Arc<WriteGate> {
-        let why = if self.fences.operator().contains(id) {
-            Fence::Operator
-        } else {
-            Fence::Start
-        };
-        let gate = WriteGate::new(id, Some(why));
+        let operator = self.fences.operator().contains(id);
+        let gate = WriteGate::opened(id, operator);
         self.fences.served().insert(
             id.to_owned(),
             Served {
@@ -172,7 +170,7 @@ impl Node {
         let (gate, _) = self.fences.gate(id)?;
         Some(match gate.fenced() {
             Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
-            Some(Fence::Start) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
+            Some(Fence::Unconfirmed) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
             None => (LocalPartitionState::Serving, FenceReason::Unspecified),
         })
     }
@@ -195,6 +193,14 @@ impl Node {
     /// Why partition `id` is fenced here, for the startup line and the log.
     pub(crate) fn fence_of(&self, id: &str) -> Option<Fence> {
         self.fences.gate(id).and_then(|(g, _)| g.fenced())
+    }
+
+    /// Whether partition `id`, open here, awaits its peers' confirmation, whatever the
+    /// operator's fence (`Status`'s `awaiting_peers`, #1829).
+    pub(crate) fn awaiting_peers(&self, id: &str) -> bool {
+        self.fences
+            .gate(id)
+            .is_some_and(|(g, _)| g.awaiting_peers())
     }
 
     /// `Cluster.Fence`: from now, P's writes answer `Fenced`; answers once every write
@@ -228,11 +234,11 @@ impl Node {
         // a refused unfence leaves a closed partition closed, its hashes kept (simp724's N1
         // on #1826).
         let closed = self.fences.closed().get(id).map(|c| c.epoch);
-        let (epoch, start_fenced) = match closed {
+        let (epoch, unconfirmed) = match closed {
             Some(epoch) => (epoch, false),
             None => {
                 let (gate, epoch) = self.fences.gate(id).ok_or_else(|| not_here(id))?;
-                (epoch, gate.fenced() == Some(Fence::Start))
+                (epoch, gate.awaiting_peers())
             }
         };
         let map = self.get_map()?;
@@ -241,10 +247,12 @@ impl Node {
         // partition first, as at start, unless the operator forces it (cli692's S1 on
         // #1755). An operator's fence needs that as much as a start fence does (audit120's
         // P2-F1): a move fences its old node as the operator, and that node is the one whose
-        // map is behind when it misses the move's map.
+        // map is behind when it misses the move's map. Asked whichever flags are set
+        // (audit120's D1 on the #1829 design): a move's old node that never restarted has
+        // been confirmed long since, and only the operator's fence is set.
         if !force && !self.peer_confirms(&map, id, epoch).await {
-            let since = if start_fenced {
-                "fenced since this node started"
+            let since = if unconfirmed {
+                "fenced, and unconfirmed since it opened here,"
             } else {
                 "fenced"
             };
@@ -301,7 +309,7 @@ impl Node {
     }
 
     /// Auto-unfence (rule 3, cli692's S3): `map`, a peer's (or this node's own, in a
-    /// cluster of one), confirms every start-fenced partition it names for this node at the
+    /// cluster of one), confirms every unconfirmed partition (operator-fenced or not) it names for this node at the
     /// partition's file's epoch, if it's at least as new as this node's map. Any later map
     /// that does counts: pushed, pulled, or fetched at start.
     pub(crate) fn confirm(&self, map: &ClusterMap) {
@@ -310,15 +318,20 @@ impl Node {
         }
         let served = self.fences.served();
         for (id, s) in served.iter() {
-            if s.gate.fenced() == Some(Fence::Start)
-                && names(map, &self.id, id, s.epoch)
-                && s.gate.unfence_start()
-            {
-                eprintln!(
-                    "phdb serve: partition {id} unfenced: map version {} still places it on \
-                     this node",
-                    map.map_version
-                );
+            if s.gate.awaiting_peers() && names(map, &self.id, id, s.epoch) && s.gate.confirm() {
+                if s.gate.fenced().is_none() {
+                    eprintln!(
+                        "phdb serve: partition {id} unfenced: map version {} still places it \
+                         on this node",
+                        map.map_version
+                    );
+                } else {
+                    eprintln!(
+                        "phdb serve: partition {id} confirmed by map version {}, and still \
+                         fenced by the operator (phdb cluster unfence lifts it)",
+                        map.map_version
+                    );
+                }
             }
         }
     }
@@ -376,7 +389,7 @@ impl Node {
             if map.nodes.iter().all(|n| n.id == self.id) {
                 self.confirm(&map);
             }
-            if self.fences.start_fenced().is_empty() {
+            if self.fences.unconfirmed().is_empty() {
                 return;
             }
             tokio::time::sleep(wait).await;

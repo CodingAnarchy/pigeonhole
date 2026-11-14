@@ -646,3 +646,108 @@ fn a_refused_unfence_leaves_a_closed_partition_closed() {
         assert_eq!(state(a, "p1").await, LocalPartitionState::Closed);
     });
 }
+
+#[test]
+fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks_them() {
+    // #1829: the operator's fence and "not confirmed since it opened" are two flags, so a
+    // restarted node's operator-fenced partition reports both, and the peers' confirmation
+    // clears only the second. `unfence` without --force is refused while no peer answers,
+    // lifts the fence with --force, and once a peer confirms, lifts it plainly.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let map = three_way(&ports);
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let limits = crate::serve::server_tests::limits();
+    let nodes = [("a", "p1"), ("b", "p2"), ("c", "p3")];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, p)) in listeners.into_iter().zip(&dirs).zip(nodes) {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, "", limits, None, false);
+        stops.push(stop);
+        dbs.push(db);
+    }
+    rt.block_on(async {
+        fence(ports[1], "p2").await.unwrap();
+        fence(ports[2], "p3").await.unwrap();
+    });
+    for stop in stops.drain(..) {
+        let _ = stop.send(());
+    }
+    rt.block_on(async {
+        for port in ports {
+            eventually("the node to stop", async || {
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err()
+            })
+            .await;
+        }
+    });
+    let bind = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let restart = |i: usize| {
+        data_node_full(
+            &rt,
+            &dirs[i],
+            nodes[i].0,
+            Some(nodes[i].1),
+            bind(ports[i]),
+            "",
+            limits,
+            dbs[i].clone(),
+            true,
+        )
+        .0
+    };
+    // c alone: p3 is the operator's and unconfirmed. No peer answers, so a plain unfence is
+    // refused; --force lifts both.
+    stops.push(restart(2));
+    rt.block_on(async {
+        let lp = local(ports[2], "p3").await;
+        assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+        assert!(
+            lp.awaiting_peers,
+            "an operator's fence no longer hides the wait: {lp:?}"
+        );
+        let e = unfence(ports[2], "p3").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("no peer's map"), "{e}");
+        let lp = client(ports[2])
+            .await
+            .unfence(PartitionRequest {
+                partition: "p3".into(),
+                force: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        assert!(!lp.awaiting_peers, "{lp:?}");
+    });
+    // a and b: b's p2 is confirmed by its peers' maps, and stays fenced by the operator
+    // until a plain unfence, which its peers now confirm.
+    stops.push(restart(0));
+    stops.push(restart(1));
+    rt.block_on(async {
+        eventually("b's p2 to be confirmed by its peers", async || {
+            !local(ports[1], "p2").await.awaiting_peers
+        })
+        .await;
+        let lp = local(ports[1], "p2").await;
+        assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+        let e = try_put(ports[1], "hank", "1").await.unwrap_err();
+        assert_eq!(code(&e), "Fenced", "{e}");
+        unfence(ports[1], "p2").await.unwrap();
+        assert_eq!(state(ports[1], "p2").await, LocalPartitionState::Serving);
+        put(ports[1], "hank", "1").await;
+    });
+    drop(stops);
+    for db in dbs.into_iter().flatten() {
+        let _ = db.close();
+    }
+}

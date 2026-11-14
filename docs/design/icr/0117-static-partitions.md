@@ -360,6 +360,7 @@
   - `state = 10`: a `LocalPartitionState`, one of `SERVING`, `FENCED`, `CLOSED` or `OPENING`;
   - `files = 11`: a closed partition's files once hashed, as `PartitionFile`;
   - `fence_reason = 12`: a `FenceReason`, `OPERATOR` or `AWAITING_PEER_MAP`, set only when `FENCED`.
+  - `awaiting_peers = 13` (bool, 1.3.0, #1829): the peers have yet to confirm it since it opened here, whatever `fence_reason` says. The gate keeps the operator's fence and the wait for the peers as two flags; `fence_reason` reports the operator's first, so an operator-fenced partition no peer has confirmed reads `OPERATOR` with `awaiting_peers` set.
 - **`StampRequest`** has six fields: `cluster_id`, `partition`, `from_epoch`, `to_epoch`, `restore` and `restore_from_cluster_id`.
 - **`PartitionRequest.force = 2`** (bool), read only by `Unfence` (cli692's S1): it lifts a start fence that no peer's map confirms.
 - **A new code, `Fenced`:** gRPC `FAILED_PRECONDITION`, HTTP 409. Nothing is written. The sender passes it through unchanged and never retries it.

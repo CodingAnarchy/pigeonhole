@@ -386,6 +386,10 @@ pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
     use proto::{FenceReason, LocalPartitionState};
     match (lp.state(), lp.fence_reason()) {
         (LocalPartitionState::Serving, _) => "serving".into(),
+        // Both reasons at once (#1829): the operator's fence, and the peers not yet asked.
+        (LocalPartitionState::Fenced, FenceReason::Operator) if lp.awaiting_peers => {
+            "fenced (operator, awaiting peer map)".into()
+        }
         (LocalPartitionState::Fenced, FenceReason::Operator) => "fenced (operator)".into(),
         (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap) => {
             "fenced (awaiting peer map)".into()
