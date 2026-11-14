@@ -2,11 +2,11 @@
 //! (`loom` is a dev-dependency, so only the `--cfg loom` test build switches.)
 
 #[cfg(all(loom, test))]
-pub(crate) use loom::sync::atomic::{AtomicU8, AtomicU64};
+pub(crate) use loom::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::atomic::{AtomicU8, AtomicU64};
+pub(crate) use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 

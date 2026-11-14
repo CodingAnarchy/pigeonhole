@@ -1197,6 +1197,27 @@ impl Pigeonhole {
         self.engine().driver_trace()
     }
 
+    /// Resizes the block cache to `block_bytes` and the row cache to `row_bytes` (#1761).
+    ///
+    /// **A serve-only contract, not part of the stable API, with no 1.x promise:** `phdb
+    /// serve` re-splits a cluster node's `--engine-memory` across its partitions with it as
+    /// partitions open and close. A shrink evicts unpinned entries down to the new size
+    /// before it returns (pinned ones stay until released, so usage can stay over it by what
+    /// is pinned); a grow evicts nothing. A cache that was off at open stays off. It blocks
+    /// while it evicts, so call it off async workers.
+    #[doc(hidden)]
+    pub fn set_cache_capacities(&self, block_bytes: usize, row_bytes: usize) {
+        self.engine().set_cache_capacities(block_bytes, row_bytes);
+    }
+
+    /// The block and row caches' configured capacities in bytes, as
+    /// [`set_cache_capacities`](Self::set_cache_capacities) last set them or `Options` at
+    /// open. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn cache_capacities(&self) -> (usize, usize) {
+        self.engine().cache_capacities()
+    }
+
     /// What the row cache did since open: hits, misses and fills (D201). All zero when
     /// [`Options::row_cache`](crate::Options::row_cache) is 0.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
