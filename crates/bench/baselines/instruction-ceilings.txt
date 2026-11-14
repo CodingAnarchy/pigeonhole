@@ -436,10 +436,18 @@ replicate-apply 6764 0.3
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
 # and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
 # runs: serve-get 74914-74925, serve-read-row 663899-663986, serve-scan 8021546-8021560, and
-# serve-mutate 70129-70197. Main's #1898 (cluster code only) added about 450-470 per call to every
-# shape through the cli crate's single codegen unit (#1902); serve-mutate's per-PR threshold is
-# 1.0%, and tracing its run-to-run noise is #1900.
-serve-get 75150 0.3
-serve-read-row 665978 0.3
-serve-mutate 70408 0.3
-serve-scan 8045625 0.3
+# serve-mutate 70129-70197. Those counts held about 450-470 per call that main's #1898 (cluster
+# code only) had added to every shape: the router awaited the cluster-only futures in place, so
+# every call's future grew with a fan-out's (#1902). #1903 removed that cost and more, below.
+# serve-mutate's per-PR threshold is 1.0%, and tracing its run-to-run noise is #1900.
+#
+# #1902 (#1903): dispatch_by boxes the cluster-only futures, so a call's future is not sized by
+# them (15304 to 8976 bytes for a gRPC Get) and is cheaper to move. Lowered from 75150, 665978,
+# 70408 and 8045625. From the head d185078d8 (main 7e0b4c49e), three identical-code runs,
+# 43625456463, 43625461046 and 43628573840 (ubuntu-24.04). The highest count of each shape times
+# 1.003. Spread across these runs: serve-get 68310-68323, serve-read-row 657557-657570,
+# serve-mutate 63474-63924, and serve-scan 8015241-8015247.
+serve-get 68528 0.3
+serve-read-row 659543 0.3
+serve-mutate 64116 0.3
+serve-scan 8039293 0.3
