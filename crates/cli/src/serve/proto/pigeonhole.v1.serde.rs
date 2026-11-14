@@ -9308,6 +9308,9 @@ impl serde::Serialize for LocalPartition {
         if self.fence_reason != 0 {
             len += 1;
         }
+        if self.awaiting_peers {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -9353,6 +9356,9 @@ impl serde::Serialize for LocalPartition {
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.fence_reason)))?;
             struct_ser.serialize_field("fence_reason", &v)?;
         }
+        if self.awaiting_peers {
+            struct_ser.serialize_field("awaiting_peers", &self.awaiting_peers)?;
+        }
         struct_ser.end()
     }
 }
@@ -9380,6 +9386,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "files",
             "fence_reason",
             "fenceReason",
+            "awaiting_peers",
+            "awaitingPeers",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -9396,6 +9404,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             State,
             Files,
             FenceReason,
+            AwaitingPeers,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -9429,6 +9438,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "state" => Ok(GeneratedField::State),
                             "files" => Ok(GeneratedField::Files),
                             "fenceReason" | "fence_reason" => Ok(GeneratedField::FenceReason),
+                            "awaitingPeers" | "awaiting_peers" => Ok(GeneratedField::AwaitingPeers),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -9460,6 +9470,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut state__ = None;
                 let mut files__ = None;
                 let mut fence_reason__ = None;
+                let mut awaiting_peers__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -9538,6 +9549,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             fence_reason__ = Some(map_.next_value::<FenceReason>()? as i32);
                         }
+                        GeneratedField::AwaitingPeers => {
+                            if awaiting_peers__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("awaitingPeers"));
+                            }
+                            awaiting_peers__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -9553,6 +9570,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     state: state__.unwrap_or_default(),
                     files: files__.unwrap_or_default(),
                     fence_reason: fence_reason__.unwrap_or_default(),
+                    awaiting_peers: awaiting_peers__.unwrap_or_default(),
                 })
             }
         }

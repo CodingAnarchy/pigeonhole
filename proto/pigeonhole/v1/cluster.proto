@@ -270,8 +270,13 @@ message LocalPartition {
   // partition's path), size and SHA-256. Empty while they're being hashed; a failed hash
   // sets `error`, and `Close` again retries it. `Stamp`'s reply: the set it installed.
   repeated PartitionFile files = 11;
-  // Why it's fenced: set only when `state` is FENCED.
+  // Why it's fenced: set only when `state` is FENCED. The operator's fence when it's set,
+  // else AWAITING_PEER_MAP.
   FenceReason fence_reason = 12;
+  // The peers have yet to confirm it since it opened here (D317 rule 3), whatever
+  // `fence_reason` says: an operator-fenced partition may be waiting for them too, and an
+  // unfence without --force asks them first (#1829, ICR 0117 amendment).
+  bool awaiting_peers = 13;
 }
 
 // A forwarded single-key call (D317 ticket 2).

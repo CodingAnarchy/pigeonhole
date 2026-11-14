@@ -5171,9 +5171,15 @@ pub struct LocalPartition {
     /// sets `error`, and `Close` again retries it. `Stamp`'s reply: the set it installed.
     #[prost(message, repeated, tag = "11")]
     pub files: ::prost::alloc::vec::Vec<PartitionFile>,
-    /// Why it's fenced: set only when `state` is FENCED.
+    /// Why it's fenced: set only when `state` is FENCED. The operator's fence when it's set,
+    /// else AWAITING_PEER_MAP.
     #[prost(enumeration = "FenceReason", tag = "12")]
     pub fence_reason: i32,
+    /// The peers have yet to confirm it since it opened here (D317 rule 3), whatever
+    /// `fence_reason` says: an operator-fenced partition may be waiting for them too, and an
+    /// unfence without --force asks them first (#1829, ICR 0117 amendment).
+    #[prost(bool, tag = "13")]
+    pub awaiting_peers: bool,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]

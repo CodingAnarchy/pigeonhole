@@ -21,20 +21,25 @@ use tokio::sync::Notify;
 
 use super::errors::ApiError;
 
-/// Why a partition is fenced.
+/// Why a partition is fenced, as a write's refusal and `Status` report it: the operator's
+/// fence when it's set, else the wait for confirmation. The gate keeps the two as separate
+/// flags (#1829); this is their reading, the operator's first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fence {
     /// `phdb cluster fence`: kept in `fenced.json` across a restart, lifted only by
     /// `phdb cluster unfence`.
     Operator,
-    /// Opened at the node's start, waiting for a peer's map that still names this node for
-    /// the partition at its file's epoch (auto-unfence).
-    Start,
+    /// Not confirmed since it opened: waiting for the peers' maps to say it's still this
+    /// node's at its file's epoch (D317 rule 3).
+    Unconfirmed,
 }
 
+/// Neither flag: writes are admitted.
 const OPEN: u8 = 0;
+/// The operator's fence (`phdb cluster fence`, `fenced.json`).
 const OPERATOR: u8 = 1;
-const START: u8 = 2;
+/// Not confirmed by the peers since the partition opened here (rule 3).
+const UNCONFIRMED: u8 = 2;
 
 /// One partition's gate, shared by its service and the node's fences.
 #[derive(Debug)]
@@ -43,18 +48,21 @@ pub(crate) struct WriteGate {
     partition: String,
     /// Writes admitted and not yet finished.
     inflight: AtomicUsize,
-    /// `OPEN`, or why it's fenced.
+    /// `OPERATOR` and `UNCONFIRMED`, each set or clear: writes are admitted with neither.
     fence: AtomicU8,
     /// Woken when the last write finishes while fenced.
     drained: Notify,
 }
 
 impl WriteGate {
-    pub(crate) fn new(partition: &str, fence: Option<Fence>) -> Arc<Self> {
+    /// A cluster partition's gate as it opens on a node: unconfirmed until the peers'
+    /// maps confirm it (rule 3), and fenced by the operator as well when `operator`
+    /// (`fenced.json` lists it).
+    pub(crate) fn opened(partition: &str, operator: bool) -> Arc<Self> {
         Arc::new(Self {
             partition: partition.to_owned(),
             inflight: AtomicUsize::new(0),
-            fence: AtomicU8::new(encode(fence)),
+            fence: AtomicU8::new(UNCONFIRMED | if operator { OPERATOR } else { OPEN }),
             drained: Notify::new(),
         })
     }
@@ -78,27 +86,32 @@ impl WriteGate {
         &self.partition
     }
 
-    /// Why the partition is fenced, `None` when it isn't.
+    /// Why the partition is fenced, `None` when it isn't: the operator's fence first.
     pub(crate) fn fenced(&self) -> Option<Fence> {
         decode(self.fence.load(Ordering::SeqCst))
     }
 
-    /// Fences the partition for an operator: writes admitted from now answer `Fenced`. It
-    /// replaces a start fence, which a gate only ever has from [`WriteGate::new`].
-    pub(crate) fn fence(&self) {
-        self.fence.store(OPERATOR, Ordering::SeqCst);
+    /// Whether the peers have yet to confirm the partition since it opened here, whatever
+    /// the operator's fence says (`Status`'s `awaiting_peers`).
+    pub(crate) fn awaiting_peers(&self) -> bool {
+        self.fence.load(Ordering::SeqCst) & UNCONFIRMED != 0
     }
 
-    /// Lifts the fence, whatever its reason.
+    /// Fences the partition for an operator: writes admitted from now answer `Fenced`. An
+    /// unconfirmed partition stays unconfirmed as well.
+    pub(crate) fn fence(&self) {
+        self.fence.fetch_or(OPERATOR, Ordering::SeqCst);
+    }
+
+    /// The peers confirmed the partition (rule 3): clears the wait for them, and leaves an
+    /// operator's fence. Whether it was waiting.
+    pub(crate) fn confirm(&self) -> bool {
+        self.fence.fetch_and(!UNCONFIRMED, Ordering::SeqCst) & UNCONFIRMED != 0
+    }
+
+    /// Lifts both: an operator's `unfence`, once the peers confirmed it, or forced.
     pub(crate) fn unfence(&self) {
         self.fence.store(OPEN, Ordering::SeqCst);
-    }
-
-    /// Lifts a start fence only: an operator's stays.
-    pub(crate) fn unfence_start(&self) -> bool {
-        self.fence
-            .compare_exchange(START, OPEN, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
     }
 
     /// Another hold for a write [`enter`](Self::enter) admitted and that's still held: the
@@ -163,19 +176,14 @@ impl Drop for Held {
     }
 }
 
-fn encode(fence: Option<Fence>) -> u8 {
-    match fence {
-        None => OPEN,
-        Some(Fence::Operator) => OPERATOR,
-        Some(Fence::Start) => START,
-    }
-}
-
+/// The flags' reading: the operator's fence first, then the wait for the peers.
 fn decode(v: u8) -> Option<Fence> {
-    match v {
-        OPERATOR => Some(Fence::Operator),
-        START => Some(Fence::Start),
-        _ => None,
+    if v & OPERATOR != 0 {
+        Some(Fence::Operator)
+    } else if v & UNCONFIRMED != 0 {
+        Some(Fence::Unconfirmed)
+    } else {
+        None
     }
 }
 
@@ -186,9 +194,9 @@ fn fenced(partition: &str, why: Fence) -> ApiError {
             "partition {partition:?} is fenced on this node (phdb cluster fence): it takes no \
              writes until it's unfenced or relocated; nothing was written"
         ),
-        Fence::Start => format!(
-            "partition {partition:?} is fenced while this node starts, until a peer's map \
-             confirms it's still this node's; nothing was written"
+        Fence::Unconfirmed => format!(
+            "partition {partition:?} is fenced until its peers' maps confirm it's still this \
+             node's (it opened here since they last did); nothing was written"
         ),
     })
 }
@@ -197,9 +205,16 @@ fn fenced(partition: &str, why: Fence) -> ApiError {
 mod tests {
     use super::*;
 
+    /// A gate as a confirmed partition has it: opened, then confirmed by the peers.
+    fn open(partition: &str) -> Arc<WriteGate> {
+        let g = WriteGate::opened(partition, false);
+        assert!(g.confirm());
+        g
+    }
+
     #[test]
     fn an_open_gate_admits_and_a_fenced_one_refuses() {
-        let g = WriteGate::new("p1", None);
+        let g = open("p1");
         let held = g.enter().unwrap();
         assert_eq!(g.inflight(), 1);
         g.fence();
@@ -214,21 +229,46 @@ mod tests {
     }
 
     #[test]
-    fn a_start_fence_never_replaces_an_operators() {
-        let g = WriteGate::new("p1", Some(Fence::Operator));
-        assert!(!g.unfence_start());
+    fn the_operators_fence_and_the_wait_for_the_peers_are_separate_flags() {
+        // #1829: an operator-fenced partition that opens is unconfirmed as well, and each
+        // flag clears on its own: the peers' confirmation leaves the operator's fence, and
+        // the gate admits writes only with both clear.
+        let g = WriteGate::opened("p1", true);
         assert_eq!(g.fenced(), Some(Fence::Operator));
-        let g = WriteGate::new("p1", Some(Fence::Start));
+        assert!(g.awaiting_peers());
+        assert!(g.confirm(), "it was waiting");
+        assert!(!g.confirm(), "no longer");
+        assert!(!g.awaiting_peers());
+        assert_eq!(
+            g.fenced(),
+            Some(Fence::Operator),
+            "the operator's fence stays"
+        );
+        assert_eq!(g.enter().unwrap_err().code, "Fenced");
+        g.unfence();
+        assert_eq!(g.fenced(), None);
+        drop(g.enter().unwrap());
+
+        // Unconfirmed alone: confirming opens it.
+        let g = WriteGate::opened("p1", false);
+        assert_eq!(g.fenced(), Some(Fence::Unconfirmed));
+        assert!(g.enter().unwrap_err().message.contains("peers' maps"));
+        // An operator's fence on top keeps it unconfirmed, and reads as the operator's.
         g.fence();
         assert_eq!(g.fenced(), Some(Fence::Operator));
-        let g = WriteGate::new("p1", Some(Fence::Start));
-        assert!(g.unfence_start());
+        assert!(g.awaiting_peers());
+        assert!(g.confirm());
+        assert_eq!(g.fenced(), Some(Fence::Operator));
+
+        let g = WriteGate::opened("p1", false);
+        assert!(g.confirm());
         assert_eq!(g.fenced(), None);
+        drop(g.enter().unwrap());
     }
 
     #[tokio::test]
     async fn drained_waits_for_writes_admitted_before_the_fence_and_their_extensions() {
-        let g = WriteGate::new("p1", None);
+        let g = open("p1");
         let held = g.enter().unwrap();
         let detached = g.extend();
         drop(held);
@@ -252,7 +292,7 @@ mod tests {
     #[test]
     fn a_racing_write_is_either_waited_for_or_refused() {
         for _ in 0..2000 {
-            let g = WriteGate::new("p1", None);
+            let g = open("p1");
             let writer = {
                 let g = Arc::clone(&g);
                 std::thread::spawn(move || g.enter().ok())

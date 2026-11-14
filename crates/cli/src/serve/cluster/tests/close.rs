@@ -175,7 +175,7 @@ fn a_call_on_a_partition_closed_under_it_answers_partition_unavailable() {
         &backups,
         crate::serve::service::Pinning::default(),
         crate::serve::placement::Memory::defaults(1),
-        crate::serve::gate::WriteGate::new("p1", None),
+        crate::serve::gate::WriteGate::opened("p1", false),
     );
     db.close().unwrap();
     let get = ServiceOp::Get(super::super::proto::GetRequest {
