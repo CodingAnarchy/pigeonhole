@@ -1,0 +1,2 @@
+### Changed
+- **A cluster partition fenced by the operator also shows whether its peers have confirmed it since it opened** (#1829, ICR 0117 amendment). `phdb cluster status` reads `fenced (operator, awaiting peer map)` until a peer's map confirms it, and `Status` gains `LocalPartition.awaiting_peers`. The peers' confirmation no longer waits behind your fence: it's recorded, and the fence stays until `phdb cluster unfence`, which asks the peers as before.
