@@ -15,8 +15,8 @@ pub(crate) mod fanout;
 pub(crate) mod feed;
 pub(crate) mod fence;
 pub(crate) mod forward;
+pub(crate) mod hub;
 pub(crate) mod identity;
-pub(crate) mod idle;
 pub(crate) mod lease;
 pub(crate) mod map;
 pub(crate) mod moving;
@@ -218,6 +218,8 @@ pub(crate) struct Node {
     opening: tokio::sync::Mutex<()>,
     /// This node, for the tasks an install starts.
     me: std::sync::Weak<Node>,
+    /// Its cluster feed hubs (#1798): one merge per subscription key.
+    pub(crate) feed_hubs: hub::Hubs,
     /// The leases this node grants, and its lease clock (D326).
     grants: lease::Grants,
     /// When this writer first saw a majority of both the nodes before and the nodes after
@@ -315,6 +317,7 @@ impl Node {
             fences: fence::Fences::default(),
             server: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
+            feed_hubs: hub::Hubs::default(),
             me: me.clone(),
         })
     }
