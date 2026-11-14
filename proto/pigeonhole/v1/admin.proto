@@ -109,6 +109,9 @@ message PartitionInfo {
   LocalPartitionState state = 5;
   // Why a fenced partition is fenced.
   FenceReason fence_reason = 6;
+  // As `Cluster.Status`'s `LocalPartition.awaiting_peers`: a majority of the map's nodes
+  // have yet to confirm it since it opened here, whatever `fence_reason` says (#1829).
+  bool awaiting_peers = 7;
 }
 
 // `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty

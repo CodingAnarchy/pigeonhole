@@ -18,7 +18,7 @@ async fn admin(port: u16) -> AdminClient<tonic::transport::Channel> {
     AdminClient::new(channel)
 }
 
-async fn info(port: u16) -> InfoResponse {
+pub(super) async fn info(port: u16) -> InfoResponse {
     admin(port)
         .await
         .info(crate::serve::proto::Empty {})
