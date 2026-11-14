@@ -462,6 +462,13 @@ fn is_conflict(t: &Tx) -> bool {
     matches!(t, Tx::Db(e) if e.code() == ErrorCode::Conflict)
 }
 
+/// The engine refused the transaction as more than a shard's memtable arena takes (about
+/// half of `Options::memtable_budget`): a split or phase 2 that moved a whole list in one
+/// then moves it a page at a time (audit120's S1 on #1881).
+fn is_too_large(t: &Tx) -> bool {
+    matches!(t, Tx::Db(e) if e.code() == ErrorCode::BatchTooLarge)
+}
+
 /// A transaction's snapshot shows `M{id}` naming a list with no centroid. A merge moves a
 /// list's vectors and mappings and deletes its centroid in one transaction that reads the
 /// list's whole row, so no consistent snapshot shows this: it's what `verify` reports as
@@ -839,7 +846,9 @@ enum SplitRead {
 enum Rule {
     /// `tied`: when the sample's margins tie at the cut (duplicate vectors, from which
     /// `two_means` filled a short side by index), the share of those at the cut that move,
-    /// spread over the list by position (audit120's N1 on #1861).
+    /// spread evenly over them in id order (audit120's N1 on #1861, and #1868: counted
+    /// among the tied vectors, not the whole list, so duplicates at a regular stride in id
+    /// order can't all move or all stay).
     Margin {
         stay: Vector,
         go: Vector,
@@ -884,8 +893,11 @@ impl Rule {
         })
     }
 
-    /// Whether `p`, the `position`th vector of the list in id order, moves.
-    fn moves(&self, cen: &VectorSpec, p: &Point, position: u64) -> Result<bool> {
+    /// Whether `p`, the next vector of the list in id order after `place`, moves; `place`
+    /// then counts it.
+    fn moves(&self, cen: &VectorSpec, p: &Point, place: &mut Place) -> Result<bool> {
+        let position = place.position;
+        place.position += 1;
         Ok(match self {
             Rule::Margin {
                 stay,
@@ -895,11 +907,13 @@ impl Rule {
             } => {
                 let m = distance(cen, p, go)? - distance(cen, p, stay)?;
                 match tied {
-                    // Every vector at the cut whose position steps `share × position` up a
-                    // whole number: that share of them, evenly through the list.
+                    // Every vector at the cut whose index among them steps `share × index`
+                    // up a whole number: that share of them, evenly.
                     Some(share) if m == *cut => {
+                        let i = place.tied;
+                        place.tied += 1;
                         let at = |i: u64| (i as f64 * share).floor();
-                        at(position + 1) > at(position)
+                        at(i + 1) > at(i)
                     }
                     _ => m < *cut,
                 }
@@ -907,6 +921,14 @@ impl Rule {
             Rule::Order { half } => position >= *half,
         })
     }
+}
+
+/// How far a paged split's pass is through its list ([`Rule::moves`]): the vectors seen in id
+/// order, and how many of them were at a tied cut.
+#[derive(Debug, Clone, Copy, Default)]
+struct Place {
+    position: u64,
+    tied: u64,
 }
 
 /// SplitMix64: the reservoir sample's generator, deterministic per list.
@@ -2205,6 +2227,13 @@ impl Index {
                 }
                 Err(Tx::Stale) => return Ok(()),
                 Err(e) if is_conflict(&e) => {}
+                // Too many vectors move for one transaction (small vectors, or a small
+                // memtable budget): the same split a page at a time, from the whole read as
+                // its sample.
+                Err(e) if is_too_large(&e) => {
+                    let seen = ids.len() as u64;
+                    return self.split_paged(list, &current.point, points, seen);
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -2247,22 +2276,21 @@ impl Index {
         // the first page's few movers, and a writer's inline merge of it would undo the pass.
         let mut new_claim = None;
         let pass = (|| -> Result<()> {
-            let (mut after, mut position) = (None::<Vec<u8>>, 0u64);
+            let (mut after, mut place) = (None::<Vec<u8>>, Place::default());
             loop {
-                let start = position;
+                let start = place;
                 let mut attempt = 0;
                 let last = loop {
-                    position = start;
+                    place = start;
                     let (ids, points) = self.page(list, after.as_deref(), page)?;
                     let Some(last) = ids.last().cloned() else {
                         return Ok(());
                     };
                     let mut moving = Vec::new();
                     for (id, p) in ids.iter().zip(&points) {
-                        if rule.moves(&inn.cen, p, position)? {
+                        if rule.moves(&inn.cen, p, &mut place)? {
                             moving.push(id.as_slice());
                         }
-                        position += 1;
                     }
                     let r = match (moving.is_empty(), new) {
                         (true, _) => Ok(()),
@@ -2379,14 +2407,17 @@ impl Index {
         }
         let dim = inn.cen.dim();
         let (stay, go) = (plan.stay.to_vector(dim)?, plan.go.to_vector(dim)?);
-        let page = usize::try_from(self.split_cap()).unwrap_or(usize::MAX);
+        let whole = usize::try_from(self.split_cap()).unwrap_or(usize::MAX);
+        let small = usize::try_from(self.max_list_len()).unwrap_or(usize::MAX);
         for nbr in layout.nearest(&inn.cen, &plan.stay, r, &[list, new])? {
             let Some(n) = layout.list(nbr) else {
                 continue;
             };
+            let mut page = whole;
             // Whole, in one transaction, while it's within a split's bound; a page of that
             // bound at a time past it, so a neighbour that outgrew its bound is never read
-            // whole (#1824, #1879). Each read at a snapshot dropped before its transaction
+            // whole (#1824, #1879); a split length at a time if that is too many moves for
+            // one transaction. Each read at a snapshot dropped before its transaction
             // commits (#1497, as in `split`): the transaction validates on its own reads.
             let mut after = None::<Vec<u8>>;
             loop {
@@ -2408,6 +2439,12 @@ impl Index {
                         Ok(()) => self.queue([nbr, list, new]),
                         Err(Tx::Stale) => {}
                         Err(e) if is_conflict(&e) => {}
+                        // Too many moves for one transaction: read the same range again
+                        // a split length at a time (audit120's S1 on #1881).
+                        Err(e) if is_too_large(&e) && page > small => {
+                            page = small;
+                            continue;
+                        }
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -3008,7 +3045,9 @@ mod tests {
 
     /// audit120's N1 on #1861: a sample whose short side `two_means` filled from duplicates
     /// ties its margins at the cut. The rule then moves the plan's share of the vectors at
-    /// the cut, spread by position, not none of them.
+    /// the cut, not none of them; and (#1868) that share of them however they fall in id
+    /// order, here at every fifth position, where a share stepped by the list position moved
+    /// none.
     #[test]
     fn a_rule_cut_at_tied_duplicates_moves_the_plans_share_of_them() {
         let cen = VectorSpec::new(2, Element::F32, pigeonhole::Metric::L2).unwrap();
@@ -3019,11 +3058,22 @@ mod tests {
         assert_eq!(plan.moving.len(), 24);
         let rule = Rule::of(&cen, &sample, &plan, 32_000).unwrap();
         let (dup, far) = (&sample[0], &sample[30]);
+        let mut place = Place::default();
         let moved = (0..1000)
-            .filter(|i| rule.moves(&cen, dup, *i).unwrap())
+            .filter(|_| rule.moves(&cen, dup, &mut place).unwrap())
             .count();
         assert_eq!(moved, 800, "24 / 30 of the duplicates");
-        assert!((0..1000).all(|i| !rule.moves(&cen, far, i).unwrap()));
+        let mut place = Place::default();
+        assert!((0..1000).all(|_| !rule.moves(&cen, far, &mut place).unwrap()));
+        // The duplicates at every fifth position, the far pair's copies between them.
+        let mut place = Place::default();
+        let moved = (0..5000)
+            .filter(|i| {
+                let p = if i % 5 == 0 { dup } else { far };
+                rule.moves(&cen, p, &mut place).unwrap() && i % 5 == 0
+            })
+            .count();
+        assert_eq!(moved, 800, "24 / 30 of the duplicates at a stride");
     }
 
     fn layout(seqno: u64, version: u64) -> Layout {

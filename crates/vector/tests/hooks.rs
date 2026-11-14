@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use common::{V, check, exact, open};
-use pigeonhole::{Element, Metric, VectorSpec};
+use pigeonhole::{Durability, Element, Metric, Options, Pigeonhole, RetryPolicy, VectorSpec};
 use pigeonhole_vector::hooks::{self, Hold};
-use pigeonhole_vector::{Index, IndexOptions, Rebalance};
+use pigeonhole_vector::{Error, Index, IndexOptions, Placed, Rebalance};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -512,5 +512,77 @@ fn a_paged_split_is_consistent_between_its_pages() {
     settle(&index, &mut copied, "the copy");
     check(&index, &copied, "the copy");
     exact(&index, &copied, &V::F32(vec![0.0, 0.0]), 5, "the copy");
+    db.close().unwrap();
+}
+
+/// audit120's S1 on #1881: a long list of small vectors, within the bound a split reads
+/// whole, whose whole move is more than the engine takes in one transaction at a small
+/// memtable budget (`BatchTooLarge`). The split and phase 2 fall back to moving it a page
+/// at a time, so the write that triggers it succeeds and the index ends within its bounds.
+#[test]
+fn a_whole_split_too_large_for_one_transaction_moves_a_page_at_a_time() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(
+        dir.join("idx.phdb"),
+        Options::default()
+            .shards(1)
+            .memtable_budget(1 << 20)
+            .durability(Durability::Buffered),
+    )
+    .unwrap();
+    let opts = IndexOptions::new()
+        .target_list_len(64)
+        .reassign_neighbours(1)
+        .rebalance(Rebalance::Background);
+    let (index, mut rebalancer) = Index::create_with_rebalancer(&db, "idx", spec(), opts).unwrap();
+    let drain = |r: &mut pigeonhole_vector::Rebalancer| {
+        while r.run_once(std::time::Duration::from_secs(60)).unwrap() {}
+    };
+    let mut model = BTreeMap::new();
+    for i in 0..400 {
+        put(&index, &mut model, &format!("s{i:03}"), i as f32);
+    }
+    drain(&mut rebalancer);
+    let lists = index.verify().unwrap().list_lens.len();
+    hooks::skip_rebalance(true);
+    // 10,000 vectors (80 KiB of them) into the list nearest 200, 500 per transaction.
+    for chunk in 0..20u32 {
+        let (placed, _) = db
+            .transact(&RetryPolicy::default(), |tx| {
+                let mut p = Placed::new();
+                for j in 0..500u32 {
+                    let i = chunk * 500 + j;
+                    let x = 200.0 + (i % 2) as f32 * 0.5 + (i % 7) as f32 * 0.01;
+                    index.insert_f32_in(tx, &mut p, format!("l{i:05}").as_bytes(), &[x, 0.0])?;
+                }
+                Ok::<Placed, Error>(p)
+            })
+            .unwrap();
+        index.after_commit(placed).unwrap();
+        for j in 0..500u32 {
+            let i = chunk * 500 + j;
+            let x = 200.0 + (i % 2) as f32 * 0.5 + (i % 7) as f32 * 0.01;
+            model.insert(format!("l{i:05}").into_bytes(), V::F32(vec![x, 0.0]));
+        }
+    }
+    hooks::skip_rebalance(false);
+    let lens = index.verify().unwrap().list_lens;
+    assert_eq!(lens.len(), lists);
+    assert!(lens.iter().any(|n| *n > 10_000), "one long list: {lens:?}");
+    // The next write into it marks it; the rebalancer's splits must not fail.
+    put(&index, &mut model, "trigger", 200.0);
+    drain(&mut rebalancer);
+    check(&index, &model, "after the long list's splits");
+    for q in [0.0, 200.0, 200.5, 390.0] {
+        exact(
+            &index,
+            &model,
+            &V::F32(vec![q, 0.0]),
+            5,
+            &format!("query {q}"),
+        );
+    }
+    drop(rebalancer);
     db.close().unwrap();
 }
