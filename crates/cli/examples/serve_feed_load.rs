@@ -138,6 +138,28 @@ struct Args {
     /// its feed hubs and their clients to stderr (Unix).
     #[arg(long, value_name = "SECS")]
     dump_every: Option<u64>,
+    /// Serve with this many tokens (`--token-file`, each its own principal) and spread the
+    /// subscribers over them, subscriber i on token i mod N; the writers and the metrics
+    /// calls use the first. 0, the default, serves without tokens. A shared cluster merge
+    /// keys on the principal (#1798), so `--principals` equal to the subscriber count gives
+    /// every subscriber its own (perf287, #1828).
+    #[arg(long, default_value_t = 0)]
+    principals: usize,
+}
+
+/// The tokens `--principals` serves with, once written (empty without it).
+static TOKENS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// `message` as a request, with token `i mod N`'s `authorization` header under
+/// `--principals N`.
+fn authed<T>(message: T, i: usize) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(message);
+    if let Some(tokens) = TOKENS.get().filter(|t| !t.is_empty()) {
+        let value = format!("Bearer {}", tokens[i % tokens.len()]);
+        req.metadata_mut()
+            .insert("authorization", value.parse().expect("an ASCII token"));
+    }
+    req
 }
 
 /// Feed streams per connection: the server allows 128 HTTP/2 streams on one connection
@@ -318,6 +340,15 @@ fn prepare(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
         db.table(&t)?.family("f", Family::default()).create()?;
     }
     db.close()?;
+    // `--principals N`: N admin tokens (each may write, read and read the metrics).
+    let tokens: Vec<String> = (0..args.principals)
+        .map(|i| format!("serve-feed-load-{i:05}-0123456789abcdef"))
+        .collect();
+    if !tokens.is_empty() {
+        let text: String = tokens.iter().map(|t| format!("admin {t}\n")).collect();
+        std::fs::write(args.dir.join("tokens"), text)?;
+    }
+    TOKENS.set(tokens).expect("set once");
     Ok(file)
 }
 
@@ -340,6 +371,14 @@ impl Server {
             .arg(format!("127.0.0.1:{}", args.port))
             .arg("--max-streams")
             .arg("1024")
+            .args(if args.principals > 0 {
+                vec![
+                    "--token-file".into(),
+                    args.dir.join("tokens").into_os_string(),
+                ]
+            } else {
+                Vec::new()
+            })
             .args(&args.serve_args)
             .spawn()?;
         Ok(Self(child))
@@ -386,7 +425,7 @@ async fn feed_counters(
     channel: &tonic::transport::Channel,
 ) -> Result<std::collections::HashMap<String, u64>, Box<dyn std::error::Error>> {
     let text = proto::admin_client::AdminClient::new(channel.clone())
-        .metrics(proto::Empty {})
+        .metrics(authed(proto::Empty {}, 0))
         .await?
         .into_inner()
         .text;
@@ -403,14 +442,14 @@ async fn feed_counters(
 /// `Feed.Subscribe` with a codec that counts each event's frame and decodes nothing.
 async fn count_frames(
     conn: tonic::transport::Channel,
-    request: proto::SubscribeRequest,
+    request: tonic::Request<proto::SubscribeRequest>,
 ) -> Result<tonic::Streaming<usize>, Box<dyn std::error::Error>> {
     let mut grpc = tonic::client::Grpc::new(conn);
     grpc.ready().await?;
     let path =
         tonic::codegen::http::uri::PathAndQuery::from_static("/pigeonhole.v1.Feed/Subscribe");
     Ok(grpc
-        .server_streaming(tonic::Request::new(request), path, CountCodec)
+        .server_streaming(request, path, CountCodec)
         .await?
         .into_inner())
 }
@@ -665,11 +704,14 @@ async fn run(
             connections.push(connect(&url, args).await?);
         }
         let conn = connections[i / STREAMS_PER_CONNECTION].clone();
-        let request = proto::SubscribeRequest {
-            tables: set.clone(),
-            visible: args.visible,
-            ..Default::default()
-        };
+        let request = authed(
+            proto::SubscribeRequest {
+                tables: set.clone(),
+                visible: args.visible,
+                ..Default::default()
+            },
+            i,
+        );
         let events = Arc::clone(&events);
         let dropped = Arc::clone(&dropped);
         let mut stop = stop_rx.clone();
@@ -799,25 +841,28 @@ async fn run(
                 let t = due.unwrap_or_else(Instant::now);
                 let sent = Instant::now();
                 let r = client
-                    .mutate(proto::MutateRequest {
-                        writes: Some(proto::RowWrites {
-                            row: Some(proto::RowKey {
-                                table: "busy".into(),
-                                row: row.into(),
+                    .mutate(authed(
+                        proto::MutateRequest {
+                            writes: Some(proto::RowWrites {
+                                row: Some(proto::RowKey {
+                                    table: "busy".into(),
+                                    row: row.into(),
+                                }),
+                                writes: vec![proto::Write {
+                                    op: Some(proto::write::Op::Put(proto::Put {
+                                        family: "f".into(),
+                                        qualifier: b"q".to_vec().into(),
+                                        timestamp: None,
+                                        value: Some(proto::Value {
+                                            kind: Some(proto::value::Kind::Bytes(value.into())),
+                                        }),
+                                    })),
+                                }],
                             }),
-                            writes: vec![proto::Write {
-                                op: Some(proto::write::Op::Put(proto::Put {
-                                    family: "f".into(),
-                                    qualifier: b"q".to_vec().into(),
-                                    timestamp: None,
-                                    value: Some(proto::Value {
-                                        kind: Some(proto::value::Kind::Bytes(value.into())),
-                                    }),
-                                })),
-                            }],
-                        }),
-                        durability,
-                    })
+                            durability,
+                        },
+                        0,
+                    ))
                     .await;
                 if r.is_ok() {
                     lat.push(t.elapsed().as_micros() as u64);
