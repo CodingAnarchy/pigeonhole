@@ -514,6 +514,14 @@ impl Router {
     /// [`dispatch`](Self::dispatch) with the request's deadline, from its arrival: a forward
     /// takes what's left of it (cli692's F2 on ticket 2); without one, the request timeout
     /// from now.
+    ///
+    /// **The large cluster-only futures are boxed** (the map's schema calls, the fan-outs and
+    /// the forward, #1902): this future is moved once or more per call, and a future is as
+    /// large as the largest it awaits in place. Awaited in place, those made every call's
+    /// future, a single node's included, over twice the size of [`Service::call`]'s, and a
+    /// change to a fan-out changed what a single node's `Get` cost. A boxed one costs its
+    /// path one allocation, beside calls to several nodes. What is still awaited in place is
+    /// counted by the serve callgrind shapes (`serveshapes.rs`): they show a growth of it.
     async fn dispatch_by(
         &self,
         op: ServiceOp,
@@ -534,9 +542,7 @@ impl Router {
                     || tokio::time::Instant::now() + self.service.request_timeout(),
                     tokio::time::Instant::from_std,
                 );
-                return self
-                    .cluster_schema(cluster, op, caller, prepaid, deadline)
-                    .await;
+                return Box::pin(self.cluster_schema(cluster, op, caller, prepaid, deadline)).await;
             }
             // A read across a table's partitions fans out (D317 tickets 4a and 4b); a
             // subscription follows every partition it covers (ticket 7). One at a snapshot
@@ -557,15 +563,14 @@ impl Router {
                     );
                     return match op {
                         ServiceOp::Nearest(_) => {
-                            self.fan_nearest(cluster, op, caller, prepaid, deadline)
-                                .await
+                            Box::pin(self.fan_nearest(cluster, op, caller, prepaid, deadline)).await
                         }
                         ServiceOp::Traverse(_) => {
-                            self.fan_traverse(cluster, op, caller, prepaid, deadline)
+                            Box::pin(self.fan_traverse(cluster, op, caller, prepaid, deadline))
                                 .await
                         }
                         _ => {
-                            self.fan_multi_get(cluster, op, caller, prepaid, deadline)
+                            Box::pin(self.fan_multi_get(cluster, op, caller, prepaid, deadline))
                                 .await
                         }
                     };
@@ -598,8 +603,7 @@ impl Router {
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
                     );
-                    self.forward(cluster, op, caller, prepaid, owner, deadline)
-                        .await
+                    Box::pin(self.forward(cluster, op, caller, prepaid, owner, deadline)).await
                 }
             };
         }
