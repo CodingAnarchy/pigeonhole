@@ -578,3 +578,67 @@ fn a_reader_process_feed_of_every_table_delivers_catalog_changes_on_an_idle_data
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// #1869 (D315 amendment): a reader process's feed of every table expires on the stop the
+/// writer published, though no catalog change ever took a hold: the stop alone ends it, as
+/// in the writer's process, and not only a frontier stuck at a frozen hold. It delivers
+/// nothing the writer committed before the stop out of order, and no catalog change.
+/// Mutation-checked: reading only the writer's own flag (`writer.is_some_and(..)`), the
+/// feed never expires.
+#[test]
+fn a_reader_process_feed_of_every_table_expires_on_the_stop_alone() {
+    use pigeonhole_io::sim::FaultPlan;
+    let vfs = SimVfs::new(4134);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _b) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut all = r.feed(spec(&[], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let before = w.commit(&[(&a, b"before")]);
+    vfs.enter_process(READER);
+    let mut got = Vec::new();
+    for _ in 0..200 {
+        match all.try_next().unwrap() {
+            Next::Commit(c) => got.push(c.seqno),
+            Next::Pending if got.contains(&before) => break,
+            Next::Pending => std::thread::yield_now(),
+            other => panic!("before the stop: {other:?}"),
+        }
+    }
+    assert_eq!(got, [before], "delivered, and not expired, before the stop");
+    // A flush's root commit: its intent append fails, and the appends stop. No catalog
+    // change, so no hold.
+    vfs.enter_process(WRITER);
+    let mut plan = FaultPlan::none();
+    plan.fail_on = Some("phdb-feed");
+    vfs.set_faults(plan);
+    w.flush();
+    assert_eq!(vfs.scheduled_fired(), 1, "the intent's append failed");
+    vfs.set_faults(FaultPlan::none());
+    assert!(w.db.shm_feed_appends_stopped());
+    vfs.enter_process(READER);
+    let mut expired = None;
+    for _ in 0..200 {
+        match all.try_next().unwrap() {
+            Next::Commit(c) => got.push(c.seqno),
+            Next::Catalog(e) => panic!("no catalog change was made: {e:?}"),
+            Next::Pending => std::thread::yield_now(),
+            Next::Expired(e) => {
+                expired = Some(e.reason.clone());
+                break;
+            }
+        }
+    }
+    let expired = expired.expect("the stop alone expires a reader process's feed of every table");
+    assert!(
+        expired.contains("sidecar can no longer be written"),
+        "the writer's reason: {expired}"
+    );
+    assert_eq!(got, [before]);
+    drop(all);
+    vfs.enter_process(WRITER);
+    w.close();
+}

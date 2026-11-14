@@ -1431,6 +1431,25 @@ impl Engine {
         }
     }
 
+    /// Makes the change feed's next sidecar sync complete as failed, once, though the VFS's
+    /// succeeded: the session's appends stop there, as on a real sync failure (#1869). A
+    /// fault seam: a root commit's Root entry is written first, so a test can fail the sync
+    /// alone. No effect without a change feed (test hook).
+    #[doc(hidden)]
+    pub fn fail_next_sidecar_sync(&self) {
+        if let Some(f) = &self.inner.shared.feed {
+            f.fail_next_sidecar_sync.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether the writer's shared-memory region says its change-feed sidecar appends
+    /// stopped (the header's `FEED_FLAGS` bit, D315 amendment, #1869; an inspection helper
+    /// for tests).
+    #[doc(hidden)]
+    pub fn shm_feed_appends_stopped(&self) -> bool {
+        self.inner.shared.shm.feed_appends_stopped()
+    }
+
     /// Takes the manifest writer's exclusion on this thread, as a commit in progress holds
     /// it: shards' manifest requests queue up (their pumps find it held and leave) until
     /// [`release_manifest`](Self::release_manifest). Returns whether it was free (test hook).

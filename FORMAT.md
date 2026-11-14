@@ -671,7 +671,8 @@ A writer always builds a new generation: create the new region, store `state = a
 | 188 | 4 | padding, so `cross_held` is 8-aligned |
 | 192 | 8 | `cross_held` u64, atomic (layout version 6, D278): the lowest decided cross-shard seqno not yet applied on every participant, `u64::MAX` when none (§11.3) |
 | 200 | 8 | `catalog_hold` u64, atomic (layout version 9, D315): the ceiling of a catalog change whose §10.4 Catalog entry isn't appended yet, `u64::MAX` when none. The writer stores it under its seqno allocator's lock, before `next_seqno` passes it, and a feed of every table's frontier stays below it (§11.3). A feed of some tables doesn't read it |
-| 200 | 3896 | reserved |
+| 208 | 4 | `feed_flags` u32, atomic (D315 amendment, #1869; layout version 9, taken from the reserved area): 0 at init. Bit 0, the session's change-feed sidecar appends stopped (§10.4: an append or a sync failed), set once by the writer with `fetch_or` (Release) and never cleared within a generation; a reader process's feed of every table expires on it, as one in the writer's process does. Other bits reserved, 0. A build that doesn't know it never reads it: its feed of every table waits at the frozen `catalog_hold` instead, delivering nothing past it |
+| 212 | 3884 | reserved |
 
 ### 11.2 Watermarks
 

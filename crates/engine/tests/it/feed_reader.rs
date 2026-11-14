@@ -2341,3 +2341,74 @@ fn a_version_2_token_of_every_table_still_resumes() {
     drop(r);
     db.close().unwrap();
 }
+
+/// #1869 (D315 amendment): each of the three places the session's sidecar appends stop
+/// publishes the stop in the writer's shared-memory region (`FEED_FLAGS` bit 0), where a
+/// reader process's feed of every table finds it: a root commit's intent append, its Root
+/// entry's write, and the sidecar sync after it. Mutation-checked: without the publish in
+/// `Feed::stop_appends`, each case fails.
+#[test]
+fn every_way_the_sidecar_appends_stop_is_published_for_reader_processes() {
+    #[derive(Debug, Clone, Copy)]
+    enum Site {
+        Intent,
+        Root,
+        Sync,
+    }
+    for site in [Site::Intent, Site::Root, Site::Sync] {
+        let vfs = SimVfs::new(3240);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, _b) = tables(&db);
+        single(&db, &a, b"before", Durability::GroupSync);
+        db.flush().unwrap();
+        assert!(
+            !db.shm_feed_appends_stopped(),
+            "{site:?}: not before the stop"
+        );
+        single(&db, &a, b"flushed", Durability::GroupSync);
+        let mut plan = FaultPlan::none();
+        plan.fail_on = Some("phdb-feed");
+        match site {
+            // The flush's root commit appends its intent first: that write fails.
+            Site::Intent => {
+                vfs.set_faults(plan);
+                db.flush().unwrap();
+                assert_eq!(
+                    vfs.scheduled_fired(),
+                    1,
+                    "{site:?}: the intent's write failed"
+                );
+                vfs.set_faults(FaultPlan::none());
+            }
+            // The intent is written, and the observer waits before the Root entry: that
+            // write fails.
+            Site::Root => {
+                db.delay_root_observer(Duration::from_millis(600));
+                let flush = {
+                    let db = Arc::clone(&db);
+                    std::thread::spawn(move || db.flush().unwrap())
+                };
+                std::thread::sleep(Duration::from_millis(150));
+                vfs.set_faults(plan);
+                flush.join().unwrap();
+                db.delay_root_observer(Duration::ZERO);
+                assert_eq!(
+                    vfs.scheduled_fired(),
+                    1,
+                    "{site:?}: the Root entry's write failed"
+                );
+                vfs.set_faults(FaultPlan::none());
+            }
+            // Both writes land; the sync after them fails.
+            Site::Sync => {
+                db.fail_next_sidecar_sync();
+                db.flush().unwrap();
+            }
+        }
+        assert!(
+            db.shm_feed_appends_stopped(),
+            "{site:?}: the stop is published in shared memory"
+        );
+        db.close().unwrap();
+    }
+}
