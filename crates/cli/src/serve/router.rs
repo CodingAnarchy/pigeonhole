@@ -520,7 +520,8 @@ impl Router {
     /// large as the largest it awaits in place. Awaited in place, those made every call's
     /// future, a single node's included, over twice the size of [`Service::call`]'s, and a
     /// change to a fan-out changed what a single node's `Get` cost. A boxed one costs its
-    /// path one allocation, beside calls to several nodes.
+    /// path one allocation, beside calls to several nodes. What is still awaited in place is
+    /// counted by the serve callgrind shapes (`serveshapes.rs`): they show a growth of it.
     async fn dispatch_by(
         &self,
         op: ServiceOp,
