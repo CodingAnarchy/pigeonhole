@@ -418,3 +418,17 @@ text-two-terms-k100 52001738 0.3
 text-fuzzy 59386475 0.3
 text-phrase 126670191 0.3
 text-phrase-slop2 131159719 0.3
+# #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
+# a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
+# identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
+# each shape (base and head) times 1.003. Spread across the runs: 0-1 per unit. The async returning
+# commits run in a binary of their own (asyncwrites.rs): in writepath.rs they moved its layout and
+# commit-incr-returning by about 50 (#1874's scratch run).
+wide-row-cells-async 1675 0.3
+commit-put-previous-async 22144 0.3
+commit-if-returning-async 29264 0.3
+# Lowered by #1874 (#1857's every-table check folded into the kept pass, cached per catalog):
+# feed-drain-all 6416 -> 6177, CI's head count 6158 (run 43560343345) times 1.003.
+feed-drain 6154 0.3
+feed-drain-all 6177 0.3
+replicate-apply 6764 0.3

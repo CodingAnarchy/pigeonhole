@@ -596,13 +596,17 @@ async fn copy_file(
         .partition_upload_status(request(
             PartitionUploadStatusRequest {
                 upload_id: id.clone(),
+                partition: p.to_owned(),
             },
             new.token.as_deref(),
         )?)
         .await
         .map_err(|s| new.failed(&format!("upload status of {what}"), &s))?
         .into_inner();
-    if st.complete {
+    // An install of a set NEW staged is in progress there (an earlier run stopped in it):
+    // nothing is sent, and the stamp finishes it. The set it installs is compared with the
+    // closed set like any other (#1848).
+    if st.complete || st.installing {
         return Ok(0);
     }
     let from = st.received;

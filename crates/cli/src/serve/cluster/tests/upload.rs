@@ -99,6 +99,7 @@ fn a_node_stages_a_partition_it_doesnt_hold_open_and_resumes_it() {
             .await
             .partition_upload_status(PartitionUploadStatusRequest {
                 upload_id: h.upload_id.clone(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -164,6 +165,7 @@ fn a_stalled_upload_ends_after_the_idle_bound_and_resumes() {
             .await
             .partition_upload_status(PartitionUploadStatusRequest {
                 upload_id: h.upload_id.clone(),
+                ..Default::default()
             })
             .await
             .unwrap()
