@@ -149,7 +149,7 @@ impl Node {
             ))
         })?;
         let shared = self
-            .opener
+            .server
             .get()
             .and_then(|o| o.shared.upgrade())
             .ok_or_else(|| {
@@ -228,9 +228,9 @@ impl Node {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
         }
         // Its shards' CPUs are free now: the server's threads take them back.
-        if let Some(opener) = self.opener.get() {
+        if let Some(server) = self.server.get() {
             super::open::remask_off_async(
-                &opener.placement,
+                &server.placement,
                 &parts,
                 format!("partition {id} closed"),
             )
