@@ -560,6 +560,9 @@ pub(super) async fn serving(
     }
 }
 
+/// The longest [`majority_holds`] waits for one node's answer in a poll.
+const PER_NODE: Duration = Duration::from_secs(10);
+
 /// Waits until a majority of `map`'s nodes hold map version `v` or newer (#1760: a move's
 /// map step). A node that missed the writer's push takes the map from a peer's round,
 /// which pushes it to a peer that answers with an older one (D317 rule 3).
@@ -582,20 +585,33 @@ pub(super) async fn majority_holds(
     );
     loop {
         // Every node at once (audit120's nit on #1899): the wait is as long as the slowest
-        // answer, not their sum.
+        // answer, not their sum. Each is bounded on its own, so a node that's down (a
+        // refused connect can take seconds on Windows) counts as missing rather than
+        // ending the wait without a count.
+        if wait.left() == Some(Duration::ZERO) {
+            return Err(wait.gave_up());
+        }
+        let per = wait.left().map_or(PER_NODE, |l| l.min(PER_NODE));
         let mut asks = tokio::task::JoinSet::new();
         for node in &map.nodes {
             let (args, id, address) = (args.clone(), node.id.clone(), node.address.clone());
             asks.spawn(async move {
-                let version: Result<u64, Failure> = async {
+                let version = async {
                     let at = At::new(&args, &id, &address).await?;
                     at.map_version().await
-                }
-                .await;
+                };
+                let version = tokio::time::timeout(per, version)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Failure::usage(&format!(
+                            "no answer within {}s",
+                            per.as_secs_f32()
+                        )))
+                    });
                 (id, version)
             });
         }
-        let answers = wait.ask(asks.join_all()).await?;
+        let answers = asks.join_all().await;
         let mut have = 0;
         let mut missing = Vec::new();
         for (id, version) in answers {
