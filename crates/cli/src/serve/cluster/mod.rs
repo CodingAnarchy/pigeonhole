@@ -1554,6 +1554,7 @@ pub(crate) fn run(
             shards: total_shards,
             compaction: total_compaction,
             engine_memory: args.engine_memory,
+            reserved: reserved.clone(),
         },
     );
     // A node that restarts with a map takes a newer one from its peers, then pushes.

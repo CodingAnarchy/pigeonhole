@@ -909,7 +909,7 @@ fn render_pinning(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
             out,
             name,
             "gauge",
-            labelled().filter_map(|(id, p)| p.engine_memory.as_ref().map(|m| (*id, read(m)))),
+            labelled().filter_map(|(id, p)| p.engine_memory().map(|m| (*id, read(&m)))),
         );
     }
 }
@@ -1123,9 +1123,10 @@ pub(crate) struct Partition {
     /// How its engine's threads were placed when it opened (D317 ticket 8a's pinning
     /// check): a cluster node's gauges.
     pub(crate) pinning: Pinning,
-    /// Its engine memory as resolved at open (D317 ticket 8a's `--engine-memory`): a cluster
-    /// node's gauges.
-    pub(crate) engine_memory: Option<super::placement::Memory>,
+    /// Its engine memory (D317 ticket 8a's `--engine-memory`): as resolved at open, then as a
+    /// node's re-split at another partition's open or close changed its caches (#1761). A
+    /// cluster node's gauges, and the next re-split's starting point.
+    engine_memory: std::sync::Mutex<Option<super::placement::Memory>>,
     /// `--backup-dir`, and the backup downloads kept for resumes.
     ///
     /// **The node's one** (simp724's N1 on #1711): `Backups::new` clears
@@ -1173,6 +1174,28 @@ impl Partition {
         self.indexes.close();
     }
 
+    /// Its engine memory now (`--engine-memory`'s share), `None` without one.
+    pub(crate) fn engine_memory(&self) -> Option<super::placement::Memory> {
+        *self
+            .engine_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Resizes its engine's block and row caches to `memory`'s, and records it (#1761: a
+    /// node re-splitting `--engine-memory` as partitions open and close). The memtables stay
+    /// as opened: `memory` carries them unchanged. Blocks while a shrink evicts: call it off
+    /// async workers.
+    pub(crate) fn resize_caches(&self, memory: super::placement::Memory) {
+        let bytes = |b: u64| usize::try_from(b).unwrap_or(usize::MAX);
+        self.db
+            .set_cache_capacities(bytes(memory.block_cache), bytes(memory.row_cache));
+        *self
+            .engine_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(memory);
+    }
+
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
     /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
     fn new(
@@ -1188,7 +1211,7 @@ impl Partition {
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: Pinning::default(),
-            engine_memory: None,
+            engine_memory: std::sync::Mutex::new(None),
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
             indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None, None)),
             bulk: super::bulk::BulkLoads::default(),
@@ -1285,7 +1308,7 @@ impl Service {
         ));
         part.backups = Arc::clone(backups);
         part.pinning = pinning;
-        part.engine_memory = Some(memory);
+        part.engine_memory = std::sync::Mutex::new(Some(memory));
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
