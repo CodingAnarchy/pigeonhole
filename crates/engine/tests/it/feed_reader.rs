@@ -2193,3 +2193,46 @@ fn an_oldest_start_from_an_earlier_session_names_it_before_any_record() {
     drop(r);
     db.close().unwrap();
 }
+
+/// D325 (1.2.1): a token of a feed of every table from 1.3 (version 3: version 2's layout
+/// followed by 16 bytes, the catalog at its position) resumes here as version 2, its 16
+/// bytes ignored, so a rollback from 1.3 keeps the feed. The feed's own tokens stay version
+/// 2. One too short for its 16 bytes isn't a token.
+#[test]
+fn a_version_3_token_from_1_3_resumes_as_version_2() {
+    let vfs = SimVfs::new(3253);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let s = single(&db, &a, b"1", Durability::GroupSync);
+    match r.wait(WAIT).unwrap() {
+        Next::Commit(c) => assert_eq!(c.seqno, s),
+        other => panic!("{other:?}"),
+    }
+    let v2 = r.token();
+    assert_eq!(v2[0], 2);
+    drop(r);
+    // As 1.3 lays it out: version 3, then the catalog's 16 bytes.
+    let mut v3 = v2.clone();
+    v3[0] = 3;
+    v3.extend_from_slice(&[0xA5; 16]);
+    let s2 = single(&db, &a, b"2", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::Token(v3.clone()))).unwrap();
+    match r.wait(WAIT).unwrap() {
+        Next::Commit(c) => assert_eq!(c.seqno, s2, "resumed just past the token"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(r.token()[0], 2, "this build's tokens stay version 2");
+    drop(r);
+    // A version 3 token without its 16 bytes.
+    let mut short = v2;
+    short[0] = 3;
+    assert!(
+        matches!(
+            db.feed(spec(&[], FeedStart::Token(short))),
+            Err(pigeonhole_engine::Error::InvalidArgument(_))
+        ),
+        "not a token"
+    );
+    db.close().unwrap();
+}

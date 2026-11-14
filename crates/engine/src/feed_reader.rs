@@ -49,6 +49,13 @@ const TOKEN_VERSION: u8 = 1;
 /// resuming every table from it would skip them. A build that doesn't know this version
 /// refuses the token as not one (`InvalidArgument`), never misreading it.
 const TOKEN_VERSION_ALL: u8 = 2;
+/// 1.3's token of a feed of every table (D325, ICR 0136): version 2's layout followed by 16
+/// bytes, the catalog at its position, which 1.3 checks on resume. This build reads it as
+/// version 2 and ignores those bytes, so a rollback from 1.3 keeps its feeds (the owner's
+/// rule, 2026-11-13). Its own tokens stay version 2.
+const TOKEN_VERSION_ALL_CATALOG: u8 = 3;
+/// The bytes version 3 adds.
+const TOKEN_CATALOG_LEN: usize = 16;
 
 /// Where a feed starts.
 #[derive(Debug, Clone)]
@@ -2680,13 +2687,24 @@ impl<'a> TokenHeader<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self> {
         let bad = || Error::InvalidArgument("not a change feed token".into());
         let (&version, rest) = bytes.split_first().ok_or_else(bad)?;
-        if !matches!(version, TOKEN_VERSION | TOKEN_VERSION_ALL) || rest.len() < 16 + 4 + 8 + 8 {
+        if !matches!(
+            version,
+            TOKEN_VERSION | TOKEN_VERSION_ALL | TOKEN_VERSION_ALL_CATALOG
+        ) || rest.len() < 16 + 4 + 8 + 8
+        {
             return Err(bad());
         }
         let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-        let all_tables = version == TOKEN_VERSION_ALL;
+        let all_tables = version != TOKEN_VERSION;
         let streams = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
         let mut per = &rest[36..];
+        // Version 3 (1.3's): the catalog at the position, last; ignored here (D325).
+        if version == TOKEN_VERSION_ALL_CATALOG {
+            let Some(split) = per.len().checked_sub(TOKEN_CATALOG_LEN) else {
+                return Err(bad());
+            };
+            per = &per[..split];
+        }
         let (mut catalog_seq, mut catalog_bound) = (0, 0);
         if all_tables {
             // The last catalog change delivered and the start's bound, after the streams'
