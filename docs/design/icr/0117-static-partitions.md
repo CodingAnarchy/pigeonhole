@@ -57,6 +57,7 @@
 - **First map:** a node's first map takes `expected_map_version = 0`, and must name the node it's sent to.
 - **Steps:** it validates (and validates the change from the current map), persists, and pushes to every other node in parallel, each push within `--cluster-push-timeout-ms`.
 - **The answer:** sent once the map is persisted here, with each push's result. A node the push missed pulls the map later (below).
+- **A node change (1.3.0, #1899, D317 amendment 3):** a non-forced map whose node ids differ from the current map's gets `previous_nodes` (`ClusterMap` field 6, repeated `Node`) set by the writer to the current map's nodes. Its `SetMap` pushes to the nodes before and after it until a majority of each holds it, for up to three push timeouts, and answers with the last pushes (nodes it removed included). While the newest map has `previous_nodes`, every non-forced `SetMap` (schema changes included) first pushes the map to both sets again, and is refused with `FailedPrecondition`, naming both counts and the nodes missing, unless a majority of each holds it. The change it takes clears `previous_nodes`, unless it changes the nodes itself. A forced map clears it. The writer ignores whatever `previous_nodes` a map sent to it says.
 
 **`PushMap`:**
 - **Accepted:** a valid map with a greater version and the same cluster (the change rules were checked where it was set).
@@ -375,7 +376,7 @@
 - **`Fence`** sets the flag, persists `DIR/fenced.json`, and waits up to 30 s for the writes admitted before it.
 - **`Unfence`** checks that the map names the node at the file's epoch, persists `fenced.json`, reconciles the schema, and clears the flag last.
   - **Either fence** needs the peers' word too: every peer is asked at the call, and the newest map among those that answer (taken, if newer) must be at least as new as the node's own and name it at the file's epoch, or `force`. The first peer to agree isn't enough: one that missed the same move holds the same stale map (simp724's S1 on #1826). The node's own map may be stale. A cluster of one confirms on its own map. (Until audit120's P2-F1, 2026-11-13, only a start fence asked. A move fences its old node as the operator, and that node's map is the one left behind when it misses the move's map: an unfence there lifted the fence on the stale map alone and gave the partition two writers.)
-  - **The accepted risk:** auto-unfence at start still trusts one peer's map at least as new as the node's, and a peer that missed the same move holds the same stale version. `unfence` takes the newest of every peer that answers, so its remaining gap is a peer that doesn't answer: with the one node that knows of a move down, the others confirm. A quorum is for 1.3.0.
+  - **The accepted risk (1.2.0):** auto-unfence at start trusted one peer's map at least as new as the node's, and a peer that missed the same move held the same stale version. **1.3.0 (#1760, D317 amendment 3):** a partition is confirmed only when a majority of the map's nodes hold the newest map and it names the node; a round brings peers that are behind up to it before counting them, every open (a move's new owner too) starts unconfirmed, a map that changes the nodes can't also move a partition, and a move waits for a majority to hold its map.
 - **Start:** every partition opens fenced. A peer's map at least as new as the node's own, naming the node at the file's epoch, unfences it. The sources are `sync_on_start`, a push from a peer, and a retry loop (250 ms up to 5 s). A one-node cluster unfences on its own map. An operator's fence stays.
 - **Not stopped by a fence:** a text index rebuild runs to its end, since the library rebuilds an index in one call. The fence's drain waits for it within its deadline. A per-batch hook in pigeonhole-text is a 1.3.0 follow-up.
 
@@ -532,7 +533,7 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **`Admin.Info`** gains `repeated PartitionInfo partitions = 7` and `repeated string other_partitions = 8`.
   - **On a cluster node:** `partitions` lists each partition the map gives the node, in id order. `other_partitions` lists the map's partitions other nodes hold. The top-level fields describe the node: `path` is its cluster directory, `file_bytes` its partitions' files together, `free_bytes` the free space on that directory's disk (0 when no partition is open), and `tables` the map's tables.
   - **On a single node:** both lists are empty, and the top-level fields are as before.
-- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), and `fence_reason = 6` (`FenceReason`).
-  - The state and fence reason are as `Cluster.Status` reports them.
+- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), `fence_reason = 6` (`FenceReason`), and `awaiting_peers = 7` (bool, 1.3.0, #1829).
+  - The state, fence reason and `awaiting_peers` are as `Cluster.Status` reports them.
   - `file_bytes` and `tables` are set only for an open partition (serving or fenced).
   - A partition the map places on the node that it hasn't opened (no file, or a failed open) is `LOCAL_PARTITION_STATE_UNSPECIFIED`.

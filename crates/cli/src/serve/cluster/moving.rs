@@ -82,6 +82,16 @@ impl At {
         ))
     }
 
+    /// The node's map version.
+    async fn map_version(&self) -> Result<u64, Failure> {
+        let (mut c, _) = connect(&self.args, &self.args.node).await?;
+        Ok(c.get_map(request(GetMapRequest {}, self.token.as_deref())?)
+            .await
+            .map_err(|s| self.failed("map", &s))?
+            .into_inner()
+            .map_version)
+    }
+
     /// Partition `p`'s line in the node's `Status`, if it lists it.
     async fn local(&self, p: &str) -> Result<Option<LocalPartition>, Failure> {
         let (mut c, _) = connect(&self.args, &self.args.node).await?;
@@ -232,6 +242,9 @@ pub(super) async fn run(
         return Err(Failure::usage(&format!("the map has no node {to:?}")));
     };
     if p.node == to {
+        // An earlier run set the map (or P was never elsewhere): it waits, as that run did,
+        // for a majority of the nodes to hold the map (#1760).
+        majority_holds(args, &m, m.map_version, timeout).await?;
         // An earlier run finished the move (or P was never elsewhere): nothing to copy, and
         // the copy can't be compared again, so nothing is dropped. Where the old copy lies
         // closed, the advice names it.
@@ -364,6 +377,15 @@ pub(super) async fn run(
     )
     .await?;
     let map_at = Instant::now();
+    // The map on a majority of its nodes before NEW is waited for (the coordinator's call
+    // on #1760's Q4): from then no round can confirm OLD again on an older map, so an
+    // unfence of OLD while NEW is down is refused (D317 rule 3). A rerun resumes here.
+    let version = set
+        .document
+        .get("map_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    majority_holds(args, &m, version, timeout).await?;
     stop_after(args, Step::Mapped)?;
 
     // 5. Serving on NEW.
@@ -535,6 +557,78 @@ pub(super) async fn serving(
             Ok(None) => wait.tick("not listed yet").await?,
             Err(f) => wait.tick(f.message()).await?,
         }
+    }
+}
+
+/// The longest [`majority_holds`] waits for one node's answer in a poll.
+const PER_NODE: Duration = Duration::from_secs(10);
+
+/// Waits until a majority of `map`'s nodes hold map version `v` or newer (#1760: a move's
+/// map step). A node that missed the writer's push takes the map from a peer's round,
+/// which pushes it to a peer that answers with an older one (D317 rule 3).
+pub(super) async fn majority_holds(
+    args: &NodeArgs,
+    map: &proto::ClusterMap,
+    v: u64,
+    timeout: Option<Duration>,
+) -> Result<(), Failure> {
+    let n = map.nodes.len();
+    let mut wait = Waiting::new(
+        format!("waiting for a majority of the {n} nodes to take map version {v}"),
+        timeout,
+        format!(
+            "The map is set at version {v}, and a node that missed it takes it from its \
+             peers: check them (phdb cluster status --node {}), and run the move again to go \
+             on waiting",
+            args.node
+        ),
+    );
+    loop {
+        // Every node at once (audit120's nit on #1899): the wait is as long as the slowest
+        // answer, not their sum. Each is bounded on its own, so a node that's down (a
+        // refused connect can take seconds on Windows) counts as missing rather than
+        // ending the wait without a count.
+        if wait.left() == Some(Duration::ZERO) {
+            return Err(wait.gave_up());
+        }
+        let per = wait.left().map_or(PER_NODE, |l| l.min(PER_NODE));
+        let mut asks = tokio::task::JoinSet::new();
+        for node in &map.nodes {
+            let (args, id, address) = (args.clone(), node.id.clone(), node.address.clone());
+            asks.spawn(async move {
+                let version = async {
+                    let at = At::new(&args, &id, &address).await?;
+                    at.map_version().await
+                };
+                let version = tokio::time::timeout(per, version)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Failure::usage(&format!(
+                            "no answer within {}s",
+                            per.as_secs_f32()
+                        )))
+                    });
+                (id, version)
+            });
+        }
+        let answers = asks.join_all().await;
+        let mut have = 0;
+        let mut missing = Vec::new();
+        for (id, version) in answers {
+            match version {
+                Ok(version) if version >= v => have += 1,
+                Ok(version) => missing.push(format!("{id} has version {version}")),
+                Err(f) => missing.push(format!("{id}: {}", f.message())),
+            }
+        }
+        if have * 2 > n {
+            return Ok(());
+        }
+        wait.tick(&format!(
+            "{have} of {n} nodes hold it ({})",
+            missing.join("; ")
+        ))
+        .await?;
     }
 }
 
