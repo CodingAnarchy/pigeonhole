@@ -94,18 +94,24 @@ pub(crate) fn read_map(dir: &Path) -> Result<Option<ClusterMap>, String> {
     }
 }
 
-/// Writes `json` as `dir`'s map file: a temporary file, synced, renamed over the old one,
-/// then the directory synced, so a crash leaves the old map or the new one, never a torn
-/// file.
+/// Writes `json` as `dir`'s map file, so a crash leaves the old map or the new one, never a
+/// torn file.
 fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
+    write_synced(dir, MAP_FILE, json.as_bytes())
+}
+
+/// Writes `bytes` as `dir`'s file `name`: a temporary file (`name.tmp`), synced, renamed
+/// over the old one, then the directory synced, so a crash leaves the old file or the new
+/// one whole.
+pub(super) fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = dir.join(format!("{MAP_FILE}.tmp"));
+    let tmp = dir.join(format!("{name}.tmp"));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, dir.join(MAP_FILE))?;
+    std::fs::rename(&tmp, dir.join(name))?;
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -1220,7 +1226,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .router
             .serve_forwarded_scan(&msg.partition, scan, &caller)
             .await?;
-        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcPages(
+        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcStream(
             pages,
         ))))
     }
