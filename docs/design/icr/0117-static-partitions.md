@@ -361,9 +361,9 @@
   - `state = 10`: a `LocalPartitionState`, one of `SERVING`, `FENCED`, `CLOSED` or `OPENING`;
   - `files = 11`: a closed partition's files once hashed, as `PartitionFile`;
   - `fence_reason = 12`: a `FenceReason`, `OPERATOR` or `AWAITING_PEER_MAP`, set only when `FENCED`.
-  - `awaiting_peers = 13` (bool, 1.3.0, #1829): the peers have yet to confirm it since it opened here, whatever `fence_reason` says. The gate keeps the operator's fence and the wait for the peers as two flags; `fence_reason` reports the operator's first, so an operator-fenced partition no peer has confirmed reads `OPERATOR` with `awaiting_peers` set.
+  - `awaiting_peers = 13` (bool, 1.3.0, #1829): the peers have yet to confirm it since it opened here, whatever `fence_reason` says. With D326 (1.3.0): it holds no live lease. The gate keeps the operator's fence and the wait for the peers as two flags; `fence_reason` reports the operator's first, so an operator-fenced partition no peer has confirmed reads `OPERATOR` with `awaiting_peers` set.
 - **`StampRequest`** has six fields: `cluster_id`, `partition`, `from_epoch`, `to_epoch`, `restore` and `restore_from_cluster_id`.
-- **`PartitionRequest.force = 2`** (bool), read only by `Unfence` (cli692's S1): it lifts a start fence that no peer's map confirms.
+- **`PartitionRequest.force = 2`** (bool), read only by `Unfence` (cli692's S1): it lifts a start fence that no peer's map confirms. **1.3.0 (D326):** it lifts only the operator's fence, without asking the peers, and never gives a lease.
 - **A new code, `Fenced`:** gRPC `FAILED_PRECONDITION`, HTTP 409. Nothing is written. The sender passes it through unchanged and never retries it.
 
 **The write gate:** each partition's writes take a gate: an in-flight count, a fence flag and a `Notify`, with `SeqCst` admission (Dekker-style).
@@ -533,7 +533,33 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **`Admin.Info`** gains `repeated PartitionInfo partitions = 7` and `repeated string other_partitions = 8`.
   - **On a cluster node:** `partitions` lists each partition the map gives the node, in id order. `other_partitions` lists the map's partitions other nodes hold. The top-level fields describe the node: `path` is its cluster directory, `file_bytes` its partitions' files together, `free_bytes` the free space on that directory's disk (0 when no partition is open), and `tables` the map's tables.
   - **On a single node:** both lists are empty, and the top-level fields are as before.
-- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), `fence_reason = 6` (`FenceReason`), and `awaiting_peers = 7` (bool, 1.3.0, #1829).
+- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), `fence_reason = 6` (`FenceReason`), `awaiting_peers = 7` (bool, 1.3.0, #1829), and `lease_remaining_ms = 8` (1.3.0, D326).
   - The state, fence reason and `awaiting_peers` are as `Cluster.Status` reports them.
   - `file_bytes` and `tables` are set only for an open partition (serving or fenced).
   - A partition the map places on the node that it hasn't opened (no file, or a failed open) is `LOCAL_PARTITION_STATE_UNSPECIFIED`.
+
+## D326 PR 1: leases (1.3.0)
+**A partition serves on its node only while a majority of the map's nodes grant it a lease** (D326). Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`, 2026-11-14):
+- **`Cluster.Lease(LeaseRequest) returns (LeaseResponse)`:** node to node, cluster scope, gRPC only.
+  - `LeaseRequest { cluster_id = 1; node_id = 2; map_version = 3; round = 4; repeated LeasePart parts = 5; }`. Another cluster's id is `InvalidArgument`.
+  - `LeasePart { partition = 1; epoch = 2; }`.
+  - `LeaseResponse { newer_map_version = 1; repeated LeasePart granted = 2; repeated LeaseWithheld withheld = 3; grace_remaining_ms = 4; }`. A refusal isn't an error: the reply says what was granted and why the rest wasn't.
+  - `LeaseWithheld { partition = 1; holder = 2; remaining_ms = 3; }`.
+  - `Release` and its messages come with D326 PR 2.
+- **`LocalPartition.lease_remaining_ms = 14`** and **`PartitionInfo.lease_remaining_ms = 8`**: the time left on the lease, 0 without one.
+- **`NodeStatus.grace_remaining_ms = 6`**: the time left on the node's start grace.
+- **`FenceReason.FENCE_REASON_LEASE_LAPSED = 3`**: the lease ran out. `AWAITING_PEER_MAP` now means no lease since the partition opened here.
+
+**Flag:** `phdb serve --cluster-lease-ms` (default 10000). Refused at start below 3 × `--cluster-push-timeout-ms`.
+
+**Behaviour:**
+- **A grantor** grants at its own map's version only, what that map gives the asker at the epochs asked, for L from receipt on its clock. It withholds a partition while its grant to another node runs, and grants nothing during its start grace, `L·(1+ρ)` (ρ = 1%), its own vote included.
+- **The holder** asks every L/3 (sooner while a partition it serves has none), from the nodes that answered its round's map fetch, and holds P until `t0 + L·(1−ρ)/(1+ρ)` once a majority granted it.
+- **Writes** need the lease and no operator's fence (`Fenced` otherwise, with the reason), and are checked again once the commit returns: past the lease's end, `OutcomeUnknown`. A transaction's `Commit` with writes is checked the same way, and a retry of it finds the same outcome.
+- **Reads** (`Get`, `MultiGet`, `ReadRow`, `Scan`, a fanned-out part, `Transactions.Begin`, `TxnGet`, `TxnGetRow`, `Snapshots.Open`, `Graph.Traverse`, `Vectors.Nearest`) need the lease when they take their snapshot, checked again after: `PartitionUnavailable` otherwise. New in 1.3.0: the fence was write-only. `Feed.Subscribe` isn't gated here (D326 PR 2).
+- **`Unfence`** without `force` checks the peers as before; with `force`, it lifts the operator's fence alone. Either way the partition serves once it holds a lease.
+- **A node change:** the writer takes no further change until `L·(1+ρ)` after it saw a majority of both node sets hold the change (audit120's L1); `SetMap` waits that out before it answers.
+- **Two nodes:** a majority is both, so with one down the other stops serving within L.
+

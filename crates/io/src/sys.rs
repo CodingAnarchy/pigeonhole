@@ -24,6 +24,23 @@ pub fn process_id() -> u32 {
     crate::os::process_id()
 }
 
+/// Nanoseconds since an arbitrary start, on a clock that keeps counting while the machine or
+/// VM is suspended, and never goes back. A cluster partition's lease is timed on it (D326):
+/// std's [`Instant`](std::time::Instant) stops during a suspend on Linux and macOS, so a
+/// node suspended past its lease would wake believing the lease still live.
+///
+/// `CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on macOS (which counts sleep there), and
+/// `QueryInterruptTime` on Windows.
+///
+/// ```
+/// let a = pigeonhole_io::sys::boot_clock_ns();
+/// let b = pigeonhole_io::sys::boot_clock_ns();
+/// assert!(b >= a);
+/// ```
+pub fn boot_clock_ns() -> u64 {
+    crate::os::boot_clock_ns()
+}
+
 /// Number of CPUs available to this process, honoring affinity masks and cgroup CPU quotas.
 pub fn available_cpus() -> usize {
     crate::os::available_cpus()

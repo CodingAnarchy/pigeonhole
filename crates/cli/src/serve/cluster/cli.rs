@@ -382,7 +382,8 @@ fn local_report(command: &'static str, node: &str, lp: &proto::LocalPartition) -
 }
 
 /// A partition's state for a person: `serving`, `fenced (operator)`, `fenced (awaiting peer
-/// map)`, `closed`, `opening`, or empty when the node doesn't hold it open.
+/// map)`, `fenced (lease lapsed)`, `closed`, `opening`, or empty when the node doesn't hold
+/// it open.
 pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
     use proto::{FenceReason, LocalPartitionState};
     match (lp.state(), lp.fence_reason()) {
@@ -395,6 +396,8 @@ pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
         (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap) => {
             "fenced (awaiting peer map)".into()
         }
+        // D326: its renewals stopped reaching a majority.
+        (LocalPartitionState::Fenced, FenceReason::LeaseLapsed) => "fenced (lease lapsed)".into(),
         (LocalPartitionState::Fenced, _) => "fenced".into(),
         (LocalPartitionState::Closed, _) => "closed".into(),
         (LocalPartitionState::Opening, _) => "opening".into(),

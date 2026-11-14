@@ -1,7 +1,8 @@
-//! Fencing a cluster node's partitions (D317 ticket 6, rule 3): each partition served here
-//! has a write gate ([`WriteGate`]), which `phdb cluster fence` and `unfence` set and
-//! lift, and which a node's start sets until a peer's map confirms the partition is still
-//! this node's (auto-unfence).
+//! Fencing a cluster node's partitions (D317 ticket 6, rule 3) and their leases (D326): each
+//! partition served here has a gate ([`WriteGate`]). `phdb cluster fence` and `unfence` set
+//! and lift the operator's fence on it; the node's lease rounds ([`Node::round`]) grant it
+//! its lease, without which it serves nothing, and renew it every third of a lease for as
+//! long as a majority of the map's nodes grant it.
 //!
 //! **`DIR/fenced.json`:** the partitions an operator fenced, `{"fenced": ["p1", ...]}`,
 //! written (temporary file, sync, rename, directory sync) before a fence or unfence
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::Node;
-use super::proto::{ClusterMap, FenceReason, LocalPartitionState};
+use super::proto::{ClusterMap, FenceReason, LeasePart, LeaseRequest, LocalPartitionState};
 use crate::serve::errors::ApiError;
 use crate::serve::gate::{Fence, WriteGate};
 
@@ -28,8 +29,8 @@ pub(crate) const FENCED_FILE: &str = "fenced.json";
 /// partition stays fenced and the answer says how many still run: `fence` again waits again.
 const DRAIN_WAIT: Duration = Duration::from_secs(30);
 
-/// How often a node still waiting to unfence a start-fenced partition asks its peers for
-/// their maps again (cli692's S3): the first wait, doubled up to the last.
+/// How often a node whose partition has no lease asks its peers again (cli692's S3): the
+/// first wait, doubled up to the last, and never more than a third of a lease.
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 
@@ -88,8 +89,16 @@ pub(crate) struct Fences {
     pub(super) opening: Mutex<BTreeSet<String>>,
     /// [`Node::confirm_soon`]'s rounds: one running, and whether another is owed.
     rounds: Mutex<Rounds>,
-    /// [`Node::confirm_until_done`]'s loop is running.
+    /// [`Node::renew_leases`]'s loop is running.
     retrying: std::sync::atomic::AtomicBool,
+    /// The node's lease rounds, numbered: a grantor ignores an older round's request that
+    /// arrives after a newer one (`LeaseRequest.round`).
+    round: std::sync::atomic::AtomicU64,
+    /// The node's last lease round asked for something: once it has nothing to ask (its
+    /// last partition moved away or closed), one more round asks for nothing, which ends
+    /// its grants at once rather than a lease later, so a planned move's new owner needn't
+    /// wait them out.
+    asked: std::sync::atomic::AtomicBool,
 }
 
 /// [`Node::confirm_soon`]'s state.
@@ -114,6 +123,15 @@ pub(crate) struct Round {
     /// Peers that answered with an older map and didn't take this node's: nothing is
     /// confirmed while there's one (audit120's F2 on #1899).
     pub(crate) behind: Vec<String>,
+    /// The node's clock before it sent the round's first request: a lease it grants runs
+    /// from here (D326).
+    pub(crate) t0: u64,
+    /// The map's nodes that granted each partition asked, this node included.
+    pub(crate) granted: BTreeMap<String, usize>,
+    /// Partitions a node withheld, the node holding them there, and the ms left.
+    pub(crate) withheld: Vec<(String, String, u64)>,
+    /// The longest start grace a node answered with, in ms (0: none).
+    pub(crate) grace_ms: u64,
 }
 
 impl Round {
@@ -125,9 +143,42 @@ impl Round {
     }
 
     /// Whether it confirms partition `id` at `epoch` on node `node`: a majority hold the
-    /// map, and the map names `node` for it there (D317 rule 3, as amended for #1760).
+    /// map, and the map names `node` for it there (D317 rule 3, as amended for #1760). An
+    /// unfence asks this; serving takes a lease as well ([`leased`](Self::leased)).
     pub(crate) fn confirms(&self, node: &str, id: &str, epoch: u64) -> bool {
         self.majority() && names(&self.map, node, id, epoch)
+    }
+
+    /// Whether it gives this node `id`'s lease at `epoch` (D326): it confirms it, and a
+    /// majority of the map's nodes granted it.
+    pub(crate) fn leased(&self, node: &str, id: &str, epoch: u64) -> bool {
+        self.confirms(node, id, epoch)
+            && self.granted.get(id).copied().unwrap_or(0) * 2 > self.map.nodes.len()
+    }
+
+    /// Why it gave this node no lease on `id`, for a log or a refusal: who withheld it, the
+    /// start grace, or how few granted.
+    pub(crate) fn why_not_leased(&self, id: &str) -> String {
+        let withheld: Vec<String> = self
+            .withheld
+            .iter()
+            .filter(|(p, _, _)| p == id)
+            .map(|(_, holder, ms)| format!("node {holder}'s lease on it has {ms} ms left"))
+            .collect();
+        if !withheld.is_empty() {
+            return withheld.join("; ");
+        }
+        if self.grace_ms > 0 {
+            return format!(
+                "a node restarted and grants no lease for {} ms more (its start grace)",
+                self.grace_ms
+            );
+        }
+        format!(
+            "{} of {} nodes granted it",
+            self.granted.get(id).copied().unwrap_or(0),
+            self.map.nodes.len()
+        )
     }
 }
 
@@ -169,17 +220,48 @@ impl Fences {
             .map(|s| (Arc::clone(&s.gate), s.epoch))
     }
 
-    /// Partitions a peer's map can still confirm: unconfirmed since they opened here
-    /// (operator-fenced or not, #1829), and named by `map`, this node's (`node`), at their
-    /// file's epoch. One the map no longer names there can never be confirmed (a map's epochs
-    /// only rise), so the start's retries don't wait for it (audit120's S1 on #1897: a move's
-    /// old node, restarted with its copy fenced, would otherwise ask its peers for ever).
+    /// Partitions a peer's map can still confirm: without a live lease (operator-fenced or
+    /// not, #1829), and named by `map`, this node's (`node`), at their file's epoch. One the
+    /// map no longer names there can never be confirmed (a map's epochs only rise), so the
+    /// rounds don't hurry for it (audit120's S1 on #1897: a move's old node, restarted with
+    /// its copy fenced, would otherwise ask its peers for ever).
     pub(crate) fn confirmable(&self, map: &ClusterMap, node: &str) -> Vec<String> {
         self.served()
             .iter()
             .filter(|(id, s)| s.gate.awaiting_peers() && names(map, node, id, s.epoch))
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// What a lease round asks for (D326): every partition served here that `map` names
+    /// this node (`node`) for at its file's epoch, operator-fenced or not (an operator's
+    /// fence stops writes, not reads).
+    pub(crate) fn askable(&self, map: &ClusterMap, node: &str) -> Vec<LeasePart> {
+        self.served()
+            .iter()
+            .filter(|(id, s)| names(map, node, id, s.epoch))
+            .map(|(id, s)| LeasePart {
+                partition: id.clone(),
+                epoch: s.epoch,
+            })
+            .collect()
+    }
+
+    /// Ends the lease of every partition served here that `map` doesn't name this node
+    /// (`node`) for at its file's epoch (audit120's S1): a map that moved it away. Run after
+    /// an install publishes the map, so a round that read the map before it either set its
+    /// lease first (and this clears it) or saw the new map (and set none).
+    pub(crate) fn lapse_unnamed(&self, map: &ClusterMap, node: &str) {
+        for (id, s) in self.served().iter() {
+            if !names(map, node, id, s.epoch) && !s.gate.awaiting_peers() {
+                s.gate.lapse();
+                eprintln!(
+                    "phdb serve: partition {id}'s lease here ended: map version {} doesn't name \
+                     this node for it at epoch {}",
+                    map.map_version, s.epoch
+                );
+            }
+        }
     }
 }
 
@@ -197,13 +279,13 @@ impl Node {
         Ok(())
     }
 
-    /// Partition `id`'s gate, at its file's `epoch`, as it opens here: unconfirmed until
-    /// the peers' maps confirm it (rule 3: a node that was down may have missed the
-    /// partition's move), and fenced by the operator as well if `fenced.json` lists it. The
-    /// two are separate flags (#1829), so an operator's fence doesn't hide the wait.
+    /// Partition `id`'s gate, at its file's `epoch`, as it opens here: with no lease until a
+    /// majority of the map's nodes grant one (D326; rule 3: a node that was down may have
+    /// missed the partition's move), and fenced by the operator as well if `fenced.json`
+    /// lists it. The two are separate (#1829), so an operator's fence doesn't hide the wait.
     pub(crate) fn open_gate(&self, id: &str, epoch: u64) -> Arc<WriteGate> {
         let operator = self.fences.operator().contains(id);
-        let gate = WriteGate::opened(id, operator);
+        let gate = WriteGate::opened(id, operator, Arc::clone(self.grants.clock()));
         self.fences.served().insert(
             id.to_owned(),
             Served {
@@ -221,6 +303,7 @@ impl Node {
         Some(match gate.fenced() {
             Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
             Some(Fence::Unconfirmed) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
+            Some(Fence::Lapsed) => (LocalPartitionState::Fenced, FenceReason::LeaseLapsed),
             None => (LocalPartitionState::Serving, FenceReason::Unspecified),
         })
     }
@@ -245,8 +328,16 @@ impl Node {
         self.fences.gate(id).and_then(|(g, _)| g.fenced())
     }
 
-    /// Whether partition `id`, open here, awaits its peers' confirmation, whatever the
-    /// operator's fence (`Status`'s `awaiting_peers`, #1829).
+    /// The time left on partition `id`'s lease here, zero without one (`Status`'s
+    /// `lease_remaining_ms`, D326).
+    pub(crate) fn lease_remaining(&self, id: &str) -> Duration {
+        self.fences
+            .gate(id)
+            .map_or(Duration::ZERO, |(g, _)| g.lease_remaining())
+    }
+
+    /// Whether partition `id`, open here, holds no lease, whatever the operator's fence
+    /// (`Status`'s `awaiting_peers`, #1829).
     pub(crate) fn awaiting_peers(&self, id: &str) -> bool {
         // Not for a copy the node's map no longer names at its epoch: no peer can confirm
         // that one (audit120's note on #1897).
@@ -276,10 +367,12 @@ impl Node {
         })
     }
 
-    /// `Cluster.Unfence`: P takes writes again. Refused unless this node's map names it for
-    /// P at its file's epoch (a write would break rule 1 or 2 anyway), and unless a peer's
-    /// map, at least as new, says the same (or `force`): this node's map alone may be
-    /// behind. P first takes the map's schema it skipped while fenced.
+    /// `Cluster.Unfence`: lifts the operator's fence, so P takes writes again once it also
+    /// holds its lease (D326). Refused unless this node's map names it for P at its file's
+    /// epoch (a write would break rule 1 or 2 anyway), and unless a majority's newest map
+    /// says the same (or `force`): this node's map alone may be behind. `force` never gives
+    /// P a lease: that still takes a majority's grants (the owner's call on D326). P first
+    /// takes the map's schema it skipped while fenced.
     pub(crate) async fn unfence(self: &Arc<Self>, id: &str, force: bool) -> Result<(), ApiError> {
         let _one = self.fences.changing.lock().await;
         // The checks first, at the epoch of the open partition or of the closed one's file:
@@ -303,6 +396,7 @@ impl Node {
         // been confirmed long since, and only the operator's fence is set.
         if !force {
             let round = self.round().await?;
+            self.apply_leases(&round);
             if !round.confirms(&self.id, id, epoch) {
                 let since = if unconfirmed {
                     "fenced, and unconfirmed since it opened here,"
@@ -344,8 +438,8 @@ impl Node {
                     "partition {id:?} is {since}, and its peers don't confirm it's still this \
                      node's at epoch {epoch}: {why}. A majority of the map's nodes must hold \
                      the newest map, and it must name this node (D317 rule 3). Wait for the \
-                     peers to answer, or pass --force only if they can't and you know the \
-                     partition hasn't moved"
+                     peers to answer. --force lifts the operator's fence without asking them, \
+                     but the partition serves only once a majority grants its lease (D326)"
                 )));
             }
         }
@@ -378,7 +472,19 @@ impl Node {
             gate.unfence();
         })
         .await?;
-        eprintln!("phdb serve: partition {id} unfenced: it takes writes");
+        // A partition reopened here (it was closed), or one whose lease hasn't come yet:
+        // one round now, so the answer says whether it serves (D326).
+        if self.awaiting_peers(id) {
+            self.confirm_round().await;
+        }
+        if self.awaiting_peers(id) {
+            eprintln!(
+                "phdb serve: partition {id} unfenced: it takes writes once a majority of the \
+                 map's nodes grant its lease"
+            );
+        } else {
+            eprintln!("phdb serve: partition {id} unfenced: it takes writes");
+        }
         Ok(())
     }
 
@@ -400,7 +506,14 @@ impl Node {
     /// holds the map, and an old owner always has a move's map before the new owner can
     /// count that peer (audit120's D3). A node that holds the newest map alone spreads it
     /// here (D4).
+    ///
+    /// **Leases (D326):** it then asks every node of the map that holds it, this one
+    /// included, for a grant of the partitions this node serves at their epochs
+    /// ([`Fences::askable`]), and counts the grants by partition. Only the nodes that
+    /// answered are asked, so a node that's down costs the round one push timeout, not two.
+    /// `t0`, the clock before the first request, is what a lease runs from.
     pub(crate) async fn round(self: &Arc<Self>) -> Result<Round, ApiError> {
+        let t0 = self.grants.clock().now();
         let mine = self.get_map()?;
         let mut asks = tokio::task::JoinSet::new();
         for n in mine.nodes.iter().filter(|n| n.id != self.id) {
@@ -461,20 +574,165 @@ impl Node {
         // the round: it answered with an older map, and may be an old owner that hasn't taken
         // the move yet (audit120's F2). A peer that never answered doesn't block.
         let mut behind = Vec::new();
+        let mut holding: Vec<(String, String)> = answers
+            .iter()
+            .filter(|(peer, _, theirs)| {
+                members.contains(peer.as_str())
+                    && theirs.map_version == map.map_version
+                    && !divergent.contains(peer)
+            })
+            .map(|(peer, address, _)| (peer.clone(), address.clone()))
+            .collect();
         for (peer, took) in pushes.join_all().await {
             if took {
                 holders += usize::from(members.contains(peer.as_str()));
+                if members.contains(peer.as_str())
+                    && let Some((_, address, _)) = answers.iter().find(|(p, _, _)| *p == peer)
+                {
+                    holding.push((peer.clone(), address.clone()));
+                }
             } else {
                 behind.push(peer);
             }
         }
-        Ok(Round {
+        let mut round = Round {
             map,
             holders,
             answered: answers.len(),
             divergent,
             behind,
-        })
+            t0,
+            granted: BTreeMap::new(),
+            withheld: Vec::new(),
+            grace_ms: 0,
+        };
+        self.ask_leases(&mut round, &holding).await;
+        Ok(round)
+    }
+
+    /// A round's lease requests (D326): to each node in `holding` (id, address), which hold
+    /// the round's map, and to this node's own grants if the map names it; each bounded by
+    /// the push timeout. Counts each partition's grants into `round`.
+    async fn ask_leases(self: &Arc<Self>, round: &mut Round, holding: &[(String, String)]) {
+        let parts = self.fences.askable(&round.map, &self.id);
+        // Nothing to ask, and nothing asked last time: no grant here to end.
+        if !self
+            .fences
+            .asked
+            .swap(!parts.is_empty(), std::sync::atomic::Ordering::AcqRel)
+            && parts.is_empty()
+        {
+            return;
+        }
+        let req = LeaseRequest {
+            cluster_id: round.map.cluster_id.clone(),
+            node_id: self.id.clone(),
+            map_version: round.map.map_version,
+            round: self
+                .fences
+                .round
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
+            parts,
+        };
+        let mut asks = tokio::task::JoinSet::new();
+        for (peer, address) in holding {
+            let (node, peer, address, req) =
+                (Arc::clone(self), peer.clone(), address.clone(), req.clone());
+            asks.spawn(async move {
+                let answer =
+                    tokio::time::timeout(node.peers.push_timeout, node.ask_lease(&address, req))
+                        .await;
+                match answer {
+                    Ok(Ok(r)) => Some((peer, r)),
+                    Ok(Err(e)) => {
+                        eprintln!("phdb serve: node {peer}'s lease grant: {e}");
+                        None
+                    }
+                    Err(_) => None,
+                }
+            });
+        }
+        let mut answers: Vec<(String, super::proto::LeaseResponse)> = Vec::new();
+        if round.map.nodes.iter().any(|n| n.id == self.id) {
+            answers.push((self.id.clone(), self.grants.grant(&round.map, &req)));
+        }
+        answers.extend(asks.join_all().await.into_iter().flatten());
+        for (_, r) in answers {
+            for g in r.granted {
+                *round.granted.entry(g.partition).or_default() += 1;
+            }
+            round.withheld.extend(
+                r.withheld
+                    .into_iter()
+                    .map(|w| (w.partition, w.holder, w.remaining_ms)),
+            );
+            round.grace_ms = round.grace_ms.max(r.grace_remaining_ms);
+        }
+    }
+
+    /// Asks the node at `address` for a lease grant.
+    async fn ask_lease(
+        &self,
+        address: &str,
+        req: LeaseRequest,
+    ) -> Result<super::proto::LeaseResponse, String> {
+        let mut client = self.client(address).await?;
+        let req = self.request(req)?;
+        client
+            .lease(req)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|s| s.message().to_owned())
+    }
+
+    /// Gives each partition served here the lease `round` gives it (D326): until
+    /// `t0 + L·(1−ρ)/(1+ρ)`. Only while the node's map is still the round's, checked and set
+    /// under the state lock: an install publishes a newer map under it first and ends the
+    /// leases that map no longer names after, so a renewal can't bring back a lease the
+    /// newer map ended (audit120's S1).
+    pub(crate) fn apply_leases(&self, round: &Round) {
+        let end = super::lease::holder_end(round.t0, self.grants.lease());
+        let st = self.state();
+        if st.version() != round.map.map_version {
+            return;
+        }
+        let served = self.fences.served();
+        for (id, s) in served.iter() {
+            if !round.leased(&self.id, id, s.epoch) {
+                // A renewal that failed while the lease still runs: said each round until it
+                // runs out, so the log shows why a partition stopped serving.
+                if names(&round.map, &self.id, id, s.epoch) && !s.gate.awaiting_peers() {
+                    eprintln!(
+                        "phdb serve: partition {id}'s lease wasn't renewed ({}); it ends in \
+                         {} ms unless a renewal reaches a majority",
+                        round.why_not_leased(id),
+                        s.gate.lease_remaining().as_millis()
+                    );
+                }
+                continue;
+            }
+            if !s.gate.renew(end) {
+                continue;
+            }
+            if s.gate.operator_fenced() {
+                eprintln!(
+                    "phdb serve: partition {id} leased by {} of {} nodes at map version {}, \
+                     and still fenced by the operator (phdb cluster unfence lifts it)",
+                    round.granted.get(id).copied().unwrap_or(0),
+                    round.map.nodes.len(),
+                    round.map.map_version
+                );
+            } else {
+                eprintln!(
+                    "phdb serve: partition {id} serves: {} of {} nodes granted its lease at \
+                     map version {}, which places it on this node",
+                    round.granted.get(id).copied().unwrap_or(0),
+                    round.map.nodes.len(),
+                    round.map.map_version
+                );
+            }
+        }
     }
 
     /// Pushes `map` to the peer at `address` (a round's catch-up of a peer that's behind).
@@ -488,48 +746,26 @@ impl Node {
             .map_err(|s| s.message().to_owned())
     }
 
-    /// A round, then every unconfirmed partition it confirms: one its map names here at the
-    /// file's epoch, with a majority of the map's nodes holding that map. An operator's
-    /// fence stays (#1829).
-    async fn confirm_round(self: &Arc<Self>) -> Option<Round> {
+    /// A lease round, then the leases it gives (D326): each partition its map names here at
+    /// the file's epoch, with a majority of the map's nodes holding that map and granting
+    /// it. An operator's fence stays (#1829).
+    pub(super) async fn confirm_round(self: &Arc<Self>) -> Option<Round> {
         let round = match self.round().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("phdb serve: confirming partitions: {}", e.message);
+                eprintln!("phdb serve: renewing partition leases: {}", e.message);
                 return None;
             }
         };
-        let served = self.fences.served();
-        for (id, s) in served.iter() {
-            if s.gate.awaiting_peers() && round.confirms(&self.id, id, s.epoch) && s.gate.confirm()
-            {
-                if s.gate.fenced().is_none() {
-                    eprintln!(
-                        "phdb serve: partition {id} unfenced: {} of {} nodes hold map version \
-                         {}, which still places it on this node",
-                        round.holders,
-                        round.map.nodes.len(),
-                        round.map.map_version
-                    );
-                } else {
-                    eprintln!(
-                        "phdb serve: partition {id} confirmed by {} of {} nodes at map version \
-                         {}, and still fenced by the operator (phdb cluster unfence lifts it)",
-                        round.holders,
-                        round.map.nodes.len(),
-                        round.map.map_version
-                    );
-                }
-            }
-        }
-        drop(served);
+        self.apply_leases(&round);
         Some(round)
     }
 
-    /// A round soon, for a map a peer pushed (it may confirm a partition): one at a time
-    /// per node, and a push that arrives during one runs one more after it, never dropped.
+    /// A round soon, for a map a peer pushed (it may give a partition its lease), rather
+    /// than at the next renewal: one at a time per node, and a push that arrives during one
+    /// runs one more after it, never dropped.
     pub(crate) fn confirm_soon(&self) {
-        // Only for a partition a round could confirm: not a copy the map moved away, which
+        // Only for a partition a round could lease: not a copy the map moved away, which
         // would otherwise run a round on every push (audit120's nit on #1899).
         let Ok(map) = self.get_map() else { return };
         if self.fences.confirmable(&map, &self.id).is_empty() {
@@ -567,11 +803,13 @@ impl Node {
         });
     }
 
-    /// Rounds, backing off, while a partition the node's map names here at its file's epoch
-    /// is unconfirmed: at the start, and after a partition opens while the node serves (a
-    /// move's new owner, which serves once a majority holds the move's map). One such loop
-    /// at a time per node; a cluster of one confirms in its first round.
-    pub(crate) async fn confirm_until_done(self: &Arc<Self>) {
+    /// The node's lease renewals (D326), for as long as it runs: a round every third of a
+    /// lease, timed from the last round's start so a slow round doesn't let a lease run out;
+    /// sooner, backing off from [`RETRY_FIRST`], while a partition its map names here has no
+    /// lease (at the start, or after it opens while the node serves: a move's new owner).
+    /// One loop per node, started once its partitions are open; it holds the node only
+    /// while a round runs, and ends once the node is gone.
+    pub(crate) fn renew_leases(self: &Arc<Self>) {
         if self
             .fences
             .retrying
@@ -579,32 +817,41 @@ impl Node {
         {
             return;
         }
-        let mut wait = RETRY_FIRST;
-        loop {
-            let done = match self.confirm_round().await {
-                Some(r) => self.fences.confirmable(&r.map, &self.id).is_empty(),
-                None => self.get_map().is_err(),
-            };
-            if done {
-                self.fences
-                    .retrying
-                    .store(false, std::sync::atomic::Ordering::Release);
-                // A partition that opened while this loop was ending: go again.
-                let Ok(map) = self.get_map() else { return };
-                if self.fences.confirmable(&map, &self.id).is_empty()
-                    || self
-                        .fences
-                        .retrying
-                        .swap(true, std::sync::atomic::Ordering::AcqRel)
-                {
-                    return;
-                }
-                wait = RETRY_FIRST;
-                continue;
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.fences
+                .retrying
+                .store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        let me = Arc::downgrade(self);
+        let period = self.grants.lease() / 3;
+        rt.spawn(async move {
+            let mut wait = RETRY_FIRST;
+            loop {
+                let Some(node) = me.upgrade() else { return };
+                let started = tokio::time::Instant::now();
+                let asked = node.fences.asked.load(std::sync::atomic::Ordering::Acquire);
+                let missing = match node.get_map() {
+                    Ok(map) if asked || !node.fences.askable(&map, &node.id).is_empty() => {
+                        match node.confirm_round().await {
+                            Some(r) => !node.fences.confirmable(&r.map, &node.id).is_empty(),
+                            None => true,
+                        }
+                    }
+                    _ => false,
+                };
+                drop(node);
+                let next = if missing {
+                    let w = wait.min(period);
+                    wait = (wait * 2).min(RETRY_MAX);
+                    started + w
+                } else {
+                    wait = RETRY_FIRST;
+                    started + period
+                };
+                tokio::time::sleep_until(next).await;
             }
-            tokio::time::sleep(wait).await;
-            wait = (wait * 2).min(RETRY_MAX);
-        }
+        });
     }
 }
 

@@ -74,15 +74,22 @@ service Cluster {
   // `FailedPrecondition` while the partition is open here, or for a file of another
   // cluster, partition or epoch. Admin scope.
   rpc Stamp(StampRequest) returns (LocalPartition);
+  // Node to node (D326): a lease round's request for this node's grant of the partitions it
+  // names, for `--cluster-lease-ms` on this node's clock from its receipt. This node grants
+  // only at its own map version, only what that map gives the asking node at the epochs
+  // asked, and withholds a partition while its grant of it to another node is live, or
+  // everything during its start grace. A refusal isn't an error: the reply says what was
+  // granted and why the rest wasn't. Cluster scope, gRPC only.
+  rpc Lease(LeaseRequest) returns (LeaseResponse);
 }
 
 // One partition on the node a `Cluster` call is sent to (D317 ticket 6).
 message PartitionRequest {
   string partition = 1;
-  // `Unfence` only: lift the fence without the peers' confirmation (D317 rule 3: a majority
-  // of the map's nodes holding the newest map, which names this node for the partition at
-  // its file's epoch). For a node whose peers can't answer; it risks two writers if a newer
-  // map moved the partition.
+  // `Unfence` only: lift the operator's fence without asking the peers whether their newest
+  // map still names this node for the partition. It never makes the partition serve
+  // without a lease (D326): that still takes a majority of the map's nodes granting it. For
+  // a node whose peers can't answer its unfence, once they can grant again.
   bool force = 2;
 }
 
@@ -124,9 +131,12 @@ enum FenceReason {
   // node's `fenced.json` across a restart, lifted by `phdb cluster unfence`, or by a stamp
   // that installs another copy of the partition (a move or relocation onto that node).
   FENCE_REASON_OPERATOR = 1;
-  // Fenced since the node started, until a peer's map at least as new as the node's names
-  // it for the partition at the file's epoch (or `phdb cluster unfence`).
+  // The node hasn't held the partition's lease since it opened here (D326): a majority of
+  // the map's nodes have yet to grant it, so it serves neither reads nor writes.
   FENCE_REASON_AWAITING_PEER_MAP = 2;
+  // The partition's lease ran out on this node (D326): its renewals stopped reaching a
+  // majority of the map's nodes, so it stopped serving until a renewal does.
+  FENCE_REASON_LEASE_LAPSED = 3;
 }
 
 // The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
@@ -251,6 +261,10 @@ message NodeStatus {
   // Peers seen with this node's `map_version` but a different map: the cluster has two maps
   // of one version, and an operator must set a newer one.
   repeated string divergent = 5;
+  // D326: the time left on this node's start grace, in which it grants no lease, its own
+  // included (it may have granted one just before it stopped, and grants live only in
+  // memory). 0 once it's over.
+  uint64 grace_remaining_ms = 6;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -279,10 +293,13 @@ message LocalPartition {
   // Why it's fenced: set only when `state` is FENCED. The operator's fence when it's set,
   // else AWAITING_PEER_MAP.
   FenceReason fence_reason = 12;
-  // The peers have yet to confirm it since it opened here (D317 rule 3), whatever
-  // `fence_reason` says: an operator-fenced partition may be waiting for them too, and an
-  // unfence without --force asks them first (#1829, ICR 0117 amendment).
+  // It holds no live lease here (D326): a majority of the map's nodes have yet to grant it
+  // since it opened, or its lease lapsed. Whatever `fence_reason` says: an operator-fenced
+  // partition may be waiting for its lease too (#1829, ICR 0117 amendment).
   bool awaiting_peers = 13;
+  // D326: the time left on the partition's lease here, in milliseconds; 0 when it holds none
+  // (`awaiting_peers` is then true). A partition serves only while it holds one.
+  uint64 lease_remaining_ms = 14;
 }
 
 // A forwarded single-key call (D317 ticket 2).
@@ -389,4 +406,50 @@ message ForwardSubscribeRequest {
   // Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
   // most 64 of them; 0: none.
   uint64 skip_through = 5;
+}
+
+// D326: a node's lease round asks each node of its map, itself included, for a grant.
+message LeaseRequest {
+  // Refused (`InvalidArgument`) if it isn't this node's cluster.
+  string cluster_id = 1;
+  // The asking node.
+  string node_id = 2;
+  // The asking node's map version: this node grants only at the same version.
+  uint64 map_version = 3;
+  // The asking node's round, rising: a request older than the last one this node took
+  // from it is ignored.
+  uint64 round = 4;
+  // What it asks for: each partition it serves that its map names it for, at the file's
+  // epoch. A grant replaces the asking node's previous one, so what it no longer asks for
+  // is no longer granted.
+  repeated LeasePart parts = 5;
+}
+
+// A partition at an epoch.
+message LeasePart {
+  string partition = 1;
+  uint64 epoch = 2;
+}
+
+message LeaseResponse {
+  // This node's map is newer than the request's: nothing is granted, and the asking node
+  // takes the newer map. 0 otherwise.
+  uint64 newer_map_version = 1;
+  // Granted until `--cluster-lease-ms` after this node received the request, on its clock:
+  // the parts asked that this node's map, at the request's version, gives the asking node.
+  repeated LeasePart granted = 2;
+  // Withheld: another node's grant of the partition is still live here.
+  repeated LeaseWithheld withheld = 3;
+  // This node is in its start grace and grants nothing until it ends: the time left. 0
+  // otherwise.
+  uint64 grace_remaining_ms = 4;
+}
+
+// A partition this node won't grant yet, and why.
+message LeaseWithheld {
+  string partition = 1;
+  // The node whose grant of it is live here.
+  string holder = 2;
+  // The time left on that grant, in milliseconds.
+  uint64 remaining_ms = 3;
 }

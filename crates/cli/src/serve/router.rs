@@ -421,6 +421,8 @@ impl Router {
             p.set_state(state);
             p.set_fence_reason(reason);
             p.awaiting_peers = cluster.node.awaiting_peers(id);
+            p.lease_remaining_ms =
+                u64::try_from(cluster.node.lease_remaining(id).as_millis()).unwrap_or(u64::MAX);
             if let Some(part) = open.get(id) {
                 let db = part.db.clone();
                 let info = self.service.blocking(move || Ok(db.info()?)).await?;

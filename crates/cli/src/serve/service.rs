@@ -431,6 +431,31 @@ impl ServiceOp {
         }
     }
 
+    /// Whether the call reads a cluster partition's data, so it needs the partition's lease
+    /// when it takes its snapshot (D326): the data reads, a transaction's or snapshot's
+    /// start, and a transaction's reads. Not a feed's subscribe (feed1248's F1: its
+    /// delivery is gated instead), nor the calls that read no rows (the schema, metrics,
+    /// maintenance), nor a transaction's `Commit`: one with writes is gated as a write where
+    /// it's answered, and a read-only one reads nothing past its transaction's reads.
+    pub(crate) fn reads_partition(&self) -> bool {
+        matches!(
+            self,
+            Self::Get(_)
+                | Self::MultiGet(_)
+                | Self::ReadRow(_)
+                | Self::Scan(_)
+                | Self::Begin(_)
+                | Self::TxnGet(_)
+                | Self::TxnGetRow(_)
+                | Self::OpenSnapshot(_)
+                | Self::Traverse(_)
+                | Self::Nearest(_)
+                | Self::VectorSearch(_)
+                | Self::TextSearch(_)
+                | Self::Recall(_)
+        )
+    }
+
     /// Whether the call writes or changes the schema: a replica refuses it (#1436). Derived
     /// from the scope, so a new write RPC is covered without being listed here (cli692's F2
     /// on #1583): every write-scope RPC writes, and `DropTable` is the one admin-scope
@@ -1583,14 +1608,32 @@ impl Service {
         // worker that hasn't parked since.
         super::placement::refresh();
         let budget = self.admit(&op.admit(), caller, prepaid).await?;
-        // A fenced partition's writes (D317 ticket 6), once admitted, so a fence's drain
-        // never waits behind a write's wait for the budget. Held until the call answers;
-        // a write that runs on past its request extends it.
-        let held = match &self.gate {
-            Some(gate) if op.writes() => Some(gate.enter()?),
-            _ => None,
+        // A cluster partition's gate (D317 ticket 6, D326), once admitted, so a fence's
+        // drain never waits behind a write's wait for the budget. A write is held until the
+        // call answers (a write that runs on past its request extends it); a read needs the
+        // partition's lease. Each is checked again once it's done: a write whose commit
+        // returned past the lease's end is `OutcomeUnknown`, and a read whose snapshot may
+        // have been taken past it is refused (audit120's S3).
+        let (held, read) = match &self.gate {
+            Some(gate) if op.writes() => (Some(gate.enter()?), None),
+            Some(gate) if op.reads_partition() => {
+                gate.serving()?;
+                (None, Some(gate))
+            }
+            _ => (None, None),
         };
-        let reply = self.answer(op, caller, budget).await;
+        let mut reply = self.answer(op, caller, budget).await;
+        if reply.is_ok() {
+            if let Some(h) = &held
+                && let Err(e) = h.committed()
+            {
+                reply = Err(e);
+            } else if let Some(gate) = read
+                && let Err(e) = gate.serving()
+            {
+                reply = Err(e);
+            }
+        }
         drop(held);
         match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
             // A transaction's Commit with writes: the engine's gate (R6) refused it.
@@ -2163,6 +2206,20 @@ impl Service {
     ) -> Result<ServiceReply, ApiError> {
         // The caller's scope, as admission checks it; the budget is the fanning-out node's.
         self.check(&op.admit(), caller)?;
+        // Its partition's lease, before the read and again after it took its snapshot
+        // (D326, audit120's S3).
+        if let Some(gate) = &self.gate {
+            gate.serving()?;
+        }
+        let reply = self.fanout_read(op, caller).await?;
+        if let Some(gate) = &self.gate {
+            gate.serving()?;
+        }
+        Ok(reply)
+    }
+
+    /// [`fanout_part`](Self::fanout_part)'s read.
+    async fn fanout_read(&self, op: ServiceOp, caller: &Caller) -> Result<ServiceReply, ApiError> {
         match op {
             ServiceOp::MultiGet(r) => self
                 .multi_get(r, caller)
@@ -3928,6 +3985,12 @@ impl Service {
                 Err(e) => Err(ApiError::outcome_unknown(format!(
                     "the commit's task failed: {e}"
                 ))),
+            };
+            // A commit that returned past the partition's lease is unknown (D326), and a
+            // retry of it finds the same.
+            let outcome = match (outcome, &held) {
+                (Ok(c), Some(h)) => h.committed().map(|()| c),
+                (o, _) => o,
             };
             ticket.finish(outcome.clone());
             drop(budget);
