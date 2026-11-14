@@ -589,12 +589,12 @@ impl<K: RingKind> HubOf<K> {
     /// `internal`: a cluster hub's merge (#1798), which keeps the task on the hub runtime.
     pub(crate) fn join(self: &Arc<Self>, tracker: &Arc<Tracker>, internal: bool) -> JoinedOf<K> {
         self.track(tracker);
-        // `external` before `members`, and after it on the way out: a client's membership
-        // never reads as a merge's ([`HubOf::internal`]).
+        // `external` before `members` (Release): whoever sees this membership in `members`
+        // (Acquire, [`HubOf::internal`]) sees a client's `external` with it (cli692's N1).
         if !internal {
             self.external.fetch_add(1, Ordering::Relaxed);
         }
-        if self.members.fetch_add(1, Ordering::Relaxed) == 0 {
+        if self.members.fetch_add(1, Ordering::Release) == 0 {
             self.sharers.fetch_add(1, Ordering::Relaxed);
         }
         self.joins.fetch_add(1, Ordering::Relaxed);
@@ -612,9 +612,12 @@ impl<K: RingKind> HubOf<K> {
         total / self.sharers.load(Ordering::Relaxed).max(1) as usize
     }
 
-    /// Whether its members are all cluster hubs' merges, and there's at least one.
+    /// Whether its members are all cluster hubs' merges, and there's at least one. `members`
+    /// first: a client counted there is counted in `external` too ([`HubOf::join`]). A client
+    /// leaving can still read as a merge for a moment, which costs at most one move to the
+    /// hub runtime and back after `solo_after`.
     fn internal(&self) -> bool {
-        self.external.load(Ordering::Relaxed) == 0 && self.members.load(Ordering::Relaxed) > 0
+        self.members.load(Ordering::Acquire) > 0 && self.external.load(Ordering::Relaxed) == 0
     }
 
     /// Counts `tracker`'s client under this hub, for the dump. Gone clients and those that
