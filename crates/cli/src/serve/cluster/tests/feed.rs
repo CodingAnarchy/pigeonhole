@@ -778,3 +778,89 @@ fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
         assert!(r.document.contains_key("done"), "{:?}", r.document);
     });
 }
+
+/// #1848: a component that took its partition's service just before a close took the
+/// partition out of the node's parts, and subscribed after the close's `end_parts`, ended
+/// with the closing database's own error: one `allow_partial` doesn't wait out, so the whole
+/// subscription ended. It's `PartitionUnavailable` now, and the subscription goes on with
+/// the partition reported unavailable. The forwarded subscribe is held at that point.
+#[test]
+fn a_component_that_subscribes_as_its_partition_closes_leaves_an_allow_partial_stream_going() {
+    // Bounded: a hold that never releases fails the test rather than hanging it (#1865).
+    bounded(Duration::from_secs(120), || {
+        use crate::serve::proto::PartitionRequest;
+        let t = Three::start();
+        let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        crate::serve::cluster::feed::HOLD_SUBSCRIBE
+            .lock()
+            .unwrap()
+            .push(((t.dirs[1].clone(), "p2".into()), wait));
+        let p2 = || PartitionRequest {
+            partition: "p2".into(),
+            ..Default::default()
+        };
+        t.rt.block_on(async {
+            // The subscription's open of p2 on b holds, with p2's service taken.
+            let opening = tokio::spawn(subscribe(
+                c,
+                SubscribeRequest {
+                    allow_partial: true,
+                    ..users()
+                },
+            ));
+            eventually("b's subscribe of p2 to be held", async || {
+                crate::serve::cluster::feed::HOLD_SUBSCRIBE
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            })
+            .await;
+            // Meanwhile p2 closes on b, its database included.
+            client(b).await.fence(p2()).await.unwrap();
+            client(b).await.close(p2()).await.unwrap();
+            eventually("p2's database to close on b", async || {
+                client(b)
+                    .await
+                    .status(StatusRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .partitions
+                    .iter()
+                    .any(|lp| lp.id == "p2" && !lp.files.is_empty())
+            })
+            .await;
+            release.send(()).unwrap();
+            let mut s = opening
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("the subscription ended: {e}"));
+            // p2 reported unavailable, and p1 carries on.
+            let mut gone = false;
+            put(a, "aafter", "v").await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut got_p1 = false;
+            while !(gone && got_p1) {
+                let e = tokio::time::timeout_at(deadline, s.message())
+                    .await
+                    .expect("p2's state and p1's commit")
+                    .unwrap_or_else(|e| panic!("the subscription ended: {e}"))
+                    .expect("the stream ended");
+                match e.event {
+                    Some(Event::PartitionState(st)) if st.partition == "p2" => {
+                        assert!(!st.available, "{st:?}");
+                        assert_eq!(st.reason, "PartitionUnavailable", "{st:?}");
+                        gone = true;
+                    }
+                    Some(Event::Commit(cm))
+                        if cm.changes.iter().any(|ch| &ch.row[..] == b"aafter") =>
+                    {
+                        got_p1 = true;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+}

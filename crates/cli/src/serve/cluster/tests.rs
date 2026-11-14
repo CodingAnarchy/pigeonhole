@@ -2461,6 +2461,32 @@ fn three_nodes_held(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    three_nodes_at(rt, inflight, hold, &[test_dir(), test_dir(), test_dir()])
+}
+
+/// [`three_nodes`] in `dirs`, a's, b's and c's, for a test that arms a seam keyed by a
+/// node's directory.
+fn three_nodes_in(
+    rt: &tokio::runtime::Runtime,
+    dirs: &[PathBuf; 3],
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    three_nodes_at(rt, 256 << 20, false, dirs)
+}
+
+fn three_nodes_at(
+    rt: &tokio::runtime::Runtime,
+    inflight: usize,
+    hold: bool,
+    dirs: &[PathBuf; 3],
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -2471,13 +2497,13 @@ fn three_nodes_held(
     let map = three_way(&[ports[0], ports[1], ports[2]]);
     let mut stops = Vec::new();
     let mut dbs = Vec::new();
-    for ((l, id), p) in listeners
+    for (((l, id), p), dir) in listeners
         .into_iter()
         .zip(["a", "b", "c"])
         .zip(["p1", "p2", "p3"])
+        .zip(dirs)
     {
-        let dir = test_dir();
-        super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
+        super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
         // Room for the stalled-stream test's scans: each holds a slot on its entry node and
         // one on the partition's.
         let limits = crate::serve::config::Limits {
@@ -2489,7 +2515,7 @@ fn three_nodes_held(
             hold_after_part_page: hold,
             ..crate::serve::server_tests::limits()
         };
-        let (stop, db) = data_node_with(rt, &dir, id, Some(p), l, limits);
+        let (stop, db) = data_node_with(rt, dir, id, Some(p), l, limits);
         stops.push(stop);
         dbs.push(db.unwrap());
     }
