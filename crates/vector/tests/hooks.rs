@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use common::{V, check, exact, open};
-use pigeonhole::{Element, Metric, VectorSpec};
+use pigeonhole::{Durability, Element, Metric, Options, Pigeonhole, RetryPolicy, VectorSpec};
 use pigeonhole_vector::hooks::{self, Hold};
-use pigeonhole_vector::{Index, IndexOptions, Rebalance};
+use pigeonhole_vector::{Error, Index, IndexOptions, Placed, Rebalance};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -282,12 +282,33 @@ fn a_crash_between_a_split_and_its_phase_2_leaves_a_consistent_index() {
     db.close().unwrap();
 }
 
+/// Counts a list row as no bytes while it lives, so a split's whole-read bound is four split
+/// lengths and a test's long list is split a page at a time (#1879: the bound is what a
+/// split holds in 16 MiB otherwise).
+struct PagedSplits;
+
+impl PagedSplits {
+    fn on() -> Self {
+        hooks::split_row_bytes(Some(0));
+        PagedSplits
+    }
+}
+
+impl Drop for PagedSplits {
+    fn drop(&mut self) {
+        hooks::split_row_bytes(None);
+    }
+}
+
 /// #1824: a list far longer than its split length (a skewed bulk load, or a list that outgrew
 /// a background rebalancer; here, writes made while rebalancing was skipped) is split from a
 /// sample and moved a page at a time. No read of the split or its phase 2 holds more than
-/// four split lengths, and the index ends within its bounds holding exactly the model.
+/// four split lengths ([`PagedSplits`]), and the index ends within its bounds holding exactly the model.
 /// The long list's vectors: two groups, or all one point, which leaves the split nothing to
 /// separate (split by order).
+///
+/// #1879: with the real bound, 16 MiB held, the same list (about 50 KiB held) is read whole,
+/// so it's split in one transaction rather than a page of eight vectors at a time.
 #[derive(Clone, Copy)]
 enum Shape {
     TwoGroups,
@@ -295,7 +316,12 @@ enum Shape {
 }
 
 fn a_long_list_splits_without_reading_it_whole(shape: Shape) {
+    a_long_list_splits(shape, true);
+}
+
+fn a_long_list_splits(shape: Shape, paged: bool) {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _paged = paged.then(PagedSplits::on);
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let (index, mut rebalancer) = Index::create_with_rebalancer(
@@ -338,7 +364,11 @@ fn a_long_list_splits_without_reading_it_whole(shape: Shape) {
     drain(&mut rebalancer);
     let held = hooks::take_split_held();
     assert!(held > 0, "a split ran");
-    assert!(held as u64 <= 4 * max, "a read held {held} > {}", 4 * max);
+    if paged {
+        assert!(held as u64 <= 4 * max, "a read held {held} > {}", 4 * max);
+    } else {
+        assert!(held as u64 > 60 * max, "read whole: held {held}");
+    }
     check(&index, &model, "after the long list's split");
     for q in [0.0, 200.0, 199.0, 201.0, 390.0] {
         exact(
@@ -361,6 +391,11 @@ fn a_long_list_of_two_groups_splits_without_reading_it_whole() {
 #[test]
 fn a_long_list_of_one_point_splits_without_reading_it_whole() {
     a_long_list_splits_without_reading_it_whole(Shape::OnePoint);
+}
+
+#[test]
+fn a_long_but_small_list_splits_whole() {
+    a_long_list_splits(Shape::TwoGroups, false);
 }
 
 /// Inline mode until every list is within its bounds: each write runs a bounded number of
@@ -392,6 +427,7 @@ fn settle(index: &Index, model: &mut BTreeMap<Vec<u8>, V>, ctx: &str) {
 #[test]
 fn a_paged_split_is_consistent_between_its_pages() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _paged = PagedSplits::on();
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let opts = IndexOptions::new()
@@ -476,5 +512,77 @@ fn a_paged_split_is_consistent_between_its_pages() {
     settle(&index, &mut copied, "the copy");
     check(&index, &copied, "the copy");
     exact(&index, &copied, &V::F32(vec![0.0, 0.0]), 5, "the copy");
+    db.close().unwrap();
+}
+
+/// audit120's S1 on #1881: a long list of small vectors, within the bound a split reads
+/// whole, whose whole move is more than the engine takes in one transaction at a small
+/// memtable budget (`BatchTooLarge`). The split and phase 2 fall back to moving it a page
+/// at a time, so the write that triggers it succeeds and the index ends within its bounds.
+#[test]
+fn a_whole_split_too_large_for_one_transaction_moves_a_page_at_a_time() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(
+        dir.join("idx.phdb"),
+        Options::default()
+            .shards(1)
+            .memtable_budget(1 << 20)
+            .durability(Durability::Buffered),
+    )
+    .unwrap();
+    let opts = IndexOptions::new()
+        .target_list_len(64)
+        .reassign_neighbours(1)
+        .rebalance(Rebalance::Background);
+    let (index, mut rebalancer) = Index::create_with_rebalancer(&db, "idx", spec(), opts).unwrap();
+    let drain = |r: &mut pigeonhole_vector::Rebalancer| {
+        while r.run_once(std::time::Duration::from_secs(60)).unwrap() {}
+    };
+    let mut model = BTreeMap::new();
+    for i in 0..400 {
+        put(&index, &mut model, &format!("s{i:03}"), i as f32);
+    }
+    drain(&mut rebalancer);
+    let lists = index.verify().unwrap().list_lens.len();
+    hooks::skip_rebalance(true);
+    // 10,000 vectors (80 KiB of them) into the list nearest 200, 500 per transaction.
+    for chunk in 0..20u32 {
+        let (placed, _) = db
+            .transact(&RetryPolicy::default(), |tx| {
+                let mut p = Placed::new();
+                for j in 0..500u32 {
+                    let i = chunk * 500 + j;
+                    let x = 200.0 + (i % 2) as f32 * 0.5 + (i % 7) as f32 * 0.01;
+                    index.insert_f32_in(tx, &mut p, format!("l{i:05}").as_bytes(), &[x, 0.0])?;
+                }
+                Ok::<Placed, Error>(p)
+            })
+            .unwrap();
+        index.after_commit(placed).unwrap();
+        for j in 0..500u32 {
+            let i = chunk * 500 + j;
+            let x = 200.0 + (i % 2) as f32 * 0.5 + (i % 7) as f32 * 0.01;
+            model.insert(format!("l{i:05}").into_bytes(), V::F32(vec![x, 0.0]));
+        }
+    }
+    hooks::skip_rebalance(false);
+    let lens = index.verify().unwrap().list_lens;
+    assert_eq!(lens.len(), lists);
+    assert!(lens.iter().any(|n| *n > 10_000), "one long list: {lens:?}");
+    // The next write into it marks it; the rebalancer's splits must not fail.
+    put(&index, &mut model, "trigger", 200.0);
+    drain(&mut rebalancer);
+    check(&index, &model, "after the long list's splits");
+    for q in [0.0, 200.0, 200.5, 390.0] {
+        exact(
+            &index,
+            &model,
+            &V::F32(vec![q, 0.0]),
+            5,
+            &format!("query {q}"),
+        );
+    }
+    drop(rebalancer);
     db.close().unwrap();
 }
