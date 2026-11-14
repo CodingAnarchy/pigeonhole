@@ -19,16 +19,18 @@ use crate::serve::backup::Backups;
 use crate::serve::errors::ApiError;
 use crate::serve::placement::{Memory, Placement, Share};
 
-/// How this node opens a partition while it serves, set once its server is built
-/// ([`attach_opener`]).
-pub(crate) struct Opener {
+/// The server a node serves through, set once it's built ([`attach`]): what the node needs
+/// to reconcile its partitions' schema and to open and close them while it serves.
+pub(crate) struct Server {
     /// The node's server: its parts, its node-wide service and the feed runtimes. Weak, since
     /// the server holds the node.
     pub(crate) shared: Weak<Shared>,
     pub(crate) placement: Arc<Placement>,
     pub(crate) backups: Arc<Backups>,
-    /// A partition's options for its share and memory, as the node's start opens them.
-    pub(crate) options: Box<dyn Fn(Share, Option<Memory>) -> pigeonhole::Options + Send + Sync>,
+    /// The options every database the server opens takes
+    /// ([`served_options`](crate::serve::served_options)); a partition's are these with its
+    /// share and memory ([`options_for`]).
+    pub(crate) served: pigeonhole::Options,
     /// `--shards` and `--compaction-threads`: the node's totals, split across its partitions.
     pub(crate) shards: usize,
     pub(crate) compaction: usize,
@@ -36,9 +38,9 @@ pub(crate) struct Opener {
     pub(crate) engine_memory: Option<u64>,
 }
 
-impl std::fmt::Debug for Opener {
+impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Opener")
+        f.debug_struct("Server")
             .field("shards", &self.shards)
             .field("compaction", &self.compaction)
             .field("engine_memory", &self.engine_memory)
@@ -191,9 +193,27 @@ fn hold_open(dir: &std::path::Path) {
     }
 }
 
-/// Lets `node` open partitions while `shared` serves (a node's start, and the test rig's).
-pub(crate) fn attach_opener(node: &Arc<Node>, opener: Opener) {
-    let _ = node.opener.set(opener);
+/// A partition's options: the server's, with the partition's share of the node's budget and
+/// its memory, at the node's start and for a partition opened while it serves.
+pub(crate) fn options_for(
+    served: &pigeonhole::Options,
+    share: Share,
+    memory: Option<Memory>,
+) -> pigeonhole::Options {
+    let options = super::partition_options(served.clone(), share);
+    match memory {
+        Some(m) => m.apply(options),
+        None => options,
+    }
+}
+
+/// Gives `node` the server it serves through (a node's start, and the test rig's): from here
+/// it reconciles its partitions' schema to every map it takes, on the installing thread
+/// before the map's routes serve, and opens and closes partitions while it serves. Its
+/// partitions are reconciled once now, to the map the node starts with.
+pub(crate) fn attach(node: &Arc<Node>, server: Server) {
+    let _ = node.server.set(server);
+    drop(node.reconcile_current(None));
 }
 
 impl Node {
@@ -205,11 +225,11 @@ impl Node {
     /// nothing to do.
     pub(crate) async fn open_part(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
         let _one = self.opening.lock().await;
-        let opener = self
-            .opener
+        let server = self
+            .server
             .get()
             .ok_or_else(|| ApiError::unsupported("this node opens no partition while it serves"))?;
-        let shared = opener
+        let shared = server
             .shared
             .upgrade()
             .ok_or_else(|| ApiError::partition_unavailable("the server is stopping"))?;
@@ -241,9 +261,9 @@ impl Node {
         // open partitions keep the shares they opened with (resharing an open engine is
         // out of scope, ICR 0117).
         let n = open_now.len() + 1;
-        let shares = crate::serve::placement::split(opener.shards, opener.compaction, n);
+        let shares = crate::serve::placement::split(server.shards, server.compaction, n);
         let share = shares[n - 1];
-        let memory = match opener.engine_memory {
+        let memory = match server.engine_memory {
             None => {
                 let bytes = map
                     .partitions
@@ -296,7 +316,7 @@ impl Node {
         let node = Arc::clone(self);
         let (part, cluster_id) = (id.to_owned(), map.cluster_id.clone());
         let opened = tokio::task::spawn_blocking(move || {
-            let Some(opener) = node.opener.get() else {
+            let Some(server) = node.server.get() else {
                 return Err(ApiError::internal("the node's opener went away"));
             };
             std::thread::scope(|scope| {
@@ -307,7 +327,7 @@ impl Node {
                     .spawn_scoped(scope, || {
                         #[cfg(test)]
                         hold_open(&node.dir);
-                        opener.placement.enter();
+                        server.placement.enter();
                         let mut log = Vec::new();
                         let opened = super::open_partitions(
                             &node.dir,
@@ -318,7 +338,7 @@ impl Node {
                                 reserved: None,
                                 memories: memory.as_ref().map(std::slice::from_ref),
                             },
-                            |s, m| (opener.options)(s, m),
+                            |s, m| options_for(&server.served, s, m),
                             &mut log,
                         );
                         eprint!("{}", String::from_utf8_lossy(&log));
@@ -339,7 +359,7 @@ impl Node {
         })?;
         // Pinned on the free cores, or not opened: never on an existing shard's sibling, and
         // never unpinned where pinning works.
-        if opener.placement.masked() && opened.pinning.shards_unpinned() > 0 {
+        if server.placement.masked() && opened.pinning.shards_unpinned() > 0 {
             let _ = opened.db.close();
             return Err(ApiError::failed_precondition(format!(
                 "partition {id}'s {} shards don't fit on this node's free cores (those off \
@@ -358,12 +378,12 @@ impl Node {
             .for_partition(
                 opened.db.clone(),
                 id,
-                &opener.backups,
+                &server.backups,
                 opened.pinning,
                 opened.memory,
                 gate,
             )
-            .placement(&opener.placement);
+            .placement(&server.placement);
         if let Some(part) = service.part_opt()
             && let Some((feeds, hubs)) = shared.feed_runtimes.get()
         {
@@ -371,7 +391,7 @@ impl Node {
         }
         let mut parts = (*cluster.parts.load_full()).clone();
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
-        remask_off_async(&opener.placement, &parts, format!("partition {id} opened")).await;
+        remask_off_async(&server.placement, &parts, format!("partition {id} opened")).await;
         cluster.parts.store(Arc::new(parts));
         // Its schema follows the map before it's unfenced (D317 ticket 5): the node's map
         // now, not the one the open began with, which a schema change may have passed while
@@ -401,7 +421,7 @@ impl Node {
     /// unfenced once the node's map confirms it (a relocation's new owner serves at once). A
     /// partition that fails to open is reported and left to the next map, or the operator.
     pub(crate) async fn open_missing(self: &Arc<Self>) {
-        if self.opener.get().is_none() {
+        if self.server.get().is_none() {
             return;
         }
         let Ok(map) = self.get_map() else {
@@ -440,7 +460,7 @@ impl Node {
     /// [`open_missing`](Self::open_missing) in a task, after an install, when a server
     /// serves this node.
     pub(crate) fn open_missing_soon(&self) {
-        if self.opener.get().is_none() {
+        if self.server.get().is_none() {
             return;
         }
         let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())
