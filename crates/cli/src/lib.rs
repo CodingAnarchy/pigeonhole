@@ -26,6 +26,11 @@ mod shell;
 
 #[doc(hidden)]
 pub use exit::ExitStatus;
+/// `phdb serve`'s router in process, for its instruction-count shapes (#1828): see
+/// `serve::bench`. Hidden, outside the semver promise (ICR 0086).
+#[cfg(feature = "serve")]
+#[doc(hidden)]
+pub use serve::bench as serve_bench;
 
 /// Runs `phdb` with `args` (the program name first, as from [`std::env::args_os`]), writing
 /// command output to `stdout` and errors to `stderr`, and returns the exit status the

@@ -18,6 +18,7 @@ use crate::serve::Shared;
 use crate::serve::backup::Backups;
 use crate::serve::errors::ApiError;
 use crate::serve::placement::{Memory, Placement, Share};
+use crate::serve::service::Service;
 
 /// The server a node serves through, set once it's built ([`attach`]): what the node needs
 /// to reconcile its partitions' schema and to open and close them while it serves.
@@ -36,6 +37,10 @@ pub(crate) struct Server {
     pub(crate) compaction: usize,
     /// `--engine-memory`, split as at the start.
     pub(crate) engine_memory: Option<u64>,
+    /// The node's reserved compaction CPUs, as its start reserved them for several
+    /// partitions (ICR 0134); `None` for one partition, none, or no pinning. A partition
+    /// opened while serving confines its compaction there (#1888).
+    pub(crate) reserved: Option<Vec<usize>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -216,6 +221,177 @@ pub(crate) fn attach(node: &Arc<Node>, server: Server) {
     drop(node.reconcile_current(None));
 }
 
+/// Where a partition opened while serving confines its compaction threads (#1888): the
+/// node's `reserved` compaction CPUs (several partitions at start, ICR 0134), else the open
+/// partitions' own pinned compaction CPUs (one at start), else `None`: a node that held no
+/// partition, or where nothing pins, places it as a start with one partition would. The
+/// open's share decides the thread count; with none (`--compaction-threads 0`) there's
+/// nothing to confine, whatever this returns.
+pub(crate) fn confine_compaction(
+    reserved: Option<&[usize]>,
+    open: impl Iterator<Item = Vec<usize>>,
+) -> Option<Vec<usize>> {
+    if let Some(r) = reserved {
+        return Some(r.to_vec());
+    }
+    let mut cpus: Vec<usize> = open.flatten().collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+    (!cpus.is_empty()).then_some(cpus)
+}
+
+/// One open partition's caches in a node's re-split of `--engine-memory` (#1761): from `old`
+/// to `new`, memtables unchanged.
+pub(crate) struct Resize {
+    pub(crate) id: String,
+    pub(crate) service: Arc<Service>,
+    pub(crate) old: Memory,
+    pub(crate) new: Memory,
+}
+
+/// The caches a re-split shrank before a partition's open: grown back to what they were if
+/// the open doesn't finish (dropped without [`keep`](Self::keep)). A grow evicts nothing, so
+/// the drop does it in place.
+struct Resized(Vec<(Arc<Service>, Memory)>);
+
+impl Resized {
+    /// Shrinks each cache in `plan` that gets smaller, on the blocking pool, and says so
+    /// (`why`), with any partition whose open SSTs pin more of its block cache than its new
+    /// share (simp724's note on #1890: those blocks stay until the SSTs close).
+    async fn shrink(plan: &[Resize], why: &str) -> Result<Self, ApiError> {
+        let shrinks: Vec<(String, Arc<Service>, Memory, Memory)> = plan
+            .iter()
+            .filter(|r| r.new.caches() < r.old.caches())
+            .map(|r| (r.id.clone(), Arc::clone(&r.service), r.old, r.new))
+            .collect();
+        if shrinks.is_empty() {
+            return Ok(Self(Vec::new()));
+        }
+        // The guard first (simp724's N1 on #1891): a shrink that fails part way (a panic
+        // in the blocking task) returns the error, and dropping the guard puts every cache
+        // back, a not-yet-shrunk one to the size it already has.
+        let guard = Self(
+            shrinks
+                .iter()
+                .map(|(_, s, old, _)| (Arc::clone(s), *old))
+                .collect(),
+        );
+        let why = why.to_owned();
+        tokio::task::spawn_blocking(move || apply(&shrinks, &why)).await?;
+        Ok(guard)
+    }
+
+    /// The open finished: the shrinks stand.
+    fn keep(mut self) {
+        self.0.clear();
+    }
+
+    /// Grows each cache in `plan` that gets larger (or stays the same size with a new
+    /// split), on the blocking pool, and says so (`why`): after a partition's open or close.
+    pub(crate) async fn grow(plan: &[Resize], why: &str) {
+        let grows: Vec<(String, Arc<Service>, Memory, Memory)> = plan
+            .iter()
+            .filter(|r| r.new.caches() >= r.old.caches())
+            .map(|r| (r.id.clone(), Arc::clone(&r.service), r.old, r.new))
+            .collect();
+        if grows.is_empty() {
+            return;
+        }
+        let why = why.to_owned();
+        if let Err(e) = tokio::task::spawn_blocking(move || apply(&grows, &why)).await {
+            eprintln!("phdb serve: a cache resize failed: {e}");
+        }
+    }
+}
+
+/// Grows the caches back in place, on whatever thread drops the guard: an async worker, or
+/// a cancelled open's. That's fine only because a grow evicts nothing (simp724's N2 on
+/// #1891): never add a step here that can block, evict or do I/O.
+impl Drop for Resized {
+    fn drop(&mut self) {
+        for (s, old) in self.0.drain(..) {
+            if let Some(p) = s.part_opt() {
+                p.resize_caches(old);
+            }
+        }
+    }
+}
+
+/// After partition `closed` closed, the partitions left in `parts` take their shares of
+/// `--engine-memory` (`total`) back: [`resplit`](crate::serve::placement::resplit) for the
+/// smaller set, applied in full (the closed engine's memory is gone, so a grow never passes
+/// the total). A split that can't be worked out (a map override past the total, say) leaves
+/// the caches as they are, and says so.
+pub(crate) async fn resplit_after_close(
+    node: &Node,
+    total: u64,
+    parts: &crate::serve::router::PartMap,
+    closed: &str,
+) {
+    let map = node.get_map().ok();
+    let asked = |pid: &str| {
+        map.as_ref()
+            .and_then(|m| m.partitions.iter().find(|p| p.id == pid))
+            .map_or(0, |p| p.memory_bytes)
+    };
+    let open: Vec<(String, Arc<Service>, Memory, u64)> = parts
+        .iter()
+        .filter_map(|(pid, s)| {
+            let m = s.part_opt()?.engine_memory()?;
+            Some((pid.clone(), Arc::clone(s), m, asked(pid)))
+        })
+        .collect();
+    let now: Vec<(Memory, u64)> = open.iter().map(|(_, _, m, o)| (*m, *o)).collect();
+    let kept = match crate::serve::placement::resplit(total, &now, None) {
+        Ok((kept, _)) => kept,
+        Err(why) => {
+            eprintln!("phdb serve: partition {closed} closed; --engine-memory not re-split: {why}");
+            return;
+        }
+    };
+    let changes: Vec<(String, Arc<Service>, Memory, Memory)> = open
+        .into_iter()
+        .zip(kept)
+        .filter(|((_, _, old, _), new)| new != old)
+        .map(|((id, s, old, _), new)| (id, s, old, new))
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+    let why = format!("partition {closed} closed");
+    if let Err(e) = tokio::task::spawn_blocking(move || apply(&changes, &why)).await {
+        eprintln!("phdb serve: a cache resize failed: {e}");
+    }
+}
+
+/// Resizes each partition's caches to its new memory, in one log line (blocking: a shrink
+/// evicts).
+fn apply(changes: &[(String, Arc<Service>, Memory, Memory)], why: &str) {
+    let mut said = Vec::with_capacity(changes.len());
+    for (id, s, old, new) in changes {
+        let Some(p) = s.part_opt() else { continue };
+        p.resize_caches(*new);
+        said.push(format!(
+            "{id} caches {} -> {} MiB",
+            old.caches() >> 20,
+            new.caches() >> 20
+        ));
+        let pinned = p.db.engine_metrics().block_cache_pinned_bytes;
+        if pinned > new.block_cache {
+            eprintln!(
+                "phdb serve: partition {id}'s open SSTs pin {} MiB of its block cache, more \
+                 than its new {} MiB: the cache stays over it by that until they close",
+                pinned >> 20,
+                new.block_cache >> 20
+            );
+        }
+    }
+    eprintln!(
+        "phdb serve: {why}: --engine-memory re-split: {} (memtables as opened)",
+        said.join(", ")
+    );
+}
+
 impl Node {
     /// Opens partition `id`, which the map gives this node, while the node serves: under
     /// the node's open lock, with its share of the node's budget recomputed for the new
@@ -263,6 +439,7 @@ impl Node {
         let n = open_now.len() + 1;
         let shares = crate::serve::placement::split(server.shards, server.compaction, n);
         let share = shares[n - 1];
+        let mut resplit: Vec<Resize> = Vec::new();
         let memory = match server.engine_memory {
             None => {
                 let bytes = map
@@ -282,34 +459,59 @@ impl Node {
                     })?
             }
             Some(total) => {
-                // What the open partitions leave of --engine-memory, never past it (perf287's
-                // P2 on #1755): at start they split all of it, so a node needs headroom for
-                // a partition opened later.
-                let held: u64 = open_now
-                    .values()
-                    .filter_map(|s| s.part_opt().and_then(|p| p.engine_memory))
-                    .map(|m| m.bytes())
-                    .sum();
-                let left = total.saturating_sub(held);
-                let asked = map
-                    .partitions
+                // --engine-memory re-split for the new set, as a restart would (#1761): the
+                // open partitions keep their memtables and their caches shrink to make room.
+                let asked = |pid: &str| {
+                    map.partitions
+                        .iter()
+                        .find(|p| p.id == pid)
+                        .map_or(0, |p| p.memory_bytes)
+                };
+                let open: Vec<(String, Arc<Service>, Memory, u64)> = open_now
                     .iter()
-                    .find(|p| p.id == id)
-                    .map_or(0, |p| p.memory_bytes);
-                let bytes = if asked > 0 { asked.min(left) } else { left };
-                let memory = Memory::of(bytes, share.shards).map_err(|least| {
-                    ApiError::failed_precondition(format!(
-                        "partition {id} can't open here: --engine-memory is {total} bytes, the \
-                         open partitions hold {held} of it, which leaves {left}, and its {} \
-                         shards' memtables need at least {least}. Restart this node to re-split \
-                         --engine-memory across its partitions (the map already gives it {id}), \
-                         or start it with headroom",
-                        share.shards
-                    ))
-                })?;
-                Some(memory)
+                    .filter_map(|(pid, s)| {
+                        let m = s.part_opt()?.engine_memory()?;
+                        Some((pid.clone(), Arc::clone(s), m, asked(pid)))
+                    })
+                    .collect();
+                let now: Vec<(Memory, u64)> = open.iter().map(|(_, _, m, o)| (*m, *o)).collect();
+                let (kept, memory) =
+                    crate::serve::placement::resplit(total, &now, Some((share.shards, asked(id))))
+                        .map_err(|why| {
+                            ApiError::failed_precondition(format!(
+                                "partition {id} can't open here: {why}"
+                            ))
+                        })?;
+                resplit = open
+                    .into_iter()
+                    .zip(kept)
+                    .filter(|((_, _, old, _), new)| new != old)
+                    .map(|((id, service, old, _), new)| Resize {
+                        id,
+                        service,
+                        old,
+                        new,
+                    })
+                    .collect();
+                memory
             }
         };
+        // The open partitions' caches shrink before the new engine allocates, so the node
+        // never holds more than --engine-memory; they grow back if the open fails (#1761).
+        let shrunk = Resized::shrink(&resplit, &format!("partition {id} opening")).await?;
+        // Its compaction on the node's compaction CPUs, as a start would place it (#1888):
+        // the start's reserved set; on a node that started with one partition, the open
+        // partitions' own compaction CPUs; on one that held none, or where nothing pins,
+        // none, and it's placed as a start with one partition is. Never the free cores,
+        // which the network side's mask covers. A node without compaction threads gives it
+        // none (`split` with 0), so there's nothing to confine.
+        let confine = confine_compaction(
+            server.reserved.as_deref(),
+            open_now
+                .values()
+                .filter_map(|s| s.part_opt())
+                .map(|p| p.db.pinned_compaction_cpus()),
+        );
         // Opening from here: `Status` shows it so, and doesn't read its file (#1770).
         let _opening = Opening::mark(self, id);
         // Joined from a blocking thread, so no async worker waits on the open.
@@ -335,7 +537,7 @@ impl Node {
                             &[(part, epoch)],
                             super::Budget {
                                 shares: &[share],
-                                reserved: None,
+                                reserved: confine.as_deref(),
                                 memories: memory.as_ref().map(std::slice::from_ref),
                             },
                             |s, m| options_for(&server.served, s, m),
@@ -393,6 +595,9 @@ impl Node {
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
         remask_off_async(&server.placement, &parts, format!("partition {id} opened")).await;
         cluster.parts.store(Arc::new(parts));
+        // Opened: the shrinks stand, and any cache the re-split grew grows now (#1761).
+        shrunk.keep();
+        Resized::grow(&resplit, &format!("partition {id} opened")).await;
         // Its schema follows the map before it's unfenced (D317 ticket 5): the node's map
         // now, not the one the open began with, which a schema change may have passed while
         // the engine opened (audit120's F6). The reconcile covers every open partition.

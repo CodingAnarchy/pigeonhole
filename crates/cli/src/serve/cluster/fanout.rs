@@ -91,6 +91,51 @@ impl Reach {
         crate::serve::router::place(&self.node, &self.parts, routes, partition)
     }
 
+    /// One partition's part of a fanned-out multi-get or nearest search: `op` served here, or
+    /// forwarded to the partition's node, and once more with the newer map after that node
+    /// answers `WrongPartition`. Its reply, and whether it was forwarded. The request's
+    /// holding covers the part (#1715): it takes no charge of its own.
+    async fn part(
+        &self,
+        partition: &str,
+        caller: &Caller,
+        op: forward_request::Op,
+    ) -> Result<(ServiceReply, bool), ApiError> {
+        let mut pulled = false;
+        loop {
+            let routes = self.routes()?;
+            match self.place(&routes, partition)? {
+                Place::Here(service) => {
+                    let op = forward::op_of(Some(op))?;
+                    return Ok((service.fanout_part(op, caller).await?, false));
+                }
+                Place::There(Target {
+                    address,
+                    map_version,
+                    ..
+                }) => {
+                    let req = ForwardRequest {
+                        fanout_part: true,
+                        map_version,
+                        caller: Some(forward::forwarded_caller(caller)?),
+                        op: Some(op.clone()),
+                    };
+                    let sent = self
+                        .forwarder
+                        .send(&address, req, self.within()?, false)
+                        .await;
+                    match sent {
+                        Err(e) if e.code == "WrongPartition" && !pulled => {
+                            pulled = true;
+                            self.catch_up(&routes, partition, &address).await?;
+                        }
+                        other => return Ok((forward::reply_of(other?)?, true)),
+                    }
+                }
+            }
+        }
+    }
+
     /// Pulls the map from the node that said it has a newer one (a `WrongPartition`).
     async fn catch_up(
         &self,
@@ -244,48 +289,13 @@ impl Router {
         r: MultiGetRequest,
         caller: &Caller,
     ) -> Result<MultiGetResponse, ApiError> {
-        let mut pulled = false;
-        loop {
-            let routes = reach.routes()?;
-            let reply = match reach.place(&routes, partition)? {
-                // The request's holding covers this page (#1715): no charge of its own.
-                Place::Here(service) => {
-                    return match service.fanout_part(ServiceOp::MultiGet(r), caller).await? {
-                        ServiceReply::MultiGet(m) => Ok(m),
-                        _ => Err(ApiError::internal("a multi-get answered another reply")),
-                    };
-                }
-                Place::There(Target {
-                    address,
-                    map_version,
-                    ..
-                }) => {
-                    let req = ForwardRequest {
-                        fanout_part: true,
-                        map_version,
-                        caller: Some(forward::forwarded_caller(caller)?),
-                        op: Some(forward_request::Op::MultiGet(r.clone())),
-                    };
-                    let sent = reach
-                        .forwarder
-                        .send(&address, req, reach.within()?, false)
-                        .await;
-                    match sent {
-                        Err(e) if e.code == "WrongPartition" && !pulled => {
-                            pulled = true;
-                            reach.catch_up(&routes, partition, &address).await?;
-                            continue;
-                        }
-                        other => forward::reply_of(other?)?,
-                    }
-                }
-            };
-            return match reply {
-                ServiceReply::MultiGet(m) => Ok(m),
-                _ => Err(ApiError::internal(
-                    "a forwarded multi-get answered another reply",
-                )),
-            };
+        let op = forward_request::Op::MultiGet(r);
+        match reach.part(partition, caller, op).await? {
+            (ServiceReply::MultiGet(m), _) => Ok(m),
+            (_, false) => Err(ApiError::internal("a multi-get answered another reply")),
+            (_, true) => Err(ApiError::internal(
+                "a forwarded multi-get answered another reply",
+            )),
         }
     }
 
@@ -790,43 +800,12 @@ impl Router {
         r: NearestRequest,
         caller: &Caller,
     ) -> Result<NearestResponse, ApiError> {
-        let mut pulled = false;
-        loop {
-            let routes = reach.routes()?;
-            let reply = match reach.place(&routes, partition)? {
-                // The request's holding covers this answer (#1715): no charge of its own.
-                Place::Here(service) => service.fanout_part(ServiceOp::Nearest(r), caller).await?,
-                Place::There(Target {
-                    address,
-                    map_version,
-                    ..
-                }) => {
-                    let req = ForwardRequest {
-                        fanout_part: true,
-                        map_version,
-                        caller: Some(forward::forwarded_caller(caller)?),
-                        op: Some(forward_request::Op::Nearest(r.clone())),
-                    };
-                    match reach
-                        .forwarder
-                        .send(&address, req, reach.within()?, false)
-                        .await
-                    {
-                        Err(e) if e.code == "WrongPartition" && !pulled => {
-                            pulled = true;
-                            reach.catch_up(&routes, partition, &address).await?;
-                            continue;
-                        }
-                        other => forward::reply_of(other?)?,
-                    }
-                }
-            };
-            return match reply {
-                ServiceReply::Nearest(n) => Ok(n),
-                _ => Err(ApiError::internal(
-                    "a nearest search answered another reply",
-                )),
-            };
+        let op = forward_request::Op::Nearest(r);
+        match reach.part(partition, caller, op).await? {
+            (ServiceReply::Nearest(n), _) => Ok(n),
+            _ => Err(ApiError::internal(
+                "a nearest search answered another reply",
+            )),
         }
     }
 

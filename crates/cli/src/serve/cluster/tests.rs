@@ -1199,6 +1199,7 @@ fn data_node_placed(
             shards: 1,
             compaction: 0,
             engine_memory,
+            reserved: None,
         },
     );
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.

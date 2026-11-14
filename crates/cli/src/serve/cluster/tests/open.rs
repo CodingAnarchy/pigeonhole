@@ -607,6 +607,148 @@ fn opened_off_the_others_cores_alone() {
     }
 }
 
+/// #1888: a partition opened while serving confines its compaction to the node's compaction
+/// CPUs: the start's reserved set; else the open partitions' own; else nothing to confine
+/// to (a node that held none, or no pinning), and it's placed as a start would.
+#[test]
+fn a_run_time_open_confines_its_compaction_to_the_nodes_compaction_cpus() {
+    use super::super::open::confine_compaction;
+    // Several partitions at start: their reserved set, whatever the open ones pin.
+    assert_eq!(
+        confine_compaction(Some(&[16, 17]), [vec![16], vec![17]].into_iter()),
+        Some(vec![16, 17])
+    );
+    // One at start: its pinned compaction CPUs.
+    assert_eq!(
+        confine_compaction(None, [vec![9, 8], vec![]].into_iter()),
+        Some(vec![8, 9])
+    );
+    // None open, or nothing pinned (or `--compaction-threads 0`, simp724's case: no
+    // compaction CPUs to confine to, and the share gives the new partition no threads).
+    assert_eq!(confine_compaction(None, std::iter::empty()), None);
+    assert_eq!(confine_compaction(None, [vec![], vec![]].into_iter()), None);
+    // `--compaction-threads 0` splits no threads to the new partition, so it has none to
+    // place, confined or not.
+    let shares = crate::serve::placement::split(4, 0, 3);
+    assert!(shares.iter().all(|s| s.compaction == 0));
+}
+
+/// #1761: a run-time open on a node started with `--engine-memory` and room for caches
+/// succeeds. The open partition's caches shrink to the two-way share, and its memtables stay
+/// as opened. A failed open puts them back, and a close grows them back to the start's split.
+#[test]
+fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
+    use crate::serve::placement::{Memory, resplit};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = test_dir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let part = |id: &str| Partition {
+        id: id.into(),
+        node: "a".into(),
+        epoch: 1,
+        memory_bytes: 0,
+        history_epoch: 0,
+    };
+    let mut map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: vec![MapNode {
+            id: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+        }],
+        partitions: vec![part("p1")],
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: Vec::new(),
+            partitions: vec!["p1".into()],
+            created: 0,
+        }],
+    };
+    super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+    // One 1-shard partition: 64 MiB of memtables and 448 MiB of caches.
+    const BUDGET: u64 = 512 << 20;
+    let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
+    let (stop, dbs, node) = data_node_placed(
+        &rt,
+        &dir,
+        "a",
+        vec![("p1", Some(p1.clone()))],
+        listener,
+        "",
+        crate::serve::server_tests::limits(),
+        false,
+        crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
+        Some(BUDGET),
+    );
+    let shared = node.server.get().unwrap().shared.upgrade().unwrap();
+    let memory_of = |id: &str| {
+        shared
+            .router
+            .partition(id)
+            .unwrap()
+            .engine_memory()
+            .unwrap()
+    };
+    let start = memory_of("p1");
+    assert_eq!((start.memtables(), start.bytes()), (64 << 20, BUDGET));
+    let (kept, new) = resplit(BUDGET, &[(start, 0)], Some((1, 0))).unwrap();
+    let (kept, new): (Memory, Memory) = (kept[0], new.unwrap());
+    map.map_version = 2;
+    map.partitions.push(part("p3"));
+    rt.block_on(async {
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(map),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // p3's file isn't here yet: the open fails after p1's caches shrank, and they're
+        // put back.
+        let e = node.open_part("p3").await.unwrap_err();
+        assert_ne!(e.code, "Ok", "{}", e.message);
+        assert_eq!(memory_of("p1"), start, "a failed open restores the caches");
+        assert_eq!(
+            p1.cache_capacities().0,
+            usize::try_from(start.block_cache).unwrap()
+        );
+        // With its file, the open succeeds: p1 shrinks to the two-way share.
+        test_partition_with(&dir, "p3", pigeonhole::Options::default().shards(1))
+            .close()
+            .unwrap();
+        node.open_part("p3").await.unwrap();
+        assert_eq!(memory_of("p1"), kept);
+        assert_eq!(kept.memtables(), start.memtables(), "memtables as opened");
+        assert!(kept.caches() < start.caches());
+        assert_eq!(
+            p1.cache_capacities().0,
+            usize::try_from(kept.block_cache).unwrap()
+        );
+        assert_eq!(memory_of("p3"), new);
+        assert!(memory_of("p1").bytes() + memory_of("p3").bytes() <= BUDGET);
+        // A close of p3 (fenced since its open: nothing confirmed it) gives p1 its share
+        // back.
+        node.close("p3").await.unwrap();
+        assert_eq!(memory_of("p1"), start, "the start's split again");
+        assert_eq!(
+            p1.cache_capacities().0,
+            usize::try_from(start.block_cache).unwrap()
+        );
+    });
+    drop(shared);
+    drop(node);
+    let _ = stop.send(());
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
 /// A run-time open gets what the open partitions leave of `--engine-memory` (perf287's P2 on
 /// #1755). At start they split all of it, so the open is refused, saying to restart the
 /// node; restarting that node alone re-splits it across both, and the partition serves (the
