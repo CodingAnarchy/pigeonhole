@@ -694,7 +694,6 @@ fn a_partition_restore_is_refused_where_it_cant_be_put_back_alone() {
 fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
     use crate::serve::cluster::cli::RESTORE_STOP_BEFORE_MAP;
     use crate::serve::cluster::restore::FAIL_AT;
-    use std::sync::atomic::Ordering::SeqCst;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, _dbs) = three_nodes(&rt);
     let (a, c) = (ports[0], ports[2]);
@@ -707,7 +706,7 @@ fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
         on(c, "p3", "fence").await.unwrap();
         on(c, "p3", "close").await.unwrap();
         // Stopped after the stamp at 2, before the map; run again: the stamp is reused.
-        RESTORE_STOP_BEFORE_MAP.store(true, SeqCst);
+        *RESTORE_STOP_BEFORE_MAP.lock().unwrap() = Some(args(a).node);
         let e = restore(&args(a), &part_args(&out, "p3", None))
             .await
             .err()
@@ -725,7 +724,7 @@ fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
         // Again, stopped after the stamp at 3; then the map moves on (p3 at 5, forced).
         on(c, "p3", "fence").await.unwrap();
         on(c, "p3", "close").await.unwrap();
-        RESTORE_STOP_BEFORE_MAP.store(true, SeqCst);
+        *RESTORE_STOP_BEFORE_MAP.lock().unwrap() = Some(args(a).node);
         restore(&args(a), &part_args(&out, "p3", None))
             .await
             .err()

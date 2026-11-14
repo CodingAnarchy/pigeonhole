@@ -446,11 +446,12 @@ pub(crate) async fn relocate(
     relocate_as(args, partition, to, old_unreachable, copy, None).await
 }
 
-/// A test's fault seam: the next one-partition restore stops after its stamp, before its
-/// map, as a crash or a refused set there would leave it.
+/// A test's fault seam: the next one-partition restore through this `--node` URL stops
+/// after its stamp, before its map, as a crash or a refused set there would leave it.
+/// Keyed by the URL, so tests running at once don't take each other's.
 #[cfg(test)]
-pub(crate) static RESTORE_STOP_BEFORE_MAP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) static RESTORE_STOP_BEFORE_MAP: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
 
 /// A one-partition restore's stamp and map step (#1832), through [`relocate_as`]: the same
 /// checks, stamp and checked map set as a relocation, with the stamp's `restore` set.
@@ -706,9 +707,12 @@ pub(super) async fn relocate_as(
         Vec::new()
     };
     #[cfg(test)]
-    if restoring.is_some()
-        && RESTORE_STOP_BEFORE_MAP.swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
+    if restoring.is_some() && {
+        let mut armed = RESTORE_STOP_BEFORE_MAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        armed.as_deref() == Some(args.node.as_str()) && armed.take().is_some()
+    } {
         return Err(Failure::usage("the test's fault after the restore's stamp"));
     }
     let set = set_map(args, m, false, copies).await?;
