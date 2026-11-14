@@ -727,10 +727,11 @@ impl proto::admin_server::Admin for AdminGrpc {
         req: Request<proto::PartitionUploadStatusRequest>,
     ) -> Result<Response<proto::PartitionUploadStatusReply>, Status> {
         let caller = self.0.caller(auth_header(&req))?;
-        let reply = self
-            .0
-            .router
-            .partition_upload_status(&caller, &req.get_ref().upload_id)?;
+        let reply = self.0.router.partition_upload_status(
+            &caller,
+            &req.get_ref().upload_id,
+            &req.get_ref().partition,
+        )?;
         Ok(Response::new(reply))
     }
 }

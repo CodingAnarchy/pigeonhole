@@ -2867,11 +2867,21 @@ impl Service {
     ) -> Result<(proto::MultiGetResponse, proto::MultiGetRequest), ApiError> {
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
+        let db = self.part()?.db.clone();
         let budget = page_bytes(r.page_bytes);
         // The request comes back with the reply, for a strict path's second read (#1661).
         self.blocking(move || {
             let reply = (|| -> Result<proto::MultiGetResponse, ApiError> {
-                let at = pinned.as_ref().map(|p| p.snapshot().clone());
+                // One snapshot for the page's reads, the request's or one taken now, so a
+                // read again ends exactly where the first measured (#1848). Only a table with
+                // a family that has a view (by its kind, whatever the selection asks) is ever
+                // read again, so any other reads now, at no snapshot's cost (audit120's S1
+                // and B2 on #1872).
+                let at = match &pinned {
+                    Some(p) => Some(p.snapshot().clone()),
+                    None if convert::Kinds::new(&table).any_view() => Some(db.snapshot()?),
+                    None => None,
+                };
                 let select = convert::Select::new(r.selection.as_ref())?.at(at);
                 let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
                 let after = if r.after.is_empty() {
@@ -2884,7 +2894,9 @@ impl Service {
                 let kinds = convert::Kinds::new(&table);
                 // Converted a column at a time, stopping at the first that doesn't fit with its
                 // aggregate view, then read again to end the page there (audit120's F4 and its
-                // S1 on #1812): no more than the budget and one column is ever built.
+                // S1 on #1812): no more than the budget and one column is ever built. Both
+                // reads see the same snapshot, so the second keeps exactly the columns the
+                // first measured; a write between them can't leave it an empty page (#1848).
                 let mut within = budget;
                 let (page, rows) = loop {
                     let mut read = select.keys(table.keys(&keys))?;
@@ -2896,7 +2908,11 @@ impl Service {
                         Ok(rows) => break (page, rows),
                         // The columns that fit are fewer than the page's, so each read keeps
                         // fewer; `min` keeps that true even if the measures ever differ.
-                        Err(cut) => within = cut.min(within.saturating_sub(1)),
+                        Err(cut) => {
+                            within = cut.min(within.saturating_sub(1));
+                            #[cfg(test)]
+                            between_reads(&r.table);
+                        }
                     }
                 };
                 let bytes = rows.iter().map(row_bytes).sum();
@@ -3454,6 +3470,7 @@ impl Service {
     pub(crate) async fn scan_opener(&self, table: &str) -> Result<ScanOpener, ApiError> {
         Ok(ScanOpener {
             table: self.table(table).await?,
+            db: self.part()?.db.clone(),
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
             inflight: Arc::clone(&self.inflight),
@@ -4133,9 +4150,34 @@ async fn held<T: Send + 'static>(
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
 }
 
+/// A hold seam (tests): runs, once, what a test armed for `table` between a page's two reads
+/// (MultiGet's and Scan's read again), as a write landing there would (#1848). Process-wide
+/// and keyed by table name only: each test that arms it uses a table name of its own.
+#[cfg(test)]
+pub(crate) static BETWEEN_READS: std::sync::Mutex<Vec<BetweenReads>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// [`BETWEEN_READS`]' entry: the table, and what runs between its page's reads.
+#[cfg(test)]
+pub(crate) type BetweenReads = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+fn between_reads(table: &str) {
+    let mut armed = BETWEEN_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(i) = armed.iter().position(|(t, _)| t == table) {
+        let (_, f) = armed.swap_remove(i);
+        drop(armed);
+        f();
+    }
+}
+
 /// A table's scan, ready to start: see [`Service::scan_opener`].
 pub(crate) struct ScanOpener {
     table: Table,
+    /// The partition's database, for a page's snapshot when the request pins none.
+    db: pigeonhole::Pigeonhole,
     pool: Arc<Semaphore>,
     reads: Arc<Semaphore>,
     inflight: Arc<Semaphore>,
@@ -4165,6 +4207,7 @@ impl ScanOpener {
         let (end_tx, end_rx) = oneshot::channel();
         let task = ScanTask {
             table: self.table.clone(),
+            db: self.db.clone(),
             r,
             after,
             pinned,
@@ -4204,6 +4247,7 @@ impl ScanOpener {
 /// A scan's reading side, run as its own task.
 struct ScanTask {
     table: Table,
+    db: pigeonhole::Pigeonhole,
     r: proto::ScanRequest,
     after: Option<ScanPosition>,
     pinned: Option<SnapshotGuard>,
@@ -4232,6 +4276,7 @@ impl ScanTask {
     async fn run(self) -> Result<(), ApiError> {
         let Self {
             table,
+            db,
             r,
             mut after,
             pinned,
@@ -4257,13 +4302,20 @@ impl ScanTask {
             if let Some(p) = &pinned {
                 p.check()?;
             }
-            let at = pinned.as_ref().map(|p| p.snapshot().clone());
-            let (table, req, pos) = (table.clone(), Arc::clone(&r), after.take());
+            let pinned_at = pinned.as_ref().map(|p| p.snapshot().clone());
+            let (table, db, req, pos) = (table.clone(), db.clone(), Arc::clone(&r), after.take());
             let thread = Arc::clone(&reads)
                 .acquire_owned()
                 .await
                 .map_err(|_| ApiError::internal("the scan threads closed"))?;
             let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
+                // One snapshot for the page's reads, as MultiGet's (#1848), when it can be
+                // read again.
+                let at = match pinned_at {
+                    Some(s) => Some(s),
+                    None if convert::Kinds::new(&table).any_view() => Some(db.snapshot()?),
+                    None => None,
+                };
                 let select = convert::Select::new(req.selection.as_ref())?.at(at);
                 let q = select.aggregate();
                 let kinds = convert::Kinds::new(&table);
@@ -4286,7 +4338,11 @@ impl ScanTask {
                             break Ok((rows, page.resume().cloned(), bytes, page.cut_by_budget()));
                         }
                         // As MultiGet's: each read keeps fewer columns.
-                        Err(cut) => within = cut.min(within.saturating_sub(1)),
+                        Err(cut) => {
+                            within = cut.min(within.saturating_sub(1));
+                            #[cfg(test)]
+                            between_reads(&req.table);
+                        }
                     }
                 }
             })

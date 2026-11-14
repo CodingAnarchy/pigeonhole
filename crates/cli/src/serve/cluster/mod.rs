@@ -165,9 +165,6 @@ pub(crate) struct Node {
     routes: arc_swap::ArcSwapOption<route::Routes>,
     /// One awaited map pull at a time ([`Node::pull_now`]).
     pulling: tokio::sync::Mutex<()>,
-    /// A serving node's schema reconcile (D317 ticket 5), run on every install before the
-    /// map's routes serve: [`schema::attach`] sets it.
-    reconciler: std::sync::OnceLock<Reconciler>,
     /// Each partition's last reconcile, by id: the map version, and its outcome, for
     /// `Status`.
     reconciled: Mutex<std::collections::BTreeMap<String, (u64, schema::Outcome)>>,
@@ -187,29 +184,16 @@ pub(crate) struct Node {
     /// The partitions served here: their write gates, and the operator's fences (D317
     /// ticket 6).
     fences: fence::Fences,
-    /// How the node opens a partition while it serves ([`open::attach_opener`]).
-    opener: std::sync::OnceLock<open::Opener>,
+    /// The server this node serves through, set once it's built ([`open::attach`]): how the
+    /// node reaches its partitions, to reconcile their schema on every install before the
+    /// map's routes serve (D317 ticket 5) and to open and close them while it serves
+    /// (ticket 6).
+    server: std::sync::OnceLock<open::Server>,
     /// One open or close of a partition at a time (D317 ticket 6): the parts' swaps take
     /// it. Taken after `fences.changing` where both are.
     opening: tokio::sync::Mutex<()>,
     /// This node, for the tasks an install starts.
     me: std::sync::Weak<Node>,
-}
-
-/// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
-/// server is gone.
-/// The second argument names a partition whose operator's fence is being lifted, which
-/// reconciles although its gate still says fenced.
-pub(crate) type Reconcile =
-    dyn Fn(&ClusterMap, Option<&str>) -> Option<Vec<(String, schema::Outcome)>> + Send + Sync;
-
-/// [`Reconcile`], boxed for [`Node::reconciler`].
-pub(crate) struct Reconciler(pub(crate) Box<Reconcile>);
-
-impl std::fmt::Debug for Reconciler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Reconciler")
-    }
 }
 
 /// Where a map [`Node::install`] takes comes from.
@@ -253,13 +237,12 @@ impl Node {
             installing: Mutex::new(()),
             routes: arc_swap::ArcSwapOption::new(routes),
             pulling: tokio::sync::Mutex::new(()),
-            reconciler: std::sync::OnceLock::new(),
             reconciled: Mutex::new(std::collections::BTreeMap::new()),
             reconciled_newest: std::sync::atomic::AtomicU64::new(0),
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
             fences: fence::Fences::default(),
-            opener: std::sync::OnceLock::new(),
+            server: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
             me: me.clone(),
         })
@@ -413,7 +396,7 @@ impl Node {
     /// them (audit120's S-C5). After the routes are stored, so a component opened meanwhile
     /// finds the new map when it checks it again ([`feed::serve`]).
     fn end_moved_feeds(&self, version: u64) {
-        let Some(shared) = self.opener.get().and_then(|o| o.shared.upgrade()) else {
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
             return;
         };
         let Some(cluster) = shared.router.cluster.as_ref() else {
@@ -683,7 +666,7 @@ impl Node {
         // The partitions this node has open: their identity comes from their own handle,
         // since a read-only open of a file a writer holds is refused (#1767).
         let open: std::collections::BTreeMap<String, crate::serve::router::PartRef> = self
-            .opener
+            .server
             .get()
             .and_then(|o| o.shared.upgrade())
             .map(|shared| shared.router.partitions().into_iter().collect())
@@ -1453,6 +1436,8 @@ pub(crate) fn run(
     let reserved = (mine.len() > 1)
         .then(|| super::placement::compaction_reserve(&shares, total_compaction))
         .flatten();
+    // What every partition's database takes, at the start and when one opens later.
+    let served = super::served_options(cli, args);
     let opened = open_partitions(
         dir,
         cluster_id.as_deref(),
@@ -1463,13 +1448,7 @@ pub(crate) fn run(
             // Unset, the library's own defaults, exactly as before.
             memories: memories.as_deref(),
         },
-        |share, memory| {
-            let options = partition_options(super::served_options(cli, args), share);
-            match memory {
-                Some(m) => m.apply(options),
-                None => options,
-            }
-        },
+        |share, memory| open::options_for(&served, share, memory),
         stderr,
     )?;
     let dbs: Vec<&pigeonhole::Pigeonhole> = opened.iter().map(|o| &o.db).collect();
@@ -1554,29 +1533,21 @@ pub(crate) fn run(
     });
     // A partition a map gives the node while it serves opens as the start's do (D317
     // ticket 6), with its share of the same totals.
-    let served = super::served_options(cli, args);
-    open::attach_opener(
+    // Its partitions' schema follows the map from here (D317 ticket 5): reconciled now, and
+    // on every map it takes.
+    open::attach(
         &node,
-        open::Opener {
+        open::Server {
             shared: Arc::downgrade(&shared),
             placement: Arc::clone(&placement),
             backups: Arc::clone(&backups),
-            options: Box::new(move |share, memory| {
-                let options = partition_options(served.clone(), share);
-                match memory {
-                    Some(m) => m.apply(options),
-                    None => options,
-                }
-            }),
+            served,
             shards: total_shards,
             compaction: total_compaction,
             engine_memory: args.engine_memory,
             reserved: reserved.clone(),
         },
     );
-    // Its partition's schema follows the map (D317 ticket 5): reconciled now, and on every
-    // map it takes.
-    schema::attach(&node, &shared);
     // A node that restarts with a map takes a newer one from its peers, then pushes.
     let start = start_sync(&node, version);
     super::serve_shared(

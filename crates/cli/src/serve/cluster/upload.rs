@@ -189,32 +189,51 @@ impl Uploads {
         Ok(&self.dir)
     }
 
-    /// `Admin.PartitionUploadStatus`: the bytes of `upload_id` the node holds, and whether
-    /// it's complete (ready to install).
-    pub(crate) fn status(&self, upload_id: &str) -> Result<PartitionUploadStatusReply, ApiError> {
+    /// `Admin.PartitionUploadStatus`: the bytes of `upload_id` the node holds, whether it's
+    /// complete (ready to install), and whether an install of `partition`'s set is in
+    /// progress here (false for an empty `partition`, an older client's).
+    pub(crate) fn status(
+        &self,
+        upload_id: &str,
+        partition: &str,
+    ) -> Result<PartitionUploadStatusReply, ApiError> {
         check_upload_id(upload_id)?;
+        if !partition.is_empty() && !super::map::id_ok(partition) {
+            return Err(ApiError::invalid(format!(
+                "{partition:?} isn't a partition id"
+            )));
+        }
+        // Its marker staged: the stamp that finishes the install comes first, and the files
+        // it renamed have no staged copy here to say complete (#1848).
+        let installing = !partition.is_empty() && self.not_installing(partition).is_err();
         if let Some(e) = self.lock().get(upload_id) {
             return Ok(PartitionUploadStatusReply {
                 received: e.received,
                 complete: false,
                 max_chunk: self.max_chunk as u64,
+                installing,
             });
         }
-        // Complete: a ready file whose header names it.
-        if let Some(h) = self
-            .ready_headers()
-            .into_iter()
-            .find(|h| h.upload_id == upload_id)
-        {
+        // Complete: a ready file whose header names it. The file itself must be there: an
+        // install that stopped after its renames may leave the header alone, and a rerun that
+        // took it for complete would send nothing and stamp nothing (#1848).
+        if let Some(h) = self.ready_headers().into_iter().find(|h| {
+            h.upload_id == upload_id
+                && h.file
+                    .as_ref()
+                    .is_some_and(|f| self.dir.join(ready_name(&h.partition, &f.name)).exists())
+        }) {
             let bytes = h.file.as_ref().map_or(0, |f| f.bytes);
             return Ok(PartitionUploadStatusReply {
                 received: bytes,
                 complete: true,
                 max_chunk: self.max_chunk as u64,
+                installing,
             });
         }
         Ok(PartitionUploadStatusReply {
             max_chunk: self.max_chunk as u64,
+            installing,
             ..Default::default()
         })
     }
@@ -712,14 +731,14 @@ mod tests {
         w.write(&chunk(0, &main[..5])).unwrap();
         let r = w.finish().unwrap();
         assert_eq!((r.received, r.complete), (5, false));
-        assert_eq!(up.status(&h.upload_id).unwrap().received, 5);
+        assert_eq!(up.status(&h.upload_id, "").unwrap().received, 5);
         // Resumed with the same header, from where it stands.
         let mut w = up.begin(h.clone(), CLOSED).unwrap();
         let e = w.write(&chunk(0, main)).unwrap_err();
         assert_eq!(e.code, "InvalidArgument", "{e:?}");
         w.write(&chunk(5, &main[5..])).unwrap();
         assert!(w.finish().unwrap().complete);
-        let st = up.status(&h.upload_id).unwrap();
+        let st = up.status(&h.upload_id, "").unwrap();
         assert_eq!((st.received, st.complete), (main.len() as u64, true));
         assert_eq!(
             std::fs::read(d.join(INCOMING).join("p2.phdb.ready")).unwrap(),
@@ -774,7 +793,10 @@ mod tests {
         drop(up.begin(other, CLOSED).unwrap());
         // The install done, the upload resumes with nothing left to send and stages.
         std::fs::remove_file(&marker).unwrap();
-        assert_eq!(up.status(&h.upload_id).unwrap().received, main.len() as u64);
+        assert_eq!(
+            up.status(&h.upload_id, "").unwrap().received,
+            main.len() as u64
+        );
         let w = up.begin(h, CLOSED).unwrap();
         assert!(w.finish().unwrap().complete);
         assert_eq!(
@@ -829,18 +851,42 @@ mod tests {
             ("NoSpace", tonic::Code::ResourceExhausted),
             "{e:?}"
         );
-        assert_eq!(up.status(&h.upload_id).unwrap().received, 4, "nothing lost");
+        assert_eq!(
+            up.status(&h.upload_id, "").unwrap().received,
+            4,
+            "nothing lost"
+        );
         w.write(&chunk(4, &data[4..])).unwrap();
         // The ready header's write fails: the bytes go back, and a resume finishes it.
         FULL_DISK.with(|n| n.set(1));
         let e = w.finish().unwrap_err();
         assert_eq!(e.code, "NoSpace", "{e:?}");
         assert!(ready_set(&d, "p2").is_none());
-        let st = up.status(&h.upload_id).unwrap();
+        let st = up.status(&h.upload_id, "").unwrap();
         assert_eq!((st.received, st.complete), (data.len() as u64, false));
         let w = up.begin(h, CLOSED).unwrap();
         assert!(w.finish().unwrap().complete);
         assert!(ready_set(&d, "p2").is_some());
+    }
+
+    #[test]
+    fn status_says_installing_for_the_partition_whose_marker_is_staged() {
+        // #1848 (audit120's B1 on #1872): the asked partition's install, not another's, and
+        // never for an older client's empty partition.
+        let d = dir();
+        let up = Arc::new(Uploads::new(&d, 1, 1 << 20));
+        let id = "0".repeat(32);
+        assert!(!up.status(&id, "p1").unwrap().installing);
+        let staging = up.staging().unwrap().to_path_buf();
+        std::fs::write(staging.join("p1.installing"), b"").unwrap();
+        assert!(up.status(&id, "p1").unwrap().installing);
+        assert!(
+            !up.status(&id, "p2").unwrap().installing,
+            "another partition's"
+        );
+        assert!(!up.status(&id, "").unwrap().installing, "an older client");
+        let e = up.status(&id, "../p1").unwrap_err();
+        assert_eq!(e.code, "InvalidArgument", "{e:?}");
     }
 
     #[test]
@@ -851,7 +897,7 @@ mod tests {
         assert_eq!(max_chunk(4 << 10), 1 << 10);
         let d = dir();
         let up = Arc::new(Uploads::new(&d, 1, 4));
-        assert_eq!(up.status(&"0".repeat(32)).unwrap().max_chunk, 4);
+        assert_eq!(up.status(&"0".repeat(32), "").unwrap().max_chunk, 4);
         let f = file("", b"12345");
         let mut w = up
             .begin(header('a', &f, std::slice::from_ref(&f)), CLOSED)
@@ -873,7 +919,11 @@ mod tests {
         w.write(&chunk(0, b"something else here!")).unwrap();
         let e = w.finish().unwrap_err();
         assert_eq!(e.code, "InvalidArgument", "{e:?}");
-        assert_eq!(up.status(&h.upload_id).unwrap().received, 0, "started over");
+        assert_eq!(
+            up.status(&h.upload_id, "").unwrap().received,
+            0,
+            "started over"
+        );
         assert!(!d.join(INCOMING).join("p2.phdb.ready").exists());
     }
 
@@ -941,11 +991,11 @@ mod tests {
         drop(w);
         let up = Uploads::new(&d, 2, CHUNK);
         assert!(
-            up.status(&ha.upload_id).unwrap().complete,
+            up.status(&ha.upload_id, "").unwrap().complete,
             "a ready file survives"
         );
         assert_eq!(
-            up.status(&hb.upload_id).unwrap().received,
+            up.status(&hb.upload_id, "").unwrap().received,
             0,
             "a partial one doesn't"
         );

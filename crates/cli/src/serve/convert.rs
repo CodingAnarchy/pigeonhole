@@ -772,6 +772,16 @@ impl<'t> Kinds<'t> {
         }
     }
 
+    /// Whether any family of the table has a view. Only such a table's pages count views
+    /// against their budget, so only they can be cut by them and read again (#1848), with
+    /// or without an aggregate query: a family's kind alone gives it a view.
+    pub(crate) fn any_view(&self) -> bool {
+        self.table
+            .families()
+            .into_iter()
+            .any(|f| self.of(f) != View::None)
+    }
+
     pub(crate) fn of(&self, family: &str) -> View {
         if let Some((_, v)) = self.seen.borrow().iter().find(|(f, _)| f == family) {
             return *v;

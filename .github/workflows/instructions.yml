@@ -29,6 +29,8 @@ on:
       - 'crates/bench/examples/writepath.rs'
       - 'crates/bench/examples/ycsb.rs'
       - 'crates/bench/examples/textshapes.rs'
+      - 'crates/bench/examples/feedshapes.rs'
+      - 'crates/bench/examples/asyncwrites.rs'
       - 'crates/text/**'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
@@ -131,10 +133,10 @@ jobs:
     # re-baseline of every ceiling in the same PR (#1795).
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # Two jobs in parallel (#1575): the read and write shapes, and the text-search shapes,
-    # which alone took about 20 minutes a side under valgrind and pushed one job to its
-    # 60-minute timeout. Each builds and counts only its own examples, and checks only its
-    # own shapes against the ceilings.
+    # Jobs in parallel (#1575): the read and write shapes; the text-search shapes, which
+    # alone took about 20 minutes a side under valgrind and pushed one job to its 60-minute
+    # timeout; and the feed and replication shapes (#1828). Each builds and counts only its
+    # own examples, and checks only its own shapes against the ceilings.
     strategy:
       fail-fast: false
       matrix:
@@ -143,7 +145,7 @@ jobs:
             # Examples built at base and head (crates/bench/examples/NAME.rs). The base is
             # built with the head's sources of these files, so a new or changed example still
             # has a baseline.
-            examples: hotrow readshapes writepath ycsb scanrate
+            examples: hotrow readshapes writepath ycsb scanrate asyncwrites
             # The hot row's three states run too (scripts/instructions-per-cell.sh's first
             # argument); `-` skips them.
             hotrow: hotrow
@@ -155,16 +157,26 @@ jobs:
             # would make the shapes nondeterministic. The default spin is checked on wall
             # time instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
             shapes: >-
-              readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
+              readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,wide-row-cells-async,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
               writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,flush,compact
               ycsb:ycsb-c,ycsb-a
               scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+              asyncwrites:commit-put-previous-async,commit-if-returning-async
           - name: text search instructions per search (callgrind)
             # The sync text search's floor (#1560 PR 0, crates/bench/examples/textshapes.rs).
             examples: textshapes
             hotrow: '-'
             shapes: >-
               textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2
+          - name: feed and replication instructions per commit (callgrind)
+            # The change feed's drain and a replica's apply (#1828,
+            # crates/bench/examples/feedshapes.rs): commits written in setup, drained or
+            # applied in the measured part. `replicate-apply` last: its setup (a primary and
+            # its feed) is the fullest.
+            examples: feedshapes
+            hotrow: '-'
+            shapes: >-
+              feedshapes:feed-drain,feed-drain-all,replicate-apply
     env:
       EXAMPLES: ${{ matrix.examples }}
       SHAPES: ${{ matrix.shapes }}
@@ -234,11 +246,28 @@ jobs:
             git diff --name-only "$base" HEAD -- crates/bench/examples > /tmp/examples-differ
             echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples; files that differ: $(tr '\n' ' ' < /tmp/examples-differ)"
             git -C /tmp/base checkout -q -- crates/bench/examples
-            (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
-              --target-dir "$GITHUB_WORKSPACE/target")
+            # Only the examples base has: an example new in this PR has no base count (its
+            # shapes show as new), and the target directory still holds the head's binary of
+            # it, which must not be copied as base's.
+            built=()
+            for e in $EXAMPLES; do
+              # Base's tree, not its directory: the head's copy of a new example is still
+              # there, untracked.
+              if git -C /tmp/base cat-file -e "HEAD:crates/bench/examples/$e.rs" 2>/dev/null; then
+                built+=("$e")
+              fi
+            done
+            if [ "${#built[@]}" -gt 0 ]; then
+              bflags=()
+              for e in "${built[@]}"; do bflags+=(--example "$e"); done
+              (cd /tmp/base && cargo build --release -p pigeonhole-bench "${bflags[@]}" \
+                --target-dir "$GITHUB_WORKSPACE/target")
+            fi
             touch /tmp/base-own-examples
+          else
+            built=($EXAMPLES)
           fi
-          for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-base/; done
+          for e in ${built[@]+"${built[@]}"}; do cp "target/release/examples/$e" /tmp/bin-base/; done
       - name: count
         shell: bash
         run: |
@@ -248,6 +277,8 @@ jobs:
             for g in $SHAPES; do
               # Base on its own examples: only the shapes base has a ceiling for.
               if [ "$side" = base ] && [ -e /tmp/base-own-examples ]; then
+                # An example base doesn't have (new in this PR): nothing to count.
+                [ -x "/tmp/bin-base/${g%%:*}" ] || continue
                 keep=()
                 IFS=, read -ra list <<< "${g#*:}"
                 for s in "${list[@]}"; do
@@ -275,7 +306,8 @@ jobs:
             [ "$HOTROW" = - ] && hot=-
             scripts/instructions-per-cell.sh "$hot" "${groups[@]}" > "/tmp/$side.txt"
           done
-          if [ ! -s /tmp/base.txt ] || [ ! -s /tmp/head.txt ]; then
+          # Base counts nothing only when every shape is new (its examples are all new).
+          if [ ! -s /tmp/head.txt ] || { [ ! -s /tmp/base.txt ] && [ ! -e /tmp/base-own-examples ]; }; then
             echo "a side counted nothing: base $(wc -l < /tmp/base.txt) lines, head $(wc -l < /tmp/head.txt)"
             exit 1
           fi

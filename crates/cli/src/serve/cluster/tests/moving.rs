@@ -570,3 +570,344 @@ fn a_moves_map_step_refuses_once_the_old_node_was_reopened_since_its_check() {
         .await;
     });
 }
+
+#[test]
+fn a_move_run_again_over_an_interrupted_install_finishes_it() {
+    // audit120's B1 on #1872: c's install of p1's set stopped after its first rename, its
+    // marker left, as a crash there leaves it. A rerun of the move sends nothing (c says the
+    // install is in progress) and goes on to the stamp, which finishes the install; the move
+    // then checks the set as usual. Before `installing`, the renamed file had no staged copy
+    // to say complete, its upload was refused while the marker was there, and the move never
+    // reached its stamp.
+    let t = Cluster::start();
+    let b = t.ports[1];
+    let marker = t.dirs[2].join(".phdb-incoming/p1.installing");
+    t.rt.block_on(async {
+        super::super::stamp::FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(t.dirs[2].clone());
+        let e = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("c's install fails after its first rename");
+        assert!(
+            e.message().contains("after the first rename"),
+            "{}",
+            e.message()
+        );
+        assert!(marker.exists(), "the install's marker is left");
+
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun failed: {}", e.message()));
+        let doc = &r.document;
+        for f in doc["copied"].as_array().unwrap() {
+            assert_eq!(f["sent"], 0, "the install in progress takes no upload: {f}");
+        }
+        assert_eq!(doc["epoch"], 2, "{doc:?}");
+        assert!(!marker.exists(), "the stamp finished the install");
+        eventually("c to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn another_partitions_install_in_progress_doesnt_skip_a_moves_copy() {
+    // The coordinator's case on #1872: `installing` is the asked partition's. c holds p2's
+    // interrupted install (its marker); a move of p1 to c meanwhile still uploads p1's set
+    // and stamps it, and p2's move, run again, then finishes its own install.
+    let t = Cluster::start();
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        put(b, "zed", "2").await;
+        super::super::stamp::FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(t.dirs[2].clone());
+        let e = within(super::super::moving::run(&t.args, "p2", "c", false, None))
+            .await
+            .err()
+            .expect("c's install of p2 fails after its first rename");
+        assert!(
+            e.message().contains("after the first rename"),
+            "{}",
+            e.message()
+        );
+        assert!(t.dirs[2].join(".phdb-incoming/p2.installing").exists());
+
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("p1's move failed: {}", e.message()));
+        for f in r.document["copied"].as_array().unwrap() {
+            assert_eq!(f["sent"], f["bytes"], "p1's files are sent: {f}");
+        }
+        let r = within(super::super::moving::run(&t.args, "p2", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("p2's rerun failed: {}", e.message()));
+        for f in r.document["copied"].as_array().unwrap() {
+            assert_eq!(
+                f["sent"], 0,
+                "p2's install in progress takes no upload: {f}"
+            );
+        }
+        assert!(!t.dirs[2].join(".phdb-incoming/p2.installing").exists());
+        for (row, value) in [("alice", "1"), ("zed", "2")] {
+            eventually(&format!("c to serve {row}"), async || {
+                get_row(b, row).await.ok().flatten() == Some(value.as_bytes().to_vec())
+            })
+            .await;
+        }
+    });
+}
+
+/// Sets the map at the writer (`writer`) to give p1 to `node` at its next epoch, marked as
+/// copied: what a move's map step sets.
+async fn give_p1_to(writer: u16, node: &str) {
+    let mut m = client(writer)
+        .await
+        .get_map(crate::serve::proto::GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let version = m.map_version;
+    for q in m.partitions.iter_mut().filter(|q| q.id == "p1") {
+        q.node = node.into();
+        q.epoch += 1;
+    }
+    m.map_version += 1;
+    client(writer)
+        .await
+        .set_map(SetMapRequest {
+            force: false,
+            expected_map_version: version,
+            map: Some(m),
+            copies: vec!["p1".into()],
+        })
+        .await
+        .unwrap();
+}
+
+/// Whether node `port` lists p1 in `state`.
+async fn p1_is(port: u16, state: crate::serve::proto::LocalPartitionState) -> bool {
+    client(port)
+        .await
+        .status(StatusRequest {})
+        .await
+        .is_ok_and(|s| {
+            s.into_inner()
+                .partitions
+                .iter()
+                .any(|lp| lp.id == "p1" && lp.state() == state)
+        })
+}
+
+#[test]
+fn a_move_off_a_node_still_opening_the_partition_is_refused() {
+    // #1848: the move's `Opening` refusal. c holds a checked copy of p1 at the next epoch
+    // (a move stopped after its stamp), and the map then gives c p1: c's open is held, and
+    // a move of p1 off c meanwhile is refused, not run against a partition mid-open.
+    use crate::serve::proto::LocalPartitionState;
+    let t = Cluster::start();
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        let stopped = within(super::super::moving::run(&t.args, "p1", "c", false, None)).await;
+        assert!(stopped.is_err(), "the move stops after its stamp");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        super::super::open::HOLD_OPEN
+            .lock()
+            .unwrap()
+            .push((t.dirs[2].clone(), wait));
+        give_p1_to(a, "c").await;
+        eventually("c to be opening p1", async || {
+            p1_is(c, LocalPartitionState::Opening).await
+        })
+        .await;
+        let e = within(super::super::moving::run(&t.args, "p1", "b", false, None))
+            .await
+            .err()
+            .expect("a move of p1 off c while c opens it is refused");
+        assert!(
+            e.message()
+                .starts_with("partition p1 is still opening on node \"c\": run the move again"),
+            "{}",
+            e.message()
+        );
+        release.send(()).unwrap();
+        // Then c's open goes on, and c serves p1 with its rows.
+        eventually("c to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn a_move_whose_set_another_moves_stamp_took_says_so_and_a_rerun_finishes() {
+    // #1848: two moves of p1 at once, and the move's "installed nothing" error. The first
+    // is held before its stamp; a second finds p1 closed and the set staged, and its stamp
+    // installs that set (it stops there, as if killed). The first's stamp then finds no set:
+    // it says another move is running, and changes nothing. Run again, the move finishes.
+    let t = Cluster::start();
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        super::super::moving::HOLD_BEFORE_STAMP
+            .lock()
+            .unwrap()
+            .push((t.args.node.clone(), reached_tx, held));
+        let args = t.args.clone();
+        let first =
+            tokio::spawn(
+                async move { super::super::moving::run(&args, "p1", "c", false, None).await },
+            );
+        within(reached)
+            .await
+            .expect("the first move reaches its stamp");
+
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        let e = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("the second move stops after its stamp");
+        assert!(e.message().contains("stopped after"), "{}", e.message());
+
+        release.send(()).unwrap();
+        let e = within(first)
+            .await
+            .unwrap()
+            .err()
+            .expect("the first move's stamp installs nothing");
+        assert!(
+            e.message().starts_with(
+                "node \"c\" installed nothing at the stamp: another move of p1 is running. The \
+                 map still gives p1 to \"a\" at epoch 1"
+            ),
+            "{}",
+            e.message()
+        );
+
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun failed: {}", e.message()));
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        eventually("c to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn a_stamp_that_installs_nothing_or_restores_keeps_the_operators_fence() {
+    // #1848: the stamp's two negatives beside the clear `a_partition_moved_back_...` tests.
+    // A stamp that installs nothing leaves the copy the operator fenced, and its fence
+    // (serve.md's promise); a restore's stamp leaves the fence for the restore to lift once
+    // its map is set.
+    use crate::serve::proto::{PartitionRequest, StampRequest};
+    let t = Cluster::start();
+    let a = t.ports[0];
+    let p1 = || PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    let fenced = || {
+        super::super::fence::read_fenced(&t.dirs[0])
+            .unwrap()
+            .contains("p1")
+    };
+    let stamp = async |from: u64, restore: bool| {
+        client(a)
+            .await
+            .stamp(StampRequest {
+                cluster_id: "c1".into(),
+                partition: "p1".into(),
+                from_epoch: from,
+                to_epoch: from + 1,
+                restore,
+                restore_from_cluster_id: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    t.rt.block_on(async {
+        client(a).await.fence(p1()).await.unwrap();
+        client(a).await.close(p1()).await.unwrap();
+        assert!(fenced(), "the close persists the operator's fence");
+
+        // Nothing staged: a's own copy goes to epoch 2, nothing is installed, and its
+        // fence stays.
+        let lp = stamp(1, false).await;
+        assert!(lp.files.is_empty(), "{lp:?}");
+        assert!(fenced(), "a stamp that installs nothing keeps the fence");
+
+        // A set staged and installed by a restore's stamp: the fence stays too.
+        let manifest = super::stamp::upload_set(a, "p1", &t.dirs[0].join("p1.phdb"), 7).await;
+        let lp = stamp(2, true).await;
+        assert_eq!(lp.files, manifest, "the restore's stamp installs the set");
+        assert!(fenced(), "a restore's stamp keeps the fence");
+    });
+}
+
+#[test]
+fn a_close_whose_drain_fails_leaves_the_partition_open_under_the_operators_fence() {
+    // #1848: a close whose drain fails (writes admitted before the fence still running after
+    // 30 s; the fault seam here). p1 is fenced on a since a started (no peer's map confirms
+    // it: the map has p1 at epoch 2, a's file at 1). The close made that fence the
+    // operator's and persisted it before the drain, so p1 stays open, fenced by the
+    // operator, and `fenced.json` lists it: what a restart of a reads, so no peer's map lifts
+    // it then (simp724's S1 on #1800).
+    use crate::serve::proto::{FenceReason, LocalPartitionState, PartitionRequest};
+    let t = Cluster::start_with(2, true);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        super::super::close::FAIL_DRAIN
+            .lock()
+            .unwrap()
+            .push(t.dirs[0].clone());
+        let e = client(a)
+            .await
+            .close(PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("the drain fails");
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(
+            e.message()
+                .contains("writes admitted before its fence still run"),
+            "{e}"
+        );
+        assert_eq!(
+            super::super::fence::read_fenced(&t.dirs[0]).unwrap(),
+            ["p1".to_owned()].into(),
+            "the operator's fence is persisted"
+        );
+        let lp = client(a)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == "p1")
+            .unwrap();
+        assert_ne!(
+            lp.state(),
+            LocalPartitionState::Closed,
+            "still open: {lp:?}"
+        );
+        assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+    });
+}

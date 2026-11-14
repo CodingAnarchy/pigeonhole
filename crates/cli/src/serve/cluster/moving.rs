@@ -332,6 +332,8 @@ pub(super) async fn run(
         sent.push(copy_file(&old, &new, &m.cluster_id, partition, e, f, &files).await?);
     }
     stop_after(args, Step::Copied)?;
+    #[cfg(test)]
+    hold_before_stamp(args).await;
     let installed = stamp(&new, &m.cluster_id, partition, e).await?;
     if installed.is_empty() {
         // The set this run staged is gone: another run's stamp took it.
@@ -450,6 +452,38 @@ pub(super) enum Step {
 /// fault seam: each test's nodes have ports of their own).
 #[cfg(test)]
 pub(super) static STOP: std::sync::Mutex<Vec<(String, Step)>> = std::sync::Mutex::new(Vec::new());
+
+/// A hold seam (tests): a move listed here, by its `--node` URL, says it reached its stamp
+/// (the sender) and waits for the release (the receiver, sent or dropped) before it stamps,
+/// so a test can run another move's stamp in between. Awaited: no thread blocks.
+#[cfg(test)]
+pub(super) static HOLD_BEFORE_STAMP: std::sync::Mutex<Vec<HeldStamp>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A [`HOLD_BEFORE_STAMP`] entry: the move's `--node` URL, its "reached" and its release.
+#[cfg(test)]
+pub(super) type HeldStamp = (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+async fn hold_before_stamp(args: &NodeArgs) {
+    let held = {
+        let mut armed = HOLD_BEFORE_STAMP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        armed
+            .iter()
+            .position(|(n, _, _)| *n == args.node)
+            .map(|i| armed.swap_remove(i))
+    };
+    if let Some((_, reached, release)) = held {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}
 
 /// The fault seam: in the tests, a move listed in [`STOP`] ends here, as if killed.
 fn stop_after(args: &NodeArgs, step: Step) -> Result<(), Failure> {
@@ -596,13 +630,17 @@ async fn copy_file(
         .partition_upload_status(request(
             PartitionUploadStatusRequest {
                 upload_id: id.clone(),
+                partition: p.to_owned(),
             },
             new.token.as_deref(),
         )?)
         .await
         .map_err(|s| new.failed(&format!("upload status of {what}"), &s))?
         .into_inner();
-    if st.complete {
+    // An install of a set NEW staged is in progress there (an earlier run stopped in it):
+    // nothing is sent, and the stamp finishes it. The set it installs is compared with the
+    // closed set like any other (#1848).
+    if st.complete || st.installing {
         return Ok(0);
     }
     let from = st.received;
