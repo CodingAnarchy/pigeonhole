@@ -1597,8 +1597,8 @@ pub(crate) fn run(
         limits,
         placement.blocking_threads,
         Arc::clone(&metrics),
-    )
-    .placement(&placement);
+        Some(Arc::clone(&placement)),
+    );
     let backups = super::backup::Backups::new(args.backup_dir.as_deref(), args.max_backups)
         .map_err(|e| Failure::usage(&e))?;
     let parts: Vec<(String, super::service::Service)> = opened
@@ -1607,9 +1607,13 @@ pub(crate) fn run(
             // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
             let gate = node.open_gate(&o.id, epoch);
-            let part = service
-                .for_partition(o.db.clone(), &o.id, &backups, o.pinning, o.memory, gate)
-                .placement(&placement);
+            let config = super::service::PartitionConfig {
+                backups: Arc::clone(&backups),
+                placement: Some(Arc::clone(&placement)),
+                pinning: o.pinning,
+                engine_memory: Some(o.memory),
+            };
+            let part = service.for_partition(o.db.clone(), &o.id, gate, config);
             (o.id.clone(), part)
         })
         .collect();

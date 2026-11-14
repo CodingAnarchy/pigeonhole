@@ -52,7 +52,7 @@ fn a_node_that_only_routes_answers_for_its_own_state_without_a_partition() {
     // D317 ticket 2: a cluster node the map gives no partition still has its node state
     // (connections, budgets, sessions, metrics); what needs a database answers that it has
     // none, and the node's own hooks pass over it.
-    let svc = Service::routing_only(limits(), 2, Arc::new(Metrics::default()));
+    let svc = Service::routing_only(limits(), 2, Arc::new(Metrics::default()), None);
     assert!(svc.part_opt().is_none());
     let e = svc.part().err().expect("no partition");
     assert_eq!(

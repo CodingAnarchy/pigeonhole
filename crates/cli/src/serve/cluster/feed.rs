@@ -1834,6 +1834,9 @@ pub(super) mod tests {
             crate::serve::server_tests::limits(),
             2,
             Arc::new(crate::serve::service::Metrics::default()),
+            crate::serve::service::PartitionConfig::new(
+                crate::serve::backup::Backups::new(None, 1).unwrap(),
+            ),
         ));
         let ctx = Arc::new(Ctx {
             node: Arc::clone(&node),
