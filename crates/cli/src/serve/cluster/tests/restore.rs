@@ -378,3 +378,47 @@ fn a_restore_from_a_backup_it_cant_write_to_warns_and_goes_on() {
         assert_eq!(keys(c).await, rows);
     });
 }
+
+/// audit120's B1 on #1872, a restore's half: b's install of p2's restored set stopped after
+/// its first rename, its marker left. Run again, the restore uploads nothing to b (b says the
+/// install is in progress) and goes on to the stamp, which finishes it.
+#[test]
+fn a_restore_run_again_over_an_interrupted_install_finishes_it() {
+    use crate::serve::cluster::stamp::FAIL_AFTER_FIRST_RENAME;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (_stops, ports, _dbs) = three_nodes_in(&rt, &dirs);
+    let (a, c) = (ports[0], ports[2]);
+    let mut rows = load(&rt, a, 12);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    let marker = dirs[1].join(".phdb-incoming/p2.installing");
+    rt.block_on(async {
+        assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
+        assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
+        FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(dirs[1].clone());
+        let e = restore(&args(a), &restore_args(&out)).await.err().unwrap();
+        assert!(
+            e.message().contains("after the first rename"),
+            "{}",
+            e.message()
+        );
+        assert!(marker.exists(), "b's install's marker is left");
+
+        let report = restore(&args(a), &restore_args(&out))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun failed: {}", e.message()));
+        assert!(!marker.exists(), "the stamp finished b's install");
+        assert_eq!(
+            epochs(&the_live_map(c).await),
+            [2, 2, 2],
+            "{:?}",
+            report.document
+        );
+        assert_eq!(keys(c).await, rows);
+    });
+}

@@ -60,8 +60,8 @@ pub(crate) enum ServiceOp {
     DropTable(proto::DropTableRequest),
     DescribeTable(proto::DescribeTableRequest),
     Info(proto::Empty),
-    Flush(proto::Empty),
-    Compact(proto::Empty),
+    Flush(proto::MaintenanceRequest),
+    Compact(proto::MaintenanceRequest),
     Backup(proto::BackupRequest),
     BackupDownload(proto::BackupDownloadRequest),
     Metrics(proto::Empty),
@@ -482,6 +482,13 @@ pub(crate) const PARTITION_ATTRIBUTE: &str = "pigeonhole.partition";
 /// A backup's partition named on a single node, which has none (D317 ticket 8b).
 fn single_node_partition() -> ApiError {
     ApiError::invalid("this server isn't a cluster node: a backup names no partition here")
+}
+
+/// A flush or compaction's partition named on a single node, which has none (#1852).
+fn single_node_maintenance() -> ApiError {
+    ApiError::invalid(
+        "this server isn't a cluster node: a flush or compaction names no partition here",
+    )
 }
 
 /// A last chunk's identity fields (D317 ticket 8b), empty on a single node.
@@ -948,7 +955,7 @@ fn render_pinning(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
             out,
             name,
             "gauge",
-            labelled().filter_map(|(id, p)| p.engine_memory.as_ref().map(|m| (*id, read(m)))),
+            labelled().filter_map(|(id, p)| p.engine_memory().map(|m| (*id, read(&m)))),
         );
     }
 }
@@ -1162,9 +1169,10 @@ pub(crate) struct Partition {
     /// How its engine's threads were placed when it opened (D317 ticket 8a's pinning
     /// check): a cluster node's gauges.
     pub(crate) pinning: Pinning,
-    /// Its engine memory as resolved at open (D317 ticket 8a's `--engine-memory`): a cluster
-    /// node's gauges.
-    pub(crate) engine_memory: Option<super::placement::Memory>,
+    /// Its engine memory (D317 ticket 8a's `--engine-memory`): as resolved at open, then as a
+    /// node's re-split at another partition's open or close changed its caches (#1761). A
+    /// cluster node's gauges, and the next re-split's starting point.
+    engine_memory: std::sync::Mutex<Option<super::placement::Memory>>,
     /// `--backup-dir`, and the backup downloads kept for resumes.
     ///
     /// **The node's one** (simp724's N1 on #1711): `Backups::new` clears
@@ -1201,6 +1209,39 @@ pub(crate) struct Partition {
 }
 
 impl Partition {
+    /// Ends the threads that use the database, in order, before it closes: a bulk load's
+    /// (its input has ended or was stopped, so it writes what came, and rebalances inline if
+    /// its index does), a running text rebuild's (it finishes first, ai1249's S1 on #1587),
+    /// then the vector indexes' rebalancers. One copy for a server's shutdown and a cluster
+    /// partition's close.
+    pub(crate) fn close_users(&self) {
+        self.bulk.close();
+        self.texts.close();
+        self.indexes.close();
+    }
+
+    /// Its engine memory now (`--engine-memory`'s share), `None` without one.
+    pub(crate) fn engine_memory(&self) -> Option<super::placement::Memory> {
+        *self
+            .engine_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Resizes its engine's block and row caches to `memory`'s, and records it (#1761: a
+    /// node re-splitting `--engine-memory` as partitions open and close). The memtables stay
+    /// as opened: `memory` carries them unchanged. Blocks while a shrink evicts: call it off
+    /// async workers.
+    pub(crate) fn resize_caches(&self, memory: super::placement::Memory) {
+        let bytes = |b: u64| usize::try_from(b).unwrap_or(usize::MAX);
+        self.db
+            .set_cache_capacities(bytes(memory.block_cache), bytes(memory.row_cache));
+        *self
+            .engine_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(memory);
+    }
+
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
     /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
     fn new(
@@ -1216,7 +1257,7 @@ impl Partition {
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: Pinning::default(),
-            engine_memory: None,
+            engine_memory: std::sync::Mutex::new(None),
             backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
             indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None, None)),
             bulk: super::bulk::BulkLoads::default(),
@@ -1313,7 +1354,7 @@ impl Service {
         ));
         part.backups = Arc::clone(backups);
         part.pinning = pinning;
-        part.engine_memory = Some(memory);
+        part.engine_memory = std::sync::Mutex::new(Some(memory));
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
@@ -1559,10 +1600,11 @@ impl Service {
         self.bulk_budget.available_permits()
     }
 
-    /// Takes `bytes` of the in-flight budget, waiting at most the request timeout: for a
-    /// front-end that knows a request's size before reading it (HTTP's `Content-Length`).
+    /// Takes `bytes` of the in-flight budget, waiting at most the request timeout: a call's
+    /// own, or for a front-end that knows a request's size before reading it (HTTP's
+    /// `Content-Length`).
     pub(crate) async fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ApiError> {
-        self.budget(bytes).await
+        budget_within(&self.inflight, bytes, self.limits.request_timeout).await
     }
 
     /// `reserve`, waiting at most `wait`.
@@ -1648,7 +1690,7 @@ impl Service {
         self.check(call, caller)?;
         match prepaid {
             Some(p) => Ok(p),
-            None => self.budget(call.size).await,
+            None => self.reserve(call.size).await,
         }
     }
 
@@ -1791,15 +1833,25 @@ impl Service {
                     tables,
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                     replica: self.replica_info(),
+                    partitions: Vec::new(),
+                    other_partitions: Vec::new(),
                 }))
             }
-            ServiceOp::Flush(_) => {
+            // On a cluster node the router serves these across its partitions (#1852): one
+            // that reaches here is a single node's, or a partition's own.
+            ServiceOp::Flush(r) => {
                 drop(budget);
+                if !r.partition.is_empty() {
+                    return Err(single_node_maintenance());
+                }
                 self.part()?.db.flush_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
-            ServiceOp::Compact(_) => {
+            ServiceOp::Compact(r) => {
                 drop(budget);
+                if !r.partition.is_empty() {
+                    return Err(single_node_maintenance());
+                }
                 self.part()?.db.compact_async().await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
@@ -2238,10 +2290,6 @@ impl Service {
         ServiceReply::Charged(Box::new(reply), charge)
     }
 
-    async fn budget(&self, size: usize) -> Result<OwnedSemaphorePermit, ApiError> {
-        budget_within(&self.inflight, size, self.limits.request_timeout).await
-    }
-
     /// The table `name`, opened on first use. A miss opens it on the blocking pool (an open
     /// is a sync call, D196) and swaps in a new map.
     ///
@@ -2491,11 +2539,7 @@ impl Service {
                 "a replica can't be followed: follow its primary",
             ));
         }
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         super::replica::follow(
             &self.part()?.db,
             r.token.to_vec(),
@@ -2550,11 +2594,7 @@ impl Service {
         map_version: Option<u64>,
     ) -> Result<super::backup::Download, ApiError> {
         use super::backup::{Copy, CopyIdentity, Taken};
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         if r.replica && self.replica_info().is_some() {
             // No cascading replicas in 1.2.0 (simp724's P2 on #1436): this copy would carry
             // this server's own replication state.
@@ -2746,11 +2786,7 @@ impl Service {
         if r.offset > kept.total {
             return Err(past_the_copy(r.offset, kept.total));
         }
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         let (tx, rx) = mpsc::channel(1);
         let (pool, idle) = (Arc::clone(&self.blocking), self.limits.stream_idle);
         let metrics = Arc::clone(&self.metrics);
@@ -2789,21 +2825,13 @@ impl Service {
         })
     }
 
-    /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once.
-    async fn blocking<T: Send + 'static>(
+    /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once: a
+    /// call's own, or a `/mcp` request's messages, whose tools make sync database calls.
+    pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         blocking(&self.blocking, f).await
-    }
-
-    /// Runs `f` on the blocking pool, within its limit: a `/mcp` request's messages, whose
-    /// tools make sync database calls.
-    pub(crate) async fn run_blocking<T: Send + 'static>(
-        &self,
-        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
-    ) -> Result<T, ApiError> {
-        self.blocking(f).await
     }
 
     /// A `--max-streams` place, now or `Overloaded`: a feed or watch stream's, or a `/mcp`
@@ -2885,11 +2913,21 @@ impl Service {
     ) -> Result<(proto::MultiGetResponse, proto::MultiGetRequest), ApiError> {
         let pinned = self.pinned_selection(r.selection.as_ref(), caller)?;
         let table = self.table(&r.table).await?;
+        let db = self.part()?.db.clone();
         let budget = page_bytes(r.page_bytes);
         // The request comes back with the reply, for a strict path's second read (#1661).
         self.blocking(move || {
             let reply = (|| -> Result<proto::MultiGetResponse, ApiError> {
-                let at = pinned.as_ref().map(|p| p.snapshot().clone());
+                // One snapshot for the page's reads, the request's or one taken now, so a
+                // read again ends exactly where the first measured (#1848). Only a table with
+                // a family that has a view (by its kind, whatever the selection asks) is ever
+                // read again, so any other reads now, at no snapshot's cost (audit120's S1
+                // and B2 on #1872).
+                let at = match &pinned {
+                    Some(p) => Some(p.snapshot().clone()),
+                    None if convert::Kinds::new(&table).any_view() => Some(db.snapshot()?),
+                    None => None,
+                };
                 let select = convert::Select::new(r.selection.as_ref())?.at(at);
                 let keys = KeySet::from_unsorted(r.keys.iter().map(|k| &k[..]));
                 let after = if r.after.is_empty() {
@@ -2902,7 +2940,9 @@ impl Service {
                 let kinds = convert::Kinds::new(&table);
                 // Converted a column at a time, stopping at the first that doesn't fit with its
                 // aggregate view, then read again to end the page there (audit120's F4 and its
-                // S1 on #1812): no more than the budget and one column is ever built.
+                // S1 on #1812): no more than the budget and one column is ever built. Both
+                // reads see the same snapshot, so the second keeps exactly the columns the
+                // first measured; a write between them can't leave it an empty page (#1848).
                 let mut within = budget;
                 let (page, rows) = loop {
                     let mut read = select.keys(table.keys(&keys))?;
@@ -2914,7 +2954,11 @@ impl Service {
                         Ok(rows) => break (page, rows),
                         // The columns that fit are fewer than the page's, so each read keeps
                         // fewer; `min` keeps that true even if the measures ever differ.
-                        Err(cut) => within = cut.min(within.saturating_sub(1)),
+                        Err(cut) => {
+                            within = cut.min(within.saturating_sub(1));
+                            #[cfg(test)]
+                            between_reads(&r.table);
+                        }
                     }
                 };
                 let bytes = rows.iter().map(row_bytes).sum();
@@ -3472,6 +3516,7 @@ impl Service {
     pub(crate) async fn scan_opener(&self, table: &str) -> Result<ScanOpener, ApiError> {
         Ok(ScanOpener {
             table: self.table(table).await?,
+            db: self.part()?.db.clone(),
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
             inflight: Arc::clone(&self.inflight),
@@ -3672,11 +3717,7 @@ impl Service {
                 "this server has no memory store (phdb serve --memory NAME)",
             ));
         };
-        let Ok(slot) = Arc::clone(&self.streams).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is at its concurrent stream limit (--max-streams)",
-            ));
-        };
+        let slot = self.stream_slot()?;
         super::memory::watch(
             core,
             crate::memcore::Scope(caller.namespaces.as_deref()),
@@ -4163,9 +4204,34 @@ async fn held<T: Send + 'static>(
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
 }
 
+/// A hold seam (tests): runs, once, what a test armed for `table` between a page's two reads
+/// (MultiGet's and Scan's read again), as a write landing there would (#1848). Process-wide
+/// and keyed by table name only: each test that arms it uses a table name of its own.
+#[cfg(test)]
+pub(crate) static BETWEEN_READS: std::sync::Mutex<Vec<BetweenReads>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// [`BETWEEN_READS`]' entry: the table, and what runs between its page's reads.
+#[cfg(test)]
+pub(crate) type BetweenReads = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+fn between_reads(table: &str) {
+    let mut armed = BETWEEN_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(i) = armed.iter().position(|(t, _)| t == table) {
+        let (_, f) = armed.swap_remove(i);
+        drop(armed);
+        f();
+    }
+}
+
 /// A table's scan, ready to start: see [`Service::scan_opener`].
 pub(crate) struct ScanOpener {
     table: Table,
+    /// The partition's database, for a page's snapshot when the request pins none.
+    db: pigeonhole::Pigeonhole,
     pool: Arc<Semaphore>,
     reads: Arc<Semaphore>,
     inflight: Arc<Semaphore>,
@@ -4195,6 +4261,7 @@ impl ScanOpener {
         let (end_tx, end_rx) = oneshot::channel();
         let task = ScanTask {
             table: self.table.clone(),
+            db: self.db.clone(),
             r,
             after,
             pinned,
@@ -4234,6 +4301,7 @@ impl ScanOpener {
 /// A scan's reading side, run as its own task.
 struct ScanTask {
     table: Table,
+    db: pigeonhole::Pigeonhole,
     r: proto::ScanRequest,
     after: Option<ScanPosition>,
     pinned: Option<SnapshotGuard>,
@@ -4262,6 +4330,7 @@ impl ScanTask {
     async fn run(self) -> Result<(), ApiError> {
         let Self {
             table,
+            db,
             r,
             mut after,
             pinned,
@@ -4287,13 +4356,20 @@ impl ScanTask {
             if let Some(p) = &pinned {
                 p.check()?;
             }
-            let at = pinned.as_ref().map(|p| p.snapshot().clone());
-            let (table, req, pos) = (table.clone(), Arc::clone(&r), after.take());
+            let pinned_at = pinned.as_ref().map(|p| p.snapshot().clone());
+            let (table, db, req, pos) = (table.clone(), db.clone(), Arc::clone(&r), after.take());
             let thread = Arc::clone(&reads)
                 .acquire_owned()
                 .await
                 .map_err(|_| ApiError::internal("the scan threads closed"))?;
             let (mut rows, mut next, mut bytes, cut) = blocking(&pool, move || {
+                // One snapshot for the page's reads, as MultiGet's (#1848), when it can be
+                // read again.
+                let at = match pinned_at {
+                    Some(s) => Some(s),
+                    None if convert::Kinds::new(&table).any_view() => Some(db.snapshot()?),
+                    None => None,
+                };
                 let select = convert::Select::new(req.selection.as_ref())?.at(at);
                 let q = select.aggregate();
                 let kinds = convert::Kinds::new(&table);
@@ -4316,7 +4392,11 @@ impl ScanTask {
                             break Ok((rows, page.resume().cloned(), bytes, page.cut_by_budget()));
                         }
                         // As MultiGet's: each read keeps fewer columns.
-                        Err(cut) => within = cut.min(within.saturating_sub(1)),
+                        Err(cut) => {
+                            within = cut.min(within.saturating_sub(1));
+                            #[cfg(test)]
+                            between_reads(&req.table);
+                        }
                     }
                 }
             })

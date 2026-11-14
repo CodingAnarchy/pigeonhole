@@ -4558,6 +4558,17 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **`Cluster.Status`** lists a closed partition's files with their SHA-256 (ICR 0135's `database_files`), hashed after the close answers.
 - **The manual order (owner-approved):** fence, then close, then copy or restore, then `relocate`. `relocate` stamps the new node's file from the map's epoch `e` to `e + 1`, then sets the map with P on the new node at `e + 1`.
 
+**D317 amendment 3 (coordinator, 2026-11-14; #1829, #1760, ICR 0117; design `.coord/simp724-design-1829-1760.md`, reviewed by audit120 and feed1248): rule 3 confirms by a majority.**
+- **The gate keeps two flags** (#1829): the operator's fence, and "not confirmed since it opened here". Every open, at start or while serving, is unconfirmed. `phdb cluster unfence` without `--force` asks the peers whichever flags are set.
+- **Which maps confirm a partition** (#1760): one confirmation round asks every peer for its map and installs the newest. Then:
+  - if that map doesn't name this node for the partition at its file's epoch, the partition isn't confirmed: only a map with a newer map version than this node's vetoes it;
+  - otherwise it pushes the map to every peer that answered with an older one, waiting for the ack, and confirms the partition when a majority of the map's nodes (this node included) hold the map;
+  - a peer holding a different map at the same version blocks it.
+- **A map set through the writer that changes the nodes may not also move or re-epoch a partition,** so a partition's owner changes only within one set of nodes, whose majorities intersect. Forced maps aren't held to it.
+- **A node change must reach a majority of both node sets before the map changes again** (#1899's F4, audit120's L2 on the leases note). The writer sets `ClusterMap.previous_nodes` (6) to the nodes before a node change, and while the newest map has it, refuses every non-forced change (a schema change too) unless a push now finds a majority of `previous_nodes` and a majority of `nodes` holding the map. The next change taken clears it. The node change's own `SetMap` pushes for up to three push timeouts for both majorities before it answers. Without this, a node change that reached only the new majority, with the old majority then cut off, let an old owner be confirmed by the old set and a new one by the new set. A forced map clears `previous_nodes` and waits for nothing.
+- **A move waits after its map step** until a majority of the nodes hold its map, so an operator's unfence of the old node can't be confirmed on the older map while the new node is down.
+- **Limit (with the owner):** a live old owner cut off from a majority keeps serving the clients that reach it until it takes the newer map. Rule 3 is about restarts and opens; closing that needs leases.
+
 <a id="d318"></a>
 ## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
 
@@ -4791,3 +4802,40 @@ jemalloc's peak RSS was 0–20% higher. #1537's futex profile had found glibc's 
 - *Per-shard visibility.* That's #717 (b2), which is shelved.
 
 **Instead.** #1681's preallocation stays for 1.2.0. #1621's remaining stall goes to 1.3.0 as #1708: stay buffered, and start a fresh page while a sync is in flight. That's a design note first, since it raises format, space and replay questions.
+
+<a id="d325"></a>
+## D325 — Every-table feed tokens carry the catalog's table-id set and id counters (token version 3) (perf2, design; owner, 2026-11-13; feed, engine, pigeonhole, #1853, ICR 0136) · D315
+
+**Problem (#1853).** A 1.1.x session after a rollback from 1.2 records no catalog change in the feed. Its Session and Root entries are byte-identical to 1.2's. Back on 1.2, a feed of every table resumed from an earlier token delivers the commits without the create, the added family or the drop. A replica following that feed either refuses a commit for ever or falls silently behind its primary. Nothing 1.2.0 writes records what the catalog was at a token's position, so no check can decide it for a 1.2.0 token. #1857 (1.2.1) catches what it can without that record: a commit to a dropped table, and a replica's refused apply.
+
+**Decision.** A token of a feed of every table gets a new layout, version 3. It is version 2's layout followed by 16 bytes, all little-endian:
+- `tables`: an order-independent hash of the catalog's set of table ids at the token's position. It is the wrapping sum of xxh3-64 over each id's four bytes, so the reader can add and remove ids as catalog changes pass.
+- `next_table` (u32) and `next_family` (u32): the catalog's id counters at that position.
+
+**Why these three are enough.** The catalog changes a feed records are a table created with its families, a family added, and a table dropped (D315).
+- Ids are never reused, and the counters only rise. So a table created or a family added without a record always leaves a counter above what the recorded changes account for.
+- A drop without a record leaves the id set different.
+- A drop's Catalog entry carries its table id but not its families' names. An id set can be worked back from that entry; a digest of names couldn't.
+
+**On resume** (a version 3 token):
+1. The reader takes the live catalog's table ids and counters.
+2. It works back through the rooted Catalog entries the history holds after the token's catalog position: a create removes its id, a drop restores its id.
+3. If the result's hash isn't the token's `tables`, the resume answers `FeedExpired`. It also expires if a live counter isn't what the token's value and the recorded creates and added families account for: the larger of the token's value and one past the largest id they carry.
+4. While delivering, the reader applies each catalog change to its set and counters, so every token it hands out carries its own position's values.
+
+**What "the start" is.** The reference is the token's own last catalog change (`catalog_seq`): its model holds the changes up to it and none after. A change after it that the token's bound passes over is compared as after the start, then put in. That's a change appended after the token was taken, while its commit was already below the bound (simp724's F1 race on #1515). The view a start sees can lag the sidecar too: a reader process's view, or a change appended but not yet published. So changes before the start that the view doesn't reflect yet are put in, and changes after it are taken out only while the view reflects them, a prefix in order (`reflects`, D315).
+
+A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard only. A non-token start has no claimed catalog, so the reader takes the live catalog as its reference: a start sees nothing that came before it.
+
+**Across versions.**
+- 1.2.0 refuses a version 3 token (`InvalidArgument`, "not a change feed token"). After a rollback from 1.3 to 1.2.0, start feeds of every table again. The upgrade note says so.
+- **1.2.1 accepts a version 3 token** and resumes it as version 2, ignoring the 16 bytes: the owner's rule of 2026-11-13, so a rollback from 1.3 to 1.2.1 keeps its feeds. A token 1.2.1 then hands out is version 2. Back on 1.3, such a token has #1857's guard only.
+- Per-table tokens (version 1) don't change.
+- The sidecar doesn't change. A new entry type would have ended every feed's history on 1.2.x, and a longer Session entry is `Corrupt` there.
+
+**Rejected.**
+- *A digest of names and families.* It can't be worked back through a drop, whose entry doesn't name the dropped table's families.
+- *A per-session baseline in the sidecar.* A new entry type is `Unknown` to 1.2.x, and ends the history of every feed, per-table ones included.
+- *A 1.1.x patch marking catalog-changing roots.* 1.1.3 is already shipped, and a rollback to it is what this decision has to survive.
+
+**Owner's approval (2026-11-13).** Yes to the version 3 layout in 1.3.0, with the upgrade note saying a 1.3 every-table token is `InvalidArgument` on 1.2.0. 1.2.1 ships #1857, plus the parse of version 3 once its layout is settled on main.

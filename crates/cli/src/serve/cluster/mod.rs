@@ -94,18 +94,24 @@ pub(crate) fn read_map(dir: &Path) -> Result<Option<ClusterMap>, String> {
     }
 }
 
-/// Writes `json` as `dir`'s map file: a temporary file, synced, renamed over the old one,
-/// then the directory synced, so a crash leaves the old map or the new one, never a torn
-/// file.
+/// Writes `json` as `dir`'s map file, so a crash leaves the old map or the new one, never a
+/// torn file.
 fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
+    write_synced(dir, MAP_FILE, json.as_bytes())
+}
+
+/// Writes `bytes` as `dir`'s file `name`: a temporary file (`name.tmp`), synced, renamed
+/// over the old one, then the directory synced, so a crash leaves the old file or the new
+/// one whole.
+pub(super) fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = dir.join(format!("{MAP_FILE}.tmp"));
+    let tmp = dir.join(format!("{name}.tmp"));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, dir.join(MAP_FILE))?;
+    std::fs::rename(&tmp, dir.join(name))?;
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -159,9 +165,6 @@ pub(crate) struct Node {
     routes: arc_swap::ArcSwapOption<route::Routes>,
     /// One awaited map pull at a time ([`Node::pull_now`]).
     pulling: tokio::sync::Mutex<()>,
-    /// A serving node's schema reconcile (D317 ticket 5), run on every install before the
-    /// map's routes serve: [`schema::attach`] sets it.
-    reconciler: std::sync::OnceLock<Reconciler>,
     /// Each partition's last reconcile, by id: the map version, and its outcome, for
     /// `Status`.
     reconciled: Mutex<std::collections::BTreeMap<String, (u64, schema::Outcome)>>,
@@ -181,8 +184,11 @@ pub(crate) struct Node {
     /// The partitions served here: their write gates, and the operator's fences (D317
     /// ticket 6).
     fences: fence::Fences,
-    /// How the node opens a partition while it serves ([`open::attach_opener`]).
-    opener: std::sync::OnceLock<open::Opener>,
+    /// The server this node serves through, set once it's built ([`open::attach`]): how the
+    /// node reaches its partitions, to reconcile their schema on every install before the
+    /// map's routes serve (D317 ticket 5) and to open and close them while it serves
+    /// (ticket 6).
+    server: std::sync::OnceLock<open::Server>,
     /// One open or close of a partition at a time (D317 ticket 6): the parts' swaps take
     /// it. Taken after `fences.changing` where both are.
     opening: tokio::sync::Mutex<()>,
@@ -192,19 +198,39 @@ pub(crate) struct Node {
     pub(crate) feed_hubs: hub::Hubs,
 }
 
-/// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
-/// server is gone.
-/// The second argument names a partition whose operator's fence is being lifted, which
-/// reconciles although its gate still says fenced.
-pub(crate) type Reconcile =
-    dyn Fn(&ClusterMap, Option<&str>) -> Option<Vec<(String, schema::Outcome)>> + Send + Sync;
+/// How long a node change's `SetMap` goes on pushing it, in push timeouts, for a majority of
+/// both the nodes before it and the nodes after it to hold it (#1899's F4).
+const JOINT_PUSHES: u32 = 3;
 
-/// [`Reconcile`], boxed for [`Node::reconciler`].
-pub(crate) struct Reconciler(pub(crate) Box<Reconcile>);
+/// Who holds a node change ([`Node::joint`]): of the nodes before it and after it, how many
+/// hold it and how many there are, this node included; and why each node that doesn't, as
+/// "id: why".
+struct Joint {
+    before: (usize, usize),
+    after: (usize, usize),
+    missing: Vec<String>,
+}
 
-impl std::fmt::Debug for Reconciler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Reconciler")
+impl Joint {
+    /// A majority of both sets.
+    fn held(&self) -> bool {
+        self.before.0 * 2 > self.before.1 && self.after.0 * 2 > self.after.1
+    }
+
+    /// The refusal of a change while `map`, a node change, isn't held.
+    fn refusal(&self, map: &ClusterMap) -> String {
+        format!(
+            "map version {} changed the cluster's nodes, and a majority of both the nodes \
+             before it ({} of {}) and the nodes after it ({} of {}) must hold it before the \
+             map changes again (D317 rule 3): {}. Bring those nodes up, or set a map with \
+             --force",
+            map.map_version,
+            self.before.0,
+            self.before.1,
+            self.after.0,
+            self.after.1,
+            self.missing.join("; ")
+        )
     }
 }
 
@@ -249,13 +275,12 @@ impl Node {
             installing: Mutex::new(()),
             routes: arc_swap::ArcSwapOption::new(routes),
             pulling: tokio::sync::Mutex::new(()),
-            reconciler: std::sync::OnceLock::new(),
             reconciled: Mutex::new(std::collections::BTreeMap::new()),
             reconciled_newest: std::sync::atomic::AtomicU64::new(0),
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
             fences: fence::Fences::default(),
-            opener: std::sync::OnceLock::new(),
+            server: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
             feed_hubs: hub::Hubs::default(),
             me: me.clone(),
@@ -282,12 +307,7 @@ impl Node {
     }
 
     fn caller(&self, header: Option<&str>) -> Result<Caller, ApiError> {
-        if !self.tokens.any() {
-            return Ok(Caller::anonymous());
-        }
-        super::auth::bearer(header)
-            .and_then(|t| self.tokens.caller(t))
-            .ok_or_else(ApiError::unauthenticated)
+        self.tokens.caller_of(header)
     }
 
     /// Whether `caller` may make a call that any of `scopes` allows. Without tokens (a
@@ -415,7 +435,7 @@ impl Node {
     /// them (audit120's S-C5). After the routes are stored, so a component opened meanwhile
     /// finds the new map when it checks it again ([`feed::serve`]).
     fn end_moved_feeds(&self, version: u64) {
-        let Some(shared) = self.opener.get().and_then(|o| o.shared.upgrade()) else {
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
             return;
         };
         let Some(cluster) = shared.router.cluster.as_ref() else {
@@ -452,8 +472,7 @@ impl Node {
                 .map_or(MapSource::Forced, MapSource::Change);
             node.install(&map, from, check)
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .await?
     }
 
     /// `Cluster.SetMap`: compare-and-set on the version, then push to the others. Only the
@@ -462,8 +481,15 @@ impl Node {
     /// follows. `force` (the forced recovery, for a writer that's down) skips the writer and
     /// the compare-and-set: the map need only be the same cluster's, at a version above this
     /// node's.
+    ///
+    /// **A node change (#1899's F4):** a map that changes the nodes carries the nodes before
+    /// it (`previous_nodes`), and answers once a majority of those and a majority of its own
+    /// hold it, or after [`JOINT_PUSHES`] push timeouts of trying. Until a majority of both
+    /// hold it, the writer takes no other change, a schema change included: a majority of
+    /// one set confirms a partition's owner (D317 rule 3), so the set before must have moved
+    /// on before a later map can count on the set after.
     async fn set_map(self: &Arc<Self>, req: SetMapRequest) -> Result<SetMapResponse, ApiError> {
-        let map = req
+        let mut map = req
             .map
             .ok_or_else(|| ApiError::invalid("SetMap needs a map"))?;
         if req.force {
@@ -475,6 +501,8 @@ impl Node {
                      the map's writer",
                 ));
             }
+            // A recovery waits for no majority: it's what `--force` means.
+            map.previous_nodes.clear();
             let version = self.install_async(map, None, |_| Ok(None)).await?;
             let pushed = self.push_all().await;
             return Ok(SetMapResponse {
@@ -504,7 +532,24 @@ impl Node {
                     "this node is still taking its peers' maps after starting: try again",
                 ));
             }
+            if let Some(why) = map::moves_with_node_change(&current, &map) {
+                return Err(ApiError::failed_precondition(why));
+            }
+            if !current.previous_nodes.is_empty() {
+                let (joint, _) = self.joint(&current).await;
+                if !joint.held() {
+                    return Err(ApiError::failed_precondition(joint.refusal(&current)));
+                }
+            }
+            map.previous_nodes = if map::same_nodes(&current, &map) {
+                Vec::new()
+            } else {
+                current.nodes.clone()
+            };
+        } else {
+            map.previous_nodes.clear();
         }
+        let changes_nodes = !map.previous_nodes.is_empty();
         let expected = req.expected_map_version;
         let version = self
             .install_async(map, Some(req.copies), move |st| {
@@ -520,11 +565,54 @@ impl Node {
                 Ok(None)
             })
             .await?;
-        let pushed = self.push_all().await;
+        let pushed = match self.get_map() {
+            Ok(set) if changes_nodes && set.map_version == version => self.joint_wait(&set).await,
+            _ => self.push_all().await,
+        };
         Ok(SetMapResponse {
             map_version: version,
             pushed,
         })
+    }
+
+    /// Pushes a node change `map` to the nodes before it and after it, until a majority of
+    /// each holds it or [`JOINT_PUSHES`] push timeouts have passed: the last pushes.
+    async fn joint_wait(self: &Arc<Self>, map: &ClusterMap) -> Vec<NodePush> {
+        let until = tokio::time::Instant::now() + self.peers.push_timeout * JOINT_PUSHES;
+        let mut pause = Duration::from_millis(100);
+        loop {
+            let (joint, pushed) = self.joint(map).await;
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            if joint.held() || left.is_zero() {
+                return pushed;
+            }
+            tokio::time::sleep(pause.min(left)).await;
+            pause = (pause * 2).min(Duration::from_secs(1));
+        }
+    }
+
+    /// Pushes a node change `map` (one with `previous_nodes`) to every node before it and
+    /// after it, and counts who holds it: those that took it, and this node.
+    async fn joint(self: &Arc<Self>, map: &ClusterMap) -> (Joint, Vec<NodePush>) {
+        let mut all = map.previous_nodes.clone();
+        for n in &map.nodes {
+            if !all.iter().any(|p| p.id == n.id) {
+                all.push(n.clone());
+            }
+        }
+        let pushed = self.push_each(map, &all).await;
+        let holds = |id: &str| id == self.id || pushed.iter().any(|p| p.node == id && p.ok);
+        let count = |set: &[proto::Node]| (set.iter().filter(|n| holds(&n.id)).count(), set.len());
+        let joint = Joint {
+            before: count(&map.previous_nodes),
+            after: count(&map.nodes),
+            missing: pushed
+                .iter()
+                .filter(|p| !p.ok)
+                .map(|p| format!("{}: {}", p.node, p.error))
+                .collect(),
+        };
+        (joint, pushed)
     }
 
     /// Pushes the node's map to every other node in it, in parallel, each within the push
@@ -533,8 +621,14 @@ impl Node {
         let Ok(map) = self.get_map() else {
             return Vec::new();
         };
+        self.push_each(&map, &map.nodes).await
+    }
+
+    /// Pushes `map` to each of `nodes` but this one, in parallel, each within the push
+    /// timeout: each node's outcome, in id order.
+    async fn push_each(self: &Arc<Self>, map: &ClusterMap, nodes: &[proto::Node]) -> Vec<NodePush> {
         let mut tasks = tokio::task::JoinSet::new();
-        for n in map.nodes.iter().filter(|n| n.id != self.id) {
+        for n in nodes.iter().filter(|n| n.id != self.id) {
             let (node, id, address, map) = (
                 Arc::clone(self),
                 n.id.clone(),
@@ -592,14 +686,13 @@ impl Node {
                     n.id, e.message
                 );
             }
-            // Its partitions' start fences (D317 ticket 6).
-            self.confirm(&theirs);
         }
         self.push_all().await;
         self.synced
             .store(true, std::sync::atomic::Ordering::Release);
-        // Partitions no peer has confirmed yet: asked again until one does (cli692's S3).
-        self.confirm_after_start().await;
+        // Its partitions, confirmed by a majority's maps (D317 rule 3, #1760): asked again,
+        // backing off, until they are (cli692's S3).
+        self.confirm_until_done().await;
     }
 
     /// Peer `address`'s map.
@@ -620,9 +713,7 @@ impl Node {
         from: Option<String>,
     ) -> Result<PushMapResponse, ApiError> {
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || node.push_map(map, from.as_deref()))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        tokio::task::spawn_blocking(move || node.push_map(map, from.as_deref())).await?
     }
 
     /// `Cluster.PushMap`: a peer's newer map. `from`: the pushing node's id, if it said.
@@ -630,10 +721,10 @@ impl Node {
     fn push_map(&self, map: ClusterMap, from: Option<&str>) -> Result<PushMapResponse, ApiError> {
         let pushed = from.is_some().then(|| map.clone());
         let version = self.push_map_install(map, from)?;
-        // A peer's map, taken or the same as this node's: its partitions' start fences
-        // (D317 ticket 6).
-        if let Some(theirs) = pushed {
-            self.confirm(&theirs);
+        // A peer's map, taken or the same as this node's: a round may now confirm this
+        // node's partitions (D317 rule 3, #1760).
+        if pushed.is_some() {
+            self.confirm_soon();
         }
         Ok(PushMapResponse {
             map_version: version,
@@ -688,7 +779,7 @@ impl Node {
         // The partitions this node has open: their identity comes from their own handle,
         // since a read-only open of a file a writer holds is refused (#1767).
         let open: std::collections::BTreeMap<String, crate::serve::router::PartRef> = self
-            .opener
+            .server
             .get()
             .and_then(|o| o.shared.upgrade())
             .map(|shared| shared.router.partitions().into_iter().collect())
@@ -796,6 +887,9 @@ impl Node {
             if let Some((state, reason)) = self.part_state(&lp.id) {
                 lp.set_state(state);
                 lp.set_fence_reason(reason);
+                // Both reasons at once (#1829): an operator-fenced partition may still await
+                // its peers' confirmation.
+                lp.awaiting_peers = self.awaiting_peers(&lp.id);
             } else if let Some(closed) = self.fences.closed().get(&lp.id) {
                 closed.describe(lp);
             }
@@ -855,16 +949,7 @@ impl Node {
         if self.state().version() > past {
             return Ok(());
         }
-        let pulled = async {
-            let mut client = self.client(address).await?;
-            let req = self.request(GetMapRequest {})?;
-            client
-                .get_map(req)
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|s| s.message().to_owned())
-        };
-        let map = tokio::time::timeout(self.peers.push_timeout, pulled)
+        let map = tokio::time::timeout(self.peers.push_timeout, self.fetch_map(address))
             .await
             .map_err(|_| "timed out".to_owned())??;
         if map.map_version <= past {
@@ -990,15 +1075,7 @@ impl Node {
         };
         let (node, from) = (Arc::clone(self), from.to_owned());
         tokio::spawn(async move {
-            let pulled = async {
-                let mut client = node.client(&address).await?;
-                let req = node.request(GetMapRequest {})?;
-                client
-                    .get_map(req)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| s.message().to_owned())
-            };
+            let pulled = node.fetch_map(&address);
             let result = match tokio::time::timeout(node.peers.push_timeout, pulled).await {
                 Ok(Ok(map)) => node
                     .push_map_async(map, Some(from.clone()))
@@ -1030,11 +1107,7 @@ struct ClusterGrpc(Arc<Node>, Option<Arc<super::Shared>>);
 
 impl ClusterGrpc {
     fn caller<T>(&self, req: &Request<T>, scopes: &[Scope], what: &str) -> Result<Caller, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(super::grpc::auth_header(req))?;
         self.0.allowed(&caller, scopes, what)?;
         self.0.maybe_pull(&caller, req.metadata());
         Ok(caller)
@@ -1047,9 +1120,7 @@ impl ClusterGrpc {
     /// Partition `id`'s line of `Status`.
     async fn local(&self, id: &str) -> Result<LocalPartition, ApiError> {
         let node = Arc::clone(&self.0);
-        let status = tokio::task::spawn_blocking(move || node.status())
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let status = tokio::task::spawn_blocking(move || node.status()).await?;
         status
             .partitions
             .into_iter()
@@ -1167,7 +1238,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let node = Arc::clone(&self.0);
         let status = tokio::task::spawn_blocking(move || node.status())
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(ApiError::from)?;
         Ok(tonic::Response::new(status))
     }
 
@@ -1245,7 +1316,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .router
             .serve_forwarded_scan(&msg.partition, scan, &caller)
             .await?;
-        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcPages(
+        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcStream(
             pages,
         ))))
     }
@@ -1257,10 +1328,7 @@ fn http_caller(
     scopes: &[Scope],
     what: &str,
 ) -> Result<(), ApiError> {
-    let header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let caller = node.caller(header)?;
+    let caller = node.caller(crate::serve::http::auth_header(headers))?;
     node.allowed(&caller, scopes, what)
 }
 
@@ -1484,6 +1552,8 @@ pub(crate) fn run(
     let reserved = (mine.len() > 1)
         .then(|| super::placement::compaction_reserve(&shares, total_compaction))
         .flatten();
+    // What every partition's database takes, at the start and when one opens later.
+    let served = super::served_options(cli, args);
     let opened = open_partitions(
         dir,
         cluster_id.as_deref(),
@@ -1494,13 +1564,7 @@ pub(crate) fn run(
             // Unset, the library's own defaults, exactly as before.
             memories: memories.as_deref(),
         },
-        |share, memory| {
-            let options = partition_options(super::served_options(cli, args), share);
-            match memory {
-                Some(m) => m.apply(options),
-                None => options,
-            }
-        },
+        |share, memory| open::options_for(&served, share, memory),
         stderr,
     )?;
     let dbs: Vec<&pigeonhole::Pigeonhole> = opened.iter().map(|o| &o.db).collect();
@@ -1557,15 +1621,21 @@ pub(crate) fn run(
     } else {
         let list: Vec<String> = mine
             .iter()
-            .map(|(p, epoch)| match node.fence_of(p) {
-                Some(crate::serve::gate::Fence::Operator) => {
-                    format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
-                }
-                Some(crate::serve::gate::Fence::Start) => {
-                    format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
-                }
-                None => format!("{p} (epoch {epoch})"),
-            })
+            .map(
+                |(p, epoch)| match (node.fence_of(p), node.awaiting_peers(p)) {
+                    (Some(crate::serve::gate::Fence::Operator), true) => format!(
+                        "{p} (epoch {epoch}, fenced: phdb cluster fence, and waiting for a \
+                         peer's map)"
+                    ),
+                    (Some(crate::serve::gate::Fence::Operator), false) => {
+                        format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
+                    }
+                    (Some(_), _) => {
+                        format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
+                    }
+                    (None, _) => format!("{p} (epoch {epoch})"),
+                },
+            )
             .collect();
         format!(
             "partition{} {} as cluster node {id} of {}; map version {version}",
@@ -1585,28 +1655,21 @@ pub(crate) fn run(
     });
     // A partition a map gives the node while it serves opens as the start's do (D317
     // ticket 6), with its share of the same totals.
-    let served = super::served_options(cli, args);
-    open::attach_opener(
+    // Its partitions' schema follows the map from here (D317 ticket 5): reconciled now, and
+    // on every map it takes.
+    open::attach(
         &node,
-        open::Opener {
+        open::Server {
             shared: Arc::downgrade(&shared),
             placement: Arc::clone(&placement),
             backups: Arc::clone(&backups),
-            options: Box::new(move |share, memory| {
-                let options = partition_options(served.clone(), share);
-                match memory {
-                    Some(m) => m.apply(options),
-                    None => options,
-                }
-            }),
+            served,
             shards: total_shards,
             compaction: total_compaction,
             engine_memory: args.engine_memory,
+            reserved: reserved.clone(),
         },
     );
-    // Its partition's schema follows the map (D317 ticket 5): reconciled now, and on every
-    // map it takes.
-    schema::attach(&node, &shared);
     // A node that restarts with a map takes a newer one from its peers, then pushes.
     let start = start_sync(&node, version);
     super::serve_shared(
@@ -1616,7 +1679,6 @@ pub(crate) fn run(
             placement,
             tls,
             serving,
-            dbs: opened.into_iter().map(|o| o.db).collect(),
             replica: None,
             start,
         },

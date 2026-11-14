@@ -26,7 +26,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
 use super::forward;
 use super::position::{Kind, Position};
-use super::route::{PartRange, Routes};
+use super::route::{PartRange, Routes, prefix_end};
 use crate::serve::auth::Caller;
 use crate::serve::config::Limits;
 use crate::serve::errors::ApiError;
@@ -34,20 +34,11 @@ use crate::serve::proto::{
     self, ForwardRequest, ForwardScanRequest, MissingRange, MultiGetRequest, MultiGetResponse,
     NearestRequest, NearestResponse, ScanPage, ScanRequest, forward_request,
 };
-use crate::serve::router::{Cluster, Router, not_open};
-use crate::serve::service::Service;
+use crate::serve::router::{Cluster, Place, Router, Target};
 use crate::serve::service::{
     PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, page_bytes, room,
 };
 use tokio::sync::Semaphore;
-
-/// Where one partition is read.
-enum Place {
-    /// This node, through the partition's service (D317 ticket 8a).
-    Here(Arc<Service>),
-    /// Its node's address, and the map version the read goes with.
-    There(String, u64),
-}
 
 /// The cluster side of a fan-out, owned, so a scan's task can outlive its request.
 #[derive(Clone)]
@@ -97,18 +88,52 @@ impl Reach {
 
     /// Where `partition` is read from this node.
     fn place(&self, routes: &Routes, partition: &str) -> Result<Place, ApiError> {
-        let owner = routes.owner(partition).ok_or_else(|| {
-            ApiError::internal(format!("the map lists no node for partition {partition:?}"))
-        })?;
-        if owner.node == self.node.id() {
-            return self
-                .parts
-                .load()
-                .get(partition)
-                .map(|s| Place::Here(Arc::clone(s)))
-                .ok_or_else(|| not_open(partition));
+        crate::serve::router::place(&self.node, &self.parts, routes, partition)
+    }
+
+    /// One partition's part of a fanned-out multi-get or nearest search: `op` served here, or
+    /// forwarded to the partition's node, and once more with the newer map after that node
+    /// answers `WrongPartition`. Its reply, and whether it was forwarded. The request's
+    /// holding covers the part (#1715): it takes no charge of its own.
+    async fn part(
+        &self,
+        partition: &str,
+        caller: &Caller,
+        op: forward_request::Op,
+    ) -> Result<(ServiceReply, bool), ApiError> {
+        let mut pulled = false;
+        loop {
+            let routes = self.routes()?;
+            match self.place(&routes, partition)? {
+                Place::Here(service) => {
+                    let op = forward::op_of(Some(op))?;
+                    return Ok((service.fanout_part(op, caller).await?, false));
+                }
+                Place::There(Target {
+                    address,
+                    map_version,
+                    ..
+                }) => {
+                    let req = ForwardRequest {
+                        fanout_part: true,
+                        map_version,
+                        caller: Some(forward::forwarded_caller(caller)?),
+                        op: Some(op.clone()),
+                    };
+                    let sent = self
+                        .forwarder
+                        .send(&address, req, self.within()?, false)
+                        .await;
+                    match sent {
+                        Err(e) if e.code == "WrongPartition" && !pulled => {
+                            pulled = true;
+                            self.catch_up(&routes, partition, &address).await?;
+                        }
+                        other => return Ok((forward::reply_of(other?)?, true)),
+                    }
+                }
+            }
         }
-        Ok(Place::There(owner.address.clone(), routes.map_version()))
     }
 
     /// Pulls the map from the node that said it has a newer one (a `WrongPartition`).
@@ -180,7 +205,7 @@ fn skippable(e: &ApiError) -> bool {
 fn span(range: Option<&proto::KeyRange>) -> (Vec<u8>, Option<Vec<u8>>) {
     use proto::key_range::Range;
     match range.and_then(|r| r.range.as_ref()) {
-        Some(Range::Prefix(p)) => (p.to_vec(), successor(p)),
+        Some(Range::Prefix(p)) => (p.to_vec(), prefix_end(p)),
         Some(Range::Bounds(b)) => (
             b.start.as_ref().map(|s| s.key.to_vec()).unwrap_or_default(),
             b.end.as_ref().map(|e| {
@@ -193,18 +218,6 @@ fn span(range: Option<&proto::KeyRange>) -> (Vec<u8>, Option<Vec<u8>>) {
         ),
         None => (Vec::new(), None),
     }
-}
-
-/// The least key above every key with `prefix`; `None` when there's none (all `0xff`).
-fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut k = prefix.to_vec();
-    while let Some(last) = k.pop() {
-        if last < 0xff {
-            k.push(last + 1);
-            return Some(k);
-        }
-    }
-    None
 }
 
 type Read<'a> = Pin<Box<dyn Future<Output = Result<MultiGetResponse, ApiError>> + Send + 'a>>;
@@ -276,44 +289,13 @@ impl Router {
         r: MultiGetRequest,
         caller: &Caller,
     ) -> Result<MultiGetResponse, ApiError> {
-        let mut pulled = false;
-        loop {
-            let routes = reach.routes()?;
-            let reply = match reach.place(&routes, partition)? {
-                // The request's holding covers this page (#1715): no charge of its own.
-                Place::Here(service) => {
-                    return match service.fanout_part(ServiceOp::MultiGet(r), caller).await? {
-                        ServiceReply::MultiGet(m) => Ok(m),
-                        _ => Err(ApiError::internal("a multi-get answered another reply")),
-                    };
-                }
-                Place::There(address, map_version) => {
-                    let req = ForwardRequest {
-                        fanout_part: true,
-                        map_version,
-                        caller: Some(forward::forwarded_caller(caller)?),
-                        op: Some(forward_request::Op::MultiGet(r.clone())),
-                    };
-                    let sent = reach
-                        .forwarder
-                        .send(&address, req, reach.within()?, false)
-                        .await;
-                    match sent {
-                        Err(e) if e.code == "WrongPartition" && !pulled => {
-                            pulled = true;
-                            reach.catch_up(&routes, partition, &address).await?;
-                            continue;
-                        }
-                        other => forward::reply_of(other?)?,
-                    }
-                }
-            };
-            return match reply {
-                ServiceReply::MultiGet(m) => Ok(m),
-                _ => Err(ApiError::internal(
-                    "a forwarded multi-get answered another reply",
-                )),
-            };
+        let op = forward_request::Op::MultiGet(r);
+        match reach.part(partition, caller, op).await? {
+            (ServiceReply::MultiGet(m), _) => Ok(m),
+            (_, false) => Err(ApiError::internal("a multi-get answered another reply")),
+            (_, true) => Err(ApiError::internal(
+                "a forwarded multi-get answered another reply",
+            )),
         }
     }
 
@@ -628,18 +610,7 @@ impl Router {
                     "this node has no cluster map yet",
                 ));
             };
-            let mine = routes
-                .owner(partition)
-                .is_some_and(|o| o.node == cluster.node.id());
-            if !mine {
-                return Err(ApiError::wrong_partition(
-                    routes.map_version(),
-                    format!("this node doesn't serve partition {partition:?}"),
-                ));
-            }
-            let Some(service) = cluster.here(partition) else {
-                return Err(not_open(partition));
-            };
+            let service = cluster.owned_here(routes, partition)?;
             // At a snapshot, checked again here: its range stays in its partition, and that's
             // this one (D317 ticket 3).
             if crate::serve::router::snapshot_of(r.selection.as_ref()).is_some() {
@@ -718,7 +689,7 @@ async fn bounded<'a, T, S>(
     .await
 }
 
-/// A scan range's bounds as `Bound`s (a prefix as `[prefix, successor)`), `None` for no
+/// A scan range's bounds as `Bound`s (a prefix as `[prefix, prefix_end)`), `None` for no
 /// bound.
 fn bounds_of(range: Option<&proto::KeyRange>) -> (Option<proto::Bound>, Option<proto::Bound>) {
     use proto::key_range::Range;
@@ -728,7 +699,7 @@ fn bounds_of(range: Option<&proto::KeyRange>) -> (Option<proto::Bound>, Option<p
                 key: p.clone(),
                 inclusive: true,
             }),
-            successor(p).map(|k| proto::Bound {
+            prefix_end(p).map(|k| proto::Bound {
                 key: k.into(),
                 inclusive: false,
             }),
@@ -829,39 +800,12 @@ impl Router {
         r: NearestRequest,
         caller: &Caller,
     ) -> Result<NearestResponse, ApiError> {
-        let mut pulled = false;
-        loop {
-            let routes = reach.routes()?;
-            let reply = match reach.place(&routes, partition)? {
-                // The request's holding covers this answer (#1715): no charge of its own.
-                Place::Here(service) => service.fanout_part(ServiceOp::Nearest(r), caller).await?,
-                Place::There(address, map_version) => {
-                    let req = ForwardRequest {
-                        fanout_part: true,
-                        map_version,
-                        caller: Some(forward::forwarded_caller(caller)?),
-                        op: Some(forward_request::Op::Nearest(r.clone())),
-                    };
-                    match reach
-                        .forwarder
-                        .send(&address, req, reach.within()?, false)
-                        .await
-                    {
-                        Err(e) if e.code == "WrongPartition" && !pulled => {
-                            pulled = true;
-                            reach.catch_up(&routes, partition, &address).await?;
-                            continue;
-                        }
-                        other => forward::reply_of(other?)?,
-                    }
-                }
-            };
-            return match reply {
-                ServiceReply::Nearest(n) => Ok(n),
-                _ => Err(ApiError::internal(
-                    "a nearest search answered another reply",
-                )),
-            };
+        let op = forward_request::Op::Nearest(r);
+        match reach.part(partition, caller, op).await? {
+            (ServiceReply::Nearest(n), _) => Ok(n),
+            _ => Err(ApiError::internal(
+                "a nearest search answered another reply",
+            )),
         }
     }
 
@@ -1356,7 +1300,11 @@ impl ScanJob {
                         .take();
                     return here.open(r, None, pinned, None).map(PartPages::Here);
                 }
-                Place::There(address, map_version) => {
+                Place::There(Target {
+                    address,
+                    map_version,
+                    ..
+                }) => {
                     let req = ForwardScanRequest {
                         map_version,
                         caller: Some(forward::forwarded_caller(&self.caller)?),
@@ -1555,14 +1503,14 @@ async fn hold_after_part_page(inflight: &Semaphore) {
 
 #[cfg(test)]
 mod tests {
-    use super::{span, successor};
+    use super::{prefix_end, span};
     use crate::serve::proto::{Bound, Bounds, KeyRange, key_range::Range};
 
     #[test]
     fn a_ranges_span_covers_every_row_it_can_hold() {
-        assert_eq!(successor(b"ab"), Some(b"ac".to_vec()));
-        assert_eq!(successor(b"a\xff"), Some(b"b".to_vec()));
-        assert_eq!(successor(b"\xff\xff"), None);
+        assert_eq!(prefix_end(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_end(b"a\xff"), Some(b"b".to_vec()));
+        assert_eq!(prefix_end(b"\xff\xff"), None);
         let prefix = KeyRange {
             range: Some(Range::Prefix(b"m".to_vec().into())),
         };

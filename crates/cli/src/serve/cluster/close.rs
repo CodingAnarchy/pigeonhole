@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use super::Node;
 use crate::serve::errors::ApiError;
-use crate::serve::gate::Fence;
 use crate::serve::proto::{LocalPartition, LocalPartitionState, PartitionFile};
 
 /// How long a close waits for the writes a fence admitted to finish.
@@ -44,6 +43,22 @@ pub(crate) struct Closed {
 pub(crate) static HOLD_BEFORE_DB_CLOSE: std::sync::Mutex<
     Option<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(None);
+
+/// A fault seam (tests): the next close in each listed cluster directory finds its drain
+/// failed, as one whose writes admitted before the fence still ran after [`DRAIN`] would.
+/// One entry per directory, so tests running at once don't take each other's.
+#[cfg(test)]
+pub(crate) static FAIL_DRAIN: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn fail_drain(dir: &std::path::Path) -> bool {
+    let mut armed = FAIL_DRAIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = armed.iter().position(|d| d == dir);
+    at.map(|i| armed.swap_remove(i)).is_some()
+}
 
 /// Each close's [`Closed::generation`].
 static CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -137,12 +152,19 @@ impl Node {
         // on #1800): a fence since the node started is kept nowhere, and a closed partition
         // reopens at a restart while the map still names this node. A peer's map would then
         // lift that fence, in the middle of a move that copied the closed files.
-        gate.fence(Fence::Operator);
+        gate.fence();
         let mut fenced = self.fences.operator().clone();
         if fenced.insert(id.to_owned()) {
             self.persist_fences(fenced).await?;
         }
-        gate.drained(DRAIN).await.map_err(|n| {
+        let drained = gate.drained(DRAIN).await;
+        #[cfg(test)]
+        let drained = if fail_drain(&self.dir) {
+            Err(1)
+        } else {
+            drained
+        };
+        drained.map_err(|n| {
             ApiError::failed_precondition(format!(
                 "partition {id:?}: {n} writes admitted before its fence still run after {}s; \
                  close it again once they finish",
@@ -150,7 +172,7 @@ impl Node {
             ))
         })?;
         let shared = self
-            .opener
+            .server
             .get()
             .and_then(|o| o.shared.upgrade())
             .ok_or_else(|| {
@@ -208,9 +230,7 @@ impl Node {
                 )));
             part.feeds.fail_all();
             part.bulk.stop();
-            part.bulk.close();
-            part.texts.close();
-            part.indexes.close();
+            part.close_users();
             part.db.clone().close()
         })
         .await;
@@ -226,13 +246,23 @@ impl Node {
                 _ => {}
             }
         }
-        let closed = closed.map_err(|e| ApiError::internal(e.to_string()))?;
+        let closed = closed?;
         if let Err(e) = closed {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
         }
         // Its shards' CPUs are free now: the server's threads take them back.
-        if let Some(opener) = self.opener.get() {
-            super::open::remask(&opener.placement, &parts, &format!("partition {id} closed"));
+        if let Some(server) = self.server.get() {
+            super::open::remask_off_async(
+                &server.placement,
+                &parts,
+                format!("partition {id} closed"),
+            )
+            .await;
+            // Its memory is free now too: the partitions left take their shares of
+            // --engine-memory back (#1761), grown after the engine closed, never before.
+            if let Some(total) = server.engine_memory {
+                super::open::resplit_after_close(self, total, &parts, id).await;
+            }
         }
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);
@@ -317,22 +347,9 @@ fn hash_files(path: &Path) -> Result<Vec<PartitionFile>, String> {
 /// `file`'s size and SHA-256, read through once; its pages are dropped from the page cache
 /// as it goes (Linux), since nothing reads a closed partition's files soon.
 fn hash_file(file: &Path) -> Result<(u64, [u8; 32]), String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(file).map_err(|e| format!("read {}: {e}", file.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut bytes = 0u64;
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("read {}: {e}", file.display()))?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        bytes += n as u64;
-    }
+    let failed = |e: std::io::Error| format!("read {}: {e}", file.display());
+    let mut f = std::fs::File::open(file).map_err(failed)?;
+    let (bytes, sha256) = crate::serve::backup::sha256_of(&mut f).map_err(failed)?;
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd as _;
@@ -344,7 +361,7 @@ fn hash_file(file: &Path) -> Result<(u64, [u8; 32]), String> {
             nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
         );
     }
-    Ok((bytes, h.finalize().into()))
+    Ok((bytes, sha256))
 }
 
 /// Where `drop-partition` moves a partition's files: inside the cluster directory, so the
@@ -385,9 +402,7 @@ impl Node {
         }
         let dir = self.dir.clone();
         let part = id.to_owned();
-        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))??;
+        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await??;
         self.fences.closed().remove(id);
         eprintln!(
             "phdb serve: partition {id}'s files moved to {}: delete it once checked",

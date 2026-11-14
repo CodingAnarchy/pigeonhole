@@ -751,6 +751,7 @@ async fn upload(
                     request(
                         PartitionUploadStatusRequest {
                             upload_id: header.upload_id.clone(),
+                            partition: header.partition.clone(),
                         },
                         token,
                     )
@@ -759,7 +760,9 @@ async fn upload(
                 .await
                 .map_err(Err)?
                 .into_inner();
-            if st.complete {
+            // Complete, or an install of the partition's set is in progress there (a run
+            // that stopped in it): the stamp finishes it (#1848).
+            if st.complete || st.installing {
                 return Ok(true);
             }
             let max = usize::try_from(st.max_chunk)

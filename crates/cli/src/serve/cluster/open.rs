@@ -18,27 +18,34 @@ use crate::serve::Shared;
 use crate::serve::backup::Backups;
 use crate::serve::errors::ApiError;
 use crate::serve::placement::{Memory, Placement, Share};
+use crate::serve::service::Service;
 
-/// How this node opens a partition while it serves, set once its server is built
-/// ([`attach_opener`]).
-pub(crate) struct Opener {
+/// The server a node serves through, set once it's built ([`attach`]): what the node needs
+/// to reconcile its partitions' schema and to open and close them while it serves.
+pub(crate) struct Server {
     /// The node's server: its parts, its node-wide service and the feed runtimes. Weak, since
     /// the server holds the node.
     pub(crate) shared: Weak<Shared>,
     pub(crate) placement: Arc<Placement>,
     pub(crate) backups: Arc<Backups>,
-    /// A partition's options for its share and memory, as the node's start opens them.
-    pub(crate) options: Box<dyn Fn(Share, Option<Memory>) -> pigeonhole::Options + Send + Sync>,
+    /// The options every database the server opens takes
+    /// ([`served_options`](crate::serve::served_options)); a partition's are these with its
+    /// share and memory ([`options_for`]).
+    pub(crate) served: pigeonhole::Options,
     /// `--shards` and `--compaction-threads`: the node's totals, split across its partitions.
     pub(crate) shards: usize,
     pub(crate) compaction: usize,
     /// `--engine-memory`, split as at the start.
     pub(crate) engine_memory: Option<u64>,
+    /// The node's reserved compaction CPUs, as its start reserved them for several
+    /// partitions (ICR 0134); `None` for one partition, none, or no pinning. A partition
+    /// opened while serving confines its compaction there (#1888).
+    pub(crate) reserved: Option<Vec<usize>>,
 }
 
-impl std::fmt::Debug for Opener {
+impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Opener")
+        f.debug_struct("Server")
             .field("shards", &self.shards)
             .field("compaction", &self.compaction)
             .field("engine_memory", &self.engine_memory)
@@ -49,6 +56,9 @@ impl std::fmt::Debug for Opener {
 /// Reapplies the server's masks for the shard CPUs of `parts`, the partitions open now
 /// (D317 ticket 6), and says so. The runtimes keep the thread counts they started with
 /// (Tokio can't resize one): a mask that shrank has more of them per CPU (cli692 on #1745).
+///
+/// Its sweep reads `/proc/self/task` and makes a syscall per thread, so async callers use
+/// [`remask_off_async`] (simp724's S1 on #1871).
 pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMap, why: &str) {
     let mut pinned: Vec<usize> = parts
         .values()
@@ -57,7 +67,22 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
         .collect();
     pinned.sort_unstable();
     pinned.dedup();
+    let previous = placement.current();
     let masks = placement.reapply(&pinned);
+    // Every other thread too, the engines' unpinned ones and our long-running ones, at once
+    // (#1762): only the engines' own pins, the shards' and compaction's, stay where they are.
+    let mut engine_pins: Vec<usize> = parts
+        .values()
+        .filter_map(|s| s.part_opt())
+        .flat_map(|p| {
+            let mut cpus = p.db.pinned_shard_cpus();
+            cpus.extend(p.db.pinned_compaction_cpus());
+            cpus
+        })
+        .collect();
+    engine_pins.sort_unstable();
+    engine_pins.dedup();
+    let swept = placement.sweep(&engine_pins, &previous);
     // Each runtime's threads against its CPUs, so an operator sees how a shrunken mask
     // packs them (perf287's note 1 on #1755); the counts stay as the server started them.
     let on = |threads: usize, m: &Option<Vec<usize>>| match m {
@@ -75,14 +100,28 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
     };
     eprintln!(
         "phdb serve: {why}: off the shards' {} CPUs{unmasked}: request workers {}, feed {} \
-         and hub {}, blocking {}; the thread counts stay as the server started them (restart \
-         to size them again)",
+         and hub {}, blocking {}, and {swept} other threads moved to the blocking mask; the \
+         thread counts stay as the server started them (restart to size them again)",
         pinned.len(),
         on(placement.io_threads, &masks.network),
         on(placement.feed_threads, &masks.feed),
         on(placement.hub_threads, &masks.hub),
         on(placement.blocking_threads, &masks.blocking),
     );
+}
+
+/// [`remask`] on the blocking pool, awaited: an open or close on a request worker never
+/// runs the sweep there. A failed task (a panic in the sweep) is logged; the masks were
+/// published before it.
+pub(crate) async fn remask_off_async(
+    placement: &Arc<Placement>,
+    parts: &crate::serve::router::PartMap,
+    why: String,
+) {
+    let (placement, parts) = (Arc::clone(placement), parts.clone());
+    if let Err(e) = tokio::task::spawn_blocking(move || remask(&placement, &parts, &why)).await {
+        eprintln!("phdb serve: the thread mask update failed: {e}");
+    }
 }
 
 /// Partition `id` marked as opening on a node, until dropped.
@@ -125,22 +164,26 @@ pub(crate) static HOLD_OPEN: std::sync::Mutex<
 > = std::sync::Mutex::new(Vec::new());
 
 /// A hold seam (tests): `open_missing` in each listed cluster directory waits after its next
-/// partition opened, before it confirms it, until the sender sends or is dropped.
+/// partition opened, before it confirms it, until the sender sends or is dropped. The wait
+/// is on a blocking thread: on a runtime worker it stopped every task queued behind it on
+/// that worker (all of them with one worker), and the test hung instead of failing (#1865).
 #[cfg(test)]
 pub(crate) static HOLD_CONFIRM: std::sync::Mutex<
     Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn hold_confirm(dir: &std::path::Path) {
-    let mut armed = HOLD_CONFIRM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(i) = armed.iter().position(|(d, _)| d == dir) {
-        let (_, wait) = armed.swap_remove(i);
-        drop(armed);
-        let _ = wait.recv();
-    }
+async fn hold_confirm(dir: &std::path::Path) {
+    let wait = {
+        let mut armed = HOLD_CONFIRM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(i) = armed.iter().position(|(d, _)| d == dir) else {
+            return;
+        };
+        armed.swap_remove(i).1
+    };
+    let _ = tokio::task::spawn_blocking(move || wait.recv()).await;
 }
 
 #[cfg(test)]
@@ -155,9 +198,198 @@ fn hold_open(dir: &std::path::Path) {
     }
 }
 
-/// Lets `node` open partitions while `shared` serves (a node's start, and the test rig's).
-pub(crate) fn attach_opener(node: &Arc<Node>, opener: Opener) {
-    let _ = node.opener.set(opener);
+/// A partition's options: the server's, with the partition's share of the node's budget and
+/// its memory, at the node's start and for a partition opened while it serves.
+pub(crate) fn options_for(
+    served: &pigeonhole::Options,
+    share: Share,
+    memory: Option<Memory>,
+) -> pigeonhole::Options {
+    let options = super::partition_options(served.clone(), share);
+    match memory {
+        Some(m) => m.apply(options),
+        None => options,
+    }
+}
+
+/// Gives `node` the server it serves through (a node's start, and the test rig's): from here
+/// it reconciles its partitions' schema to every map it takes, on the installing thread
+/// before the map's routes serve, and opens and closes partitions while it serves. Its
+/// partitions are reconciled once now, to the map the node starts with.
+pub(crate) fn attach(node: &Arc<Node>, server: Server) {
+    let _ = node.server.set(server);
+    drop(node.reconcile_current(None));
+}
+
+/// Where a partition opened while serving confines its compaction threads (#1888): the
+/// node's `reserved` compaction CPUs (several partitions at start, ICR 0134), else the open
+/// partitions' own pinned compaction CPUs (one at start), else `None`: a node that held no
+/// partition, or where nothing pins, places it as a start with one partition would. The
+/// open's share decides the thread count; with none (`--compaction-threads 0`) there's
+/// nothing to confine, whatever this returns.
+pub(crate) fn confine_compaction(
+    reserved: Option<&[usize]>,
+    open: impl Iterator<Item = Vec<usize>>,
+) -> Option<Vec<usize>> {
+    if let Some(r) = reserved {
+        return Some(r.to_vec());
+    }
+    let mut cpus: Vec<usize> = open.flatten().collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+    (!cpus.is_empty()).then_some(cpus)
+}
+
+/// One open partition's caches in a node's re-split of `--engine-memory` (#1761): from `old`
+/// to `new`, memtables unchanged.
+pub(crate) struct Resize {
+    pub(crate) id: String,
+    pub(crate) service: Arc<Service>,
+    pub(crate) old: Memory,
+    pub(crate) new: Memory,
+}
+
+/// The caches a re-split shrank before a partition's open: grown back to what they were if
+/// the open doesn't finish (dropped without [`keep`](Self::keep)). A grow evicts nothing, so
+/// the drop does it in place.
+struct Resized(Vec<(Arc<Service>, Memory)>);
+
+impl Resized {
+    /// Shrinks each cache in `plan` that gets smaller, on the blocking pool, and says so
+    /// (`why`), with any partition whose open SSTs pin more of its block cache than its new
+    /// share (simp724's note on #1890: those blocks stay until the SSTs close).
+    async fn shrink(plan: &[Resize], why: &str) -> Result<Self, ApiError> {
+        let shrinks: Vec<(String, Arc<Service>, Memory, Memory)> = plan
+            .iter()
+            .filter(|r| r.new.caches() < r.old.caches())
+            .map(|r| (r.id.clone(), Arc::clone(&r.service), r.old, r.new))
+            .collect();
+        if shrinks.is_empty() {
+            return Ok(Self(Vec::new()));
+        }
+        // The guard first (simp724's N1 on #1891): a shrink that fails part way (a panic
+        // in the blocking task) returns the error, and dropping the guard puts every cache
+        // back, a not-yet-shrunk one to the size it already has.
+        let guard = Self(
+            shrinks
+                .iter()
+                .map(|(_, s, old, _)| (Arc::clone(s), *old))
+                .collect(),
+        );
+        let why = why.to_owned();
+        tokio::task::spawn_blocking(move || apply(&shrinks, &why)).await?;
+        Ok(guard)
+    }
+
+    /// The open finished: the shrinks stand.
+    fn keep(mut self) {
+        self.0.clear();
+    }
+
+    /// Grows each cache in `plan` that gets larger (or stays the same size with a new
+    /// split), on the blocking pool, and says so (`why`): after a partition's open or close.
+    pub(crate) async fn grow(plan: &[Resize], why: &str) {
+        let grows: Vec<(String, Arc<Service>, Memory, Memory)> = plan
+            .iter()
+            .filter(|r| r.new.caches() >= r.old.caches())
+            .map(|r| (r.id.clone(), Arc::clone(&r.service), r.old, r.new))
+            .collect();
+        if grows.is_empty() {
+            return;
+        }
+        let why = why.to_owned();
+        if let Err(e) = tokio::task::spawn_blocking(move || apply(&grows, &why)).await {
+            eprintln!("phdb serve: a cache resize failed: {e}");
+        }
+    }
+}
+
+/// Grows the caches back in place, on whatever thread drops the guard: an async worker, or
+/// a cancelled open's. That's fine only because a grow evicts nothing (simp724's N2 on
+/// #1891): never add a step here that can block, evict or do I/O.
+impl Drop for Resized {
+    fn drop(&mut self) {
+        for (s, old) in self.0.drain(..) {
+            if let Some(p) = s.part_opt() {
+                p.resize_caches(old);
+            }
+        }
+    }
+}
+
+/// After partition `closed` closed, the partitions left in `parts` take their shares of
+/// `--engine-memory` (`total`) back: [`resplit`](crate::serve::placement::resplit) for the
+/// smaller set, applied in full (the closed engine's memory is gone, so a grow never passes
+/// the total). A split that can't be worked out (a map override past the total, say) leaves
+/// the caches as they are, and says so.
+pub(crate) async fn resplit_after_close(
+    node: &Node,
+    total: u64,
+    parts: &crate::serve::router::PartMap,
+    closed: &str,
+) {
+    let map = node.get_map().ok();
+    let asked = |pid: &str| {
+        map.as_ref()
+            .and_then(|m| m.partitions.iter().find(|p| p.id == pid))
+            .map_or(0, |p| p.memory_bytes)
+    };
+    let open: Vec<(String, Arc<Service>, Memory, u64)> = parts
+        .iter()
+        .filter_map(|(pid, s)| {
+            let m = s.part_opt()?.engine_memory()?;
+            Some((pid.clone(), Arc::clone(s), m, asked(pid)))
+        })
+        .collect();
+    let now: Vec<(Memory, u64)> = open.iter().map(|(_, _, m, o)| (*m, *o)).collect();
+    let kept = match crate::serve::placement::resplit(total, &now, None) {
+        Ok((kept, _)) => kept,
+        Err(why) => {
+            eprintln!("phdb serve: partition {closed} closed; --engine-memory not re-split: {why}");
+            return;
+        }
+    };
+    let changes: Vec<(String, Arc<Service>, Memory, Memory)> = open
+        .into_iter()
+        .zip(kept)
+        .filter(|((_, _, old, _), new)| new != old)
+        .map(|((id, s, old, _), new)| (id, s, old, new))
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+    let why = format!("partition {closed} closed");
+    if let Err(e) = tokio::task::spawn_blocking(move || apply(&changes, &why)).await {
+        eprintln!("phdb serve: a cache resize failed: {e}");
+    }
+}
+
+/// Resizes each partition's caches to its new memory, in one log line (blocking: a shrink
+/// evicts).
+fn apply(changes: &[(String, Arc<Service>, Memory, Memory)], why: &str) {
+    let mut said = Vec::with_capacity(changes.len());
+    for (id, s, old, new) in changes {
+        let Some(p) = s.part_opt() else { continue };
+        p.resize_caches(*new);
+        said.push(format!(
+            "{id} caches {} -> {} MiB",
+            old.caches() >> 20,
+            new.caches() >> 20
+        ));
+        let pinned = p.db.engine_metrics().block_cache_pinned_bytes;
+        if pinned > new.block_cache {
+            eprintln!(
+                "phdb serve: partition {id}'s open SSTs pin {} MiB of its block cache, more \
+                 than its new {} MiB: the cache stays over it by that until they close",
+                pinned >> 20,
+                new.block_cache >> 20
+            );
+        }
+    }
+    eprintln!(
+        "phdb serve: {why}: --engine-memory re-split: {} (memtables as opened)",
+        said.join(", ")
+    );
 }
 
 impl Node {
@@ -169,11 +401,11 @@ impl Node {
     /// nothing to do.
     pub(crate) async fn open_part(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
         let _one = self.opening.lock().await;
-        let opener = self
-            .opener
+        let server = self
+            .server
             .get()
             .ok_or_else(|| ApiError::unsupported("this node opens no partition while it serves"))?;
-        let shared = opener
+        let shared = server
             .shared
             .upgrade()
             .ok_or_else(|| ApiError::partition_unavailable("the server is stopping"))?;
@@ -205,9 +437,10 @@ impl Node {
         // open partitions keep the shares they opened with (resharing an open engine is
         // out of scope, ICR 0117).
         let n = open_now.len() + 1;
-        let shares = crate::serve::placement::split(opener.shards, opener.compaction, n);
+        let shares = crate::serve::placement::split(server.shards, server.compaction, n);
         let share = shares[n - 1];
-        let memory = match opener.engine_memory {
+        let mut resplit: Vec<Resize> = Vec::new();
+        let memory = match server.engine_memory {
             None => {
                 let bytes = map
                     .partitions
@@ -226,41 +459,66 @@ impl Node {
                     })?
             }
             Some(total) => {
-                // What the open partitions leave of --engine-memory, never past it (perf287's
-                // P2 on #1755): at start they split all of it, so a node needs headroom for
-                // a partition opened later.
-                let held: u64 = open_now
-                    .values()
-                    .filter_map(|s| s.part_opt().and_then(|p| p.engine_memory))
-                    .map(|m| m.bytes())
-                    .sum();
-                let left = total.saturating_sub(held);
-                let asked = map
-                    .partitions
+                // --engine-memory re-split for the new set, as a restart would (#1761): the
+                // open partitions keep their memtables and their caches shrink to make room.
+                let asked = |pid: &str| {
+                    map.partitions
+                        .iter()
+                        .find(|p| p.id == pid)
+                        .map_or(0, |p| p.memory_bytes)
+                };
+                let open: Vec<(String, Arc<Service>, Memory, u64)> = open_now
                     .iter()
-                    .find(|p| p.id == id)
-                    .map_or(0, |p| p.memory_bytes);
-                let bytes = if asked > 0 { asked.min(left) } else { left };
-                let memory = Memory::of(bytes, share.shards).map_err(|least| {
-                    ApiError::failed_precondition(format!(
-                        "partition {id} can't open here: --engine-memory is {total} bytes, the \
-                         open partitions hold {held} of it, which leaves {left}, and its {} \
-                         shards' memtables need at least {least}. Restart this node to re-split \
-                         --engine-memory across its partitions (the map already gives it {id}), \
-                         or start it with headroom",
-                        share.shards
-                    ))
-                })?;
-                Some(memory)
+                    .filter_map(|(pid, s)| {
+                        let m = s.part_opt()?.engine_memory()?;
+                        Some((pid.clone(), Arc::clone(s), m, asked(pid)))
+                    })
+                    .collect();
+                let now: Vec<(Memory, u64)> = open.iter().map(|(_, _, m, o)| (*m, *o)).collect();
+                let (kept, memory) =
+                    crate::serve::placement::resplit(total, &now, Some((share.shards, asked(id))))
+                        .map_err(|why| {
+                            ApiError::failed_precondition(format!(
+                                "partition {id} can't open here: {why}"
+                            ))
+                        })?;
+                resplit = open
+                    .into_iter()
+                    .zip(kept)
+                    .filter(|((_, _, old, _), new)| new != old)
+                    .map(|((id, service, old, _), new)| Resize {
+                        id,
+                        service,
+                        old,
+                        new,
+                    })
+                    .collect();
+                memory
             }
         };
+        // The open partitions' caches shrink before the new engine allocates, so the node
+        // never holds more than --engine-memory; they grow back if the open fails (#1761).
+        let shrunk = Resized::shrink(&resplit, &format!("partition {id} opening")).await?;
+        // Its compaction on the node's compaction CPUs, as a start would place it (#1888):
+        // the start's reserved set; on a node that started with one partition, the open
+        // partitions' own compaction CPUs; on one that held none, or where nothing pins,
+        // none, and it's placed as a start with one partition is. Never the free cores,
+        // which the network side's mask covers. A node without compaction threads gives it
+        // none (`split` with 0), so there's nothing to confine.
+        let confine = confine_compaction(
+            server.reserved.as_deref(),
+            open_now
+                .values()
+                .filter_map(|s| s.part_opt())
+                .map(|p| p.db.pinned_compaction_cpus()),
+        );
         // Opening from here: `Status` shows it so, and doesn't read its file (#1770).
         let _opening = Opening::mark(self, id);
         // Joined from a blocking thread, so no async worker waits on the open.
         let node = Arc::clone(self);
         let (part, cluster_id) = (id.to_owned(), map.cluster_id.clone());
         let opened = tokio::task::spawn_blocking(move || {
-            let Some(opener) = node.opener.get() else {
+            let Some(server) = node.server.get() else {
                 return Err(ApiError::internal("the node's opener went away"));
             };
             std::thread::scope(|scope| {
@@ -271,7 +529,7 @@ impl Node {
                     .spawn_scoped(scope, || {
                         #[cfg(test)]
                         hold_open(&node.dir);
-                        opener.placement.enter();
+                        server.placement.enter();
                         let mut log = Vec::new();
                         let opened = super::open_partitions(
                             &node.dir,
@@ -279,10 +537,10 @@ impl Node {
                             &[(part, epoch)],
                             super::Budget {
                                 shares: &[share],
-                                reserved: None,
+                                reserved: confine.as_deref(),
                                 memories: memory.as_ref().map(std::slice::from_ref),
                             },
-                            |s, m| (opener.options)(s, m),
+                            |s, m| options_for(&server.served, s, m),
                             &mut log,
                         );
                         eprint!("{}", String::from_utf8_lossy(&log));
@@ -294,8 +552,7 @@ impl Node {
                     .map_err(|f| ApiError::failed_precondition(f.message().to_owned()))
             })
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await?;
         let mut opened = opened?.pop().ok_or_else(|| {
             ApiError::failed_precondition(format!(
                 "partition {id}'s file is stamped at an epoch above the map's {epoch}: a \
@@ -304,7 +561,7 @@ impl Node {
         })?;
         // Pinned on the free cores, or not opened: never on an existing shard's sibling, and
         // never unpinned where pinning works.
-        if opener.placement.masked() && opened.pinning.shards_unpinned() > 0 {
+        if server.placement.masked() && opened.pinning.shards_unpinned() > 0 {
             let _ = opened.db.close();
             return Err(ApiError::failed_precondition(format!(
                 "partition {id}'s {} shards don't fit on this node's free cores (those off \
@@ -323,12 +580,12 @@ impl Node {
             .for_partition(
                 opened.db.clone(),
                 id,
-                &opener.backups,
+                &server.backups,
                 opened.pinning,
                 opened.memory,
                 gate,
             )
-            .placement(&opener.placement);
+            .placement(&server.placement);
         if let Some(part) = service.part_opt()
             && let Some((feeds, hubs)) = shared.feed_runtimes.get()
         {
@@ -336,39 +593,36 @@ impl Node {
         }
         let mut parts = (*cluster.parts.load_full()).clone();
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
-        remask(&opener.placement, &parts, &format!("partition {id} opened"));
+        remask_off_async(&server.placement, &parts, format!("partition {id} opened")).await;
         cluster.parts.store(Arc::new(parts));
+        // Opened: the shrinks stand, and any cache the re-split grew grows now (#1761).
+        shrunk.keep();
+        Resized::grow(&resplit, &format!("partition {id} opened")).await;
         // Its schema follows the map before it's unfenced (D317 ticket 5): the node's map
         // now, not the one the open began with, which a schema change may have passed while
         // the engine opened (audit120's F6). The reconcile covers every open partition.
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None)))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None))).await?;
         Ok(())
     }
 
-    /// Confirms this node's start-fenced partitions on its current map, after a partition
-    /// opened here. Not the map the open began with: a map installed here since (a table
-    /// created at the writer, say) makes that one older than the node's, which
-    /// [`confirm`](Self::confirm) ignores, and the newer map's own `open_missing` skipped
-    /// the partition because it was already open. Nothing else confirms a map set at this
-    /// node, so the partition stayed fenced until a peer's push or an `unfence` (audit120's
-    /// P2-C2). Read again if yet another map landed meanwhile.
-    fn confirm_current(&self) {
-        while let Ok(map) = self.get_map() {
-            self.confirm(&map);
-            if self.state().version() <= map.map_version {
-                break;
-            }
-        }
+    /// A partition opened here starts a run of confirmation rounds, which confirm it once a
+    /// majority of the map's nodes hold a map naming this node for it (#1760): a move's new
+    /// owner serves only then, so it and the old owner are never both confirmed. Spawned:
+    /// the open answers at once.
+    fn confirm_opened(&self) {
+        let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        rt.spawn(async move { node.confirm_until_done().await });
     }
 
     /// Opens every partition the newest map gives this node that isn't open here, each
     /// unfenced once the node's map confirms it (a relocation's new owner serves at once). A
     /// partition that fails to open is reported and left to the next map, or the operator.
     pub(crate) async fn open_missing(self: &Arc<Self>) {
-        if self.opener.get().is_none() {
+        if self.server.get().is_none() {
             return;
         }
         let Ok(map) = self.get_map() else {
@@ -392,8 +646,8 @@ impl Node {
                         map.map_version
                     );
                     #[cfg(test)]
-                    hold_confirm(&self.dir);
-                    self.confirm_current();
+                    hold_confirm(&self.dir).await;
+                    self.confirm_opened();
                 }
                 Err(e) => eprintln!(
                     "phdb serve: partition {id}: map version {} gives it to this node, and it \
@@ -406,16 +660,16 @@ impl Node {
 
     /// The server's feed delivery runtime, once it set one (`run_on`): where a cluster
     /// subscription's merge runs, off the threads that serve requests (#1798 (a)). `None`
-    /// before the server is built, or without an opener (some tests): the caller's runtime.
+    /// before the server is built, or without a server (some tests): the caller's runtime.
     pub(crate) fn feed_runtime(&self) -> Option<tokio::runtime::Handle> {
-        let shared = self.opener.get()?.shared.upgrade()?;
+        let shared = self.server.get()?.shared.upgrade()?;
         shared.feed_runtimes.get().map(|(feed, _)| feed.clone())
     }
 
     /// [`open_missing`](Self::open_missing) in a task, after an install, when a server
     /// serves this node.
     pub(crate) fn open_missing_soon(&self) {
-        if self.opener.get().is_none() {
+        if self.server.get().is_none() {
             return;
         }
         let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())

@@ -328,6 +328,31 @@ impl BlockCache {
     pub fn capacity(&self) -> usize {
         self.shards.capacity()
     }
+
+    /// Resizes the cache to `capacity` bytes, over the shards it was built with (#1761).
+    ///
+    /// A shrink evicts unpinned blocks down to each shard's new share before it returns, a
+    /// few at a time with the shard's lock released between them, so gets go on meanwhile. It
+    /// can't evict a pinned block (one a reader holds, or an SST's top index and filters,
+    /// [`add_pinned`](Self::add_pinned)), so a shard's usage can stay over its share by what
+    /// is pinned until those handles drop, as at any capacity. A grow evicts nothing. A
+    /// [`disabled`](Self::disabled) cache stays disabled.
+    ///
+    /// ```
+    /// use pigeonhole_cache::{BlockCache, BlockData, BlockKey, Priority};
+    ///
+    /// let cache = BlockCache::new(1 << 20, 1);
+    /// for i in 0..64 {
+    ///     let key = BlockKey { file: 1, offset: i * 4096 };
+    ///     drop(cache.insert(key, BlockData::from(vec![0u8; 4096]), Priority::Normal));
+    /// }
+    /// cache.set_capacity(64 << 10);
+    /// assert_eq!(cache.capacity(), 64 << 10);
+    /// assert!(cache.usage() <= 64 << 10);
+    /// ```
+    pub fn set_capacity(&self, capacity: usize) {
+        self.shards.set_capacity(capacity);
+    }
 }
 
 impl fmt::Debug for BlockCache {
@@ -734,6 +759,18 @@ impl RowCache {
     /// Bytes currently cached (rows, encodings and a fixed per-entry overhead).
     pub fn usage(&self) -> usize {
         self.shards.usage()
+    }
+
+    /// Configured capacity.
+    pub fn capacity(&self) -> usize {
+        self.shards.capacity()
+    }
+
+    /// Resizes the cache to `capacity` bytes, as [`BlockCache::set_capacity`] does: a shrink
+    /// evicts unpinned rows down to it before returning, a few at a time outside the lock; a
+    /// grow evicts nothing (#1761).
+    pub fn set_capacity(&self, capacity: usize) {
+        self.shards.set_capacity(capacity);
     }
 }
 

@@ -418,3 +418,36 @@ text-two-terms-k100 52001738 0.3
 text-fuzzy 59386475 0.3
 text-phrase 126670191 0.3
 text-phrase-slop2 131159719 0.3
+# #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
+# a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
+# identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
+# each shape (base and head) times 1.003. Spread across the runs: 0-1 per unit. The async returning
+# commits run in a binary of their own (asyncwrites.rs): in writepath.rs they moved its layout and
+# commit-incr-returning by about 50 (#1874's scratch run).
+wide-row-cells-async 1675 0.3
+commit-put-previous-async 22144 0.3
+commit-if-returning-async 29264 0.3
+# Lowered by #1874 (#1857's every-table check folded into the kept pass, cached per catalog):
+# feed-drain-all 6416 -> 6177, CI's head count 6158 (run 43560343345) times 1.003.
+feed-drain 6154 0.3
+feed-drain-all 6177 0.3
+replicate-apply 6764 0.3
+# #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
+# From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
+# and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
+# runs: serve-get 74914-74925, serve-read-row 663899-663986, serve-scan 8021546-8021560, and
+# serve-mutate 70129-70197. Those counts held about 450-470 per call that main's #1898 (cluster
+# code only) had added to every shape: the router awaited the cluster-only futures in place, so
+# every call's future grew with a fan-out's (#1902). #1903 removed that cost and more, below.
+# serve-mutate's per-PR threshold is 1.0%, and tracing its run-to-run noise is #1900.
+#
+# #1902 (#1903): dispatch_by boxes the cluster-only futures, so a call's future is not sized by
+# them (15304 to 8976 bytes for a gRPC Get) and is cheaper to move. Lowered from 75150, 665978,
+# 70408 and 8045625. From the head d185078d8 (main 7e0b4c49e), three identical-code runs,
+# 43625456463, 43625461046 and 43628573840 (ubuntu-24.04). The highest count of each shape times
+# 1.003. Spread across these runs: serve-get 68310-68323, serve-read-row 657557-657570,
+# serve-mutate 63474-63924, and serve-scan 8015241-8015247.
+serve-get 68528 0.3
+serve-read-row 659543 0.3
+serve-mutate 64116 0.3
+serve-scan 8039293 0.3

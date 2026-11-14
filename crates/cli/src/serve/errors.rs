@@ -539,6 +539,14 @@ impl From<pigeonhole::Error> for ApiError {
     }
 }
 
+/// A blocking task or a joined task that panicked or was cancelled: `Internal`, with the join
+/// error's text.
+impl From<tokio::task::JoinError> for ApiError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        Self::internal(e.to_string())
+    }
+}
+
 /// The vector index's errors keep their code: an engine error as the engine's, the crate's
 /// own (`InvalidArgument`, `Conflict`, `Corruption`) under the same table.
 impl From<pigeonhole_vector::Error> for ApiError {

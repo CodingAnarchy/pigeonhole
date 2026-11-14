@@ -98,6 +98,38 @@ fn loom_handle_dropped_while_evicting() {
     });
 }
 
+/// #1761 (simp724's S3): a shrink racing a get and an insert on the same shard. The shrink
+/// evicts in passes with the lock released between them, so the other two interleave with
+/// it. A handle a get returned keeps its bytes. The capacity ends at the shrink's. Once
+/// every handle is gone, the shard is within it.
+#[test]
+fn loom_resize_races_get_and_insert() {
+    loom::model(|| {
+        let cache = Arc::new(BlockCache::new(128, 1));
+        drop(cache.insert(key(0), block(1), Priority::Normal));
+        drop(cache.insert(key(1), block(2), Priority::Normal));
+
+        let c = Arc::clone(&cache);
+        let resizer = thread::spawn(move || c.set_capacity(64));
+        let c = Arc::clone(&cache);
+        let user = thread::spawn(move || {
+            if let Some(h) = c.get(key(0)) {
+                thread::yield_now();
+                assert_eq!(h.bytes(), &[1; 64]);
+            }
+            let h = c.insert(key(2), block(3), Priority::Normal);
+            assert_eq!(h.bytes(), &[3; 64]);
+        });
+        resizer.join().unwrap();
+        user.join().unwrap();
+        assert_eq!(cache.capacity(), 64);
+        // Nothing is pinned now: one more resize to the same capacity evicts any excess an
+        // interleaving left (an entry pinned during the shrink).
+        cache.set_capacity(64);
+        assert!(cache.usage() <= 64, "usage {}", cache.usage());
+    });
+}
+
 #[test]
 fn loom_row_handle_survives_invalidate() {
     loom::model(|| {

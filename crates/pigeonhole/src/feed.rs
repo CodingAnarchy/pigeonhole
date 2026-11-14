@@ -818,6 +818,16 @@ impl Feed {
         ))
     }
 
+    /// The digest of the catalog at the feed's position, for a feed of every table (#1853
+    /// part C2): a replica that applied everything this feed delivered has the same
+    /// [`Pigeonhole::replication_catalog_digest`](crate::Pigeonhole::replication_catalog_digest).
+    /// Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn catalog_digest(&self) -> Option<u64> {
+        self.reader.catalog_digest()
+    }
+
     /// A delivery happened: the span from the last one's end to the stream's position now.
     fn note_delivery(&mut self) {
         let after = stream_position(&self.reader);

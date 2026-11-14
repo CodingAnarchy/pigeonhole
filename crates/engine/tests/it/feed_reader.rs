@@ -2032,10 +2032,10 @@ fn a_capped_feed_of_every_table_delivers_a_catalog_change_after_the_commits_befo
 /// A token's writer session: bytes 29..37 (after the version byte, the database id, the
 /// stream count and the last seqno delivered; `TokenHeader::parse`).
 fn token_session(token: &[u8]) -> u64 {
-    // The layouts these offsets hold for (versions 1 and 2): a new one fails here rather
-    // than being misread.
+    // The layouts these offsets hold for (versions 1 to 3; 3 appends the catalog, D325): a
+    // new one fails here rather than being misread.
     assert!(
-        matches!(token.first(), Some(1 | 2)),
+        matches!(token.first(), Some(1..=3)),
         "a token layout this test doesn't know: {token:?}"
     );
     u64::from_le_bytes(token[29..37].try_into().unwrap())
@@ -2190,6 +2190,154 @@ fn an_oldest_start_from_an_earlier_session_names_it_before_any_record() {
         matches!(r.try_next().unwrap(), Next::Expired(_)),
         "a gap is never skipped silently, whenever the token was taken"
     );
+    drop(r);
+    db.close().unwrap();
+}
+
+/// Cuts every `Catalog` entry (type 4) from the sidecar past its first `from` bytes, as a
+/// session that records no catalog changes leaves it: a 1.1.x build's, after a rollback
+/// (#1853). Its Session and Root entries are the same bytes 1.2's are (the pigeonhole crate's
+/// `schema-rollback-1.1.3` corpus is 1.1.3's own).
+fn cut_catalog_entries(vfs: &Arc<SimVfs>, from: usize) -> usize {
+    use pigeonhole_format::feed::FEED_SUFFIX;
+    use pigeonhole_io::Vfs;
+    let path = format!("{DB}{FEED_SUFFIX}");
+    let file = vfs
+        .open(
+            Path::new(&path),
+            pigeonhole_io::OpenOptions::read_write_create(),
+        )
+        .unwrap();
+    let mut bytes = vec![0u8; file.len().unwrap() as usize];
+    file.read_at(&mut bytes, 0).unwrap();
+    let mut kept = bytes[..from].to_vec();
+    let (mut at, mut cut) = (from, 0);
+    while at < bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let frame = &bytes[at..at + 8 + len];
+        if frame[8] == 4 {
+            cut += 1;
+        } else {
+            kept.extend_from_slice(frame);
+        }
+        at += 8 + len;
+    }
+    file.set_len(0).unwrap();
+    file.write_at(&kept, 0).unwrap();
+    file.sync_data().unwrap();
+    cut
+}
+
+/// The sidecar's length.
+fn sidecar_len(vfs: &Arc<SimVfs>) -> usize {
+    use pigeonhole_format::feed::FEED_SUFFIX;
+    use pigeonhole_io::Vfs;
+    let path = format!("{DB}{FEED_SUFFIX}");
+    vfs.open(Path::new(&path), pigeonhole_io::OpenOptions::read())
+        .unwrap()
+        .len()
+        .unwrap() as usize
+}
+
+/// D325 (#1853): a token of a feed of every table carries the catalog at its position (token
+/// version 3), and a resume checks it. A session that changes the catalog and records no
+/// change of it in the feed (made here by cutting its Catalog entries) expires the token,
+/// whatever it did: created a table and wrote to it, created one and left it empty, dropped
+/// one, or added a family. The same session with its entries kept resumes, delivering the
+/// change and the commit after it.
+#[test]
+fn a_token_of_every_table_expires_across_a_catalog_change_with_no_record() {
+    for case in [
+        "created",
+        "created_unwritten",
+        "dropped",
+        "family",
+        "recorded",
+    ] {
+        let vfs = SimVfs::new(3251);
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let (a, b) = tables(&db);
+        let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+        let s = single(&db, &a, b"before", Durability::GroupSync);
+        assert_eq!(next(&mut r).seqno, s, "{case}");
+        let token = r.token();
+        assert_eq!(token[0], 3, "{case}: a version 3 token");
+        drop(r);
+        db.close().unwrap();
+        let recorded = sidecar_len(&vfs);
+
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let f = || vec![("g".into(), FamilyOptions::default())];
+        match case {
+            "created" | "recorded" => {
+                let c = db.create_table("c", &f()).unwrap();
+                single(&db, &c, b"in c", Durability::GroupSync);
+            }
+            "created_unwritten" => {
+                db.create_table("c", &f()).unwrap();
+            }
+            "dropped" => db.drop_table(b.id).unwrap(),
+            "family" => {
+                db.add_family(a.id, "g", FamilyOptions::default()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let after = single(&db, &a, b"after", Durability::GroupSync);
+        db.close().unwrap();
+        if case != "recorded" {
+            assert_eq!(cut_catalog_entries(&vfs, recorded), 1, "{case}");
+        }
+
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+        if case == "recorded" {
+            assert!(
+                matches!(r.wait(WAIT).unwrap(), Next::Catalog(_)),
+                "{case}: the create"
+            );
+            assert!(matches!(r.wait(WAIT).unwrap(), Next::Commit(_)), "{case}");
+            assert_eq!(next_any(&mut r), after, "{case}");
+        } else {
+            match r.wait(WAIT).unwrap() {
+                Next::Expired(e) => assert!(
+                    e.reason.contains("without a record"),
+                    "{case}: says why: {e:?}"
+                ),
+                other => panic!("{case}: resumed across it: {other:?}"),
+            }
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// The next commit of a feed of every table, its seqno.
+fn next_any(r: &mut FeedReader) -> Seqno {
+    match r.wait(WAIT).unwrap() {
+        Next::Commit(c) => c.seqno,
+        other => panic!("not a commit: {other:?}"),
+    }
+}
+
+/// D325: a version 2 token (1.2.x's, or 1.2.1's after a rollback from 1.3) still resumes,
+/// with no catalog to check, and the feed's next token is version 3.
+#[test]
+fn a_version_2_token_of_every_table_still_resumes() {
+    let vfs = SimVfs::new(3252);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _) = tables(&db);
+    let mut r = db.feed(spec(&[], FeedStart::Now)).unwrap();
+    let s = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s);
+    let mut token = r.token();
+    drop(r);
+    // Version 2: the same layout without the 16 bytes of the catalog.
+    token.truncate(token.len() - 16);
+    token[0] = 2;
+    let s2 = single(&db, &a, b"2", Durability::GroupSync);
+    let mut r = db.feed(spec(&[], FeedStart::Token(token))).unwrap();
+    assert_eq!(next_any(&mut r), s2);
+    assert_eq!(r.token()[0], 3, "a version 3 token from here on");
     drop(r);
     db.close().unwrap();
 }

@@ -487,7 +487,7 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     let caller_owned = caller.clone();
     let shared_owned = Arc::clone(&shared);
     let answered = service
-        .run_blocking(move || {
+        .blocking(move || {
             let gate = Gate {
                 session: &session,
                 shared: &shared_owned,
@@ -637,7 +637,7 @@ async fn poll_wait(
     let _place = service.stream_slot().ok()?;
     let tools = Arc::clone(session);
     let (mut feed, wait) = service
-        .run_blocking(move || Ok(tools.tools.feed_poll_waiter(&args)))
+        .blocking(move || Ok(tools.tools.feed_poll_waiter(&args)))
         .await
         .ok()??;
     let start = feed.token();

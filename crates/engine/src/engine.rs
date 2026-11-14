@@ -2102,6 +2102,16 @@ impl Engine {
         self.inner.promote()
     }
 
+    /// The digest of this database's catalog (#1853 part C2): its table ids, but a replica's
+    /// state table, and its id counters, as a feed of every table's
+    /// [`FeedReader::catalog_digest`](crate::FeedReader::catalog_digest) reports them at its
+    /// position. A replica that applied everything its primary's feed delivered has the
+    /// digest that feed reports; a different one means a schema change the feed never
+    /// delivered.
+    pub fn catalog_digest(&self) -> u64 {
+        crate::feed_reader::catalog_digest_of(&self.inner.catalog())
+    }
+
     /// The replica's state cell, as the last apply stored it; `None` before the first.
     pub fn replication_state(&self) -> Result<Option<Vec<u8>>> {
         if self
@@ -3526,6 +3536,36 @@ impl Engine {
             .iter()
             .map(|m| m.group_syncs.load(Ordering::Relaxed))
             .sum()
+    }
+
+    /// Resizes this database's block cache to `block_bytes` and its row cache to `row_bytes`
+    /// (#1761: `phdb serve` re-splitting a node's `--engine-memory` as partitions open and
+    /// close). A shrink evicts unpinned entries down to the new size before returning, a few
+    /// at a time with each cache shard's lock released between them; pinned blocks (open
+    /// readers, SSTs' top indexes and filters) stay until released, so usage can stay over
+    /// the new size by what is pinned. A grow evicts nothing. A cache that was off at open (0
+    /// bytes) stays off: the row cache's watermarks exist only when it was on. In a reader
+    /// process it resizes only that process's block cache (its row cache is its attachment's).
+    /// Synchronous: call it off async workers.
+    pub fn set_cache_capacities(&self, block_bytes: usize, row_bytes: usize) {
+        self.inner.shared.cache.set_capacity(block_bytes);
+        if let Some(rc) = &self.inner.shared.row_cache {
+            rc.set_capacity(row_bytes);
+        }
+    }
+
+    /// The block and row caches' configured capacities in bytes. A row cache that is off
+    /// reports 0, and so does a reader process's: its row cache is its attachment's (D281),
+    /// which this neither reports nor resizes (perf2's N1 on #1890).
+    pub fn cache_capacities(&self) -> (usize, usize) {
+        (
+            self.inner.shared.cache.capacity(),
+            self.inner
+                .shared
+                .row_cache
+                .as_ref()
+                .map_or(0, |rc| rc.capacity()),
+        )
     }
 
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,

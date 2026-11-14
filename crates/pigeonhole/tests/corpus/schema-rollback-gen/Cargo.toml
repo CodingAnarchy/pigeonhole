@@ -1,0 +1,16 @@
+[package]
+name = "schema-rollback-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+# The first step of the schema-rollback corpus (#1853), written by 1.2.0's own code: the v1.2.0
+# tag's commit, pinned by revision so the entries were written by the same code as the release
+# (session ids are random, so a second run writes other bytes). The second step is 1.1.3's,
+# `rollback-gen schema`.
+[dependencies]
+# `__unstable-hooks` for `Options::wal_segment_size` (256 KiB segments keep the entries small),
+# `__unstable-replication` for the replica's bootstrap and applies.
+pigeonhole = { git = "https://github.com/CodingAnarchy/pigeonhole", rev = "e2f93b93541f614dfba3e66a21db0341287633dc", features = ["__unstable-hooks", "__unstable-replication"] }

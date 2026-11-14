@@ -409,7 +409,7 @@ impl Merging {
                 && let Poll::Ready(Some(done)) = self.merge.opens.poll_join_next(cx)
             {
                 let opened = done
-                    .map_err(|e| ApiError::internal(e.to_string()))
+                    .map_err(ApiError::from)
                     .and_then(|(i, result)| self.merge.opened(i, result));
                 if let Err(e) = opened {
                     self.end(e);
@@ -592,7 +592,7 @@ impl Merge {
             let Some(done) = set.join_next().await else {
                 break;
             };
-            let (i, result) = done.map_err(|e| ApiError::internal(e.to_string()))?;
+            let (i, result) = done?;
             opened[i] = Some(result);
         }
         for (i, result) in opened.into_iter().enumerate() {
@@ -1164,8 +1164,10 @@ impl Ctx {
             };
             let events = here
                 .subscribe_part(open.request, &self.caller, open.skip, true, open.internal)
-                .await?;
+                .await
+                .map_err(|e| closed_since(&self.parts, &open.partition, &here, e))?;
             still_owner(&self.node, &open.partition)?;
+            still_served(&self.parts, &open.partition, &here)?;
             return Ok((Box::pin(LocalEvents(events)), epoch));
         }
         let channel = self.channel(&owner.address).await?;
@@ -1353,11 +1355,80 @@ pub(crate) async fn serve(
         };
         service
     };
+    #[cfg(test)]
+    hold_subscribe(node.dir(), &req.partition).await;
     let events = service
         .subscribe_part(r, &caller, req.skip_through, true, false)
-        .await?;
+        .await
+        .map_err(|e| closed_since(parts, &req.partition, &service, e))?;
     still_owner(node, &req.partition)?;
+    still_served(parts, &req.partition, &service)?;
     Ok(events)
+}
+
+/// A hold seam (tests): a forwarded subscribe of partition `p` on the node in a listed
+/// cluster directory waits, once, after it took the partition's service and before it
+/// subscribes, until the sender sends or is dropped (#1848).
+#[cfg(test)]
+pub(crate) static HOLD_SUBSCRIBE: std::sync::Mutex<Vec<HeldSubscribe>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// [`HOLD_SUBSCRIBE`]'s entry: the node's cluster directory and the partition, and the
+/// release.
+#[cfg(test)]
+pub(crate) type HeldSubscribe = (
+    (std::path::PathBuf, String),
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+async fn hold_subscribe(dir: &std::path::Path, p: &str) {
+    let wait = {
+        let mut armed = HOLD_SUBSCRIBE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        armed
+            .iter()
+            .position(|((d, q), _)| d == dir && q == p)
+            .map(|i| armed.swap_remove(i).1)
+    };
+    if let Some(wait) = wait {
+        let _ = wait.await;
+    }
+}
+
+/// After a component subscribed on this node: `PartitionUnavailable` if the partition was
+/// closed here since its service was taken. The close's
+/// [`Feeds::end_parts`](crate::serve::feed::Feeds::end_parts) may have run before the
+/// component was there to end, and a close doesn't change the map, so [`still_owner`] passes;
+/// the component would then end with the closing database's own error, which ends an
+/// `allow_partial` subscription rather than leaving it to wait (#1848).
+fn still_served(
+    parts: &crate::serve::router::Parts,
+    partition: &str,
+    service: &Arc<crate::serve::service::Service>,
+) -> Result<(), ApiError> {
+    if parts
+        .load()
+        .get(partition)
+        .is_some_and(|s| Arc::ptr_eq(s, service))
+    {
+        return Ok(());
+    }
+    Err(ApiError::partition_unavailable(format!(
+        "partition {partition:?} closed or reopened on this node"
+    )))
+}
+
+/// A component's subscribe that failed: `PartitionUnavailable` if the partition was closed
+/// here meanwhile (its database then refuses), else the error as it is (#1848).
+fn closed_since(
+    parts: &crate::serve::router::Parts,
+    partition: &str,
+    service: &Arc<crate::serve::service::Service>,
+    e: ApiError,
+) -> ApiError {
+    still_served(parts, partition, service).err().unwrap_or(e)
 }
 
 /// After a component subscribed on this node: `WrongPartition` if a map installed since
@@ -1416,11 +1487,7 @@ impl tonic::server::ServerStreamingService<proto::ForwardSubscribeRequest> for F
     fn call(&mut self, req: tonic::Request<proto::ForwardSubscribeRequest>) -> Self::Future {
         let this = self.0.clone();
         Box::pin(async move {
-            let header = req
-                .metadata()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok());
-            let caller = this.node.caller(header)?;
+            let caller = this.node.caller(crate::serve::grpc::auth_header(&req))?;
             this.node.allowed(
                 &caller,
                 &[crate::serve::auth::Scope::Cluster],

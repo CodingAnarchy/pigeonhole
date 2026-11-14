@@ -144,15 +144,25 @@ impl Memory {
         if per_shard < MEMTABLE_FLOOR {
             return Err(MEMTABLE_FLOOR * n);
         }
-        let rest = share - per_shard * n;
-        let block_cache = rest / (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE
-            + rest % (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE / (BLOCK_CACHE + ROW_CACHE);
-        Ok(Self {
+        Ok(Self::with_caches(shards, per_shard, share - per_shard * n))
+    }
+
+    /// `shards` shards of `memtable_per_shard` each, and `caches` bytes split between the
+    /// block cache and the row cache in the library's ratio (4:1).
+    pub(crate) fn with_caches(shards: usize, memtable_per_shard: u64, caches: u64) -> Self {
+        let block_cache = caches / (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE
+            + caches % (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE / (BLOCK_CACHE + ROW_CACHE);
+        Self {
             shards,
-            memtable_per_shard: per_shard,
+            memtable_per_shard,
             block_cache,
-            row_cache: rest - block_cache,
-        })
+            row_cache: caches - block_cache,
+        }
+    }
+
+    /// Its block and row caches together.
+    pub(crate) fn caches(&self) -> u64 {
+        self.block_cache + self.row_cache
     }
 
     pub(crate) fn memtables(&self) -> u64 {
@@ -218,6 +228,56 @@ pub(crate) fn memory(
             })
         })
         .collect()
+}
+
+/// A cluster node's `--engine-memory` (`total`) re-split while it serves (#1761), when a
+/// partition opens (`new`: its shard count and the map's `memory_bytes` override, 0 for
+/// none) or closes (`new` is `None`). `open` is each open partition's memory now and its
+/// override.
+///
+/// The target is [`memory`]'s split for the new set, as a restart would give. An open
+/// engine's memtables can't be resized (their arena is a fixed shared-memory region), so
+/// each open partition keeps its memtables and its caches become what the target leaves of
+/// its share after them, or none. The new partition gets what the open ones then leave of
+/// `total` (its override, if smaller), split as at a start.
+///
+/// Returns each open partition's memory, in `open`'s order, and the new partition's. `Err`
+/// says why it can't fit, for an open that is then refused, as before #1761.
+pub(crate) fn resplit(
+    total: u64,
+    open: &[(Memory, u64)],
+    new: Option<(usize, u64)>,
+) -> Result<(Vec<Memory>, Option<Memory>), String> {
+    let mut parts: Vec<(usize, u64)> = open.iter().map(|(m, o)| (m.shards, *o)).collect();
+    parts.extend(new);
+    let target = memory(Some(total), &parts).map_err(|(_, why)| why)?;
+    let kept: Vec<Memory> = open
+        .iter()
+        .zip(&target)
+        .map(|((now, _), t)| {
+            Memory::with_caches(
+                now.shards,
+                now.memtable_per_shard,
+                t.bytes().saturating_sub(now.memtables()),
+            )
+        })
+        .collect();
+    let Some((shards, asked)) = new else {
+        return Ok((kept, None));
+    };
+    let held: u64 = kept.iter().map(Memory::bytes).sum();
+    let left = total.saturating_sub(held);
+    let bytes = if asked > 0 { asked.min(left) } else { left };
+    let memory = Memory::of(bytes, shards).map_err(|least| {
+        format!(
+            "--engine-memory is {total} bytes; the open partitions' memtables, which can't \
+             shrink while they're open, and their caches' new shares hold {held} of it, which \
+             leaves {left}, and its {shards} shards' memtables need at least {least}. Restart \
+             this node to re-split --engine-memory with smaller memtables (the map already \
+             gives it the partition), or start it with more"
+        )
+    })?;
+    Ok((kept, Some(memory)))
 }
 
 /// The CPUs a node with several partitions reserves for its compaction threads (D317
@@ -302,6 +362,10 @@ struct Live {
     generation: std::sync::atomic::AtomicU64,
     /// The process's CPUs, which a thread masked to `None` gets back.
     process: Vec<usize>,
+    /// The threads that follow [`refresh`] (every [`Placement::enter_as`]), by thread ID: the
+    /// sweep leaves them to it (#1762, perf287's S1: names don't tell them apart).
+    #[cfg(target_os = "linux")]
+    registered: std::sync::Mutex<std::collections::HashSet<i32>>,
 }
 
 /// Which runtime's mask a thread takes.
@@ -328,6 +392,30 @@ thread_local! {
     /// This thread's placement, its role and the generation of the mask it last applied.
     static THREAD: std::cell::RefCell<Option<(Arc<Live>, Role, u64)>> =
         const { std::cell::RefCell::new(None) };
+    /// This thread's entry in [`Live::registered`], removed when the thread exits: Linux
+    /// reuses thread IDs, and the blocking pool retires idle threads, so a stale entry
+    /// would let the sweep skip an unrelated later thread that got the same ID.
+    #[cfg(target_os = "linux")]
+    static REGISTERED: std::cell::RefCell<Option<Registered>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One thread's registration; dropping it (at thread exit, or a new `enter_as`) removes it.
+#[cfg(target_os = "linux")]
+struct Registered {
+    live: Arc<Live>,
+    tid: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.live
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.tid);
+    }
 }
 
 /// Reapplies the calling thread's mask if a reapply published a newer one since it last
@@ -345,6 +433,38 @@ pub(crate) fn refresh() {
             apply_to(&live.process, live.masks.load().of(*role));
         }
     });
+}
+
+/// The process's thread IDs (`/proc/self/task`).
+#[cfg(target_os = "linux")]
+fn thread_ids() -> Vec<i32> {
+    std::fs::read_dir("/proc/self/task")
+        .map(|d| {
+            d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Thread `tid`'s CPUs, sorted; `None` when it has gone, or can't be read.
+#[cfg(target_os = "linux")]
+fn affinity_of(tid: i32) -> Option<Vec<usize>> {
+    let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+    Some(
+        (0..nix::sched::CpuSet::count())
+            .filter(|&c| set.is_set(c).unwrap_or(false))
+            .collect(),
+    )
+}
+
+/// Masks thread `tid` to `cpus`; false when it has gone, or the OS refused.
+#[cfg(target_os = "linux")]
+fn set_affinity_of(tid: i32, cpus: &[usize]) -> bool {
+    let mut mask = nix::sched::CpuSet::new();
+    for &c in cpus {
+        let _ = mask.set(c);
+    }
+    nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &mask).is_ok()
 }
 
 /// Masks the calling thread to `cpus` (Linux). `None` means where the OS puts it, so the
@@ -443,6 +563,8 @@ impl Placement {
             masks: arc_swap::ArcSwap::from_pointee(plan.masks.clone()),
             generation: std::sync::atomic::AtomicU64::new(0),
             process: plan.process.clone(),
+            #[cfg(target_os = "linux")]
+            registered: std::sync::Mutex::default(),
         });
         plan
     }
@@ -497,9 +619,18 @@ impl Placement {
     }
 
     /// The masks the threads take now: the start's, or the last reapply's.
-    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn current(&self) -> RuntimeMasks {
         (**self.live.masks.load()).clone()
+    }
+
+    /// Whether thread `tid` is registered as following [`refresh`].
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn is_registered(&self, tid: i32) -> bool {
+        self.live
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&tid)
     }
 
     /// Masks the calling thread to `role`'s CPUs now, and records it, so its [`refresh`]
@@ -509,8 +640,129 @@ impl Placement {
             .live
             .generation
             .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(target_os = "linux")]
+        {
+            let tid = nix::unistd::gettid().as_raw();
+            // Drop any earlier entry first: its drop takes the lock below to remove this tid.
+            REGISTERED.with_borrow_mut(|r| *r = None);
+            // Registered and masked under the lock a sweep holds while it checks and masks a
+            // thread, so a sweep never overwrites the mask of a thread entering meanwhile
+            // (perf287's N1 on #1871).
+            let mut registered = self
+                .live
+                .registered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.insert(tid);
+            apply_to(&self.live.process, self.live.masks.load().of(role));
+            drop(registered);
+            REGISTERED.with_borrow_mut(|r| {
+                *r = Some(Registered {
+                    live: Arc::clone(&self.live),
+                    tid,
+                });
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
         apply_to(&self.live.process, self.live.masks.load().of(role));
         THREAD.with_borrow_mut(|t| *t = Some((Arc::clone(&self.live), role, now)));
+    }
+
+    /// After a [`reapply`](Self::reapply): moves every thread of the process that doesn't
+    /// follow [`refresh`] itself onto the blocking mask (or the process's CPUs when there's
+    /// none), so the engines' unpinned threads and the server's long-running ones (a backup,
+    /// a bulk load, a rebalancer, a replica's follow, candle's pool) leave CPUs a new
+    /// partition's shards were just pinned to (#1762). Linux; elsewhere it does nothing.
+    ///
+    /// Left alone:
+    /// - the threads that follow `refresh()` (registered by thread ID as they enter): they
+    ///   take their runtime's mask at their next park, unpark, call or task, as before;
+    /// - every thread whose affinity is a subset of `engine_pins`, the open partitions'
+    ///   pinned shard and compaction CPUs: the engines' own pins (D235), one CPU or a
+    ///   confined set (ICR 0134). This assumes an engine never pins a thread outside those.
+    ///   Except a thread whose affinity equals one of `previous`'s masks (the ones in force
+    ///   before the reapply) or the process's CPUs: that's a thread still on an old mask,
+    ///   which the new partition's pins may now cover whole, and it moves (perf287's S1 on
+    ///   #1871: on a narrow host, the case #1762 is about).
+    ///
+    /// A thread is checked and masked under the lock [`enter_as`](Self::enter_as) registers
+    /// and masks under, so one entering meanwhile keeps its own mask.
+    ///
+    /// Two passes at most: a second when the thread count changed during the first, then it
+    /// stops and says so (perf287's N1). The number of threads it moved; a thread that
+    /// refuses a mask (io_uring's `iou-wrk-*` workers) isn't counted, and is tried again at
+    /// the next sweep (simp724's N2 on #1871).
+    pub(crate) fn sweep(&self, engine_pins: &[usize], previous: &RuntimeMasks) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            let target: Vec<usize> = self
+                .live
+                .masks
+                .load()
+                .of(Role::Blocking)
+                .map_or_else(|| self.live.process.clone(), <[usize]>::to_vec);
+            if target.is_empty() {
+                return 0;
+            }
+            // The old masks, each sorted as `affinity_of` reads a thread's.
+            let old: Vec<Vec<usize>> = [
+                &previous.network,
+                &previous.blocking,
+                &previous.feed,
+                &previous.hub,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .chain(std::iter::once(self.live.process.clone()))
+            .map(|mut m| {
+                m.sort_unstable();
+                m
+            })
+            .collect();
+            let mut moved = 0;
+            let mut seen = None;
+            for _ in 0..2 {
+                let tids = thread_ids();
+                if seen == Some(tids.len()) {
+                    return moved;
+                }
+                seen = Some(tids.len());
+                for tid in tids {
+                    let registered = self
+                        .live
+                        .registered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if registered.contains(&tid) {
+                        continue;
+                    }
+                    let Some(now) = affinity_of(tid) else {
+                        continue;
+                    };
+                    let engine_pin =
+                        !old.contains(&now) && now.iter().all(|c| engine_pins.contains(c));
+                    if now == target || engine_pin {
+                        continue;
+                    }
+                    if set_affinity_of(tid, &target) {
+                        moved += 1;
+                    }
+                }
+            }
+            if seen != Some(thread_ids().len()) {
+                eprintln!(
+                    "phdb serve: the thread mask sweep stopped after two passes with threads still \
+                     starting: one started meanwhile takes its spawner's mask"
+                );
+            }
+            moved
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (engine_pins, previous);
+            0
+        }
     }
 
     /// The CPUs the server's own heavy threads may run on, as a CPU list (`2-7,10`), when the
@@ -814,7 +1066,7 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, default_shards};
+    use super::{Memory, Placement, default_shards, memory, resplit};
     use pigeonhole::{Options, Pigeonhole};
 
     /// D313 R1's mask, on a 4-core, 8-CPU topology (CPU `c`'s sibling is `c ^ 4`): the
@@ -946,6 +1198,65 @@ mod tests {
     /// D317 ticket 8a (cli692's M3): a share's memory goes to the memtables first, at most
     /// the library's arena per shard, then to the caches at the library's 4:1; overrides
     /// come off the top, and a share that can't cover the memtables' floor is refused.
+    /// #1761, the design note's example: 8 GiB, two 8-shard partitions at start, a third
+    /// opened. The open two keep their 512 MiB of memtables and their caches shrink to the
+    /// three-way share; the third gets the rest, and the total stays 8 GiB.
+    #[test]
+    fn a_resplit_shrinks_the_open_partitions_caches_to_make_room() {
+        const GIB: u64 = 1 << 30;
+        let start = memory(Some(8 * GIB), &[(8, 0), (8, 0)]).unwrap();
+        assert_eq!(start[0].memtables(), 512 << 20);
+        assert_eq!(start[0].bytes(), 4 * GIB);
+        let open: Vec<(Memory, u64)> = start.iter().map(|m| (*m, 0)).collect();
+        let (kept, new) = resplit(8 * GIB, &open, Some((8, 0))).unwrap();
+        let new = new.unwrap();
+        let target = memory(Some(8 * GIB), &[(8, 0), (8, 0), (8, 0)]).unwrap();
+        for (k, t) in kept.iter().zip(&target) {
+            assert_eq!(
+                k.memtable_per_shard, start[0].memtable_per_shard,
+                "memtables kept"
+            );
+            assert_eq!(k.bytes(), t.bytes(), "the three-way share");
+            assert!(k.caches() < start[0].caches(), "caches shrank");
+        }
+        assert_eq!(new.memtables(), 512 << 20);
+        let all: u64 = kept.iter().map(Memory::bytes).sum::<u64>() + new.bytes();
+        assert!(all <= 8 * GIB && all > 8 * GIB - 16, "the total: {all}");
+        // A close of the third: the two left grow back to the two-way share.
+        let open: Vec<(Memory, u64)> = kept.iter().map(|m| (*m, 0)).collect();
+        let (back, none) = resplit(8 * GIB, &open, None).unwrap();
+        assert!(none.is_none());
+        assert_eq!(back, start, "back to the start's split");
+    }
+
+    /// #1761: memtables opened under a looser split can't shrink, so a partition whose
+    /// memtables already exceed its new share keeps no cache, and the new one gets what's
+    /// left: refused, with the restart named, when that can't cover its memtables.
+    #[test]
+    fn a_resplit_that_cant_cover_the_new_memtables_is_refused() {
+        // 2 GiB, two 16-shard partitions: 1 GiB each, all of it memtables (64 MiB × 16).
+        let start = memory(Some(2 << 30), &[(16, 0), (16, 0)]).unwrap();
+        assert_eq!(start[0].caches(), 0);
+        let open: Vec<(Memory, u64)> = start.iter().map(|m| (*m, 0)).collect();
+        let e = resplit(2 << 30, &open, Some((16, 0))).unwrap_err();
+        assert!(e.contains("Restart this node"), "{e}");
+        // A small new partition still fits beside them only if there's room: none here.
+        assert!(resplit(2 << 30, &open, Some((1, 0))).is_err());
+    }
+
+    /// #1761: a map's `memory_bytes` override is the new partition's, if it fits, and an open
+    /// partition's override keeps its share across the re-split.
+    #[test]
+    fn a_resplit_keeps_overrides() {
+        const GIB: u64 = 1 << 30;
+        let start = memory(Some(8 * GIB), &[(4, 2 * GIB), (4, 0)]).unwrap();
+        let open: Vec<(Memory, u64)> = vec![(start[0], 2 * GIB), (start[1], 0)];
+        let (kept, new) = resplit(8 * GIB, &open, Some((4, GIB))).unwrap();
+        assert_eq!(kept[0].bytes(), 2 * GIB, "the override is kept");
+        assert_eq!(new.unwrap().bytes(), GIB, "the new override");
+        assert_eq!(kept[1].bytes(), 5 * GIB, "the rest");
+    }
+
     #[test]
     fn engine_memory_splits_memtables_first_then_the_caches() {
         use super::{MEMTABLE_FLOOR, MEMTABLE_PER_SHARD, Memory, memory};

@@ -57,6 +57,7 @@
 - **First map:** a node's first map takes `expected_map_version = 0`, and must name the node it's sent to.
 - **Steps:** it validates (and validates the change from the current map), persists, and pushes to every other node in parallel, each push within `--cluster-push-timeout-ms`.
 - **The answer:** sent once the map is persisted here, with each push's result. A node the push missed pulls the map later (below).
+- **A node change (1.3.0, #1899, D317 amendment 3):** a non-forced map whose node ids differ from the current map's gets `previous_nodes` (`ClusterMap` field 6, repeated `Node`) set by the writer to the current map's nodes. Its `SetMap` pushes to the nodes before and after it until a majority of each holds it, for up to three push timeouts, and answers with the last pushes (nodes it removed included). While the newest map has `previous_nodes`, every non-forced `SetMap` (schema changes included) first pushes the map to both sets again, and is refused with `FailedPrecondition`, naming both counts and the nodes missing, unless a majority of each holds it. The change it takes clears `previous_nodes`, unless it changes the nodes itself. A forced map clears it. The writer ignores whatever `previous_nodes` a map sent to it says.
 
 **`PushMap`:**
 - **Accepted:** a valid map with a greater version and the same cluster (the change rules were checked where it was set).
@@ -360,6 +361,7 @@
   - `state = 10`: a `LocalPartitionState`, one of `SERVING`, `FENCED`, `CLOSED` or `OPENING`;
   - `files = 11`: a closed partition's files once hashed, as `PartitionFile`;
   - `fence_reason = 12`: a `FenceReason`, `OPERATOR` or `AWAITING_PEER_MAP`, set only when `FENCED`.
+  - `awaiting_peers = 13` (bool, 1.3.0, #1829): the peers have yet to confirm it since it opened here, whatever `fence_reason` says. The gate keeps the operator's fence and the wait for the peers as two flags; `fence_reason` reports the operator's first, so an operator-fenced partition no peer has confirmed reads `OPERATOR` with `awaiting_peers` set.
 - **`StampRequest`** has six fields: `cluster_id`, `partition`, `from_epoch`, `to_epoch`, `restore` and `restore_from_cluster_id`.
 - **`PartitionRequest.force = 2`** (bool), read only by `Unfence` (cli692's S1): it lifts a start fence that no peer's map confirms.
 - **A new code, `Fenced`:** gRPC `FAILED_PRECONDITION`, HTTP 409. Nothing is written. The sender passes it through unchanged and never retries it.
@@ -374,7 +376,7 @@
 - **`Fence`** sets the flag, persists `DIR/fenced.json`, and waits up to 30 s for the writes admitted before it.
 - **`Unfence`** checks that the map names the node at the file's epoch, persists `fenced.json`, reconciles the schema, and clears the flag last.
   - **Either fence** needs the peers' word too: every peer is asked at the call, and the newest map among those that answer (taken, if newer) must be at least as new as the node's own and name it at the file's epoch, or `force`. The first peer to agree isn't enough: one that missed the same move holds the same stale map (simp724's S1 on #1826). The node's own map may be stale. A cluster of one confirms on its own map. (Until audit120's P2-F1, 2026-11-13, only a start fence asked. A move fences its old node as the operator, and that node's map is the one left behind when it misses the move's map: an unfence there lifted the fence on the stale map alone and gave the partition two writers.)
-  - **The accepted risk:** auto-unfence at start still trusts one peer's map at least as new as the node's, and a peer that missed the same move holds the same stale version. `unfence` takes the newest of every peer that answers, so its remaining gap is a peer that doesn't answer: with the one node that knows of a move down, the others confirm. A quorum is for 1.3.0.
+  - **The accepted risk (1.2.0):** auto-unfence at start trusted one peer's map at least as new as the node's, and a peer that missed the same move held the same stale version. **1.3.0 (#1760, D317 amendment 3):** a partition is confirmed only when a majority of the map's nodes hold the newest map and it names the node; a round brings peers that are behind up to it before counting them, every open (a move's new owner too) starts unconfirmed, a map that changes the nodes can't also move a partition, and a move waits for a majority to hold its map.
 - **Start:** every partition opens fenced. A peer's map at least as new as the node's own, naming the node at the file's epoch, unfences it. The sources are `sync_on_start`, a push from a peer, and a retry loop (250 ms up to 5 s). A one-node cluster unfences on its own map. An operator's fence stays.
 - **Not stopped by a fence:** a text index rebuild runs to its end, since the library rebuilds an index in one call. The fence's drain waits for it within its deadline. A per-batch hook in pigeonhole-text is a 1.3.0 follow-up.
 
@@ -383,7 +385,8 @@
   - a map that gives the node a partition not open there opens it, then unfences it on that map;
   - `unfence` reopens a closed partition.
 - **Its share** of `--shards` and `--compaction-threads` is the node's totals split for the new set. Open engines keep theirs; resharing an open engine is out of scope.
-- **Its memory** is what the open partitions leave of `--engine-memory`, never past it (perf287's P2). Below the memtables' floor, the open is refused, naming the budget, and a restart of that node alone re-splits it (`start_budget`), since the map already gives it the partition. A target with no partitions gets all of it. Re-splitting the open engines live is a 1.3.0 option.
+  - **Its compaction** is confined to the node's compaction CPUs (#1888, 1.3.0): the start's reserved set (ICR 0134), kept on the node's `Server`, or on a node that started with one partition the open partitions' pinned compaction CPUs. Before, a run-time open passed no set, so its threads were pinned on the free cores the network side's mask covers.
+- **Its memory** is what the open partitions leave of `--engine-memory`, never past it (perf287's P2). Below the memtables' floor, the open is refused, naming the budget, and a restart of that node alone re-splits it (`start_budget`), since the map already gives it the partition. A target with no partitions gets all of it. **Amended (#1761, 1.3.0):** the open re-splits `--engine-memory` live, as a restart would. The open partitions keep their memtables (the arena is a fixed shared-memory region readers map, sized at open) and their block and row caches are resized (`Pigeonhole::set_cache_capacities`, hidden: a serve-only contract) to what their new shares leave after them (`placement::resplit`). Caches shrink before the new engine opens and grow back if the open fails; a close grows the others' after its engine closed, so the node never holds more than `--engine-memory`. The open is refused only when the open partitions' memtables leave too little for the new one's, and then a restart re-splits with smaller memtables. Shards aren't re-split (a database keeps its count), nor compaction threads (confined, above, their CPU is bounded).
 - **Where it opens (the coordinator's mask directive):** on a fresh thread that first takes the narrow free-core mask (`Placement::enter`). `pin_plan` plans from the calling thread's mask, so the new shards land off every open partition's shard cores and their SMT siblings.
 - **Too few free cores:** where the new partition's shards don't fit, the open is refused, never pinned onto a sibling or left unpinned.
 - **The mask reapply:** each runtime's masks sit in an `ArcSwap` with a generation, published before the bump.
@@ -391,7 +394,14 @@
   - The triggers are the request, feed and hub runtimes' park and unpark hooks, each `Service::call`, and each blocking task's start, so a busy worker takes it at its next call.
   - The hub's read loop and the feed's delivery loops refresh too, once per read or batch: a busy hub may never park (perf287's P1).
   - Thread counts stay as started (Tokio can't resize a runtime), so a mask that shrank has more threads per CPU (cli692 on #1745). The log line gives each runtime's threads against its CPUs, and says so when the masks fall back to none (too few free cores).
-  - **Known gaps:** the engines' unpinned threads take the mask they started on and never refresh (the engine owns them). A partition opened later can pin shards on CPUs where they run. Background threads already running (a backup, a bulk load, an index build, a replica's follow) keep their CPUs until they end.
+  - **The other threads (#1762, 1.3.0):** right after the reapply, a sweep of `/proc/self/task` moves every thread that doesn't refresh itself onto the blocking mask, or the process's CPUs when there's none. That covers the engines' unpinned threads, and the server's own long-running ones: a backup, a bulk load, an index build or rebalancer, a replica's follow, and candle's pool, whose `CANDLE_CPU_MASK` is read only once.
+    - It leaves alone the threads that refresh themselves (registered by thread ID as they enter: names don't tell a network worker from a Tokio blocking thread), and any thread whose affinity lies within the open partitions' pinned shard and compaction CPUs: the engines' own pins (D235, ICR 0134).
+    - A thread whose affinity equals a mask in force before the reapply, or the process's CPUs, is moved even when the new pins cover it whole: on a narrow host, that's a thread still on the old free cores the new shards took (perf287's S1 on #1871).
+      - That includes compaction threads confined to the node's reserved compaction CPUs (several partitions, ICR 0134) when the reserved set is the whole old blocking mask: free cores exactly as many as the compaction CPUs, without SMT. They move to the new blocking mask, which is the reserved set minus the new shard's core, and a close of that partition widens them again. `pinned_compaction_cpus()` still reports the whole reserved set. Letting the confined set win instead would leave every other thread on the new shard's core in that layout (perf287 and simp724 on #1871).
+    - A thread is checked and masked under the lock a thread registers and masks itself under, so one entering mid-sweep keeps its own mask.
+    - It runs on the blocking pool, awaited by the open or close, never on a request worker (simp724's S1 on #1871).
+    - Two passes at most, the second only when threads started during the first. The log line counts the threads it moved. io_uring's `iou-wrk-*` workers refuse a new mask; they aren't counted, and are tried again at the next sweep.
+    - Before 1.3.0 these threads kept the mask they started on, so a partition opened later could pin its shards where they ran.
 
 **Close (amendment 2):**
 - **It refuses an unfenced partition,** then waits 30 s for the fence's writes.
@@ -429,7 +439,7 @@
 - **`phdb cluster status`** gives each partition's state, for example `fenced (operator)`.
 
 ## Partition upload (for restore, 8b PR 2, and relocation by file copy, ticket 6 PR 2)
-**`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id }`** says how many bytes of an upload the node holds, so a client can resume. Both answer `Unsupported` on a single node.
+**`Admin.PartitionUpload`** (client streaming, gRPC only, admin scope, a cluster node only) streams one file of a partition's set into a node. **`Admin.PartitionUploadStatus { upload_id = 1; partition = 2 }`** says how many bytes of an upload the node holds, so a client can resume, and whether an install of `partition`'s set is in progress there (#1848, 1.3.0; empty `partition`, from an older client: false). Both answer `Unsupported` on a single node.
 - **A partition is a set of files,** named by their suffix of the partition's database path: `""` for the main file, `-wal-<n>` for a WAL sidecar, `-feed` for the change feed's sidecar. Each node maps a name onto its own path. **`PartitionFile { name = 1; bytes = 2; sha256 = 3 }`** (common.proto) describes one.
 - **`PartitionUploadHeader`:**
   - `partition` (1), and `cluster_id` (2) and `epoch` (3): what the main file says it is, so the epoch the copy is *of*;
@@ -438,7 +448,9 @@
   - `file` (6): the file this upload carries;
   - `manifest` (7): every file of the set, `file` among them, with the main file required.
 - **`PartitionUploadChunk { header = 1; offset = 2; data = 3 }`:** the first message carries the header. Each message's data starts where the node's bytes end, and is at most the node's `max_chunk`. That's 512 KiB, or less on a node whose `--max-request-bytes` is lower: min(512 KiB, the limit − 16 KiB), at least 1 KiB (cli692's F3 on #1728). A message that doesn't come within `--stream-idle-ms` ends the upload with `DeadlineExceeded`, which frees its place; it then resumes (cli692's F1).
-- **Replies:** `PartitionUploadReply { received = 1; complete = 2 }`, and `PartitionUploadStatusReply { received = 1; complete = 2; max_chunk = 3 }`. A client asks the status first, for `max_chunk`.
+- **Replies:** `PartitionUploadReply { received = 1; complete = 2 }`, and `PartitionUploadStatusReply { received = 1; complete = 2; max_chunk = 3; installing = 4 }`. A client asks the status first, for `max_chunk`.
+  - `complete` holds only while the file is staged: an install renames it away.
+  - `installing` holds while the partition's install marker is staged. The node then takes no upload of the partition, and a file the install already renamed isn't complete. A relocation or a restore run again over an interrupted install therefore sends nothing and goes on to its stamp, which finishes the install (#1848).
 - **A full disk or quota** answers `NoSpace` (`ResourceExhausted`, 507): free space, then resume from the status. Nothing written is lost (cli692's F2).
 - **Accepted only while the partition isn't open on the node,** with one upload of a given file of it at a time, and at most `--max-uploads` (default 1) at once; more are `Overloaded`. A resume must send the same header (`InvalidArgument` otherwise).
 - **Staged, never served:**
@@ -490,7 +502,7 @@ A partition moved by copying its closed files keeps its history, so feed tokens 
 
 **`phdb cluster move P --to ID [--drop-source]`** (`cluster/moving.rs`) runs the whole move against the writer's map, where P is on OLD at epoch `e`:
 1. **Fence and close** P on OLD (skipping what's done), then poll OLD's `Status` until P's `files` are listed. A failed hash is closed again. A close the database itself reported an error for stops the move.
-2. **Copy** each file: `PartitionUploadStatus` on NEW for `received` and `max_chunk`, then `BackupDownload{fenced_file}` from OLD at `received`, re-chunked into `PartitionUpload{RELOCATE, epoch e, manifest = OLD's files}`. The upload id is the first 16 bytes, as hex, of a SHA-256 over the cluster, the partition, `e`, the file's name and its hash. So a rerun resumes its own uploads, and a re-close with other bytes starts new ones. The download's last chunk must carry the listed size and hash.
+2. **Copy** each file: `PartitionUploadStatus` on NEW for `received` and `max_chunk` (nothing is sent for a complete file, or while NEW reports the partition's install in progress: the stamp finishes it), then `BackupDownload{fenced_file}` from OLD at `received`, re-chunked into `PartitionUpload{RELOCATE, epoch e, manifest = OLD's files}`. The upload id is the first 16 bytes, as hex, of a SHA-256 over the cluster, the partition, `e`, the file's name and its hash. So a rerun resumes its own uploads, and a re-close with other bytes starts new ones. The download's last chunk must carry the listed size and hash.
 3. **Stamp** NEW from `e` to `e + 1`. Compare the reply's `files` (the installed set, Q1) with OLD's closed `files`, by name, size and SHA-256. A mismatch stops the move before the map changes. The stamp itself refuses a staged set that doesn't match the manifest it was sent, so no test can produce a mismatch through the API: only `compare`'s unit test covers this check (simp724's N4).
 4. **The map:** `relocate --copy`. Its stamp is a no-op now (the file is at `e + 1`).
 5. **Serving:** poll NEW's `Status` until P is `serving`. A node serves P only at the map's epoch, so the state is enough.
@@ -511,3 +523,17 @@ Nothing is persisted client-side. The report gives the write downtime (fence to 
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.
+
+## Amendment: `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852, 1.3.0)
+Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cluster node answered these three `Unsupported` (the router's catch-all).
+- **`Admin.Flush` and `Admin.Compact`** take `MaintenanceRequest { string partition = 1; }` in place of `Empty`, which is wire-compatible: an old client's empty message decodes as an empty request.
+  - **On a cluster node:** an empty `partition` acts on every partition the map gives the node that's open, serving or fenced (a fenced partition's files still change), one after another: the set `Info` lists, so a copy the map moved away that's still open here isn't one of them. Each is tried even after one fails, and the answer is the first failure's code with every failed partition named in its message. A named one acts on that partition alone: `WrongPartition` for one another node holds, `PartitionUnavailable` for one closed or not open here, and `NotFound` for one the map doesn't list.
+  - **On a single node:** `partition` must be empty (`InvalidArgument`).
+  - **Never forwarded:** each node answers for its own partitions, as a backup does.
+- **`Admin.Info`** gains `repeated PartitionInfo partitions = 7` and `repeated string other_partitions = 8`.
+  - **On a cluster node:** `partitions` lists each partition the map gives the node, in id order. `other_partitions` lists the map's partitions other nodes hold. The top-level fields describe the node: `path` is its cluster directory, `file_bytes` its partitions' files together, `free_bytes` the free space on that directory's disk (0 when no partition is open), and `tables` the map's tables.
+  - **On a single node:** both lists are empty, and the top-level fields are as before.
+- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), `fence_reason = 6` (`FenceReason`), and `awaiting_peers = 7` (bool, 1.3.0, #1829).
+  - The state, fence reason and `awaiting_peers` are as `Cluster.Status` reports them.
+  - `file_bytes` and `tables` are set only for an open partition (serving or fenced).
+  - A partition the map places on the node that it hasn't opened (no file, or a failed open) is `LOCAL_PARTITION_STATE_UNSPECIFIED`.

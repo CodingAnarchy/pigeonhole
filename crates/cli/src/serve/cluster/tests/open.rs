@@ -150,6 +150,155 @@ fn a_partition_opened_while_serving_pins_off_the_others_cores_or_is_refused() {
     );
 }
 
+/// #1762: the sweep after a reapply moves every thread that doesn't refresh itself onto the
+/// blocking mask, and leaves alone the threads that do (registered as they enter) and the
+/// engine's own pins. Linux only; alone in its process, as pin claims are process-wide.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_mask_sweep_moves_other_threads_and_leaves_the_engines_pins() {
+    run_alone(
+        module_path!(),
+        "the_mask_sweep_moves_other_threads_and_leaves_the_engines_pins",
+        mask_sweep_alone,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn mask_sweep_alone() {
+    use crate::serve::placement::Placement;
+    use std::sync::mpsc;
+    let affinity = || -> Vec<usize> {
+        let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+        (0..nix::sched::CpuSet::count())
+            .filter(|&c| set.is_set(c).unwrap_or(false))
+            .collect()
+    };
+    let set_mine = |cpus: &[usize]| {
+        let mut m = nix::sched::CpuSet::new();
+        for &c in cpus {
+            m.set(c).unwrap();
+        }
+        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &m).unwrap();
+    };
+    let all = affinity();
+    let dir = test_dir();
+    let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
+    let shards = p1.pinned_shard_cpus();
+    if shards.is_empty() {
+        println!("skipped: nothing pins here");
+        return;
+    }
+    let placement = Placement::plan(&[&p1], Some(2), Some(2), None, None, true);
+    let Some(blocking) = placement.masks.blocking.clone() else {
+        println!("skipped: too few free cores for a mask");
+        return;
+    };
+    let mut engine_pins = shards.clone();
+    engine_pins.extend(p1.pinned_compaction_cpus());
+    // Every thread's affinity now, by id: the engine's pinned threads among them.
+    let before: Vec<(i32, Vec<usize>)> = std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter_map(|tid: i32| {
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+            let cpus = (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect();
+            Some((tid, cpus))
+        })
+        .collect();
+
+    // Three threads, each set up, then held until the sweep has run:
+    // - `other`, of ours, that never entered (a backup's, say), on every CPU: moved;
+    // - `entered`, which entered as a blocking thread, then widened by hand: left to its
+    //   own refresh();
+    // - `pinned`, on the shard's CPU, as an engine's pin: left alone;
+    // - `stale`, on a mask in force before the reapply that the engine pins now cover whole
+    //   (a narrow host, #1762's own case): moved, though it looks like a pin (perf287's S1
+    //   on #1871). The sweep is told the pins cover one more CPU, `x`, to make that so.
+    let shard = shards[0];
+    let Some(x) = all.iter().copied().find(|c| !engine_pins.contains(c)) else {
+        println!("skipped: no CPU off the engine's pins");
+        return;
+    };
+    let mut stale_mask = vec![shard, x];
+    stale_mask.sort_unstable();
+    let previous = crate::serve::placement::RuntimeMasks {
+        blocking: Some(stale_mask.clone()),
+        ..Default::default()
+    };
+    let mut covering = engine_pins.clone();
+    covering.push(x);
+    let (entered_tid, entered_tid_rx) = mpsc::channel();
+    // Each sets up, waits until all three have, then holds until the sweep has run.
+    let ready = std::sync::Barrier::new(5);
+    let go = std::sync::Barrier::new(5);
+    let (other, entered, pinned, stale, moved) = std::thread::scope(|scope| {
+        let (ready, go, all, placement) = (&ready, &go, &all, &placement);
+        let held = move |setup: &dyn Fn()| {
+            setup();
+            ready.wait();
+            go.wait();
+            affinity()
+        };
+        let other = scope.spawn(move || held(&|| set_mine(all)));
+        let entered_tid = &entered_tid;
+        let entered = scope.spawn(move || {
+            held(&|| {
+                placement.enter();
+                entered_tid.send(nix::unistd::gettid().as_raw()).unwrap();
+                set_mine(all);
+            })
+        });
+        let pinned = scope.spawn(move || held(&|| set_mine(&[shard])));
+        let stale_mask = &stale_mask;
+        let stale = scope.spawn(move || held(&|| set_mine(stale_mask)));
+        ready.wait();
+        let moved = placement.sweep(&covering, &previous);
+        go.wait();
+        (
+            other.join().unwrap(),
+            entered.join().unwrap(),
+            pinned.join().unwrap(),
+            stale.join().unwrap(),
+            moved,
+        )
+    });
+    assert!(
+        moved >= 2,
+        "the unregistered and stale threads moved: {moved}"
+    );
+    assert_eq!(
+        other, blocking,
+        "a thread that doesn't refresh is moved to the blocking mask"
+    );
+    assert_eq!(entered, all, "a thread that refreshes itself is left to it");
+    assert_eq!(pinned, [shard], "an engine-style pin stays");
+    assert_eq!(
+        stale, blocking,
+        "a thread on an old mask the pins now cover is moved, not taken for a pin"
+    );
+    // Once a registered thread exits its ID is forgotten, since Linux reuses IDs.
+    let tid = entered_tid_rx.recv().unwrap();
+    assert!(
+        !placement.is_registered(tid),
+        "an exited thread's ID {tid} is no longer registered"
+    );
+    // The engine's own pinned threads (D235) are as they were.
+    for (tid, cpus) in before
+        .iter()
+        .filter(|(_, c)| c.iter().all(|x| engine_pins.contains(x)))
+    {
+        if let Ok(set) = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(*tid)) {
+            let now: Vec<usize> = (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect();
+            assert_eq!(&now, cpus, "engine thread {tid}'s pin is unchanged");
+        }
+    }
+    p1.close().unwrap();
+}
+
 #[cfg(target_os = "linux")]
 fn opened_off_the_others_cores_alone() {
     use crate::serve::placement::{Placement, siblings};
@@ -188,6 +337,7 @@ fn opened_off_the_others_cores_alone() {
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
@@ -218,12 +368,12 @@ fn opened_off_the_others_cores_alone() {
     );
     map.map_version = 2;
     map.partitions.extend([part("p3"), part("p4")]);
-    let shared = node.opener.get().unwrap().shared.upgrade().unwrap();
+    let shared = node.server.get().unwrap().shared.upgrade().unwrap();
     // p1's feed side on runtimes of its own, entered as the server's are but with no park or
     // unpark hooks, so only the hub's and delivery's own refreshes can move them (perf287's
     // P1 on #1755: a busy hub may never park).
     let feed_rt = {
-        let p = Arc::clone(&node.opener.get().unwrap().placement);
+        let p = Arc::clone(&node.server.get().unwrap().placement);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("phdb-test-feed")
@@ -233,7 +383,7 @@ fn opened_off_the_others_cores_alone() {
             .unwrap()
     };
     let hub_rt = {
-        let p = Arc::clone(&node.opener.get().unwrap().placement);
+        let p = Arc::clone(&node.server.get().unwrap().placement);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("phdb-test-hub")
@@ -305,7 +455,7 @@ fn opened_off_the_others_cores_alone() {
     };
     // A thread of the server's own, on the free cores before p3 opens: it takes the mask
     // the open reapplies at its next refresh.
-    let placement = Arc::clone(&node.opener.get().unwrap().placement);
+    let placement = Arc::clone(&node.server.get().unwrap().placement);
     let (go, wait) = std::sync::mpsc::channel::<()>();
     let worker = {
         let placement = Arc::clone(&placement);
@@ -319,6 +469,50 @@ fn opened_off_the_others_cores_alone() {
                 .collect::<Vec<usize>>()
         })
     };
+    // Every thread's CPUs, by thread ID.
+    let tasks = || -> Vec<(i32, Vec<usize>)> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter_map(|tid: i32| {
+                let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+                let cpus = (0..nix::sched::CpuSet::count())
+                    .filter(|&c| set.is_set(c).unwrap_or(false))
+                    .collect();
+                Some((tid, cpus))
+            })
+            .collect()
+    };
+    // The open's mask sweep, through the open path (simp724's S2 on #1871): a plain thread
+    // that never entered, on the process's CPUs, is moved to the new blocking mask, while
+    // p1's shard threads and p3's own keep their pins.
+    let (plain_go, plain_wait) = std::sync::mpsc::channel::<()>();
+    let (plain_ready, plain_readied) = std::sync::mpsc::channel::<()>();
+    let plain = {
+        let process = process.clone();
+        std::thread::spawn(move || {
+            let mut m = nix::sched::CpuSet::new();
+            for &c in &process {
+                m.set(c).unwrap();
+            }
+            nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &m).unwrap();
+            plain_ready.send(()).unwrap();
+            plain_wait.recv().unwrap();
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+            (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect::<Vec<usize>>()
+        })
+    };
+    plain_readied.recv().unwrap();
+    let p1_shards: Vec<(i32, Vec<usize>)> = tasks()
+        .into_iter()
+        .filter(|(_, cpus)| cpus.len() == 1 && held.contains(&cpus[0]))
+        .collect();
+    assert!(
+        !p1_shards.is_empty(),
+        "p1's shard thread pinned to {held:?}"
+    );
     rt.block_on(async {
         client(port)
             .await
@@ -370,6 +564,24 @@ fn opened_off_the_others_cores_alone() {
         };
         go.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), blocking);
+        // The sweep ran before p3 became visible: the plain thread is on the blocking mask
+        // already, and every engine pin stayed.
+        plain_go.send(()).unwrap();
+        assert_eq!(
+            plain.join().unwrap(),
+            blocking,
+            "a thread that never entered moves to the new blocking mask at the open"
+        );
+        let after = tasks();
+        for (tid, cpus) in &p1_shards {
+            if let Some((_, now)) = after.iter().find(|(t, _)| t == tid) {
+                assert_eq!(now, cpus, "p1's shard thread {tid} keeps its pin");
+            }
+        }
+        assert!(
+            after.iter().any(|(_, cpus)| *cpus == new),
+            "p3's shard thread keeps its pin on {new:?}"
+        );
         // The feed side's thread, busy delivering p1's commits (with one client the hub
         // reads on the feed runtime too, #1689), takes the new mask by its own refresh.
         let feed = now.feed.clone().unwrap_or_else(|| process.clone());
@@ -390,6 +602,149 @@ fn opened_off_the_others_cores_alone() {
     });
     drop(shared);
     drop(stop);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// #1888: a partition opened while serving confines its compaction to the node's compaction
+/// CPUs: the start's reserved set; else the open partitions' own; else nothing to confine
+/// to (a node that held none, or no pinning), and it's placed as a start would.
+#[test]
+fn a_run_time_open_confines_its_compaction_to_the_nodes_compaction_cpus() {
+    use super::super::open::confine_compaction;
+    // Several partitions at start: their reserved set, whatever the open ones pin.
+    assert_eq!(
+        confine_compaction(Some(&[16, 17]), [vec![16], vec![17]].into_iter()),
+        Some(vec![16, 17])
+    );
+    // One at start: its pinned compaction CPUs.
+    assert_eq!(
+        confine_compaction(None, [vec![9, 8], vec![]].into_iter()),
+        Some(vec![8, 9])
+    );
+    // None open, or nothing pinned (or `--compaction-threads 0`, simp724's case: no
+    // compaction CPUs to confine to, and the share gives the new partition no threads).
+    assert_eq!(confine_compaction(None, std::iter::empty()), None);
+    assert_eq!(confine_compaction(None, [vec![], vec![]].into_iter()), None);
+    // `--compaction-threads 0` splits no threads to the new partition, so it has none to
+    // place, confined or not.
+    let shares = crate::serve::placement::split(4, 0, 3);
+    assert!(shares.iter().all(|s| s.compaction == 0));
+}
+
+/// #1761: a run-time open on a node started with `--engine-memory` and room for caches
+/// succeeds. The open partition's caches shrink to the two-way share, and its memtables stay
+/// as opened. A failed open puts them back, and a close grows them back to the start's split.
+#[test]
+fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
+    use crate::serve::placement::{Memory, resplit};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = test_dir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let part = |id: &str| Partition {
+        id: id.into(),
+        node: "a".into(),
+        epoch: 1,
+        memory_bytes: 0,
+        history_epoch: 0,
+    };
+    let mut map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: vec![MapNode {
+            id: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+        }],
+        partitions: vec![part("p1")],
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: Vec::new(),
+            partitions: vec!["p1".into()],
+            created: 0,
+        }],
+        previous_nodes: Vec::new(),
+    };
+    super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+    // One 1-shard partition: 64 MiB of memtables and 448 MiB of caches.
+    const BUDGET: u64 = 512 << 20;
+    let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
+    let (stop, dbs, node) = data_node_placed(
+        &rt,
+        &dir,
+        "a",
+        vec![("p1", Some(p1.clone()))],
+        listener,
+        "",
+        crate::serve::server_tests::limits(),
+        false,
+        crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
+        Some(BUDGET),
+    );
+    let shared = node.server.get().unwrap().shared.upgrade().unwrap();
+    let memory_of = |id: &str| {
+        shared
+            .router
+            .partition(id)
+            .unwrap()
+            .engine_memory()
+            .unwrap()
+    };
+    let start = memory_of("p1");
+    assert_eq!((start.memtables(), start.bytes()), (64 << 20, BUDGET));
+    let (kept, new) = resplit(BUDGET, &[(start, 0)], Some((1, 0))).unwrap();
+    let (kept, new): (Memory, Memory) = (kept[0], new.unwrap());
+    map.map_version = 2;
+    map.partitions.push(part("p3"));
+    rt.block_on(async {
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(map),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // p3's file isn't here yet: the open fails after p1's caches shrank, and they're
+        // put back.
+        let e = node.open_part("p3").await.unwrap_err();
+        assert_ne!(e.code, "Ok", "{}", e.message);
+        assert_eq!(memory_of("p1"), start, "a failed open restores the caches");
+        assert_eq!(
+            p1.cache_capacities().0,
+            usize::try_from(start.block_cache).unwrap()
+        );
+        // With its file, the open succeeds: p1 shrinks to the two-way share.
+        test_partition_with(&dir, "p3", pigeonhole::Options::default().shards(1))
+            .close()
+            .unwrap();
+        node.open_part("p3").await.unwrap();
+        assert_eq!(memory_of("p1"), kept);
+        assert_eq!(kept.memtables(), start.memtables(), "memtables as opened");
+        assert!(kept.caches() < start.caches());
+        assert_eq!(
+            p1.cache_capacities().0,
+            usize::try_from(kept.block_cache).unwrap()
+        );
+        assert_eq!(memory_of("p3"), new);
+        assert!(memory_of("p1").bytes() + memory_of("p3").bytes() <= BUDGET);
+        // A close of p3 (fenced since its open: nothing confirmed it) gives p1 its share
+        // back.
+        node.close("p3").await.unwrap();
+        assert_eq!(memory_of("p1"), start, "the start's split again");
+        assert_eq!(
+            p1.cache_capacities().0,
+            usize::try_from(start.block_cache).unwrap()
+        );
+    });
+    drop(shared);
+    drop(node);
+    let _ = stop.send(());
     for db in dbs {
         let _ = db.close();
     }
@@ -416,6 +771,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
@@ -819,7 +1175,15 @@ fn a_table_created_while_another_partition_opens_keeps_its_rows() {
 /// lands, and must serve p3 once released.
 #[test]
 fn a_partition_opened_on_the_writer_serves_though_another_map_lands_before_its_confirm() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Bounded (#1865): it hung on CI when its hold stopped a runtime worker, and `eventually`
+    // bounds only how often it asks, not a call that never answers.
+    bounded(Duration::from_secs(120), || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        another_map_lands_before_the_confirm(&rt);
+    });
+}
+
+fn another_map_lands_before_the_confirm(rt: &tokio::runtime::Runtime) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -839,7 +1203,7 @@ fn a_partition_opened_on_the_writer_serves_though_another_map_lands_before_its_c
             .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
     {
         super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        let (stop, db) = data_node_tokens(rt, dir, id, local, l, "");
         stops.push(stop);
         dbs.extend(db);
     }

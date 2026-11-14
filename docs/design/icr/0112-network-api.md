@@ -268,3 +268,16 @@ The design is on #1567, with cli692's review (D1, D2).
   - **One partition:** a one-partition subscription, or `checkpoint_every: 1`, carries a token on every event, as a single node does.
   - **SSE:** an event without a token is sent without an `id:` line, so an SSE client's `Last-Event-ID` stays at the last checkpoint and its native reconnect resumes there.
 - **A cluster token isn't a single node's,** and neither resumes the other (`InvalidArgument`).
+
+## Amendment: `ReplicationBatch.catalog_digest` (#1853)
+**Status:** Approved by the coordinator (field number 4 in `.coord/numbers.md`). It is additive and wire-compatible.
+
+- **`ReplicationBatch.catalog_digest` (4, `optional uint64`):** the digest of the primary's catalog at the position the batch ends at. It covers the catalog's table ids (but a replica's state table) and its id counters, as the primary's feed of every table has them (D325's model).
+- **What the replica does with it:**
+  - Once it has applied every event up to the batch's end, it compares the digest with its own catalog's. That holds for a replica bootstrapped from a copy, as `phdb serve`'s always is: its id counters are the primary's. A replica the library starts empty at its first apply never matches, since its counters miss every id allocated before it, so the check isn't for that mode (feed1248's N2 on #1878).
+  - A different digest means a schema change the primary's feed never delivered: one made while the primary ran 1.1.x after a rollback, which a 1.2.x-era replica's token can't catch. The replica then bootstraps again.
+  - It doesn't compare while events from the batch are still unapplied.
+  - A mismatch on a copy just bootstrapped, before any digest has matched, can't be a missed schema change: no 1.1.x session runs under a serving primary between a copy and its batches. The replica then retries with backoff instead of copying again, and reports both digests (cli692's S1 on #1878). The one case it can't tell apart, a primary rolled back between the copy and its first match, is left to the operator: the error says to restart the replica, which starts confirmed and so takes a new copy.
+- **Across versions:**
+  - A 1.2.x primary doesn't send the field, and the replica skips the check.
+  - A 1.2.x replica ignores the field.

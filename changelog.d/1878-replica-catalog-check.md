@@ -1,0 +1,2 @@
+### Fixed
+- `phdb serve --replica-of`: a replica whose tables are no longer its primary's bootstraps again, even when no apply is refused. This covers a table dropped, or created but not yet written to, while the primary was rolled back to 1.1.x. The primary sends its catalog's digest with each batch (`ReplicationBatch.catalog_digest`), and the replica compares it with its own once it has caught up (#1853).

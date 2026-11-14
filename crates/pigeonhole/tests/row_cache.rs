@@ -656,3 +656,113 @@ fn by_default_gets_fill_nothing_but_are_served_from_cached_rows() {
     drop(t);
     db.close().unwrap();
 }
+
+/// #1761 (simp724's S4): reads stay right across a shrink and a grow of the caches
+/// (`set_cache_capacities`, serve's re-split of a node's memory). Rows cached before a
+/// shrink are evicted or kept, never served stale. Writes during the small cache are seen.
+/// After a grow, rows refill and hit again, and a commit moves a cached row forward as before
+/// (D290).
+///
+/// Hit counts are bounds, not exact: the row cache's hint tables are indexed by a tag that
+/// includes a row's write epoch, hashed with a per-engine random seed, so two of the 64 rows
+/// can share a slot (and rewriting a row moves it to another slot), and a shared slot is a
+/// false miss (D201: never a wrong row). The exact checks are that every read equals what
+/// was written.
+#[test]
+fn reads_stay_right_across_a_cache_shrink_and_grow() {
+    let vfs = SimVfs::new(1761);
+    let db = Pigeonhole::open("/db/rc-resize.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    let rows: Vec<Vec<u8>> = (0..64).map(|i| format!("r{i:02}").into_bytes()).collect();
+    for (i, r) in rows.iter().enumerate() {
+        t.mutate(r)
+            .put("f", b"a", format!("v{i}").as_bytes())
+            .put("f", b"b", &[b'x'; 200])
+            .commit()
+            .unwrap();
+    }
+    let read = |r: &[u8]| cells(t.row(r).family("f").read().unwrap().map(|r| r.to_owned()));
+    let mut want: Vec<Cells> = rows.iter().map(|r| read(r)).collect();
+    // A second read fills each row, and a third hits.
+    for r in &rows {
+        read(r);
+    }
+    let s = db.row_cache_stats();
+    for (r, w) in rows.iter().zip(&want) {
+        assert_eq!(&read(r), w);
+    }
+    let at_least = rows.len() as u64 * 3 / 4;
+    assert!(
+        delta(&db, s).0 >= at_least,
+        "the rows are cached: {:?}",
+        delta(&db, s)
+    );
+    let (block, row) = db.cache_capacities();
+    assert_eq!(row, 1 << 20);
+
+    // Shrink both to a few rows' worth.
+    db.set_cache_capacities(64 << 10, 2 << 10);
+    assert_eq!(db.cache_capacities(), (64 << 10, 2 << 10));
+    // Every read is still right, and most now miss.
+    let s = db.row_cache_stats();
+    for (r, w) in rows.iter().zip(&want) {
+        assert_eq!(&read(r), w);
+    }
+    assert!(
+        delta(&db, s).1 > rows.len() as u64 / 2,
+        "most rows were evicted: {:?}",
+        delta(&db, s)
+    );
+    // Writes during the small cache are seen.
+    for (i, r) in rows.iter().enumerate().step_by(3) {
+        t.mutate(r)
+            .put("f", b"a", format!("w{i}").as_bytes())
+            .commit()
+            .unwrap();
+        want[i] = read(r);
+        assert_eq!(want[i][0].3, format!("w{i}").as_bytes());
+    }
+    for (r, w) in rows.iter().zip(&want) {
+        assert_eq!(&read(r), w);
+    }
+
+    // Grow back: rows refill and hit again.
+    db.set_cache_capacities(block, row);
+    assert_eq!(db.cache_capacities(), (block, row));
+    for _ in 0..2 {
+        for r in &rows {
+            read(r);
+        }
+    }
+    let s = db.row_cache_stats();
+    for (r, w) in rows.iter().zip(&want) {
+        assert_eq!(&read(r), w);
+    }
+    assert!(
+        delta(&db, s).0 >= at_least,
+        "the rows are cached again after the grow: {:?}",
+        delta(&db, s)
+    );
+    // A commit to a cached cell moves the row forward (D290): the next read sees it, and
+    // hits unless the row's new tag shares a hint slot (then it misses and refills, as
+    // #918's test allows). One of a few rows hits.
+    let moved_forward = rows.iter().take(4).enumerate().any(|(i, r)| {
+        let v = format!("z{i}");
+        t.mutate(r).put("f", b"a", v.as_bytes()).commit().unwrap();
+        let s = db.row_cache_stats();
+        assert_eq!(read(r)[0].3, v.as_bytes(), "the write is seen");
+        match delta(&db, s) {
+            (1, 0, 0) => true,
+            d => {
+                assert_eq!(d.0, 0, "a hit or a miss, never both: {d:?}");
+                false
+            }
+        }
+    });
+    assert!(
+        moved_forward,
+        "no row of four was moved forward and hit after the grow"
+    );
+    drop(t);
+    db.close().unwrap();
+}

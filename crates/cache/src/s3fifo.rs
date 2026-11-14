@@ -43,7 +43,7 @@ use crate::Priority;
 use crate::hash::BuildKeyHasher;
 use std::sync::atomic::Ordering;
 
-use crate::sync::{Arc, AtomicU8, AtomicU64, RwLock, lock};
+use crate::sync::{Arc, AtomicU8, AtomicU64, AtomicUsize, Mutex, RwLock, lock};
 
 /// Maximum hit count per priority: S3-FIFO's 2 bits for `Normal`, one life for `Low`, and
 /// more lives for `High`, so a hot `High` block outlasts an equally hot `Normal` one in main.
@@ -341,6 +341,14 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         self.usage
     }
 
+    /// Sets the shard's capacity (and its small queue's share of it), evicting nothing:
+    /// [`Sharded::set_capacity`] evicts down to it in batches, outside the lock between them
+    /// (#1761, simp724's S1).
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        self.small_target = capacity / (100 / SMALL_PERCENT);
+    }
+
     /// Eviction passes that stopped early with a full [`Taken`] ([`TAKEN_MAX`]).
     pub(crate) fn deferred_evictions(&self) -> u64 {
         self.deferred_evictions
@@ -381,6 +389,15 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
     }
 
     fn evict(&mut self, taken: &mut Taken<V>) {
+        if self.evict_pass(taken) {
+            self.deferred_evictions += 1;
+        }
+    }
+
+    /// Evicts down to capacity, or until `taken` is full: then it returns true, with the
+    /// shard still over capacity. False when it got under capacity, or can make no further
+    /// progress (every entry left pinned).
+    fn evict_pass(&mut self, taken: &mut Taken<V>) -> bool {
         // A pinned entry is rotated to its queue's tail; once a whole queue has been skipped
         // without any progress, stop using it. Progress is an eviction or anything else that
         // changes what a later pass finds (aging, promotion, dropping a stale entry); each of
@@ -390,8 +407,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         let mut skipped_main = 0;
         while self.usage > self.capacity {
             if taken.is_full() {
-                self.deferred_evictions += 1;
-                break;
+                return true;
             }
             let small_ok = !self.small.is_empty() && skipped_small < self.small.len();
             let main_ok = !self.main.is_empty() && skipped_main < self.main.len();
@@ -419,6 +435,7 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
                 }
             }
         }
+        false
     }
 
     fn evict_small(&mut self, taken: &mut Taken<V>) -> Step {
@@ -515,10 +532,23 @@ pub(crate) struct Padded<K, V> {
     pub(crate) lock: RwLock<Shard<K, V>>,
 }
 
+/// Shard `i`'s part of `capacity` over `n` shards: equal, the remainder one byte each to the
+/// first.
+fn share(capacity: usize, n: usize, i: usize) -> usize {
+    capacity / n + usize::from(i < capacity % n)
+}
+
 /// A fixed set of shards, picked by key hash.
 pub(crate) struct Sharded<K, V> {
     shards: Box<[Padded<K, V>]>,
-    capacity: usize,
+    /// The shards' capacities together: read without a lock (the block cache's pinned-bytes
+    /// thresholds, metrics), changed only by [`Sharded::set_capacity`] (#1761). Stored before
+    /// the shards are resized, so it leads them while a resize runs.
+    capacity: AtomicUsize,
+    /// Held across a whole [`Sharded::set_capacity`], so two resizes can't interleave their
+    /// per-shard passes and leave the shards at a mix of both totals (perf2's S1 on #1890).
+    /// Off the get and insert paths.
+    resizing: Mutex<()>,
 }
 
 impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
@@ -539,20 +569,22 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
             .map(|i| Padded {
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
-                lock: RwLock::new(Shard::new(
-                    capacity / n + usize::from(i < capacity % n),
-                    entry_hint,
-                )),
+                lock: RwLock::new(Shard::new(share(capacity, n, i), entry_hint)),
             })
             .collect();
-        Self { shards, capacity }
+        Self {
+            shards,
+            capacity: AtomicUsize::new(capacity),
+            resizing: Mutex::new(()),
+        }
     }
 
     /// No shards: stores nothing.
     pub(crate) fn empty() -> Self {
         Self {
             shards: Box::new([]),
-            capacity: 0,
+            capacity: AtomicUsize::new(0),
+            resizing: Mutex::new(()),
         }
     }
 
@@ -608,7 +640,46 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
     }
 
     pub(crate) fn capacity(&self) -> usize {
-        self.capacity
+        self.capacity.load(Ordering::Relaxed)
+    }
+
+    /// Resizes to `capacity` bytes over the same shards, each its share as at
+    /// [`new`](Self::new) (#1761: a node re-splitting its engine memory as partitions open and
+    /// close). A shard over its new share evicts down to it in passes of at most
+    /// [`TAKEN_MAX`] entries, its lock released and the taken values dropped between them, so
+    /// a large shrink never holds one shard's lock for the whole eviction (simp724's S1). It
+    /// returns once every shard is at or under its share, or holds only pinned entries over
+    /// it: those stay until their handles drop, as at any capacity. A grow evicts nothing.
+    /// No shards (a disabled cache): nothing changes. Concurrent resizes run one after the
+    /// other, the last to take the lock deciding the capacity.
+    pub(crate) fn set_capacity(&self, capacity: usize) {
+        let n = self.shards.len();
+        if n == 0 {
+            return;
+        }
+        let _one = self
+            .resizing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.capacity.store(capacity, Ordering::Relaxed);
+        for (i, s) in self.shards.iter().enumerate() {
+            let mut first = true;
+            loop {
+                // Declared before the guard, so the values drop after it (#1559).
+                let mut taken = Taken::new();
+                let mut shard = lock(&s.lock);
+                if first {
+                    shard.set_capacity(share(capacity, n, i));
+                    first = false;
+                }
+                let more = shard.evict_pass(&mut taken);
+                drop(shard);
+                drop(taken);
+                if !more {
+                    break;
+                }
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -815,5 +886,162 @@ mod tests {
         let mut total = 0;
         s.for_each(|sh, _| total += sh.capacity);
         assert_eq!(total, 10);
+    }
+
+    /// A `Sharded` of `shards` shards and `cap` bytes, filled with `entries` 10-byte entries
+    /// (keys 0..entries), none pinned.
+    fn filled(cap: usize, shards: usize, entries: u32) -> Sharded<u32, Vec<u8>> {
+        let s: Sharded<u32, Vec<u8>> = Sharded::new(cap, shards, 1, 0);
+        for k in 0..entries {
+            let mut taken = Taken::new();
+            let h = crate::hash::hash_of(&k);
+            let shard = s.shard(h).unwrap();
+            lock(shard).insert(k, Arc::new(vec![0; 10]), 10, Priority::Normal, &mut taken);
+        }
+        s
+    }
+
+    /// #1761 (simp724's S1): a shrink far past one pass's `TAKEN_MAX` evicts every shard down
+    /// to its new share before it returns, in passes that are not counted as deferred.
+    #[test]
+    fn a_shrink_evicts_every_shard_down_to_its_share_in_passes() {
+        let entries = n(2000);
+        // Room for every entry however the keys hash over the shards.
+        let s = filled(40 * entries as usize, 4, entries);
+        assert_eq!(s.usage(), 10 * entries as usize);
+        let deferred = s.deferred_evictions();
+        // About a quarter of the entries per shard, down to 2 or 3: many passes each.
+        s.set_capacity(100);
+        assert_eq!(s.capacity(), 100);
+        let mut caps = Vec::new();
+        s.for_each(|sh, _| {
+            assert!(
+                sh.usage() <= sh.capacity,
+                "{} over {}",
+                sh.usage(),
+                sh.capacity
+            );
+            caps.push(sh.capacity);
+        });
+        assert_eq!(caps, [25, 25, 25, 25], "each shard its share");
+        assert!(s.usage() <= 100);
+        assert_eq!(
+            s.deferred_evictions(),
+            deferred,
+            "a resize's passes aren't deferrals"
+        );
+    }
+
+    /// #1761 (simp724's S2): the small queue's target follows the capacity.
+    #[test]
+    fn a_resize_recomputes_the_small_target() {
+        let s: Sharded<u32, Vec<u8>> = Sharded::new(1000, 1, 1, 0);
+        s.set_capacity(5000);
+        s.for_each(|sh, _| assert_eq!((sh.capacity, sh.small_target), (5000, 500)));
+        s.set_capacity(100);
+        s.for_each(|sh, _| assert_eq!((sh.capacity, sh.small_target), (100, 10)));
+    }
+
+    /// #1761 (simp724's S2): an entry larger than the new capacity is evicted with the rest,
+    /// and one inserted afterwards isn't cached, as for any oversized entry.
+    #[test]
+    fn a_shrink_below_an_entry_evicts_it_and_a_later_one_isnt_cached() {
+        let s: Sharded<u32, Vec<u8>> = Sharded::new(1000, 1, 1, 0);
+        let shard = s.shard(0).unwrap();
+        let mut taken = Taken::new();
+        lock(shard).insert(1, Arc::new(vec![0; 500]), 500, Priority::Normal, &mut taken);
+        drop(taken);
+        s.set_capacity(100);
+        assert!(
+            lock(shard).peek(&1).is_none(),
+            "the 500-byte entry is evicted"
+        );
+        assert_eq!(s.usage(), 0);
+        let mut taken = Taken::new();
+        lock(shard).insert(2, Arc::new(vec![0; 500]), 500, Priority::Normal, &mut taken);
+        assert!(lock(shard).peek(&2).is_none(), "nor is a new one cached");
+    }
+
+    /// #1761: a shrink can't evict what's pinned; those entries stay over the new share until
+    /// their handles drop, and the resize returns rather than spinning on them.
+    #[test]
+    fn a_shrink_stops_at_pinned_entries() {
+        let s: Sharded<u32, Vec<u8>> = Sharded::new(1000, 1, 1, 0);
+        let shard = s.shard(0).unwrap();
+        let mut held = Vec::new();
+        for k in 0..10u32 {
+            let v = Arc::new(vec![0u8; 50]);
+            held.push(Arc::clone(&v));
+            let mut taken = Taken::new();
+            lock(shard).insert(k, v, 50, Priority::Normal, &mut taken);
+        }
+        for k in 10..20u32 {
+            let mut taken = Taken::new();
+            lock(shard).insert(k, Arc::new(vec![0u8; 50]), 50, Priority::Normal, &mut taken);
+        }
+        assert_eq!(s.usage(), 1000);
+        s.set_capacity(100);
+        assert_eq!(s.usage(), 500, "only the ten pinned entries are left");
+        drop(held);
+        // The next change evicts down to the new capacity.
+        let mut taken = Taken::new();
+        lock(shard).insert(
+            99,
+            Arc::new(vec![0u8; 10]),
+            10,
+            Priority::Normal,
+            &mut taken,
+        );
+        drop(taken);
+        assert!(s.usage() <= 100, "usage {}", s.usage());
+    }
+
+    /// #1761: a grow evicts nothing, and the cache fills to the new capacity.
+    #[test]
+    fn a_grow_keeps_everything_and_fills_further() {
+        let s = filled(500, 1, 100);
+        assert_eq!(s.usage(), 500);
+        s.set_capacity(2000);
+        assert_eq!(s.usage(), 500, "nothing evicted");
+        let shard = s.shard(0).unwrap();
+        for k in 100..300u32 {
+            let mut taken = Taken::new();
+            lock(shard).insert(k, Arc::new(vec![0; 10]), 10, Priority::Normal, &mut taken);
+        }
+        assert_eq!(s.usage(), 2000);
+    }
+
+    /// perf2's S1 on #1890: two resizes at once end at one of the two totals, every shard at
+    /// its share of it, never a mix.
+    #[test]
+    fn concurrent_resizes_end_at_one_total() {
+        for _ in 0..n(200) {
+            let s = Arc::new(filled(4000, 4, 100));
+            let (a, b) = (Arc::clone(&s), Arc::clone(&s));
+            let one = std::thread::spawn(move || a.set_capacity(400));
+            let two = std::thread::spawn(move || b.set_capacity(2000));
+            one.join().unwrap();
+            two.join().unwrap();
+            let total = s.capacity();
+            assert!(total == 400 || total == 2000, "{total}");
+            let mut sum = 0;
+            s.for_each(|sh, _| {
+                assert_eq!(
+                    sh.capacity,
+                    total / 4,
+                    "every shard at its share of {total}"
+                );
+                sum += sh.capacity;
+            });
+            assert_eq!(sum, total);
+        }
+    }
+
+    /// A disabled (shardless) cache stays disabled.
+    #[test]
+    fn a_resize_of_no_shards_changes_nothing() {
+        let s: Sharded<u32, Vec<u8>> = Sharded::empty();
+        s.set_capacity(1 << 20);
+        assert_eq!(s.capacity(), 0);
     }
 }

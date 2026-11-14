@@ -128,6 +128,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
     ClusterMap {
         cluster_id: "c1".into(),
         map_version: version,
+        previous_nodes: Vec::new(),
         nodes: ["a", "b", "c"]
             .iter()
             .zip(ports)
@@ -196,6 +197,28 @@ async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("{what}: never happened");
+}
+
+/// Runs `test` on a thread of its own and fails if it isn't done within `limit`, so a test
+/// that would hang (a call that never answers, a stuck runtime) fails instead (#1865). A
+/// panic in `test` is the test's.
+fn bounded(limit: Duration, test: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let body = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(limit) {
+        Ok(()) => body.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = body.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the test didn't finish within {limit:?}")
+        }
+    }
 }
 
 #[test]
@@ -1166,23 +1189,19 @@ fn data_node_placed(
         feed_runtimes: std::sync::OnceLock::new(),
     });
     // Partitions a map gives it while it serves open as `run` has them.
-    super::open::attach_opener(
+    super::open::attach(
         &node,
-        super::open::Opener {
+        super::open::Server {
             shared: Arc::downgrade(&shared),
             placement: Arc::new(placement),
             backups: Arc::clone(&backups),
-            options: Box::new(|share, _| {
-                pigeonhole::Options::default()
-                    .default_shards(share.shards)
-                    .compaction_cores(share.compaction)
-            }),
+            served: pigeonhole::Options::default(),
             shards: 1,
             compaction: 0,
             engine_memory,
+            reserved: None,
         },
     );
-    super::schema::attach(&node, &shared);
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
     let start = if restart {
         super::start_sync(&node, node.get_map().map_or(0, |m| m.map_version))
@@ -2444,6 +2463,32 @@ fn three_nodes_held(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
+    three_nodes_at(rt, inflight, hold, &[test_dir(), test_dir(), test_dir()])
+}
+
+/// [`three_nodes`] in `dirs`, a's, b's and c's, for a test that arms a seam keyed by a
+/// node's directory.
+fn three_nodes_in(
+    rt: &tokio::runtime::Runtime,
+    dirs: &[PathBuf; 3],
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
+    three_nodes_at(rt, 256 << 20, false, dirs)
+}
+
+fn three_nodes_at(
+    rt: &tokio::runtime::Runtime,
+    inflight: usize,
+    hold: bool,
+    dirs: &[PathBuf; 3],
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<u16>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -2454,13 +2499,13 @@ fn three_nodes_held(
     let map = three_way(&[ports[0], ports[1], ports[2]]);
     let mut stops = Vec::new();
     let mut dbs = Vec::new();
-    for ((l, id), p) in listeners
+    for (((l, id), p), dir) in listeners
         .into_iter()
         .zip(["a", "b", "c"])
         .zip(["p1", "p2", "p3"])
+        .zip(dirs)
     {
-        let dir = test_dir();
-        super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
+        super::write_map(dir, &super::map::canonical_json(&map)).unwrap();
         // Room for the stalled-stream test's scans: each holds a slot on its entry node and
         // one on the partition's.
         let limits = crate::serve::config::Limits {
@@ -2472,7 +2517,7 @@ fn three_nodes_held(
             hold_after_part_page: hold,
             ..crate::serve::server_tests::limits()
         };
-        let (stop, db) = data_node_with(rt, &dir, id, Some(p), l, limits);
+        let (stop, db) = data_node_with(rt, dir, id, Some(p), l, limits);
         stops.push(stop);
         dbs.push(db.unwrap());
     }
@@ -3665,6 +3710,7 @@ fn split_nodes(
     let map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: ports
             .iter()
             .enumerate()
@@ -4439,6 +4485,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
     });
 }
 
+mod admin;
 mod backup;
 mod charge;
 mod close;

@@ -263,7 +263,7 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
         // (cli692's S1); --force lifts it anyway.
         let e = unfence(ports[0], "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
-        assert!(e.message().contains("no peer's map"), "{e}");
+        assert!(e.message().contains("not a majority"), "{e}");
         let lp = client(ports[0])
             .await
             .unfence(PartitionRequest {
@@ -477,7 +477,7 @@ fn an_operators_fence_lifts_only_once_a_peers_map_confirms_it() {
     t.rt.block_on(async {
         let e = unfence(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
-        assert!(e.message().contains("no peer's map"), "{e}");
+        assert!(e.message().contains("not a majority"), "{e}");
         assert_eq!(state(a, "p1").await, LocalPartitionState::Fenced);
         let lp = client(a)
             .await
@@ -645,4 +645,403 @@ fn a_refused_unfence_leaves_a_closed_partition_closed() {
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert_eq!(state(a, "p1").await, LocalPartitionState::Closed);
     });
+}
+
+/// Nodes a (p1), b (p2) and c (none), as `data_node_placed` serves them, with their `Node`s:
+/// for a test that reaches into a node (its install lock, its reconciles).
+struct Served {
+    rt: tokio::runtime::Runtime,
+    ports: [u16; 3],
+    nodes: Vec<Arc<Node>>,
+    stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    dbs: Vec<pigeonhole::Pigeonhole>,
+}
+
+impl Served {
+    fn start() -> Self {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listeners: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+        let mut map = the_map(1, &ports);
+        map.partitions.retain(|p| p.id != "p3");
+        let mut stops = Vec::new();
+        let mut dbs = Vec::new();
+        let mut nodes = Vec::new();
+        for (l, (id, local)) in
+            listeners
+                .into_iter()
+                .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+        {
+            let dir = test_dir();
+            super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+            let (stop, db, node) = data_node_placed(
+                &rt,
+                &dir,
+                id,
+                local.map(|p| (p, None)).into_iter().collect(),
+                l,
+                "",
+                crate::serve::server_tests::limits(),
+                false,
+                crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
+                None,
+            );
+            stops.push(stop);
+            dbs.extend(db);
+            nodes.push(node);
+        }
+        Self {
+            rt,
+            ports,
+            nodes,
+            stops,
+            dbs,
+        }
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.stops.clear();
+        for db in self.dbs.drain(..) {
+            let _ = db.close();
+        }
+    }
+}
+
+#[test]
+fn a_map_older_than_the_newest_reconciled_isnt_reconciled() {
+    // #1848: `reconcile_locked`'s refusal (audit120's F6). Under `installing`, a map older
+    // than the newest one reconciled here is passed over, since it would drop the tables
+    // created since; one as new or newer is reconciled. No production path hands it an
+    // older map today: it's the guard if one ever does. Seen in the version each reconcile
+    // records for a's p1 (what `Status` reports as its reconciled version).
+    let t = Served::start();
+    let a = &t.nodes[0];
+    let base = a.get_map().unwrap();
+    let map = |v: u64| ClusterMap {
+        map_version: v,
+        ..base.clone()
+    };
+    let reconciled = || a.reconciled.lock().unwrap().get("p1").map(|(v, _)| *v);
+    let installing = a.installing.lock().unwrap();
+    let mut seen = Vec::new();
+    for v in [3, 2, 3, 4, 1] {
+        a.reconcile_locked(&installing, &map(v), None);
+        seen.push(reconciled());
+    }
+    drop(installing);
+    assert_eq!(seen, [Some(3), Some(3), Some(3), Some(4), Some(4)]);
+}
+
+#[test]
+fn an_unfence_lifts_the_gate_only_under_the_install_lock() {
+    // #1848: the unfence reconciles the partition to the node's map and lifts its gate under
+    // `installing`, so a map install (and its schema reconcile) can't land between the two
+    // and leave the partition taking writes without that schema (audit120's F6 and its
+    // first should). With the lock held, the unfence waits, its gate still fenced; released,
+    // it lifts.
+    let t = Served::start();
+    let (rt, ports, nodes) = (&t.rt, t.ports, &t.nodes);
+    let b = ports[1];
+    let gate = || nodes[1].fences.gate("p2").expect("p2 is open on b").0;
+    rt.block_on(fence(b, "p2")).unwrap();
+    assert!(gate().fenced().is_some());
+
+    let installing = nodes[1].installing.lock().unwrap();
+    let call = rt.spawn(unfence(b, "p2"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !call.is_finished(),
+        "the unfence waits for the install lock"
+    );
+    assert!(gate().fenced().is_some(), "and its gate is still fenced");
+    drop(installing);
+    // The timer is made inside the runtime: `timeout` needs one when it's built.
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(30), call).await })
+        .expect("the unfence finishes once the lock is free")
+        .unwrap()
+        .unwrap();
+    assert!(gate().fenced().is_none(), "lifted once the lock was free");
+}
+
+#[test]
+fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks_them() {
+    // #1829: the operator's fence and "not confirmed since it opened" are two flags, so a
+    // restarted node's operator-fenced partition reports both, and the peers' confirmation
+    // clears only the second. `unfence` without --force is refused while no peer answers,
+    // lifts the fence with --force, and once a peer confirms, lifts it plainly.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let map = three_way(&ports);
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let limits = crate::serve::server_tests::limits();
+    let nodes = [("a", "p1"), ("b", "p2"), ("c", "p3")];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, p)) in listeners.into_iter().zip(&dirs).zip(nodes) {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, "", limits, None, false);
+        stops.push(stop);
+        dbs.push(db);
+    }
+    rt.block_on(async {
+        fence(ports[1], "p2").await.unwrap();
+        fence(ports[2], "p3").await.unwrap();
+    });
+    for stop in stops.drain(..) {
+        let _ = stop.send(());
+    }
+    rt.block_on(async {
+        for port in ports {
+            eventually("the node to stop", async || {
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err()
+            })
+            .await;
+        }
+    });
+    let bind = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let restart = |i: usize| {
+        data_node_full(
+            &rt,
+            &dirs[i],
+            nodes[i].0,
+            Some(nodes[i].1),
+            bind(ports[i]),
+            "",
+            limits,
+            dbs[i].clone(),
+            true,
+        )
+        .0
+    };
+    // c alone: p3 is the operator's and unconfirmed. No peer answers, so a plain unfence is
+    // refused; --force lifts both.
+    stops.push(restart(2));
+    rt.block_on(async {
+        let lp = local(ports[2], "p3").await;
+        assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+        assert!(
+            lp.awaiting_peers,
+            "an operator's fence no longer hides the wait: {lp:?}"
+        );
+        let p3 = super::admin::info(ports[2]).await.partitions.remove(0);
+        assert!(p3.awaiting_peers, "Admin.Info says it too: {p3:?}");
+        let e = unfence(ports[2], "p3").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("not a majority"), "{e}");
+        let lp = client(ports[2])
+            .await
+            .unfence(PartitionRequest {
+                partition: "p3".into(),
+                force: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        assert!(!lp.awaiting_peers, "{lp:?}");
+    });
+    // a and b: b's p2 is confirmed by its peers' maps, and stays fenced by the operator
+    // until a plain unfence, which its peers now confirm.
+    stops.push(restart(0));
+    stops.push(restart(1));
+    rt.block_on(async {
+        eventually("b's p2 to be confirmed by its peers", async || {
+            !local(ports[1], "p2").await.awaiting_peers
+        })
+        .await;
+        let lp = local(ports[1], "p2").await;
+        assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+        let p2 = super::admin::info(ports[1]).await.partitions.remove(0);
+        assert!(!p2.awaiting_peers, "{p2:?}");
+        let e = try_put(ports[1], "hank", "1").await.unwrap_err();
+        assert_eq!(code(&e), "Fenced", "{e}");
+        unfence(ports[1], "p2").await.unwrap();
+        assert_eq!(state(ports[1], "p2").await, LocalPartitionState::Serving);
+        put(ports[1], "hank", "1").await;
+    });
+    drop(stops);
+    for db in dbs.into_iter().flatten() {
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn a_map_that_changes_the_nodes_cant_also_move_a_partition() {
+    // #1760, the coordinator's call on audit120's D2: a majority of one set of nodes
+    // confirms a partition's owner, so a map set through the writer that changes the nodes
+    // and moves (or re-epochs) a partition in one go is refused, naming the reason. The two
+    // as separate maps are taken.
+    let t = Rig::start();
+    let a = t.ports[0];
+    let current = || async {
+        client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let set = |m: ClusterMap| async move {
+        let expected = m.map_version - 1;
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+    };
+    let add_d = |m: &mut ClusterMap| {
+        m.nodes.push(MapNode {
+            id: "d".into(),
+            address: "127.0.0.1:9".into(),
+        });
+    };
+    let move_p1 = |m: &mut ClusterMap| {
+        for p in m.partitions.iter_mut().filter(|p| p.id == "p1") {
+            p.node = "c".into();
+            p.epoch += 1;
+        }
+    };
+    t.rt.block_on(async {
+        let mut both = current().await;
+        both.map_version += 1;
+        add_d(&mut both);
+        move_p1(&mut both);
+        let e = set(both).await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(
+            e.message()
+                .contains("can't also move or re-epoch a partition (partition \"p1\")"),
+            "{e}"
+        );
+        assert_eq!(current().await.map_version, 1, "nothing was set");
+
+        let mut nodes = current().await;
+        nodes.map_version += 1;
+        add_d(&mut nodes);
+        set(nodes).await.unwrap();
+        let mut moved = current().await;
+        moved.map_version += 1;
+        move_p1(&mut moved);
+        set(moved).await.unwrap();
+        let m = current().await;
+        assert_eq!(m.map_version, 3);
+        assert!(m.partitions.iter().any(|p| p.id == "p1" && p.node == "c"));
+    });
+}
+
+#[test]
+fn a_node_change_holds_back_every_later_map_until_a_majority_before_and_after_it_holds_it() {
+    // #1899's F4, with audit120's L2: a majority of one set of nodes confirms a partition's
+    // owner, so a map that changes the nodes must reach a majority of the nodes before it
+    // as well as of those after it before the map changes again. Here b and c are down when
+    // d and e join: a, d and e are a majority of the five, but a alone isn't one of the three
+    // before. Every later change is refused, another node change included, until b is back.
+    let mut t = Rig::start();
+    let limits = crate::serve::server_tests::limits();
+    let listeners: Vec<std::net::TcpListener> = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let new_ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let new_dirs = [test_dir(), test_dir()];
+    let mut new_stops = Vec::new();
+    for ((l, dir), id) in listeners.into_iter().zip(&new_dirs).zip(["d", "e"]) {
+        // New nodes with no map yet: the writer's push gives them their first.
+        let (stop, _) = data_node_full(&t.rt, dir, id, None, l, "", limits, None, false);
+        new_stops.push(stop);
+    }
+    t.stop(1);
+    t.stop(2);
+    let a = t.ports[0];
+    let current = || async {
+        client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let set = |m: ClusterMap| async move {
+        let expected = m.map_version - 1;
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+    };
+    t.rt.block_on(async {
+        let mut grown = current().await;
+        grown.map_version += 1;
+        for (id, port) in ["d", "e"].into_iter().zip(&new_ports) {
+            grown.nodes.push(MapNode {
+                id: id.into(),
+                address: format!("127.0.0.1:{port}"),
+            });
+        }
+        let r = set(grown).await.unwrap().into_inner();
+        for (node, ok) in [("b", false), ("c", false), ("d", true), ("e", true)] {
+            assert!(
+                r.pushed.iter().any(|p| p.node == node && p.ok == ok),
+                "{node}: {r:?}"
+            );
+        }
+        let m = current().await;
+        assert_eq!(m.map_version, 2);
+        let before: Vec<&str> = m.previous_nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            before,
+            ["a", "b", "c"],
+            "the writer derives the nodes before it"
+        );
+
+        // Any change, not only a move: here one that changes nothing else, and another node
+        // change (dropping e).
+        let mut same = m.clone();
+        same.map_version += 1;
+        let mut shrunk = same.clone();
+        shrunk.nodes.retain(|n| n.id != "e");
+        for next in [same, shrunk] {
+            let e = set(next).await.unwrap_err();
+            assert_eq!(code(&e), "FailedPrecondition", "{e}");
+            assert!(
+                e.message().contains("(1 of 3)") && e.message().contains("(3 of 5)"),
+                "{e}"
+            );
+        }
+        assert_eq!(current().await.map_version, 2, "nothing was set");
+    });
+
+    // b back: a and b are a majority of the three, so the next map is taken, and it clears
+    // the nodes before (it doesn't change them itself).
+    t.restart(1);
+    t.rt.block_on(async {
+        let mut next = current().await;
+        next.map_version += 1;
+        set(next).await.unwrap();
+        let m = current().await;
+        assert_eq!(m.map_version, 3);
+        assert!(m.previous_nodes.is_empty(), "{m:?}");
+    });
+    drop(new_stops);
 }

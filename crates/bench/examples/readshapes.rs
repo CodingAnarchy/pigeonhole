@@ -30,6 +30,9 @@
 //!   (D288) parks once per row, between two of the SST's admitted entries;
 //! - `wide-row-cells`, `wide-row-pages`: a walk of one 2,000-column row of table `w` (built
 //!   only for these shapes, flushed) with `RowRead::cells()` and with `pages(500)` (D297);
+//! - `wide-row-cells-async`: `wide-row-cells`'s walk with `RowCells::poll_next` (#1625,
+//!   #1828), polled with a waker that does nothing: the row's blocks are cached, so it is
+//!   never `Pending`;
 //! - `multi-get-dense`, `multi-get-sparse`: a multi-get (`Table::keys`, D299) of 200 rows of
 //!   table `t`, contiguous or spread over the table, counted per row (the key set is built
 //!   outside the measured function);
@@ -270,6 +273,28 @@ fn shape_wide_cells(w: &Table) -> usize {
     while let Some(e) = cells.next().unwrap() {
         std::hint::black_box(&e);
         n += 1;
+    }
+    n
+}
+
+#[inline(never)]
+fn shape_wide_cells_async(w: &Table) -> usize {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let _measured = Measured::start();
+    let mut cells = w.row(b"w:hub").family("f").cells().unwrap();
+    let mut n = 0;
+    loop {
+        match cells.poll_next(&mut cx) {
+            Poll::Ready(Ok(Some(e))) => {
+                std::hint::black_box(&e);
+                n += 1;
+            }
+            Poll::Ready(Ok(None)) => break,
+            Poll::Ready(Err(e)) => panic!("{e}"),
+            // Waiting would count a timing-dependent number of polls.
+            Poll::Pending => panic!("a cached row's walk was pending"),
+        }
     }
     n
 }
@@ -589,6 +614,7 @@ fn main() {
                     shape_scan_interleaved(i.as_ref().expect("built above"), &mut rng)
                 }
                 "wide-row-cells" => shape_wide_cells(w.as_ref().expect("built above")),
+                "wide-row-cells-async" => shape_wide_cells_async(w.as_ref().expect("built above")),
                 "wide-row-pages" => shape_wide_pages(w.as_ref().expect("built above")),
                 "scan-budget" => shape_scan_budget(&t, &mut rng),
                 "scan-budget-twin" => shape_scan_budget_twin(&t, &mut rng),

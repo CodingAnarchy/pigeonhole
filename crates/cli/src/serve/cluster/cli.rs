@@ -140,9 +140,10 @@ pub(crate) enum ClusterCommand {
         partition: String,
         #[command(flatten)]
         node: NodeArgs,
-        /// Lift a fence that no peer's map confirms: only when no peer can answer and you
-        /// know the partition hasn't moved. A peer's newer map may have given it to another
-        /// node, and then both would take writes.
+        /// Lift a fence the peers don't confirm (a majority of the map's nodes must hold the
+        /// newest map, naming this node): only when they can't answer and you know the
+        /// partition hasn't moved. A newer map may have given it to another node, and then
+        /// both would take writes.
         #[arg(long)]
         force: bool,
     },
@@ -386,6 +387,10 @@ pub(super) fn state_text(lp: &proto::LocalPartition) -> String {
     use proto::{FenceReason, LocalPartitionState};
     match (lp.state(), lp.fence_reason()) {
         (LocalPartitionState::Serving, _) => "serving".into(),
+        // Both reasons at once (#1829): the operator's fence, and the peers not yet asked.
+        (LocalPartitionState::Fenced, FenceReason::Operator) if lp.awaiting_peers => {
+            "fenced (operator, awaiting peer map)".into()
+        }
         (LocalPartitionState::Fenced, FenceReason::Operator) => "fenced (operator)".into(),
         (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap) => {
             "fenced (awaiting peer map)".into()

@@ -1,0 +1,18 @@
+# The schema-rollback corpus: written by 1.2.0's code (schema-rollback-gen), then 1.1.3's (rollback-gen schema): path, length, xxh3-64.
+# Frozen: no file or line ever changes.
+created/data.phdb 1310720 4ce5a62f67c3edde
+created/data.phdb-feed 701 d1f6ef61f00c022e
+created/data.phdb-wal-0 524288 5ce67138ba8f4525
+created/replica.phdb 1310720 ac80e0940cfc9837
+created_unwritten/data.phdb 1048576 cf8bd9dfd904e8a6
+created_unwritten/data.phdb-feed 701 f2e7e0f56d3565ad
+created_unwritten/data.phdb-wal-0 524288 fd1ff0e307d838f8
+created_unwritten/replica.phdb 1310720 bb6188e50b3f6923
+dropped/data.phdb 1048576 8d7acedb85eb77d5
+dropped/data.phdb-feed 701 cf317d8febbfb328
+dropped/data.phdb-wal-0 524288 d878f336f14516cd
+dropped/replica.phdb 1310720 473c4b283a601a3f
+family/data.phdb 1310720 94b79a3703fb0cfc
+family/data.phdb-feed 701 371500d72e4b5846
+family/data.phdb-wal-0 524288 ab4915ccd102aace
+family/replica.phdb 1310720 e525f795248f0ee7

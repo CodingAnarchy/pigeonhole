@@ -261,9 +261,9 @@ const ID_ALLOWANCE: u64 = 32;
 /// the most a list holds before it splits (the audit's P2-F2; 1, the coordinator's call on
 /// #1825). `expected` is an upper bound: lists × that is about twice `expected`, rounded up
 /// to whole lists, so an honest load never reaches it, and one that declared too few (0,
-/// say) stops here instead of growing one list without bound, which the rebalance's split
-/// then reads whole. What's left: a load whose vectors all fall in one list makes the split
-/// read about twice `expected` vectors (#1824).
+/// say) stops here instead of growing one list without bound. The rebalance's split no
+/// longer reads a long list whole (#1824), so this bounds the load's writes and the splits
+/// after it, not their memory.
 const SIZED_FACTOR: u64 = 1;
 
 /// What a bulk load holds at most, by the crate's design ([`SAMPLE_FLOOR`]).

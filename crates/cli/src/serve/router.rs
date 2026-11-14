@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use super::auth::Caller;
 use super::cluster::forward::{self, Forwarder};
-use super::cluster::route::Routes;
+use super::cluster::route::{Routes, prefix_end};
 use super::errors::ApiError;
 use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection, routing_key};
 use super::replica::ReadDeadline;
@@ -42,6 +42,56 @@ impl Cluster {
     pub(crate) fn here(&self, id: &str) -> Option<Arc<Service>> {
         self.parts.load().get(id).cloned()
     }
+
+    /// The service of `partition`, which a peer sent this node a call for, by `routes`: the
+    /// owner's side of a forward (a call's, a scan's). `WrongPartition` with this node's map
+    /// version when the map doesn't give it here (it moved away, or was never here: the
+    /// sender's map is older or newer than this node's, and it pulls and routes again), and
+    /// [`not_open`] when the map gives it here but it isn't open.
+    pub(crate) fn owned_here(
+        &self,
+        routes: &Routes,
+        partition: &str,
+    ) -> Result<Arc<Service>, ApiError> {
+        let mine = routes
+            .owner(partition)
+            .is_some_and(|o| o.node == self.node.id());
+        if !mine {
+            return Err(ApiError::wrong_partition(
+                routes.map_version(),
+                format!("this node doesn't serve partition {partition:?}"),
+            ));
+        }
+        self.here(partition).ok_or_else(|| not_open(partition))
+    }
+}
+
+/// Where `partition` is served, by `routes`, as an entry node sees it: here, or the node the
+/// map gives it. Here only when the map gives this node the partition *and* this node has it
+/// open: a partition the map moved away is the new owner's, even if its file is still open
+/// here. One copy for a routed call ([`Cluster::target`]) and a fanned-out read's part
+/// (`cluster::fanout`), which holds the node and its parts without the [`Cluster`].
+pub(crate) fn place(
+    node: &super::cluster::Node,
+    parts: &Parts,
+    routes: &Routes,
+    partition: &str,
+) -> Result<Place, ApiError> {
+    let owner = routes.owner(partition).ok_or_else(|| {
+        ApiError::internal(format!("the map lists no node for partition {partition:?}"))
+    })?;
+    if owner.node == node.id() {
+        return parts
+            .load()
+            .get(partition)
+            .map(|s| Place::Here(Arc::clone(s)))
+            .ok_or_else(|| not_open(partition));
+    }
+    Ok(Place::There(Target {
+        node: owner.node.clone(),
+        address: owner.address.clone(),
+        map_version: routes.map_version(),
+    }))
 }
 
 /// A partition's service that serves one ([`Service::part_opt`] is `Some`), read as its
@@ -172,8 +222,9 @@ impl Router {
         &self,
         caller: &Caller,
         upload_id: &str,
+        partition: &str,
     ) -> Result<super::proto::PartitionUploadStatusReply, ApiError> {
-        self.uploads_for(caller)?.status(upload_id)
+        self.uploads_for(caller)?.status(upload_id, partition)
     }
 
     fn uploads_for(
@@ -276,6 +327,123 @@ impl Router {
         self.service.metrics_text(&parts, &sessions)
     }
 
+    /// A cluster node's `Admin.Info`, `Flush` or `Compact` (ICR 0117, #1852), answered here
+    /// for the partitions this node holds and never forwarded, as a backup is. `Info` lists
+    /// each partition the map gives this node, with its state as `Cluster.Status` reports it,
+    /// and the map's other partitions. `Flush` and `Compact` act on every partition the map
+    /// gives this node that's open here (serving or fenced: a fenced partition's files still
+    /// change), one after another, trying each, or on the one the request names.
+    async fn cluster_admin(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<ServiceReply, ApiError> {
+        drop(self.service.admit(&op.admit(), caller, prepaid).await?);
+        let (r, compact) = match op {
+            ServiceOp::Info(_) => return self.cluster_info(cluster).await.map(ServiceReply::Info),
+            ServiceOp::Flush(r) => (r, false),
+            ServiceOp::Compact(r) => (r, true),
+            _ => return Err(ApiError::internal("not a maintenance call")),
+        };
+        let parts = if r.partition.is_empty() {
+            // The partitions the map gives this node, as `Info` lists them: not a copy the map
+            // moved away that's still open here, fenced until it's closed (simp724's N1).
+            let routes = cluster.node.routes();
+            let mine: std::collections::BTreeSet<&str> = routes
+                .as_ref()
+                .map(|r| r.partitions_of(cluster.node.id()).collect())
+                .unwrap_or_default();
+            let mut parts = self.partitions();
+            parts.retain(|(id, _)| mine.contains(id.as_str()));
+            parts.sort_by(|a, b| a.0.cmp(&b.0));
+            parts
+        } else {
+            vec![(r.partition.clone(), self.partition(&r.partition)?)]
+        };
+        // Every one is tried, so one that fails doesn't leave the rest undone; the answer is
+        // the first failure's code, naming every partition that failed (simp724's N2).
+        let mut failed: Vec<ApiError> = Vec::new();
+        for (id, part) in parts {
+            let done = if compact {
+                part.db.compact_async().await
+            } else {
+                part.db.flush_async().await
+            };
+            if let Err(e) = done {
+                let mut e = ApiError::from(e);
+                e.message = format!("partition {id}: {}", e.message);
+                failed.push(e);
+            }
+        }
+        match failed.len() {
+            0 => Ok(ServiceReply::Empty(super::proto::Empty {})),
+            1 => Err(failed.remove(0)),
+            _ => {
+                let all: Vec<String> = failed.iter().map(|e| e.message.clone()).collect();
+                let mut first = failed.remove(0);
+                first.message = all.join("; ");
+                Err(first)
+            }
+        }
+    }
+
+    /// `Admin.Info` on a cluster node (#1852): see [`cluster_admin`](Self::cluster_admin).
+    async fn cluster_info(
+        &self,
+        cluster: &Cluster,
+    ) -> Result<super::proto::InfoResponse, ApiError> {
+        let routes = cluster.node.routes();
+        let Some(routes) = routes.as_ref() else {
+            return Err(ApiError::partition_unavailable(
+                "this cluster node has no map yet",
+            ));
+        };
+        let me = cluster.node.id();
+        let mut ids: Vec<&str> = routes.partitions_of(me).collect();
+        ids.sort_unstable();
+        let open: std::collections::BTreeMap<String, PartRef> =
+            self.partitions().into_iter().collect();
+        let (mut partitions, mut file_bytes, mut free_bytes) = (Vec::new(), 0u64, None);
+        for id in ids {
+            let (state, reason) = cluster.node.local_state(id);
+            let mut p = super::proto::PartitionInfo {
+                id: id.to_owned(),
+                path: cluster
+                    .node
+                    .dir()
+                    .join(format!("{id}.phdb"))
+                    .display()
+                    .to_string(),
+                ..Default::default()
+            };
+            p.set_state(state);
+            p.set_fence_reason(reason);
+            p.awaiting_peers = cluster.node.awaiting_peers(id);
+            if let Some(part) = open.get(id) {
+                let db = part.db.clone();
+                let info = self.service.blocking(move || Ok(db.info()?)).await?;
+                p.path = part.db.path().display().to_string();
+                p.file_bytes = info.file_bytes;
+                p.tables = part.0.user_tables();
+                file_bytes += info.file_bytes;
+                free_bytes = free_bytes.or(info.free_bytes);
+            }
+            partitions.push(p);
+        }
+        Ok(super::proto::InfoResponse {
+            path: cluster.node.dir().display().to_string(),
+            file_bytes,
+            free_bytes: free_bytes.unwrap_or(0),
+            tables: routes.table_names(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            replica: None,
+            partitions,
+            other_partitions: routes.partitions_not_of(me),
+        })
+    }
+
     /// A cluster node's `Admin.Backup` or `BackupDownload` (D317 ticket 8b): of a partition
     /// this node holds, named by the request, and never forwarded. A backup's bytes don't
     /// take a hop: `phdb cluster backup` asks each partition's owner from the map.
@@ -347,6 +515,14 @@ impl Router {
     /// [`dispatch`](Self::dispatch) with the request's deadline, from its arrival: a forward
     /// takes what's left of it (cli692's F2 on ticket 2); without one, the request timeout
     /// from now.
+    ///
+    /// **The large cluster-only futures are boxed** (the map's schema calls, the fan-outs and
+    /// the forward, #1902): this future is moved once or more per call, and a future is as
+    /// large as the largest it awaits in place. Awaited in place, those made every call's
+    /// future, a single node's included, over twice the size of [`Service::call`]'s, and a
+    /// change to a fan-out changed what a single node's `Get` cost. A boxed one costs its
+    /// path one allocation, beside calls to several nodes. What is still awaited in place is
+    /// counted by the serve callgrind shapes (`serveshapes.rs`): they show a growth of it.
     async fn dispatch_by(
         &self,
         op: ServiceOp,
@@ -367,9 +543,7 @@ impl Router {
                     || tokio::time::Instant::now() + self.service.request_timeout(),
                     tokio::time::Instant::from_std,
                 );
-                return self
-                    .cluster_schema(cluster, op, caller, prepaid, deadline)
-                    .await;
+                return Box::pin(self.cluster_schema(cluster, op, caller, prepaid, deadline)).await;
             }
             // A read across a table's partitions fans out (D317 tickets 4a and 4b); a
             // subscription follows every partition it covers (ticket 7). One at a snapshot
@@ -390,15 +564,14 @@ impl Router {
                     );
                     return match op {
                         ServiceOp::Nearest(_) => {
-                            self.fan_nearest(cluster, op, caller, prepaid, deadline)
-                                .await
+                            Box::pin(self.fan_nearest(cluster, op, caller, prepaid, deadline)).await
                         }
                         ServiceOp::Traverse(_) => {
-                            self.fan_traverse(cluster, op, caller, prepaid, deadline)
+                            Box::pin(self.fan_traverse(cluster, op, caller, prepaid, deadline))
                                 .await
                         }
                         _ => {
-                            self.fan_multi_get(cluster, op, caller, prepaid, deadline)
+                            Box::pin(self.fan_multi_get(cluster, op, caller, prepaid, deadline))
                                 .await
                         }
                     };
@@ -410,6 +583,10 @@ impl Router {
                 // Served where the partition is, never forwarded (D317 ticket 8b).
                 ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
                     return self.backup(cluster, op, caller, prepaid).await;
+                }
+                // Across the partitions this node holds, never forwarded (ICR 0117, #1852).
+                ServiceOp::Info(_) | ServiceOp::Flush(_) | ServiceOp::Compact(_) => {
+                    return self.cluster_admin(cluster, op, caller, prepaid).await;
                 }
                 // This node's own, every partition it holds labelled (D317 ticket 8b).
                 ServiceOp::Metrics(_) => {
@@ -427,8 +604,7 @@ impl Router {
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
                     );
-                    self.forward(cluster, op, caller, prepaid, owner, deadline)
-                        .await
+                    Box::pin(self.forward(cluster, op, caller, prepaid, owner, deadline)).await
                 }
             };
         }
@@ -586,18 +762,7 @@ impl Router {
                 ));
             };
             let p = route(routes, &op)?;
-            let mine = routes
-                .owner(&p)
-                .is_some_and(|o| o.node == cluster.node.id());
-            if !mine {
-                // The map moved the partition away, or never gave it here: the sender's map
-                // is older or newer than this node's; it pulls and routes again.
-                return Err(ApiError::wrong_partition(
-                    routes.map_version(),
-                    format!("this node doesn't serve partition {p:?}"),
-                ));
-            }
-            cluster.here(&p).ok_or_else(|| not_open(&p))?
+            cluster.owned_here(routes, &p)?
         };
         match op {
             ServiceOp::MultiGet(_) | ServiceOp::Nearest(_) if fanout_part => {
@@ -629,9 +794,9 @@ impl Router {
 
 /// Where a routed call goes when it isn't this node's.
 pub(crate) struct Target {
-    node: String,
-    address: String,
-    map_version: u64,
+    pub(crate) node: String,
+    pub(crate) address: String,
+    pub(crate) map_version: u64,
 }
 
 /// Where a routed call goes: a partition's service here, or the node serving it.
@@ -650,23 +815,7 @@ impl Cluster {
             ));
         };
         let partition = route(routes, op)?;
-        let owner = routes.owner(&partition).ok_or_else(|| {
-            ApiError::internal(format!("the map lists no node for partition {partition:?}"))
-        })?;
-        // Served here only when the map gives this node the partition *and* this node has
-        // it open: a partition the map moved away is the new owner's, even if its file is
-        // still open here.
-        if owner.node == self.node.id() {
-            return self
-                .here(&partition)
-                .map(Place::Here)
-                .ok_or_else(|| not_open(&partition));
-        }
-        Ok(Place::There(Target {
-            node: owner.node.clone(),
-            address: owner.address.clone(),
-            map_version: routes.map_version(),
-        }))
+        place(&self.node, &self.parts, routes, &partition)
     }
 }
 
@@ -674,7 +823,7 @@ impl Cluster {
 /// its rows are in one, and a transaction's or snapshot's (D317 ticket 3): its `route` when
 /// it begins, then the partition its id names, with every row it reads or writes checked to
 /// be in it (`CrossPartition`). The owner routes a forwarded call again, so it checks too.
-/// Everything else is refused until its D317 ticket.
+/// Everything else is refused.
 pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError> {
     let one = |table: &str, row: &[u8]| {
         routes
@@ -822,7 +971,7 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
                     ))),
                 }
             }
-            None => Err(later("a read across partitions", 4)),
+            None => Err(unrouted()),
         },
         ServiceOp::Nearest(r) if !r.snapshot_id.is_empty() => Err(ApiError::unsupported(
             "a nearest-neighbour search at a snapshot isn't supported on a cluster",
@@ -833,27 +982,22 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         // One partition's part of a `Nearest` another node fans out (D317 ticket 4b): its
         // keys, or a range clipped to the partition. A client's fans out before it gets here.
         ServiceOp::Nearest(r) => nearest_partition(routes, r),
-        ServiceOp::Traverse(_) => Err(ApiError::internal(
-            "a fanned-out read isn't routed to one partition",
-        )),
         // An index lives in one partition's file, and no D317 ticket routes a search to it
         // (#1722, 1.3.0).
         ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
             "indexed vector and text search isn't supported on a cluster in this release: use \
              Vectors.Nearest, which fans out across the partitions",
         )),
-        ServiceOp::ListTables(_)
+        // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
+        // read that fans out, a schema call (the map's), a subscription and a backup.
+        ServiceOp::Traverse(_)
+        | ServiceOp::ListTables(_)
         | ServiceOp::CreateTable(_)
         | ServiceOp::DropTable(_)
-        | ServiceOp::DescribeTable(_) => Err(ApiError::internal(
-            "a schema call is answered from the cluster map, not routed to a partition",
-        )),
-        // A cluster subscription is routed before this ([`Router::subscribe`]).
-        ServiceOp::Subscribe(_) => Err(ApiError::internal("a subscription isn't routed by key")),
-        // A backup is served before this ([`Router::backup`]).
-        ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
-            Err(ApiError::internal("a backup isn't routed by key"))
-        }
+        | ServiceOp::DescribeTable(_)
+        | ServiceOp::Subscribe(_)
+        | ServiceOp::Backup(_)
+        | ServiceOp::BackupDownload(_) => Err(unrouted()),
         _ => Err(ApiError::unsupported(
             "this call isn't served by a cluster node (D317)",
         )),
@@ -984,19 +1128,6 @@ fn scan_span<'a>(routes: &'a Routes, r: &ScanRequest) -> Result<Vec<&'a str>, Ap
         .ok_or_else(|| ApiError::not_found(format!("table {:?} isn't in the cluster map", r.table)))
 }
 
-/// The first key after every key starting with `prefix`; `None` when there is none (all
-/// `0xff`, or empty).
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last < 0xff {
-            end.push(last + 1);
-            return Some(end);
-        }
-    }
-    None
-}
-
 /// Whether a forward of `op` that fails after it was sent leaves an outcome unknown (B3):
 /// a write, and a transaction's buffered writes, commit and abort (ticket 3).
 fn forward_writes(op: &ServiceOp) -> bool {
@@ -1015,9 +1146,7 @@ pub(crate) fn not_open(partition: &str) -> ApiError {
     ))
 }
 
-/// A call a later D317 ticket brings to a cluster.
-pub(crate) fn later(what: &str, ticket: u32) -> ApiError {
-    ApiError::unsupported(format!(
-        "{what} in a cluster comes with D317's ticket {ticket}"
-    ))
+/// The answer of [`route`] to a call no caller brings it: one answered before it's routed.
+fn unrouted() -> ApiError {
+    ApiError::internal("this call isn't routed to one partition")
 }
