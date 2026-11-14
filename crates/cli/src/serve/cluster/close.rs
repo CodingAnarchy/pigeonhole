@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use super::Node;
 use crate::serve::errors::ApiError;
-use crate::serve::gate::Fence;
 use crate::serve::proto::{LocalPartition, LocalPartitionState, PartitionFile};
 
 /// How long a close waits for the writes a fence admitted to finish.
@@ -137,7 +136,7 @@ impl Node {
         // on #1800): a fence since the node started is kept nowhere, and a closed partition
         // reopens at a restart while the map still names this node. A peer's map would then
         // lift that fence, in the middle of a move that copied the closed files.
-        gate.fence(Fence::Operator);
+        gate.fence();
         let mut fenced = self.fences.operator().clone();
         if fenced.insert(id.to_owned()) {
             self.persist_fences(fenced).await?;
@@ -226,7 +225,7 @@ impl Node {
                 _ => {}
             }
         }
-        let closed = closed.map_err(|e| ApiError::internal(e.to_string()))?;
+        let closed = closed?;
         if let Err(e) = closed {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
         }
@@ -385,9 +384,7 @@ impl Node {
         }
         let dir = self.dir.clone();
         let part = id.to_owned();
-        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))??;
+        let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await??;
         self.fences.closed().remove(id);
         eprintln!(
             "phdb serve: partition {id}'s files moved to {}: delete it once checked",

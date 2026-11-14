@@ -364,7 +364,7 @@ impl Merging {
                 && let Poll::Ready(Some(done)) = self.merge.opens.poll_join_next(cx)
             {
                 let opened = done
-                    .map_err(|e| ApiError::internal(e.to_string()))
+                    .map_err(ApiError::from)
                     .and_then(|(i, result)| self.merge.opened(i, result));
                 if let Err(e) = opened {
                     self.end(e);
@@ -533,7 +533,7 @@ impl Merge {
             let Some(done) = set.join_next().await else {
                 break;
             };
-            let (i, result) = done.map_err(|e| ApiError::internal(e.to_string()))?;
+            let (i, result) = done?;
             opened[i] = Some(result);
         }
         for (i, result) in opened.into_iter().enumerate() {
