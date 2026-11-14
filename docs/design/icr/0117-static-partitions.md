@@ -531,7 +531,7 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **`Admin.Info`** gains `repeated PartitionInfo partitions = 7` and `repeated string other_partitions = 8`.
   - **On a cluster node:** `partitions` lists each partition the map gives the node, in id order. `other_partitions` lists the map's partitions other nodes hold. The top-level fields describe the node: `path` is its cluster directory, `file_bytes` its partitions' files together, `free_bytes` the free space on that directory's disk (0 when no partition is open), and `tables` the map's tables.
   - **On a single node:** both lists are empty, and the top-level fields are as before.
-- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), and `fence_reason = 6` (`FenceReason`).
-  - The state and fence reason are as `Cluster.Status` reports them.
+- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), `fence_reason = 6` (`FenceReason`), and `awaiting_peers = 7` (bool, 1.3.0, #1829).
+  - The state, fence reason and `awaiting_peers` are as `Cluster.Status` reports them.
   - `file_bytes` and `tables` are set only for an open partition (serving or fenced).
   - A partition the map places on the node that it hasn't opened (no file, or a failed open) is `LOCAL_PARTITION_STATE_UNSPECIFIED`.

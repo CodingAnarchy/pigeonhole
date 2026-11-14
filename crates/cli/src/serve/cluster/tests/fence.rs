@@ -833,6 +833,8 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
             lp.awaiting_peers,
             "an operator's fence no longer hides the wait: {lp:?}"
         );
+        let p3 = super::admin::info(ports[2]).await.partitions.remove(0);
+        assert!(p3.awaiting_peers, "Admin.Info says it too: {p3:?}");
         let e = unfence(ports[2], "p3").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert!(e.message().contains("not a majority"), "{e}");
@@ -860,6 +862,8 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
         let lp = local(ports[1], "p2").await;
         assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
         assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
+        let p2 = super::admin::info(ports[1]).await.partitions.remove(0);
+        assert!(!p2.awaiting_peers, "{p2:?}");
         let e = try_put(ports[1], "hank", "1").await.unwrap_err();
         assert_eq!(code(&e), "Fenced", "{e}");
         unfence(ports[1], "p2").await.unwrap();

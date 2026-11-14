@@ -6690,6 +6690,10 @@ pub struct PartitionInfo {
     /// Why a fenced partition is fenced.
     #[prost(enumeration = "FenceReason", tag = "6")]
     pub fence_reason: i32,
+    /// As `Cluster.Status`'s `LocalPartition.awaiting_peers`: a majority of the map's nodes
+    /// have yet to confirm it since it opened here, whatever `fence_reason` says (#1829).
+    #[prost(bool, tag = "7")]
+    pub awaiting_peers: bool,
 }
 /// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
 /// acts on every partition the map gives the node that's open (the ones `Info` lists), trying
