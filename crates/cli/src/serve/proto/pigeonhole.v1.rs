@@ -5388,6 +5388,17 @@ pub struct LeaseRequest {
     /// is no longer granted.
     #[prost(message, repeated, tag = "5")]
     pub parts: ::prost::alloc::vec::Vec<LeasePart>,
+    /// The asking node's `--cluster-lease-ms`. Refused (`FailedPrecondition`, naming both) if
+    /// it isn't this node's: a holder with a longer lease than its grantors' would serve past
+    /// their grants (audit120's M1).
+    #[prost(uint64, tag = "6")]
+    pub lease_ms: u64,
+    /// A random id the asking node picks when it starts. A request with another id than the
+    /// one this node's grant to it carries is a new start of that node: its rounds start
+    /// again, so the round order doesn't apply, and the request replaces the grant (a node
+    /// that starts holds no lease).
+    #[prost(uint64, tag = "7")]
+    pub start: u64,
 }
 /// A partition at an epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

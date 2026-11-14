@@ -1279,3 +1279,64 @@ fn in_a_two_node_cluster_a_node_stops_serving_within_its_lease_when_the_other_is
         let _ = db.close();
     }
 }
+
+#[test]
+fn a_scan_running_past_its_partitions_lease_ends_with_the_lease_error() {
+    // audit120's M2: each page of a scan is a read at its own snapshot, so each needs the
+    // partition's lease, not only the scan's start. a restarts so p1's lease is a real one,
+    // a scan of p1 through a reads small pages (two rows each), and a is cut off from its
+    // peers: once its lease runs out, the scan ends with the lease error rather than reading
+    // on.
+    const ROWS: usize = 200;
+    let mut t = Rig::start();
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    let (mut stream, mut rows) = t.rt.block_on(async {
+        eventually("p1 to serve on a after its restart", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        // 32 KiB a row, so the stream's 6.4 MB can't all sit in the connection's buffers and
+        // flow-control windows before the cut: the scan still has pages to read after it.
+        let value = "v".repeat(32 << 10);
+        for i in 0..ROWS {
+            try_put(a, &format!("a{i:03}"), &value).await.unwrap();
+        }
+        let mut stream = data(a)
+            .await
+            .scan(crate::serve::proto::ScanRequest {
+                table: "users".into(),
+                page_bytes: 64 << 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.message().await.unwrap().expect("a first page");
+        assert!(
+            !first.rows.is_empty() && first.rows.len() < ROWS,
+            "{first:?}"
+        );
+        (stream, first.rows.len())
+    });
+    cut(&t, 0, true);
+    t.rt.block_on(async {
+        eventually("p1's lease on a to run out", async || {
+            reason(a, "p1").await == FenceReason::LeaseLapsed
+        })
+        .await;
+        // A page read before the lease ran out may still be on its way; then the error.
+        let e = loop {
+            match stream.message().await {
+                Ok(Some(page)) => rows += page.rows.len(),
+                Ok(None) => panic!("the scan ended cleanly after {rows} of {ROWS} rows"),
+                Err(e) => break e,
+            }
+        };
+        assert!(rows < ROWS, "{rows}");
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+        assert!(e.message().contains("lease"), "{e:?}");
+    });
+    cut(&t, 0, false);
+}

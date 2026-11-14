@@ -42,7 +42,9 @@ pub fn process_id() -> u32 {
 ///
 /// An internal helper, not part of the crate's public contract.
 ///
-/// ```
+/// Compiled, not run: Miri runs this crate's doctests and has no `CLOCK_BOOTTIME`.
+///
+/// ```no_run
 /// let a = pigeonhole_io::sys::boot_clock_ns();
 /// let b = pigeonhole_io::sys::boot_clock_ns();
 /// assert!(b >= a);

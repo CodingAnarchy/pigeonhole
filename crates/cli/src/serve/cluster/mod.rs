@@ -453,12 +453,14 @@ impl Node {
         st.divergent.clear();
         // Versions at or below this one need no pull again (cli692's N3).
         st.pulled.retain(|v| *v > version);
-        drop(st);
-        // A lease the map no longer names this node for ends now (audit120's S1), after
-        // the map is published: see `apply_leases`.
-        if let Ok(m) = self.get_map() {
-            self.fences.lapse_unnamed(&m, &self.id);
+        // A lease the map no longer names this node for ends now (audit120's S1), still
+        // under the state lock, so a round reads the new map only once it has (audit120's
+        // M3): its request no longer asks for the partition, and frees its grants. The
+        // state lock, then the served one, as `apply_leases` takes them.
+        if let Some((m, _)) = &st.map {
+            self.fences.lapse_unnamed(m, &self.id);
         }
+        drop(st);
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
         self.end_moved_feeds(version);
@@ -1296,7 +1298,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             ))
             .into());
         }
-        Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)))
+        Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
     }
 
     async fn get_map(
@@ -1596,7 +1598,9 @@ pub(crate) fn run(
     };
     // A renewal round has to fit in a third of a lease, with a push timeout to spare for a
     // node that's down (D326).
-    if args.cluster_lease_ms < args.cluster_push_timeout_ms.saturating_mul(3) {
+    if args.cluster_lease_ms == 0
+        || args.cluster_lease_ms < args.cluster_push_timeout_ms.max(1).saturating_mul(3)
+    {
         return Err(Failure::usage(&format!(
             "--cluster-lease-ms ({}) must be at least 3 times --cluster-push-timeout-ms ({}): \
              a lease is renewed every third of it, and a renewal can wait a push timeout for \

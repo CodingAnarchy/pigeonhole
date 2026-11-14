@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::proto::{ClusterMap, LeasePart, LeaseRequest, LeaseResponse, LeaseWithheld};
+use crate::serve::errors::ApiError;
 use crate::serve::gate::LeaseClock;
 
 /// ρ, each clock's rate drift against real time, in parts per million: 1%.
@@ -49,6 +50,19 @@ fn scale(v: u64, num: u64, den: u64) -> u64 {
     u64::try_from(u128::from(v) * u128::from(num) / u128::from(den)).unwrap_or(u64::MAX)
 }
 
+/// A random id for this start of the node, never 0 (a request without one).
+fn start_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.write_u32(std::process::id());
+    h.finish().max(1)
+}
+
 fn millis(ns: u64) -> u64 {
     ns / 1_000_000
 }
@@ -56,6 +70,8 @@ fn millis(ns: u64) -> u64 {
 /// One node's grant here.
 #[derive(Debug)]
 struct Grant {
+    /// The holder's start id (`LeaseRequest.start`): a request with another is a new start.
+    start: u64,
     /// The holder's round it was made for.
     round: u64,
     /// The partitions granted, with their epochs.
@@ -72,6 +88,9 @@ pub(crate) struct Grants {
     lease: Duration,
     /// When this node started, on its clock: it grants nothing until the start grace ends.
     started: u64,
+    /// This start's id (`LeaseRequest.start`): random, so a grantor tells a restarted node
+    /// from a delayed request of its last start.
+    start: u64,
     by_holder: Mutex<BTreeMap<String, Grant>>,
 }
 
@@ -83,8 +102,14 @@ impl Grants {
             clock,
             lease,
             started,
+            start: start_id(),
             by_holder: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// This start's id.
+    pub(crate) fn start(&self) -> u64 {
+        self.start
     }
 
     /// L.
@@ -103,27 +128,47 @@ impl Grants {
         Duration::from_nanos(end.saturating_sub(self.clock.now()))
     }
 
+    /// L in whole milliseconds, as `LeaseRequest.lease_ms` carries it.
+    pub(crate) fn lease_ms(&self) -> u64 {
+        u64::try_from(self.lease.as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Answers `req`, from node `req.node_id`, against this node's map `mine` (D326's
     /// grantor rules, in the module's doc). The cluster id was checked by the caller.
+    /// `FailedPrecondition` when the asking node's lease isn't this node's (audit120's M1):
+    /// the holder's bound holds only for a lease no longer than each grantor's.
     ///
     /// No grace exemption, even for a map that names this node alone (audit120's S4): a
     /// forced map that dropped the other nodes clears `previous_nodes`, so nothing tells a
     /// node that was always alone from one whose grant to a peer may still run.
-    pub(crate) fn grant(&self, mine: &ClusterMap, req: &LeaseRequest) -> LeaseResponse {
+    pub(crate) fn grant(
+        &self,
+        mine: &ClusterMap,
+        req: &LeaseRequest,
+    ) -> Result<LeaseResponse, ApiError> {
+        if req.lease_ms != self.lease_ms() {
+            return Err(ApiError::failed_precondition(format!(
+                "node {} runs with --cluster-lease-ms {} and this node with {}: every node of a \
+                 cluster must take the same lease, so this node grants it nothing",
+                req.node_id,
+                req.lease_ms,
+                self.lease_ms()
+            )));
+        }
         let mut out = LeaseResponse::default();
         if mine.map_version > req.map_version {
             out.newer_map_version = mine.map_version;
-            return out;
+            return Ok(out);
         }
         // Behind the asking node: it pushes its map in its round before it asks, so this is
         // a race with that push. Nothing is granted; its next round asks again.
         if mine.map_version < req.map_version {
-            return out;
+            return Ok(out);
         }
         let grace = self.grace_remaining();
         if !grace.is_zero() {
             out.grace_remaining_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX).max(1);
-            return out;
+            return Ok(out);
         }
         let now = self.clock.now();
         let mut by = self
@@ -131,10 +176,19 @@ impl Grants {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         by.retain(|_, g| g.until > now);
-        // An older round of the same holder, arriving after a newer one: ignored, so it
-        // can't put back what the newer one no longer asked for.
-        if by.get(&req.node_id).is_some_and(|g| g.round > req.round) {
-            return out;
+        // An older round of the same start of the holder, arriving after a newer one:
+        // ignored, so it can't put back what the newer one no longer asked for. Another
+        // start's request replaces the grant whatever its round (a node that starts holds no
+        // lease, and its rounds count from the start again: audit120's S-b).
+        if let Some(g) = by.get(&req.node_id)
+            && g.start == req.start
+            && g.round > req.round
+        {
+            eprintln!(
+                "phdb serve: node {}'s lease round {} arrived after its round {}: ignored",
+                req.node_id, req.round, g.round
+            );
+            return Ok(out);
         }
         let mut parts = BTreeMap::new();
         for LeasePart { partition, epoch } in &req.parts {
@@ -168,12 +222,13 @@ impl Grants {
         by.insert(
             req.node_id.clone(),
             Grant {
+                start: req.start,
                 round: req.round,
                 parts,
                 until: now.saturating_add(nanos(self.lease)),
             },
         );
-        out
+        Ok(out)
     }
 }
 
@@ -206,12 +261,15 @@ mod tests {
         }
     }
 
+    /// A request from node `node`'s first start, with the tests' 10 s lease.
     fn ask(node: &str, version: u64, round: u64, parts: &[(&str, u64)]) -> LeaseRequest {
         LeaseRequest {
             cluster_id: "c1".into(),
             node_id: node.into(),
             map_version: version,
             round,
+            lease_ms: 10_000,
+            start: 1,
             parts: parts
                 .iter()
                 .map(|(p, e)| LeasePart {
@@ -220,6 +278,11 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// `g`'s answer, which the tests' requests never make an error.
+    fn grant(g: &Grants, mine: &ClusterMap, req: &LeaseRequest) -> LeaseResponse {
+        g.grant(mine, req).unwrap()
     }
 
     fn granted(r: &LeaseResponse) -> Vec<&str> {
@@ -248,12 +311,12 @@ mod tests {
         // its vote for p1 from any other node, and says how long is left.
         let (g, clock) = grants(Duration::from_secs(10));
         let v1 = map(1, &[("p1", "a", 1), ("p2", "b", 1)]);
-        let r = g.grant(&v1, &ask("a", 1, 1, &[("p1", 1)]));
+        let r = grant(&g, &v1, &ask("a", 1, 1, &[("p1", 1)]));
         assert_eq!(granted(&r), ["p1"]);
         // v2 relocates p1 to c at epoch 2 without a (cut off): c asks while a's grant runs.
         let v2 = map(2, &[("p1", "c", 2), ("p2", "b", 1)]);
         clock.advance(Duration::from_secs(3));
-        let r = g.grant(&v2, &ask("c", 2, 1, &[("p1", 2)]));
+        let r = grant(&g, &v2, &ask("c", 2, 1, &[("p1", 2)]));
         assert!(r.granted.is_empty(), "{r:?}");
         assert_eq!(r.withheld.len(), 1);
         assert_eq!(r.withheld[0].holder, "a");
@@ -264,11 +327,11 @@ mod tests {
         // Once it ran out, c's lease is granted.
         clock.advance(Duration::from_secs(7));
         assert_eq!(
-            granted(&g.grant(&v2, &ask("c", 2, 2, &[("p1", 2)]))),
+            granted(&grant(&g, &v2, &ask("c", 2, 2, &[("p1", 2)]))),
             ["p1"]
         );
         // And a, asking at v1 again, is told of v2 and granted nothing.
-        let r = g.grant(&v2, &ask("a", 1, 2, &[("p1", 1)]));
+        let r = grant(&g, &v2, &ask("a", 1, 2, &[("p1", 1)]));
         assert_eq!(r.newer_map_version, 2);
         assert!(r.granted.is_empty());
     }
@@ -278,14 +341,14 @@ mod tests {
         let (g, _clock) = grants(Duration::from_secs(10));
         let v3 = map(3, &[("p1", "a", 2), ("p2", "b", 1)]);
         // Another node's partition, or another epoch: neither granted nor withheld.
-        let r = g.grant(&v3, &ask("a", 3, 1, &[("p1", 1), ("p2", 1)]));
+        let r = grant(&g, &v3, &ask("a", 3, 1, &[("p1", 1), ("p2", 1)]));
         assert!(r.granted.is_empty() && r.withheld.is_empty(), "{r:?}");
         assert_eq!(
-            granted(&g.grant(&v3, &ask("a", 3, 2, &[("p1", 2)]))),
+            granted(&grant(&g, &v3, &ask("a", 3, 2, &[("p1", 2)]))),
             ["p1"]
         );
         // A grantor behind the asker grants nothing (the asker's push hasn't landed).
-        let r = g.grant(&v3, &ask("a", 4, 3, &[("p1", 2)]));
+        let r = grant(&g, &v3, &ask("a", 4, 3, &[("p1", 2)]));
         assert!(r.granted.is_empty() && r.newer_map_version == 0, "{r:?}");
     }
 
@@ -297,17 +360,17 @@ mod tests {
         let (g, _clock) = grants(Duration::from_secs(10));
         let v1 = map(1, &[("p1", "a", 1), ("p2", "a", 1)]);
         assert_eq!(
-            granted(&g.grant(&v1, &ask("a", 1, 5, &[("p1", 1), ("p2", 1)]))).len(),
+            granted(&grant(&g, &v1, &ask("a", 1, 5, &[("p1", 1), ("p2", 1)]))).len(),
             2
         );
         assert_eq!(
-            granted(&g.grant(&v1, &ask("a", 1, 6, &[("p1", 1)]))),
+            granted(&grant(&g, &v1, &ask("a", 1, 6, &[("p1", 1)]))),
             ["p1"]
         );
-        assert!(granted(&g.grant(&v1, &ask("a", 1, 5, &[("p2", 1)]))).is_empty());
+        assert!(granted(&grant(&g, &v1, &ask("a", 1, 5, &[("p2", 1)]))).is_empty());
         let v2 = map(2, &[("p1", "a", 1), ("p2", "b", 2)]);
         assert_eq!(
-            granted(&g.grant(&v2, &ask("b", 2, 1, &[("p2", 2)]))),
+            granted(&grant(&g, &v2, &ask("b", 2, 1, &[("p2", 2)]))),
             ["p2"]
         );
     }
@@ -327,14 +390,57 @@ mod tests {
             }],
             ..map(1, &[("p1", "a", 1)])
         };
-        let r = g.grant(&alone, &ask("a", 1, 1, &[("p1", 1)]));
+        let r = grant(&g, &alone, &ask("a", 1, 1, &[("p1", 1)]));
         assert!(r.granted.is_empty());
         assert!((10_000..=10_100).contains(&r.grace_remaining_ms), "{r:?}");
         clock.advance(Duration::from_millis(10_100));
         assert!(g.grace_remaining().is_zero());
         assert_eq!(
-            granted(&g.grant(&alone, &ask("a", 1, 2, &[("p1", 1)]))),
+            granted(&grant(&g, &alone, &ask("a", 1, 2, &[("p1", 1)]))),
             ["p1"]
+        );
+    }
+
+    #[test]
+    fn a_grantor_refuses_a_holder_with_another_lease_and_a_new_start_replaces_its_grant() {
+        // audit120's M1: a holder whose lease is longer than its grantors' would serve past
+        // their grants, so a different length is refused, naming both.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = map(1, &[("p1", "a", 1), ("p2", "a", 1)]);
+        let e = g
+            .grant(
+                &v1,
+                &LeaseRequest {
+                    lease_ms: 30_000,
+                    ..ask("a", 1, 1, &[("p1", 1)])
+                },
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "FailedPrecondition", "{}", e.message);
+        assert!(
+            e.message.contains("30000") && e.message.contains("10000"),
+            "{}",
+            e.message
+        );
+        // audit120's S-b: a restarted node's rounds start again at 1. Its old start's
+        // round 9 doesn't make them stale: a new start replaces the grant.
+        assert_eq!(
+            grant(&g, &v1, &ask("a", 1, 9, &[("p1", 1), ("p2", 1)]))
+                .granted
+                .len(),
+            2
+        );
+        let restarted = LeaseRequest {
+            start: 2,
+            ..ask("a", 1, 1, &[("p1", 1)])
+        };
+        assert_eq!(granted(&grant(&g, &v1, &restarted)), ["p1"]);
+        // And the old start's delayed round 9 is now another start's, so it replaces again:
+        // still a grant to a, never one that keeps p2 from a new owner past its lease.
+        let v2 = map(2, &[("p1", "a", 1), ("p2", "b", 2)]);
+        assert_eq!(
+            granted(&grant(&g, &v2, &ask("b", 2, 1, &[("p2", 2)]))),
+            ["p2"]
         );
     }
 }

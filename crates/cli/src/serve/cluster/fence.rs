@@ -634,6 +634,8 @@ impl Node {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1,
             parts,
+            lease_ms: self.grants.lease_ms(),
+            start: self.grants.start(),
         };
         let mut asks = tokio::task::JoinSet::new();
         for (peer, address) in holding {
@@ -655,7 +657,10 @@ impl Node {
         }
         let mut answers: Vec<(String, super::proto::LeaseResponse)> = Vec::new();
         if round.map.nodes.iter().any(|n| n.id == self.id) {
-            answers.push((self.id.clone(), self.grants.grant(&round.map, &req)));
+            match self.grants.grant(&round.map, &req) {
+                Ok(r) => answers.push((self.id.clone(), r)),
+                Err(e) => eprintln!("phdb serve: this node's own lease grant: {}", e.message),
+            }
         }
         answers.extend(asks.join_all().await.into_iter().flatten());
         for (_, r) in answers {

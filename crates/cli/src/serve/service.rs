@@ -3527,6 +3527,7 @@ impl Service {
     pub(crate) async fn scan_opener(&self, table: &str) -> Result<ScanOpener, ApiError> {
         Ok(ScanOpener {
             table: self.table(table).await?,
+            gate: self.gate.clone(),
             db: self.part()?.db.clone(),
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
@@ -4239,6 +4240,8 @@ fn between_reads(table: &str) {
 /// A table's scan, ready to start: see [`Service::scan_opener`].
 pub(crate) struct ScanOpener {
     table: Table,
+    /// A cluster partition's gate: each page needs its lease (D326).
+    gate: Option<Arc<super::gate::WriteGate>>,
     /// The partition's database, for a page's snapshot when the request pins none.
     db: pigeonhole::Pigeonhole,
     pool: Arc<Semaphore>,
@@ -4270,6 +4273,7 @@ impl ScanOpener {
         let (end_tx, end_rx) = oneshot::channel();
         let task = ScanTask {
             table: self.table.clone(),
+            gate: self.gate.clone(),
             db: self.db.clone(),
             r,
             after,
@@ -4310,6 +4314,7 @@ impl ScanOpener {
 /// A scan's reading side, run as its own task.
 struct ScanTask {
     table: Table,
+    gate: Option<Arc<super::gate::WriteGate>>,
     db: pigeonhole::Pigeonhole,
     r: proto::ScanRequest,
     after: Option<ScanPosition>,
@@ -4339,6 +4344,7 @@ impl ScanTask {
     async fn run(self) -> Result<(), ApiError> {
         let Self {
             table,
+            gate,
             db,
             r,
             mut after,
@@ -4364,6 +4370,12 @@ impl ScanTask {
             let limit = remaining.map(|n| n.saturating_add(u64::from(last_row.is_some())));
             if let Some(p) = &pinned {
                 p.check()?;
+            }
+            // A cluster partition's lease, for each page (D326, audit120's M2): before it
+            // takes the page's snapshot, and again once the page is read, before it's sent
+            // (S3). A page is a read at a snapshot of its own unless the request pins one.
+            if let Some(g) = &gate {
+                g.serving()?;
             }
             let pinned_at = pinned.as_ref().map(|p| p.snapshot().clone());
             let (table, db, req, pos) = (table.clone(), db.clone(), Arc::clone(&r), after.take());
@@ -4411,6 +4423,9 @@ impl ScanTask {
             })
             .await?;
             drop(thread);
+            if let Some(g) = &gate {
+                g.serving()?;
+            }
             let continued = matches!(
                 (&last_row, rows.first()),
                 (Some(p), Some(first)) if first.key[..] == p[..]

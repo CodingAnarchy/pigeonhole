@@ -423,6 +423,15 @@ message LeaseRequest {
   // epoch. A grant replaces the asking node's previous one, so what it no longer asks for
   // is no longer granted.
   repeated LeasePart parts = 5;
+  // The asking node's `--cluster-lease-ms`. Refused (`FailedPrecondition`, naming both) if
+  // it isn't this node's: a holder with a longer lease than its grantors' would serve past
+  // their grants (audit120's M1).
+  uint64 lease_ms = 6;
+  // A random id the asking node picks when it starts. A request with another id than the
+  // one this node's grant to it carries is a new start of that node: its rounds start
+  // again, so the round order doesn't apply, and the request replaces the grant (a node
+  // that starts holds no lease).
+  uint64 start = 7;
 }
 
 // A partition at an epoch.

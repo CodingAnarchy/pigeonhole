@@ -8996,6 +8996,12 @@ impl serde::Serialize for LeaseRequest {
         if !self.parts.is_empty() {
             len += 1;
         }
+        if self.lease_ms != 0 {
+            len += 1;
+        }
+        if self.start != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseRequest", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -9016,6 +9022,16 @@ impl serde::Serialize for LeaseRequest {
         if !self.parts.is_empty() {
             struct_ser.serialize_field("parts", &self.parts)?;
         }
+        if self.lease_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("lease_ms", ToString::to_string(&self.lease_ms).as_str())?;
+        }
+        if self.start != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("start", ToString::to_string(&self.start).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -9034,6 +9050,9 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
             "mapVersion",
             "round",
             "parts",
+            "lease_ms",
+            "leaseMs",
+            "start",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -9043,6 +9062,8 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
             MapVersion,
             Round,
             Parts,
+            LeaseMs,
+            Start,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -9069,6 +9090,8 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                             "mapVersion" | "map_version" => Ok(GeneratedField::MapVersion),
                             "round" => Ok(GeneratedField::Round),
                             "parts" => Ok(GeneratedField::Parts),
+                            "leaseMs" | "lease_ms" => Ok(GeneratedField::LeaseMs),
+                            "start" => Ok(GeneratedField::Start),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -9093,6 +9116,8 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                 let mut map_version__ = None;
                 let mut round__ = None;
                 let mut parts__ = None;
+                let mut lease_ms__ = None;
+                let mut start__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -9129,6 +9154,22 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                             }
                             parts__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::LeaseMs => {
+                            if lease_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leaseMs"));
+                            }
+                            lease_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Start => {
+                            if start__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("start"));
+                            }
+                            start__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LeaseRequest {
@@ -9137,6 +9178,8 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                     map_version: map_version__.unwrap_or_default(),
                     round: round__.unwrap_or_default(),
                     parts: parts__.unwrap_or_default(),
+                    lease_ms: lease_ms__.unwrap_or_default(),
+                    start: start__.unwrap_or_default(),
                 })
             }
         }

@@ -543,7 +543,7 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 
 **Proto** (numbers from the coordinator, `.coord/numbers.md`, 2026-11-14):
 - **`Cluster.Lease(LeaseRequest) returns (LeaseResponse)`:** node to node, cluster scope, gRPC only.
-  - `LeaseRequest { cluster_id = 1; node_id = 2; map_version = 3; round = 4; repeated LeasePart parts = 5; }`. Another cluster's id is `InvalidArgument`.
+  - `LeaseRequest { cluster_id = 1; node_id = 2; map_version = 3; round = 4; repeated LeasePart parts = 5; lease_ms = 6; start = 7; }`. Another cluster's id is `InvalidArgument`. A `lease_ms` other than the grantor's `--cluster-lease-ms` is `FailedPrecondition`, naming both (audit120's M1). `start` is a random id per start of the asking node: a request with another id than the grant's replaces it whatever its round (audit120's S-b); within one start, an older round is ignored.
   - `LeasePart { partition = 1; epoch = 2; }`.
   - `LeaseResponse { newer_map_version = 1; repeated LeasePart granted = 2; repeated LeaseWithheld withheld = 3; grace_remaining_ms = 4; }`. A refusal isn't an error: the reply says what was granted and why the rest wasn't.
   - `LeaseWithheld { partition = 1; holder = 2; remaining_ms = 3; }`.
