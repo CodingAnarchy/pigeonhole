@@ -688,7 +688,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 - **Shared merges** (#1798): subscriptions from now that enter the same node with the same token and the same request share one merge there.
   - The same request means the same tables, prefix, visibility, `allow_partial` and `checkpoint_every`.
   - A shared merge keeps a ring of its merged events, as a single node's hub does. Its ring takes a share of `--feed-ring-bytes`, and a node has at most `--max-feed-hubs` shared merges, counted apart from its partitions' hubs. Past that, a new request runs a merge of its own.
-  - The partition hubs it reads from on the entry node keep 1 MiB rings each, outside `--feed-ring-bytes`, while shared merges are their only readers.
+  - The partition hubs it reads from on the entry node take a share of `--feed-ring-bytes` too, as any hub does. While shared merges are their only readers, they run on the hub threads (`phdb-serve-hub`), so the feed threads are left to merge and deliver.
   - Starts from a token, from the oldest commit, or with `skip_through` run a merge of their own until they catch up, then join the shared one.
   - The saving needs subscribers that share a token and a request. Each token or request of its own costs about what a subscription did before.
 - **Falling behind a shared merge:** a subscriber more than its ring behind goes on alone from its last checkpoint, with nothing skipped or repeated, and rejoins once caught up.
@@ -823,7 +823,7 @@ A node serves every partition its map gives it ([D317](../design/decisions/phase
 - **`--change-feed` is not split:** each partition keeps the whole retention over its own shards, so a node's feed disk is its partition count times the retention. With WAL preallocation (unless `--no-wal-preallocate`), that disk is written when the partitions open, not reached over time. For example, with `--change-feed 4294967296` (4 GiB), a 16-shard node writes about 9 GiB of log at start as one database, and about 37 GiB as 8 partitions of 2 shards. A node-total feed budget is planned for 1.3.0 ([#1786](https://github.com/CodingAnarchy/pigeonhole/issues/1786)).
 - **Sessions and feeds:** `--max-sessions`, `--max-sessions-per-token`, `--feed-ring-bytes`, `--max-feed-hubs` and `--max-catch-up` count across all of a node's partitions. A feed with tables on two of a node's partitions holds two hubs there.
   - `--max-feed-hubs` also caps the node's shared cluster feed merges ([Limits](#limits)). Those are counted on their own, apart from the partitions' hubs, so a node can have up to that many of each.
-  - A partition's hub whose only readers are shared merges keeps a ring of 1 MiB, outside `--feed-ring-bytes`. The shared merges drain it as it fills, so they don't take a share each twice.
+  - A partition's hub whose only readers are shared merges takes a share of `--feed-ring-bytes` like any other. So a node running shared merges over its own partitions splits the budget over both: 16 shared merges over one local partition's 16 hubs make 32 rings, each a thirty-second of it.
 
 **What a partition costs** even so: each is a whole database engine, with costs that don't shrink with its share of the load:
 - at least one shard's memtable arena (64 MiB by default);

@@ -106,8 +106,8 @@ pub(crate) struct Spec {
     /// subscription's part (D317 ticket 7) then knows where it is from the start, so it can
     /// resume after a break that came before any event, with nothing skipped.
     pub announce: bool,
-    /// A cluster feed hub's own component (#1798): it doesn't give its hub's ring a full
-    /// share of `--feed-ring-bytes` ([`INTERNAL_RING`]).
+    /// A cluster feed hub's own component (#1798): a hub whose members are all these runs
+    /// on the hub runtime, never beside its one member ([`HubOf::external`]).
     pub internal: bool,
 }
 
@@ -514,12 +514,6 @@ impl Ring {
     }
 }
 
-/// A ring with no member but cluster hubs' merges ([`HubOf::external`]) is capped at this,
-/// outside the share the others split (#1798): its one reader is a merge on the same runtime
-/// that drains it as it fills, and a merge that falls this far behind catches up on its own
-/// stream, as any client does. About 2,800 commits at s55's sizes.
-pub(crate) const INTERNAL_RING: usize = 1 << 20;
-
 /// A hub: its ring, its task, and its members.
 pub(crate) struct HubOf<K: RingKind> {
     ring: Mutex<RingOf<K>>,
@@ -530,8 +524,10 @@ pub(crate) struct HubOf<K: RingKind> {
     /// Its clients, on its ring or on their own streams until they rejoin it: a [`JoinedOf`]
     /// each. At most one, a single node's hub task runs on the feed runtime (#1689).
     members: AtomicUsize,
-    /// Its members that aren't a cluster hub's merge (#1798): while it has none, its ring is
-    /// [`INTERNAL_RING`], and it isn't one of the rings that split `--feed-ring-bytes`.
+    /// Its members that aren't a cluster hub's merge (#1798). While it has members and none
+    /// of these, its task stays on the hub runtime: its readers are merges on the feed
+    /// runtime, so running it beside them (#1689) only adds the engine's reads to the
+    /// runtime that delivers every cluster subscriber's events (g100).
     external: AtomicUsize,
     /// Bumped by each join, so the task sees a client that joined and left between two of
     /// its looks at `members`.
@@ -542,7 +538,7 @@ pub(crate) struct HubOf<K: RingKind> {
     stats: Arc<FeedStats>,
     /// Live hubs of its kind: `--max-feed-hubs` counts them.
     live: Arc<AtomicU64>,
-    /// The node's rings that split `--feed-ring-bytes`: every hub with an external member.
+    /// The node's rings that split `--feed-ring-bytes`: every hub with a member.
     sharers: Arc<AtomicU64>,
     /// Its clients' trackers, for the dump; a gone client's is pruned there.
     clients: Mutex<Vec<Weak<Tracker>>>,
@@ -590,11 +586,15 @@ impl<K: RingKind> HubOf<K> {
     }
 
     /// Makes `tracker`'s client one of this hub's members until the [`JoinedOf`] drops;
-    /// `internal`: a cluster hub's merge (#1798), which doesn't give the ring a full share.
+    /// `internal`: a cluster hub's merge (#1798), which keeps the task on the hub runtime.
     pub(crate) fn join(self: &Arc<Self>, tracker: &Arc<Tracker>, internal: bool) -> JoinedOf<K> {
         self.track(tracker);
-        self.members.fetch_add(1, Ordering::Relaxed);
-        if !internal && self.external.fetch_add(1, Ordering::Relaxed) == 0 {
+        // `external` before `members`, and after it on the way out: a client's membership
+        // never reads as a merge's ([`HubOf::internal`]).
+        if !internal {
+            self.external.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.members.fetch_add(1, Ordering::Relaxed) == 0 {
             self.sharers.fetch_add(1, Ordering::Relaxed);
         }
         self.joins.fetch_add(1, Ordering::Relaxed);
@@ -606,16 +606,15 @@ impl<K: RingKind> HubOf<K> {
         self.members.load(Ordering::Relaxed)
     }
 
-    /// Its ring's cap, from `--feed-ring-bytes` (`total`): [`INTERNAL_RING`] while all its
-    /// members are cluster hubs' merges, else a share of it.
+    /// Its ring's cap: an equal share of `--feed-ring-bytes` (`total`) among the rings with
+    /// a member, a cluster hub's and the partition hubs its merges read alike (#1798).
     pub(crate) fn ring_limit(&self, total: usize) -> usize {
-        // Members, all of them merges: internal. None yet (a hub just opened for its first
-        // client): a full share, as before (cli692's N3 on #1884).
-        if self.external.load(Ordering::Relaxed) == 0 && self.members.load(Ordering::Relaxed) > 0 {
-            INTERNAL_RING.min(total)
-        } else {
-            total / self.sharers.load(Ordering::Relaxed).max(1) as usize
-        }
+        total / self.sharers.load(Ordering::Relaxed).max(1) as usize
+    }
+
+    /// Whether its members are all cluster hubs' merges, and there's at least one.
+    fn internal(&self) -> bool {
+        self.external.load(Ordering::Relaxed) == 0 && self.members.load(Ordering::Relaxed) > 0
     }
 
     /// Counts `tracker`'s client under this hub, for the dump. Gone clients and those that
@@ -708,9 +707,11 @@ type Joined = JoinedOf<Single>;
 impl<K: RingKind> Drop for JoinedOf<K> {
     fn drop(&mut self) {
         let hub = &self.0;
-        hub.members.fetch_sub(1, Ordering::Relaxed);
-        if !self.1 && hub.external.fetch_sub(1, Ordering::Relaxed) == 1 {
+        if hub.members.fetch_sub(1, Ordering::Relaxed) == 1 {
             hub.sharers.fetch_sub(1, Ordering::Relaxed);
+        }
+        if !self.1 {
+            hub.external.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -742,17 +743,18 @@ struct Driver {
 
 impl Driver {
     /// Where the task should run now, if not where it is: on the hub runtime at once with two
-    /// or more clients, back on the feed runtime after `solo_after` with at most one.
+    /// or more clients, or with only cluster hubs' merges ([`HubOf::external`]); back on the
+    /// feed runtime after `solo_after` with at most one other client.
     ///
     /// Asked only after a commit, so a hub left alone on the hub runtime by a quiet table
     /// stays there until its next commit. That's harmless: with no commits there's no
     /// handoff to save (perf287's N1 on #1716).
     fn moves(&mut self, hub: &Hub) -> Option<Place> {
         self.runtimes.as_ref()?;
-        let members = hub.members.load(Ordering::Relaxed);
+        let shared = hub.members.load(Ordering::Relaxed) >= 2 || hub.internal();
         match self.place {
-            Place::Feed => (members >= 2).then_some(Place::Hubs),
-            Place::Hubs if members >= 2 => {
+            Place::Feed => shared.then_some(Place::Hubs),
+            Place::Hubs if shared => {
                 self.alone = None;
                 None
             }
@@ -920,8 +922,8 @@ impl Drop for HubPlace<'_> {
 pub(crate) struct FeedShared {
     pub(crate) catch_up: Arc<Semaphore>,
     live: Arc<AtomicU64>,
-    /// The rings that split `--feed-ring-bytes`, single-node hubs' and cluster feed hubs'
-    /// alike ([`HubOf::ring_limit`], #1798).
+    /// The rings with a member, which split `--feed-ring-bytes`: single-node hubs' and
+    /// cluster feed hubs' alike ([`HubOf::ring_limit`], #1798).
     pub(crate) sharers: Arc<AtomicU64>,
 }
 
@@ -2437,6 +2439,94 @@ mod tests {
             feeds.dump()
         );
         drop(t);
+        drop(requests);
+        drop(delivery);
+        drop(hubs);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hub_read_only_by_cluster_merges_runs_on_the_hub_runtime_with_a_full_share() {
+        // #1798, g100: a partition hub whose one member is a cluster hub's merge isn't solo.
+        // Its reader runs on the feed runtime, which also delivers every cluster subscriber's
+        // events, so the hub's engine reads go to the hub runtime at its first commit and
+        // stay there past `solo_after`. Its ring takes an equal share of `--feed-ring-bytes`
+        // with every other ring that has a member, as a client's hub does.
+        let (_, db, dir) = commits("feedint", 0);
+        let (requests, delivery, hubs) = server_runtimes(1);
+        let t = db.table("t").unwrap().open().unwrap();
+        let u = db
+            .table("u")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let shared = FeedShared::new(1);
+        let feeds = Feeds::new(
+            db.clone(),
+            limits_solo_after(Duration::from_millis(50)),
+            &shared,
+        );
+        feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
+        let slots = Arc::new(Semaphore::new(8));
+        let hubs_before = hubs.metrics().num_alive_tasks();
+        requests.block_on(async {
+            let put =
+                |t: &Table, row: &[u8]| t.mutate(row).put("f", b"q", b"v").commit().unwrap().seqno;
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let merge = Spec {
+                internal: true,
+                ..now_spec(&t)
+            };
+            let mut m = feeds.subscribe(merge, slot, |_| {}).unwrap();
+            let s1 = put(&t, b"r1");
+            assert_eq!(seqnos(&mut m, Duration::from_millis(300)).await, [s1]);
+            assert_eq!(
+                tasks_on(&hubs, hubs_before + 1).await,
+                hubs_before + 1,
+                "the merge's hub, on the hub runtime"
+            );
+            assert_eq!(feeds.gauges().solo_hubs, 0);
+            // Past `solo_after`, with another commit: still there.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let s2 = put(&t, b"r2");
+            assert_eq!(seqnos(&mut m, Duration::from_millis(300)).await, [s2]);
+            let s3 = put(&t, b"r3");
+            assert_eq!(seqnos(&mut m, Duration::from_millis(300)).await, [s3]);
+            assert_eq!(tasks_on(&hubs, hubs_before + 1).await, hubs_before + 1);
+            assert_eq!(feeds.gauges().solo_hubs, 0);
+            assert_eq!(feeds.stats.hub_moves.load(Ordering::Relaxed), 1);
+
+            // A client's hub beside it: two rings with members, so each has half.
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut c = feeds.subscribe(now_spec(&u), slot, |_| {}).unwrap();
+            assert_eq!(shared.sharers.load(Ordering::Relaxed), 2);
+            let total = 16 << 20;
+            for h in feeds
+                .hubs
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(Weak::upgrade)
+            {
+                assert_eq!(h.ring_limit(total), total / 2);
+            }
+            let s4 = put(&u, b"r4");
+            assert_eq!(seqnos(&mut c, Duration::from_millis(300)).await, [s4]);
+            assert_eq!(feeds.gauges().solo_hubs, 1, "the client's hub is solo");
+            drop(c);
+            drop(m);
+            // Every membership gone, once the clients' tasks end: no ring splits the budget.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while shared.sharers.load(Ordering::Relaxed) != 0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(shared.sharers.load(Ordering::Relaxed), 0);
+        });
+        drop((t, u));
         drop(requests);
         drop(delivery);
         drop(hubs);
