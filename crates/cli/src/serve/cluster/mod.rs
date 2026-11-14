@@ -94,18 +94,24 @@ pub(crate) fn read_map(dir: &Path) -> Result<Option<ClusterMap>, String> {
     }
 }
 
-/// Writes `json` as `dir`'s map file: a temporary file, synced, renamed over the old one,
-/// then the directory synced, so a crash leaves the old map or the new one, never a torn
-/// file.
+/// Writes `json` as `dir`'s map file, so a crash leaves the old map or the new one, never a
+/// torn file.
 fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
+    write_synced(dir, MAP_FILE, json.as_bytes())
+}
+
+/// Writes `bytes` as `dir`'s file `name`: a temporary file (`name.tmp`), synced, renamed
+/// over the old one, then the directory synced, so a crash leaves the old file or the new
+/// one whole.
+pub(super) fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = dir.join(format!("{MAP_FILE}.tmp"));
+    let tmp = dir.join(format!("{name}.tmp"));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, dir.join(MAP_FILE))?;
+    std::fs::rename(&tmp, dir.join(name))?;
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -279,12 +285,7 @@ impl Node {
     }
 
     fn caller(&self, header: Option<&str>) -> Result<Caller, ApiError> {
-        if !self.tokens.any() {
-            return Ok(Caller::anonymous());
-        }
-        super::auth::bearer(header)
-            .and_then(|t| self.tokens.caller(t))
-            .ok_or_else(ApiError::unauthenticated)
+        self.tokens.caller_of(header)
     }
 
     /// Whether `caller` may make a call that any of `scopes` allows. Without tokens (a
@@ -1007,11 +1008,7 @@ struct ClusterGrpc(Arc<Node>, Option<Arc<super::Shared>>);
 
 impl ClusterGrpc {
     fn caller<T>(&self, req: &Request<T>, scopes: &[Scope], what: &str) -> Result<Caller, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(super::grpc::auth_header(req))?;
         self.0.allowed(&caller, scopes, what)?;
         self.0.maybe_pull(&caller, req.metadata());
         Ok(caller)
@@ -1220,7 +1217,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .router
             .serve_forwarded_scan(&msg.partition, scan, &caller)
             .await?;
-        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcPages(
+        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcStream(
             pages,
         ))))
     }

@@ -32,6 +32,7 @@ on:
       - 'crates/bench/examples/feedshapes.rs'
       - 'crates/bench/examples/serveshapes.rs'
       - 'crates/cli/src/serve/**'
+      - 'crates/bench/examples/asyncwrites.rs'
       - 'crates/text/**'
       - 'crates/bench/examples/support/**'
       - 'scripts/instructions-per-cell.sh'
@@ -146,7 +147,7 @@ jobs:
             # Examples built at base and head (crates/bench/examples/NAME.rs). The base is
             # built with the head's sources of these files, so a new or changed example still
             # has a baseline.
-            examples: hotrow readshapes writepath ycsb scanrate
+            examples: hotrow readshapes writepath ycsb scanrate asyncwrites
             # The hot row's three states run too (scripts/instructions-per-cell.sh's first
             # argument); `-` skips them.
             hotrow: hotrow
@@ -159,9 +160,10 @@ jobs:
             # time instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
             shapes: >-
               readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,wide-row-cells-async,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
-              writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,commit-put-previous-async,commit-if-returning-async,flush,compact
+              writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,flush,compact
               ycsb:ycsb-c,ycsb-a
               scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+              asyncwrites:commit-put-previous-async,commit-if-returning-async
           - name: text search instructions per search (callgrind)
             # The sync text search's floor (#1560 PR 0, crates/bench/examples/textshapes.rs).
             examples: textshapes

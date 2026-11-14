@@ -302,6 +302,10 @@ struct Live {
     generation: std::sync::atomic::AtomicU64,
     /// The process's CPUs, which a thread masked to `None` gets back.
     process: Vec<usize>,
+    /// The threads that follow [`refresh`] (every [`Placement::enter_as`]), by thread ID: the
+    /// sweep leaves them to it (#1762, perf287's S1: names don't tell them apart).
+    #[cfg(target_os = "linux")]
+    registered: std::sync::Mutex<std::collections::HashSet<i32>>,
 }
 
 /// Which runtime's mask a thread takes.
@@ -328,6 +332,30 @@ thread_local! {
     /// This thread's placement, its role and the generation of the mask it last applied.
     static THREAD: std::cell::RefCell<Option<(Arc<Live>, Role, u64)>> =
         const { std::cell::RefCell::new(None) };
+    /// This thread's entry in [`Live::registered`], removed when the thread exits: Linux
+    /// reuses thread IDs, and the blocking pool retires idle threads, so a stale entry
+    /// would let the sweep skip an unrelated later thread that got the same ID.
+    #[cfg(target_os = "linux")]
+    static REGISTERED: std::cell::RefCell<Option<Registered>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One thread's registration; dropping it (at thread exit, or a new `enter_as`) removes it.
+#[cfg(target_os = "linux")]
+struct Registered {
+    live: Arc<Live>,
+    tid: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.live
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.tid);
+    }
 }
 
 /// Reapplies the calling thread's mask if a reapply published a newer one since it last
@@ -345,6 +373,38 @@ pub(crate) fn refresh() {
             apply_to(&live.process, live.masks.load().of(*role));
         }
     });
+}
+
+/// The process's thread IDs (`/proc/self/task`).
+#[cfg(target_os = "linux")]
+fn thread_ids() -> Vec<i32> {
+    std::fs::read_dir("/proc/self/task")
+        .map(|d| {
+            d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Thread `tid`'s CPUs, sorted; `None` when it has gone, or can't be read.
+#[cfg(target_os = "linux")]
+fn affinity_of(tid: i32) -> Option<Vec<usize>> {
+    let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(tid)).ok()?;
+    Some(
+        (0..nix::sched::CpuSet::count())
+            .filter(|&c| set.is_set(c).unwrap_or(false))
+            .collect(),
+    )
+}
+
+/// Masks thread `tid` to `cpus`; false when it has gone, or the OS refused.
+#[cfg(target_os = "linux")]
+fn set_affinity_of(tid: i32, cpus: &[usize]) -> bool {
+    let mut mask = nix::sched::CpuSet::new();
+    for &c in cpus {
+        let _ = mask.set(c);
+    }
+    nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &mask).is_ok()
 }
 
 /// Masks the calling thread to `cpus` (Linux). `None` means where the OS puts it, so the
@@ -443,6 +503,8 @@ impl Placement {
             masks: arc_swap::ArcSwap::from_pointee(plan.masks.clone()),
             generation: std::sync::atomic::AtomicU64::new(0),
             process: plan.process.clone(),
+            #[cfg(target_os = "linux")]
+            registered: std::sync::Mutex::default(),
         });
         plan
     }
@@ -497,9 +559,18 @@ impl Placement {
     }
 
     /// The masks the threads take now: the start's, or the last reapply's.
-    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn current(&self) -> RuntimeMasks {
         (**self.live.masks.load()).clone()
+    }
+
+    /// Whether thread `tid` is registered as following [`refresh`].
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn is_registered(&self, tid: i32) -> bool {
+        self.live
+            .registered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&tid)
     }
 
     /// Masks the calling thread to `role`'s CPUs now, and records it, so its [`refresh`]
@@ -509,8 +580,129 @@ impl Placement {
             .live
             .generation
             .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(target_os = "linux")]
+        {
+            let tid = nix::unistd::gettid().as_raw();
+            // Drop any earlier entry first: its drop takes the lock below to remove this tid.
+            REGISTERED.with_borrow_mut(|r| *r = None);
+            // Registered and masked under the lock a sweep holds while it checks and masks a
+            // thread, so a sweep never overwrites the mask of a thread entering meanwhile
+            // (perf287's N1 on #1871).
+            let mut registered = self
+                .live
+                .registered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.insert(tid);
+            apply_to(&self.live.process, self.live.masks.load().of(role));
+            drop(registered);
+            REGISTERED.with_borrow_mut(|r| {
+                *r = Some(Registered {
+                    live: Arc::clone(&self.live),
+                    tid,
+                });
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
         apply_to(&self.live.process, self.live.masks.load().of(role));
         THREAD.with_borrow_mut(|t| *t = Some((Arc::clone(&self.live), role, now)));
+    }
+
+    /// After a [`reapply`](Self::reapply): moves every thread of the process that doesn't
+    /// follow [`refresh`] itself onto the blocking mask (or the process's CPUs when there's
+    /// none), so the engines' unpinned threads and the server's long-running ones (a backup,
+    /// a bulk load, a rebalancer, a replica's follow, candle's pool) leave CPUs a new
+    /// partition's shards were just pinned to (#1762). Linux; elsewhere it does nothing.
+    ///
+    /// Left alone:
+    /// - the threads that follow `refresh()` (registered by thread ID as they enter): they
+    ///   take their runtime's mask at their next park, unpark, call or task, as before;
+    /// - every thread whose affinity is a subset of `engine_pins`, the open partitions'
+    ///   pinned shard and compaction CPUs: the engines' own pins (D235), one CPU or a
+    ///   confined set (ICR 0134). This assumes an engine never pins a thread outside those.
+    ///   Except a thread whose affinity equals one of `previous`'s masks (the ones in force
+    ///   before the reapply) or the process's CPUs: that's a thread still on an old mask,
+    ///   which the new partition's pins may now cover whole, and it moves (perf287's S1 on
+    ///   #1871: on a narrow host, the case #1762 is about).
+    ///
+    /// A thread is checked and masked under the lock [`enter_as`](Self::enter_as) registers
+    /// and masks under, so one entering meanwhile keeps its own mask.
+    ///
+    /// Two passes at most: a second when the thread count changed during the first, then it
+    /// stops and says so (perf287's N1). The number of threads it moved; a thread that
+    /// refuses a mask (io_uring's `iou-wrk-*` workers) isn't counted, and is tried again at
+    /// the next sweep (simp724's N2 on #1871).
+    pub(crate) fn sweep(&self, engine_pins: &[usize], previous: &RuntimeMasks) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            let target: Vec<usize> = self
+                .live
+                .masks
+                .load()
+                .of(Role::Blocking)
+                .map_or_else(|| self.live.process.clone(), <[usize]>::to_vec);
+            if target.is_empty() {
+                return 0;
+            }
+            // The old masks, each sorted as `affinity_of` reads a thread's.
+            let old: Vec<Vec<usize>> = [
+                &previous.network,
+                &previous.blocking,
+                &previous.feed,
+                &previous.hub,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .chain(std::iter::once(self.live.process.clone()))
+            .map(|mut m| {
+                m.sort_unstable();
+                m
+            })
+            .collect();
+            let mut moved = 0;
+            let mut seen = None;
+            for _ in 0..2 {
+                let tids = thread_ids();
+                if seen == Some(tids.len()) {
+                    return moved;
+                }
+                seen = Some(tids.len());
+                for tid in tids {
+                    let registered = self
+                        .live
+                        .registered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if registered.contains(&tid) {
+                        continue;
+                    }
+                    let Some(now) = affinity_of(tid) else {
+                        continue;
+                    };
+                    let engine_pin =
+                        !old.contains(&now) && now.iter().all(|c| engine_pins.contains(c));
+                    if now == target || engine_pin {
+                        continue;
+                    }
+                    if set_affinity_of(tid, &target) {
+                        moved += 1;
+                    }
+                }
+            }
+            if seen != Some(thread_ids().len()) {
+                eprintln!(
+                    "phdb serve: the thread mask sweep stopped after two passes with threads still \
+                     starting: one started meanwhile takes its spawner's mask"
+                );
+            }
+            moved
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (engine_pins, previous);
+            0
+        }
     }
 
     /// The CPUs the server's own heavy threads may run on, as a CPU list (`2-7,10`), when the
