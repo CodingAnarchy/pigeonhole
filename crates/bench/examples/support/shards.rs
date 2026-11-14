@@ -33,6 +33,50 @@ impl Shards {
         (db, Shards { drivers, ctl })
     }
 
+    /// [`open`](Self::open) with `more` applied to its options last (the change feed's:
+    /// `feedshapes.rs`). Kept apart from `open`, not shared with it: a change to `open`'s
+    /// code moves the code layout of every example that includes this module, and with it
+    /// their counts (#1828: `writepath`'s `commit-incr-returning`). A generic function no
+    /// example calls generates no code.
+    #[allow(dead_code, reason = "only feedshapes.rs calls it")]
+    pub fn open_with(
+        path: &Path,
+        vfs: Option<pigeonhole_io::VfsRef>,
+        more: impl FnOnce(Options) -> Options,
+    ) -> (Pigeonhole, Shards) {
+        let mut options = Options::default();
+        if let Some(vfs) = vfs {
+            options = options.vfs(vfs);
+        }
+        let pigeonhole::AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(
+            path,
+            more(
+                options
+                    .shards(1)
+                    .tablet_changes(false)
+                    .durability(Durability::Buffered)
+                    .memtable_budget(1 << 30)
+                    .block_cache(256 << 20)
+                    .commit_spin(std::time::Duration::ZERO)
+                    .row_cache(row_cache()),
+            ),
+        )
+        .expect("open");
+        let ctl = Arc::new(Ctl {
+            shards: shards.len(),
+            ..Ctl::default()
+        });
+        let drivers = shards
+            .into_iter()
+            .map(|shard| {
+                let ctl = Arc::clone(&ctl);
+                ctl.busy.fetch_add(1, Ordering::AcqRel);
+                thread::spawn(move || run(shard, &ctl))
+            })
+            .collect();
+        (db, Shards { drivers, ctl })
+    }
+
     /// Runs `f`, the measured work, with the shards' side counted too.
     ///
     /// The measured work starts and ends with every shard idle: what the setup left running
