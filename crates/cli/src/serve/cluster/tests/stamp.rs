@@ -631,8 +631,13 @@ fn an_upload_is_complete_only_while_its_staged_file_is_there() {
         dbs.extend(db);
     }
     let c = ports[2];
+    // p1's files, closed in a directory of their own: a's are open, which Windows locks.
+    let source = test_dir();
+    test_partition_with(&source, "p1", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
     rt.block_on(async {
-        upload_set(c, "p1", &dirs[0].join("p1.phdb"), 7).await;
+        upload_set(c, "p1", &source.join("p1.phdb"), 7).await;
         // The main file's upload (the first, id 0700…).
         let id = format!("{:02x}{:02x}", 7, 0).repeat(8);
         let status = async || {

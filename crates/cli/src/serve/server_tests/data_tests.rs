@@ -1405,13 +1405,13 @@ fn grpc_health_reserves_nothing_and_refuses_a_long_message() {
     assert_eq!(service.inflight_available(), l.inflight_bytes);
 }
 
-/// One write to row "a" of `table`: each value into `q:x` and `r:x`, two quantile columns.
-fn grow_put(table: &str, values: &[f64]) -> proto::MutateRequest {
+/// One write to `row` of `table`: each value into `q:x` and `r:x`, two aggregate columns.
+fn grow_put(table: &str, row: &str, values: &[f64]) -> proto::MutateRequest {
     proto::MutateRequest {
         writes: Some(proto::RowWrites {
             row: Some(proto::RowKey {
                 table: table.into(),
-                row: b"a".to_vec().into(),
+                row: row.as_bytes().to_vec().into(),
             }),
             writes: ["q", "r"]
                 .iter()
@@ -1446,10 +1446,16 @@ fn grow_between_reads(s: &Server, table: &str) -> proto::Selection {
     ]});
     let (status, body) = s.rpc("Schema/CreateTable", &spec, None);
     assert_eq!(status, 200, "{body}");
-    s.block_on(c.mutate(grow_put(table, &[1.0]))).unwrap();
-    let url = s.url.clone();
+    s.block_on(c.mutate(grow_put(table, "a", &[1.0]))).unwrap();
     let wide: Vec<f64> = (0..400).map(|i| f64::from(i) * 977.0 + 1.0).collect();
-    let owned = table.to_owned();
+    write_between_reads(s, table, grow_put(table, "a", &wide));
+    aggregate_query(1024, 0, 0)
+}
+
+/// Arms `put` to land between a page's two reads of `table`, through its own connection
+/// (the hold seam runs on a blocking thread).
+fn write_between_reads(s: &Server, table: &str, put: proto::MutateRequest) {
+    let url = s.url.clone();
     super::super::service::BETWEEN_READS.lock().unwrap().push((
         table.into(),
         Box::new(move || {
@@ -1462,14 +1468,13 @@ fn grow_between_reads(s: &Server, table: &str) -> proto::Selection {
                         .await
                         .unwrap();
                     let mut c = proto::data_client::DataClient::new(ch);
-                    c.mutate(grow_put(&owned, &wide)).await.unwrap();
+                    c.mutate(put).await.unwrap();
                 });
             })
             .join()
             .unwrap();
         }),
     ));
-    aggregate_query(1024, 0, 0)
 }
 
 /// Whether the write armed for `table` ran: the page was read again, with it between.
@@ -1502,6 +1507,70 @@ fn a_write_between_a_pages_two_reads_doesnt_empty_it() {
         .into_inner();
     assert!(read_again_with_the_write_between("grow"));
     assert_eq!(page.rows.len(), 1, "{page:?}");
+    assert_eq!(page.rows[0].cells.len(), 1, "the first column alone");
+    assert!(!page.next.is_empty(), "the second column is next");
+}
+
+/// #1848, audit120's B2 on #1872: a plain selection, with no aggregate query, over families
+/// whose kind gives each cell a view (histograms here) is cut by those views and read again
+/// too, so its reads share one snapshot as well. The page's budget fits both columns by the
+/// engine's measure but not with their views; between the reads, a row that sorts first
+/// lands, whose first column alone is over what the read again may take. Read at a new
+/// snapshot, that read admitted nothing: an empty page with a position.
+#[test]
+fn a_write_between_two_reads_of_a_plain_selection_over_viewed_families_doesnt_empty_it() {
+    use prost::Message as _;
+    let s = Server::start("", limits());
+    let mut c = s.grpc();
+    let hist =
+        json!({"kind": "AGGREGATION_KIND_HISTOGRAM", "histogram_bounds": [1.0, 10.0, 100.0]});
+    let spec = json!({"name": "hist", "if_missing": false, "families": [
+        {"name": "q", "aggregate": hist},
+        {"name": "r", "aggregate": hist},
+    ]});
+    let (status, body) = s.rpc("Schema/CreateTable", &spec, None);
+    assert_eq!(status, 200, "{body}");
+    s.block_on(c.mutate(grow_put("hist", "a", &[5.0]))).unwrap();
+    let first = "0-sorts-first-with-a-longer-key";
+    let mut get = |page_bytes: u64| {
+        s.block_on(c.multi_get(proto::MultiGetRequest {
+            table: "hist".into(),
+            keys: vec![first.as_bytes().to_vec().into(), b"a".to_vec().into()],
+            page_bytes,
+            ..Default::default()
+        }))
+        .unwrap()
+        .into_inner()
+    };
+    // Row a's measure, by the engine's count and its views, from a page with room for all.
+    let whole = get(1 << 20);
+    assert_eq!(whole.rows.len(), 1, "{whole:?}");
+    let row = &whole.rows[0];
+    assert_eq!(row.cells.len(), 2, "{row:?}");
+    let views: u64 = row
+        .cells
+        .iter()
+        .map(|c| c.aggregate.as_ref().map_or(0, |a| a.encoded_len() as u64))
+        .sum();
+    assert!(
+        views >= 2,
+        "a histogram's cells have views without a query: {row:?}"
+    );
+    let own = row.key.len() as u64
+        + row
+            .cells
+            .iter()
+            .map(|c| (c.qualifier.len() + c.value.len() + 16) as u64)
+            .sum::<u64>();
+    write_between_reads(&s, "hist", grow_put("hist", first, &[5.0]));
+    let page = get(own + views / 2);
+    assert!(read_again_with_the_write_between("hist"));
+    assert_eq!(page.rows.len(), 1, "{page:?}");
+    assert_eq!(
+        page.rows[0].key.as_ref(),
+        b"a",
+        "the snapshot's rows only: {page:?}"
+    );
     assert_eq!(page.rows[0].cells.len(), 1, "the first column alone");
     assert!(!page.next.is_empty(), "the second column is next");
 }
