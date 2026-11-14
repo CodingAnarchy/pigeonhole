@@ -161,7 +161,7 @@ pub fn rebalancer_thread_started(index: &crate::Index) -> bool {
 
 /// Counts a list row as `bytes` (process-wide; `None` restores the 4 MiB) in a split's bound
 /// on what it reads whole (#1824, #1879), so a test reaches a split a page at a time without
-/// writing 16 MiB. `Some(0)` leaves the bound at four split lengths.
+/// writing 16 MiB's worth. `Some(0)` leaves the bound at four split lengths.
 pub fn split_row_bytes(bytes: Option<u64>) {
     SPLIT_ROW_BYTES.store(bytes.unwrap_or(u64::MAX), Ordering::SeqCst);
 }

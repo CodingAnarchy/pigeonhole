@@ -283,8 +283,8 @@ fn a_crash_between_a_split_and_its_phase_2_leaves_a_consistent_index() {
 }
 
 /// Counts a list row as no bytes while it lives, so a split's whole-read bound is four split
-/// lengths and a test's long list is split a page at a time (#1879: the bound is four 4 MiB
-/// rows' worth otherwise).
+/// lengths and a test's long list is split a page at a time (#1879: the bound is what a
+/// split holds in 16 MiB otherwise).
 struct PagedSplits;
 
 impl PagedSplits {
@@ -307,8 +307,8 @@ impl Drop for PagedSplits {
 /// The long list's vectors: two groups, or all one point, which leaves the split nothing to
 /// separate (split by order).
 ///
-/// #1879: with the real bound, four 4 MiB rows, the same list (about 4 KiB) is read whole,
-/// so it's split in one transaction rather than a page of four vectors at a time.
+/// #1879: with the real bound, 16 MiB held, the same list (about 50 KiB held) is read whole,
+/// so it's split in one transaction rather than a page of eight vectors at a time.
 #[derive(Clone, Copy)]
 enum Shape {
     TwoGroups,

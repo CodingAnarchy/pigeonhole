@@ -95,7 +95,7 @@ assert!(index.delete(&42u32.to_be_bytes())?);
 ```
 
 - **Ids are bytes,** at most a row key's length. An insert of an existing id replaces its vector (an upsert).
-- **Every insert and delete is one transaction.** Lists split above twice `target_list_len` (default 1,000) and merge below a quarter of it, each move a transaction too. A list that grew past four list rows' worth of vectors, 16 MiB of `f32` (writes while rebalancing was behind, or a bulk load whose vectors mostly fell in one list), is split from a sample and moved a page per transaction, so a split holds at most that much at once; searches lose some recall until the split ends, never a vector. A search reads one snapshot, so a concurrent split never shows a vector twice or hides it.
+- **Every insert and delete is one transaction.** Lists split above twice `target_list_len` (default 1,000) and merge below a quarter of it, each move a transaction too. A list that grew too long for a split to hold in about 16 MiB, or past four split lengths if that's more (writes while rebalancing was behind, or a bulk load whose vectors mostly fell in one list), is split from a sample and moved a page per transaction, so a split holds at most that much at once; searches lose some recall until the split ends, never a vector. A search reads one snapshot, so a concurrent split never shows a vector twice or hides it.
 - **`search_f32(q, k)`** returns `Hit { id, distance }`, nearest first. Options:
   - `nprobe(n)`: the lists probed. It overrides the index's own default, `IndexOptions::nprobe`: 24 for an index created now. Options are fixed when an index is created, so an older index keeps the default it was created with;
   - `snapshot(&s)`;

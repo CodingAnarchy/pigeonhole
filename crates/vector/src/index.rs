@@ -30,13 +30,16 @@ const RELOADS: usize = 32;
 /// queued for the next call.
 const MAINTENANCE_PER_CALL: usize = 16;
 /// A split reads its list whole while the list holds at most this many list rows' worth of
-/// vectors: [`MAX_LIST_BYTES`] each, or its split length ([`Index::max_list_len`]) if that is
-/// more. A longer list (a skewed bulk load, or a list that outgrew a background rebalancer)
+/// vectors: as many as the split holds in [`MAX_LIST_BYTES`] each, or its split length
+/// ([`Index::max_list_len`]) if that is more. A longer list (a skewed bulk load, or a list that outgrew a background rebalancer)
 /// is split from a sample of that many vectors and moved a page of one split length at a
 /// time (#1824); phase 2 reads a neighbour that many vectors at a time. Counted in bytes,
 /// not split lengths, so an index with a short target still splits a long but small list,
 /// and moves a neighbour's vectors, in one transaction (#1879).
 const SPLIT_WHOLE_LISTS: u64 = 4;
+/// What a split holds per vector beyond its point's elements: the `Point` and the id's `Vec`
+/// headers, their two allocations, and a short id (perf287's S1 on #1881).
+const HELD_PER_VECTOR: u64 = 96;
 
 /// An index's options, fixed when it is created ([`Index::create`]) and stored with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2047,16 +2050,18 @@ impl Index {
         SPLIT_WHOLE_LISTS.saturating_mul(self.max_list_len().max(self.row_vectors()))
     }
 
-    /// How many of this index's vectors a [`MAX_LIST_BYTES`] list row holds.
+    /// How many of this index's vectors a split holds in [`MAX_LIST_BYTES`]: each as a
+    /// [`Point`] (`f32`, whatever the element, but for bits) and its id ([`HELD_PER_VECTOR`]),
+    /// so the bound is the memory it states at any element and dimension (perf287's S1 on
+    /// #1881).
     fn row_vectors(&self) -> u64 {
         let spec = self.spec();
         let dim = u64::from(spec.dim());
-        let bytes = match spec.element() {
-            Element::F32 => 4 * dim,
-            Element::F16 | Element::BF16 => 2 * dim,
+        let point = match spec.element() {
             Element::Bit => dim.div_ceil(8),
-            _ => dim,
+            _ => 4 * dim,
         };
+        let bytes = point + HELD_PER_VECTOR;
         #[cfg(feature = "__unstable-hooks")]
         if let Some(row) = crate::hooks::split_row_bytes_set() {
             return row / bytes.max(1);
