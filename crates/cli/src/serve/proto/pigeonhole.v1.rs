@@ -4947,9 +4947,10 @@ pub mod vectors_server {
 pub struct PartitionRequest {
     #[prost(string, tag = "1")]
     pub partition: ::prost::alloc::string::String,
-    /// `Unfence` only: lift a start fence even though no peer's map (at least as new as this
-    /// node's, naming it for the partition at its file's epoch) confirms it. For a node whose
-    /// peers can't answer; it risks two writers if a peer's newer map moved the partition.
+    /// `Unfence` only: lift the fence without the peers' confirmation (D317 rule 3: a majority
+    /// of the map's nodes holding the newest map, which names this node for the partition at
+    /// its file's epoch). For a node whose peers can't answer; it risks two writers if a newer
+    /// map moved the partition.
     #[prost(bool, tag = "2")]
     pub force: bool,
 }
@@ -4995,6 +4996,12 @@ pub struct ClusterMap {
     /// Which partition holds each key range (layer 1: fixed once written).
     #[prost(message, repeated, tag = "5")]
     pub tables: ::prost::alloc::vec::Vec<TablePlacement>,
+    /// The nodes of the map before this one, when this one changed them (D317 rule 3, #1899's
+    /// F4): the map's writer takes no other change until a majority of these and a majority of
+    /// `nodes` hold the map. Derived where the map is set (a forced map clears it), carried by
+    /// the changes after it, and cleared by the first one once both majorities hold it.
+    #[prost(message, repeated, tag = "6")]
+    pub previous_nodes: ::prost::alloc::vec::Vec<Node>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -6689,6 +6696,10 @@ pub struct PartitionInfo {
     /// Why a fenced partition is fenced.
     #[prost(enumeration = "FenceReason", tag = "6")]
     pub fence_reason: i32,
+    /// As `Cluster.Status`'s `LocalPartition.awaiting_peers`: a majority of the map's nodes
+    /// have yet to confirm it since it opened here, whatever `fence_reason` says (#1829).
+    #[prost(bool, tag = "7")]
+    pub awaiting_peers: bool,
 }
 /// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
 /// acts on every partition the map gives the node that's open (the ones `Info` lists), trying

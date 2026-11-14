@@ -79,9 +79,10 @@ service Cluster {
 // One partition on the node a `Cluster` call is sent to (D317 ticket 6).
 message PartitionRequest {
   string partition = 1;
-  // `Unfence` only: lift a start fence even though no peer's map (at least as new as this
-  // node's, naming it for the partition at its file's epoch) confirms it. For a node whose
-  // peers can't answer; it risks two writers if a peer's newer map moved the partition.
+  // `Unfence` only: lift the fence without the peers' confirmation (D317 rule 3: a majority
+  // of the map's nodes holding the newest map, which names this node for the partition at
+  // its file's epoch). For a node whose peers can't answer; it risks two writers if a newer
+  // map moved the partition.
   bool force = 2;
 }
 
@@ -141,6 +142,11 @@ message ClusterMap {
   repeated Partition partitions = 4;
   // Which partition holds each key range (layer 1: fixed once written).
   repeated TablePlacement tables = 5;
+  // The nodes of the map before this one, when this one changed them (D317 rule 3, #1899's
+  // F4): the map's writer takes no other change until a majority of these and a majority of
+  // `nodes` hold the map. Derived where the map is set (a forced map clears it), carried by
+  // the changes after it, and cleared by the first one once both majorities hold it.
+  repeated Node previous_nodes = 6;
 }
 
 message Node {
