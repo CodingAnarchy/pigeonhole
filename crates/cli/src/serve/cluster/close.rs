@@ -207,9 +207,7 @@ impl Node {
                 )));
             part.feeds.fail_all();
             part.bulk.stop();
-            part.bulk.close();
-            part.texts.close();
-            part.indexes.close();
+            part.close_users();
             part.db.clone().close()
         })
         .await;

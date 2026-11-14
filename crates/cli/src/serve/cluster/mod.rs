@@ -285,12 +285,7 @@ impl Node {
     }
 
     fn caller(&self, header: Option<&str>) -> Result<Caller, ApiError> {
-        if !self.tokens.any() {
-            return Ok(Caller::anonymous());
-        }
-        super::auth::bearer(header)
-            .and_then(|t| self.tokens.caller(t))
-            .ok_or_else(ApiError::unauthenticated)
+        self.tokens.caller_of(header)
     }
 
     /// Whether `caller` may make a call that any of `scopes` allows. Without tokens (a
@@ -1013,11 +1008,7 @@ struct ClusterGrpc(Arc<Node>, Option<Arc<super::Shared>>);
 
 impl ClusterGrpc {
     fn caller<T>(&self, req: &Request<T>, scopes: &[Scope], what: &str) -> Result<Caller, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(super::grpc::auth_header(req))?;
         self.0.allowed(&caller, scopes, what)?;
         self.0.maybe_pull(&caller, req.metadata());
         Ok(caller)
