@@ -774,6 +774,9 @@ impl Node {
             if let Some((state, reason)) = self.part_state(&lp.id) {
                 lp.set_state(state);
                 lp.set_fence_reason(reason);
+                // Both reasons at once (#1829): an operator-fenced partition may still await
+                // its peers' confirmation.
+                lp.awaiting_peers = self.awaiting_peers(&lp.id);
             } else if let Some(closed) = self.fences.closed().get(&lp.id) {
                 closed.describe(lp);
             }
@@ -1505,15 +1508,21 @@ pub(crate) fn run(
     } else {
         let list: Vec<String> = mine
             .iter()
-            .map(|(p, epoch)| match node.fence_of(p) {
-                Some(crate::serve::gate::Fence::Operator) => {
-                    format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
-                }
-                Some(crate::serve::gate::Fence::Start) => {
-                    format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
-                }
-                None => format!("{p} (epoch {epoch})"),
-            })
+            .map(
+                |(p, epoch)| match (node.fence_of(p), node.awaiting_peers(p)) {
+                    (Some(crate::serve::gate::Fence::Operator), true) => format!(
+                        "{p} (epoch {epoch}, fenced: phdb cluster fence, and waiting for a \
+                         peer's map)"
+                    ),
+                    (Some(crate::serve::gate::Fence::Operator), false) => {
+                        format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
+                    }
+                    (Some(_), _) => {
+                        format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
+                    }
+                    (None, _) => format!("{p} (epoch {epoch})"),
+                },
+            )
             .collect();
         format!(
             "partition{} {} as cluster node {id} of {}; map version {version}",
@@ -1545,6 +1554,7 @@ pub(crate) fn run(
             shards: total_shards,
             compaction: total_compaction,
             engine_memory: args.engine_memory,
+            reserved: reserved.clone(),
         },
     );
     // A node that restarts with a map takes a newer one from its peers, then pushes.

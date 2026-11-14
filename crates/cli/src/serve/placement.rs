@@ -144,15 +144,25 @@ impl Memory {
         if per_shard < MEMTABLE_FLOOR {
             return Err(MEMTABLE_FLOOR * n);
         }
-        let rest = share - per_shard * n;
-        let block_cache = rest / (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE
-            + rest % (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE / (BLOCK_CACHE + ROW_CACHE);
-        Ok(Self {
+        Ok(Self::with_caches(shards, per_shard, share - per_shard * n))
+    }
+
+    /// `shards` shards of `memtable_per_shard` each, and `caches` bytes split between the
+    /// block cache and the row cache in the library's ratio (4:1).
+    pub(crate) fn with_caches(shards: usize, memtable_per_shard: u64, caches: u64) -> Self {
+        let block_cache = caches / (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE
+            + caches % (BLOCK_CACHE + ROW_CACHE) * BLOCK_CACHE / (BLOCK_CACHE + ROW_CACHE);
+        Self {
             shards,
-            memtable_per_shard: per_shard,
+            memtable_per_shard,
             block_cache,
-            row_cache: rest - block_cache,
-        })
+            row_cache: caches - block_cache,
+        }
+    }
+
+    /// Its block and row caches together.
+    pub(crate) fn caches(&self) -> u64 {
+        self.block_cache + self.row_cache
     }
 
     pub(crate) fn memtables(&self) -> u64 {
@@ -218,6 +228,56 @@ pub(crate) fn memory(
             })
         })
         .collect()
+}
+
+/// A cluster node's `--engine-memory` (`total`) re-split while it serves (#1761), when a
+/// partition opens (`new`: its shard count and the map's `memory_bytes` override, 0 for
+/// none) or closes (`new` is `None`). `open` is each open partition's memory now and its
+/// override.
+///
+/// The target is [`memory`]'s split for the new set, as a restart would give. An open
+/// engine's memtables can't be resized (their arena is a fixed shared-memory region), so
+/// each open partition keeps its memtables and its caches become what the target leaves of
+/// its share after them, or none. The new partition gets what the open ones then leave of
+/// `total` (its override, if smaller), split as at a start.
+///
+/// Returns each open partition's memory, in `open`'s order, and the new partition's. `Err`
+/// says why it can't fit, for an open that is then refused, as before #1761.
+pub(crate) fn resplit(
+    total: u64,
+    open: &[(Memory, u64)],
+    new: Option<(usize, u64)>,
+) -> Result<(Vec<Memory>, Option<Memory>), String> {
+    let mut parts: Vec<(usize, u64)> = open.iter().map(|(m, o)| (m.shards, *o)).collect();
+    parts.extend(new);
+    let target = memory(Some(total), &parts).map_err(|(_, why)| why)?;
+    let kept: Vec<Memory> = open
+        .iter()
+        .zip(&target)
+        .map(|((now, _), t)| {
+            Memory::with_caches(
+                now.shards,
+                now.memtable_per_shard,
+                t.bytes().saturating_sub(now.memtables()),
+            )
+        })
+        .collect();
+    let Some((shards, asked)) = new else {
+        return Ok((kept, None));
+    };
+    let held: u64 = kept.iter().map(Memory::bytes).sum();
+    let left = total.saturating_sub(held);
+    let bytes = if asked > 0 { asked.min(left) } else { left };
+    let memory = Memory::of(bytes, shards).map_err(|least| {
+        format!(
+            "--engine-memory is {total} bytes; the open partitions' memtables, which can't \
+             shrink while they're open, and their caches' new shares hold {held} of it, which \
+             leaves {left}, and its {shards} shards' memtables need at least {least}. Restart \
+             this node to re-split --engine-memory with smaller memtables (the map already \
+             gives it the partition), or start it with more"
+        )
+    })?;
+    Ok((kept, Some(memory)))
 }
 
 /// The CPUs a node with several partitions reserves for its compaction threads (D317
@@ -1006,7 +1066,7 @@ fn parse_cpu_list(list: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Placement, default_shards};
+    use super::{Memory, Placement, default_shards, memory, resplit};
     use pigeonhole::{Options, Pigeonhole};
 
     /// D313 R1's mask, on a 4-core, 8-CPU topology (CPU `c`'s sibling is `c ^ 4`): the
@@ -1138,6 +1198,65 @@ mod tests {
     /// D317 ticket 8a (cli692's M3): a share's memory goes to the memtables first, at most
     /// the library's arena per shard, then to the caches at the library's 4:1; overrides
     /// come off the top, and a share that can't cover the memtables' floor is refused.
+    /// #1761, the design note's example: 8 GiB, two 8-shard partitions at start, a third
+    /// opened. The open two keep their 512 MiB of memtables and their caches shrink to the
+    /// three-way share; the third gets the rest, and the total stays 8 GiB.
+    #[test]
+    fn a_resplit_shrinks_the_open_partitions_caches_to_make_room() {
+        const GIB: u64 = 1 << 30;
+        let start = memory(Some(8 * GIB), &[(8, 0), (8, 0)]).unwrap();
+        assert_eq!(start[0].memtables(), 512 << 20);
+        assert_eq!(start[0].bytes(), 4 * GIB);
+        let open: Vec<(Memory, u64)> = start.iter().map(|m| (*m, 0)).collect();
+        let (kept, new) = resplit(8 * GIB, &open, Some((8, 0))).unwrap();
+        let new = new.unwrap();
+        let target = memory(Some(8 * GIB), &[(8, 0), (8, 0), (8, 0)]).unwrap();
+        for (k, t) in kept.iter().zip(&target) {
+            assert_eq!(
+                k.memtable_per_shard, start[0].memtable_per_shard,
+                "memtables kept"
+            );
+            assert_eq!(k.bytes(), t.bytes(), "the three-way share");
+            assert!(k.caches() < start[0].caches(), "caches shrank");
+        }
+        assert_eq!(new.memtables(), 512 << 20);
+        let all: u64 = kept.iter().map(Memory::bytes).sum::<u64>() + new.bytes();
+        assert!(all <= 8 * GIB && all > 8 * GIB - 16, "the total: {all}");
+        // A close of the third: the two left grow back to the two-way share.
+        let open: Vec<(Memory, u64)> = kept.iter().map(|m| (*m, 0)).collect();
+        let (back, none) = resplit(8 * GIB, &open, None).unwrap();
+        assert!(none.is_none());
+        assert_eq!(back, start, "back to the start's split");
+    }
+
+    /// #1761: memtables opened under a looser split can't shrink, so a partition whose
+    /// memtables already exceed its new share keeps no cache, and the new one gets what's
+    /// left: refused, with the restart named, when that can't cover its memtables.
+    #[test]
+    fn a_resplit_that_cant_cover_the_new_memtables_is_refused() {
+        // 2 GiB, two 16-shard partitions: 1 GiB each, all of it memtables (64 MiB × 16).
+        let start = memory(Some(2 << 30), &[(16, 0), (16, 0)]).unwrap();
+        assert_eq!(start[0].caches(), 0);
+        let open: Vec<(Memory, u64)> = start.iter().map(|m| (*m, 0)).collect();
+        let e = resplit(2 << 30, &open, Some((16, 0))).unwrap_err();
+        assert!(e.contains("Restart this node"), "{e}");
+        // A small new partition still fits beside them only if there's room: none here.
+        assert!(resplit(2 << 30, &open, Some((1, 0))).is_err());
+    }
+
+    /// #1761: a map's `memory_bytes` override is the new partition's, if it fits, and an open
+    /// partition's override keeps its share across the re-split.
+    #[test]
+    fn a_resplit_keeps_overrides() {
+        const GIB: u64 = 1 << 30;
+        let start = memory(Some(8 * GIB), &[(4, 2 * GIB), (4, 0)]).unwrap();
+        let open: Vec<(Memory, u64)> = vec![(start[0], 2 * GIB), (start[1], 0)];
+        let (kept, new) = resplit(8 * GIB, &open, Some((4, GIB))).unwrap();
+        assert_eq!(kept[0].bytes(), 2 * GIB, "the override is kept");
+        assert_eq!(new.unwrap().bytes(), GIB, "the new override");
+        assert_eq!(kept[1].bytes(), 5 * GIB, "the rest");
+    }
+
     #[test]
     fn engine_memory_splits_memtables_first_then_the_caches() {
         use super::{MEMTABLE_FLOOR, MEMTABLE_PER_SHARD, Memory, memory};
