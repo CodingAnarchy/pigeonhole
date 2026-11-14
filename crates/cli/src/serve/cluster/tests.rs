@@ -1188,23 +1188,18 @@ fn data_node_placed(
         feed_runtimes: std::sync::OnceLock::new(),
     });
     // Partitions a map gives it while it serves open as `run` has them.
-    super::open::attach_opener(
+    super::open::attach(
         &node,
-        super::open::Opener {
+        super::open::Server {
             shared: Arc::downgrade(&shared),
             placement: Arc::new(placement),
             backups: Arc::clone(&backups),
-            options: Box::new(|share, _| {
-                pigeonhole::Options::default()
-                    .default_shards(share.shards)
-                    .compaction_cores(share.compaction)
-            }),
+            served: pigeonhole::Options::default(),
             shards: 1,
             compaction: 0,
             engine_memory,
         },
     );
-    super::schema::attach(&node, &shared);
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
     let start = if restart {
         super::start_sync(&node, node.get_map().map_or(0, |m| m.map_version))
