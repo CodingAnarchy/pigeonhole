@@ -21,7 +21,7 @@ use std::time::Duration;
 use tonic::transport::{Channel, Endpoint};
 
 use super::Node;
-use crate::serve::auth::{ANONYMOUS, Caller, Scope, Tokens};
+use crate::serve::auth::{ANONYMOUS, Caller, Scope, TokenId, Tokens};
 use crate::serve::errors::ApiError;
 use crate::serve::proto::{
     ForwardRequest, ForwardResponse, ForwardScanRequest, ForwardedCaller, ScanPage,
@@ -371,6 +371,7 @@ pub(crate) fn caller_of(f: Option<ForwardedCaller>, tokens: &Tokens) -> Result<C
         }
         return Ok(Caller {
             principal: ANONYMOUS,
+            token: TokenId::ANONYMOUS,
             scope,
             namespaces: (!f.all_namespaces).then_some(f.namespaces),
             // The reply goes back to the forwarding node as protobuf; that node charges and

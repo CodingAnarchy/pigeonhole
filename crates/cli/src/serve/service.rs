@@ -695,8 +695,17 @@ pub(crate) struct Metrics {
     /// that long, on a single node or a cluster (the merge task's take clock, #1798 (a)).
     /// A cluster subscription's parts aren't counted: the subscription is, once.
     pub(crate) feed_idle_drops: AtomicU64,
-    /// Cluster subscriptions' merge tasks running now, on the feed runtime (#1798 (a)).
+    /// Cluster subscriptions' merges running now, on the feed runtime (#1798): each cluster
+    /// feed hub's, and each subscriber's own.
     pub(crate) cluster_merges: AtomicU64,
+    /// Cluster subscriptions on a cluster feed hub now (#1798's B).
+    pub(crate) cluster_hub_members: AtomicU64,
+    /// Cluster subscriptions that fell off their hub's ring onto a merge of their own, and
+    /// that rejoined it (#1798's B).
+    pub(crate) cluster_fell_behind: AtomicU64,
+    pub(crate) cluster_rejoined: AtomicU64,
+    /// Cluster subscriptions that waited for a `--max-catch-up` slot after falling behind.
+    pub(crate) cluster_catch_up_waits: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -709,6 +718,10 @@ impl Default for Metrics {
             replies_lost: AtomicU64::new(0),
             feed_idle_drops: AtomicU64::new(0),
             cluster_merges: AtomicU64::new(0),
+            cluster_hub_members: AtomicU64::new(0),
+            cluster_fell_behind: AtomicU64::new(0),
+            cluster_rejoined: AtomicU64::new(0),
+            cluster_catch_up_waits: AtomicU64::new(0),
         }
     }
 }
@@ -809,6 +822,30 @@ impl Metrics {
             "pigeonhole_serve_feed_cluster_merges {}",
             self.cluster_merges.load(Ordering::Relaxed)
         );
+        let _ = writeln!(
+            out,
+            "# TYPE pigeonhole_serve_feed_cluster_hub_members gauge"
+        );
+        let _ = writeln!(
+            out,
+            "pigeonhole_serve_feed_cluster_hub_members {}",
+            self.cluster_hub_members.load(Ordering::Relaxed)
+        );
+        for (name, n) in [
+            ("fell_behind", &self.cluster_fell_behind),
+            ("rejoined", &self.cluster_rejoined),
+            ("catch_up_waits", &self.cluster_catch_up_waits),
+        ] {
+            let _ = writeln!(
+                out,
+                "# TYPE pigeonhole_serve_feed_cluster_{name}_total counter"
+            );
+            let _ = writeln!(
+                out,
+                "pigeonhole_serve_feed_cluster_{name}_total {}",
+                n.load(Ordering::Relaxed)
+            );
+        }
         out
     }
 }
@@ -3667,7 +3704,7 @@ impl Service {
             ));
         }
         drop(budget);
-        self.subscribe_part(r, caller, 0, false).await
+        self.subscribe_part(r, caller, 0, false, false).await
     }
 
     /// A subscription of this server's database: a single node's `Feed.Subscribe`, or one
@@ -3681,6 +3718,7 @@ impl Service {
         caller: &Caller,
         skip: u64,
         announce: bool,
+        internal: bool,
     ) -> Result<super::feed::FeedEvents, ApiError> {
         use super::feed::Start;
         use proto::subscribe_request::Start as S;
@@ -3718,6 +3756,7 @@ impl Service {
                 start,
                 skip,
                 announce,
+                internal,
             },
             slot,
             move |e| {
@@ -3733,6 +3772,12 @@ impl Service {
 
     /// The feed fan-out's limits: a cluster subscription's buffer and idle limit are a
     /// single client's (D317 ticket 7), on a node that only routes too.
+    /// The node's feed state every partition shares: its catch-up slots and the rings
+    /// that split `--feed-ring-bytes` (#1798's cluster feed hubs use both).
+    pub(crate) fn feed_shared(&self) -> &super::feed::FeedShared {
+        &self.feed_shared
+    }
+
     pub(crate) fn feed_limits(&self) -> super::feed::FeedLimits {
         feed_limits(&self.limits)
     }

@@ -617,7 +617,14 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
                 .into_iter()
                 .map(|p| Arc::clone(&p.feeds))
                 .collect();
-            if !feeds.is_empty() {
+            // A cluster node's feed hubs too (#1798), on a node that only routes as well.
+            let node = shared
+                .router
+                .cluster
+                .as_ref()
+                .map(|c| Arc::clone(&c.node));
+            let ring_bytes = shared.router.service.feed_limits().ring_bytes;
+            if !feeds.is_empty() || node.is_some() {
                 tokio::spawn(async move {
                     use tokio::signal::unix::{SignalKind, signal};
                     let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
@@ -625,8 +632,13 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
                     };
                     while usr1.recv().await.is_some() {
                         let f = feeds.clone();
+                        let n = node.clone();
                         let dumped = tokio::task::spawn_blocking(move || {
-                            f.iter().map(|f| f.dump()).collect::<String>()
+                            let mut text = f.iter().map(|f| f.dump()).collect::<String>();
+                            if let Some(n) = n {
+                                text.push_str(&n.feed_hubs.dump(ring_bytes));
+                            }
+                            text
                         });
                         if let Ok(text) = dumped.await {
                             eprint!("{text}");

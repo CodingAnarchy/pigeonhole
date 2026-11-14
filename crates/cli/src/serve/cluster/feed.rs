@@ -57,21 +57,21 @@ const RETRY: Duration = Duration::from_secs(1);
 const OPENS: usize = 8;
 
 /// `FeedEvent`'s fields, as the merge reads and writes them.
-const TOKEN_FIELD: u32 = 1;
+pub(super) const TOKEN_FIELD: u32 = 1;
 const COMMIT_FIELD: u32 = 2;
 const PROGRESS_FIELD: u32 = 4;
 const PARTITION_FIELD: u32 = 5;
 
 /// What a subscription needs to open (and open again) its components: shared by its task.
-struct Ctx {
-    node: Arc<Node>,
+pub(super) struct Ctx {
+    pub(super) node: Arc<Node>,
     /// The partitions served here, each with its service (D317 ticket 8a).
-    parts: crate::serve::router::Parts,
+    pub(super) parts: crate::serve::router::Parts,
     /// The node's service: its stream slots, limits and timeouts.
-    service: Arc<Service>,
+    pub(super) service: Arc<Service>,
     caller: Caller,
     prefix: Bytes,
-    visible: bool,
+    pub(super) visible: bool,
     /// Opens the node-to-node streams' connections, apart from forwarded unary calls'.
     forwarder: Arc<super::forward::Forwarder>,
     /// The subscription's connection to each peer (S1): a stream lease of its own, taken on
@@ -83,12 +83,12 @@ struct Ctx {
 type Events = Pin<Box<dyn Stream<Item = Result<Bytes, ApiError>> + Send>>;
 
 /// One partition's part of the subscription.
-struct Part {
+pub(super) struct Part {
     partition: String,
     /// The subscription's tables placed on it, sorted.
     tables: Vec<String>,
     epoch: u64,
-    at: At,
+    pub(super) at: At,
     /// Commits through this seqno after `at` are passed over (`skip_through`); 0: none.
     skip: u64,
     events: Option<Events>,
@@ -97,7 +97,7 @@ struct Part {
     /// An open of it is running in the background.
     opening: bool,
     /// Reported unavailable, and not yet available again.
-    unavailable: bool,
+    pub(super) unavailable: bool,
 }
 
 /// `Feed.Subscribe` on a cluster node: opens every component, then merges them on a task of
@@ -137,7 +137,6 @@ pub(crate) async fn subscribe(
             placed.entry(p.to_owned()).or_default().push(t.clone());
         }
     }
-    let epoch = |p: &str| routes.owner(p).map_or(0, |o| o.epoch);
     let history = |p: &str| routes.owner(p).map_or(0, |o| o.history_epoch);
     let subscription = subscription_hash(&tables, &r.prefix, r.visible);
     let mut skips: HashMap<String, u64> = HashMap::new();
@@ -151,6 +150,12 @@ pub(crate) async fn subscribe(
         skips.insert(s.partition.clone(), s.seqno);
     }
     let resumed = matches!(r.start, Some(S::Resume(_)));
+    let oldest = matches!(r.start, Some(S::FromOldest(true)));
+    // A member's first position on a merge of its own: the token it resumes from.
+    let token = match &r.start {
+        Some(S::Resume(bytes)) => bytes.clone(),
+        _ => Bytes::new(),
+    };
     let starts: BTreeMap<String, At> = match r.start {
         None | Some(S::FromOldest(false)) => placed.keys().map(|p| (p.clone(), At::Now)).collect(),
         Some(S::FromOldest(true)) => placed.keys().map(|p| (p.clone(), At::Oldest)).collect(),
@@ -172,20 +177,6 @@ pub(crate) async fn subscribe(
         return Err(ApiError::invalid("skip_through needs a resume token"));
     }
     let map_version = routes.map_version();
-    let parts: Vec<Part> = placed
-        .into_iter()
-        .map(|(partition, tables)| Part {
-            epoch: epoch(&partition),
-            at: starts[&partition].clone(),
-            skip: skips.get(&partition).copied().unwrap_or(0),
-            partition,
-            tables,
-            events: None,
-            retry: None,
-            opening: false,
-            unavailable: false,
-        })
-        .collect();
     let cluster_id = routes.cluster_id().to_owned();
     drop(guard);
     // One `--max-streams` place here for the whole subscription (simp724's C); each
@@ -201,247 +192,148 @@ pub(crate) async fn subscribe(
         visible: r.visible,
         channels: Mutex::new(HashMap::new()),
     });
-    let mut merge = Merge {
+    let every = u64::from(r.checkpoint_every);
+    let plan = Plan {
         ctx,
-        parts,
+        placed,
         allow_partial: r.allow_partial,
-        every: u64::from(r.checkpoint_every),
+        every,
         map_version,
         subscription,
         cluster_id,
-        since_checkpoint: 0,
-        next_checkpoint: 1,
-        moved: false,
-        states: Vec::new(),
-        token: Vec::new(),
-        cache: super::token::TokenCache::default(),
-        tail: tail_buffer(),
-        opens: tokio::task::JoinSet::new(),
     };
-    merge.open_all().await?;
-    // The merge runs as a task on the feed runtime, off the threads that serve requests
-    // (#1798 (a): g96 found it on the gRPC workers, beside the writes it delayed), and hands
-    // the client what's ready in batches, so the hop costs once per batch, not per event.
-    let limits = service.feed_limits();
-    let metrics = Arc::clone(&service.metrics);
-    let partitions: Vec<String> = merge.parts.iter().map(|p| p.partition.clone()).collect();
-    let runtime = merge.ctx.node.feed_runtime();
-    let idle = limits.stream_idle;
-    let client_bytes = limits
-        .client_bytes
-        .clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
-    let (tx, rx) = tokio::sync::mpsc::channel(BATCHES);
-    let budget = Arc::new(tokio::sync::Semaphore::new(client_bytes));
-    let taken = Arc::new(TakeClock::new());
-    let (end_tx, end_rx) = tokio::sync::oneshot::channel();
-    let task = MergeTask {
-        merging: Merging::new(merge, slot, limits.quiet),
-        tx,
-        budget,
-        client_bytes,
-        taken: Arc::clone(&taken),
-        idle,
-        metrics,
-        partitions,
-        started: std::time::Instant::now(),
-    };
-    let run = task.run(end_tx);
-    match runtime {
-        Some(rt) => drop(rt.spawn(run)),
-        None => drop(tokio::spawn(run)),
+    // A `Now` start shares its key's merge (#1798's B): one per key, not one per subscriber.
+    let key = super::hub::Key::new(
+        &tables,
+        &r.prefix,
+        r.visible,
+        r.allow_partial,
+        every,
+        caller,
+    );
+    super::hub::subscribe(super::hub::Subscribe {
+        plan,
+        key,
+        starts,
+        shareable: !resumed && !oldest && skips.is_empty(),
+        skips,
+        slot,
+        token,
+    })
+    .await
+}
+
+/// What a subscription's merges are made from: its hub's, and each member's own (#1798).
+#[derive(Clone)]
+pub(super) struct Plan {
+    pub(super) ctx: Arc<Ctx>,
+    /// Each partition the subscription covers, with its tables on it.
+    placed: BTreeMap<String, Vec<String>>,
+    allow_partial: bool,
+    every: u64,
+    map_version: u64,
+    subscription: u64,
+    cluster_id: String,
+}
+
+impl Plan {
+    /// The partitions, in the merge's parts' order.
+    pub(super) fn partitions(&self) -> Vec<String> {
+        self.placed.keys().cloned().collect()
     }
-    Ok(FeedEvents::merged(ClusterEvents {
-        rx: Some(rx),
-        batch: Vec::new().into_iter(),
-        taken,
-        end: Some(end_rx),
-        done: false,
-    }))
-}
 
-/// A batch handed to the client: up to [`BATCH_EVENTS`] events or about [`BATCH_BYTES`],
-/// each holding its share of the client's buffer, given back as the client takes it
-/// (simp724's note on the #1798 (a) design).
-type Batch = Vec<(Out, tokio::sync::OwnedSemaphorePermit)>;
-
-/// A batch's bounds: what one wake of the merge drains before it hands over. 64, as the
-/// hub ring's read batch; 64 KiB, well under the client's buffer (`--feed-client-bytes`).
-const BATCH_EVENTS: usize = 64;
-const BATCH_BYTES: usize = 64 << 10;
-
-/// Batches in the channel to the client at most: the bytes are bounded by the client's
-/// buffer, this only keeps the merge from running ahead in many small batches.
-const BATCHES: usize = 4;
-
-/// A cluster subscription's merge as a task of its own on the feed runtime (#1798 (a)):
-/// the merge ([`Merging`]) as before, its events handed to the client's stream
-/// ([`ClusterEvents`]) in batches, within the client's buffer and its idle limit.
-struct MergeTask {
-    merging: Merging,
-    tx: tokio::sync::mpsc::Sender<Batch>,
-    /// The client's buffer, in encoded bytes: each event in flight holds its size.
-    budget: Arc<tokio::sync::Semaphore>,
-    client_bytes: usize,
-    /// When the client last took an event.
-    taken: Arc<TakeClock>,
-    idle: Duration,
-    metrics: Arc<crate::serve::service::Metrics>,
-    partitions: Vec<String>,
-    started: std::time::Instant,
-}
-
-/// What [`MergeTask::fill`] stopped at.
-enum Fill {
-    /// A batch to hand over: the merge had nothing more ready, or the batch is full.
-    Batch,
-    /// The merge ended: with its error, or `None` (dropped).
-    End(Option<ApiError>),
-}
-
-/// Counts a merge task while it runs.
-struct Live<'a>(&'a std::sync::atomic::AtomicU64);
-
-impl<'a> Live<'a> {
-    fn new(n: &'a std::sync::atomic::AtomicU64) -> Self {
-        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Live(n)
-    }
-}
-
-impl Drop for Live<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl MergeTask {
-    async fn run(self, end: tokio::sync::oneshot::Sender<ApiError>) {
-        let MergeTask {
-            mut merging,
-            tx,
-            budget,
-            client_bytes,
-            taken,
-            idle,
-            metrics,
-            partitions,
-            started,
-        } = self;
-        let _live = Live::new(&metrics.cluster_merges);
-        let mut ready: Vec<Out> = Vec::with_capacity(BATCH_EVENTS);
-        let mut bytes = 0usize;
-        // When the client's buffer last went from empty to holding events: the limit counts
-        // from it or the last take, whichever is later. From the last take alone, the first
-        // event after a long quiet spell would look untaken for that whole spell.
-        let mut waiting_since = tokio::time::Instant::now();
-        loop {
-            // Waiting for the merge's next event. A client gone ends the merge here, not at
-            // its next send (simp724's S3: a quiet merge never sends); and a client that left
-            // events untaken past its idle limit ends it, whether or not the merge has more
-            // (S1: on a quiet feed nothing waits for room, so no send would notice).
-            // Armed only while events wait in the client's buffer: a client that took
-            // everything is waiting for a commit, and a deadline from its last take would
-            // be past for good and fire on every turn.
-            let pending = budget.available_permits() < client_bytes;
-            let deadline = untaken_since(&taken, waiting_since) + idle;
-            let filled = tokio::select! {
-                biased;
-                () = tx.closed() => return,
-                () = tokio::time::sleep_until(deadline), if pending => {
-                    if stalled(&taken, waiting_since, &budget, client_bytes, idle) {
-                        drop_idle(&metrics, &partitions, started, idle);
-                        return;
-                    }
-                    continue;
-                }
-                // The same task, and so the same waker, polls the merge again for each
-                // event it drains (simp724's S4): one that stops at a bound with more ready
-                // has nothing registered for it, so the loop comes straight back here after
-                // the send, with no other wait between them.
-                f = std::future::poll_fn(|cx| MergeTask::fill(&mut merging, &mut ready, &mut bytes, cx)) => f,
-            };
-            if !ready.is_empty() {
-                // S1, on every send too: a client that hasn't taken anything for the limit
-                // while events wait for it has stopped reading.
-                if stalled(&taken, waiting_since, &budget, client_bytes, idle) {
-                    drop_idle(&metrics, &partitions, started, idle);
-                    return;
-                }
-                if budget.available_permits() >= client_bytes {
-                    waiting_since = tokio::time::Instant::now();
-                }
-                let n = bytes.clamp(1, client_bytes);
-                let batch = std::mem::replace(&mut ready, Vec::with_capacity(BATCH_EVENTS));
-                bytes = 0;
-                match hand_over(batch, n, &tx, &budget, &taken, waiting_since, idle).await {
-                    Handed::Yes => {}
-                    Handed::Gone => return,
-                    Handed::Idle => {
-                        drop_idle(&metrics, &partitions, started, idle);
-                        return;
-                    }
-                }
-            }
-            if let Fill::End(e) = filled {
-                // After the last batch (its checkpoint included), never before it: the client
-                // reads this only once the batches are drained (simp724's S2).
-                if let Some(e) = e {
-                    let _ = end.send(e);
-                }
-                return;
-            }
+    /// A merge from `starts`, its parts not opened yet; `shared`: a hub's
+    /// ([`crate::serve::feed::Spec::internal`] for its local components).
+    pub(super) fn merge(
+        &self,
+        starts: &BTreeMap<String, At>,
+        skips: &HashMap<String, u64>,
+        shared: bool,
+    ) -> Merge {
+        let epochs: Vec<u64> = {
+            let routes = self.ctx.node.routes();
+            self.placed
+                .keys()
+                .map(|p| {
+                    routes
+                        .as_ref()
+                        .and_then(|r| r.owner(p))
+                        .map_or(0, |o| o.epoch)
+                })
+                .collect()
+        };
+        let parts = self
+            .placed
+            .iter()
+            .zip(epochs)
+            .map(|((partition, tables), epoch)| Part {
+                epoch,
+                at: starts.get(partition).cloned().unwrap_or(At::Now),
+                skip: skips.get(partition).copied().unwrap_or(0),
+                partition: partition.clone(),
+                tables: tables.clone(),
+                events: None,
+                retry: None,
+                opening: false,
+                unavailable: false,
+            })
+            .collect();
+        Merge {
+            ctx: Arc::clone(&self.ctx),
+            parts,
+            allow_partial: self.allow_partial,
+            every: self.every,
+            map_version: self.map_version,
+            subscription: self.subscription,
+            cluster_id: self.cluster_id.clone(),
+            since_checkpoint: 0,
+            next_checkpoint: 1,
+            moved: false,
+            states: Vec::new(),
+            token: Vec::new(),
+            cache: super::token::TokenCache::default(),
+            tail: tail_buffer(),
+            opens: tokio::task::JoinSet::new(),
+            shared,
+            last: None,
         }
     }
 
-    /// Drains what the merge has ready into `ready`, up to the batch's bounds: `Pending` only
-    /// when nothing is ready at all (every wake source then registered with `cx`).
-    fn fill(
-        merging: &mut Merging,
-        ready: &mut Vec<Out>,
-        bytes: &mut usize,
-        cx: &mut Context<'_>,
-    ) -> Poll<Fill> {
-        loop {
-            match merging.poll(cx) {
-                Poll::Ready(Some(Ok(out))) => {
-                    *bytes += out.encoded_len().max(1);
-                    ready.push(out);
-                    if ready.len() >= BATCH_EVENTS || *bytes >= BATCH_BYTES {
-                        return Poll::Ready(Fill::Batch);
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Fill::End(Some(e))),
-                Poll::Ready(None) => return Poll::Ready(Fill::End(None)),
-                Poll::Pending if ready.is_empty() => return Poll::Pending,
-                Poll::Pending => return Poll::Ready(Fill::Batch),
-            }
-        }
+    /// Each part's start from one of this subscription's checkpoints, as a resume checks
+    /// it: a member that fell off its hub's ring goes on from its last one (#1798).
+    pub(super) fn starts_from(&self, token: &[u8]) -> Result<BTreeMap<String, At>, ApiError> {
+        let t = ClusterToken::decode(token).map_err(|why| {
+            ApiError::internal(format!("a member's checkpoint can't be read: {why}"))
+        })?;
+        let routes = self.ctx.node.routes();
+        let history = |p: &str| {
+            routes
+                .as_ref()
+                .and_then(|r| r.owner(p))
+                .map_or(0, |o| o.history_epoch)
+        };
+        resume_starts(
+            &t,
+            &self.cluster_id,
+            self.subscription,
+            &self.placed,
+            history,
+        )
     }
 }
 
 /// Since when the client has left events untaken: its last take, or when its buffer last
 /// went from empty to holding events (`waiting_since`), whichever is later.
-fn untaken_since(taken: &TakeClock, waiting_since: tokio::time::Instant) -> tokio::time::Instant {
-    taken.last_or_start().max(waiting_since)
-}
-
-/// Whether the client has stopped reading: events wait in its buffer, and it took none of
-/// them for the idle limit. A client with nothing waiting for it is waiting for a commit,
-/// never idle, however long that takes.
-fn stalled(
+pub(super) fn untaken_since(
     taken: &TakeClock,
     waiting_since: tokio::time::Instant,
-    budget: &tokio::sync::Semaphore,
-    client_bytes: usize,
-    idle: Duration,
-) -> bool {
-    budget.available_permits() < client_bytes
-        && untaken_since(taken, waiting_since) + idle <= tokio::time::Instant::now()
+) -> tokio::time::Instant {
+    taken.last_or_start().max(waiting_since)
 }
 
 /// A subscription ended at its idle limit: counted, said, and its error left for a client
 /// that never reads it.
-fn drop_idle(
+pub(super) fn drop_idle(
     metrics: &crate::serve::service::Metrics,
     partitions: &[String],
     started: std::time::Instant,
@@ -462,166 +354,11 @@ fn drop_idle(
     );
 }
 
-/// How a batch's hand-over went.
-enum Handed {
-    Yes,
-    /// The client went away.
-    Gone,
-    /// The client took nothing for its idle limit while the batch waited for room.
-    Idle,
-}
-
-/// Hands `batch` (`n` bytes in all) to the client: room in its buffer, then a place in the
-/// channel, both within the idle limit counted from the client's last take, not from the
-/// start of the wait (simp724's I1 on #1536, as [`Sink`](crate::serve::feed::Sink)'s put).
-async fn hand_over(
-    batch: Vec<Out>,
-    n: usize,
-    tx: &tokio::sync::mpsc::Sender<Batch>,
-    budget: &Arc<tokio::sync::Semaphore>,
-    taken: &TakeClock,
-    waiting_since: tokio::time::Instant,
-    idle: Duration,
-) -> Handed {
-    let n = u32::try_from(n).unwrap_or(u32::MAX);
-    let room = match Arc::clone(budget).try_acquire_many_owned(n) {
-        Ok(room) => Some(room),
-        Err(tokio::sync::TryAcquireError::NoPermits) => None,
-        Err(tokio::sync::TryAcquireError::Closed) => return Handed::Gone,
-    };
-    let room = match room {
-        Some(room) => room,
-        None => match within_idle(
-            Arc::clone(budget).acquire_many_owned(n),
-            taken,
-            waiting_since,
-            idle,
-        )
-        .await
-        {
-            Some(Ok(room)) => room,
-            Some(Err(_)) => return Handed::Gone,
-            None => return Handed::Idle,
-        },
-    };
-    let batch = share(batch, room);
-    match tx.try_send(batch) {
-        Ok(()) => Handed::Yes,
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Handed::Gone,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
-            match within_idle(tx.send(batch), taken, waiting_since, idle).await {
-                Some(Ok(())) => Handed::Yes,
-                Some(Err(_)) => Handed::Gone,
-                None => Handed::Idle,
-            }
-        }
-    }
-}
-
-/// `f`, or `None` once the client has left events untaken for `idle`: one timer, moved on
-/// when the client took something since it was set.
-async fn within_idle<T>(
-    f: impl std::future::Future<Output = T>,
-    taken: &TakeClock,
-    waiting_since: tokio::time::Instant,
-    idle: Duration,
-) -> Option<T> {
-    tokio::pin!(f);
-    loop {
-        let deadline = untaken_since(taken, waiting_since) + idle;
-        tokio::select! {
-            out = &mut f => return Some(out),
-            () = tokio::time::sleep_until(deadline) => {
-                if untaken_since(taken, waiting_since) + idle <= tokio::time::Instant::now() {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-/// The batch's events, each holding its own share of `room` (the batch's bytes), so each
-/// gives its bytes back as the client takes it, not when the batch's last is taken
-/// (simp724's note). The last event takes what's left.
-fn share(batch: Vec<Out>, mut room: tokio::sync::OwnedSemaphorePermit) -> Batch {
-    let last = batch.len().saturating_sub(1);
-    let mut out = Vec::with_capacity(batch.len());
-    for (i, e) in batch.into_iter().enumerate() {
-        let own = if i == last {
-            None
-        } else {
-            let want = e.encoded_len().max(1).min(room.num_permits());
-            room.split(want)
-        };
-        match own {
-            Some(own) => out.push((e, own)),
-            None => {
-                // The last one, or the room ran out on a batch clamped to the buffer: the
-                // rest goes with this event.
-                let rest = room.split(room.num_permits()).expect("all of what's left");
-                out.push((e, rest));
-            }
-        }
-    }
-    out
-}
-
-/// A cluster subscription as its client's stream: the merge task's batches, one event per
-/// poll, then its end (#1798 (a)). Taking an event gives its bytes back to the client's
-/// buffer and stamps the take clock the task's idle limit counts from.
-pub(crate) struct ClusterEvents {
-    rx: Option<tokio::sync::mpsc::Receiver<Batch>>,
-    batch: std::vec::IntoIter<(Out, tokio::sync::OwnedSemaphorePermit)>,
-    taken: Arc<TakeClock>,
-    end: Option<tokio::sync::oneshot::Receiver<ApiError>>,
-    done: bool,
-}
-
-impl ClusterEvents {
-    pub(crate) fn poll_out(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
-        loop {
-            if let Some((out, room)) = self.batch.next() {
-                drop(room);
-                self.taken.took();
-                return Poll::Ready(Some(Ok(out)));
-            }
-            if self.done {
-                return Poll::Ready(None);
-            }
-            if let Some(rx) = self.rx.as_mut() {
-                match rx.poll_recv(cx) {
-                    Poll::Ready(Some(batch)) => {
-                        self.batch = batch.into_iter();
-                        continue;
-                    }
-                    Poll::Ready(None) => self.rx = None,
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-            // Every batch taken and the task gone: only now its error, so it never overtakes
-            // the last checkpoint (simp724's S2).
-            let Some(end) = self.end.as_mut() else {
-                self.done = true;
-                return Poll::Ready(None);
-            };
-            let out = match Pin::new(end).poll(cx) {
-                Poll::Ready(Ok(e)) => Some(Err(e)),
-                Poll::Ready(Err(_)) => None,
-                Poll::Pending => return Poll::Pending,
-            };
-            self.end = None;
-            self.done = true;
-            return Poll::Ready(out);
-        }
-    }
-}
-
-/// A merge with what its stream holds: its `--max-streams` place, its timers, and what goes
-/// out before anything else.
-struct Merging {
-    merge: Merge,
-    /// The subscription's `--max-streams` place, freed with it.
-    _slot: tokio::sync::OwnedSemaphorePermit,
+/// A merge with what its stream holds: its timers, what goes out before anything else, and
+/// a test's `--max-streams` place (a cluster subscription's member holds its own, #1798).
+pub(super) struct Merging {
+    pub(super) merge: Merge,
+    _slot: Option<tokio::sync::OwnedSemaphorePermit>,
     retry: Timer,
     quiet: Quiet,
     turn: usize,
@@ -632,7 +369,11 @@ struct Merging {
 }
 
 impl Merging {
-    fn new(merge: Merge, slot: tokio::sync::OwnedSemaphorePermit, quiet: Duration) -> Self {
+    pub(super) fn new(
+        merge: Merge,
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
+        quiet: Duration,
+    ) -> Self {
         Self {
             merge,
             _slot: slot,
@@ -646,7 +387,7 @@ impl Merging {
 
     /// The next item, registering every wake source when there's none: an open finishing,
     /// the retry timer, a part's event, the quiet timer (simp724's R3).
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
         loop {
             if let Some(item) = self.queued.pop_front() {
                 if item.is_ok() {
@@ -779,11 +520,11 @@ fn expired(message: String) -> ApiError {
     ApiError::from_code(pigeonhole::ErrorCode::FeedExpired, &message)
 }
 
-/// The subscription's task.
-struct Merge {
+/// A subscription's merge: its hub's (#1798), or a member's own.
+pub(super) struct Merge {
     ctx: Arc<Ctx>,
-    parts: Vec<Part>,
-    allow_partial: bool,
+    pub(super) parts: Vec<Part>,
+    pub(super) allow_partial: bool,
     /// `checkpoint_every`; 0: from the token's size.
     every: u64,
     map_version: u64,
@@ -799,7 +540,7 @@ struct Merge {
     /// The last checkpoint's token ([`Merge::checkpoint`]), kept so a checkpoint per event
     /// allocates nothing (#1758), and what it was built from: only a part that moved is
     /// encoded again (2a).
-    token: Vec<u8>,
+    pub(super) token: Vec<u8>,
     cache: super::token::TokenCache,
     /// Each commit's tail is written here and split off ([`Merge::cover`]).
     tail: prost::bytes::BytesMut,
@@ -807,6 +548,11 @@ struct Merge {
     /// unreachable partitions never stop the merge from reading the others (simp724's S1 on
     /// #1700).
     opens: tokio::task::JoinSet<(usize, Opened)>,
+    /// A cluster feed hub's merge (#1798): its local components don't give their hubs'
+    /// rings a full share ([`crate::serve::feed::Spec::internal`]).
+    shared: bool,
+    /// The last commit [`Merge::cover`] sent: its part, and whether it carried a checkpoint.
+    pub(super) last: Option<(usize, bool)>,
 }
 
 /// What a component's event was.
@@ -817,9 +563,23 @@ enum Kind {
 }
 
 impl Merge {
+    /// Whether every part has said where it is (its first event), or is unavailable
+    /// (`allow_partial`): a hub's first checkpoint then names every part (#1798).
+    pub(super) fn placed(&self) -> bool {
+        self.parts
+            .iter()
+            .all(|p| p.unavailable || matches!(p.at, At::Token(_)))
+    }
+
+    /// A checkpoint now, as its token's bytes.
+    pub(super) fn checkpoint_now(&mut self) -> Vec<u8> {
+        self.checkpoint();
+        self.token.clone()
+    }
+
     /// Opens every component, at most [`OPENS`] at once. A failure fails the call, unless
     /// `allow_partial`: then the part starts unavailable, reported in a first event.
-    async fn open_all(&mut self) -> Result<(), ApiError> {
+    pub(super) async fn open_all(&mut self) -> Result<(), ApiError> {
         let mut set = tokio::task::JoinSet::new();
         let mut opened: Vec<Option<Opened>> = (0..self.parts.len()).map(|_| None).collect();
         let mut next = 0;
@@ -860,6 +620,7 @@ impl Merge {
             skip: p.skip,
             map_version: self.map_version,
             epoch: p.epoch,
+            internal: self.shared,
         }
     }
 
@@ -971,10 +732,12 @@ impl Merge {
                     PARTITION_FIELD,
                     self.parts[i].partition.as_bytes(),
                 );
-                if self.since_checkpoint >= self.next_checkpoint {
+                let checkpoint = self.since_checkpoint >= self.next_checkpoint;
+                if checkpoint {
                     self.checkpoint();
                     put_field(&mut self.tail, TOKEN_FIELD, &self.token);
                 }
+                self.last = Some((i, checkpoint));
                 Ok(Some(Out::Spliced {
                     body,
                     tail: self.tail.split().freeze(),
@@ -1279,7 +1042,7 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
 }
 
 /// Appends a length-delimited field.
-fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
+pub(super) fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
     prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, out);
     prost::encoding::encode_varint(value.len() as u64, out);
     out.put_slice(value);
@@ -1298,6 +1061,8 @@ struct Open {
     /// The epoch the part's position is from: the open refuses a partition whose history
     /// began after it (D317 ticket 6).
     epoch: u64,
+    /// A cluster feed hub's component (#1798, [`crate::serve::feed::Spec::internal`]).
+    internal: bool,
 }
 
 impl Ctx {
@@ -1398,7 +1163,7 @@ impl Ctx {
                 )));
             };
             let events = here
-                .subscribe_part(open.request, &self.caller, open.skip, true)
+                .subscribe_part(open.request, &self.caller, open.skip, true, open.internal)
                 .await?;
             still_owner(&self.node, &open.partition)?;
             return Ok((Box::pin(LocalEvents(events)), epoch));
@@ -1589,7 +1354,7 @@ pub(crate) async fn serve(
         service
     };
     let events = service
-        .subscribe_part(r, &caller, req.skip_through, true)
+        .subscribe_part(r, &caller, req.skip_through, true, false)
         .await?;
     still_owner(node, &req.partition)?;
     Ok(events)
@@ -1701,7 +1466,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::serve::cluster::token::Component;
 
@@ -1742,7 +1507,7 @@ mod tests {
     }
 
     /// A runtime on a paused clock: virtual time, advanced only when every task waits.
-    fn paused() -> tokio::runtime::Runtime {
+    pub(in crate::serve::cluster) fn paused() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -1861,7 +1626,7 @@ mod tests {
         });
     }
 
-    fn event(token: &[u8], commit_seqno: Option<u64>) -> Bytes {
+    pub(in crate::serve::cluster) fn event(token: &[u8], commit_seqno: Option<u64>) -> Bytes {
         let e = proto::FeedEvent {
             token: Bytes::copy_from_slice(token),
             event: Some(match commit_seqno {
@@ -1879,7 +1644,7 @@ mod tests {
 
     /// A D310 version-2 token of 4 streams at `n`: what a one-partition subscription's part
     /// carries on every event.
-    fn d310_token(n: u64) -> Vec<u8> {
+    pub(in crate::serve::cluster) fn d310_token(n: u64) -> Vec<u8> {
         let mut t = vec![2u8];
         t.extend_from_slice(&[7u8; 16]);
         t.extend_from_slice(&4u32.to_le_bytes());
@@ -1962,9 +1727,10 @@ mod tests {
         }
     }
 
-    type Feed = tokio::sync::mpsc::UnboundedSender<Result<Bytes, ApiError>>;
+    pub(in crate::serve::cluster) type Feed =
+        tokio::sync::mpsc::UnboundedSender<Result<Bytes, ApiError>>;
 
-    fn fed() -> (Feed, Events) {
+    pub(in crate::serve::cluster) fn fed() -> (Feed, Events) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (tx, Box::pin(Fed(rx)))
     }
@@ -1972,7 +1738,10 @@ mod tests {
     /// A merge of `n` parts (`p0`, `p1`, ...), each fed by the test or not open yet
     /// (`None`), with `allow_partial`, as its client's stream would hold it. Its node has no
     /// map, so a reopen fails as unavailable.
-    fn merging(events: Vec<Option<Events>>, quiet: Duration) -> Merging {
+    pub(in crate::serve::cluster) fn merging(
+        events: Vec<Option<Events>>,
+        quiet: Duration,
+    ) -> Merging {
         let dir = super::super::tests::test_dir();
         let node = super::super::tests::node(&dir, "a");
         let db = pigeonhole::Pigeonhole::open(
@@ -2027,11 +1796,13 @@ mod tests {
             cache: super::super::token::TokenCache::default(),
             tail: tail_buffer(),
             opens: tokio::task::JoinSet::new(),
+            shared: false,
+            last: None,
         };
         let slot = Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
             .unwrap();
-        Merging::new(merge, slot, quiet)
+        Merging::new(merge, Some(slot), quiet)
     }
 
     /// The next item, within `d` of virtual time: `None` if nothing woke the stream with one.
@@ -2041,7 +1812,9 @@ mod tests {
             .ok()
     }
 
-    fn commit_of(item: Option<Option<Result<Out, ApiError>>>) -> (String, u64) {
+    pub(in crate::serve::cluster) fn commit_of(
+        item: Option<Option<Result<Out, ApiError>>>,
+    ) -> (String, u64) {
         let e = item
             .expect("woken")
             .expect("not ended")
@@ -2053,260 +1826,24 @@ mod tests {
         }
     }
 
-    const QUIET: Duration = Duration::from_secs(10);
+    pub(in crate::serve::cluster) const QUIET: Duration = Duration::from_secs(10);
 
-    /// A merge task (#1798 (a)) around `m`, spawned on the test's runtime: the client's
-    /// stream, and what the tests look at (the client's buffer, the metrics, the task).
-    struct Task {
-        events: ClusterEvents,
-        budget: Arc<tokio::sync::Semaphore>,
-        metrics: Arc<crate::serve::service::Metrics>,
-        handle: tokio::task::JoinHandle<()>,
-    }
-
-    const CLIENT_BYTES: usize = 256 << 10;
-
-    fn task(m: Merging, idle: Duration) -> Task {
-        let (tx, rx) = tokio::sync::mpsc::channel(BATCHES);
-        let budget = Arc::new(tokio::sync::Semaphore::new(CLIENT_BYTES));
-        let taken = Arc::new(TakeClock::new());
-        let metrics = Arc::new(crate::serve::service::Metrics::default());
-        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
-        let t = MergeTask {
-            merging: m,
-            tx,
-            budget: Arc::clone(&budget),
-            client_bytes: CLIENT_BYTES,
-            taken: Arc::clone(&taken),
-            idle,
-            metrics: Arc::clone(&metrics),
-            partitions: vec!["p0".into()],
-            started: std::time::Instant::now(),
-        };
-        let handle = tokio::spawn(t.run(end_tx));
-        Task {
-            events: ClusterEvents {
-                rx: Some(rx),
-                batch: Vec::new().into_iter(),
-                taken,
-                end: Some(end_rx),
-                done: false,
-            },
-            budget,
-            metrics,
-            handle,
-        }
-    }
-
-    /// The client's next item, within `d` of virtual time.
-    async fn take(e: &mut ClusterEvents, d: Duration) -> Option<Option<Result<Out, ApiError>>> {
-        tokio::time::timeout(d, std::future::poll_fn(|cx| e.poll_out(cx)))
-            .await
-            .ok()
-    }
-
-    #[test]
-    fn a_client_that_leaves_events_untaken_is_ended_at_the_limit_and_one_with_none_is_not() {
-        // simp724's S1 on the #1798 (a) design: on a quiet feed nothing waits for room, so a
-        // send never notices a stalled client; the task's own timer must. A client that
-        // never reads loses its subscription (its slot, its parts) at the limit, counted
-        // once. One with nothing waiting for it is waiting for a commit, and stays.
-        const LIMIT: Duration = Duration::from_millis(400);
-        paused().block_on(async {
-            let (p0, events) = fed();
-            let slots = Arc::new(tokio::sync::Semaphore::new(1));
-            let mut m = merging(vec![Some(events)], QUIET);
-            m._slot = Arc::clone(&slots).try_acquire_owned().unwrap();
-            let t = task(m, LIMIT);
-            p0.send(Ok(event(b"t1", Some(1)))).unwrap();
-            // Never taken.
-            tokio::time::sleep(LIMIT / 2).await;
-            assert!(!t.handle.is_finished(), "not yet: half the limit");
-            tokio::time::sleep(LIMIT).await;
-            assert!(t.handle.is_finished(), "ended at the limit");
-            assert_eq!(
-                t.metrics
-                    .feed_idle_drops
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                1
-            );
-            assert_eq!(
-                slots.available_permits(),
-                1,
-                "its --max-streams place is free"
-            );
-            assert_eq!(
-                t.metrics
-                    .cluster_merges
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                0
-            );
-            drop(t.events);
-
-            // Nothing sent: ten limits later it's still there, never counted.
-            let (_p1, events) = fed();
-            let t = task(merging(vec![Some(events)], QUIET), LIMIT);
-            tokio::time::sleep(LIMIT * 10).await;
-            assert!(
-                !t.handle.is_finished(),
-                "a client with nothing waiting stays"
-            );
-            assert_eq!(
-                t.metrics
-                    .feed_idle_drops
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                0
-            );
-        });
-    }
-
-    #[test]
-    fn the_first_event_after_a_quiet_spell_isnt_counted_as_untaken_for_the_spell() {
-        // Found building #1798 (a): the limit counted from the last take alone, so the first
-        // event after a quiet spell longer than the limit looked untaken for all of it, and
-        // a client reading along was ended. It counts from that event's arrival.
-        const LIMIT: Duration = Duration::from_millis(400);
-        paused().block_on(async {
-            let (p0, events) = fed();
-            let mut t = task(merging(vec![Some(events)], QUIET), LIMIT);
-            p0.send(Ok(event(b"t1", Some(1)))).unwrap();
-            commit_of(take(&mut t.events, Duration::from_millis(10)).await);
-            tokio::time::sleep(LIMIT * 5).await;
-            p0.send(Ok(event(b"t2", Some(2)))).unwrap();
-            assert_eq!(
-                commit_of(take(&mut t.events, LIMIT / 4).await),
-                ("p0".into(), 2)
-            );
-            assert!(!t.handle.is_finished());
-            assert_eq!(
-                t.metrics
-                    .feed_idle_drops
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                0
-            );
-        });
-    }
-
-    #[test]
-    fn the_last_checkpoint_comes_before_the_error_across_batches() {
-        // simp724's S2: the end goes through its own channel, read only once every batch is
-        // taken, so the error never overtakes the checkpoint before it. A part failing
-        // without `allow_partial` after more than one batch of commits.
-        paused().block_on(async {
-            let (p0, events) = fed();
-            let mut m = merging(vec![Some(events)], QUIET);
-            m.merge.allow_partial = false;
-            let mut t = task(m, Duration::from_secs(30));
-            let n = BATCH_EVENTS as u64 + 6;
-            for i in 1..=n {
-                p0.send(Ok(event(b"t", Some(i)))).unwrap();
-            }
-            // The position moves past the last commit, then the part fails.
-            p0.send(Ok(event(b"later", None))).unwrap();
-            p0.send(Err(ApiError::invalid("the part's own refusal")))
-                .unwrap();
-            let mut seen = Vec::new();
-            while let Some(item) = take(&mut t.events, Duration::from_secs(1)).await {
-                match item {
-                    None => break,
-                    Some(r) => seen.push(r),
-                }
-            }
-            let commits = seen
+    /// `m`'s subscription as a [`Plan`] (#1798's member tests).
+    pub(in crate::serve::cluster) fn plan_of(m: &Merging) -> Plan {
+        let merge = &m.merge;
+        Plan {
+            ctx: Arc::clone(&merge.ctx),
+            placed: merge
+                .parts
                 .iter()
-                .filter(|r| matches!(r, Ok(o) if matches!(o, Out::Spliced { .. })))
-                .count();
-            assert_eq!(commits as u64, n, "every commit, in more than one batch");
-            let k = seen.len();
-            assert!(
-                matches!(&seen[k - 1], Err(e) if e.message.contains("refusal")),
-                "the error last"
-            );
-            let last = match &seen[k - 2] {
-                Ok(o) => o.to_bytes(),
-                Err(e) => panic!("two errors: {e:?}"),
-            };
-            let e = <proto::FeedEvent as prost::Message>::decode(last).unwrap();
-            assert!(
-                matches!(e.event, Some(proto::feed_event::Event::Progress(_)))
-                    && !e.token.is_empty(),
-                "a checkpoint right before it: {e:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn a_client_gone_ends_a_quiet_merge_at_once() {
-        // simp724's S3: a quiet merge waits in its poll, not in a send, so it must notice the
-        // client going there too, not at its next send or tick.
-        paused().block_on(async {
-            let (_p0, events) = fed();
-            let t = task(merging(vec![Some(events)], QUIET), Duration::from_secs(30));
-            tokio::task::yield_now().await;
-            assert_eq!(
-                t.metrics
-                    .cluster_merges
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                1
-            );
-            drop(t.events);
-            tokio::time::timeout(Duration::from_millis(1), t.handle)
-                .await
-                .expect("ended without waiting for any timer")
-                .unwrap();
-            assert_eq!(
-                t.metrics
-                    .cluster_merges
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                0
-            );
-        });
-    }
-
-    #[test]
-    fn everything_ready_arrives_in_bounded_batches_and_each_gives_its_bytes_back() {
-        // S4's drain: commits all ready at once go out in batches of at most `BATCH_EVENTS`,
-        // and the loop polls the merge again after each send, so none is left behind with no
-        // wake registered (no further event or timer here would wake it). And each event
-        // gives its own bytes back as it's taken, not when its batch's last is (simp724's
-        // note).
-        paused().block_on(async {
-            let (p0, events) = fed();
-            let mut t = task(merging(vec![Some(events)], QUIET), Duration::from_secs(30));
-            let n = 3 * BATCH_EVENTS as u64 + 5;
-            for i in 1..=n {
-                p0.send(Ok(event(b"t", Some(i)))).unwrap();
-            }
-            tokio::task::yield_now().await;
-            // The first batch is in the client's hands; taking one event of it frees that
-            // event's bytes alone.
-            let before = t.budget.available_permits();
-            let first = take(&mut t.events, Duration::ZERO)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let freed = t.budget.available_permits() - before;
-            assert_eq!(
-                freed,
-                first.encoded_len(),
-                "one event's bytes, not its batch's"
-            );
-            let mut got = vec![commit_of(Some(Some(Ok(first)))).1];
-            while got.len() < n as usize {
-                got.push(commit_of(take(&mut t.events, Duration::from_secs(1)).await).1);
-            }
-            assert_eq!(
-                got,
-                (1..=n).collect::<Vec<_>>(),
-                "all, in order, none stranded"
-            );
-            assert_eq!(
-                t.budget.available_permits(),
-                CLIENT_BYTES,
-                "every byte back"
-            );
-        });
+                .map(|p| (p.partition.clone(), p.tables.clone()))
+                .collect(),
+            allow_partial: merge.allow_partial,
+            every: merge.every,
+            map_version: merge.map_version,
+            subscription: merge.subscription,
+            cluster_id: merge.cluster_id.clone(),
+        }
     }
 
     #[test]

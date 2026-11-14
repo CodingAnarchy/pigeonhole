@@ -106,6 +106,9 @@ pub(crate) struct Spec {
     /// subscription's part (D317 ticket 7) then knows where it is from the start, so it can
     /// resume after a break that came before any event, with nothing skipped.
     pub announce: bool,
+    /// A cluster feed hub's own component (#1798): a hub whose members are all these runs
+    /// on the hub runtime, never beside its one member ([`HubOf::external`]).
+    pub internal: bool,
 }
 
 /// At most this many commits a client would have been sent are passed over for `skip`: a
@@ -117,9 +120,9 @@ pub(crate) const SKIP_LIMIT: u64 = 64;
 /// Where a client is, for the feed dump ([`Feeds::dump`], `phdb serve` on SIGUSR1): two
 /// relaxed stores per batch, read only by the dump.
 #[derive(Debug, Default)]
-struct Tracker {
+pub(crate) struct Tracker {
     /// [`ON_RING`], [`ON_OWN`] or [`WAITING`].
-    state: AtomicU64,
+    pub(crate) state: AtomicU64,
     /// On the ring, its next index; on its own stream, the seqno it covered.
     at: AtomicU64,
     /// The hub it's counted under (its address): a client that moved to a failed hub's
@@ -127,13 +130,13 @@ struct Tracker {
     hub: AtomicUsize,
 }
 
-const ON_RING: u64 = 0;
-const ON_OWN: u64 = 1;
+pub(crate) const ON_RING: u64 = 0;
+pub(crate) const ON_OWN: u64 = 1;
 /// Waiting for a `--max-catch-up` slot, delivering nothing.
-const WAITING: u64 = 2;
+pub(crate) const WAITING: u64 = 2;
 
 impl Tracker {
-    fn set(&self, state: u64, at: u64) {
+    pub(crate) fn set(&self, state: u64, at: u64) {
         self.state.store(state, Ordering::Relaxed);
         self.at.store(at, Ordering::Relaxed);
     }
@@ -395,12 +398,87 @@ fn commit_event(token: Bytes, c: proto::FeedCommit) -> proto::FeedEvent {
     }
 }
 
-#[derive(Default)]
-struct Ring {
-    entries: VecDeque<Arc<Entry>>,
+/// What a hub's ring holds (#1798): a single node's commits ([`Single`]), or a cluster
+/// feed hub's merged events (`cluster::hub`). A type parameter, never a trait object, so
+/// the single node's ring compiles as it did before the cluster's shared it (simp724's Q3).
+pub(crate) trait RingKind: Sized + Send + Sync + 'static {
+    type Entry: Send + Sync + 'static;
+    /// What the ring knows beside its entries: where its feed is.
+    type State: Send + 'static;
+    /// An entry's share of `--feed-ring-bytes`.
+    fn bytes(e: &Self::Entry) -> usize;
+    /// `e` left the ring's front.
+    fn evicted(_state: &mut Self::State, _e: &Self::Entry) {}
+}
+
+/// A hub's bounded ring: its entries, the index of the first in the hub's whole sequence,
+/// their bytes, and the kind's state (reached through `Deref`).
+pub(crate) struct RingOf<K: RingKind> {
+    pub(crate) entries: VecDeque<Arc<K::Entry>>,
     /// The index of `entries[0]` in the hub's whole sequence.
-    base: u64,
-    bytes: usize,
+    pub(crate) base: u64,
+    pub(crate) bytes: usize,
+    pub(crate) state: K::State,
+}
+
+impl<K: RingKind> std::ops::Deref for RingOf<K> {
+    type Target = K::State;
+
+    fn deref(&self) -> &K::State {
+        &self.state
+    }
+}
+
+impl<K: RingKind> std::ops::DerefMut for RingOf<K> {
+    fn deref_mut(&mut self) -> &mut K::State {
+        &mut self.state
+    }
+}
+
+impl<K: RingKind> RingOf<K> {
+    pub(crate) fn new(state: K::State) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            base: 0,
+            bytes: 0,
+            state,
+        }
+    }
+
+    pub(crate) fn head(&self) -> u64 {
+        self.base + self.entries.len() as u64
+    }
+
+    /// Appends `e`, then drops entries from the front while the ring is over `limit`, always
+    /// keeping the newest: a client at the head needs its boundary.
+    pub(crate) fn push(&mut self, e: Arc<K::Entry>, limit: usize) {
+        self.bytes += K::bytes(&e);
+        self.entries.push_back(e);
+        while self.bytes > limit && self.entries.len() > 1 {
+            if let Some(e) = self.entries.pop_front() {
+                self.bytes -= K::bytes(&e);
+                self.base += 1;
+                K::evicted(&mut self.state, &e);
+            }
+        }
+    }
+}
+
+/// A single node's ring ([`RingKind`]): its commits as [`Entry`]s.
+pub(crate) struct Single;
+
+impl RingKind for Single {
+    type Entry = Entry;
+    type State = SingleRing;
+
+    fn bytes(e: &Entry) -> usize {
+        e.bytes
+    }
+}
+
+/// Where a single node's hub feed is, beside its ring.
+#[derive(Default)]
+pub(crate) struct SingleRing {
     /// The hub feed's position when it opened: with no entry yet, the ring holds every
     /// commit of the spec above it.
     start_seqno: u64,
@@ -413,11 +491,9 @@ struct Ring {
     failed: bool,
 }
 
-impl Ring {
-    fn head(&self) -> u64 {
-        self.base + self.entries.len() as u64
-    }
+type Ring = RingOf<Single>;
 
+impl Ring {
     /// Where a client at position `seqno` rejoins: the index of the first entry after it.
     /// The client has covered every commit of the spec up to `seqno` (its own stream's
     /// `position`), and the ring holds every one after the position before its first entry.
@@ -438,15 +514,21 @@ impl Ring {
     }
 }
 
-struct Hub {
-    ring: Mutex<Ring>,
-    /// The ring's head index, bumped by each commit and by a failure.
-    head: watch::Sender<u64>,
+/// A hub: its ring, its task, and its members.
+pub(crate) struct HubOf<K: RingKind> {
+    ring: Mutex<RingOf<K>>,
+    /// The ring's head index, bumped by each push and by a failure.
+    pub(crate) head: watch::Sender<u64>,
     /// Its task: replaced each time the task moves between runtimes ([`drive`]).
     task: Mutex<tokio::task::AbortHandle>,
-    /// Its clients, on its ring or on their own streams until they rejoin it: a [`Joined`]
-    /// each. At most one, its task runs on the feed runtime (#1689).
+    /// Its clients, on its ring or on their own streams until they rejoin it: a [`JoinedOf`]
+    /// each. At most one, a single node's hub task runs on the feed runtime (#1689).
     members: AtomicUsize,
+    /// Its members that aren't a cluster hub's merge (#1798). While it has members and none
+    /// of these, its task stays on the hub runtime: its readers are merges on the feed
+    /// runtime, so running it beside them (#1689) only adds the engine's reads to the
+    /// runtime that delivers every cluster subscriber's events (g100).
+    external: AtomicUsize,
     /// Bumped by each join, so the task sees a client that joined and left between two of
     /// its looks at `members`.
     joins: AtomicU64,
@@ -454,14 +536,43 @@ struct Hub {
     /// gauge and the dump.
     solo: AtomicBool,
     stats: Arc<FeedStats>,
-    /// Live hubs, shared: each ring's cap is the total over it.
+    /// Live hubs of its kind: `--max-feed-hubs` counts them.
     live: Arc<AtomicU64>,
+    /// The node's rings that split `--feed-ring-bytes`: every hub with a member.
+    sharers: Arc<AtomicU64>,
     /// Its clients' trackers, for the dump; a gone client's is pruned there.
     clients: Mutex<Vec<Weak<Tracker>>>,
 }
 
-impl Hub {
-    fn ring(&self) -> MutexGuard<'_, Ring> {
+pub(crate) type Hub = HubOf<Single>;
+
+impl<K: RingKind> HubOf<K> {
+    /// A hub with `ring` and its task's handle, holding a place in `live`.
+    pub(crate) fn new(
+        ring: RingOf<K>,
+        task: tokio::task::AbortHandle,
+        solo: bool,
+        stats: Arc<FeedStats>,
+        live: Arc<AtomicU64>,
+        sharers: Arc<AtomicU64>,
+    ) -> Self {
+        let (head, _) = watch::channel(ring.head());
+        Self {
+            ring: Mutex::new(ring),
+            head,
+            task: Mutex::new(task),
+            members: AtomicUsize::new(0),
+            external: AtomicUsize::new(0),
+            joins: AtomicU64::new(0),
+            solo: AtomicBool::new(solo),
+            stats,
+            live,
+            sharers,
+            clients: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn ring(&self) -> MutexGuard<'_, RingOf<K>> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -469,18 +580,50 @@ impl Hub {
         self.task.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Makes `tracker`'s client one of this hub's members until the [`Joined`] drops.
-    fn join(self: &Arc<Self>, tracker: &Arc<Tracker>) -> Joined {
+    /// Replaces its task's handle (a cluster hub's task starts after the hub is made).
+    pub(crate) fn set_task(&self, task: tokio::task::AbortHandle) {
+        *self.task() = task;
+    }
+
+    /// Makes `tracker`'s client one of this hub's members until the [`JoinedOf`] drops;
+    /// `internal`: a cluster hub's merge (#1798), which keeps the task on the hub runtime.
+    pub(crate) fn join(self: &Arc<Self>, tracker: &Arc<Tracker>, internal: bool) -> JoinedOf<K> {
         self.track(tracker);
-        self.members.fetch_add(1, Ordering::Relaxed);
+        // `external` before `members` (Release): whoever sees this membership in `members`
+        // (Acquire, [`HubOf::internal`]) sees a client's `external` with it (cli692's N1).
+        if !internal {
+            self.external.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.members.fetch_add(1, Ordering::Release) == 0 {
+            self.sharers.fetch_add(1, Ordering::Relaxed);
+        }
         self.joins.fetch_add(1, Ordering::Relaxed);
-        Joined(Arc::clone(self))
+        JoinedOf(Arc::clone(self), internal)
+    }
+
+    /// Its members now.
+    pub(crate) fn members(&self) -> usize {
+        self.members.load(Ordering::Relaxed)
+    }
+
+    /// Its ring's cap: an equal share of `--feed-ring-bytes` (`total`) among the rings with
+    /// a member, a cluster hub's and the partition hubs its merges read alike (#1798).
+    pub(crate) fn ring_limit(&self, total: usize) -> usize {
+        total / self.sharers.load(Ordering::Relaxed).max(1) as usize
+    }
+
+    /// Whether its members are all cluster hubs' merges, and there's at least one. `members`
+    /// first: a client counted there is counted in `external` too ([`HubOf::join`]). A client
+    /// leaving can still read as a merge for a moment, which costs at most one move to the
+    /// hub runtime and back after `solo_after`.
+    fn internal(&self) -> bool {
+        self.members.load(Ordering::Acquire) > 0 && self.external.load(Ordering::Relaxed) == 0
     }
 
     /// Counts `tracker`'s client under this hub, for the dump. Gone clients and those that
     /// moved to another hub are pruned here whenever the list reaches a power of two, so it
     /// stays bounded on a server nobody dumps (perf287's R1 on #1643), and in the dump.
-    fn track(&self, tracker: &Arc<Tracker>) {
+    pub(crate) fn track(&self, tracker: &Arc<Tracker>) {
         let me = std::ptr::from_ref(self) as usize;
         tracker.hub.store(me, Ordering::Relaxed);
         let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
@@ -493,25 +636,29 @@ impl Hub {
         clients.push(Arc::downgrade(tracker));
     }
 
+    /// Its live clients' trackers, pruning gone ones and those counted under another hub.
+    pub(crate) fn trackers(&self) -> Vec<Arc<Tracker>> {
+        let me = std::ptr::from_ref(self) as usize;
+        let mut c = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        c.retain(|w| {
+            w.upgrade()
+                .is_some_and(|t| t.hub.load(Ordering::Relaxed) == me)
+        });
+        c.iter().filter_map(Weak::upgrade).collect()
+    }
+}
+
+impl Hub {
     fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
-        let limit = total / self.live.load(Ordering::Relaxed).max(1) as usize;
+        let limit = self.ring_limit(total);
         // Encoded here, on the hub's task and outside the ring's lock.
         let seqno = commit.seqno();
         let mut entry = Entry::new(&commit, token.clone());
-        let bytes = entry.bytes;
         let mut r = self.ring();
         entry.prev = r.passed;
         r.passed = position.max(seqno);
         r.passed_token = token;
-        r.entries.push_back(Arc::new(entry));
-        r.bytes += bytes;
-        // Always keep the newest: a client at the head needs its boundary.
-        while r.bytes > limit && r.entries.len() > 1 {
-            if let Some(e) = r.entries.pop_front() {
-                r.bytes -= e.bytes;
-                r.base += 1;
-            }
-        }
+        r.push(Arc::new(entry), limit);
         let head = r.head();
         drop(r);
         self.head.send_replace(head);
@@ -543,9 +690,9 @@ impl Hub {
     }
 }
 
-impl Drop for Hub {
+impl<K: RingKind> Drop for HubOf<K> {
     fn drop(&mut self) {
-        // The last client left: the engine subscription (and its shard wakers) goes.
+        // The last client left: the hub's feed (and its shard wakers) goes.
         self.task
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
@@ -554,12 +701,21 @@ impl Drop for Hub {
     }
 }
 
-/// A client's membership of its hub, counted in the hub's `members` while held.
-struct Joined(Arc<Hub>);
+/// A client's membership of its hub, counted in the hub's `members` while held; `.1`:
+/// a cluster hub's merge ([`HubOf::join`]).
+pub(crate) struct JoinedOf<K: RingKind>(pub(crate) Arc<HubOf<K>>, bool);
 
-impl Drop for Joined {
+type Joined = JoinedOf<Single>;
+
+impl<K: RingKind> Drop for JoinedOf<K> {
     fn drop(&mut self) {
-        self.0.members.fetch_sub(1, Ordering::Relaxed);
+        let hub = &self.0;
+        if hub.members.fetch_sub(1, Ordering::Relaxed) == 1 {
+            hub.sharers.fetch_sub(1, Ordering::Relaxed);
+        }
+        if !self.1 {
+            hub.external.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -590,17 +746,18 @@ struct Driver {
 
 impl Driver {
     /// Where the task should run now, if not where it is: on the hub runtime at once with two
-    /// or more clients, back on the feed runtime after `solo_after` with at most one.
+    /// or more clients, or with only cluster hubs' merges ([`HubOf::external`]); back on the
+    /// feed runtime after `solo_after` with at most one other client.
     ///
     /// Asked only after a commit, so a hub left alone on the hub runtime by a quiet table
     /// stays there until its next commit. That's harmless: with no commits there's no
     /// handoff to save (perf287's N1 on #1716).
     fn moves(&mut self, hub: &Hub) -> Option<Place> {
         self.runtimes.as_ref()?;
-        let members = hub.members.load(Ordering::Relaxed);
+        let shared = hub.members.load(Ordering::Relaxed) >= 2 || hub.internal();
         match self.place {
-            Place::Feed => (members >= 2).then_some(Place::Hubs),
-            Place::Hubs if members >= 2 => {
+            Place::Feed => shared.then_some(Place::Hubs),
+            Place::Hubs if shared => {
                 self.alone = None;
                 None
             }
@@ -712,9 +869,11 @@ pub(crate) struct Feeds {
     catch_up: Arc<Semaphore>,
     limits: FeedLimits,
     pub(crate) stats: Arc<FeedStats>,
-    /// The node's live hubs, every partition's: the ring budget (`--feed-ring-bytes`) is
-    /// split across them, and `--max-feed-hubs` counts them (D317 ticket 8a).
+    /// The node's live hubs, every partition's: `--max-feed-hubs` counts them (D317 ticket
+    /// 8a).
     live: Arc<AtomicU64>,
+    /// The node's rings that split `--feed-ring-bytes` ([`FeedShared::sharers`]).
+    sharers: Arc<AtomicU64>,
     /// Ends every cluster component stream (`Spec::announce`) open on this partition, with
     /// the error sent: the node's map no longer gives it the partition (audit120's S-C5).
     parts_ended: watch::Sender<Option<ApiError>>,
@@ -764,8 +923,11 @@ impl Drop for HubPlace<'_> {
 /// they are on a single node.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedShared {
-    catch_up: Arc<Semaphore>,
+    pub(crate) catch_up: Arc<Semaphore>,
     live: Arc<AtomicU64>,
+    /// The rings with a member, which split `--feed-ring-bytes`: single-node hubs' and
+    /// cluster feed hubs' alike ([`HubOf::ring_limit`], #1798).
+    pub(crate) sharers: Arc<AtomicU64>,
 }
 
 impl FeedShared {
@@ -773,6 +935,7 @@ impl FeedShared {
         Self {
             catch_up: Arc::new(Semaphore::new(max_catch_up.max(1))),
             live: Arc::default(),
+            sharers: Arc::default(),
         }
     }
 }
@@ -810,7 +973,18 @@ impl Feeds {
             limits,
             stats: Arc::default(),
             live: Arc::clone(&shared.live),
+            sharers: Arc::clone(&shared.sharers),
             parts_ended: watch::Sender::new(None),
+        })
+    }
+
+    /// The database's seqno now, at the visibility a feed delivers at: what a `Now` start
+    /// passes over up to (simp724's F5 on #1518; a cluster hub's joiner, #1798).
+    pub(crate) fn seqno_now(&self, visible: bool) -> Result<u64, ApiError> {
+        Ok(if visible {
+            self.db.snapshot()?.seqno()
+        } else {
+            self.db.durable_snapshot()?.seqno()
         })
     }
 
@@ -929,16 +1103,8 @@ impl Feeds {
                     r.failed,
                 )
             };
-            let limit = self.limits.ring_bytes / hub.live.load(Ordering::Relaxed).max(1) as usize;
-            let me = Arc::as_ptr(hub) as usize;
-            let trackers: Vec<Arc<Tracker>> = {
-                let mut c = hub.clients.lock().unwrap_or_else(PoisonError::into_inner);
-                c.retain(|w| {
-                    w.upgrade()
-                        .is_some_and(|t| t.hub.load(Ordering::Relaxed) == me)
-                });
-                c.iter().filter_map(Weak::upgrade).collect()
-            };
+            let limit = hub.ring_limit(self.limits.ring_bytes);
+            let trackers = hub.trackers();
             let (mut on_ring, mut own, mut waiting) = (Vec::new(), Vec::new(), 0usize);
             for t in &trackers {
                 let at = t.at.load(Ordering::Relaxed);
@@ -1030,9 +1196,9 @@ impl Feeds {
         let stream = FeedStream::new(open(tables, visible, &Start::Snapshot(snapshot))?);
         let start_seqno = stream.position().seqno();
         let start_token = token_of(&stream);
-        let (head, _) = watch::channel(0);
         let stats = Arc::clone(&self.stats);
         let live = Arc::clone(&self.live);
+        let sharers = Arc::clone(&self.sharers);
         // From here the hub holds the place, and gives it back when it's dropped.
         place.keep();
         // A new hub has one client coming: it starts beside it on the feed runtime (#1689),
@@ -1056,22 +1222,19 @@ impl Feeds {
                 Some((feed, _)) => feed.spawn(drive(driver)),
                 None => self.spawn_hub(drive(driver)),
             };
-            Hub {
-                ring: Mutex::new(Ring {
+            Hub::new(
+                Ring::new(SingleRing {
                     start_seqno,
                     passed: start_seqno,
                     passed_token: start_token,
-                    ..Ring::default()
+                    failed: false,
                 }),
-                head,
-                task: Mutex::new(task.abort_handle()),
-                members: AtomicUsize::new(0),
-                joins: AtomicU64::new(0),
-                solo: AtomicBool::new(runtimes.is_some()),
+                task.abort_handle(),
+                runtimes.is_some(),
                 stats,
                 live,
-                clients: Mutex::default(),
-            }
+                sharers,
+            )
         });
         hubs.insert(key, Arc::downgrade(&hub));
         Ok(hub)
@@ -1103,7 +1266,7 @@ impl Feeds {
         let spec_announce = spec.announce;
         let (sink, events, end_tx) = Sink::new(&self.limits);
         let tracker = Arc::new(Tracker::default());
-        let joined = hub.join(&tracker);
+        let joined = hub.join(&tracker, spec.internal);
         drop(hub);
         let client = Client {
             feeds: Arc::clone(self),
@@ -1112,6 +1275,7 @@ impl Feeds {
             skip: spec.skip,
             skipped: AtomicU64::new(0),
             announce: spec.announce,
+            internal: spec.internal,
             tables: spec.tables,
             prefix: spec.prefix,
             visible: spec.visible,
@@ -1236,6 +1400,8 @@ struct Client {
     skipped: AtomicU64,
     /// [`Spec::announce`].
     announce: bool,
+    /// [`Spec::internal`].
+    internal: bool,
     tables: Vec<Table>,
     prefix: Vec<u8>,
     visible: bool,
@@ -1452,7 +1618,7 @@ impl Client {
             if hub.ring().failed && hub_retry.is_none_or(|t| t.elapsed() >= HUB_RETRY) {
                 hub_retry = Some(Instant::now());
                 if let Ok(new) = self.feeds.hub(&self.tables, self.visible) {
-                    let joined = new.join(&self.tracker);
+                    let joined = new.join(&self.tracker, self.internal);
                     *self.hub.lock().unwrap_or_else(PoisonError::into_inner) = joined;
                     hub = new;
                 }
@@ -1614,6 +1780,16 @@ impl Sink {
         (sink, events, end_tx)
     }
 
+    /// Whether events wait in the connection's buffer, untaken.
+    pub(crate) fn pending(&self) -> bool {
+        self.budget.available_permits() < self.client_bytes
+    }
+
+    /// When the connection last took an event.
+    pub(crate) fn taken(&self) -> &TakeClock {
+        &self.taken
+    }
+
     /// Whether the connection went away.
     pub(crate) fn is_closed(&self) -> bool {
         self.tx.is_closed()
@@ -1751,14 +1927,12 @@ enum EventSource {
         taken: Arc<TakeClock>,
         end: Option<oneshot::Receiver<ApiError>>,
     },
-    Merged(Box<crate::serve::cluster::feed::ClusterEvents>),
 }
 
 impl std::fmt::Debug for FeedEvents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self.0 {
             EventSource::Sink { .. } => "FeedEvents(sink)",
-            EventSource::Merged(_) => "FeedEvents(merged)",
         })
     }
 }
@@ -1777,6 +1951,8 @@ pub(crate) enum Out {
     /// checkpoint the cluster token). A protobuf message is the concatenation of its fields,
     /// so the component's encoding is sent as it is, not decoded and built again.
     Spliced { body: Bytes, tail: Bytes },
+    /// A cluster feed hub's entry (#1798): encoded once for every member, as `Shared` is.
+    Merged(Arc<crate::serve::cluster::hub::ClusterEntry>),
 }
 
 impl Out {
@@ -1790,6 +1966,7 @@ impl Out {
             Out::Event(e) => &e.token,
             Out::Shared(e) => &e.token,
             Out::Spliced { .. } => &NONE,
+            Out::Merged(e) => &e.token,
         }
     }
 
@@ -1799,6 +1976,7 @@ impl Out {
             Out::Event(e) => prost::Message::encoded_len(e),
             Out::Shared(e) => e.encoded().map_or(0, Bytes::len),
             Out::Spliced { body, tail } => body.len() + tail.len(),
+            Out::Merged(e) => e.body.len() + e.tail.len(),
         }
     }
 
@@ -1808,6 +1986,8 @@ impl Out {
             Out::Event(e) => Bytes::from(prost::Message::encode_to_vec(e)),
             Out::Shared(e) => e.encoded().cloned().unwrap_or_default(),
             Out::Spliced { body, tail } => [body.as_ref(), tail.as_ref()].concat().into(),
+            Out::Merged(e) if e.tail.is_empty() => e.body.clone(),
+            Out::Merged(e) => [e.body.as_ref(), e.tail.as_ref()].concat().into(),
         }
     }
 
@@ -1819,7 +1999,7 @@ impl Out {
                 .encoded()
                 .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
                 .unwrap_or_else(|| commit_event(e.token.clone(), proto::FeedCommit::default())),
-            Out::Spliced { .. } => {
+            Out::Spliced { .. } | Out::Merged(_) => {
                 <proto::FeedEvent as prost::Message>::decode(self.to_bytes()).unwrap_or_default()
             }
         }
@@ -1843,6 +2023,11 @@ impl Out {
                 buf.put_slice(tail);
                 Ok(())
             }
+            Out::Merged(e) => {
+                buf.put_slice(&e.body);
+                buf.put_slice(&e.tail);
+                Ok(())
+            }
         }
     }
 }
@@ -1854,7 +2039,6 @@ impl FeedEvents {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
         let (events, taken, end) = match &mut self.0 {
-            EventSource::Merged(m) => return m.poll_out(cx),
             EventSource::Sink { events, taken, end } => (events, taken, end),
         };
         match events.poll_recv(cx) {
@@ -1877,11 +2061,6 @@ impl FeedEvents {
         };
         *end = None;
         Poll::Ready(out)
-    }
-
-    /// A cluster subscription's events: merged as the client polls.
-    pub(crate) fn merged(events: crate::serve::cluster::feed::ClusterEvents) -> Self {
-        FeedEvents(EventSource::Merged(Box::new(events)))
     }
 }
 
@@ -1935,25 +2114,21 @@ mod tests {
     /// clients and those counted under another hub are pruned as it grows.
     #[test]
     fn a_hubs_tracker_list_stays_bounded_without_a_dump() {
-        let (head, _) = watch::channel(0);
-        let hub = |head: watch::Sender<u64>| Hub {
-            ring: Mutex::default(),
-            head,
-            task: Mutex::new(
+        let hub = || {
+            Hub::new(
+                Ring::new(SingleRing::default()),
                 tokio::runtime::Builder::new_current_thread()
                     .build()
                     .unwrap()
                     .spawn(async {})
                     .abort_handle(),
-            ),
-            members: AtomicUsize::new(0),
-            joins: AtomicU64::new(0),
-            solo: AtomicBool::new(false),
-            stats: Arc::default(),
-            live: Arc::new(AtomicU64::new(1)),
-            clients: Mutex::default(),
+                false,
+                Arc::default(),
+                Arc::new(AtomicU64::new(1)),
+                Arc::default(),
+            )
         };
-        let (a, b) = (hub(head.clone()), hub(head));
+        let (a, b) = (hub(), hub());
         // Ten thousand clients that came and went.
         for _ in 0..10_000 {
             a.track(&Arc::new(Tracker::default()));
@@ -1981,11 +2156,11 @@ mod tests {
     }
 
     fn ring(start: u64, commits: &[Commit], evicted: usize) -> Ring {
-        let mut r = Ring {
+        let mut r = Ring::new(SingleRing {
             start_seqno: start,
             passed: commits.last().map_or(start, Commit::seqno),
-            ..Ring::default()
-        };
+            ..SingleRing::default()
+        });
         let mut prev = start;
         for c in commits {
             r.entries.push_back(Arc::new(Entry {
@@ -2050,6 +2225,7 @@ mod tests {
             start: Start::Now,
             skip: 0,
             announce: false,
+            internal: false,
         };
         rt.block_on(async {
             let slot = || Arc::clone(&slots).try_acquire_owned().unwrap();
@@ -2165,6 +2341,7 @@ mod tests {
             start: Start::Now,
             skip: 0,
             announce: false,
+            internal: false,
         }
     }
 
@@ -2265,6 +2442,170 @@ mod tests {
             feeds.dump()
         );
         drop(t);
+        drop(requests);
+        drop(delivery);
+        drop(hubs);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_nodes_hub_placement_is_mains() {
+        // #1798, g102: on a node with no cluster merges, `Driver::moves` decides as main's
+        // did (4a47d2a47): the hub runtime at once with two or more clients, back to the feed
+        // runtime once alone for `solo_after`. B's `internal()` must never read a client-only
+        // hub as a merge's, at any member count, so a single node's placement is unchanged.
+        // `main` is main's rule, written out; every step's answer is checked against it.
+        fn main(place: Place, members: usize, alone_due: bool) -> Option<Place> {
+            match place {
+                Place::Feed => (members >= 2).then_some(Place::Hubs),
+                Place::Hubs if members >= 2 => None,
+                Place::Hubs => alone_due.then_some(Place::Feed),
+            }
+        }
+        let (_, db, dir) = commits("feedpin", 0);
+        let t = db.table("t").unwrap().open().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let hub = Arc::new(Hub::new(
+            Ring::new(SingleRing::default()),
+            rt.spawn(async {}).abort_handle(),
+            true,
+            Arc::default(),
+            Arc::new(AtomicU64::new(1)),
+            Arc::default(),
+        ));
+        let snapshot = db.snapshot().unwrap();
+        let stream = open(std::slice::from_ref(&t), true, &Start::Snapshot(snapshot)).unwrap();
+        let mut d = Driver {
+            stream: FeedStream::new(stream),
+            hub: Arc::downgrade(&hub),
+            ring_bytes: 16 << 20,
+            runtimes: Some((rt.handle().clone(), rt.handle().clone())),
+            solo_after: Duration::ZERO,
+            place: Place::Feed,
+            alone: None,
+        };
+        // One step, checked against main's rule; `alone_due`: main's answer alone on the hub
+        // runtime (the step after the one that started the `solo_after` clock).
+        let step = |d: &mut Driver, alone_due: bool| {
+            let members = hub.members();
+            assert!(!hub.internal(), "a client-only hub with {members} members");
+            let got = d.moves(&hub);
+            let want = main(d.place, members, alone_due);
+            assert_eq!(got, want, "{members} members at {:?}", d.place);
+            if let Some(p) = got {
+                d.place = p;
+            }
+            got
+        };
+        let join = || hub.join(&Arc::new(Tracker::default()), false);
+        let mut joined = Vec::new();
+        assert_eq!(step(&mut d, false), None, "no members yet");
+        joined.push(join());
+        assert_eq!(step(&mut d, false), None, "one client: solo, beside it");
+        joined.push(join());
+        assert_eq!(step(&mut d, false), Some(Place::Hubs), "a second client");
+        joined.push(join());
+        assert_eq!(step(&mut d, false), None, "three: stays");
+        joined.truncate(2);
+        assert_eq!(step(&mut d, false), None, "two: stays");
+        joined.truncate(1);
+        assert_eq!(step(&mut d, false), None, "alone: the clock starts");
+        assert_eq!(
+            step(&mut d, true),
+            Some(Place::Feed),
+            "alone past solo_after"
+        );
+        joined.clear();
+        assert_eq!(step(&mut d, false), None, "none left, on the feed runtime");
+        drop((d, t));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hub_read_only_by_cluster_merges_runs_on_the_hub_runtime_with_a_full_share() {
+        // #1798, g100: a partition hub whose one member is a cluster hub's merge isn't solo.
+        // Its reader runs on the feed runtime, which also delivers every cluster subscriber's
+        // events, so the hub's engine reads go to the hub runtime at its first commit and
+        // stay there past `solo_after`. Its ring takes an equal share of `--feed-ring-bytes`
+        // with every other ring that has a member, as a client's hub does.
+        let (_, db, dir) = commits("feedint", 0);
+        let (requests, delivery, hubs) = server_runtimes(1);
+        let t = db.table("t").unwrap().open().unwrap();
+        let u = db
+            .table("u")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let shared = FeedShared::new(1);
+        let feeds = Feeds::new(
+            db.clone(),
+            limits_solo_after(Duration::from_millis(50)),
+            &shared,
+        );
+        feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
+        let slots = Arc::new(Semaphore::new(8));
+        let hubs_before = hubs.metrics().num_alive_tasks();
+        requests.block_on(async {
+            let put =
+                |t: &Table, row: &[u8]| t.mutate(row).put("f", b"q", b"v").commit().unwrap().seqno;
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let merge = Spec {
+                internal: true,
+                ..now_spec(&t)
+            };
+            let mut m = feeds.subscribe(merge, slot, |_| {}).unwrap();
+            let s1 = put(&t, b"r1");
+            assert_eq!(seqnos(&mut m, Duration::from_millis(300)).await, [s1]);
+            assert_eq!(
+                tasks_on(&hubs, hubs_before + 1).await,
+                hubs_before + 1,
+                "the merge's hub, on the hub runtime"
+            );
+            assert_eq!(feeds.gauges().solo_hubs, 0);
+            // Past `solo_after`, with another commit: still there.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let s2 = put(&t, b"r2");
+            assert_eq!(seqnos(&mut m, Duration::from_millis(300)).await, [s2]);
+            let s3 = put(&t, b"r3");
+            assert_eq!(seqnos(&mut m, Duration::from_millis(300)).await, [s3]);
+            assert_eq!(tasks_on(&hubs, hubs_before + 1).await, hubs_before + 1);
+            assert_eq!(feeds.gauges().solo_hubs, 0);
+            assert_eq!(feeds.stats.hub_moves.load(Ordering::Relaxed), 1);
+
+            // A client's hub beside it: two rings with members, so each has half.
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut c = feeds.subscribe(now_spec(&u), slot, |_| {}).unwrap();
+            assert_eq!(shared.sharers.load(Ordering::Relaxed), 2);
+            let total = 16 << 20;
+            for h in feeds
+                .hubs
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(Weak::upgrade)
+            {
+                assert_eq!(h.ring_limit(total), total / 2);
+            }
+            let s4 = put(&u, b"r4");
+            assert_eq!(seqnos(&mut c, Duration::from_millis(300)).await, [s4]);
+            assert_eq!(feeds.gauges().solo_hubs, 1, "the client's hub is solo");
+            drop(c);
+            drop(m);
+            // Every membership gone, once the clients' tasks end: no ring splits the budget.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while shared.sharers.load(Ordering::Relaxed) != 0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(shared.sharers.load(Ordering::Relaxed), 0);
+        });
+        drop((t, u));
         drop(requests);
         drop(delivery);
         drop(hubs);
@@ -2397,6 +2738,7 @@ mod tests {
                 start: Start::Now,
                 skip: 0,
                 announce: false,
+                internal: false,
             };
             let _events = feeds.subscribe(spec, slot, |_| {}).unwrap();
             // Park the feed runtime's one worker while the backlog is written, so the hub
@@ -2484,6 +2826,7 @@ mod tests {
                         start: Start::Now,
                         skip: 0,
                         announce: false,
+                        internal: false,
                     },
                     Arc::clone(&slots).try_acquire_owned().unwrap(),
                     |_| {},
@@ -2578,6 +2921,7 @@ mod tests {
                         start: Start::Now,
                         skip: 0,
                         announce: false,
+                        internal: false,
                     },
                     Arc::clone(&slots).try_acquire_owned().unwrap(),
                     move |e| {
@@ -2676,6 +3020,7 @@ mod tests {
                         start: Start::Now,
                         skip: 0,
                         announce: false,
+                        internal: false,
                     },
                     Arc::clone(&slots).try_acquire_owned().unwrap(),
                     |_| {},
