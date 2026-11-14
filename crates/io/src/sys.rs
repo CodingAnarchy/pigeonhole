@@ -29,8 +29,15 @@ pub fn process_id() -> u32 {
 /// std's [`Instant`](std::time::Instant) stops during a suspend on Linux and macOS, so a
 /// node suspended past its lease would wake believing the lease still live.
 ///
-/// `CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on macOS (which counts sleep there), and
-/// `QueryInterruptTime` on Windows.
+/// It counts time across a suspend on each OS:
+/// - **Linux (and Android):** `CLOCK_BOOTTIME`, which includes time suspended
+///   (`CLOCK_MONOTONIC` there doesn't).
+/// - **macOS and other Unix:** `CLOCK_MONOTONIC`, which on macOS keeps counting while the
+///   system sleeps (`mach_continuous_time`'s clock; `CLOCK_UPTIME_RAW`, std's, doesn't).
+/// - **Windows:** `QueryInterruptTime`, which includes time asleep or hibernating
+///   (`QueryUnbiasedInterruptTime` doesn't).
+///
+/// An internal helper, not part of the crate's public contract.
 ///
 /// ```
 /// let a = pigeonhole_io::sys::boot_clock_ns();
