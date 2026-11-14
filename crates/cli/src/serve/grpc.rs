@@ -382,6 +382,13 @@ fn parse_grpc_timeout(v: &str) -> Option<Duration> {
     })
 }
 
+/// A gRPC request's `Authorization` header, if it has one that is text.
+pub(crate) fn auth_header<T>(req: &Request<T>) -> Option<&str> {
+    req.metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+}
+
 /// A reply stream as gRPC messages: each `ApiError` as its `Status`. A scan's pages (a
 /// cluster's forwarded scan's too, D317 ticket 4a), a backup download's chunks, a follow's
 /// batches and a memory watch's events.
@@ -420,11 +427,7 @@ async fn call<T>(
     req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<ServiceReply, Status> {
-    let header = req
-        .metadata()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-    let caller = shared.caller(header)?;
+    let caller = shared.caller(auth_header(&req))?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -710,11 +713,7 @@ impl proto::admin_server::Admin for AdminGrpc {
         &self,
         req: Request<tonic::Streaming<proto::PartitionUploadChunk>>,
     ) -> Result<Response<proto::PartitionUploadReply>, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(auth_header(&req))?;
         let reply = self
             .0
             .router
@@ -727,11 +726,7 @@ impl proto::admin_server::Admin for AdminGrpc {
         &self,
         req: Request<proto::PartitionUploadStatusRequest>,
     ) -> Result<Response<proto::PartitionUploadStatusReply>, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(auth_header(&req))?;
         let reply = self
             .0
             .router
@@ -820,11 +815,7 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
         req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
     ) -> Result<Response<proto::Empty>, Status> {
         let shared = &self.0;
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = shared.caller(header)?;
+        let caller = shared.caller(auth_header(&req))?;
         let first_budget = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
         let meter = req.extensions().get::<Meter>().cloned().unwrap_or_default();
         let limits = shared.limits;
