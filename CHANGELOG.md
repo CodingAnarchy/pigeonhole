@@ -4,6 +4,18 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-14
+
+Change feed and replica fixes for a database rolled back to 1.1.x and changed there, and the release to roll back to from 1.3. Upgrade if you use a feed of every table (`Pigeonhole::feed()`) or `phdb serve --replica-of`, or may move a database back from 1.3 with such a feed. The file format, the shared-memory layout and the feed token layout 1.2.1 writes are unchanged, so 1.2.0 and 1.2.1 processes work together, and files move freely between them.
+
+### Changed
+- A feed of every table checks each commit's tables in the pass that builds the commit, against a cache of the tables it has already found in the catalog. This takes back most of the cost the check for a 1.1.x session's drop added: about 4% fewer instructions a commit (#1874).
+
+### Fixed
+- A feed of every table resumed across a 1.1.x session that dropped a table (after a rollback from 1.2) answers `FeedExpired` when it reaches a commit to the dropped table. Before, it delivered that commit with an empty table name and went on without the drop (#1853).
+- `phdb serve --replica-of`: a replica whose apply is refused because its tables are no longer its primary's bootstraps again. Before, it retried from the same token for ever. This happens after a schema change the primary's feed didn't record, such as one made while the primary ran 1.1.x (#1853).
+- After a rollback from 1.3, a token of a feed of every table that 1.3 took resumes. Before, it was refused with `InvalidArgument`. 1.3 adds the catalog at the token's position to such tokens (version 3, D325); this release reads them and ignores that part (#1853).
+
 ## [1.2.0] - 2026-11-13
 
 Pigeonhole 1.2.0 serves a database over the network. Files stay in format 4; read "Upgrading from 1.1.x" below before upgrading. It adds:
@@ -980,7 +992,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.2.0
 [1.1.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...v1.1.2
