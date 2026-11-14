@@ -1,6 +1,6 @@
-//! A cluster subscription's idle limit once its merge is the client's own stream (#1758's
-//! option B, simp724's R1): a client that stops reading loses its subscription, its
-//! `--max-streams` place and its parts at `--stream-idle-ms`, counted once; a client that
+//! A cluster subscription's idle limit, its merge a task on the feed runtime handing the
+//! client batches (#1798 (a)): a client that leaves events untaken loses its subscription,
+//! its `--max-streams` place and its parts at `--stream-idle-ms`, counted once; a client that
 //! reads a quiet subscription keeps it, however long nothing happens.
 
 use super::*;
@@ -95,9 +95,9 @@ async fn idle_drops(port: u16) -> u64 {
 
 #[test]
 fn a_client_reading_a_quiet_subscription_keeps_it_past_the_idle_limit() {
-    // simp724's point 1: every poll is the client asking, and the stream is woken every
-    // half limit with nothing to send, so a reader of a quiet subscription is never idle,
-    // with the limit (400 ms) far below the quiet interval (10 s).
+    // simp724's point 1: a client with nothing waiting for it is waiting for a commit, so a
+    // reader of a quiet subscription is never idle, with the limit (400 ms) far below the
+    // quiet interval (10 s).
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, _dbs) = nodes(&rt);
     let [a, _, c] = ports;
@@ -127,9 +127,9 @@ fn a_client_reading_a_quiet_subscription_keeps_it_past_the_idle_limit() {
 
 #[test]
 fn a_client_that_stops_reading_loses_its_subscription_and_slot_at_the_idle_limit() {
-    // simp724's R1: nothing polls a stream whose client's window is full, so the watchdog
-    // ends it: its `--max-streams` place (c has one) and its parts are freed, and it's
-    // counted once.
+    // simp724's R1: a client whose window is full leaves the merge's batches untaken, so the
+    // merge task ends it: its `--max-streams` place (c has one) and its parts are freed, and
+    // it's counted once.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, _dbs) = nodes(&rt);
     let [a, _, c] = ports;

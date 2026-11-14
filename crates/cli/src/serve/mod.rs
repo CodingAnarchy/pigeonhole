@@ -581,7 +581,7 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     let enter = Arc::clone(&placement);
     let hub_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.hub_threads)
-        .thread_name("phdb-serve-feed-hub")
+        .thread_name("phdb-serve-hub")
         .on_thread_start(move || enter.enter_hub())
         .on_thread_park(placement::refresh)
         .on_thread_unpark(placement::refresh)
