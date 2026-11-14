@@ -116,6 +116,67 @@ impl Three {
         self.stops[i] = Some(stop);
         self.nodes[i] = Some(node_rt);
     }
+
+    /// Starts node `i` again as a restarted node (D326): its partitions wait for a lease
+    /// from its rounds, which it then renews, rather than standing for a node that has
+    /// served all along.
+    fn restart_leased(&mut self, i: usize) {
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", self.ports[i]).parse().unwrap();
+        let node_rt = runtime();
+        let listener = node_rt.block_on(async {
+            for _ in 0..100 {
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket.set_reuseaddr(true).unwrap();
+                if socket.bind(addr).is_ok() {
+                    return socket.listen(64).unwrap().into_std().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("port {addr} never came free");
+        });
+        let (stop, _) = data_node_full(
+            &node_rt,
+            &self.dirs[i],
+            IDS[i],
+            PARTS[i],
+            listener,
+            "",
+            crate::serve::server_tests::limits(),
+            self.dbs[i].clone(),
+            true,
+        );
+        self.stops[i] = Some(stop);
+        self.nodes[i] = Some(node_rt);
+    }
+
+    /// Cuts node `i` off from its peers both ways (its lease rounds and pushes), or joins it
+    /// again; its clients still reach it.
+    fn cut(&self, i: usize, off: bool) {
+        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
+        let mut cut = super::super::CUT_OFF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cut.retain(|e| *e != entry);
+        if off {
+            cut.push(entry);
+        }
+    }
+}
+
+/// Puts `row` through `port` until it's taken: a restarted node's partition takes writes
+/// once it holds its lease.
+async fn put_when_leased(port: u16, row: &str) {
+    eventually("the partition to take writes under its lease", async || {
+        data(port)
+            .await
+            .mutate(MutateRequest {
+                writes: Some(put_row(row, "v")),
+                durability: 0,
+            })
+            .await
+            .is_ok()
+    })
+    .await;
 }
 
 impl Drop for Three {
@@ -1502,4 +1563,124 @@ fn a_moved_component_whose_new_node_never_serves_gives_up_at_the_request_timeout
             );
         });
     });
+}
+
+#[test]
+fn a_node_cut_off_at_its_restart_ends_its_partitions_subscriptions() {
+    // feed1248's F2 on D326: a lease-less node's subscriptions wait only while its rounds
+    // reach a majority. a restarts cut off from its peers, so its rounds reach none: a
+    // subscription through it ends with PartitionUnavailable rather than waiting for ever.
+    let mut t = Three::start();
+    let a = t.ports[0];
+    t.stop(0);
+    t.cut(0, true);
+    t.restart_leased(0);
+    t.rt.block_on(async {
+        let e = match subscribe(a, users()).await {
+            Err(e) => e,
+            Ok(mut s) => tokio::time::timeout(Duration::from_secs(10), s.message())
+                .await
+                .expect("the subscription ends within a round or two")
+                .expect_err("it ends with an error"),
+        };
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+        assert!(e.message().contains("lease"), "{e:?}");
+    });
+    t.cut(0, false);
+}
+
+#[test]
+fn a_partitions_open_subscription_ends_when_its_lease_lapses() {
+    // feed1248's F3 and F5 on D326: a lease that runs out ends the partition's feed
+    // components, a quiet one included (nothing to deliver carries it), so a subscription
+    // through another node ends with PartitionUnavailable rather than hanging while a new
+    // owner may take writes.
+    let mut t = Three::start();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.stop(0);
+    t.restart_leased(0);
+    t.rt.block_on(async {
+        put_when_leased(a, "alice").await;
+        let mut s = subscribe(c, users()).await.unwrap();
+        put(c, "amy", "v").await;
+        let (seen, _) = commits(&mut s, 1).await;
+        assert_eq!(seen[0].rows, ["amy"]);
+        t.cut(0, true);
+        let e = loop {
+            match tokio::time::timeout(TEST_LEASE * 4, s.message())
+                .await
+                .expect("the subscription ends within a few leases")
+            {
+                Ok(Some(e)) => assert!(!matches!(e.event, Some(Event::Commit(_))), "{e:?}"),
+                Ok(None) => panic!("the stream ended cleanly"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+        assert!(e.message().contains("lease"), "{e:?}");
+    });
+    t.cut(0, false);
+}
+
+#[test]
+fn a_planned_move_with_its_release_lost_resumes_on_the_new_node_once_its_lease_starts() {
+    // feed1248's §6 test on D326 PR 2: a's p1 holds a real lease, and its release when the
+    // move closes p1 never reaches its peers. The open subscription ends as the move closes
+    // p1 (no allow_partial); resumed at once from its last checkpoint through b, its p1
+    // component waits on c for c's lease, and then delivers every commit after the
+    // checkpoint once, with no gap.
+    let mut t = Three::start();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.stop(0);
+    t.restart_leased(0);
+    super::super::fence::DROP_RELEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(t.dirs[0].clone());
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    t.rt.block_on(async {
+        put_when_leased(a, "aaa").await;
+        let mut s = subscribe(c, users()).await.unwrap();
+        let before = rows("before", 8);
+        for row in &before {
+            put(c, row, "v").await;
+        }
+        let (seen, _) = commits(&mut s, before.len()).await;
+        let at = seen.iter().rposition(|x| x.token.is_some()).unwrap();
+        let token = seen[at].token.clone().unwrap();
+        let mut want: Vec<String> = seen[at + 1..].iter().flat_map(|x| x.rows.clone()).collect();
+
+        let r = within(super::super::moving::run(&args, "p1", "c", true, None))
+            .await
+            .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let mut s = subscribe(
+            b,
+            SubscribeRequest {
+                start: Some(Start::Resume(token)),
+                ..users()
+            },
+        )
+        .await
+        .unwrap();
+        let after = rows("after", 8);
+        for row in &after {
+            put(a, row, "v").await;
+        }
+        want.extend(after.iter().cloned());
+        let (seen, _) = commits(&mut s, want.len()).await;
+        in_order(&seen);
+        let mut got: Vec<String> = seen.iter().flat_map(|x| x.rows.clone()).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "no gap and no repeat across the move");
+    });
+    super::super::fence::DROP_RELEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|d| *d != t.dirs[0]);
 }

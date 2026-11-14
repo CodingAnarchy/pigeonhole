@@ -1772,11 +1772,14 @@ impl Sink {
             client_bytes,
             stream_idle: limits.stream_idle,
         };
-        let events = FeedEvents(EventSource::Sink {
-            events: rx,
-            taken,
-            end: Some(end_rx),
-        });
+        let events = FeedEvents(
+            EventSource::Sink {
+                events: rx,
+                taken,
+                end: Some(end_rx),
+            },
+            None,
+        );
         (sink, events, end_tx)
     }
 
@@ -1918,7 +1921,36 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 /// A client's events, then its error if it failed: a single node's, from its [`Sink`]; or
 /// a cluster subscription's, merged as the client polls ([`crate::serve::cluster::feed`],
 /// #1758's B).
-pub(crate) struct FeedEvents(EventSource);
+pub(crate) struct FeedEvents(EventSource, Option<Box<FeedLease>>);
+
+/// A cluster partition's component's lease check (D326 PR 2, feed1248's F2, F3 and F5): it
+/// delivers only while the partition holds a lease. Every component of the partition on
+/// this node, its catch-up from a position included, reads through one of these, so the
+/// check is one clock read per event delivered, and nothing on a single node.
+struct FeedLease {
+    gate: Arc<super::gate::WriteGate>,
+    /// Wakes the component at the lease's end while it has nothing to deliver, or for its
+    /// next look while it waits for a lease: a quiet partition's feeds still end on time.
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// It ended with the lease's error.
+    ended: bool,
+}
+
+/// How often a component waiting for its partition's first lease looks again.
+const LEASE_WAIT: Duration = Duration::from_millis(100);
+
+impl FeedLease {
+    /// Wakes `cx` at `deadline`, or at once if that's passed.
+    fn wake_at(&mut self, deadline: tokio::time::Instant, cx: &mut Context<'_>) {
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        timer.as_mut().reset(deadline);
+        if timer.as_mut().poll(cx).is_ready() {
+            cx.waker().wake_by_ref();
+        }
+    }
+}
 
 enum EventSource {
     Sink {
@@ -2033,8 +2065,87 @@ impl Out {
 }
 
 impl FeedEvents {
+    /// These events, delivered only while cluster partition `gate`'s lease holds (D326 PR
+    /// 2): they wait while it has had none since it opened and the node reaches a majority,
+    /// and end with `PartitionUnavailable` once it lapses or the node doesn't (feed1248's
+    /// F2). Refused at once in that last case, so a subscribe never starts there.
+    pub(crate) fn leased(mut self, gate: Arc<super::gate::WriteGate>) -> Result<Self, ApiError> {
+        if let super::gate::Delivery::End(e) = gate.delivery() {
+            return Err(e);
+        }
+        self.1 = Some(Box::new(FeedLease {
+            gate,
+            timer: None,
+            ended: false,
+        }));
+        Ok(self)
+    }
+
     /// The next event as it left the client, then the client's error if it failed.
     pub(crate) fn poll_out(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Out, ApiError>>> {
+        if let Some(lease) = self.1.as_ref() {
+            if lease.ended {
+                return Poll::Ready(None);
+            }
+            // Without a lease, the stream's own end still comes through first: a map that
+            // moves the partition away ends its lease and its components with
+            // `WrongPartition` at once, and the merge must see that to open it again where
+            // the map puts it (audit120's S-C5). Events not yet delivered go; the reopen
+            // resumes from the last one delivered.
+            if !matches!(lease.gate.delivery(), super::gate::Delivery::Serve)
+                && let Poll::Ready(Some(e)) = self.as_mut().poll_end(cx)
+            {
+                if let Some(lease) = self.1.as_mut() {
+                    lease.ended = true;
+                }
+                return Poll::Ready(Some(Err(e)));
+            }
+        }
+        if let Some(lease) = self.1.as_mut() {
+            match lease.gate.delivery() {
+                super::gate::Delivery::Serve => {}
+                super::gate::Delivery::Wait => {
+                    lease.wake_at(tokio::time::Instant::now() + LEASE_WAIT, cx);
+                    return Poll::Pending;
+                }
+                super::gate::Delivery::End(e) => {
+                    lease.ended = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
+        }
+        let out = self.as_mut().poll_events(cx);
+        // Nothing to deliver: woken at the lease's end, so the component ends then even with
+        // no event to carry it (feed1248's F3). A renewal before then only wakes it early.
+        if out.is_pending()
+            && let Some(lease) = self.1.as_mut()
+        {
+            let left = lease.gate.lease_remaining().max(Duration::from_millis(1));
+            lease.wake_at(tokio::time::Instant::now() + left, cx);
+        }
+        out
+    }
+
+    /// The sink's error, if it has ended with one, without taking its events.
+    fn poll_end(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<ApiError>> {
+        let EventSource::Sink { end, .. } = &mut self.0;
+        let Some(rx) = end.as_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(rx).poll(cx) {
+            Poll::Ready(Ok(e)) => {
+                *end = None;
+                Poll::Ready(Some(e))
+            }
+            Poll::Ready(Err(_)) | Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// The sink's next event, then its error if it failed.
+    fn poll_events(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
@@ -2108,6 +2219,56 @@ mod tests {
         }
         drop((feed, t));
         (out, db, dir)
+    }
+
+    /// The next of `events`' items.
+    async fn next_out(events: &mut FeedEvents) -> Option<Result<Out, ApiError>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *events).poll_out(cx)).await
+    }
+
+    /// D326 PR 2 (feed1248's F2, F3 and F5): a cluster partition's component delivers only
+    /// under its lease. Without one since it opened (and the node reaching a majority), it
+    /// waits, delivering nothing, its catch-up included; once leased, it delivers; when the
+    /// lease runs out, it ends with the lease's error even with nothing to deliver; and a
+    /// node whose last round reached no majority refuses the subscribe.
+    #[tokio::test]
+    async fn a_cluster_components_events_wait_for_a_lease_and_end_when_it_runs_out() {
+        use crate::serve::gate::{LeaseClock, WriteGate};
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", false, Arc::clone(&clock));
+        let (sink, events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        sink.put(Out::event(proto::FeedEvent::default()))
+            .await
+            .unwrap();
+        let mut events = events.leased(Arc::clone(&gate)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next_out(&mut events))
+                .await
+                .is_err(),
+            "nothing before the lease"
+        );
+        gate.renew(clock.now() + 400_000_000);
+        let first = tokio::time::timeout(Duration::from_secs(5), next_out(&mut events))
+            .await
+            .expect("delivered once leased");
+        assert!(matches!(first, Some(Ok(_))));
+        // Quiet: no event to carry it, and the lease runs out.
+        let end = tokio::time::timeout(Duration::from_secs(5), next_out(&mut events))
+            .await
+            .expect("woken at the lease's end");
+        let Some(Err(e)) = end else {
+            panic!("the lease's error, not an event or the end");
+        };
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+        assert!(e.message.contains("ran out"), "{}", e.message);
+        assert!(next_out(&mut events).await.is_none(), "then the end");
+
+        // A node whose last round reached no majority: refused at once.
+        clock.set_majority(false);
+        let gate = WriteGate::opened("p2", false, Arc::clone(&clock));
+        let (_sink, events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        let e = events.leased(gate).unwrap_err();
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
     }
 
     /// A hub's tracker list stays bounded without a dump (perf287's R1 on #1643): gone
