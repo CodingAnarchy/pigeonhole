@@ -33,7 +33,7 @@ async fn stamp(
 }
 
 /// Uploads every file of the database at `main` to `port` as partition `p`'s set at epoch 1.
-async fn upload_set(port: u16, p: &str, main: &Path, ids: u8) -> Vec<PartitionFile> {
+pub(super) async fn upload_set(port: u16, p: &str, main: &Path, ids: u8) -> Vec<PartitionFile> {
     let files: Vec<(PartitionFile, Vec<u8>)> = pigeonhole::Pigeonhole::database_files(main)
         .unwrap()
         .iter()

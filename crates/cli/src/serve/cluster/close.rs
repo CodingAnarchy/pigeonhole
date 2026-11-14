@@ -44,6 +44,22 @@ pub(crate) static HOLD_BEFORE_DB_CLOSE: std::sync::Mutex<
     Option<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(None);
 
+/// A fault seam (tests): the next close in each listed cluster directory finds its drain
+/// failed, as one whose writes admitted before the fence still ran after [`DRAIN`] would.
+/// One entry per directory, so tests running at once don't take each other's.
+#[cfg(test)]
+pub(crate) static FAIL_DRAIN: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn fail_drain(dir: &std::path::Path) -> bool {
+    let mut armed = FAIL_DRAIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = armed.iter().position(|d| d == dir);
+    at.map(|i| armed.swap_remove(i)).is_some()
+}
+
 /// Each close's [`Closed::generation`].
 static CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -141,7 +157,14 @@ impl Node {
         if fenced.insert(id.to_owned()) {
             self.persist_fences(fenced).await?;
         }
-        gate.drained(DRAIN).await.map_err(|n| {
+        let drained = gate.drained(DRAIN).await;
+        #[cfg(test)]
+        let drained = if fail_drain(&self.dir) {
+            Err(1)
+        } else {
+            drained
+        };
+        drained.map_err(|n| {
             ApiError::failed_precondition(format!(
                 "partition {id:?}: {n} writes admitted before its fence still run after {}s; \
                  close it again once they finish",
