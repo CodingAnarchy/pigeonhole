@@ -1442,6 +1442,17 @@ impl Engine {
         }
     }
 
+    /// Runs `f` once, in the next root commit's observer, after that root's feed intent
+    /// landed and before its Root entry is written (#1869): a test arms a fault there to
+    /// fail the Root write alone, whatever the timing. A fault seam: the observer then goes
+    /// on as always. No effect without a change feed (test hook).
+    #[doc(hidden)]
+    pub fn before_next_root_write(&self, f: impl FnOnce() + Send + 'static) {
+        if let Some(feed) = &self.inner.shared.feed {
+            feed.before_root_write.arm(Box::new(f));
+        }
+    }
+
     /// Whether the writer's shared-memory region says its change-feed sidecar appends
     /// stopped (the header's `FEED_FLAGS` bit, D315 amendment, #1869; an inspection helper
     /// for tests).

@@ -531,6 +531,39 @@ pub(crate) struct Feed {
     /// completes as failed, once, though the VFS's succeeded.
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_next_sidecar_sync: std::sync::atomic::AtomicBool,
+    /// A fault seam (`Engine::before_next_root_write`, #1869): runs once, in the root-commit
+    /// observer, after the root's intent landed and before its Root entry is written, so a
+    /// test fails that write alone.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) before_root_write: OnceHook,
+}
+
+/// A test's one-shot callback (`Feed::before_root_write`).
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+pub(crate) struct OnceHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(feature = "test-hooks")]
+impl OnceHook {
+    /// Arms `f` for the next run, replacing one not yet run.
+    pub(crate) fn arm(&self, f: Box<dyn FnOnce() + Send>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Runs the armed callback, if any, once.
+    fn run(&self) {
+        let f = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(f) = f {
+            f();
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for OnceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnceHook")
+    }
 }
 
 /// A catalog change staged for its root commit's `Catalog` sidecar entry (D315).
@@ -603,6 +636,8 @@ impl Feed {
             root_intent_delay_nanos: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             fail_next_sidecar_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            before_root_write: OnceHook::default(),
         }
     }
 
@@ -906,6 +941,7 @@ impl Feed {
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_nanos(delay));
             }
+            self.before_root_write.run();
         }
         // A catalog change whose intent didn't append it (no intent hook ran): its entry
         // goes first, in the same append as the Root entry.
@@ -1000,7 +1036,8 @@ impl Feed {
     /// amendment, #1869), and publishes a stop already made: root commits of this open
     /// (`finish`'s upgrade) may have stopped the appends before the region existed.
     pub(crate) fn publish_to(&self, shm: pigeonhole_shm::ShmRegion) {
-        let _ = self.shm.set(shm);
+        let set = self.shm.set(shm);
+        debug_assert!(set.is_ok(), "a session is handed its region once");
         std::sync::atomic::fence(Ordering::SeqCst);
         if self.appends_stopped.load(Ordering::SeqCst)
             && let Some(shm) = self.shm.get()
