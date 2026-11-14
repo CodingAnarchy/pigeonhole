@@ -51,6 +51,10 @@ const HUB_START: Duration = Duration::from_secs(10);
 /// How often a member on its own merge looks at its hub's ring for a place to rejoin.
 const REJOIN_TICK: Duration = Duration::from_millis(250);
 
+/// How often a member on its own merge with no running hub looks for its key's hub (as a
+/// single node's client does for a failed hub's replacement, cli692's S1 on #1884).
+const HUB_RETRY: Duration = Duration::from_secs(1);
+
 /// An entry's size beside its bytes and positions, as a single node's (`ENTRY_OVERHEAD`).
 const ENTRY_OVERHEAD: usize = 112;
 
@@ -624,9 +628,15 @@ pub(super) async fn subscribe(s: Subscribe) -> Result<FeedEvents, ApiError> {
     let tracker = Arc::new(Tracker::default());
     let n = partitions.len();
     // A `Now` start: its key's hub, opened if none and there's room (simp724's S1).
-    let mut hub = None;
-    if shareable {
-        hub = node.feed_hubs.get(&key, &partitions);
+    // A `Now` start: its key's hub, opened if none and there's room (simp724's S1). A hub
+    // found just as its merge ended is no use to a joiner with no head yet: it looks once
+    // more, and opens a new one if none runs (simp724's S3 on #1884).
+    let mut joined_head = None;
+    for attempt in 0..2 {
+        if !shareable {
+            break;
+        }
+        let mut hub = node.feed_hubs.get(&key, &partitions);
         if hub.is_none() && node.feed_hubs.place(limits.max_hubs.max(1) as u64) {
             let mut merge = plan.merge(&starts, &skips, true);
             if let Err(e) = merge.open_all().await {
@@ -641,18 +651,29 @@ pub(super) async fn subscribe(s: Subscribe) -> Result<FeedEvents, ApiError> {
                 &service,
             ));
         }
+        let Some(hub) = hub else { break };
+        #[cfg(test)]
+        hold(&HOLD_READY, node.dir()).await;
+        let joined = Joined::new(&hub, &tracker, &metrics);
+        match ready_head(&hub).await? {
+            Ready::Head(head) => {
+                joined_head = Some((joined, head));
+                break;
+            }
+            Ready::Ended(_) if attempt == 0 => {}
+            Ready::Ended(e) => return Err(e),
+        }
     }
-    let begin = match hub {
-        Some(hub) => {
-            let joined = Joined::new(&hub, &tracker, &metrics);
+    let begin = match joined_head {
+        Some((joined, head)) => {
             let Head {
                 at,
                 token,
                 passed,
                 out,
-            } = ready_head(&hub).await?;
+            } = head;
             #[cfg(test)]
-            hold_join(node.dir()).await;
+            hold(&HOLD_JOIN, node.dir()).await;
             // Then each local partition's seqno (F5's order: head first): commits at or
             // below it predate the subscribe and are passed over.
             let mut own = Vec::with_capacity(n);
@@ -694,6 +715,7 @@ pub(super) async fn subscribe(s: Subscribe) -> Result<FeedEvents, ApiError> {
     let member = Member {
         sink,
         plan,
+        key,
         node: Arc::clone(&node),
         hub: None,
         own: Vec::new(),
@@ -745,24 +767,30 @@ struct Head {
     out: Vec<Bytes>,
 }
 
+/// What a joiner found on its hub: its place, or the hub's end.
+enum Ready {
+    Head(Head),
+    Ended(ApiError),
+}
+
 /// The head of `hub`'s ring once its components have said where they are, with its
 /// checkpoint and positions there, taken together (simp724's point on §2.3).
-async fn ready_head(hub: &ClusterHub) -> Result<Head, ApiError> {
+async fn ready_head(hub: &ClusterHub) -> Result<Ready, ApiError> {
     let mut head = hub.head.subscribe();
     let wait = async {
         loop {
             {
                 let r = hub.ring();
                 if let Some(e) = &r.ended {
-                    return Err(e.clone());
+                    return Ok(Ready::Ended(e.clone()));
                 }
                 if r.ready {
-                    return Ok(Head {
+                    return Ok(Ready::Head(Head {
                         at: r.head(),
                         token: r.token.clone(),
                         passed: r.passed.clone(),
                         out: r.out.iter().flatten().cloned().collect(),
-                    });
+                    }));
                 }
             }
             if head.changed().await.is_err() {
@@ -786,10 +814,20 @@ pub(crate) static HOLD_JOIN: std::sync::Mutex<
     Vec<(std::path::PathBuf, tokio::sync::oneshot::Receiver<()>)>,
 > = std::sync::Mutex::new(Vec::new());
 
+/// A hold seam (tests): the next `Now` joiner on each listed cluster directory waits after it
+/// found or opened its key's hub, before it joins it, as [`HOLD_JOIN`] does.
 #[cfg(test)]
-async fn hold_join(dir: &std::path::Path) {
+pub(crate) static HOLD_READY: std::sync::Mutex<
+    Vec<(std::path::PathBuf, tokio::sync::oneshot::Receiver<()>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn hold(
+    seam: &std::sync::Mutex<Vec<(std::path::PathBuf, tokio::sync::oneshot::Receiver<()>)>>,
+    dir: &std::path::Path,
+) {
     let wait = {
-        let mut armed = HOLD_JOIN.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut armed = seam.lock().unwrap_or_else(PoisonError::into_inner);
         armed
             .iter()
             .position(|(d, _)| d == dir)
@@ -864,6 +902,8 @@ enum Stop {
 struct Member {
     sink: Sink,
     plan: Plan,
+    /// Its key, to find its hub again when it has none running.
+    key: Key,
     node: Arc<super::Node>,
     hub: Option<Joined>,
     /// Each part's position the member has covered: its commits at or below it are passed
@@ -1153,6 +1193,9 @@ impl Member {
             .stats
             .catch_up_waits
             .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .cluster_catch_up_waits
+            .fetch_add(1, Ordering::Relaxed);
         self.tracker.set(WAITING, 0);
         let sem = Arc::clone(&self.catch_up);
         tokio::select! {
@@ -1167,14 +1210,27 @@ impl Member {
     async fn read_own(
         &mut self,
         mut merging: Box<Merging>,
-        slot: Option<OwnedSemaphorePermit>,
+        mut slot: Option<OwnedSemaphorePermit>,
         count: (Count, OwnCount),
     ) -> Result<Source, Stop> {
         let mut at: Vec<u64> = Vec::new();
+        let mut hub_retry: Option<tokio::time::Instant> = None;
         loop {
             crate::serve::placement::refresh();
             self.tracker
                 .set(ON_OWN, self.own.first().copied().unwrap_or(0));
+            // No running hub: look for the key's at most once a second (cli692's S1 on
+            // #1884). Until there's one to rejoin, the merge is an unshared one, like a key's
+            // past the hub limit: it gives its --max-catch-up slot back.
+            if !self.hub_runs() && hub_retry.is_none_or(|t| t.elapsed() >= HUB_RETRY) {
+                hub_retry = Some(tokio::time::Instant::now());
+                if let Some(h) = self.node.feed_hubs.get(&self.key, &self.partitions) {
+                    self.hub = Some(Joined::new(&h, &self.tracker, &self.metrics));
+                } else {
+                    self.hub = None;
+                    drop(slot.take());
+                }
+            }
             if let Some(i) = self.rejoin() {
                 self.node
                     .feed_hubs
@@ -1230,6 +1286,11 @@ impl Member {
             }
             self.cover_to(&at);
         }
+    }
+
+    /// Whether its hub is there and hasn't ended.
+    fn hub_runs(&self) -> bool {
+        self.hub().is_some_and(|h| h.ring().ended.is_none())
     }
 
     /// Where it rejoins its hub's ring now, if it can: the hub runs, covers its partitions,
@@ -1461,6 +1522,7 @@ mod tests {
         let member = Member {
             sink,
             plan,
+            key: test_key(),
             node: Arc::clone(&node),
             hub: None,
             own: Vec::new(),
@@ -1493,6 +1555,96 @@ mod tests {
             handle: start(member, begin, end, None),
             slots,
         }
+    }
+
+    /// The key the member tests' merges run under.
+    fn test_key() -> Key {
+        Key::new(
+            &["users".into()],
+            &Bytes::new(),
+            false,
+            true,
+            0,
+            &Caller::anonymous(),
+        )
+    }
+
+    #[test]
+    fn a_member_on_its_own_merge_gives_its_slot_back_while_no_hub_runs_and_finds_a_new_one() {
+        // cli692's S1 on #1884: a member that fell behind holds a --max-catch-up slot for
+        // its own merge. If its hub then ends, it couldn't rejoin it, and held the slot
+        // (shared with single-node streams) until its client left. It looks for the key's
+        // hub once a second, and gives the slot back while none runs.
+        paused().block_on(async {
+            let (_p0, events) = fed();
+            let m = merging(vec![Some(events)], QUIET);
+            let plan = plan_of(&m);
+            let node = Arc::clone(&plan.ctx.node);
+            let parts = vec!["p0".to_string()];
+            let hub = |hubs: &Hubs| {
+                Arc::new(ClusterHub::new(
+                    RingOf::new(ClusterRing::new(parts.clone())),
+                    tokio::spawn(async {}).abort_handle(),
+                    false,
+                    Arc::default(),
+                    Arc::clone(&hubs.live),
+                    Arc::default(),
+                ))
+            };
+            let ended = hub(&node.feed_hubs);
+            ended.ring().ended = Some(ApiError::internal("over"));
+            let catch_up = Arc::new(Semaphore::new(1));
+            let limits = crate::serve::feed::FeedLimits {
+                ring_bytes: 1 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: QUIET,
+                stream_idle: Duration::from_secs(30),
+                client_events: crate::serve::feed::CLIENT_EVENTS,
+                client_bytes: crate::serve::feed::CLIENT_BYTES,
+                solo_after: crate::serve::feed::SOLO_AFTER,
+            };
+            let (sink, _events, _end) = Sink::new(&limits);
+            let metrics = Arc::new(Metrics::default());
+            let tracker: Arc<Tracker> = Arc::default();
+            let now = tokio::time::Instant::now();
+            let mut member = Member {
+                sink,
+                plan,
+                key: test_key(),
+                node: Arc::clone(&node),
+                hub: Some(Joined::new(&ended, &tracker, &metrics)),
+                own: vec![0],
+                token: Bytes::new(),
+                sent: Bytes::new(),
+                last_event: now,
+                waiting_since: now,
+                quiet: QUIET,
+                idle: Duration::from_secs(30),
+                catch_up: Arc::clone(&catch_up),
+                metrics: Arc::clone(&metrics),
+                tracker,
+                partitions: parts.clone(),
+                started: std::time::Instant::now(),
+                _slot: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            };
+            let slot = Arc::clone(&catch_up).try_acquire_owned().unwrap();
+            let count = (
+                Count::new(&metrics, merges),
+                OwnCount::new(&node, Why::Behind),
+            );
+            let run = tokio::spawn(async move {
+                let _ = member.read_own(Box::new(m), Some(slot), count).await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(catch_up.available_permits(), 1, "its slot is back");
+            // A hub for its key opens: it joins it, to rejoin once it can.
+            let live = node.feed_hubs.insert(test_key(), hub(&node.feed_hubs));
+            tokio::time::sleep(HUB_RETRY * 2).await;
+            assert_eq!(live.members(), 1, "it found the key's new hub");
+            assert_eq!(ended.members(), 0, "and left the ended one");
+            run.abort();
+        });
     }
 
     /// The client's next item, within `d` of virtual time.

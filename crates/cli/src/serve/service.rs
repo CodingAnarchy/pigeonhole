@@ -704,6 +704,8 @@ pub(crate) struct Metrics {
     /// that rejoined it (#1798's B).
     pub(crate) cluster_fell_behind: AtomicU64,
     pub(crate) cluster_rejoined: AtomicU64,
+    /// Cluster subscriptions that waited for a `--max-catch-up` slot after falling behind.
+    pub(crate) cluster_catch_up_waits: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -719,6 +721,7 @@ impl Default for Metrics {
             cluster_hub_members: AtomicU64::new(0),
             cluster_fell_behind: AtomicU64::new(0),
             cluster_rejoined: AtomicU64::new(0),
+            cluster_catch_up_waits: AtomicU64::new(0),
         }
     }
 }
@@ -831,6 +834,7 @@ impl Metrics {
         for (name, n) in [
             ("fell_behind", &self.cluster_fell_behind),
             ("rejoined", &self.cluster_rejoined),
+            ("catch_up_waits", &self.cluster_catch_up_waits),
         ] {
             let _ = writeln!(
                 out,

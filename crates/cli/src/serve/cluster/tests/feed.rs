@@ -1115,3 +1115,58 @@ fn a_member_that_stops_reading_is_dropped_without_holding_up_the_others() {
         metric_until(c, MEMBERS, |n| n == 1).await;
     });
 }
+
+#[test]
+fn a_joiner_that_found_its_hub_as_it_ended_opens_a_new_one() {
+    // simp724's S3 on #1884: a joiner that found its key's hub just before the hub's merge
+    // ended has no head yet, so it looks again and opens a new hub, rather than end with the
+    // other subscribers' error. Here the hub ends because p2's node stops; it's back before
+    // the joiner goes on.
+    let mut t = Three::start();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    let (mut first, joining, go) = t.rt.block_on(async {
+        let first = subscribe(c, users()).await.unwrap();
+        metric_until(c, MEMBERS, |n| n == 1).await;
+        let (go, wait) = tokio::sync::oneshot::channel();
+        crate::serve::cluster::hub::HOLD_READY
+            .lock()
+            .unwrap()
+            .push((t.dirs[2].clone(), wait));
+        let joining = tokio::spawn(subscribe(c, users()));
+        // Found the hub, and held before it joins.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (first, joining, go)
+    });
+    t.stop(1);
+    t.rt.block_on(async {
+        // The hub's merge ends: its subscriber's stream with it.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), first.message()).await {
+                Ok(Ok(Some(_))) => {}
+                Ok(Err(e)) => {
+                    assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    });
+    t.restart(1);
+    t.rt.block_on(async {
+        // b serves again.
+        put(b, "z-back", "v").await;
+        go.send(()).unwrap();
+        let mut second = joining
+            .await
+            .unwrap()
+            .expect("a new hub, not the ended one's error");
+        put(a, "a-new", "v").await;
+        put(b, "z-new", "v").await;
+        let (seen, _) = commits(&mut second, 2).await;
+        let rows: BTreeSet<&str> = seen
+            .iter()
+            .flat_map(|s| s.rows.iter().map(String::as_str))
+            .collect();
+        assert_eq!(rows, ["a-new", "z-new"].into_iter().collect());
+    });
+}

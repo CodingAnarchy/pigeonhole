@@ -606,10 +606,12 @@ impl<K: RingKind> HubOf<K> {
         self.members.load(Ordering::Relaxed)
     }
 
-    /// Its ring's cap, from `--feed-ring-bytes` (`total`): a share of it while it has an
-    /// external member, else [`INTERNAL_RING`].
+    /// Its ring's cap, from `--feed-ring-bytes` (`total`): [`INTERNAL_RING`] while all its
+    /// members are cluster hubs' merges, else a share of it.
     pub(crate) fn ring_limit(&self, total: usize) -> usize {
-        if self.external.load(Ordering::Relaxed) == 0 {
+        // Members, all of them merges: internal. None yet (a hub just opened for its first
+        // client): a full share, as before (cli692's N3 on #1884).
+        if self.external.load(Ordering::Relaxed) == 0 && self.members.load(Ordering::Relaxed) > 0 {
             INTERNAL_RING.min(total)
         } else {
             total / self.sharers.load(Ordering::Relaxed).max(1) as usize

@@ -412,6 +412,7 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_feed_cluster_hub_members` | gauge | Cluster feed subscriptions on a shared merge now (#1798). |
 | `pigeonhole_serve_feed_cluster_fell_behind_total` | counter | Cluster feed subscriptions that fell behind their shared merge's ring and went on alone. |
 | `pigeonhole_serve_feed_cluster_rejoined_total` | counter | Cluster feed subscriptions that caught up and rejoined their shared merge. |
+| `pigeonhole_serve_feed_cluster_catch_up_waits_total` | counter | Cluster feed subscriptions that fell behind and waited for a `--max-catch-up` slot. |
 | `pigeonhole_serve_feed_hub_failures_total` | counter | Shared subscriptions that failed. Their streams end with the error. |
 | `pigeonhole_serve_bulk_load_phase` | gauge | A `Vectors.BulkLoad`'s phase: 0 none, 1 receiving, 2 writing and rebalancing. |
 | `pigeonhole_serve_bulk_load_vectors`, `pigeonhole_serve_bulk_load_bytes` | gauge | The vectors and message bytes handed to the running load. |
@@ -686,12 +687,14 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 - **Memory:** it buffers up to 256 KiB on each partition's node, so partitions × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed. The entry node merges the partitions' events on its feed threads (`phdb-serve-feed`, not the threads that serve requests) and buffers up to the client's own 256 KiB, as a single node's stream does.
 - **Shared merges** (#1798): subscriptions from now that enter the same node with the same token and the same request share one merge there.
   - The same request means the same tables, prefix, visibility, `allow_partial` and `checkpoint_every`.
-  - A shared merge keeps a ring of its merged events, as a single node's hub does. Its ring takes a share of `--feed-ring-bytes`, and a node has at most `--max-feed-hubs` shared merges. Past that, a new request runs a merge of its own.
+  - A shared merge keeps a ring of its merged events, as a single node's hub does. Its ring takes a share of `--feed-ring-bytes`, and a node has at most `--max-feed-hubs` shared merges, counted apart from its partitions' hubs. Past that, a new request runs a merge of its own.
+  - The partition hubs it reads from on the entry node keep 1 MiB rings each, outside `--feed-ring-bytes`, while shared merges are their only readers.
   - Starts from a token, from the oldest commit, or with `skip_through` run a merge of their own until they catch up, then join the shared one.
   - The saving needs subscribers that share a token and a request. Each token or request of its own costs about what a subscription did before.
 - **Falling behind a shared merge:** a subscriber more than its ring behind goes on alone from its last checkpoint, with nothing skipped or repeated, and rejoins once caught up.
   - Going on alone takes a `--max-catch-up` slot, as a single node's catch-up stream does.
   - With no slot free, it waits, delivering nothing, until one is free or the client goes away. `--stream-idle-ms` doesn't end the wait: it counts only events the client left untaken.
+  - If its shared merge ends meanwhile, it gives the slot back and goes on alone, joining the request's next shared merge once one runs.
 - **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens: the limit counts how long an event waits untaken, so it ends a client that stopped reading, never one that's waiting for a commit. On a feed with no commits, a client that stopped reading is first left an event by the next quiet progress event (about 10 s), then ended `--stream-idle-ms` after that, as on a single node.
 
 #### Expiry and what isn't supported
@@ -819,6 +822,8 @@ A node serves every partition its map gives it ([D317](../design/decisions/phase
 - **The startup lines** give each partition's shard and compaction threads (pinned, confined or unpinned) and its memory. On Linux, a partition with unpinned threads is a warning. `/metrics` has the same per partition.
 - **`--change-feed` is not split:** each partition keeps the whole retention over its own shards, so a node's feed disk is its partition count times the retention. With WAL preallocation (unless `--no-wal-preallocate`), that disk is written when the partitions open, not reached over time. For example, with `--change-feed 4294967296` (4 GiB), a 16-shard node writes about 9 GiB of log at start as one database, and about 37 GiB as 8 partitions of 2 shards. A node-total feed budget is planned for 1.3.0 ([#1786](https://github.com/CodingAnarchy/pigeonhole/issues/1786)).
 - **Sessions and feeds:** `--max-sessions`, `--max-sessions-per-token`, `--feed-ring-bytes`, `--max-feed-hubs` and `--max-catch-up` count across all of a node's partitions. A feed with tables on two of a node's partitions holds two hubs there.
+  - `--max-feed-hubs` also caps the node's shared cluster feed merges ([Limits](#limits)). Those are counted on their own, apart from the partitions' hubs, so a node can have up to that many of each.
+  - A partition's hub whose only readers are shared merges keeps a ring of 1 MiB, outside `--feed-ring-bytes`. The shared merges drain it as it fills, so they don't take a share each twice.
 
 **What a partition costs** even so: each is a whole database engine, with costs that don't shrink with its share of the load:
 - at least one shard's memtable arena (64 MiB by default);
