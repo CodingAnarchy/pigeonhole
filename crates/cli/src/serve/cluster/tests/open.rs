@@ -666,6 +666,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        previous_nodes: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     // One 1-shard partition: 64 MiB of memtables and 448 MiB of caches.
