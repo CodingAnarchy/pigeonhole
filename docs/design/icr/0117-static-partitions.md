@@ -517,3 +517,17 @@ Nothing is persisted client-side. The report gives the write downtime (fence to 
 
 ## Callers changed
 None yet: ticket 1 adds a mode, a service and a scope, and changes nothing a single-node server answers, except that `__phdb_` table names are refused and hidden.
+
+## Amendment: `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852, 1.3.0)
+Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cluster node answered these three `Unsupported` (the router's catch-all).
+- **`Admin.Flush` and `Admin.Compact`** take `MaintenanceRequest { string partition = 1; }` in place of `Empty`, which is wire-compatible: an old client's empty message decodes as an empty request.
+  - **On a cluster node:** an empty `partition` acts on every partition the map gives the node that's open, serving or fenced (a fenced partition's files still change), one after another: the set `Info` lists, so a copy the map moved away that's still open here isn't one of them. Each is tried even after one fails, and the answer is the first failure's code with every failed partition named in its message. A named one acts on that partition alone: `WrongPartition` for one another node holds, `PartitionUnavailable` for one closed or not open here, and `NotFound` for one the map doesn't list.
+  - **On a single node:** `partition` must be empty (`InvalidArgument`).
+  - **Never forwarded:** each node answers for its own partitions, as a backup does.
+- **`Admin.Info`** gains `repeated PartitionInfo partitions = 7` and `repeated string other_partitions = 8`.
+  - **On a cluster node:** `partitions` lists each partition the map gives the node, in id order. `other_partitions` lists the map's partitions other nodes hold. The top-level fields describe the node: `path` is its cluster directory, `file_bytes` its partitions' files together, `free_bytes` the free space on that directory's disk (0 when no partition is open), and `tables` the map's tables.
+  - **On a single node:** both lists are empty, and the top-level fields are as before.
+- **`PartitionInfo`:** `id = 1`, `path = 2` (its database file), `file_bytes = 3`, `tables = 4` (its own file's), `state = 5` (`LocalPartitionState`), and `fence_reason = 6` (`FenceReason`).
+  - The state and fence reason are as `Cluster.Status` reports them.
+  - `file_bytes` and `tables` are set only for an open partition (serving or fenced).
+  - A partition the map places on the node that it hasn't opened (no file, or a failed open) is `LOCAL_PARTITION_STATE_UNSPECIFIED`.

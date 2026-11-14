@@ -83,17 +83,10 @@ impl WriteGate {
         decode(self.fence.load(Ordering::SeqCst))
     }
 
-    /// Fences the partition: writes admitted from now answer `Fenced`. An operator's fence
-    /// replaces a start fence; a start fence never replaces an operator's.
-    pub(crate) fn fence(&self, why: Fence) {
-        match why {
-            Fence::Operator => self.fence.store(OPERATOR, Ordering::SeqCst),
-            Fence::Start => {
-                let _ =
-                    self.fence
-                        .compare_exchange(OPEN, START, Ordering::SeqCst, Ordering::SeqCst);
-            }
-        }
+    /// Fences the partition for an operator: writes admitted from now answer `Fenced`. It
+    /// replaces a start fence, which a gate only ever has from [`WriteGate::new`].
+    pub(crate) fn fence(&self) {
+        self.fence.store(OPERATOR, Ordering::SeqCst);
     }
 
     /// Lifts the fence, whatever its reason.
@@ -209,7 +202,7 @@ mod tests {
         let g = WriteGate::new("p1", None);
         let held = g.enter().unwrap();
         assert_eq!(g.inflight(), 1);
-        g.fence(Fence::Operator);
+        g.fence();
         let e = g.enter().unwrap_err();
         assert_eq!(e.code, "Fenced");
         // The refused write isn't counted.
@@ -223,12 +216,10 @@ mod tests {
     #[test]
     fn a_start_fence_never_replaces_an_operators() {
         let g = WriteGate::new("p1", Some(Fence::Operator));
-        g.fence(Fence::Start);
-        assert_eq!(g.fenced(), Some(Fence::Operator));
         assert!(!g.unfence_start());
         assert_eq!(g.fenced(), Some(Fence::Operator));
         let g = WriteGate::new("p1", Some(Fence::Start));
-        g.fence(Fence::Operator);
+        g.fence();
         assert_eq!(g.fenced(), Some(Fence::Operator));
         let g = WriteGate::new("p1", Some(Fence::Start));
         assert!(g.unfence_start());
@@ -241,7 +232,7 @@ mod tests {
         let held = g.enter().unwrap();
         let detached = g.extend();
         drop(held);
-        g.fence(Fence::Operator);
+        g.fence();
         assert_eq!(
             g.drained(Duration::from_millis(20)).await,
             Err(1),
@@ -266,7 +257,7 @@ mod tests {
                 let g = Arc::clone(&g);
                 std::thread::spawn(move || g.enter().ok())
             };
-            g.fence(Fence::Operator);
+            g.fence();
             let seen = g.inflight();
             let held = writer.join().unwrap();
             if held.is_some() {

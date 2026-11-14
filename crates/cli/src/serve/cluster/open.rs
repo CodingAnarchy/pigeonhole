@@ -157,22 +157,26 @@ pub(crate) static HOLD_OPEN: std::sync::Mutex<
 > = std::sync::Mutex::new(Vec::new());
 
 /// A hold seam (tests): `open_missing` in each listed cluster directory waits after its next
-/// partition opened, before it confirms it, until the sender sends or is dropped.
+/// partition opened, before it confirms it, until the sender sends or is dropped. The wait
+/// is on a blocking thread: on a runtime worker it stopped every task queued behind it on
+/// that worker (all of them with one worker), and the test hung instead of failing (#1865).
 #[cfg(test)]
 pub(crate) static HOLD_CONFIRM: std::sync::Mutex<
     Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn hold_confirm(dir: &std::path::Path) {
-    let mut armed = HOLD_CONFIRM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(i) = armed.iter().position(|(d, _)| d == dir) {
-        let (_, wait) = armed.swap_remove(i);
-        drop(armed);
-        let _ = wait.recv();
-    }
+async fn hold_confirm(dir: &std::path::Path) {
+    let wait = {
+        let mut armed = HOLD_CONFIRM
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(i) = armed.iter().position(|(d, _)| d == dir) else {
+            return;
+        };
+        armed.swap_remove(i).1
+    };
+    let _ = tokio::task::spawn_blocking(move || wait.recv()).await;
 }
 
 #[cfg(test)]
@@ -326,8 +330,7 @@ impl Node {
                     .map_err(|f| ApiError::failed_precondition(f.message().to_owned()))
             })
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .await?;
         let mut opened = opened?.pop().ok_or_else(|| {
             ApiError::failed_precondition(format!(
                 "partition {id}'s file is stamped at an epoch above the map's {epoch}: a \
@@ -374,9 +377,7 @@ impl Node {
         // now, not the one the open began with, which a schema change may have passed while
         // the engine opened (audit120's F6). The reconcile covers every open partition.
         let node = Arc::clone(self);
-        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None)))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        tokio::task::spawn_blocking(move || drop(node.reconcile_current(None))).await?;
         Ok(())
     }
 
@@ -424,7 +425,7 @@ impl Node {
                         map.map_version
                     );
                     #[cfg(test)]
-                    hold_confirm(&self.dir);
+                    hold_confirm(&self.dir).await;
                     self.confirm_current();
                 }
                 Err(e) => eprintln!(

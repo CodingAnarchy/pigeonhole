@@ -198,6 +198,28 @@ async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
     panic!("{what}: never happened");
 }
 
+/// Runs `test` on a thread of its own and fails if it isn't done within `limit`, so a test
+/// that would hang (a call that never answers, a stuck runtime) fails instead (#1865). A
+/// panic in `test` is the test's.
+fn bounded(limit: Duration, test: impl FnOnce() + Send + 'static) {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let body = std::thread::spawn(move || {
+        test();
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(limit) {
+        Ok(()) => body.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = body.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the test didn't finish within {limit:?}")
+        }
+    }
+}
+
 #[test]
 fn a_forced_first_map_starts_each_history_at_its_epoch() {
     // simp724's S1 on #1729: a restore's forced map onto a fresh node carries the backup
@@ -4439,6 +4461,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
     });
 }
 
+mod admin;
 mod backup;
 mod charge;
 mod close;

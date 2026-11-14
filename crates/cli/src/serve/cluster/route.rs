@@ -211,11 +211,30 @@ impl Routes {
             .filter(move |(_, o)| o.node == node)
             .map(|(id, _)| id.as_str())
     }
+
+    /// The partitions the map gives nodes other than `node`, sorted (`Admin.Info`, #1852).
+    pub(crate) fn partitions_not_of(&self, node: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .owners
+            .iter()
+            .filter(|(_, o)| o.node != node)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The map's tables, sorted (`Admin.Info` on a cluster node, #1852).
+    pub(crate) fn table_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        names.sort();
+        names
+    }
 }
 
 /// The first key after every key starting with `prefix`; `None` when there's none (an
 /// empty prefix, or one of `0xff` bytes only).
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
         if last < 0xff {
