@@ -433,11 +433,13 @@ feed-drain 6154 0.3
 feed-drain-all 6177 0.3
 replicate-apply 6764 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
-# From the head 61512f049 (main db540e918), three identical-code runs, 43568754841, 43568758481
-# and 43571151108 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across the
-# runs: serve-get 74377-74406, serve-read-row 663387-663434, serve-scan 8021027-8021039, and
-# serve-mutate 69528-69731 (0.29%, close to the headroom; its source isn't traced yet).
-serve-get 74630 0.3
-serve-read-row 665425 0.3
-serve-mutate 69941 0.3
-serve-scan 8045103 0.3
+# From the head bceed2da9 (main e9b1e5f44, with #1872's and #1892's serve changes: #1892 added
+# about 55 to serve-get and 70 to serve-scan), three identical-code runs, 43580182634, 43580187515
+# and 43583722484 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
+# runs: serve-get 74444-74462, serve-read-row 663434-663458, serve-scan 8021082-8021107, and
+# serve-mutate 69532-69827 (0.42%; over nine runs on three heads 69528-69827; its source isn't
+# traced yet).
+serve-get 74686 0.3
+serve-read-row 665449 0.3
+serve-mutate 70037 0.3
+serve-scan 8045171 0.3
