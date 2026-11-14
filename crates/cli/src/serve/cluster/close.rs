@@ -229,7 +229,12 @@ impl Node {
         }
         // Its shards' CPUs are free now: the server's threads take them back.
         if let Some(opener) = self.opener.get() {
-            super::open::remask(&opener.placement, &parts, &format!("partition {id} closed"));
+            super::open::remask_off_async(
+                &opener.placement,
+                &parts,
+                format!("partition {id} closed"),
+            )
+            .await;
         }
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);
