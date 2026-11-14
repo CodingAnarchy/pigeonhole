@@ -179,6 +179,21 @@ impl Tokens {
         !self.0.is_empty()
     }
 
+    /// The caller an `Authorization` header identifies, or `Unauthenticated`. With no tokens
+    /// configured (a loopback server or cluster), everyone is the anonymous caller, who may
+    /// do everything.
+    pub(crate) fn caller_of(
+        &self,
+        header: Option<&str>,
+    ) -> Result<Caller, super::errors::ApiError> {
+        if !self.any() {
+            return Ok(Caller::anonymous());
+        }
+        bearer(header)
+            .and_then(|t| self.caller(t))
+            .ok_or_else(super::errors::ApiError::unauthenticated)
+    }
+
     /// The caller a forwarded call's token digest identifies here (D317 ticket 3): this
     /// node's own entry for it, so its scope and namespaces are this node's, or `None` when
     /// it isn't listed. Compared as [`caller`](Self::caller) compares.

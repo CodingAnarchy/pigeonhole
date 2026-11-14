@@ -29,8 +29,10 @@ fixed-seed = []
 
 [dependencies]
 # Default features (async included): the instruction counts measure what users get.
-# The bench reads pigeonhole's test and bench hooks (ICR 0085).
-pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
+# The bench reads pigeonhole's test and bench hooks (ICR 0085), and `feedshapes` measures
+# replication apply (D315, #1828): `__unstable-replication` only adds the replica's API
+# (`ReplicatedEvent`, `Feed::replicated`, `apply_replicated`), nothing on another path.
+pigeonhole = { workspace = true, features = ["__unstable-hooks", "__unstable-replication"] }
 # The fixed hash seeds of the measured examples (#1273): only adds the setter, no measured code.
 pigeonhole-format = { workspace = true, features = ["__unstable-fixed-seed"] }
 # D306 PR 3: the IVF index on SIFT1M (`examples/ivfsift.rs`).

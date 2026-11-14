@@ -207,9 +207,7 @@ impl Node {
                 )));
             part.feeds.fail_all();
             part.bulk.stop();
-            part.bulk.close();
-            part.texts.close();
-            part.indexes.close();
+            part.close_users();
             part.db.clone().close()
         })
         .await;
@@ -231,7 +229,12 @@ impl Node {
         }
         // Its shards' CPUs are free now: the server's threads take them back.
         if let Some(opener) = self.opener.get() {
-            super::open::remask(&opener.placement, &parts, &format!("partition {id} closed"));
+            super::open::remask_off_async(
+                &opener.placement,
+                &parts,
+                format!("partition {id} closed"),
+            )
+            .await;
         }
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);
@@ -316,22 +319,9 @@ fn hash_files(path: &Path) -> Result<Vec<PartitionFile>, String> {
 /// `file`'s size and SHA-256, read through once; its pages are dropped from the page cache
 /// as it goes (Linux), since nothing reads a closed partition's files soon.
 fn hash_file(file: &Path) -> Result<(u64, [u8; 32]), String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(file).map_err(|e| format!("read {}: {e}", file.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut bytes = 0u64;
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("read {}: {e}", file.display()))?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        bytes += n as u64;
-    }
+    let failed = |e: std::io::Error| format!("read {}: {e}", file.display());
+    let mut f = std::fs::File::open(file).map_err(failed)?;
+    let (bytes, sha256) = crate::serve::backup::sha256_of(&mut f).map_err(failed)?;
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd as _;
@@ -343,7 +333,7 @@ fn hash_file(file: &Path) -> Result<(u64, [u8; 32]), String> {
             nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
         );
     }
-    Ok((bytes, h.finalize().into()))
+    Ok((bytes, sha256))
 }
 
 /// Where `drop-partition` moves a partition's files: inside the cluster directory, so the

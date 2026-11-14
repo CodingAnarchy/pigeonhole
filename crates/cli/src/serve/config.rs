@@ -108,8 +108,8 @@ pub(crate) struct ServeArgs {
     /// a load's sample of max(50,000, lists) vectors while it clusters them, then up to 255
     /// unwritten vectors a list. A load whose worst case is more is refused before it starts;
     /// one that fits reserves its worst case for its life. Not counted: the rebalance after a
-    /// load, which holds at most four lists' vectors at once (16 MiB of `f32`), however
-    /// the vectors fall.
+    /// load, which holds about 16 MiB at most (or four lists' vectors, if more), however the
+    /// vectors fall.
     #[arg(long, value_name = "BYTES", default_value_t = 1 << 30)]
     pub bulk_load_bytes: usize,
     /// How long a request may wait for the server's limits, in milliseconds. A write the

@@ -391,8 +391,8 @@ impl Drop for Server {
             }
             rt.shutdown_timeout(Duration::from_secs(5));
         }
-        self.shared.router.service.part().unwrap().bulk.close();
-        self.shared.router.service.part().unwrap().texts.close();
+        // As the server's own shutdown ends them (cli692's nit on #1885).
+        self.shared.router.service.part().unwrap().close_users();
         let _ = self
             .shared
             .router

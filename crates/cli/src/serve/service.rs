@@ -1162,6 +1162,17 @@ pub(crate) struct Partition {
 }
 
 impl Partition {
+    /// Ends the threads that use the database, in order, before it closes: a bulk load's
+    /// (its input has ended or was stopped, so it writes what came, and rebalances inline if
+    /// its index does), a running text rebuild's (it finishes first, ai1249's S1 on #1587),
+    /// then the vector indexes' rebalancers. One copy for a server's shutdown and a cluster
+    /// partition's close.
+    pub(crate) fn close_users(&self) {
+        self.bulk.close();
+        self.texts.close();
+        self.indexes.close();
+    }
+
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
     /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
     fn new(

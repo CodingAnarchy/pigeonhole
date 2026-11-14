@@ -78,12 +78,7 @@ impl Shared {
     /// The caller an `Authorization` header identifies. With no tokens configured (a
     /// loopback server), everyone may do everything.
     fn caller(&self, header: Option<&str>) -> Result<auth::Caller, errors::ApiError> {
-        if !self.tokens.any() {
-            return Ok(auth::Caller::anonymous());
-        }
-        auth::bearer(header)
-            .and_then(|t| self.tokens.caller(t))
-            .ok_or_else(errors::ApiError::unauthenticated)
+        self.tokens.caller_of(header)
     }
 
     /// Counts a reply to RPC `rpc`, decoded at `started`. A scan's stream is counted by its
@@ -693,14 +688,10 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     // runtime, before the database closes under their feeds.
     feed_runtime.shutdown_timeout(Duration::from_secs(5));
     hub_runtime.shutdown_timeout(Duration::from_secs(5));
-    // A bulk load's thread, then the vector indexes' rebalancing threads, end before the
-    // database closes. The front-ends are gone, so a load's input has ended: it writes what
-    // came, and rebalances inline if its index does.
+    // The threads that use each database end before it closes. The front-ends are gone, so a
+    // bulk load's input has ended.
     for part in shared.router.parts() {
-        part.bulk.close();
-        // A running text rebuild finishes before the database closes (ai1249's S1 on #1587).
-        part.texts.close();
-        part.indexes.close();
+        part.close_users();
     }
     // The databases to close last: a single node's one, or the partitions a cluster node has
     // open now (those it opened while serving too, and not those it closed, D317 ticket 6);
