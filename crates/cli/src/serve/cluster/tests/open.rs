@@ -337,6 +337,7 @@ fn opened_off_the_others_cores_alone() {
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
