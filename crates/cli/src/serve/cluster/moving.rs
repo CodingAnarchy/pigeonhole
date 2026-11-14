@@ -50,12 +50,14 @@ const DEFAULT_CHUNK: u64 = 512 << 10;
 
 type Admin = proto::admin_client::AdminClient<tonic::transport::Channel>;
 
-/// A node's channel, as the move uses it.
+/// A node's channel, as the move uses it: one connection for its `Admin` and `Cluster`
+/// calls, which tonic re-dials when a call finds it broken (a node restarted mid-move).
 pub(super) struct At {
     id: String,
     args: NodeArgs,
     token: Option<String>,
     admin: Admin,
+    cluster: super::cli::Client,
 }
 
 impl At {
@@ -67,7 +69,8 @@ impl At {
         let (ch, token) = channel(&args, &args.node).await?;
         Ok(Self {
             id: id.to_owned(),
-            admin: Admin::new(ch).max_decoding_message_size(4 << 20),
+            admin: Admin::new(ch.clone()).max_decoding_message_size(4 << 20),
+            cluster: super::cli::Client::new(ch),
             args,
             token,
         })
@@ -84,7 +87,7 @@ impl At {
 
     /// Partition `p`'s line in the node's `Status`, if it lists it.
     async fn local(&self, p: &str) -> Result<Option<LocalPartition>, Failure> {
-        let (mut c, _) = connect(&self.args, &self.args.node).await?;
+        let mut c = self.cluster.clone();
         let st = c
             .status(request(StatusRequest {}, self.token.as_deref())?)
             .await
@@ -95,7 +98,7 @@ impl At {
 
     /// Fence, close or drop partition `p` here.
     async fn call(&self, p: &str, what: &'static str) -> Result<LocalPartition, Failure> {
-        let (mut c, _) = connect(&self.args, &self.args.node).await?;
+        let mut c = self.cluster.clone();
         let req = request(
             PartitionRequest {
                 partition: p.to_owned(),
@@ -711,7 +714,7 @@ async fn copy_file(
 
 /// Stamps NEW from `e` to `e + 1`: the set it installed, none if it found no set staged.
 async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<PartitionFile>, Failure> {
-    let (mut c, _) = connect(&new.args, &new.args.node).await?;
+    let mut c = new.cluster.clone();
     Ok(c.stamp(request(
         proto::StampRequest {
             cluster_id: cluster.to_owned(),
