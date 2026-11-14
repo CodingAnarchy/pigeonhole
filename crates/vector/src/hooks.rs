@@ -1,7 +1,7 @@
 //! Hold and fault seams for tests (`__unstable-hooks` only). They pause or skip; they never run
 //! another path.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Where a test can hold an index operation.
@@ -42,6 +42,8 @@ static ARMED: Mutex<Option<(Hold, Gate)>> = Mutex::new(None);
 static SKIP_REBALANCE: Mutex<bool> = Mutex::new(false);
 static FAIL_AFTER_SPLIT: Mutex<bool> = Mutex::new(false);
 static SPLIT_HELD: AtomicUsize = AtomicUsize::new(0);
+/// `u64::MAX`: not set.
+static SPLIT_ROW_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Holds the next operation that reaches `at` (one at a time, process-wide).
 pub fn arm(at: Hold) -> Armed {
@@ -155,4 +157,15 @@ pub fn shares_state(a: &crate::Index, b: &crate::Index) -> bool {
 /// (#1640).
 pub fn rebalancer_thread_started(index: &crate::Index) -> bool {
     index.inner().thread_started()
+}
+
+/// Counts a list row as `bytes` (process-wide; `None` restores the 4 MiB) in a split's bound
+/// on what it reads whole (#1824, #1879), so a test reaches a split a page at a time without
+/// writing 16 MiB. `Some(0)` leaves the bound at four split lengths.
+pub fn split_row_bytes(bytes: Option<u64>) {
+    SPLIT_ROW_BYTES.store(bytes.unwrap_or(u64::MAX), Ordering::SeqCst);
+}
+
+pub(crate) fn split_row_bytes_set() -> Option<u64> {
+    Some(SPLIT_ROW_BYTES.load(Ordering::SeqCst)).filter(|b| *b != u64::MAX)
 }

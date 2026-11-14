@@ -29,10 +29,13 @@ const RELOADS: usize = 32;
 /// Splits and merges one insert or delete runs after its commit, at most; the rest stay
 /// queued for the next call.
 const MAINTENANCE_PER_CALL: usize = 16;
-/// A split reads its list whole while the list holds at most this many times its split
-/// length ([`Index::max_list_len`]). A longer list (a skewed bulk load, or a list that
-/// outgrew a background rebalancer) is split from a sample of that many vectors and moved a
-/// page of one split length at a time (#1824).
+/// A split reads its list whole while the list holds at most this many list rows' worth of
+/// vectors: [`MAX_LIST_BYTES`] each, or its split length ([`Index::max_list_len`]) if that is
+/// more. A longer list (a skewed bulk load, or a list that outgrew a background rebalancer)
+/// is split from a sample of that many vectors and moved a page of one split length at a
+/// time (#1824); phase 2 reads a neighbour that many vectors at a time. Counted in bytes,
+/// not split lengths, so an index with a short target still splits a long but small list,
+/// and moves a neighbour's vectors, in one transaction (#1879).
 const SPLIT_WHOLE_LISTS: u64 = 4;
 
 /// An index's options, fixed when it is created ([`Index::create`]) and stored with it.
@@ -2038,6 +2041,29 @@ impl Index {
         fresh.then(|| Claim { set, list })
     }
 
+    /// The most vectors a split or its phase 2 reads at once ([`SPLIT_WHOLE_LISTS`]): a list
+    /// or neighbour within it is read whole.
+    fn split_cap(&self) -> u64 {
+        SPLIT_WHOLE_LISTS.saturating_mul(self.max_list_len().max(self.row_vectors()))
+    }
+
+    /// How many of this index's vectors a [`MAX_LIST_BYTES`] list row holds.
+    fn row_vectors(&self) -> u64 {
+        let spec = self.spec();
+        let dim = u64::from(spec.dim());
+        let bytes = match spec.element() {
+            Element::F32 => 4 * dim,
+            Element::F16 | Element::BF16 => 2 * dim,
+            Element::Bit => dim.div_ceil(8),
+            _ => dim,
+        };
+        #[cfg(feature = "__unstable-hooks")]
+        if let Some(row) = crate::hooks::split_row_bytes_set() {
+            return row / bytes.max(1);
+        }
+        MAX_LIST_BYTES / bytes.max(1)
+    }
+
     /// Reads `list` for its split, at a snapshot dropped before anything commits (#1497):
     /// whole while it holds at most `cap` vectors, else a uniform sample of `cap` of them
     /// (reservoir sampling, seeded by the list id and `version`, so a split that moved
@@ -2127,7 +2153,7 @@ impl Index {
         let Some(_claim) = self.claim(list) else {
             return Ok(());
         };
-        let cap = SPLIT_WHOLE_LISTS.saturating_mul(self.max_list_len());
+        let cap = self.split_cap();
         for _ in 0..ATTEMPTS {
             // The loser of a duplicate split re-checks the length before splitting the
             // fresh half (rev 3 S2).
@@ -2150,7 +2176,7 @@ impl Index {
             let (ids, points) = match self.split_read(list, current.version, cap)? {
                 SplitRead::Whole(ids, points) => (ids, points),
                 SplitRead::Sample { points, seen } => {
-                    return self.split_paged(list, &current.point, &points, seen);
+                    return self.split_paged(list, &current.point, points, seen);
                 }
             };
             if ids.len() as u64 <= self.max_list_len() {
@@ -2194,7 +2220,7 @@ impl Index {
     /// lose some recall meanwhile, not correctness. A page that loses every attempt to
     /// conflicts stays where it is, as a phase 2 neighbour does. The two lists are queued
     /// afterwards, so a half still too long splits again.
-    fn split_paged(&self, list: u32, current: &Point, sample: &[Point], seen: u64) -> Result<()> {
+    fn split_paged(&self, list: u32, current: &Point, sample: Vec<Point>, seen: u64) -> Result<()> {
         let inn = &*self.inner;
         // The bound on each side, scaled to the sample.
         let min = self
@@ -2203,11 +2229,13 @@ impl Index {
             .div_ceil(seen.max(1));
         let plan = two_means(
             &inn.cen,
-            sample,
+            &sample,
             current,
             usize::try_from(min).unwrap_or(usize::MAX),
         )?;
-        let rule = Rule::of(&inn.cen, sample, &plan, seen)?;
+        let rule = Rule::of(&inn.cen, &sample, &plan, seen)?;
+        // The pass holds a page, not the sample as well.
+        drop(sample);
         let page = usize::try_from(self.max_list_len()).unwrap_or(usize::MAX);
         let mut new = None;
         // The new list is claimed for the pass (audit120's S1 on #1861): it may hold only
@@ -2346,14 +2374,15 @@ impl Index {
         }
         let dim = inn.cen.dim();
         let (stay, go) = (plan.stay.to_vector(dim)?, plan.go.to_vector(dim)?);
-        let page = usize::try_from(self.max_list_len()).unwrap_or(usize::MAX);
+        let page = usize::try_from(self.split_cap()).unwrap_or(usize::MAX);
         for nbr in layout.nearest(&inn.cen, &plan.stay, r, &[list, new])? {
             let Some(n) = layout.list(nbr) else {
                 continue;
             };
-            // A page at a time, so a neighbour that outgrew its bound is never read whole
-            // (#1824); each read at a snapshot dropped before its transaction commits
-            // (#1497, as in `split`): the transaction validates on its own reads.
+            // Whole, in one transaction, while it's within a split's bound; a page of that
+            // bound at a time past it, so a neighbour that outgrew its bound is never read
+            // whole (#1824, #1879). Each read at a snapshot dropped before its transaction
+            // commits (#1497, as in `split`): the transaction validates on its own reads.
             let mut after = None::<Vec<u8>>;
             loop {
                 let (ids, points) = self.page(nbr, after.as_deref(), page)?;

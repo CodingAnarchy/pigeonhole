@@ -282,12 +282,33 @@ fn a_crash_between_a_split_and_its_phase_2_leaves_a_consistent_index() {
     db.close().unwrap();
 }
 
+/// Counts a list row as no bytes while it lives, so a split's whole-read bound is four split
+/// lengths and a test's long list is split a page at a time (#1879: the bound is four 4 MiB
+/// rows' worth otherwise).
+struct PagedSplits;
+
+impl PagedSplits {
+    fn on() -> Self {
+        hooks::split_row_bytes(Some(0));
+        PagedSplits
+    }
+}
+
+impl Drop for PagedSplits {
+    fn drop(&mut self) {
+        hooks::split_row_bytes(None);
+    }
+}
+
 /// #1824: a list far longer than its split length (a skewed bulk load, or a list that outgrew
 /// a background rebalancer; here, writes made while rebalancing was skipped) is split from a
 /// sample and moved a page at a time. No read of the split or its phase 2 holds more than
-/// four split lengths, and the index ends within its bounds holding exactly the model.
+/// four split lengths ([`PagedSplits`]), and the index ends within its bounds holding exactly the model.
 /// The long list's vectors: two groups, or all one point, which leaves the split nothing to
 /// separate (split by order).
+///
+/// #1879: with the real bound, four 4 MiB rows, the same list (about 4 KiB) is read whole,
+/// so it's split in one transaction rather than a page of four vectors at a time.
 #[derive(Clone, Copy)]
 enum Shape {
     TwoGroups,
@@ -295,7 +316,12 @@ enum Shape {
 }
 
 fn a_long_list_splits_without_reading_it_whole(shape: Shape) {
+    a_long_list_splits(shape, true);
+}
+
+fn a_long_list_splits(shape: Shape, paged: bool) {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _paged = paged.then(PagedSplits::on);
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let (index, mut rebalancer) = Index::create_with_rebalancer(
@@ -338,7 +364,11 @@ fn a_long_list_splits_without_reading_it_whole(shape: Shape) {
     drain(&mut rebalancer);
     let held = hooks::take_split_held();
     assert!(held > 0, "a split ran");
-    assert!(held as u64 <= 4 * max, "a read held {held} > {}", 4 * max);
+    if paged {
+        assert!(held as u64 <= 4 * max, "a read held {held} > {}", 4 * max);
+    } else {
+        assert!(held as u64 > 60 * max, "read whole: held {held}");
+    }
     check(&index, &model, "after the long list's split");
     for q in [0.0, 200.0, 199.0, 201.0, 390.0] {
         exact(
@@ -361,6 +391,11 @@ fn a_long_list_of_two_groups_splits_without_reading_it_whole() {
 #[test]
 fn a_long_list_of_one_point_splits_without_reading_it_whole() {
     a_long_list_splits_without_reading_it_whole(Shape::OnePoint);
+}
+
+#[test]
+fn a_long_but_small_list_splits_whole() {
+    a_long_list_splits(Shape::TwoGroups, false);
 }
 
 /// Inline mode until every list is within its bounds: each write runs a bounded number of
@@ -392,6 +427,7 @@ fn settle(index: &Index, model: &mut BTreeMap<Vec<u8>, V>, ctx: &str) {
 #[test]
 fn a_paged_split_is_consistent_between_its_pages() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _paged = PagedSplits::on();
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);
     let opts = IndexOptions::new()
