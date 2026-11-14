@@ -259,6 +259,10 @@ impl WriteGate {
 
     /// The map no longer names this node for the partition at its file's epoch: its lease
     /// ends now (audit120's S1). It reads as never held, since no renewal can bring it back.
+    /// That matters for the feeds (feed1248 on #1912): the install ends the leases before it
+    /// ends the moved partition's components with `WrongPartition`, and a component polled
+    /// in between must see `Wait` (and take that end next), not `End`'s
+    /// `PartitionUnavailable`, which would skip S-C5's reopen at the new owner.
     pub(crate) fn lapse(&self) {
         self.lease_end.store(0, Ordering::SeqCst);
         self.leased_once.store(false, Ordering::SeqCst);
