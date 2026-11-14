@@ -73,7 +73,7 @@ impl Cluster {
 /// (`cluster::fanout`), which holds the node and its parts without the [`Cluster`].
 ///
 /// A partition the map doesn't list is `WrongPartition` with the map's version (#1896): a
-/// fanned-out part named it from an older map, and a forced map dropped it since. The
+/// fanned-out part named it from an older map, and a newer map dropped it since. The
 /// caller re-reads the map and routes again.
 pub(crate) fn place(
     node: &super::cluster::Node,
@@ -84,7 +84,7 @@ pub(crate) fn place(
     let owner = routes.owner(partition).ok_or_else(|| {
         ApiError::wrong_partition(
             routes.map_version(),
-            format!("the map no longer lists partition {partition:?}: a forced map dropped it"),
+            format!("the map no longer lists partition {partition:?}: a newer map dropped it"),
         )
     })?;
     if owner.node == node.id() {

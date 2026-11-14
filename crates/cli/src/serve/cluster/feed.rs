@@ -896,14 +896,15 @@ fn retryable(e: &ApiError) -> bool {
     )
 }
 
-/// A part whose partition the map no longer lists: a forced map dropped it (#1896).
+/// A part whose partition the map no longer lists: a newer map dropped it (#1896), a forced
+/// one, or one that dropped it once no table was placed on it.
 /// `PartitionUnavailable`, so an `allow_partial` subscription reports it and goes on with
 /// the others (retrying it, in case a later map lists it again), and one without ends with
 /// a code it can act on. Not `Internal`: the state is one an operator made on purpose.
 fn dropped(partition: &str, map_version: u64) -> ApiError {
     ApiError::partition_unavailable(format!(
         "the cluster map (version {map_version}) no longer lists partition {partition:?}: a \
-         forced map dropped it"
+         newer map dropped it"
     ))
 }
 

@@ -954,7 +954,7 @@ fn a_component_of_a_partition_the_map_no_longer_lists_ends_as_unavailable() {
             assert!(
                 ended
                     .message()
-                    .contains("no longer lists partition \"p3\": a forced map dropped it"),
+                    .contains("no longer lists partition \"p3\": a newer map dropped it"),
                 "{ended}"
             );
             // The lenient subscription reports p3 gone, with the reason, and goes on.
@@ -969,7 +969,7 @@ fn a_component_of_a_partition_the_map_no_longer_lists_ends_as_unavailable() {
                 {
                     assert!(!st.available, "{st:?}");
                     assert_eq!(st.reason, "PartitionUnavailable", "{st:?}");
-                    assert!(st.message.contains("a forced map dropped it"), "{st:?}");
+                    assert!(st.message.contains("a newer map dropped it"), "{st:?}");
                     break;
                 }
             }
