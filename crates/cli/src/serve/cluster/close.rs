@@ -235,6 +235,11 @@ impl Node {
                 format!("partition {id} closed"),
             )
             .await;
+            // Its memory is free now too: the partitions left take their shares of
+            // --engine-memory back (#1761), grown after the engine closed, never before.
+            if let Some(total) = opener.engine_memory {
+                super::open::resplit_after_close(self, total, &parts, id).await;
+            }
         }
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);

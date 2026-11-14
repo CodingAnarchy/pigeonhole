@@ -1202,6 +1202,7 @@ fn data_node_placed(
             shards: 1,
             compaction: 0,
             engine_memory,
+            reserved: None,
         },
     );
     super::schema::attach(&node, &shared);

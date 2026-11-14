@@ -1571,6 +1571,7 @@ pub(crate) fn run(
             shards: total_shards,
             compaction: total_compaction,
             engine_memory: args.engine_memory,
+            reserved: reserved.clone(),
         },
     );
     // Its partition's schema follows the map (D317 ticket 5): reconciled now, and on every
