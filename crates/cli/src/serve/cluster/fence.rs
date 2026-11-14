@@ -108,15 +108,20 @@ pub(crate) struct Round {
     pub(crate) holders: usize,
     /// The peers that answered.
     pub(crate) answered: usize,
-    /// Peers holding a different map at the same version (two forced maps): nothing is
-    /// confirmed while there's one.
+    /// Peers holding a different map at the same version (two forced maps), or a newer one
+    /// this node refused: nothing is confirmed while there's one.
     pub(crate) divergent: Vec<String>,
+    /// Peers that answered with an older map and didn't take this node's: nothing is
+    /// confirmed while there's one (audit120's F2 on #1899).
+    pub(crate) behind: Vec<String>,
 }
 
 impl Round {
     /// Whether a majority of `map`'s nodes hold it, with no divergent map among them.
     fn majority(&self) -> bool {
-        self.divergent.is_empty() && self.holders * 2 > self.map.nodes.len()
+        self.divergent.is_empty()
+            && self.behind.is_empty()
+            && self.holders * 2 > self.map.nodes.len()
     }
 
     /// Whether it confirms partition `id` at `epoch` on node `node`: a majority hold the
@@ -133,15 +138,6 @@ impl Fences {
 
     fn rounds(&self) -> std::sync::MutexGuard<'_, Rounds> {
         self.rounds.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Partitions open here that await their peers' confirmation, by id.
-    fn unconfirmed_any(&self) -> Vec<String> {
-        self.served()
-            .iter()
-            .filter(|(_, s)| s.gate.awaiting_peers())
-            .map(|(id, _)| id.clone())
-            .collect()
     }
 
     pub(super) fn operator(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
@@ -315,10 +311,17 @@ impl Node {
                 };
                 let why = if !round.divergent.is_empty() {
                     format!(
-                        "node{} {} hold{} a different map at version {}",
+                        "node{} {} hold{} a map that conflicts with this node's version {}",
                         if round.divergent.len() > 1 { "s" } else { "" },
                         round.divergent.join(", "),
                         if round.divergent.len() > 1 { "" } else { "s" },
+                        round.map.map_version
+                    )
+                } else if !round.behind.is_empty() {
+                    format!(
+                        "node{} {} answered with an older map and didn't take version {}",
+                        if round.behind.len() > 1 { "s" } else { "" },
+                        round.behind.join(", "),
                         round.map.map_version
                     )
                 } else if !names(&round.map, &self.id, id, epoch) {
@@ -423,34 +426,54 @@ impl Node {
         }
         let map = self.get_map()?;
         let json = super::map::canonical_json(&map);
-        let mut holders = 1;
+        // Counted only among the round's map's nodes: one that map removed doesn't vote
+        // (audit120's F1 on #1899).
+        let members: BTreeSet<&str> = map.nodes.iter().map(|n| n.id.as_str()).collect();
+        let mut holders = usize::from(members.contains(self.id.as_str()));
         let mut divergent = Vec::new();
         let mut pushes = tokio::task::JoinSet::new();
         for (peer, address, theirs) in &answers {
             match theirs.map_version.cmp(&map.map_version) {
                 std::cmp::Ordering::Equal if super::map::canonical_json(theirs) == json => {
-                    holders += 1;
+                    holders += usize::from(members.contains(peer.as_str()));
                 }
                 std::cmp::Ordering::Equal => divergent.push(peer.clone()),
                 std::cmp::Ordering::Less => {
-                    let (node, address, map) = (Arc::clone(self), address.clone(), map.clone());
+                    let (node, peer, address, map) =
+                        (Arc::clone(self), peer.clone(), address.clone(), map.clone());
                     pushes.spawn(async move {
-                        tokio::time::timeout(node.peers.push_timeout, node.push_to(&address, map))
-                            .await
-                            .is_ok_and(|r| r.is_ok())
+                        let took = tokio::time::timeout(
+                            node.peers.push_timeout,
+                            node.push_to(&address, map),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                        (peer, took)
                     });
                 }
                 // Newer than the map this node now holds: its install was refused (a forced
-                // map from another history, say). It doesn't hold this node's map.
-                std::cmp::Ordering::Greater => {}
+                // map from another history, say). It holds a map that conflicts with this
+                // node's, so it blocks the round as a divergent one does (audit120's F3).
+                std::cmp::Ordering::Greater => divergent.push(peer.clone()),
             }
         }
-        holders += pushes.join_all().await.into_iter().filter(|ok| *ok).count();
+        // An answerer that was behind counts once it took the map. One that didn't blocks
+        // the round: it answered with an older map, and may be an old owner that hasn't taken
+        // the move yet (audit120's F2). A peer that never answered doesn't block.
+        let mut behind = Vec::new();
+        for (peer, took) in pushes.join_all().await {
+            if took {
+                holders += usize::from(members.contains(peer.as_str()));
+            } else {
+                behind.push(peer);
+            }
+        }
         Ok(Round {
             map,
             holders,
             answered: answers.len(),
             divergent,
+            behind,
         })
     }
 
@@ -506,11 +529,20 @@ impl Node {
     /// A round soon, for a map a peer pushed (it may confirm a partition): one at a time
     /// per node, and a push that arrives during one runs one more after it, never dropped.
     pub(crate) fn confirm_soon(&self) {
-        if self.fences.unconfirmed_any().is_empty() {
+        // Only for a partition a round could confirm: not a copy the map moved away, which
+        // would otherwise run a round on every push (audit120's nit on #1899).
+        let Ok(map) = self.get_map() else { return };
+        if self.fences.confirmable(&map, &self.id).is_empty() {
             return;
         }
-        let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())
-        else {
+        let Some(node) = self.me.upgrade() else {
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            eprintln!(
+                "phdb serve: a pushed map can't start a confirmation round here (no runtime); \
+                 the start's retries confirm the partitions instead"
+            );
             return;
         };
         {

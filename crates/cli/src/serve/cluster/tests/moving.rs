@@ -1091,3 +1091,77 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
         let _ = a;
     });
 }
+
+#[test]
+fn a_node_the_newest_map_removed_doesnt_count_toward_its_majority() {
+    // audit120's F1 on #1899: a round counts holders only among the nodes of the map it
+    // ends with. v2 removes c, which serves nothing (nodes a and b); c alone took it. p1 is
+    // fenced on a by the operator, a is still on v1, and b is down. An unfence of p1 runs a
+    // round from v1: c answers with v2, which a installs, and a and c hold it, but c isn't
+    // one of v2's nodes, so it's 1 of 2 and the unfence is refused. With b back, it lifts.
+    use crate::serve::proto::{GetMapRequest, PartitionRequest, PushMapRequest};
+    let mut t = Cluster::start();
+    let [a, b, c] = t.ports;
+    let p1 = || PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    let v2 = t.rt.block_on(async {
+        client(a).await.fence(p1()).await.unwrap();
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.nodes.retain(|n| n.id != "c");
+        m
+    });
+    // b stops; c takes v2 alone.
+    let _ = t.stops.remove(1);
+    t.rt.block_on(eventually("b to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", b))
+            .await
+            .is_err()
+    }));
+    t.rt.block_on(async {
+        client(c)
+            .await
+            .push_map(PushMapRequest { map: Some(v2) })
+            .await
+            .unwrap();
+        let e = client(a).await.unfence(p1()).await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(
+            e.message().contains("1 of 2 nodes hold map version 2"),
+            "c, removed by v2, isn't counted: {e}"
+        );
+        let m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(m.map_version, 2, "the round took c's newer map");
+    });
+    let l = std::net::TcpListener::bind(("127.0.0.1", b)).unwrap();
+    let (stop, _) = data_node_full(
+        &t.rt,
+        &t.dirs[1],
+        "b",
+        Some("p2"),
+        l,
+        "",
+        crate::serve::server_tests::limits(),
+        Some(t.dbs[1].clone()),
+        true,
+    );
+    t.stops.push(stop);
+    t.rt.block_on(async {
+        eventually("the unfence to be confirmed once b holds v2", async || {
+            client(a).await.unfence(p1()).await.is_ok()
+        })
+        .await;
+    });
+}

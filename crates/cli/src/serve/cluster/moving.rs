@@ -581,17 +581,28 @@ pub(super) async fn majority_holds(
         ),
     );
     loop {
+        // Every node at once (audit120's nit on #1899): the wait is as long as the slowest
+        // answer, not their sum.
+        let mut asks = tokio::task::JoinSet::new();
+        for node in &map.nodes {
+            let (args, id, address) = (args.clone(), node.id.clone(), node.address.clone());
+            asks.spawn(async move {
+                let version: Result<u64, Failure> = async {
+                    let at = At::new(&args, &id, &address).await?;
+                    at.map_version().await
+                }
+                .await;
+                (id, version)
+            });
+        }
+        let answers = wait.ask(asks.join_all()).await?;
         let mut have = 0;
         let mut missing = Vec::new();
-        for node in &map.nodes {
-            let at = async {
-                let at = At::new(args, &node.id, &node.address).await?;
-                at.map_version().await
-            };
-            match wait.ask(at).await? {
+        for (id, version) in answers {
+            match version {
                 Ok(version) if version >= v => have += 1,
-                Ok(version) => missing.push(format!("{} has version {version}", node.id)),
-                Err(f) => missing.push(format!("{}: {}", node.id, f.message())),
+                Ok(version) => missing.push(format!("{id} has version {version}")),
+                Err(f) => missing.push(format!("{id}: {}", f.message())),
             }
         }
         if have * 2 > n {
