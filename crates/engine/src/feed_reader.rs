@@ -569,6 +569,12 @@ pub struct FeedReader {
     claim_known: Option<u64>,
     /// At open, until the first sidecar load: the catalog the start sees.
     deriving: Option<Arc<crate::catalog::Catalog>>,
+    /// A feed of every table: the tables seen present in `present_of`, the catalog of the
+    /// view they were checked against (#1853's guard, without a lookup per commit).
+    present: pigeonhole_format::hash::FastSet<TableId>,
+    present_of: Option<Arc<crate::catalog::Catalog>>,
+    /// The table the last commit's changes ended with, present in `present_of`.
+    present_last: Option<TableId>,
     out_catalog: CatalogEvent,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
@@ -1090,6 +1096,9 @@ impl FeedReader {
             claim: None,
             claim_known: None,
             deriving: None,
+            present: Default::default(),
+            present_of: None,
+            present_last: None,
             out_catalog: CatalogEvent::default(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
@@ -2349,35 +2358,121 @@ impl FeedReader {
                 Packs::One(r) => std::slice::from_ref(r),
                 Packs::Many(v) => v,
             };
-            // A feed of every table (#1853): a table the catalog no longer has was dropped,
-            // and every drop appends its catalog change to the sidecar before the catalog
-            // loses the table. If no recorded drop explains a table missing from the view,
-            // even after reading the sidecar again (a drop can race the view), the table was
-            // dropped by a session that records no catalog changes: a 1.1.x session after a
-            // rollback. Catalog changes are then missing from the history (that session's
-            // creates too), so the feed expires rather than deliver a commit it can't name
-            // and go on without them.
-            // In a reader process, whose view can lag the writer's manifest, a table a
-            // recorded change created may be missing from the view without a drop.
-            if self.tables.is_empty() {
+            // A feed of every table (#1853): the tables seen present in the catalog, kept
+            // while the catalog is the same one (a view swap with a new catalog forgets
+            // them), so a commit to tables seen before costs no lookup (perf287 on #1857).
+            let every = self.tables.is_empty();
+            if every
+                && !self
+                    .present_of
+                    .as_ref()
+                    .is_some_and(|c| Arc::ptr_eq(c, &view.catalog))
+            {
+                self.present.clear();
+                self.present_last = None;
+                self.present_of = Some(Arc::clone(&view.catalog));
+            }
+            let dropped = &self.dropped_tables;
+            let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
+            if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
+                continue;
+            }
+            self.out.seqno = key;
+            self.out.ts = ts;
+            self.out.changes.clear();
+            // Takes change `$r` into the commit, or ends the reader (a blob gone, or an error).
+            // One copy of the code in each loop below, so a feed of some tables runs exactly
+            // the loop it ran before #1857's check.
+            macro_rules! take {
+                ($r:expr) => {{
+                    let r = $r;
+                    let value = match blob_pointer(r.value) {
+                        None => r.value.to_vec(),
+                        // The blob GC horizon follows the oldest retained segment, not readers: a
+                        // file the view no longer lists under a slow reader means retention
+                        // passed it (S1). Any other failure, a checksum's included, is an error.
+                        Some(ptr) if view.ssts.blob_reader(ptr.blob_file).is_none() => {
+                            self.expired = Some(expiry(
+                                "a blob value the feed was delivering is gone: retention passed the feed",
+                            ));
+                            return Ok(Emitted::Nothing);
+                        }
+                        Some(ptr) => match view.ssts.read_pointer(&ptr) {
+                            Ok(cell) => cell.to_vec(),
+                            // The commit is taken: going on would skip it, so the reader stops
+                            // here for good.
+                            Err(e) => {
+                                self.failed = Some(e.to_string());
+                                return Err(e);
+                            }
+                        },
+                    };
+                    self.out.changes.push(Change {
+                        table: r.table,
+                        family: r.family,
+                        kind: r.kind,
+                        ts: r.ts.unwrap_or(ts),
+                        row: r.row.to_vec(),
+                        qualifier: r.qualifier.to_vec(),
+                        value,
+                    });
+                }};
+            }
+            // A table of this commit the catalog doesn't have (#1853), checked in this pass:
+            // a commit's changes run by table, so each run is checked once, and a run of the
+            // table the last one ended with (`present_last`) costs no lookup at all.
+            // The order is deliberate (feed1248's N1 on #1874): the changes are taken in the
+            // same pass, so a commit with a missing table may end on its values first, a blob
+            // gone (`FeedExpired` too, worded for retention) or a read error. Checking before
+            // the values would bring back the second pass this replaces.
+            let mut missing = false;
+            if every {
+                let mut last = self.present_last;
+                for r in packs.iter().flat_map(Raws::iter).filter(kept) {
+                    if last != Some(r.table) {
+                        last = Some(r.table);
+                        if !self.present.contains(&r.table) {
+                            if view.catalog.table(r.table).is_some() {
+                                self.present.insert(r.table);
+                            } else {
+                                missing = true;
+                            }
+                        }
+                    }
+                    take!(r);
+                }
+                if !missing {
+                    self.present_last = last;
+                }
+            } else {
+                for r in packs.iter().flat_map(Raws::iter).filter(kept) {
+                    take!(r);
+                }
+            }
+            // A table the catalog no longer has was dropped, and every drop appends its
+            // catalog change to the sidecar before the catalog loses the table. If no recorded
+            // drop explains a table missing from the view, even after reading the sidecar
+            // again (a drop can race the view), the table was dropped by a session that
+            // records no catalog changes: a 1.1.x session after a rollback. Catalog changes
+            // are then missing from the history (that session's creates too), so the feed
+            // expires rather than deliver a commit it can't name and go on without them. In
+            // a reader process, whose view can lag the writer's manifest, a table a recorded
+            // change created may be missing from the view without a drop.
+            if missing {
                 let lagging = self.writer.is_none();
                 let unexplained = |this: &Self| {
-                    // A commit's changes run by table: each run is looked up once.
-                    let mut last = None;
                     packs
                         .iter()
                         .flat_map(Raws::iter)
                         .map(|r| r.table)
                         .find(|&t| {
-                            if last.replace(t) == Some(t) {
-                                return false;
-                            }
                             view.catalog.table(t).is_none()
                                 && !this.recorded_drops.contains(&t)
                                 && !(lagging && this.recorded_creates.contains(&t))
                         })
                 };
-                // A cheap check first: most commits never read the sidecar again.
+                // Most missing tables are explained by a drop already read: the sidecar is
+                // read again only when one isn't.
                 if unexplained(self).is_some() {
                     self.load_catalog(None)?;
                     // The re-read finds only a change that raced the view, whose ceiling is
@@ -2401,46 +2496,6 @@ impl FeedReader {
                     )));
                     return Ok(Emitted::Nothing);
                 }
-            }
-            let dropped = &self.dropped_tables;
-            let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
-            if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
-                continue;
-            }
-            self.out.seqno = key;
-            self.out.ts = ts;
-            self.out.changes.clear();
-            for r in packs.iter().flat_map(Raws::iter).filter(kept) {
-                let value = match blob_pointer(r.value) {
-                    None => r.value.to_vec(),
-                    // The blob GC horizon follows the oldest retained segment, not readers: a
-                    // file the view no longer lists under a slow reader means retention
-                    // passed it (S1). Any other failure, a checksum's included, is an error.
-                    Some(ptr) if view.ssts.blob_reader(ptr.blob_file).is_none() => {
-                        self.expired = Some(expiry(
-                            "a blob value the feed was delivering is gone: retention passed the feed",
-                        ));
-                        return Ok(Emitted::Nothing);
-                    }
-                    Some(ptr) => match view.ssts.read_pointer(&ptr) {
-                        Ok(cell) => cell.to_vec(),
-                        // The commit is taken: going on would skip it, so the reader stops
-                        // here for good.
-                        Err(e) => {
-                            self.failed = Some(e.to_string());
-                            return Err(e);
-                        }
-                    },
-                };
-                self.out.changes.push(Change {
-                    table: r.table,
-                    family: r.family,
-                    kind: r.kind,
-                    ts: r.ts.unwrap_or(ts),
-                    row: r.row.to_vec(),
-                    qualifier: r.qualifier.to_vec(),
-                    value,
-                });
             }
             return Ok(Emitted::Commit);
         }

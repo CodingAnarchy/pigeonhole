@@ -367,12 +367,12 @@ fn opened_off_the_others_cores_alone() {
     );
     map.map_version = 2;
     map.partitions.extend([part("p3"), part("p4")]);
-    let shared = node.opener.get().unwrap().shared.upgrade().unwrap();
+    let shared = node.server.get().unwrap().shared.upgrade().unwrap();
     // p1's feed side on runtimes of its own, entered as the server's are but with no park or
     // unpark hooks, so only the hub's and delivery's own refreshes can move them (perf287's
     // P1 on #1755: a busy hub may never park).
     let feed_rt = {
-        let p = Arc::clone(&node.opener.get().unwrap().placement);
+        let p = Arc::clone(&node.server.get().unwrap().placement);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("phdb-test-feed")
@@ -382,7 +382,7 @@ fn opened_off_the_others_cores_alone() {
             .unwrap()
     };
     let hub_rt = {
-        let p = Arc::clone(&node.opener.get().unwrap().placement);
+        let p = Arc::clone(&node.server.get().unwrap().placement);
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("phdb-test-hub")
@@ -454,7 +454,7 @@ fn opened_off_the_others_cores_alone() {
     };
     // A thread of the server's own, on the free cores before p3 opens: it takes the mask
     // the open reapplies at its next refresh.
-    let placement = Arc::clone(&node.opener.get().unwrap().placement);
+    let placement = Arc::clone(&node.server.get().unwrap().placement);
     let (go, wait) = std::sync::mpsc::channel::<()>();
     let worker = {
         let placement = Arc::clone(&placement);
