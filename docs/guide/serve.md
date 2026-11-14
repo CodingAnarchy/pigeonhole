@@ -567,7 +567,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Any node takes any call.** It serves the call if it holds the row's partition, and otherwise forwards it to the node that does. A client needs no map. One that wants to skip the hop can read the map (`Cluster.GetMap`) and call the owner directly.
 - **Served by row:** `Get`, `ReadRow`, `Mutate`, `CheckAndMutate`, `MutateReturning` and counters. Also a `Batch` whose rows are all in one partition, which commits atomically as on a single node.
 - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
-- **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again.
+- **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again. A fanned-out read's part whose partition a newer map dropped since the read began answers `WrongPartition` too: read the map again and retry.
 - **Refused with `Unsupported`** on a cluster node in this release:
   - every IVF and full-text index call, not only the searches: `Vectors.CreateIndex`, `Insert`, `Delete`, `BulkLoad`, `Search` and `Verify`, and `Text.CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild` and `Verify` (#1722, 1.3.0). For vectors, `Vectors.Nearest` works and fans out across the partitions;
   - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
@@ -669,10 +669,12 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 - **By default:**
   - a subscription that can't open one of its partitions fails with `PartitionUnavailable` naming it;
   - a stream whose partition goes away ends with `PartitionUnavailable`, after a last checkpoint. Resume once the node is back.
+  - a stream whose partition the map drops (a forced map, or one that drops it once no table is placed on it) ends with `PartitionUnavailable` too, its message saying the map no longer lists the partition. A new subscription follows the tables as the map now places them.
 - **With `allow_partial: true`,** the stream carries on with the other partitions:
   - A `partition_state` event (`available: false`, with the error's code in `reason`) says which partition is missing. It's sent at the start for one unavailable then, and once when it goes.
   - The node tries the partition again every second, each try bounded by `--request-timeout-ms`, without holding up the others. When it's back, a `partition_state` event says so, and its commits continue from where they stopped, with none skipped.
   - A partition that was down since a subscription "from now" began starts at its own "now" when it comes back. One subscribed "from the oldest" starts at its oldest commit.
+  - A partition the map drops is reported the same way, and tried again in case a later map lists it.
   - An expired position, or a refusal such as a revoked token, still ends the stream.
 - **A partition moved to another node** (a newer map, from `phdb cluster move` or `relocate`: [Fencing and relocation](#fencing-and-relocation)) is opened again where the map then puts it, through any node, with nothing skipped, unless the move started a new history ([Expiry and what isn't supported](#expiry-and-what-isnt-supported)). The new node may still be opening it: the subscription waits for that, up to `--request-timeout-ms`, before it counts the partition unavailable, so with `allow_partial` a moved partition's `partition_state` event can come that much later.
 

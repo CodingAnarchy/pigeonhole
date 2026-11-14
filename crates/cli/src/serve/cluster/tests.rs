@@ -1429,6 +1429,28 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
 }
 
 #[test]
+fn a_partition_the_map_no_longer_lists_is_wrong_partition_not_internal() {
+    // #1896: a fanned-out read's part names its partition from the map it planned with, and
+    // a forced map can drop that partition before the part is placed. That's the operator's
+    // doing, not a server bug: `WrongPartition` with the map's version, so the caller
+    // re-reads the map and routes again.
+    let dir = test_dir();
+    let node = node(&dir, "a");
+    let routes = super::route::Routes::new(&the_map(7, &[1, 2, 3]));
+    let parts: crate::serve::router::Parts = Default::default();
+    let Err(e) = crate::serve::router::place(&node, &parts, &routes, "p9") else {
+        panic!("p9 placed");
+    };
+    assert_eq!(e.code, "WrongPartition", "{}", e.message);
+    assert!(
+        e.message.contains("no longer lists partition \"p9\"")
+            && e.message.contains("map is version 7"),
+        "{}",
+        e.message
+    );
+}
+
+#[test]
 fn a_node_whose_map_moved_a_partition_away_answers_wrong_partition_and_the_sender_catches_up() {
     // v1: p1 on a, p2 on b, c routes. v2 moves p2 to a (epoch 2) and reaches a and b only.
     let rt = tokio::runtime::Runtime::new().unwrap();

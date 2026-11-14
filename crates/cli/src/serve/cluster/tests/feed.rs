@@ -866,12 +866,14 @@ fn a_component_that_subscribes_as_its_partition_closes_leaves_an_allow_partial_s
 }
 
 #[test]
-fn a_component_of_a_partition_the_map_no_longer_lists_ends() {
+fn a_component_of_a_partition_the_map_no_longer_lists_ends_as_unavailable() {
     // #1848: `end_moved_feeds` for a partition still open here that the map no longer lists
     // at all (tested before only for one the map gives another node). A forced map that drops
     // p3 and narrows `users` to p1 and p2 reaches c, where p3 stays open: c's component of a
-    // subscription to `users` ends rather than following a copy no map owns, and the
-    // subscription (no `allow_partial`) ends with an error.
+    // subscription to `users` ends rather than following a copy no map owns. Its reopen finds
+    // no owner: `PartitionUnavailable` naming the drop (#1896), not `Internal`. A
+    // subscription without `allow_partial` ends with it; one with it reports p3 gone and
+    // goes on with p1 and p2.
     bounded(Duration::from_secs(120), || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (_stops, ports, _dbs) = three_nodes(&rt);
@@ -882,7 +884,8 @@ fn a_component_of_a_partition_the_map_no_longer_lists_ends() {
                 .connect()
                 .await
                 .unwrap();
-            let mut s = FeedClient::new(channel)
+            let mut feeds = FeedClient::new(channel);
+            let mut s = feeds
                 .subscribe(SubscribeRequest {
                     tables: vec!["users".into()],
                     ..Default::default()
@@ -890,18 +893,29 @@ fn a_component_of_a_partition_the_map_no_longer_lists_ends() {
                 .await
                 .unwrap()
                 .into_inner();
+            let mut lenient = feeds
+                .subscribe(SubscribeRequest {
+                    tables: vec!["users".into()],
+                    allow_partial: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
             // p3's component delivers: a commit of "zed" (>= "m").
             put(c, "zed", "1").await;
-            loop {
-                let e = tokio::time::timeout(Duration::from_secs(10), s.message())
-                    .await
-                    .expect("zed's commit within 10 s")
-                    .unwrap()
-                    .expect("the stream ended");
-                if let Some(Event::Commit(cm)) = &e.event
-                    && cm.changes.iter().any(|ch| ch.row.as_ref() == b"zed")
-                {
-                    break;
+            for s in [&mut s, &mut lenient] {
+                loop {
+                    let e = tokio::time::timeout(Duration::from_secs(10), s.message())
+                        .await
+                        .expect("zed's commit within 10 s")
+                        .unwrap()
+                        .expect("the stream ended");
+                    if let Some(Event::Commit(cm)) = &e.event
+                        && cm.changes.iter().any(|ch| ch.row.as_ref() == b"zed")
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -936,11 +950,42 @@ fn a_component_of_a_partition_the_map_no_longer_lists_ends() {
                 }
             };
             // c's component ended as moved, and its reopen finds no owner for p3 in the map.
-            assert_eq!(code(&ended), "Internal", "{ended}");
+            assert_eq!(code(&ended), "PartitionUnavailable", "{ended}");
             assert!(
-                ended.message().contains("the map lists no node for \"p3\""),
+                ended
+                    .message()
+                    .contains("no longer lists partition \"p3\": a newer map dropped it"),
                 "{ended}"
             );
+            // The lenient subscription reports p3 gone, with the reason, and goes on.
+            loop {
+                let e = tokio::time::timeout(Duration::from_secs(20), lenient.message())
+                    .await
+                    .expect("p3's state within 20 s")
+                    .unwrap()
+                    .expect("the lenient stream ended");
+                if let Some(Event::PartitionState(st)) = &e.event
+                    && st.partition == "p3"
+                {
+                    assert!(!st.available, "{st:?}");
+                    assert_eq!(st.reason, "PartitionUnavailable", "{st:?}");
+                    assert!(st.message.contains("a newer map dropped it"), "{st:?}");
+                    break;
+                }
+            }
+            put(c, "alice", "2").await;
+            loop {
+                let e = tokio::time::timeout(Duration::from_secs(10), lenient.message())
+                    .await
+                    .expect("alice's commit within 10 s")
+                    .unwrap()
+                    .expect("the lenient stream ended");
+                if let Some(Event::Commit(cm)) = &e.event
+                    && cm.changes.iter().any(|ch| ch.row.as_ref() == b"alice")
+                {
+                    break;
+                }
+            }
         });
     });
 }

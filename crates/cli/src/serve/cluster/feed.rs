@@ -896,6 +896,18 @@ fn retryable(e: &ApiError) -> bool {
     )
 }
 
+/// A part whose partition the map no longer lists: a newer map dropped it (#1896), a forced
+/// one, or one that dropped it once no table was placed on it.
+/// `PartitionUnavailable`, so an `allow_partial` subscription reports it and goes on with
+/// the others (retrying it, in case a later map lists it again), and one without ends with
+/// a code it can act on. Not `Internal`: the state is one an operator made on purpose.
+fn dropped(partition: &str, map_version: u64) -> ApiError {
+    ApiError::partition_unavailable(format!(
+        "the cluster map (version {map_version}) no longer lists partition {partition:?}: a \
+         newer map dropped it"
+    ))
+}
+
 /// `e`, naming the partition it came from.
 fn in_partition(partition: &str, mut e: ApiError) -> ApiError {
     e.message = format!("partition {partition:?}: {}", e.message);
@@ -1079,9 +1091,10 @@ impl Ctx {
             let routes = routes
                 .as_ref()
                 .ok_or_else(|| ApiError::partition_unavailable("this node has no map"))?;
-            routes.owner(&open.partition).cloned().ok_or_else(|| {
-                ApiError::internal(format!("the map lists no node for {:?}", open.partition))
-            })?
+            routes
+                .owner(&open.partition)
+                .cloned()
+                .ok_or_else(|| dropped(&open.partition, routes.map_version()))?
         };
         if owner.history_epoch > open.epoch {
             return Err(expired(format!(
