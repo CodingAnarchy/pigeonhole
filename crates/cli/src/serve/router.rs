@@ -532,7 +532,7 @@ impl Router {
     ///
     /// **The rest stay in place:** [`Service::call`], which every single-node call takes,
     /// and the cluster's scan fan-out, subscription, backup and admin calls, whose futures
-    /// are each under half of `Service::call`'s, so they don't size this one. A test below
+    /// are each smaller than `Service::call`'s, so they don't size this one. A test below
     /// keeps this future within a margin of `Service::call`'s; one of them that outgrows it
     /// is boxed as the others are. The serve callgrind shapes (`serveshapes.rs`) count what
     /// a growth of `Service::call` itself costs.
