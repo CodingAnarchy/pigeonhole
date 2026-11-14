@@ -708,8 +708,10 @@ impl CatalogModel {
     /// One number for the whole model (#1853 part C2): xxh3-64 of its encoding. A replica
     /// compares its own catalog's with its primary's feed's at the same position.
     fn digest(&self) -> u64 {
-        let mut b = Vec::with_capacity(Self::LEN);
-        self.encode(&mut b);
+        let mut b = [0u8; Self::LEN];
+        b[..8].copy_from_slice(&self.tables.to_le_bytes());
+        b[8..12].copy_from_slice(&self.next_table.to_le_bytes());
+        b[12..].copy_from_slice(&self.next_family.to_le_bytes());
         pigeonhole_format::checksum::xxh3_64(&b)
     }
 

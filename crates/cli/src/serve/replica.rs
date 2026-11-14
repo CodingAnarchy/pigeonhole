@@ -377,6 +377,12 @@ pub(crate) struct Replica {
     /// The primary's seqno applied through, as `Status::applied`, for reads waiting on it
     /// (#1577). It goes back to 0 only when a bootstrap swaps another copy in.
     applied: watch::Sender<u64>,
+    /// Set when a bootstrap swaps a copy in, cleared by the first catalog digest that
+    /// matches the primary's (#1853 part C2). A mismatch while set can't be a schema change
+    /// the primary's feed missed (no 1.1.x session runs under a serving primary between a
+    /// copy and its batches), so another copy wouldn't fix it: the loop retries instead of
+    /// downloading the database again (cli692's S1 on #1878).
+    unconfirmed: AtomicBool,
 }
 
 /// The fault seam: in the tests, a promote of the database at this path fails after the
@@ -418,6 +424,7 @@ impl Replica {
             }),
             promoted: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
+            unconfirmed: AtomicBool::new(false),
             stop: watch::channel(false).0,
             task: Mutex::new(None),
             applied: watch::channel(0).0,
@@ -864,14 +871,30 @@ impl Replica {
             if run.events.is_empty()
                 && peeked.is_none()
                 && let Some(want) = batch.catalog_digest
-                && db.replication_catalog_digest() != want
             {
-                return Halt::Expired(
-                    "the replica's tables are no longer its primary's at the same position (a \
-                     schema change the primary's feed didn't record, such as one made while \
-                     it ran 1.1.x), so it bootstraps again"
-                        .to_owned(),
-                );
+                let have = db.replication_catalog_digest();
+                if have == want {
+                    self.unconfirmed.store(false, Ordering::Relaxed);
+                } else if self.unconfirmed.load(Ordering::Relaxed) {
+                    // A fresh copy that doesn't match: the two sides' digests disagree for
+                    // another reason, which a copy won't change (cli692's S1 on #1878). The
+                    // one exception, a primary rolled back between the copy and its first
+                    // match, can't be told apart here: a restart starts confirmed, so the
+                    // message names that way out.
+                    return Halt::Failed(format!(
+                        "the replica's catalog digest {have:016x} isn't its primary's \
+                         {want:016x} right after a bootstrap: a copy won't fix it, so it \
+                         retries (report this); if the primary was rolled back since this \
+                         copy, restart the replica to take a new copy"
+                    ));
+                } else {
+                    return Halt::Expired(
+                        "the replica's tables are no longer its primary's at the same position \
+                         (a schema change the primary's feed didn't record, such as one made \
+                         while it ran 1.1.x), so it bootstraps again"
+                            .to_owned(),
+                    );
+                }
             }
             let mut s = self.status();
             let caught_up = batch.caught_up && run.events.is_empty() && peeked.is_none();
@@ -1000,6 +1023,7 @@ impl Replica {
         // nothing cached of the old one may serve again.
         service.engine_replaced();
         swapped.map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        self.unconfirmed.store(true, Ordering::Relaxed);
         let mut s = self.status();
         s.caught_up = false;
         s.behind_since = Instant::now();

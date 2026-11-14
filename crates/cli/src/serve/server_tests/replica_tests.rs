@@ -27,6 +27,13 @@ fn a_replica_bootstraps_follows_and_refuses_writes() {
     let r = Server::start_replica(test_dir(), &p.url, Some("s3cret"));
     wait_replica(&r, "caught up after its bootstrap", caught_up(&p, tok));
     assert_eq!(get_value(&r, "t", "r7", None), b64(b"v7"));
+    // The copy's file, to see below that no catalog change brings another (#1853 part C2's
+    // digest check agrees with recorded changes; cli692's N3 on #1878).
+    #[cfg(unix)]
+    let copy = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(r.dir.join("t.phdb")).unwrap().ino()
+    };
 
     // Commits after the bootstrap follow, a new table and its writes in commit order.
     for i in 20..40 {
@@ -67,6 +74,15 @@ fn a_replica_bootstraps_follows_and_refuses_writes() {
     assert_eq!(p.rpc("Admin/Flush", &json!({}), tok).0, 200);
     wait_replica(&r, "the new table", caught_up(&p, tok));
     assert_eq!(get_value(&r, "u", "x2", None), b64(b"in the new u"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(r.dir.join("t.phdb")).unwrap().ino(),
+            copy,
+            "a create, a drop and a create again, all recorded, bring no new copy"
+        );
+    }
     assert_eq!(get_value(&r, "u", "x", None), Json::Null);
 
     // Writes and schema changes are refused, naming the primary.
