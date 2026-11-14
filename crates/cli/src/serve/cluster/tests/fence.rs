@@ -759,6 +759,10 @@ fn an_unfence_lifts_the_gate_only_under_the_install_lock() {
     );
     assert!(gate().fenced().is_some(), "and its gate is still fenced");
     drop(installing);
-    rt.block_on(call).unwrap().unwrap();
+    // The timer is made inside the runtime: `timeout` needs one when it's built.
+    rt.block_on(async { tokio::time::timeout(Duration::from_secs(30), call).await })
+        .expect("the unfence finishes once the lock is free")
+        .unwrap()
+        .unwrap();
     assert!(gate().fenced().is_none(), "lifted once the lock was free");
 }

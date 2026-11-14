@@ -864,8 +864,8 @@ fn a_close_whose_drain_fails_leaves_the_partition_open_under_the_operators_fence
     // 30 s; the fault seam here). p1 is fenced on a since a started (no peer's map confirms
     // it: the map has p1 at epoch 2, a's file at 1). The close made that fence the
     // operator's and persisted it before the drain, so p1 stays open, fenced by the
-    // operator, and a restart of a keeps it fenced: no peer's map lifts it (simp724's S1 on
-    // #1800).
+    // operator, and `fenced.json` lists it: what a restart of a reads, so no peer's map lifts
+    // it then (simp724's S1 on #1800).
     use crate::serve::proto::{FenceReason, LocalPartitionState, PartitionRequest};
     let t = Cluster::start_with(2, true);
     let a = t.ports[0];

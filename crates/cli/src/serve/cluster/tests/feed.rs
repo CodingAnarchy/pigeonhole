@@ -935,7 +935,12 @@ fn a_component_of_a_partition_the_map_no_longer_lists_ends() {
                     Err(e) => break e,
                 }
             };
-            assert_ne!(code(&ended), "", "{ended}");
+            // c's component ended as moved, and its reopen finds no owner for p3 in the map.
+            assert_eq!(code(&ended), "Internal", "{ended}");
+            assert!(
+                ended.message().contains("the map lists no node for \"p3\""),
+                "{ended}"
+            );
         });
     });
 }
