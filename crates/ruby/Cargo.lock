@@ -385,7 +385,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pigeonhole"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arc-swap",
  "futures-core",
@@ -398,14 +398,14 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-cache"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-io",
 ]
 
 [[package]]
 name = "pigeonhole-compaction"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-cache",
  "pigeonhole-format",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-engine"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "arc-swap",
  "loom",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-format"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "crc-fast",
  "foldhash",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-io"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memory"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-core",
  "getrandom 0.3.4",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memtable"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-pager"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-ruby"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "magnus",
  "nix",
@@ -499,14 +499,14 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-runtime"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-io",
 ]
 
 [[package]]
 name = "pigeonhole-shm"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-sst"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-cache",
  "pigeonhole-format",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-text"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-core",
  "levenshtein_automata",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-vector"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-core",
  "pigeonhole",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-wal"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",

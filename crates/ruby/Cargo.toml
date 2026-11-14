@@ -3,7 +3,7 @@ name = "pigeonhole-ruby"
 description = "Ruby bindings for Pigeonhole (the `pigeonhole-db` gem), over magnus and rb-sys (#697, ICR 0111)."
 # A workspace of its own (the root workspace excludes it: building it needs a Ruby with headers).
 # These follow the root's `[workspace.package]`; the version is the public line's (D295).
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -23,12 +23,12 @@ doctest = false
 test-hooks = []
 
 [dependencies]
-pigeonhole = { path = "../pigeonhole", version = "1.2.0" }
+pigeonhole = { path = "../pigeonhole", version = "1.2.1" }
 # `Pigeonhole::Memory` (PR 3a).
-pigeonhole-memory = { path = "../memory", version = "1.2.0" }
+pigeonhole-memory = { path = "../memory", version = "1.2.1" }
 # `Pigeonhole::Text` and `Pigeonhole::Vector` (PR 3b).
-pigeonhole-text = { path = "../text", version = "1.2.0" }
-pigeonhole-vector = { path = "../vector", version = "1.2.0" }
+pigeonhole-text = { path = "../text", version = "1.2.1" }
+pigeonhole-vector = { path = "../vector", version = "1.2.1" }
 # `bytes`: `RString::to_bytes`, the safe copy of a String's bytes.
 magnus = { version = "0.9", features = ["bytes"] }
 # `gvl.rs` only: `rb_thread_call_without_gvl2`, which magnus doesn't wrap (ICR 0111, O3).

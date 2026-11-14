@@ -2148,7 +2148,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pigeonhole"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-arrow"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-bench"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "pigeonhole",
  "pigeonhole-arrow",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-cache"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "loom",
@@ -2211,14 +2211,14 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-capi"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "pigeonhole",
 ]
 
 [[package]]
 name = "pigeonhole-cli"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "arc-swap",
  "arrow-ipc",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-compaction"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "pigeonhole-cache",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-engine"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-example-serving"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "axum",
  "futures-core",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-format"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "crc-fast",
  "criterion",
@@ -2342,7 +2342,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-io"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "io-uring",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memory"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-core",
  "getrandom 0.3.4",
@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-memtable"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "loom",
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-pager"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "pigeonhole-format",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-python"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "pigeonhole",
  "pigeonhole-arrow",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-runtime"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "loom",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-shm"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "libc",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-sim"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "pigeonhole-format",
  "pigeonhole-io",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-sst"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "pigeonhole-cache",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-text"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-core",
  "levenshtein_automata",
@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-vector"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-core",
  "pigeonhole",
@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "pigeonhole-wal"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "criterion",
  "pigeonhole-format",
