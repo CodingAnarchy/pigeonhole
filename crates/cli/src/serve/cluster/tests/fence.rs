@@ -263,7 +263,7 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
         // (cli692's S1); --force lifts it anyway.
         let e = unfence(ports[0], "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
-        assert!(e.message().contains("no peer's map"), "{e}");
+        assert!(e.message().contains("not a majority"), "{e}");
         let lp = client(ports[0])
             .await
             .unfence(PartitionRequest {
@@ -477,7 +477,7 @@ fn an_operators_fence_lifts_only_once_a_peers_map_confirms_it() {
     t.rt.block_on(async {
         let e = unfence(a, "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
-        assert!(e.message().contains("no peer's map"), "{e}");
+        assert!(e.message().contains("not a majority"), "{e}");
         assert_eq!(state(a, "p1").await, LocalPartitionState::Fenced);
         let lp = client(a)
             .await
@@ -835,7 +835,7 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
         );
         let e = unfence(ports[2], "p3").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
-        assert!(e.message().contains("no peer's map"), "{e}");
+        assert!(e.message().contains("not a majority"), "{e}");
         let lp = client(ports[2])
             .await
             .unfence(PartitionRequest {
@@ -870,4 +870,72 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
     for db in dbs.into_iter().flatten() {
         let _ = db.close();
     }
+}
+
+#[test]
+fn a_map_that_changes_the_nodes_cant_also_move_a_partition() {
+    // #1760, the coordinator's call on audit120's D2: a majority of one set of nodes
+    // confirms a partition's owner, so a map set through the writer that changes the nodes
+    // and moves (or re-epochs) a partition in one go is refused, naming the reason. The two
+    // as separate maps are taken.
+    let t = Rig::start();
+    let a = t.ports[0];
+    let current = || async {
+        client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let set = |m: ClusterMap| async move {
+        let expected = m.map_version - 1;
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+    };
+    let add_d = |m: &mut ClusterMap| {
+        m.nodes.push(MapNode {
+            id: "d".into(),
+            address: "127.0.0.1:9".into(),
+        });
+    };
+    let move_p1 = |m: &mut ClusterMap| {
+        for p in m.partitions.iter_mut().filter(|p| p.id == "p1") {
+            p.node = "c".into();
+            p.epoch += 1;
+        }
+    };
+    t.rt.block_on(async {
+        let mut both = current().await;
+        both.map_version += 1;
+        add_d(&mut both);
+        move_p1(&mut both);
+        let e = set(both).await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(
+            e.message()
+                .contains("can't also move or re-epoch a partition (partition \"p1\")"),
+            "{e}"
+        );
+        assert_eq!(current().await.map_version, 1, "nothing was set");
+
+        let mut nodes = current().await;
+        nodes.map_version += 1;
+        add_d(&mut nodes);
+        set(nodes).await.unwrap();
+        let mut moved = current().await;
+        moved.map_version += 1;
+        move_p1(&mut moved);
+        set(moved).await.unwrap();
+        let m = current().await;
+        assert_eq!(m.map_version, 3);
+        assert!(m.partitions.iter().any(|p| p.id == "p1" && p.node == "c"));
+    });
 }

@@ -4947,9 +4947,10 @@ pub mod vectors_server {
 pub struct PartitionRequest {
     #[prost(string, tag = "1")]
     pub partition: ::prost::alloc::string::String,
-    /// `Unfence` only: lift a start fence even though no peer's map (at least as new as this
-    /// node's, naming it for the partition at its file's epoch) confirms it. For a node whose
-    /// peers can't answer; it risks two writers if a peer's newer map moved the partition.
+    /// `Unfence` only: lift the fence without the peers' confirmation (D317 rule 3: a majority
+    /// of the map's nodes holding the newest map, which names this node for the partition at
+    /// its file's epoch). For a node whose peers can't answer; it risks two writers if a newer
+    /// map moved the partition.
     #[prost(bool, tag = "2")]
     pub force: bool,
 }

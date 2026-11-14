@@ -484,6 +484,9 @@ impl Node {
                     "this node is still taking its peers' maps after starting: try again",
                 ));
             }
+            if let Some(why) = map::moves_with_node_change(&current, &map) {
+                return Err(ApiError::failed_precondition(why));
+            }
         }
         let expected = req.expected_map_version;
         let version = self
@@ -572,14 +575,13 @@ impl Node {
                     n.id, e.message
                 );
             }
-            // Its partitions' start fences (D317 ticket 6).
-            self.confirm(&theirs);
         }
         self.push_all().await;
         self.synced
             .store(true, std::sync::atomic::Ordering::Release);
-        // Partitions no peer has confirmed yet: asked again until one does (cli692's S3).
-        self.confirm_after_start().await;
+        // Its partitions, confirmed by a majority's maps (D317 rule 3, #1760): asked again,
+        // backing off, until they are (cli692's S3).
+        self.confirm_until_done().await;
     }
 
     /// Peer `address`'s map.
@@ -608,10 +610,10 @@ impl Node {
     fn push_map(&self, map: ClusterMap, from: Option<&str>) -> Result<PushMapResponse, ApiError> {
         let pushed = from.is_some().then(|| map.clone());
         let version = self.push_map_install(map, from)?;
-        // A peer's map, taken or the same as this node's: its partitions' start fences
-        // (D317 ticket 6).
-        if let Some(theirs) = pushed {
-            self.confirm(&theirs);
+        // A peer's map, taken or the same as this node's: a round may now confirm this
+        // node's partitions (D317 rule 3, #1760).
+        if pushed.is_some() {
+            self.confirm_soon();
         }
         Ok(PushMapResponse {
             map_version: version,

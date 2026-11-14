@@ -79,9 +79,10 @@ service Cluster {
 // One partition on the node a `Cluster` call is sent to (D317 ticket 6).
 message PartitionRequest {
   string partition = 1;
-  // `Unfence` only: lift a start fence even though no peer's map (at least as new as this
-  // node's, naming it for the partition at its file's epoch) confirms it. For a node whose
-  // peers can't answer; it risks two writers if a peer's newer map moved the partition.
+  // `Unfence` only: lift the fence without the peers' confirmation (D317 rule 3: a majority
+  // of the map's nodes holding the newest map, which names this node for the partition at
+  // its file's epoch). For a node whose peers can't answer; it risks two writers if a newer
+  // map moved the partition.
   bool force = 2;
 }
 

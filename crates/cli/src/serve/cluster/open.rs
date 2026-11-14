@@ -401,20 +401,16 @@ impl Node {
         Ok(())
     }
 
-    /// Confirms this node's start-fenced partitions on its current map, after a partition
-    /// opened here. Not the map the open began with: a map installed here since (a table
-    /// created at the writer, say) makes that one older than the node's, which
-    /// [`confirm`](Self::confirm) ignores, and the newer map's own `open_missing` skipped
-    /// the partition because it was already open. Nothing else confirms a map set at this
-    /// node, so the partition stayed fenced until a peer's push or an `unfence` (audit120's
-    /// P2-C2). Read again if yet another map landed meanwhile.
-    fn confirm_current(&self) {
-        while let Ok(map) = self.get_map() {
-            self.confirm(&map);
-            if self.state().version() <= map.map_version {
-                break;
-            }
-        }
+    /// A partition opened here starts a run of confirmation rounds, which confirm it once a
+    /// majority of the map's nodes hold a map naming this node for it (#1760): a move's new
+    /// owner serves only then, so it and the old owner are never both confirmed. Spawned:
+    /// the open answers at once.
+    fn confirm_opened(&self) {
+        let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        rt.spawn(async move { node.confirm_until_done().await });
     }
 
     /// Opens every partition the newest map gives this node that isn't open here, each
@@ -446,7 +442,7 @@ impl Node {
                     );
                     #[cfg(test)]
                     hold_confirm(&self.dir).await;
-                    self.confirm_current();
+                    self.confirm_opened();
                 }
                 Err(e) => eprintln!(
                     "phdb serve: partition {id}: map version {} gives it to this node, and it \

@@ -268,6 +268,32 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     validate_epochs(old, new)
 }
 
+/// A map set through the writer that changes the cluster's nodes may not also move a
+/// partition or raise its epoch (D317 rule 3, as amended for #1760): a partition's owner
+/// changes only in a map with the same nodes as the one before it, so a majority of those
+/// nodes confirms one owner at a time. The refusal, naming the first such partition, or
+/// `None`. Forced maps aren't held to it (a recovery's), nor maps a peer pushes.
+pub(crate) fn moves_with_node_change(old: &ClusterMap, new: &ClusterMap) -> Option<String> {
+    let ids = |m: &ClusterMap| -> std::collections::BTreeSet<String> {
+        m.nodes.iter().map(|n| n.id.clone()).collect()
+    };
+    if ids(old) == ids(new) {
+        return None;
+    }
+    let old_parts: HashMap<&str, _> = old.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
+    let moved = new.partitions.iter().find(|p| {
+        old_parts
+            .get(p.id.as_str())
+            .is_some_and(|o| o.node != p.node || o.epoch != p.epoch)
+    })?;
+    Some(format!(
+        "a map that changes the cluster's nodes can't also move or re-epoch a partition \
+         (partition {:?}): set the node change, then the move, as two maps (D317 rule 3: a \
+         majority of one set of nodes confirms a partition's owner)",
+        moved.id
+    ))
+}
+
 /// Checks each partition `old` and `new` both have: its epoch never goes back, and it moves
 /// to another node only with a higher epoch (D317 §2). So no epoch, and no history begun at
 /// one (ticket 6), is used twice. Part of [`validate_change`]; a forced map (amendment 1)

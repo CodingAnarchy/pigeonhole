@@ -4558,6 +4558,16 @@ PR 3 adds an in-process two-database replication test with process and power-los
 - **`Cluster.Status`** lists a closed partition's files with their SHA-256 (ICR 0135's `database_files`), hashed after the close answers.
 - **The manual order (owner-approved):** fence, then close, then copy or restore, then `relocate`. `relocate` stamps the new node's file from the map's epoch `e` to `e + 1`, then sets the map with P on the new node at `e + 1`.
 
+**D317 amendment 3 (coordinator, 2026-11-14; #1829, #1760, ICR 0117; design `.coord/simp724-design-1829-1760.md`, reviewed by audit120 and feed1248): rule 3 confirms by a majority.**
+- **The gate keeps two flags** (#1829): the operator's fence, and "not confirmed since it opened here". Every open, at start or while serving, is unconfirmed. `phdb cluster unfence` without `--force` asks the peers whichever flags are set.
+- **Which maps confirm a partition** (#1760): one confirmation round asks every peer for its map and installs the newest. Then:
+  - if that map doesn't name this node for the partition at its file's epoch, the partition isn't confirmed: only a map with a newer map version than this node's vetoes it;
+  - otherwise it pushes the map to every peer that answered with an older one, waiting for the ack, and confirms the partition when a majority of the map's nodes (this node included) hold the map;
+  - a peer holding a different map at the same version blocks it.
+- **A map set through the writer that changes the nodes may not also move or re-epoch a partition,** so a partition's owner changes only within one set of nodes, whose majorities intersect. Forced maps aren't held to it.
+- **A move waits after its map step** until a majority of the nodes hold its map, so an operator's unfence of the old node can't be confirmed on the older map while the new node is down.
+- **Limit (with the owner):** a live old owner cut off from a majority keeps serving the clients that reach it until it takes the newer map. Rule 3 is about restarts and opens; closing that needs leases.
+
 <a id="d318"></a>
 ## D318 — `pigeonhole-embed` runs a pinned open embedding model on the CPU, in-process (ai1249, design; owner decision, 2026-11-05; embed, memory, cli, #1345, ICR 0119)
 

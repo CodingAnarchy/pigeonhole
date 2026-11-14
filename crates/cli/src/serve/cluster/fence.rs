@@ -86,11 +86,62 @@ pub(crate) struct Fences {
     /// Partitions being opened while the node serves ([`Node::open_part`]): `Status` shows
     /// them opening and doesn't read their files (#1770).
     pub(super) opening: Mutex<BTreeSet<String>>,
+    /// [`Node::confirm_soon`]'s rounds: one running, and whether another is owed.
+    rounds: Mutex<Rounds>,
+    /// [`Node::confirm_until_done`]'s loop is running.
+    retrying: std::sync::atomic::AtomicBool,
+}
+
+/// [`Node::confirm_soon`]'s state.
+#[derive(Debug, Default)]
+struct Rounds {
+    running: bool,
+    again: bool,
+}
+
+/// What one confirmation round found ([`Node::round`]).
+#[derive(Debug)]
+pub(crate) struct Round {
+    /// The node's map after the round: the newest that answered, installed if newer.
+    pub(crate) map: ClusterMap,
+    /// The nodes that hold `map` now, this one included: answered with it, or took its push.
+    pub(crate) holders: usize,
+    /// The peers that answered.
+    pub(crate) answered: usize,
+    /// Peers holding a different map at the same version (two forced maps): nothing is
+    /// confirmed while there's one.
+    pub(crate) divergent: Vec<String>,
+}
+
+impl Round {
+    /// Whether a majority of `map`'s nodes hold it, with no divergent map among them.
+    fn majority(&self) -> bool {
+        self.divergent.is_empty() && self.holders * 2 > self.map.nodes.len()
+    }
+
+    /// Whether it confirms partition `id` at `epoch` on node `node`: a majority hold the
+    /// map, and the map names `node` for it there (D317 rule 3, as amended for #1760).
+    pub(crate) fn confirms(&self, node: &str, id: &str, epoch: u64) -> bool {
+        self.majority() && names(&self.map, node, id, epoch)
+    }
 }
 
 impl Fences {
     fn served(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Served>> {
         self.served.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn rounds(&self) -> std::sync::MutexGuard<'_, Rounds> {
+        self.rounds.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Partitions open here that await their peers' confirmation, by id.
+    fn unconfirmed_any(&self) -> Vec<String> {
+        self.served()
+            .iter()
+            .filter(|(_, s)| s.gate.awaiting_peers())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub(super) fn operator(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
@@ -201,9 +252,11 @@ impl Node {
     /// Whether partition `id`, open here, awaits its peers' confirmation, whatever the
     /// operator's fence (`Status`'s `awaiting_peers`, #1829).
     pub(crate) fn awaiting_peers(&self, id: &str) -> bool {
-        self.fences
-            .gate(id)
-            .is_some_and(|(g, _)| g.awaiting_peers())
+        // Not for a copy the node's map no longer names at its epoch: no peer can confirm
+        // that one (audit120's note on #1897).
+        self.fences.gate(id).is_some_and(|(g, epoch)| {
+            g.awaiting_peers() && self.get_map().is_ok_and(|m| names(&m, &self.id, id, epoch))
+        })
     }
 
     /// `Cluster.Fence`: from now, P's writes answer `Fenced`; answers once every write
@@ -244,7 +297,6 @@ impl Node {
                 (epoch, gate.awaiting_peers())
             }
         };
-        let map = self.get_map()?;
         // This node's own map may be stale, whichever fence it is: it was down or missed a
         // push, and a move may have passed it by. So its peers' newest map must confirm the
         // partition first, as at start, unless the operator forces it (cli692's S1 on
@@ -253,20 +305,46 @@ impl Node {
         // map is behind when it misses the move's map. Asked whichever flags are set
         // (audit120's D1 on the #1829 design): a move's old node that never restarted has
         // been confirmed long since, and only the operator's fence is set.
-        if !force && !self.peer_confirms(&map, id, epoch).await {
-            let since = if unconfirmed {
-                "fenced, and unconfirmed since it opened here,"
-            } else {
-                "fenced"
-            };
-            return Err(ApiError::failed_precondition(format!(
-                "partition {id:?} is {since}, and no peer's map confirms it's still this \
-                 node's at epoch {epoch}: the newest map among the peers that answer must be \
-                 at least as new as this node's and name it. A peer that holds a newer map \
-                 may have moved the partition, and unfencing would give it two writers. \
-                 Wait for a peer to answer, or pass --force only if no peer can and you \
-                 know the partition hasn't moved"
-            )));
+        if !force {
+            let round = self.round().await?;
+            if !round.confirms(&self.id, id, epoch) {
+                let since = if unconfirmed {
+                    "fenced, and unconfirmed since it opened here,"
+                } else {
+                    "fenced"
+                };
+                let why = if !round.divergent.is_empty() {
+                    format!(
+                        "node{} {} hold{} a different map at version {}",
+                        if round.divergent.len() > 1 { "s" } else { "" },
+                        round.divergent.join(", "),
+                        if round.divergent.len() > 1 { "" } else { "s" },
+                        round.map.map_version
+                    )
+                } else if !names(&round.map, &self.id, id, epoch) {
+                    format!(
+                        "the newest map among the peers that answer, version {}, doesn't name \
+                         this node for it at epoch {epoch}: the partition moved on",
+                        round.map.map_version
+                    )
+                } else {
+                    format!(
+                        "{} of {} nodes hold map version {} ({} of the peers answered), not a \
+                         majority",
+                        round.holders,
+                        round.map.nodes.len(),
+                        round.map.map_version,
+                        round.answered
+                    )
+                };
+                return Err(ApiError::failed_precondition(format!(
+                    "partition {id:?} is {since}, and its peers don't confirm it's still this \
+                     node's at epoch {epoch}: {why}. A majority of the map's nodes must hold \
+                     the newest map, and it must name this node (D317 rule 3). Wait for the \
+                     peers to answer, or pass --force only if they can't and you know the \
+                     partition hasn't moved"
+                )));
+            }
         }
         // The node's map as it is now: the peers' newest was taken if it was newer.
         let map = self.get_map()?;
@@ -311,110 +389,189 @@ impl Node {
         Ok(())
     }
 
-    /// Auto-unfence (rule 3, cli692's S3): `map`, a peer's (or this node's own, in a
-    /// cluster of one), confirms every unconfirmed partition (operator-fenced or not) it names for this node at the
-    /// partition's file's epoch, if it's at least as new as this node's map. Any later map
-    /// that does counts: pushed, pulled, or fetched at start.
-    pub(crate) fn confirm(&self, map: &ClusterMap) {
-        if map.map_version < self.state().version() {
-            return;
+    /// One confirmation round (D317 rule 3, as amended for #1760): this node asks every
+    /// peer for its map at once, each within the push timeout, and installs the newest if
+    /// it's newer than its own (a map that moved a partition on is then this node's, and
+    /// can't confirm it here: the newer-version veto). It then pushes its map to each peer
+    /// that answered with an older one, waiting for the ack, so a peer counts only once it
+    /// holds the map, and an old owner always has a move's map before the new owner can
+    /// count that peer (audit120's D3). A node that holds the newest map alone spreads it
+    /// here (D4).
+    pub(crate) async fn round(self: &Arc<Self>) -> Result<Round, ApiError> {
+        let mine = self.get_map()?;
+        let mut asks = tokio::task::JoinSet::new();
+        for n in mine.nodes.iter().filter(|n| n.id != self.id) {
+            let (node, peer, address) = (Arc::clone(self), n.id.clone(), n.address.clone());
+            asks.spawn(async move {
+                let theirs =
+                    tokio::time::timeout(node.peers.push_timeout, node.fetch_map(&address))
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                theirs.map(|m| (peer, address, m))
+            });
         }
+        let answers: Vec<(String, String, ClusterMap)> =
+            asks.join_all().await.into_iter().flatten().collect();
+        if let Some((peer, _, newest)) = answers.iter().max_by_key(|(_, _, m)| m.map_version)
+            && newest.map_version > self.state().version()
+            && let Err(e) = self
+                .push_map_async(newest.clone(), Some(peer.clone()))
+                .await
+        {
+            eprintln!("phdb serve: node {peer}'s newer cluster map: {}", e.message);
+        }
+        let map = self.get_map()?;
+        let json = super::map::canonical_json(&map);
+        let mut holders = 1;
+        let mut divergent = Vec::new();
+        let mut pushes = tokio::task::JoinSet::new();
+        for (peer, address, theirs) in &answers {
+            match theirs.map_version.cmp(&map.map_version) {
+                std::cmp::Ordering::Equal if super::map::canonical_json(theirs) == json => {
+                    holders += 1;
+                }
+                std::cmp::Ordering::Equal => divergent.push(peer.clone()),
+                std::cmp::Ordering::Less => {
+                    let (node, address, map) = (Arc::clone(self), address.clone(), map.clone());
+                    pushes.spawn(async move {
+                        tokio::time::timeout(node.peers.push_timeout, node.push_to(&address, map))
+                            .await
+                            .is_ok_and(|r| r.is_ok())
+                    });
+                }
+                // Newer than the map this node now holds: its install was refused (a forced
+                // map from another history, say). It doesn't hold this node's map.
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        holders += pushes.join_all().await.into_iter().filter(|ok| *ok).count();
+        Ok(Round {
+            map,
+            holders,
+            answered: answers.len(),
+            divergent,
+        })
+    }
+
+    /// Pushes `map` to the peer at `address` (a round's catch-up of a peer that's behind).
+    async fn push_to(&self, address: &str, map: ClusterMap) -> Result<(), String> {
+        let mut client = self.client(address).await?;
+        let req = self.request(super::proto::PushMapRequest { map: Some(map) })?;
+        client
+            .push_map(req)
+            .await
+            .map(drop)
+            .map_err(|s| s.message().to_owned())
+    }
+
+    /// A round, then every unconfirmed partition it confirms: one its map names here at the
+    /// file's epoch, with a majority of the map's nodes holding that map. An operator's
+    /// fence stays (#1829).
+    async fn confirm_round(self: &Arc<Self>) -> Option<Round> {
+        let round = match self.round().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("phdb serve: confirming partitions: {}", e.message);
+                return None;
+            }
+        };
         let served = self.fences.served();
         for (id, s) in served.iter() {
-            if s.gate.awaiting_peers() && names(map, &self.id, id, s.epoch) && s.gate.confirm() {
+            if s.gate.awaiting_peers() && round.confirms(&self.id, id, s.epoch) && s.gate.confirm()
+            {
                 if s.gate.fenced().is_none() {
                     eprintln!(
-                        "phdb serve: partition {id} unfenced: map version {} still places it \
-                         on this node",
-                        map.map_version
+                        "phdb serve: partition {id} unfenced: {} of {} nodes hold map version \
+                         {}, which still places it on this node",
+                        round.holders,
+                        round.map.nodes.len(),
+                        round.map.map_version
                     );
                 } else {
                     eprintln!(
-                        "phdb serve: partition {id} confirmed by map version {}, and still \
-                         fenced by the operator (phdb cluster unfence lifts it)",
-                        map.map_version
+                        "phdb serve: partition {id} confirmed by {} of {} nodes at map version \
+                         {}, and still fenced by the operator (phdb cluster unfence lifts it)",
+                        round.holders,
+                        round.map.nodes.len(),
+                        round.map.map_version
                     );
                 }
             }
         }
+        drop(served);
+        Some(round)
     }
 
-    /// Whether partition `id` at `epoch` is still this node's by its peers' word: its own
-    /// map, in a cluster of one; else the NEWEST map among the peers that answer, which
-    /// must be at least as new as `map` and name this node. Every peer is asked, at once:
-    /// the first one to agree isn't enough, since a peer that missed the same move holds the
-    /// same stale map (simp724's S1 on #1826). The newest map is taken here if it's newer.
-    /// A peer that doesn't answer can't be counted: with the one peer that knows of a move
-    /// down, the others still confirm (a quorum is for 1.3.0, ICR 0117).
-    async fn peer_confirms(self: &Arc<Self>, map: &ClusterMap, id: &str, epoch: u64) -> bool {
-        if map.nodes.iter().all(|n| n.id == self.id) {
-            return names(map, &self.id, id, epoch);
+    /// A round soon, for a map a peer pushed (it may confirm a partition): one at a time
+    /// per node, and a push that arrives during one runs one more after it, never dropped.
+    pub(crate) fn confirm_soon(&self) {
+        if self.fences.unconfirmed_any().is_empty() {
+            return;
         }
-        let mut asks = tokio::task::JoinSet::new();
-        for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let (node, peer, address) = (Arc::clone(self), n.id.clone(), n.address.clone());
-            asks.spawn(async move {
-                tokio::time::timeout(node.peers.push_timeout, node.fetch_map(&address))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|theirs| (peer, theirs))
-            });
-        }
-        let mut newest: Option<(String, ClusterMap)> = None;
-        while let Some(answer) = asks.join_next().await {
-            if let Ok(Some((peer, theirs))) = answer
-                && newest
-                    .as_ref()
-                    .is_none_or(|(_, n)| theirs.map_version > n.map_version)
-            {
-                newest = Some((peer, theirs));
-            }
-        }
-        let Some((peer, theirs)) = newest else {
-            return false;
+        let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())
+        else {
+            return;
         };
-        if theirs.map_version > self.state().version() {
-            let _ = self.push_map_async(theirs.clone(), Some(peer)).await;
+        {
+            let mut r = self.fences.rounds();
+            if r.running {
+                r.again = true;
+                return;
+            }
+            r.running = true;
         }
-        theirs.map_version >= map.map_version && names(&theirs, &self.id, id, epoch)
+        rt.spawn(async move {
+            loop {
+                node.confirm_round().await;
+                let mut r = node.fences.rounds();
+                if r.again {
+                    r.again = false;
+                } else {
+                    r.running = false;
+                    return;
+                }
+            }
+        });
     }
 
-    /// At start, after [`Node::sync_on_start`]'s round: while a partition is still fenced
-    /// since the start, asks the peers for their maps again, backing off, until one
-    /// confirms it. A cluster of one confirms on its own map.
-    pub(crate) async fn confirm_after_start(self: &Arc<Self>) {
+    /// Rounds, backing off, while a partition the node's map names here at its file's epoch
+    /// is unconfirmed: at the start, and after a partition opens while the node serves (a
+    /// move's new owner, which serves once a majority holds the move's map). One such loop
+    /// at a time per node; a cluster of one confirms in its first round.
+    pub(crate) async fn confirm_until_done(self: &Arc<Self>) {
+        if self
+            .fences
+            .retrying
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         let mut wait = RETRY_FIRST;
         loop {
-            let Ok(map) = self.get_map() else {
-                return;
+            let done = match self.confirm_round().await {
+                Some(r) => self.fences.confirmable(&r.map, &self.id).is_empty(),
+                None => self.get_map().is_err(),
             };
-            if map.nodes.iter().all(|n| n.id == self.id) {
-                self.confirm(&map);
-            }
-            if self.fences.confirmable(&map, &self.id).is_empty() {
-                return;
+            if done {
+                self.fences
+                    .retrying
+                    .store(false, std::sync::atomic::Ordering::Release);
+                // A partition that opened while this loop was ending: go again.
+                let Ok(map) = self.get_map() else { return };
+                if self.fences.confirmable(&map, &self.id).is_empty()
+                    || self
+                        .fences
+                        .retrying
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return;
+                }
+                wait = RETRY_FIRST;
+                continue;
             }
             tokio::time::sleep(wait).await;
             wait = (wait * 2).min(RETRY_MAX);
-            for n in map.nodes.iter().filter(|n| n.id != self.id) {
-                let fetched =
-                    tokio::time::timeout(self.peers.push_timeout, self.fetch_map(&n.address)).await;
-                let Ok(Ok(theirs)) = fetched else {
-                    continue;
-                };
-                if theirs.map_version > self.state().version()
-                    && let Err(e) = self
-                        .push_map_async(theirs.clone(), Some(n.id.clone()))
-                        .await
-                {
-                    eprintln!(
-                        "phdb serve: node {}'s newer cluster map: {}",
-                        n.id, e.message
-                    );
-                }
-                self.confirm(&theirs);
-            }
         }
     }
 }
@@ -431,7 +588,7 @@ mod tests {
     fn the_starts_retries_wait_only_for_partitions_the_map_still_names_here() {
         // audit120's S1 on #1897: an unconfirmed partition the node's own map no longer names
         // at its file's epoch (its copy was moved away) can't be confirmed again, so
-        // `confirm_after_start` doesn't keep asking the peers for it.
+        // `confirm_until_done` doesn't keep asking the peers for it.
         let dir = pigeonhole::doc_support::temp_dir();
         let n = super::super::tests::node(&dir, "a");
         let map = |node: &str, epoch: u64| ClusterMap {
