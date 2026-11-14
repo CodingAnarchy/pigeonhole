@@ -864,3 +864,245 @@ fn a_component_that_subscribes_as_its_partition_closes_leaves_an_allow_partial_s
         });
     });
 }
+
+#[test]
+fn a_component_of_a_partition_the_map_no_longer_lists_ends() {
+    // #1848: `end_moved_feeds` for a partition still open here that the map no longer lists
+    // at all (tested before only for one the map gives another node). A forced map that drops
+    // p3 and narrows `users` to p1 and p2 reaches c, where p3 stays open: c's component of a
+    // subscription to `users` ends rather than following a copy no map owns, and the
+    // subscription (no `allow_partial`) ends with an error.
+    bounded(Duration::from_secs(120), || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_stops, ports, _dbs) = three_nodes(&rt);
+        let c = ports[2];
+        rt.block_on(async {
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut s = FeedClient::new(channel)
+                .subscribe(SubscribeRequest {
+                    tables: vec!["users".into()],
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            // p3's component delivers: a commit of "zed" (>= "m").
+            put(c, "zed", "1").await;
+            loop {
+                let e = tokio::time::timeout(Duration::from_secs(10), s.message())
+                    .await
+                    .expect("zed's commit within 10 s")
+                    .unwrap()
+                    .expect("the stream ended");
+                if let Some(Event::Commit(cm)) = &e.event
+                    && cm.changes.iter().any(|ch| ch.row.as_ref() == b"zed")
+                {
+                    break;
+                }
+            }
+
+            let mut m = client(c)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            m.map_version += 1;
+            m.partitions.retain(|p| p.id != "p3");
+            m.tables[0].splits.truncate(1);
+            m.tables[0].partitions.retain(|p| p != "p3");
+            client(c)
+                .await
+                .set_map(SetMapRequest {
+                    force: true,
+                    expected_map_version: 0,
+                    map: Some(m),
+                    copies: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let ended = loop {
+                match tokio::time::timeout(Duration::from_secs(20), s.message())
+                    .await
+                    .expect("the subscription ends once c takes the map")
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("the stream ended without an error"),
+                    Err(e) => break e,
+                }
+            };
+            assert_ne!(code(&ended), "", "{ended}");
+        });
+    });
+}
+
+#[test]
+fn a_component_that_subscribes_as_its_partition_moves_doesnt_follow_the_old_copy() {
+    // #1848: `still_owner`'s race (#1805). b's subscribe of p2 holds with p2's service taken;
+    // meanwhile a map gives p2 to c and leaves b's copy open, and b's install ends p2's
+    // components before this one is there to end. Released, the component finds the map no
+    // longer names b and refuses, so the `allow_partial` subscription looks for p2 at c
+    // (which never opens it) and reports it unavailable, while p1 carries on. Without the
+    // check the component registers on b's old copy and follows it quietly.
+    bounded(Duration::from_secs(120), || {
+        let t = Three::start();
+        let (a, c) = (t.ports[0], t.ports[2]);
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        crate::serve::cluster::feed::HOLD_SUBSCRIBE
+            .lock()
+            .unwrap()
+            .push(((t.dirs[1].clone(), "p2".into()), wait));
+        t.rt.block_on(async {
+            let opening = tokio::spawn(subscribe(
+                c,
+                SubscribeRequest {
+                    allow_partial: true,
+                    ..users()
+                },
+            ));
+            eventually("b's subscribe of p2 to be held", async || {
+                crate::serve::cluster::feed::HOLD_SUBSCRIBE
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            })
+            .await;
+            // The writer (a) gives p2 to c at the next epoch; b keeps its copy open.
+            let mut m = client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let version = m.map_version;
+            for p in m.partitions.iter_mut().filter(|p| p.id == "p2") {
+                p.node = "c".into();
+                p.epoch += 1;
+            }
+            m.map_version += 1;
+            client(a)
+                .await
+                .set_map(SetMapRequest {
+                    force: false,
+                    expected_map_version: version,
+                    map: Some(m),
+                    copies: Vec::new(),
+                })
+                .await
+                .unwrap();
+            let want = version + 1;
+            eventually("b to take the map", async || {
+                client(t.ports[1])
+                    .await
+                    .get_map(GetMapRequest {})
+                    .await
+                    .is_ok_and(|r| r.into_inner().map_version == want)
+            })
+            .await;
+            release.send(()).unwrap();
+            let mut s = opening
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("the subscription ended: {e}"));
+            // p2 reported unavailable (its new node never serves it), and p1 carries on.
+            put(a, "aafter", "v").await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let (mut gone, mut got_p1) = (false, false);
+            while !(gone && got_p1) {
+                let e = tokio::time::timeout_at(deadline, s.message())
+                    .await
+                    .expect("p2's state and p1's commit")
+                    .unwrap_or_else(|e| panic!("the subscription ended: {e}"))
+                    .expect("the stream ended");
+                match e.event {
+                    Some(Event::PartitionState(st)) if st.partition == "p2" => {
+                        assert!(!st.available, "{st:?}");
+                        gone = true;
+                    }
+                    Some(Event::Commit(cm))
+                        if cm.changes.iter().any(|ch| &ch.row[..] == b"aafter") =>
+                    {
+                        got_p1 = true;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    });
+}
+
+#[test]
+fn a_moved_component_whose_new_node_never_serves_gives_up_at_the_request_timeout() {
+    // #1848: the moved reopen's retry loop (audit120's S-C5) giving up. A map gives p2 to c,
+    // which has no copy and never serves it; b ends its component as moved. The subscription
+    // (no `allow_partial`) tries c again for one request timeout (5 s in the tests), not
+    // ending at c's first `PartitionUnavailable`, and then ends with it.
+    bounded(Duration::from_secs(120), || {
+        let t = Three::start();
+        let (a, c) = (t.ports[0], t.ports[2]);
+        t.rt.block_on(async {
+            let mut s = subscribe(c, users())
+                .await
+                .unwrap_or_else(|e| panic!("subscribe: {e}"));
+            // p2's component delivers first.
+            put(a, "zed", "1").await;
+            loop {
+                let e = tokio::time::timeout(Duration::from_secs(10), s.message())
+                    .await
+                    .expect("zed's commit within 10 s")
+                    .unwrap()
+                    .expect("the stream ended");
+                if let Some(Event::Commit(cm)) = &e.event
+                    && cm.changes.iter().any(|ch| ch.row.as_ref() == b"zed")
+                {
+                    break;
+                }
+            }
+            let mut m = client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let version = m.map_version;
+            for p in m.partitions.iter_mut().filter(|p| p.id == "p2") {
+                p.node = "c".into();
+                p.epoch += 1;
+            }
+            m.map_version += 1;
+            let moved = tokio::time::Instant::now();
+            client(a)
+                .await
+                .set_map(SetMapRequest {
+                    force: false,
+                    expected_map_version: version,
+                    map: Some(m),
+                    // Marked as copied, so p2 keeps its history and the subscription's
+                    // position stays good at c: only c's never serving it can end it.
+                    copies: vec!["p2".into()],
+                })
+                .await
+                .unwrap();
+            let ended = loop {
+                match tokio::time::timeout(Duration::from_secs(30), s.message())
+                    .await
+                    .expect("the subscription ends")
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("the stream ended without an error"),
+                    Err(e) => break e,
+                }
+            };
+            let took = moved.elapsed();
+            assert_eq!(code(&ended), "PartitionUnavailable", "{ended}");
+            assert!(
+                took >= Duration::from_secs(4),
+                "tried c again for the request timeout, not once: {took:?} ({ended})"
+            );
+        });
+    });
+}
