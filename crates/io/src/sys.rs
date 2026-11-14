@@ -32,8 +32,11 @@ pub fn process_id() -> u32 {
 /// It counts time across a suspend on each OS:
 /// - **Linux (and Android):** `CLOCK_BOOTTIME`, which includes time suspended
 ///   (`CLOCK_MONOTONIC` there doesn't).
-/// - **macOS and other Unix:** `CLOCK_MONOTONIC`, which on macOS keeps counting while the
-///   system sleeps (`mach_continuous_time`'s clock; `CLOCK_UPTIME_RAW`, std's, doesn't).
+/// - **macOS (Apple platforms):** `CLOCK_MONOTONIC_RAW`, `mach_continuous_time` scaled by
+///   the timebase, which keeps counting while the system sleeps and which no frequency or
+///   time adjustment slews (`CLOCK_UPTIME_RAW`, std's, stops).
+/// - **OpenBSD:** `CLOCK_BOOTTIME`.
+/// - **Other Unix:** `CLOCK_MONOTONIC`. That it counts a suspend there isn't checked.
 /// - **Windows:** `QueryInterruptTime`, which includes time asleep or hibernating
 ///   (`QueryUnbiasedInterruptTime` doesn't).
 ///

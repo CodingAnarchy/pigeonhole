@@ -587,14 +587,24 @@ pub(crate) fn current_start_time() -> u64 {
     }
 }
 
-/// [`crate::sys::boot_clock_ns`]: `CLOCK_BOOTTIME` on Linux and Android, which counts time
-/// the machine was suspended; `CLOCK_MONOTONIC` elsewhere, which on Apple platforms counts
-/// it too (`mach_continuous_time`'s clock, where std's `Instant` is `CLOCK_UPTIME_RAW`,
-/// which doesn't).
+/// [`crate::sys::boot_clock_ns`]: a clock that counts time the machine was suspended.
+/// - Linux, Android and OpenBSD: `CLOCK_BOOTTIME`.
+/// - Apple platforms: `CLOCK_MONOTONIC_RAW`, which is `mach_continuous_time` scaled by the
+///   timebase: it counts sleep and no frequency or time adjustment slews it (audit120 on
+///   #1905). `CLOCK_MONOTONIC` there counts sleep too, but it's the wall clock minus the boot
+///   time, so `adjtime` and NTP slew it; std's `Instant` is `CLOCK_UPTIME_RAW`, which stops.
+/// - Elsewhere: `CLOCK_MONOTONIC`, which isn't checked to count a suspend.
 pub(crate) fn boot_clock_ns() -> u64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
     const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_vendor = "apple")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC_RAW;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "openbsd",
+        target_vendor = "apple"
+    )))]
     const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
     let mut ts = libc::timespec {
         tv_sec: 0,
