@@ -463,14 +463,14 @@ fn a_reader_process_feed_of_every_table_delivers_catalog_changes() {
     w.close();
 }
 
-/// simp724 on #1493 and F2 on #1515 (D315 2b): once the writer's sidecar appends stop, the
-/// next catalog change's hold stays up for the rest of the session. A feed of every table in
-/// a reader process, which can't see the stop, waits at it: nothing at or above that
-/// change's ceiling, even after a later change (which takes no hold of its own). A table's
-/// feed doesn't read the hold and carries on. Mutation-checked: without `release_catalog`'s
-/// freeze, and with a later change taking its own hold.
+/// #1869 (simp724 on #1493 and F2 on #1515, D315 2b): once the writer's sidecar appends stop,
+/// the next catalog change's hold stays up for the rest of the session. A feed of every table
+/// in a reader process expires, as one in the writer's process does, rather than waiting at
+/// that hold until the writer restarts: it delivers nothing at or above that change's
+/// ceiling, even after a later change (which takes no hold of its own), and no catalog change
+/// without its entry. A table's feed doesn't read the hold and carries on.
 #[test]
-fn a_reader_process_feed_of_every_table_waits_at_a_frozen_hold() {
+fn a_reader_process_feed_of_every_table_expires_once_the_sidecar_appends_stop() {
     use pigeonhole_io::sim::FaultPlan;
     let vfs = SimVfs::new(4132);
     vfs.enter_process(WRITER);
@@ -502,23 +502,31 @@ fn a_reader_process_feed_of_every_table_waits_at_a_frozen_hold() {
     vfs.enter_process(READER);
     let mut got_one = Vec::new();
     let mut got_all = Vec::new();
+    let mut expired = None;
     for _ in 0..200 {
         got_one.extend(ready(&mut one).unwrap().into_iter().map(|(s, _)| s));
-        loop {
+        while expired.is_none() {
             match all.try_next().unwrap() {
                 Next::Commit(c) => got_all.push(c.seqno),
                 Next::Catalog(e) => panic!("a change with no entry: {e:?}"),
                 Next::Pending => break,
-                Next::Expired(e) => panic!("expired: {e:?}"),
+                Next::Expired(e) => expired = Some(e.reason.clone()),
             }
+        }
+        if expired.is_some() && got_one.len() == 2 {
+            break;
         }
         std::thread::yield_now();
     }
     assert_eq!(got_one, [below, above], "a table's feed carries on");
-    assert_eq!(
-        got_all,
-        [below],
-        "nothing at or above the frozen ceiling ({later})"
+    assert!(
+        got_all.iter().all(|&s| s == below),
+        "nothing at or above the frozen ceiling ({later}): {got_all:?}"
+    );
+    let expired = expired.expect("a reader process's feed of every table expires");
+    assert!(
+        expired.contains("sidecar can no longer be written"),
+        "the writer's reason: {expired}"
     );
     drop((all, one));
     vfs.enter_process(WRITER);
