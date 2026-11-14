@@ -30,6 +30,12 @@ on:
       - 'crates/bench/examples/ycsb.rs'
       - 'crates/bench/examples/textshapes.rs'
       - 'crates/bench/examples/feedshapes.rs'
+      - 'crates/bench/examples/serveshapes.rs'
+      - 'crates/cli/src/serve/**'
+      # The serve path is mostly third-party code (tonic, axum, hyper, h2): a dependency bump
+      # moves its counts, so it runs the jobs too.
+      - 'crates/cli/Cargo.toml'
+      - 'Cargo.lock'
       - 'crates/bench/examples/asyncwrites.rs'
       - 'crates/text/**'
       - 'crates/bench/examples/support/**'
@@ -78,7 +84,12 @@ env:
   # 2026-10-28): a counter group counts the entries it folds and tests for its stop at a base
   # or column delete (+42 per get, +0.49%, scratch x86 A/B run of 06c4ef89 against d77b17d3),
   # while the counter read the D280 row measures fell from 2.3-5.5 ms to 35-40 µs at p99.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8
+  # `serve-mutate` gets 1.0% (#1864): over nine identical-code runs on three heads it read
+  # 69528-69827 per call (0.43%), so one base run against one head run can differ by nearly
+  # the default on noise alone. The likely source, untraced: a write awaits the shard thread's
+  # commit (not counted), and whether it is done by the task's first poll is timing, so some
+  # calls take another poll through the service stack. Tracing it is #1900.
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8 serve-mutate=1.0
 
 jobs:
   # Valgrind's .debs, cached so the callgrind jobs don't need the Ubuntu archive (down for
@@ -135,8 +146,8 @@ jobs:
     timeout-minutes: 60
     # Jobs in parallel (#1575): the read and write shapes; the text-search shapes, which
     # alone took about 20 minutes a side under valgrind and pushed one job to its 60-minute
-    # timeout; and the feed and replication shapes (#1828). Each builds and counts only its
-    # own examples, and checks only its own shapes against the ceilings.
+    # timeout; the feed and replication shapes, and `phdb serve`'s calls (#1828). Each builds
+    # and counts only its own examples, and checks only its own shapes against the ceilings.
     strategy:
       fail-fast: false
       matrix:
@@ -177,6 +188,15 @@ jobs:
             hotrow: '-'
             shapes: >-
               feedshapes:feed-drain,feed-drain-all,replicate-apply
+          - name: phdb serve instructions per call (callgrind)
+            # `phdb serve`'s gRPC calls through its router in process (#1828,
+            # crates/bench/examples/serveshapes.rs): the token check, prepay, decode,
+            # admission, handler, conversion and encode, not the shards' side. `serve-scan`
+            # last: its setup is the fullest (it warms the most rows).
+            examples: serveshapes
+            hotrow: '-'
+            shapes: >-
+              serveshapes:serve-get,serve-read-row,serve-mutate,serve-scan
     env:
       EXAMPLES: ${{ matrix.examples }}
       SHAPES: ${{ matrix.shapes }}
@@ -229,7 +249,10 @@ jobs:
           # Default features of every crate, always: the counts must be what a user of the
           # published crates gets (#430: `pigeonhole`'s default-on `async` adds a second,
           # cache-only instance of the read paths). Never pass --no-default-features or
-          # --features here, and keep the bench's dependencies on their default features.
+          # --features here, and keep the bench's dependencies on their default features. The
+          # one exception is `pigeonhole-cli` (serveshapes): its defaults are the `phdb`
+          # binary's allocator (`jemalloc`) and the embedding client (`embed`), neither part of
+          # the library's serve path (crates/bench/Cargo.toml says why).
           cargo build --release -p pigeonhole-bench "${flags[@]}"
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-head/; done
           git worktree add -q /tmp/base "$base"

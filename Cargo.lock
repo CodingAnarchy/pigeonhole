@@ -2183,8 +2183,11 @@ dependencies = [
 name = "pigeonhole-bench"
 version = "1.2.0"
 dependencies = [
+ "axum",
+ "http-body",
  "pigeonhole",
  "pigeonhole-arrow",
+ "pigeonhole-cli",
  "pigeonhole-engine",
  "pigeonhole-format",
  "pigeonhole-io",
@@ -2193,10 +2196,15 @@ dependencies = [
  "pigeonhole-text",
  "pigeonhole-vector",
  "proptest",
+ "prost",
  "rocksdb",
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tower",
 ]
 
 [[package]]

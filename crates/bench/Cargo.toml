@@ -60,4 +60,17 @@ pigeonhole-format = { workspace = true }
 # The `memrecall` example measures agent-memory recall (D311 T5).
 pigeonhole-memory = { workspace = true }
 pigeonhole-text = { workspace = true }
+# The `serveshapes` example (#1828) calls `phdb serve`'s router in process
+# (`pigeonhole_cli::serve_bench`) with gRPC messages from the server's own generated code.
+# Without the cli's default features: `embed` (the HTTPS client for an embedding endpoint;
+# `embed-local` is the model runtime, and off by default) isn't on any measured path, and
+# `jemalloc` is the `phdb` binary's allocator, not the library's.
+pigeonhole-cli = { path = "../cli", default-features = false, features = ["serve"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["rt", "time"] }
+http-body = "1"
+prost = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14"
 

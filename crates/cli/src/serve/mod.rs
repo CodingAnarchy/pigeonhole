@@ -20,6 +20,8 @@ use crate::exit::Failure;
 
 mod auth;
 mod backup;
+#[doc(hidden)]
+pub mod bench;
 mod bulk;
 mod charge;
 mod cluster;
@@ -404,6 +406,18 @@ pub(crate) fn run(
     if let Some(dir) = &args.cluster {
         return cluster::run(cli, args, dir, stderr);
     }
+    let serving = single(cli, args, stderr)?;
+    serve_shared(serving, stderr)
+}
+
+/// A single node, opened and ready to serve: its database, its service and the state every
+/// handler shares, from its arguments. [`run`] serves it; the hidden [`bench`] entry builds
+/// its router with this same construction, for the instruction-count shapes (#1828).
+pub(crate) fn single<'a>(
+    cli: &Cli,
+    args: &'a ServeArgs,
+    stderr: &mut dyn std::io::Write,
+) -> Result<Serving<'a>, Failure> {
     let tokens = tokens(args)?;
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => {
@@ -502,18 +516,15 @@ pub(crate) fn run(
         feed_runtimes: std::sync::OnceLock::new(),
     });
 
-    serve_shared(
-        Serving {
-            args,
-            shared,
-            placement,
-            tls,
-            serving: args.db_file().display().to_string(),
-            replica,
-            start: None,
-        },
-        stderr,
-    )
+    Ok(Serving {
+        args,
+        shared,
+        placement,
+        tls,
+        serving: args.db_file().display().to_string(),
+        replica,
+        start: None,
+    })
 }
 
 /// What [`serve_shared`] serves.
