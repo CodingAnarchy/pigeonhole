@@ -437,8 +437,8 @@ replicate-apply 6764 0.3
 # about 55 to serve-get and 70 to serve-scan), three identical-code runs, 43580182634, 43580187515
 # and 43583722484 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
 # runs: serve-get 74444-74462, serve-read-row 663434-663458, serve-scan 8021082-8021107, and
-# serve-mutate 69532-69827 (0.42%; over nine runs on three heads 69528-69827; its source isn't
-# traced yet).
+# serve-mutate 69532-69827 (0.42%; over nine runs on three heads 69528-69827; its per-PR
+# threshold is 1.0%, and tracing the noise is #1900).
 serve-get 74686 0.3
 serve-read-row 665449 0.3
 serve-mutate 70037 0.3

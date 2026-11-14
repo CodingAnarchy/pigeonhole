@@ -297,6 +297,11 @@ fn shape_serve(router: &axum::Router, calls: &[Call]) -> usize {
 }
 
 /// Makes `calls` one after another; each must answer `grpc-status` 0.
+///
+/// The count includes some client-side work per call: the `authorization` header's
+/// `format!`, the request body's clone, and draining the response body. It's the same for
+/// every call, so it can't hide a server regression, but the count is a little more than
+/// the server's own.
 async fn run(router: &axum::Router, calls: &[Call]) -> usize {
     for call in calls {
         let req = Request::post(call.path)
