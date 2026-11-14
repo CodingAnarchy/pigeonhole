@@ -9260,6 +9260,15 @@ pub struct ReplicationBatch {
     /// applies it is caught up.
     #[prost(bool, tag = "3")]
     pub caught_up: bool,
+    /// The digest of the primary's catalog at the position this batch ends at (#1853, an
+    /// additive amendment to ICR 0112): its table ids (reserved tables aside) and id counters,
+    /// as the primary's feed has them. A replica that has applied every event up to here has
+    /// the same digest; a
+    /// different one means a schema change the primary's feed never delivered (one made under
+    /// 1.1.x after a rollback), and the replica bootstraps again. Absent from a primary that
+    /// doesn't send it (1.2.x).
+    #[prost(uint64, optional, tag = "4")]
+    pub catalog_digest: ::core::option::Option<u64>,
 }
 /// Generated client implementations.
 pub mod replication_client {

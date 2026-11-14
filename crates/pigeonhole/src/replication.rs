@@ -466,6 +466,18 @@ impl Pigeonhole {
         self.engine().feed_frontier(true)
     }
 
+    /// The digest of this database's catalog (#1853 part C2): what its primary's feed of every
+    /// table reports (`Feed::catalog_digest`) at the position a replica applied through,
+    /// unless a schema change never reached the feed. That holds for a replica bootstrapped
+    /// from a copy ([`begin_replication`](Self::begin_replication)), whose id counters are
+    /// the primary's. One that started empty at its first apply never matches: its counters
+    /// miss every id the primary allocated before it (feed1248's N2 on #1878). Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn replication_catalog_digest(&self) -> u64 {
+        self.engine().catalog_digest()
+    }
+
     /// The primary's commit seqno a replica applied through (#1436's lag): `None` on a
     /// database that isn't a replica. Not part of the stable API.
     #[doc(hidden)]

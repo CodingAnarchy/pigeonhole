@@ -1,0 +1,2 @@
+### Fixed
+- **A cluster node that opens a partition while it serves moves every thread off the new shards' CPUs** (#1762). Before, the engines' unpinned threads and the server's long-running ones (a backup, a bulk load, an index rebalancer, a replica's follow, candle's pool) kept the mask they started on, so the new partition's shards could be pinned to CPUs those threads still ran on. A sweep after each mask change now moves them. The engines' pinned shard and compaction threads stay where they are.

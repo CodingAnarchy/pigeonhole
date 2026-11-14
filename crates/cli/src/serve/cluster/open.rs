@@ -49,6 +49,9 @@ impl std::fmt::Debug for Opener {
 /// Reapplies the server's masks for the shard CPUs of `parts`, the partitions open now
 /// (D317 ticket 6), and says so. The runtimes keep the thread counts they started with
 /// (Tokio can't resize one): a mask that shrank has more of them per CPU (cli692 on #1745).
+///
+/// Its sweep reads `/proc/self/task` and makes a syscall per thread, so async callers use
+/// [`remask_off_async`] (simp724's S1 on #1871).
 pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMap, why: &str) {
     let mut pinned: Vec<usize> = parts
         .values()
@@ -57,7 +60,22 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
         .collect();
     pinned.sort_unstable();
     pinned.dedup();
+    let previous = placement.current();
     let masks = placement.reapply(&pinned);
+    // Every other thread too, the engines' unpinned ones and our long-running ones, at once
+    // (#1762): only the engines' own pins, the shards' and compaction's, stay where they are.
+    let mut engine_pins: Vec<usize> = parts
+        .values()
+        .filter_map(|s| s.part_opt())
+        .flat_map(|p| {
+            let mut cpus = p.db.pinned_shard_cpus();
+            cpus.extend(p.db.pinned_compaction_cpus());
+            cpus
+        })
+        .collect();
+    engine_pins.sort_unstable();
+    engine_pins.dedup();
+    let swept = placement.sweep(&engine_pins, &previous);
     // Each runtime's threads against its CPUs, so an operator sees how a shrunken mask
     // packs them (perf287's note 1 on #1755); the counts stay as the server started them.
     let on = |threads: usize, m: &Option<Vec<usize>>| match m {
@@ -75,14 +93,28 @@ pub(crate) fn remask(placement: &Placement, parts: &crate::serve::router::PartMa
     };
     eprintln!(
         "phdb serve: {why}: off the shards' {} CPUs{unmasked}: request workers {}, feed {} \
-         and hub {}, blocking {}; the thread counts stay as the server started them (restart \
-         to size them again)",
+         and hub {}, blocking {}, and {swept} other threads moved to the blocking mask; the \
+         thread counts stay as the server started them (restart to size them again)",
         pinned.len(),
         on(placement.io_threads, &masks.network),
         on(placement.feed_threads, &masks.feed),
         on(placement.hub_threads, &masks.hub),
         on(placement.blocking_threads, &masks.blocking),
     );
+}
+
+/// [`remask`] on the blocking pool, awaited: an open or close on a request worker never
+/// runs the sweep there. A failed task (a panic in the sweep) is logged; the masks were
+/// published before it.
+pub(crate) async fn remask_off_async(
+    placement: &Arc<Placement>,
+    parts: &crate::serve::router::PartMap,
+    why: String,
+) {
+    let (placement, parts) = (Arc::clone(placement), parts.clone());
+    if let Err(e) = tokio::task::spawn_blocking(move || remask(&placement, &parts, &why)).await {
+        eprintln!("phdb serve: the thread mask update failed: {e}");
+    }
 }
 
 /// Partition `id` marked as opening on a node, until dropped.
@@ -339,7 +371,7 @@ impl Node {
         }
         let mut parts = (*cluster.parts.load_full()).clone();
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
-        remask(&opener.placement, &parts, &format!("partition {id} opened"));
+        remask_off_async(&opener.placement, &parts, format!("partition {id} opened")).await;
         cluster.parts.store(Arc::new(parts));
         // Its schema follows the map before it's unfenced (D317 ticket 5): the node's map
         // now, not the one the open began with, which a schema change may have passed while

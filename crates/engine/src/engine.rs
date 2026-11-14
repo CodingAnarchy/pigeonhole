@@ -2102,6 +2102,16 @@ impl Engine {
         self.inner.promote()
     }
 
+    /// The digest of this database's catalog (#1853 part C2): its table ids, but a replica's
+    /// state table, and its id counters, as a feed of every table's
+    /// [`FeedReader::catalog_digest`](crate::FeedReader::catalog_digest) reports them at its
+    /// position. A replica that applied everything its primary's feed delivered has the
+    /// digest that feed reports; a different one means a schema change the feed never
+    /// delivered.
+    pub fn catalog_digest(&self) -> u64 {
+        crate::feed_reader::catalog_digest_of(&self.inner.catalog())
+    }
+
     /// The replica's state cell, as the last apply stored it; `None` before the first.
     pub fn replication_state(&self) -> Result<Option<Vec<u8>>> {
         if self
