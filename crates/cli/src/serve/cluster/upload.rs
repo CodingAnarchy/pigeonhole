@@ -22,12 +22,11 @@
 //!   [`KEEP`] are deleted, and so is every incomplete one at the node's start.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::map;
@@ -647,20 +646,10 @@ pub(super) fn read_header(path: &Path) -> Result<PartitionUploadHeader, String> 
 }
 
 pub(super) fn digest(path: &Path) -> Result<[u8; 32], ApiError> {
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| ApiError::internal(format!("read {}: {e}", path.display())))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| ApiError::internal(format!("read {}: {e}", path.display())))?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Ok(h.finalize().into())
+    std::fs::File::open(path)
+        .and_then(|mut f| crate::serve::backup::sha256_of(&mut f))
+        .map(|(_, sha)| sha)
+        .map_err(|e| ApiError::internal(format!("read {}: {e}", path.display())))
 }
 
 pub(super) fn sync_dir(dir: &Path) {
@@ -675,6 +664,7 @@ pub(super) fn sync_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn dir() -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

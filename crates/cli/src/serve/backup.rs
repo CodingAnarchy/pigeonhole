@@ -551,15 +551,20 @@ impl Drop for Backups {
 
 /// `path`'s size and SHA-256, read once (on the blocking pool).
 pub(crate) fn digest(path: &Path) -> Result<(u64, [u8; 32]), ApiError> {
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| ApiError::internal(format!("reading the backup: {e}")))?;
+    std::fs::File::open(path)
+        .and_then(|mut f| sha256_of(&mut f))
+        .map_err(|e| ApiError::internal(format!("reading the backup: {e}")))
+}
+
+/// The size and SHA-256 of what's left of `f`, read through once. One copy for a backup
+/// download, an upload, a closed partition's files and `phdb cluster backup`; each caller
+/// opens the file and words its own error.
+pub(crate) fn sha256_of(f: &mut impl Read) -> std::io::Result<(u64, [u8; 32])> {
     let mut h = Sha256::new();
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; 1 << 20];
     let mut total = 0u64;
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| ApiError::internal(format!("reading the backup: {e}")))?;
+        let n = f.read(&mut buf)?;
         if n == 0 {
             break;
         }
