@@ -34,20 +34,11 @@ use crate::serve::proto::{
     self, ForwardRequest, ForwardScanRequest, MissingRange, MultiGetRequest, MultiGetResponse,
     NearestRequest, NearestResponse, ScanPage, ScanRequest, forward_request,
 };
-use crate::serve::router::{Cluster, Router, not_open};
-use crate::serve::service::Service;
+use crate::serve::router::{Cluster, Place, Router, Target};
 use crate::serve::service::{
     PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, page_bytes, room,
 };
 use tokio::sync::Semaphore;
-
-/// Where one partition is read.
-enum Place {
-    /// This node, through the partition's service (D317 ticket 8a).
-    Here(Arc<Service>),
-    /// Its node's address, and the map version the read goes with.
-    There(String, u64),
-}
 
 /// The cluster side of a fan-out, owned, so a scan's task can outlive its request.
 #[derive(Clone)]
@@ -97,18 +88,7 @@ impl Reach {
 
     /// Where `partition` is read from this node.
     fn place(&self, routes: &Routes, partition: &str) -> Result<Place, ApiError> {
-        let owner = routes.owner(partition).ok_or_else(|| {
-            ApiError::internal(format!("the map lists no node for partition {partition:?}"))
-        })?;
-        if owner.node == self.node.id() {
-            return self
-                .parts
-                .load()
-                .get(partition)
-                .map(|s| Place::Here(Arc::clone(s)))
-                .ok_or_else(|| not_open(partition));
-        }
-        Ok(Place::There(owner.address.clone(), routes.map_version()))
+        crate::serve::router::place(&self.node, &self.parts, routes, partition)
     }
 
     /// Pulls the map from the node that said it has a newer one (a `WrongPartition`).
@@ -275,7 +255,11 @@ impl Router {
                         _ => Err(ApiError::internal("a multi-get answered another reply")),
                     };
                 }
-                Place::There(address, map_version) => {
+                Place::There(Target {
+                    address,
+                    map_version,
+                    ..
+                }) => {
                     let req = ForwardRequest {
                         fanout_part: true,
                         map_version,
@@ -616,18 +600,7 @@ impl Router {
                     "this node has no cluster map yet",
                 ));
             };
-            let mine = routes
-                .owner(partition)
-                .is_some_and(|o| o.node == cluster.node.id());
-            if !mine {
-                return Err(ApiError::wrong_partition(
-                    routes.map_version(),
-                    format!("this node doesn't serve partition {partition:?}"),
-                ));
-            }
-            let Some(service) = cluster.here(partition) else {
-                return Err(not_open(partition));
-            };
+            let service = cluster.owned_here(routes, partition)?;
             // At a snapshot, checked again here: its range stays in its partition, and that's
             // this one (D317 ticket 3).
             if crate::serve::router::snapshot_of(r.selection.as_ref()).is_some() {
@@ -823,7 +796,11 @@ impl Router {
             let reply = match reach.place(&routes, partition)? {
                 // The request's holding covers this answer (#1715): no charge of its own.
                 Place::Here(service) => service.fanout_part(ServiceOp::Nearest(r), caller).await?,
-                Place::There(address, map_version) => {
+                Place::There(Target {
+                    address,
+                    map_version,
+                    ..
+                }) => {
                     let req = ForwardRequest {
                         fanout_part: true,
                         map_version,
@@ -1344,7 +1321,11 @@ impl ScanJob {
                         .take();
                     return here.open(r, None, pinned, None).map(PartPages::Here);
                 }
-                Place::There(address, map_version) => {
+                Place::There(Target {
+                    address,
+                    map_version,
+                    ..
+                }) => {
                     let req = ForwardScanRequest {
                         map_version,
                         caller: Some(forward::forwarded_caller(&self.caller)?),

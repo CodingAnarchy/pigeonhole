@@ -42,6 +42,56 @@ impl Cluster {
     pub(crate) fn here(&self, id: &str) -> Option<Arc<Service>> {
         self.parts.load().get(id).cloned()
     }
+
+    /// The service of `partition`, which a peer sent this node a call for, by `routes`: the
+    /// owner's side of a forward (a call's, a scan's). `WrongPartition` with this node's map
+    /// version when the map doesn't give it here (it moved away, or was never here: the
+    /// sender's map is older or newer than this node's, and it pulls and routes again), and
+    /// [`not_open`] when the map gives it here but it isn't open.
+    pub(crate) fn owned_here(
+        &self,
+        routes: &Routes,
+        partition: &str,
+    ) -> Result<Arc<Service>, ApiError> {
+        let mine = routes
+            .owner(partition)
+            .is_some_and(|o| o.node == self.node.id());
+        if !mine {
+            return Err(ApiError::wrong_partition(
+                routes.map_version(),
+                format!("this node doesn't serve partition {partition:?}"),
+            ));
+        }
+        self.here(partition).ok_or_else(|| not_open(partition))
+    }
+}
+
+/// Where `partition` is served, by `routes`, as an entry node sees it: here, or the node the
+/// map gives it. Here only when the map gives this node the partition *and* this node has it
+/// open: a partition the map moved away is the new owner's, even if its file is still open
+/// here. One copy for a routed call ([`Cluster::target`]) and a fanned-out read's part
+/// (`cluster::fanout`), which holds the node and its parts without the [`Cluster`].
+pub(crate) fn place(
+    node: &super::cluster::Node,
+    parts: &Parts,
+    routes: &Routes,
+    partition: &str,
+) -> Result<Place, ApiError> {
+    let owner = routes.owner(partition).ok_or_else(|| {
+        ApiError::internal(format!("the map lists no node for partition {partition:?}"))
+    })?;
+    if owner.node == node.id() {
+        return parts
+            .load()
+            .get(partition)
+            .map(|s| Place::Here(Arc::clone(s)))
+            .ok_or_else(|| not_open(partition));
+    }
+    Ok(Place::There(Target {
+        node: owner.node.clone(),
+        address: owner.address.clone(),
+        map_version: routes.map_version(),
+    }))
 }
 
 /// A partition's service that serves one ([`Service::part_opt`] is `Some`), read as its
@@ -706,18 +756,7 @@ impl Router {
                 ));
             };
             let p = route(routes, &op)?;
-            let mine = routes
-                .owner(&p)
-                .is_some_and(|o| o.node == cluster.node.id());
-            if !mine {
-                // The map moved the partition away, or never gave it here: the sender's map
-                // is older or newer than this node's; it pulls and routes again.
-                return Err(ApiError::wrong_partition(
-                    routes.map_version(),
-                    format!("this node doesn't serve partition {p:?}"),
-                ));
-            }
-            cluster.here(&p).ok_or_else(|| not_open(&p))?
+            cluster.owned_here(routes, &p)?
         };
         match op {
             ServiceOp::MultiGet(_) | ServiceOp::Nearest(_) if fanout_part => {
@@ -749,9 +788,9 @@ impl Router {
 
 /// Where a routed call goes when it isn't this node's.
 pub(crate) struct Target {
-    node: String,
-    address: String,
-    map_version: u64,
+    pub(crate) node: String,
+    pub(crate) address: String,
+    pub(crate) map_version: u64,
 }
 
 /// Where a routed call goes: a partition's service here, or the node serving it.
@@ -770,23 +809,7 @@ impl Cluster {
             ));
         };
         let partition = route(routes, op)?;
-        let owner = routes.owner(&partition).ok_or_else(|| {
-            ApiError::internal(format!("the map lists no node for partition {partition:?}"))
-        })?;
-        // Served here only when the map gives this node the partition *and* this node has
-        // it open: a partition the map moved away is the new owner's, even if its file is
-        // still open here.
-        if owner.node == self.node.id() {
-            return self
-                .here(&partition)
-                .map(Place::Here)
-                .ok_or_else(|| not_open(&partition));
-        }
-        Ok(Place::There(Target {
-            node: owner.node.clone(),
-            address: owner.address.clone(),
-            map_version: routes.map_version(),
-        }))
+        place(&self.node, &self.parts, routes, &partition)
     }
 }
 
