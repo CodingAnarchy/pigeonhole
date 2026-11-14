@@ -57,6 +57,7 @@
 - **First map:** a node's first map takes `expected_map_version = 0`, and must name the node it's sent to.
 - **Steps:** it validates (and validates the change from the current map), persists, and pushes to every other node in parallel, each push within `--cluster-push-timeout-ms`.
 - **The answer:** sent once the map is persisted here, with each push's result. A node the push missed pulls the map later (below).
+- **A node change (1.3.0, #1899, D317 amendment 3):** a non-forced map whose node ids differ from the current map's gets `previous_nodes` (`ClusterMap` field 6, repeated `Node`) set by the writer to the current map's nodes. Its `SetMap` pushes to the nodes before and after it until a majority of each holds it, for up to three push timeouts, and answers with the last pushes (nodes it removed included). While the newest map has `previous_nodes`, every non-forced `SetMap` (schema changes included) first pushes the map to both sets again, and is refused with `FailedPrecondition`, naming both counts and the nodes missing, unless a majority of each holds it. The change it takes clears `previous_nodes`, unless it changes the nodes itself. A forced map clears it. The writer ignores whatever `previous_nodes` a map sent to it says.
 
 **`PushMap`:**
 - **Accepted:** a valid map with a greater version and the same cluster (the change rules were checked where it was set).

@@ -943,3 +943,105 @@ fn a_map_that_changes_the_nodes_cant_also_move_a_partition() {
         assert!(m.partitions.iter().any(|p| p.id == "p1" && p.node == "c"));
     });
 }
+
+#[test]
+fn a_node_change_holds_back_every_later_map_until_a_majority_before_and_after_it_holds_it() {
+    // #1899's F4, with audit120's L2: a majority of one set of nodes confirms a partition's
+    // owner, so a map that changes the nodes must reach a majority of the nodes before it
+    // as well as of those after it before the map changes again. Here b and c are down when
+    // d and e join: a, d and e are a majority of the five, but a alone isn't one of the three
+    // before. Every later change is refused, another node change included, until b is back.
+    let mut t = Rig::start();
+    let limits = crate::serve::server_tests::limits();
+    let listeners: Vec<std::net::TcpListener> = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let new_ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let new_dirs = [test_dir(), test_dir()];
+    let mut new_stops = Vec::new();
+    for ((l, dir), id) in listeners.into_iter().zip(&new_dirs).zip(["d", "e"]) {
+        // New nodes with no map yet: the writer's push gives them their first.
+        let (stop, _) = data_node_full(&t.rt, dir, id, None, l, "", limits, None, false);
+        new_stops.push(stop);
+    }
+    t.stop(1);
+    t.stop(2);
+    let a = t.ports[0];
+    let current = || async {
+        client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let set = |m: ClusterMap| async move {
+        let expected = m.map_version - 1;
+        client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+    };
+    t.rt.block_on(async {
+        let mut grown = current().await;
+        grown.map_version += 1;
+        for (id, port) in ["d", "e"].into_iter().zip(&new_ports) {
+            grown.nodes.push(MapNode {
+                id: id.into(),
+                address: format!("127.0.0.1:{port}"),
+            });
+        }
+        let r = set(grown).await.unwrap().into_inner();
+        for (node, ok) in [("b", false), ("c", false), ("d", true), ("e", true)] {
+            assert!(
+                r.pushed.iter().any(|p| p.node == node && p.ok == ok),
+                "{node}: {r:?}"
+            );
+        }
+        let m = current().await;
+        assert_eq!(m.map_version, 2);
+        let before: Vec<&str> = m.previous_nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            before,
+            ["a", "b", "c"],
+            "the writer derives the nodes before it"
+        );
+
+        // Any change, not only a move: here one that changes nothing else, and another node
+        // change (dropping e).
+        let mut same = m.clone();
+        same.map_version += 1;
+        let mut shrunk = same.clone();
+        shrunk.nodes.retain(|n| n.id != "e");
+        for next in [same, shrunk] {
+            let e = set(next).await.unwrap_err();
+            assert_eq!(code(&e), "FailedPrecondition", "{e}");
+            assert!(
+                e.message().contains("(1 of 3)") && e.message().contains("(3 of 5)"),
+                "{e}"
+            );
+        }
+        assert_eq!(current().await.map_version, 2, "nothing was set");
+    });
+
+    // b back: a and b are a majority of the three, so the next map is taken, and it clears
+    // the nodes before (it doesn't change them itself).
+    t.restart(1);
+    t.rt.block_on(async {
+        let mut next = current().await;
+        next.map_version += 1;
+        set(next).await.unwrap();
+        let m = current().await;
+        assert_eq!(m.map_version, 3);
+        assert!(m.previous_nodes.is_empty(), "{m:?}");
+    });
+    drop(new_stops);
+}

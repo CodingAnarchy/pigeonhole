@@ -627,6 +627,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),

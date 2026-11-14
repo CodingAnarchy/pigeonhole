@@ -4996,6 +4996,12 @@ pub struct ClusterMap {
     /// Which partition holds each key range (layer 1: fixed once written).
     #[prost(message, repeated, tag = "5")]
     pub tables: ::prost::alloc::vec::Vec<TablePlacement>,
+    /// The nodes of the map before this one, when this one changed them (D317 rule 3, #1899's
+    /// F4): the map's writer takes no other change until a majority of these and a majority of
+    /// `nodes` hold the map. Derived where the map is set (a forced map clears it), carried by
+    /// the changes after it, and cleared by the first one once both majorities hold it.
+    #[prost(message, repeated, tag = "6")]
+    pub previous_nodes: ::prost::alloc::vec::Vec<Node>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {

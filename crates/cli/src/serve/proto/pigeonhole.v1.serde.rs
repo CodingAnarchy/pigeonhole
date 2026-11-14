@@ -2954,6 +2954,9 @@ impl serde::Serialize for ClusterMap {
         if !self.tables.is_empty() {
             len += 1;
         }
+        if !self.previous_nodes.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ClusterMap", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -2972,6 +2975,9 @@ impl serde::Serialize for ClusterMap {
         if !self.tables.is_empty() {
             struct_ser.serialize_field("tables", &self.tables)?;
         }
+        if !self.previous_nodes.is_empty() {
+            struct_ser.serialize_field("previous_nodes", &self.previous_nodes)?;
+        }
         struct_ser.end()
     }
 }
@@ -2989,6 +2995,8 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             "nodes",
             "partitions",
             "tables",
+            "previous_nodes",
+            "previousNodes",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -2998,6 +3006,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             Nodes,
             Partitions,
             Tables,
+            PreviousNodes,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -3024,6 +3033,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             "nodes" => Ok(GeneratedField::Nodes),
                             "partitions" => Ok(GeneratedField::Partitions),
                             "tables" => Ok(GeneratedField::Tables),
+                            "previousNodes" | "previous_nodes" => Ok(GeneratedField::PreviousNodes),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -3048,6 +3058,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                 let mut nodes__ = None;
                 let mut partitions__ = None;
                 let mut tables__ = None;
+                let mut previous_nodes__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -3082,6 +3093,12 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             }
                             tables__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::PreviousNodes => {
+                            if previous_nodes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("previousNodes"));
+                            }
+                            previous_nodes__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ClusterMap {
@@ -3090,6 +3107,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                     nodes: nodes__.unwrap_or_default(),
                     partitions: partitions__.unwrap_or_default(),
                     tables: tables__.unwrap_or_default(),
+                    previous_nodes: previous_nodes__.unwrap_or_default(),
                 })
             }
         }

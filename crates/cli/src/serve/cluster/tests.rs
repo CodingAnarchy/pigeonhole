@@ -128,6 +128,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
     ClusterMap {
         cluster_id: "c1".into(),
         map_version: version,
+        previous_nodes: Vec::new(),
         nodes: ["a", "b", "c"]
             .iter()
             .zip(ports)
@@ -3708,6 +3709,7 @@ fn split_nodes(
     let map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: ports
             .iter()
             .enumerate()

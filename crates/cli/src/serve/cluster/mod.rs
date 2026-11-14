@@ -196,6 +196,42 @@ pub(crate) struct Node {
     me: std::sync::Weak<Node>,
 }
 
+/// How long a node change's `SetMap` goes on pushing it, in push timeouts, for a majority of
+/// both the nodes before it and the nodes after it to hold it (#1899's F4).
+const JOINT_PUSHES: u32 = 3;
+
+/// Who holds a node change ([`Node::joint`]): of the nodes before it and after it, how many
+/// hold it and how many there are, this node included; and why each node that doesn't, as
+/// "id: why".
+struct Joint {
+    before: (usize, usize),
+    after: (usize, usize),
+    missing: Vec<String>,
+}
+
+impl Joint {
+    /// A majority of both sets.
+    fn held(&self) -> bool {
+        self.before.0 * 2 > self.before.1 && self.after.0 * 2 > self.after.1
+    }
+
+    /// The refusal of a change while `map`, a node change, isn't held.
+    fn refusal(&self, map: &ClusterMap) -> String {
+        format!(
+            "map version {} changed the cluster's nodes, and a majority of both the nodes \
+             before it ({} of {}) and the nodes after it ({} of {}) must hold it before the \
+             map changes again (D317 rule 3): {}. Bring those nodes up, or set a map with \
+             --force",
+            map.map_version,
+            self.before.0,
+            self.before.1,
+            self.after.0,
+            self.after.1,
+            self.missing.join("; ")
+        )
+    }
+}
+
 /// Where a map [`Node::install`] takes comes from.
 #[derive(Clone, Copy)]
 enum MapSource<'a> {
@@ -442,8 +478,15 @@ impl Node {
     /// follows. `force` (the forced recovery, for a writer that's down) skips the writer and
     /// the compare-and-set: the map need only be the same cluster's, at a version above this
     /// node's.
+    ///
+    /// **A node change (#1899's F4):** a map that changes the nodes carries the nodes before
+    /// it (`previous_nodes`), and answers once a majority of those and a majority of its own
+    /// hold it, or after [`JOINT_PUSHES`] push timeouts of trying. Until a majority of both
+    /// hold it, the writer takes no other change, a schema change included: a majority of
+    /// one set confirms a partition's owner (D317 rule 3), so the set before must have moved
+    /// on before a later map can count on the set after.
     async fn set_map(self: &Arc<Self>, req: SetMapRequest) -> Result<SetMapResponse, ApiError> {
-        let map = req
+        let mut map = req
             .map
             .ok_or_else(|| ApiError::invalid("SetMap needs a map"))?;
         if req.force {
@@ -455,6 +498,8 @@ impl Node {
                      the map's writer",
                 ));
             }
+            // A recovery waits for no majority: it's what `--force` means.
+            map.previous_nodes.clear();
             let version = self.install_async(map, None, |_| Ok(None)).await?;
             let pushed = self.push_all().await;
             return Ok(SetMapResponse {
@@ -487,7 +532,21 @@ impl Node {
             if let Some(why) = map::moves_with_node_change(&current, &map) {
                 return Err(ApiError::failed_precondition(why));
             }
+            if !current.previous_nodes.is_empty() {
+                let (joint, _) = self.joint(&current).await;
+                if !joint.held() {
+                    return Err(ApiError::failed_precondition(joint.refusal(&current)));
+                }
+            }
+            map.previous_nodes = if map::same_nodes(&current, &map) {
+                Vec::new()
+            } else {
+                current.nodes.clone()
+            };
+        } else {
+            map.previous_nodes.clear();
         }
+        let changes_nodes = !map.previous_nodes.is_empty();
         let expected = req.expected_map_version;
         let version = self
             .install_async(map, Some(req.copies), move |st| {
@@ -503,11 +562,54 @@ impl Node {
                 Ok(None)
             })
             .await?;
-        let pushed = self.push_all().await;
+        let pushed = match self.get_map() {
+            Ok(set) if changes_nodes && set.map_version == version => self.joint_wait(&set).await,
+            _ => self.push_all().await,
+        };
         Ok(SetMapResponse {
             map_version: version,
             pushed,
         })
+    }
+
+    /// Pushes a node change `map` to the nodes before it and after it, until a majority of
+    /// each holds it or [`JOINT_PUSHES`] push timeouts have passed: the last pushes.
+    async fn joint_wait(self: &Arc<Self>, map: &ClusterMap) -> Vec<NodePush> {
+        let until = tokio::time::Instant::now() + self.peers.push_timeout * JOINT_PUSHES;
+        let mut pause = Duration::from_millis(100);
+        loop {
+            let (joint, pushed) = self.joint(map).await;
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            if joint.held() || left.is_zero() {
+                return pushed;
+            }
+            tokio::time::sleep(pause.min(left)).await;
+            pause = (pause * 2).min(Duration::from_secs(1));
+        }
+    }
+
+    /// Pushes a node change `map` (one with `previous_nodes`) to every node before it and
+    /// after it, and counts who holds it: those that took it, and this node.
+    async fn joint(self: &Arc<Self>, map: &ClusterMap) -> (Joint, Vec<NodePush>) {
+        let mut all = map.previous_nodes.clone();
+        for n in &map.nodes {
+            if !all.iter().any(|p| p.id == n.id) {
+                all.push(n.clone());
+            }
+        }
+        let pushed = self.push_each(map, &all).await;
+        let holds = |id: &str| id == self.id || pushed.iter().any(|p| p.node == id && p.ok);
+        let count = |set: &[proto::Node]| (set.iter().filter(|n| holds(&n.id)).count(), set.len());
+        let joint = Joint {
+            before: count(&map.previous_nodes),
+            after: count(&map.nodes),
+            missing: pushed
+                .iter()
+                .filter(|p| !p.ok)
+                .map(|p| format!("{}: {}", p.node, p.error))
+                .collect(),
+        };
+        (joint, pushed)
     }
 
     /// Pushes the node's map to every other node in it, in parallel, each within the push
@@ -516,8 +618,14 @@ impl Node {
         let Ok(map) = self.get_map() else {
             return Vec::new();
         };
+        self.push_each(&map, &map.nodes).await
+    }
+
+    /// Pushes `map` to each of `nodes` but this one, in parallel, each within the push
+    /// timeout: each node's outcome, in id order.
+    async fn push_each(self: &Arc<Self>, map: &ClusterMap, nodes: &[proto::Node]) -> Vec<NodePush> {
         let mut tasks = tokio::task::JoinSet::new();
-        for n in map.nodes.iter().filter(|n| n.id != self.id) {
+        for n in nodes.iter().filter(|n| n.id != self.id) {
             let (node, id, address, map) = (
                 Arc::clone(self),
                 n.id.clone(),

@@ -268,16 +268,21 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     validate_epochs(old, new)
 }
 
+/// Whether `a` and `b` list the same node ids (in any order).
+pub(crate) fn same_nodes(a: &ClusterMap, b: &ClusterMap) -> bool {
+    fn ids(m: &ClusterMap) -> std::collections::BTreeSet<&str> {
+        m.nodes.iter().map(|n| n.id.as_str()).collect()
+    }
+    ids(a) == ids(b)
+}
+
 /// A map set through the writer that changes the cluster's nodes may not also move a
 /// partition or raise its epoch (D317 rule 3, as amended for #1760): a partition's owner
 /// changes only in a map with the same nodes as the one before it, so a majority of those
 /// nodes confirms one owner at a time. The refusal, naming the first such partition, or
 /// `None`. Forced maps aren't held to it (a recovery's), nor maps a peer pushes.
 pub(crate) fn moves_with_node_change(old: &ClusterMap, new: &ClusterMap) -> Option<String> {
-    let ids = |m: &ClusterMap| -> std::collections::BTreeSet<String> {
-        m.nodes.iter().map(|n| n.id.clone()).collect()
-    };
-    if ids(old) == ids(new) {
+    if same_nodes(old, new) {
         return None;
     }
     let old_parts: HashMap<&str, _> = old.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
@@ -448,6 +453,7 @@ mod tests {
         ClusterMap {
             cluster_id: "c1".into(),
             map_version: 1,
+            previous_nodes: Vec::new(),
             nodes: vec![node("a", 7001), node("b", 7002)],
             partitions: vec![part("p1", "a"), part("p2", "b"), part("p3", "b")],
             tables: vec![
