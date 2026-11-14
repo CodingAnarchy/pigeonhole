@@ -254,6 +254,19 @@ impl RowCaches {
         self.cache.usage()
     }
 
+    /// Resizes the cache to `bytes` (#1761): a shrink evicts down to it before returning, a
+    /// grow evicts nothing. The watermark slot table keeps its open size: it's a hint table
+    /// keyed by hash, so a shrunk cache has spare slots and a grown one more collisions (a
+    /// lower hit ratio, never a wrong read).
+    pub(crate) fn set_capacity(&self, bytes: usize) {
+        self.cache.set_capacity(bytes);
+    }
+
+    /// The cache's configured capacity in bytes.
+    pub(crate) fn capacity(&self) -> usize {
+        self.cache.capacity()
+    }
+
     /// The row cache's eviction passes that stopped early (#1559 A,
     /// `RowCache::deferred_evictions`).
     pub(crate) fn deferred_evictions(&self) -> u64 {

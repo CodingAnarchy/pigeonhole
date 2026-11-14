@@ -3538,6 +3538,36 @@ impl Engine {
             .sum()
     }
 
+    /// Resizes this database's block cache to `block_bytes` and its row cache to `row_bytes`
+    /// (#1761: `phdb serve` re-splitting a node's `--engine-memory` as partitions open and
+    /// close). A shrink evicts unpinned entries down to the new size before returning, a few
+    /// at a time with each cache shard's lock released between them; pinned blocks (open
+    /// readers, SSTs' top indexes and filters) stay until released, so usage can stay over
+    /// the new size by what is pinned. A grow evicts nothing. A cache that was off at open (0
+    /// bytes) stays off: the row cache's watermarks exist only when it was on. In a reader
+    /// process it resizes only that process's block cache (its row cache is its attachment's).
+    /// Synchronous: call it off async workers.
+    pub fn set_cache_capacities(&self, block_bytes: usize, row_bytes: usize) {
+        self.inner.shared.cache.set_capacity(block_bytes);
+        if let Some(rc) = &self.inner.shared.row_cache {
+            rc.set_capacity(row_bytes);
+        }
+    }
+
+    /// The block and row caches' configured capacities in bytes. A row cache that is off
+    /// reports 0, and so does a reader process's: its row cache is its attachment's (D281),
+    /// which this neither reports nor resizes (perf2's N1 on #1890).
+    pub fn cache_capacities(&self) -> (usize, usize) {
+        (
+            self.inner.shared.cache.capacity(),
+            self.inner
+                .shared
+                .row_cache
+                .as_ref()
+                .map_or(0, |rc| rc.capacity()),
+        )
+    }
+
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,
     /// its cache since the last attach to a writer generation (D281). A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
