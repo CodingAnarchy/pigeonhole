@@ -1226,7 +1226,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .router
             .serve_forwarded_scan(&msg.partition, scan, &caller)
             .await?;
-        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcPages(
+        Ok(tonic::Response::new(Box::pin(super::grpc::GrpcStream(
             pages,
         ))))
     }
