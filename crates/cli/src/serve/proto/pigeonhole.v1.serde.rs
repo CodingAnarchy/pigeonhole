@@ -17188,6 +17188,9 @@ impl serde::Serialize for ReplicationBatch {
         if self.caught_up {
             len += 1;
         }
+        if self.catalog_digest.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ReplicationBatch", len)?;
         if !self.events.is_empty() {
             struct_ser.serialize_field("events", &self.events.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
@@ -17199,6 +17202,11 @@ impl serde::Serialize for ReplicationBatch {
         }
         if self.caught_up {
             struct_ser.serialize_field("caught_up", &self.caught_up)?;
+        }
+        if let Some(v) = self.catalog_digest.as_ref() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("catalog_digest", ToString::to_string(&v).as_str())?;
         }
         struct_ser.end()
     }
@@ -17215,6 +17223,8 @@ impl<'de> serde::Deserialize<'de> for ReplicationBatch {
             "primarySeqno",
             "caught_up",
             "caughtUp",
+            "catalog_digest",
+            "catalogDigest",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17222,6 +17232,7 @@ impl<'de> serde::Deserialize<'de> for ReplicationBatch {
             Events,
             PrimarySeqno,
             CaughtUp,
+            CatalogDigest,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -17246,6 +17257,7 @@ impl<'de> serde::Deserialize<'de> for ReplicationBatch {
                             "events" => Ok(GeneratedField::Events),
                             "primarySeqno" | "primary_seqno" => Ok(GeneratedField::PrimarySeqno),
                             "caughtUp" | "caught_up" => Ok(GeneratedField::CaughtUp),
+                            "catalogDigest" | "catalog_digest" => Ok(GeneratedField::CatalogDigest),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -17268,6 +17280,7 @@ impl<'de> serde::Deserialize<'de> for ReplicationBatch {
                 let mut events__ = None;
                 let mut primary_seqno__ = None;
                 let mut caught_up__ = None;
+                let mut catalog_digest__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Events => {
@@ -17293,12 +17306,21 @@ impl<'de> serde::Deserialize<'de> for ReplicationBatch {
                             }
                             caught_up__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::CatalogDigest => {
+                            if catalog_digest__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("catalogDigest"));
+                            }
+                            catalog_digest__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
                     }
                 }
                 Ok(ReplicationBatch {
                     events: events__.unwrap_or_default(),
                     primary_seqno: primary_seqno__.unwrap_or_default(),
                     caught_up: caught_up__.unwrap_or_default(),
+                    catalog_digest: catalog_digest__,
                 })
             }
         }

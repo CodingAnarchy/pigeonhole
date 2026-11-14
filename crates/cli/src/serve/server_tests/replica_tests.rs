@@ -1313,17 +1313,27 @@ fn a_promote_that_fails_after_the_stop_reports_a_replica_that_follows_nothing() 
 /// - `dropped`: only the primary's check sees it; with no commit to the dropped table, the
 ///   replica would apply on and keep it.
 ///
+/// A replica made by 1.2.x holds a version 2 token, with no catalog for the primary to check
+/// (made here by cutting a version 3 token down). For it, a drop or a create nothing writes
+/// to is caught by the replica itself: the primary's batches carry its catalog's digest
+/// (#1853 part C2), and the replica's differs once it has applied everything.
+///
 /// The 1.1.x session is made here as 1.1.x leaves the sidecar: 1.2's session with its Catalog
 /// entries cut (the pigeonhole crate's `schema-rollback-1.1.3` corpus is 1.1.3's own bytes for
 /// the same cases).
 #[test]
 fn a_replica_bootstraps_again_when_its_primary_s_feed_missed_a_schema_change() {
-    for case in ["created", "dropped"] {
-        replica_across_an_unrecorded_schema_change(case);
+    for (case, legacy) in [
+        ("created", false),
+        ("dropped", false),
+        ("dropped", true),
+        ("created_unwritten", true),
+    ] {
+        replica_across_an_unrecorded_schema_change(case, legacy);
     }
 }
 
-fn replica_across_an_unrecorded_schema_change(case: &str) {
+fn replica_across_an_unrecorded_schema_change(case: &str, legacy: bool) {
     use pigeonhole_format::feed::{FEED_SUFFIX, FeedHeader};
     let options = || {
         Options::default()
@@ -1355,8 +1365,16 @@ fn replica_across_an_unrecorded_schema_change(case: &str) {
     put(&primary, "t", b"t0");
     let snap = primary.durable_snapshot().unwrap();
     primary.backup_at(&snap, rdir.join("t.phdb")).unwrap();
-    let start = primary.feed().from_snapshot(&snap).open().unwrap().token();
+    let mut start = primary.feed().from_snapshot(&snap).open().unwrap().token();
     drop(snap);
+    if legacy {
+        // 1.2.x's layout: version 2, without version 3's 16 bytes of catalog (D325).
+        let mut b = start.as_bytes().to_vec();
+        assert_eq!(b[0], 3, "a version 3 token");
+        b.truncate(b.len() - 16);
+        b[0] = 2;
+        start = pigeonhole::FeedToken::from_bytes(b);
+    }
     let replica = Pigeonhole::open(rdir.join("t.phdb"), Options::default()).unwrap();
     replica.begin_replication(&start).unwrap();
     replica.close().unwrap();
@@ -1375,6 +1393,14 @@ fn replica_across_an_unrecorded_schema_change(case: &str) {
                 .create()
                 .unwrap();
             put(&primary, "c", b"c1");
+        }
+        "created_unwritten" => {
+            primary
+                .table("c")
+                .unwrap()
+                .family("f", Family::default())
+                .create()
+                .unwrap();
         }
         "dropped" => primary.drop_table("d").unwrap(),
         _ => unreachable!(),
@@ -1398,7 +1424,7 @@ fn replica_across_an_unrecorded_schema_change(case: &str) {
     }
     assert!(
         recorded >= FeedHeader::LEN && cut == 1,
-        "{case}: one Catalog entry cut: {cut}"
+        "{case} {legacy}: one Catalog entry cut: {cut}"
     );
     std::fs::write(&sidecar, kept).unwrap();
 
@@ -1406,13 +1432,14 @@ fn replica_across_an_unrecorded_schema_change(case: &str) {
     let p = Server::serve(pdir, primary, "", limits(), None, |s| s);
     let r = Server::start_replica(rdir, &p.url, None);
     wait_replica(&r, "caught up again", caught_up(&p, None));
-    assert_eq!(get_value(&r, "t", "r", None), b64(b"t1"), "{case}");
+    assert_eq!(get_value(&r, "t", "r", None), b64(b"t1"), "{case} {legacy}");
     // Only a new bootstrap's copy brings the change: the feed never delivered it.
     let mut tables = r.shared.router.service.part().unwrap().db.tables();
     tables.sort();
     match case {
         "created" => assert_eq!(get_value(&r, "c", "r", None), b64(b"c1")),
-        "dropped" => assert_eq!(tables, ["t"], "{case}: the drop"),
+        "created_unwritten" => assert_eq!(tables, ["c", "d", "t"], "{case} {legacy}: the create"),
+        "dropped" => assert_eq!(tables, ["t"], "{case} {legacy}: the drop"),
         _ => unreachable!(),
     }
 }

@@ -245,6 +245,8 @@ fn pump(
             // seqno, which runs ahead of it under `Buffered` (cli692's F5 on #1583).
             primary_seqno: db.replication_frontier(),
             caught_up,
+            // The catalog at the feed's position, after these events (#1853 part C2).
+            catalog_digest: feed.catalog_digest(),
         };
         if !send_within(tx, batch, idle)? {
             // The replica went away.
@@ -852,6 +854,24 @@ impl Replica {
                 {
                     return halt;
                 }
+            }
+            // Every event up to the batch's end is applied (#1853 part C2): the replica's
+            // catalog must now be its primary's at the same position. A different one is a
+            // schema change the primary's feed never delivered (one made under 1.1.x after a
+            // rollback: a drop, or a create nothing has written to, which no apply refuses),
+            // so the replica bootstraps again. A primary that sends no digest (1.2.x) isn't
+            // checked.
+            if run.events.is_empty()
+                && peeked.is_none()
+                && let Some(want) = batch.catalog_digest
+                && db.replication_catalog_digest() != want
+            {
+                return Halt::Expired(
+                    "the replica's tables are no longer its primary's at the same position (a \
+                     schema change the primary's feed didn't record, such as one made while \
+                     it ran 1.1.x), so it bootstraps again"
+                        .to_owned(),
+                );
             }
             let mut s = self.status();
             let caught_up = batch.caught_up && run.events.is_empty() && peeked.is_none();

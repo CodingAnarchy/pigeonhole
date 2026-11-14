@@ -705,6 +705,14 @@ impl CatalogModel {
         out.extend_from_slice(&self.next_family.to_le_bytes());
     }
 
+    /// One number for the whole model (#1853 part C2): xxh3-64 of its encoding. A replica
+    /// compares its own catalog's with its primary's feed's at the same position.
+    fn digest(&self) -> u64 {
+        let mut b = Vec::with_capacity(Self::LEN);
+        self.encode(&mut b);
+        pigeonhole_format::checksum::xxh3_64(&b)
+    }
+
     fn decode(b: &[u8]) -> Self {
         Self {
             tables: u64::from_le_bytes(b[..8].try_into().unwrap()),
@@ -712,6 +720,12 @@ impl CatalogModel {
             next_family: u32::from_le_bytes(b[12..16].try_into().unwrap()),
         }
     }
+}
+
+/// The digest of `catalog`'s model (#1853 part C2): what [`FeedReader::catalog_digest`] says
+/// at the same position.
+pub(crate) fn catalog_digest_of(catalog: &crate::catalog::Catalog) -> u64 {
+    CatalogModel::of(catalog).digest()
 }
 
 /// The catalog model at a feed of every table's start, worked out at open from the catalog
@@ -1503,6 +1517,14 @@ impl FeedReader {
     pub fn set_progress(&mut self, sink: Arc<AtomicU64>) {
         sink.fetch_max(self.position().seqno, Ordering::Relaxed);
         self.progress = Some(sink);
+    }
+
+    /// A feed of every table: the digest of the catalog at its position (D325's model, #1853
+    /// part C2), which a replica that applied everything this feed delivered must have too
+    /// ([`Engine::catalog_digest`](crate::Engine::catalog_digest)). `None` for a feed of some
+    /// tables, and for one that expired at its open.
+    pub fn catalog_digest(&self) -> Option<u64> {
+        self.model.as_ref().map(CatalogModel::digest)
     }
 
     /// Where this feed is, to resume it with [`FeedStart::Token`]: just past the last
