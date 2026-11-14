@@ -3257,12 +3257,39 @@ fn seed_timeout() -> Duration {
 /// How long each gdb attempt in a hang report may take (`timeout`'s bound; `-k 5` after it).
 const GDB_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Starts the hang report's own deadline: a thread that aborts the process once the report
-/// (two gdb attempts, then 5 s of trace) has had time to finish, whatever the report is
-/// blocked on. A stalled disk then ends the job about [`seed_timeout`] plus 2.5 minutes after
-/// the seed started, not at the job's limit.
+/// Starts the hang report's deadlines, before the report does anything that can block: once
+/// the report (two gdb attempts, then 5 s of trace) has had time to finish, the process ends,
+/// whatever the report is blocked on. A stalled disk then ends the job about
+/// [`seed_timeout`] plus 2.5 minutes after the seed started, not at the job's limit.
+///
+/// Two of them:
+/// - a thread of this process that writes a note and aborts, at 150 s;
+/// - a process outside it that kills it (`SIGKILL`) 10 s later, for when the thread can't
+///   run: an attached gdb stops every thread of the process, and a gdb stuck on the disk
+///   while attached may not die to `timeout`'s kill until its I/O returns (audit120's S1 on
+///   #1911). It waits on a pipe this process holds open (`timeout N cat`), so if this
+///   process ends first, `cat` reads end of file and nothing is killed: a reused pid is
+///   never signalled. Where there is no `timeout` (macOS), it does nothing.
 fn hang_deadline() {
     let report = 2 * (GDB_TIMEOUT + Duration::from_secs(5)) + Duration::from_secs(20);
+    let outside = report + Duration::from_secs(10);
+    let pid = std::process::id();
+    if let Ok(mut killer) = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "timeout {} cat >/dev/null; [ $? -eq 124 ] && kill -9 {pid}",
+            outside.as_secs()
+        ))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // The pipe's write end stays open for the rest of this process (it ends soon): its
+        // close at exit is what tells the killer to stand down.
+        std::mem::forget(killer.stdin.take());
+        std::mem::forget(killer);
+    }
     let _ = std::thread::Builder::new()
         .name("hang deadline".to_owned())
         .spawn(move || {
@@ -3343,14 +3370,12 @@ fn check(cfg: &Config) -> Vec<Stats> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone();
                 // Straight to stderr: the test harness's capture would lose an `eprintln!`.
-                // Before the failure log, which is a file write.
                 let hung = format!(
                     "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
                      {placed}) did not finish in {limit:?}; it was at {at}",
                     cfg.shards, cfg.tablet_changes, cfg.deferred_io
                 );
                 let _ = writeln!(std::io::stderr(), "{hung}");
-                log_failure(&hung);
                 // Every thread's stack, where gdb can attach: what the hung thread waits
                 // on, when nothing else shows it (#838). Only on CI (`CI` is set on the
                 // runners, where root bypasses ptrace_scope) or on request
@@ -3408,6 +3433,9 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 pigeonhole_engine::set_tracing(true);
                 std::thread::sleep(Duration::from_secs(5));
                 let _ = writeln!(std::io::stderr(), "HUNG: end of the trace after the hang");
+                // The failure log last: it is a file write (a sweep sets
+                // `PIGEONHOLE_FAIL_LOG`), and a stalled disk there must not cost the stacks.
+                log_failure(&hung);
                 std::process::abort();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
