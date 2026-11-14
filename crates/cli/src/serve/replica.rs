@@ -245,6 +245,8 @@ fn pump(
             // seqno, which runs ahead of it under `Buffered` (cli692's F5 on #1583).
             primary_seqno: db.replication_frontier(),
             caught_up,
+            // The catalog at the feed's position, after these events (#1853 part C2).
+            catalog_digest: feed.catalog_digest(),
         };
         if !send_within(tx, batch, idle)? {
             // The replica went away.
@@ -309,10 +311,44 @@ impl std::fmt::Debug for ReplicaConfig {
     }
 }
 
+/// Where a replica's loop is, as `ReplicaInfo.state` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Starting,
+    Bootstrapping,
+    Following,
+    ReBootstrapping,
+    /// After an error, which `last_error` gives.
+    Retrying,
+    /// A promote failed after it stopped the loop.
+    Stopped,
+    /// A primary now: `Admin.Info` reports no replica.
+    Promoted,
+}
+
+impl State {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Bootstrapping => "bootstrapping",
+            Self::Following => "following",
+            Self::ReBootstrapping => "re-bootstrapping",
+            Self::Retrying => "retrying",
+            Self::Stopped => "stopped",
+            Self::Promoted => "promoted",
+        }
+    }
+
+    /// Whether the replica's copy is still arriving or being swapped in.
+    fn copying(self) -> bool {
+        matches!(self, Self::Bootstrapping | Self::ReBootstrapping)
+    }
+}
+
 /// What `Admin.Info` and `/metrics` report.
 #[derive(Debug)]
 struct Status {
-    state: &'static str,
+    state: State,
     applied: u64,
     primary_seqno: u64,
     caught_up: bool,
@@ -341,6 +377,12 @@ pub(crate) struct Replica {
     /// The primary's seqno applied through, as `Status::applied`, for reads waiting on it
     /// (#1577). It goes back to 0 only when a bootstrap swaps another copy in.
     applied: watch::Sender<u64>,
+    /// Set when a bootstrap swaps a copy in, cleared by the first catalog digest that
+    /// matches the primary's (#1853 part C2). A mismatch while set can't be a schema change
+    /// the primary's feed missed (no 1.1.x session runs under a serving primary between a
+    /// copy and its batches), so another copy wouldn't fix it: the loop retries instead of
+    /// downloading the database again (cli692's S1 on #1878).
+    unconfirmed: AtomicBool,
 }
 
 /// The fault seam: in the tests, a promote of the database at this path fails after the
@@ -371,7 +413,7 @@ impl Replica {
         Arc::new(Self {
             config,
             status: Mutex::new(Status {
-                state: "starting",
+                state: State::Starting,
                 applied: 0,
                 primary_seqno: 0,
                 caught_up: false,
@@ -382,6 +424,7 @@ impl Replica {
             }),
             promoted: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
+            unconfirmed: AtomicBool::new(false),
             stop: watch::channel(false).0,
             task: Mutex::new(None),
             applied: watch::channel(0).0,
@@ -398,7 +441,7 @@ impl Replica {
     /// lacks then is `ReplicaBehind`, not `Unavailable` (#1618).
     pub(crate) fn settling(&self) -> Option<&'static str> {
         let state = self.status().state;
-        matches!(state, "starting" | "bootstrapping" | "re-bootstrapping").then_some(state)
+        (state == State::Starting || state.copying()).then_some(state.as_str())
     }
 
     /// Records `error` as the replica's last error (`Admin.Info`), its state as it is: for a
@@ -416,7 +459,7 @@ impl Replica {
         self.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn set_state(&self, state: &'static str) {
+    fn set_state(&self, state: State) {
         self.status().state = state;
     }
 
@@ -432,7 +475,7 @@ impl Replica {
         self.status().bootstrap_phase = phase;
     }
 
-    fn fail(&self, state: &'static str, error: String) {
+    fn fail(&self, state: State, error: String) {
         let mut s = self.status();
         s.state = state;
         s.last_error = error;
@@ -468,9 +511,10 @@ impl Replica {
             return Ok(());
         }
         let state = self.status().state;
-        if matches!(state, "bootstrapping" | "re-bootstrapping") {
+        if state.copying() {
             return Err(ApiError::replica_behind(format!(
-                "this replica is {state}: it can't wait for the primary's seqno {seqno}"
+                "this replica is {}: it can't wait for the primary's seqno {seqno}",
+                state.as_str()
             )));
         }
         let wait = tokio::time::timeout_at(deadline.at.into(), rx.wait_for(|&a| a >= seqno));
@@ -494,7 +538,7 @@ impl Replica {
         let s = self.status();
         Some(proto::ReplicaInfo {
             primary: self.config.primary.clone(),
-            state: s.state.to_owned(),
+            state: s.state.as_str().to_owned(),
             applied_primary_seqno: s.applied,
             primary_seqno: s.primary_seqno,
             lag_commits: s.primary_seqno.saturating_sub(s.applied),
@@ -613,7 +657,7 @@ impl Replica {
             Err(e) => {
                 // Past the stop, a failed promote leaves a replica that follows nothing:
                 // Info and the `following` gauge say so (audit120's S1 on #1801).
-                self.fail("stopped", format!("promote failed: {}", e.message));
+                self.fail(State::Stopped, format!("promote failed: {}", e.message));
                 return Err(e);
             }
         };
@@ -621,7 +665,7 @@ impl Replica {
         // A primary now: every read waiting for a seqno passes (the loop is stopped, so
         // nothing sets the value again).
         self.applied.send_replace(u64::MAX);
-        self.set_state("promoted");
+        self.set_state(State::Promoted);
         Ok(token.map(|t| t.as_bytes().to_vec()).unwrap_or_default())
     }
 
@@ -653,7 +697,7 @@ impl Replica {
             let failed = match halt {
                 Halt::Stopped => return,
                 Halt::Expired(why) => {
-                    self.fail("re-bootstrapping", why);
+                    self.fail(State::ReBootstrapping, why);
                     match self.bootstrap(shared, &mut stop).await {
                         Ok(()) => None,
                         Err(Halt::Stopped) => return,
@@ -663,7 +707,7 @@ impl Replica {
                 Halt::Failed(e) => Some(e),
             };
             if let Some(e) = failed {
-                self.fail("retrying", e);
+                self.fail(State::Retrying, e);
             }
             tokio::select! {
                 () = tokio::time::sleep(backoff) => {}
@@ -728,7 +772,7 @@ impl Replica {
                 // one.)
                 // `phdb serve` checked at start that the file was empty or a replica's.
                 Ok(Ok(_)) => {
-                    self.set_state("bootstrapping");
+                    self.set_state(State::Bootstrapping);
                     if let Err(halt) = self.bootstrap(shared, stop).await {
                         return halt;
                     }
@@ -757,7 +801,7 @@ impl Replica {
             Ok(r) => r.into_inner(),
             Err(status) => return halt_of(&status),
         };
-        self.set_state("following");
+        self.set_state(State::Following);
         let mut run = Run::default();
         let mut peeked = None;
         loop {
@@ -818,6 +862,40 @@ impl Replica {
                     return halt;
                 }
             }
+            // Every event up to the batch's end is applied (#1853 part C2): the replica's
+            // catalog must now be its primary's at the same position. A different one is a
+            // schema change the primary's feed never delivered (one made under 1.1.x after a
+            // rollback: a drop, or a create nothing has written to, which no apply refuses),
+            // so the replica bootstraps again. A primary that sends no digest (1.2.x) isn't
+            // checked.
+            if run.events.is_empty()
+                && peeked.is_none()
+                && let Some(want) = batch.catalog_digest
+            {
+                let have = db.replication_catalog_digest();
+                if have == want {
+                    self.unconfirmed.store(false, Ordering::Relaxed);
+                } else if self.unconfirmed.load(Ordering::Relaxed) {
+                    // A fresh copy that doesn't match: the two sides' digests disagree for
+                    // another reason, which a copy won't change (cli692's S1 on #1878). The
+                    // one exception, a primary rolled back between the copy and its first
+                    // match, can't be told apart here: a restart starts confirmed, so the
+                    // message names that way out.
+                    return Halt::Failed(format!(
+                        "the replica's catalog digest {have:016x} isn't its primary's \
+                         {want:016x} right after a bootstrap: a copy won't fix it, so it \
+                         retries (report this); if the primary was rolled back since this \
+                         copy, restart the replica to take a new copy"
+                    ));
+                } else {
+                    return Halt::Expired(
+                        "the replica's tables are no longer its primary's at the same position \
+                         (a schema change the primary's feed didn't record, such as one made \
+                         while it ran 1.1.x), so it bootstraps again"
+                            .to_owned(),
+                    );
+                }
+            }
             let mut s = self.status();
             let caught_up = batch.caught_up && run.events.is_empty() && peeked.is_none();
             if caught_up {
@@ -826,7 +904,7 @@ impl Replica {
                 s.caught_up = false;
                 s.behind_since = Instant::now();
             }
-            if !s.last_error.is_empty() && s.state == "following" {
+            if !s.last_error.is_empty() && s.state == State::Following {
                 s.last_error.clear();
             }
         }
@@ -945,6 +1023,7 @@ impl Replica {
         // nothing cached of the old one may serve again.
         service.engine_replaced();
         swapped.map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        self.unconfirmed.store(true, Ordering::Relaxed);
         let mut s = self.status();
         s.caught_up = false;
         s.behind_since = Instant::now();

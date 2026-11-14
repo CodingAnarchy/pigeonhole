@@ -91,13 +91,19 @@ pub(crate) enum Copy {
 }
 
 struct Entry {
-    kept: Kept,
-    /// Written and hashed: until then the backup thread owns it, and it counts against
-    /// `KEPT_MAX` but is neither evicted nor reaped (its readers wait on `state`).
-    ready: bool,
+    path: PathBuf,
     readers: usize,
     last_used: Instant,
+    /// The copy, written only under the table's lock.
     state: watch::Sender<Copy>,
+}
+
+impl Entry {
+    /// Written and hashed: until then the backup thread owns the copy, and it counts against
+    /// `KEPT_MAX` but is neither evicted nor reaped (its readers wait on `state`).
+    fn ready(&self) -> bool {
+        matches!(*self.state.borrow(), Copy::Ready(_))
+    }
 }
 
 /// The server's backups: `--backup-dir`, its download directory, and the downloads kept.
@@ -338,7 +344,7 @@ impl Backups {
         while kept.len() >= KEPT_MAX {
             let oldest = kept
                 .iter()
-                .filter(|(_, e)| e.ready && e.readers == 0)
+                .filter(|(_, e)| e.ready() && e.readers == 0)
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(id, _)| id.clone());
             let Some(old) = oldest else {
@@ -348,7 +354,7 @@ impl Backups {
                 )));
             };
             if let Some(e) = kept.remove(&old) {
-                let _ = std::fs::remove_file(&e.kept.path);
+                let _ = std::fs::remove_file(&e.path);
             }
         }
         let (state, copy) = watch::channel(Copy::Writing {
@@ -357,14 +363,7 @@ impl Backups {
         kept.insert(
             id.clone(),
             Entry {
-                kept: Kept {
-                    path: path.clone(),
-                    total: 0,
-                    sha256: [0; 32],
-                    feed_token: Vec::new(),
-                    identity: None,
-                },
-                ready: false,
+                path: path.clone(),
                 readers: 1,
                 last_used: Instant::now(),
                 state,
@@ -377,7 +376,6 @@ impl Backups {
     /// its readers can follow from it before the copy is written.
     fn started(&self, id: &str, feed_token: Vec<u8>) {
         if let Some(e) = self.lock().get_mut(id) {
-            e.kept.feed_token.clone_from(&feed_token);
             e.state.send_replace(Copy::Writing { feed_token });
         }
     }
@@ -393,23 +391,25 @@ impl Backups {
         let Some(e) = kept.get_mut(id) else { return };
         // The token the backup returned is the one it announced (cli692's N3 on #1628).
         debug_assert!(
-            e.kept.feed_token.is_empty() || e.kept.feed_token == feed_token,
+            matches!(&*e.state.borrow(), Copy::Writing { feed_token: announced }
+                if announced.is_empty() || *announced == feed_token),
             "copy {id}'s feed token changed"
         );
-        e.kept.total = total;
-        e.kept.sha256 = sha256;
-        e.kept.feed_token = feed_token;
-        e.kept.identity = identity;
-        e.ready = true;
         e.last_used = Instant::now();
-        e.state.send_replace(Copy::Ready(e.kept.clone()));
+        e.state.send_replace(Copy::Ready(Kept {
+            path: e.path.clone(),
+            total,
+            sha256,
+            feed_token,
+            identity,
+        }));
     }
 
     /// Copy `id` won't be finished: its readers see why, and it goes, file and all.
     fn fail(&self, id: &str, error: ApiError) {
         if let Some(e) = self.lock().remove(id) {
             e.state.send_replace(Copy::Failed(error));
-            let _ = std::fs::remove_file(&e.kept.path);
+            let _ = std::fs::remove_file(&e.path);
         }
     }
 }
@@ -442,12 +442,12 @@ impl Backups {
             let old: Vec<String> = kept
                 .iter()
                 .filter(|(_, e)| {
-                    e.ready && e.readers == 0 && now.duration_since(e.last_used) >= KEEP
+                    e.ready() && e.readers == 0 && now.duration_since(e.last_used) >= KEEP
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
             old.iter()
-                .filter_map(|id| kept.remove(id).map(|e| e.kept.path))
+                .filter_map(|id| kept.remove(id).map(|e| e.path))
                 .collect()
         };
         for path in gone {
@@ -544,22 +544,27 @@ impl Drop for Backups {
     /// The server is going: the downloads it kept for resumes go with it.
     fn drop(&mut self) {
         for e in self.lock().values() {
-            let _ = std::fs::remove_file(&e.kept.path);
+            let _ = std::fs::remove_file(&e.path);
         }
     }
 }
 
 /// `path`'s size and SHA-256, read once (on the blocking pool).
 pub(crate) fn digest(path: &Path) -> Result<(u64, [u8; 32]), ApiError> {
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| ApiError::internal(format!("reading the backup: {e}")))?;
+    std::fs::File::open(path)
+        .and_then(|mut f| sha256_of(&mut f))
+        .map_err(|e| ApiError::internal(format!("reading the backup: {e}")))
+}
+
+/// The size and SHA-256 of what's left of `f`, read through once. One copy for a backup
+/// download, an upload, a closed partition's files and `phdb cluster backup`; each caller
+/// opens the file and words its own error.
+pub(crate) fn sha256_of(f: &mut impl Read) -> std::io::Result<(u64, [u8; 32])> {
     let mut h = Sha256::new();
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; 1 << 20];
     let mut total = 0u64;
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| ApiError::internal(format!("reading the backup: {e}")))?;
+        let n = f.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -917,7 +922,7 @@ mod tests {
         go.send(()).unwrap();
         let path = done.recv_timeout(Duration::from_secs(5)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !b.lock().values().any(|e| e.ready && e.readers == 0) {
+        while !b.lock().values().any(|e| e.ready() && e.readers == 0) {
             assert!(Instant::now() < deadline, "the copy was never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
