@@ -122,12 +122,15 @@ impl Fences {
             .map(|s| (Arc::clone(&s.gate), s.epoch))
     }
 
-    /// Partitions the peers haven't confirmed since they opened here, operator-fenced or not
-    /// (#1829: an operator's fence no longer hides the wait).
-    pub(crate) fn unconfirmed(&self) -> Vec<String> {
+    /// Partitions a peer's map can still confirm: unconfirmed since they opened here
+    /// (operator-fenced or not, #1829), and named by `map`, this node's (`node`), at their
+    /// file's epoch. One the map no longer names there can never be confirmed (a map's epochs
+    /// only rise), so the start's retries don't wait for it (audit120's S1 on #1897: a move's
+    /// old node, restarted with its copy fenced, would otherwise ask its peers for ever).
+    pub(crate) fn confirmable(&self, map: &ClusterMap, node: &str) -> Vec<String> {
         self.served()
             .iter()
-            .filter(|(_, s)| s.gate.awaiting_peers())
+            .filter(|(id, s)| s.gate.awaiting_peers() && names(map, node, id, s.epoch))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -389,7 +392,7 @@ impl Node {
             if map.nodes.iter().all(|n| n.id == self.id) {
                 self.confirm(&map);
             }
-            if self.fences.unconfirmed().is_empty() {
+            if self.fences.confirmable(&map, &self.id).is_empty() {
                 return;
             }
             tokio::time::sleep(wait).await;
@@ -423,6 +426,35 @@ pub(super) fn not_here(id: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_starts_retries_wait_only_for_partitions_the_map_still_names_here() {
+        // audit120's S1 on #1897: an unconfirmed partition the node's own map no longer names
+        // at its file's epoch (its copy was moved away) can't be confirmed again, so
+        // `confirm_after_start` doesn't keep asking the peers for it.
+        let dir = pigeonhole::doc_support::temp_dir();
+        let n = super::super::tests::node(&dir, "a");
+        let map = |node: &str, epoch: u64| ClusterMap {
+            map_version: 2,
+            partitions: vec![crate::serve::proto::Partition {
+                id: "p1".into(),
+                node: node.into(),
+                epoch,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _gate = n.open_gate("p1", 1);
+        assert_eq!(n.fences.confirmable(&map("a", 1), "a"), ["p1"]);
+        assert!(
+            n.fences.confirmable(&map("b", 2), "a").is_empty(),
+            "moved away"
+        );
+        assert!(
+            n.fences.confirmable(&map("a", 2), "a").is_empty(),
+            "another epoch"
+        );
+    }
 
     #[test]
     fn fenced_json_round_trips_and_a_missing_file_is_none() {
