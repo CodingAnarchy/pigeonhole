@@ -433,13 +433,13 @@ feed-drain 6154 0.3
 feed-drain-all 6177 0.3
 replicate-apply 6764 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
-# From the head bceed2da9 (main e9b1e5f44, with #1872's and #1892's serve changes: #1892 added
-# about 55 to serve-get and 70 to serve-scan), three identical-code runs, 43580182634, 43580187515
-# and 43583722484 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
-# runs: serve-get 74444-74462, serve-read-row 663434-663458, serve-scan 8021082-8021107, and
-# serve-mutate 69532-69827 (0.42%; over nine runs on three heads 69528-69827; its per-PR
-# threshold is 1.0%, and tracing the noise is #1900).
-serve-get 74686 0.3
-serve-read-row 665449 0.3
-serve-mutate 70037 0.3
-serve-scan 8045171 0.3
+# From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
+# and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
+# runs: serve-get 74914-74925, serve-read-row 663899-663986, serve-scan 8021546-8021560, and
+# serve-mutate 70129-70197. Main's #1898 (cluster code only) added about 450-470 per call to every
+# shape through the cli crate's single codegen unit (#1902); serve-mutate's per-PR threshold is
+# 1.0%, and tracing its run-to-run noise is #1900.
+serve-get 75150 0.3
+serve-read-row 665978 0.3
+serve-mutate 70408 0.3
+serve-scan 8045625 0.3
