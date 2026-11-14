@@ -1423,11 +1423,7 @@ impl tonic::server::ServerStreamingService<proto::ForwardSubscribeRequest> for F
     fn call(&mut self, req: tonic::Request<proto::ForwardSubscribeRequest>) -> Self::Future {
         let this = self.0.clone();
         Box::pin(async move {
-            let header = req
-                .metadata()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok());
-            let caller = this.node.caller(header)?;
+            let caller = this.node.caller(crate::serve::grpc::auth_header(&req))?;
             this.node.allowed(
                 &caller,
                 &[crate::serve::auth::Scope::Cluster],

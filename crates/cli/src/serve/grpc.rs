@@ -26,7 +26,7 @@ use super::errors::ApiError;
 use super::feed::Out;
 use super::proto::{self, data_server::Data};
 use super::replica::ReadDeadline;
-use super::service::{ScanPages, ServiceOp, ServiceReply};
+use super::service::{ServiceOp, ServiceReply};
 
 /// The budget `prepay` reserved for a request, for its handler to take. Extensions must be
 /// `Clone`; the permit is taken once.
@@ -382,11 +382,23 @@ fn parse_grpc_timeout(v: &str) -> Option<Duration> {
     })
 }
 
-/// A scan's pages as gRPC messages (a cluster's forwarded scan's too, D317 ticket 4a).
-pub(crate) struct GrpcPages(pub(crate) ScanPages);
+/// A gRPC request's `Authorization` header, if it has one that is text.
+pub(crate) fn auth_header<T>(req: &Request<T>) -> Option<&str> {
+    req.metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+}
 
-impl Stream for GrpcPages {
-    type Item = Result<proto::ScanPage, Status>;
+/// A reply stream as gRPC messages: each `ApiError` as its `Status`. A scan's pages (a
+/// cluster's forwarded scan's too, D317 ticket 4a), a backup download's chunks, a follow's
+/// batches and a memory watch's events.
+pub(crate) struct GrpcStream<S>(pub(crate) S);
+
+impl<S, T> Stream for GrpcStream<S>
+where
+    S: Stream<Item = Result<T, ApiError>> + Unpin,
+{
+    type Item = Result<T, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.0)
@@ -415,11 +427,7 @@ async fn call<T>(
     req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<ServiceReply, Status> {
-    let header = req
-        .metadata()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-    let caller = shared.caller(header)?;
+    let caller = shared.caller(auth_header(&req))?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -631,18 +639,6 @@ impl tonic::server::NamedService for FeedGrpc {
 #[derive(Debug, Clone)]
 pub(crate) struct AdminGrpc(pub(crate) Arc<Shared>);
 
-struct GrpcChunks(super::backup::Download);
-
-impl Stream for GrpcChunks {
-    type Item = Result<proto::BackupChunk, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.0)
-            .poll_next(cx)
-            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
-    }
-}
-
 #[tonic::async_trait]
 impl proto::admin_server::Admin for AdminGrpc {
     /// Liveness, with no token: whether the database is open and not failed.
@@ -694,7 +690,7 @@ impl proto::admin_server::Admin for AdminGrpc {
         req: Request<proto::BackupDownloadRequest>,
     ) -> Result<Response<Self::BackupDownloadStream>, Status> {
         match call(&self.0, req, ServiceOp::BackupDownload).await? {
-            ServiceReply::Download(d) => Ok(Response::new(Box::pin(GrpcChunks(d)))),
+            ServiceReply::Download(d) => Ok(Response::new(Box::pin(GrpcStream(d)))),
             _ => Err(unexpected()),
         }
     }
@@ -717,11 +713,7 @@ impl proto::admin_server::Admin for AdminGrpc {
         &self,
         req: Request<tonic::Streaming<proto::PartitionUploadChunk>>,
     ) -> Result<Response<proto::PartitionUploadReply>, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(auth_header(&req))?;
         let reply = self
             .0
             .router
@@ -734,11 +726,7 @@ impl proto::admin_server::Admin for AdminGrpc {
         &self,
         req: Request<proto::PartitionUploadStatusRequest>,
     ) -> Result<Response<proto::PartitionUploadStatusReply>, Status> {
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = self.0.caller(header)?;
+        let caller = self.0.caller(auth_header(&req))?;
         let reply = self.0.router.partition_upload_status(
             &caller,
             &req.get_ref().upload_id,
@@ -752,18 +740,6 @@ impl proto::admin_server::Admin for AdminGrpc {
 #[derive(Debug, Clone)]
 pub(crate) struct ReplicationGrpc(pub(crate) Arc<Shared>);
 
-struct GrpcBatches(super::replica::FollowBatches);
-
-impl Stream for GrpcBatches {
-    type Item = Result<proto::ReplicationBatch, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.0)
-            .poll_next(cx)
-            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
-    }
-}
-
 #[tonic::async_trait]
 impl proto::replication_server::Replication for ReplicationGrpc {
     type FollowStream = Pin<Box<dyn Stream<Item = Result<proto::ReplicationBatch, Status>> + Send>>;
@@ -773,7 +749,7 @@ impl proto::replication_server::Replication for ReplicationGrpc {
         req: Request<proto::FollowRequest>,
     ) -> Result<Response<Self::FollowStream>, Status> {
         match call(&self.0, req, ServiceOp::Follow).await? {
-            ServiceReply::Follow(b) => Ok(Response::new(Box::pin(GrpcBatches(b)))),
+            ServiceReply::Follow(b) => Ok(Response::new(Box::pin(GrpcStream(b)))),
             _ => Err(unexpected()),
         }
     }
@@ -840,11 +816,7 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
         req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
     ) -> Result<Response<proto::Empty>, Status> {
         let shared = &self.0;
-        let header = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        let caller = shared.caller(header)?;
+        let caller = shared.caller(auth_header(&req))?;
         let first_budget = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
         let meter = req.extensions().get::<Meter>().cloned().unwrap_or_default();
         let limits = shared.limits;
@@ -963,19 +935,6 @@ impl proto::text_server::Text for TextGrpc {
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryGrpc(pub(crate) Arc<Shared>);
 
-/// A memory watch's events as gRPC messages.
-struct GrpcMemoryEvents(super::memory::MemoryEvents);
-
-impl Stream for GrpcMemoryEvents {
-    type Item = Result<proto::MemoryEvent, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.0)
-            .poll_next(cx)
-            .map(|item| item.map(|r| r.map_err(|e| e.to_status())))
-    }
-}
-
 #[tonic::async_trait]
 impl proto::memory_server::Memory for MemoryGrpc {
     type WatchStream = Pin<Box<dyn Stream<Item = Result<proto::MemoryEvent, Status>> + Send>>;
@@ -1027,7 +986,7 @@ impl proto::memory_server::Memory for MemoryGrpc {
         req: Request<proto::MemoryWatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         match call(&self.0, req, ServiceOp::MemoryWatch).await? {
-            ServiceReply::MemoryWatch(e) => Ok(Response::new(Box::pin(GrpcMemoryEvents(e)))),
+            ServiceReply::MemoryWatch(e) => Ok(Response::new(Box::pin(GrpcStream(e)))),
             _ => Err(unexpected()),
         }
     }
@@ -1133,7 +1092,7 @@ impl Data for DataGrpc {
         req: Request<proto::ScanRequest>,
     ) -> Result<Response<Self::ScanStream>, Status> {
         match self.call(req, ServiceOp::Scan).await? {
-            ServiceReply::Scan(pages) => Ok(Response::new(Box::pin(GrpcPages(pages)))),
+            ServiceReply::Scan(pages) => Ok(Response::new(Box::pin(GrpcStream(pages)))),
             _ => Err(unexpected()),
         }
     }
