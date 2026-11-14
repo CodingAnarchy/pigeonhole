@@ -427,6 +427,8 @@ text-phrase-slop2 131159719 0.3
 wide-row-cells-async 1675 0.3
 commit-put-previous-async 22144 0.3
 commit-if-returning-async 29264 0.3
+# Lowered by #1874 (#1857's every-table check folded into the kept pass, cached per catalog):
+# feed-drain-all 6416 -> 6177, CI's head count 6158 (run 43560343345) times 1.003.
 feed-drain 6154 0.3
-feed-drain-all 6416 0.3
+feed-drain-all 6177 0.3
 replicate-apply 6764 0.3

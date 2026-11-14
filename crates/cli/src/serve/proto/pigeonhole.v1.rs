@@ -6834,6 +6834,11 @@ pub struct PartitionUploadReply {
 pub struct PartitionUploadStatusRequest {
     #[prost(string, tag = "1")]
     pub upload_id: ::prost::alloc::string::String,
+    /// The partition the upload is of (ICR 0117 amendment, #1848): the reply's `installing`
+    /// says whether its install is in progress here. Empty (an older client): `installing` is
+    /// false.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PartitionUploadStatusReply {
@@ -6846,6 +6851,12 @@ pub struct PartitionUploadStatusReply {
     /// `--max-request-bytes`): send chunks of at most this many bytes.
     #[prost(uint64, tag = "3")]
     pub max_chunk: u64,
+    /// An install of `partition`'s set is in progress here (its marker is staged): the node
+    /// takes no upload of the partition until a stamp finishes it, and the files it renamed
+    /// already have no staged copy to report as complete. A relocation or restore run again
+    /// then skips its copy and goes on to the stamp, which finishes the install (#1848).
+    #[prost(bool, tag = "4")]
+    pub installing: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

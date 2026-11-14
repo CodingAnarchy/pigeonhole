@@ -570,3 +570,95 @@ fn a_moves_map_step_refuses_once_the_old_node_was_reopened_since_its_check() {
         .await;
     });
 }
+
+#[test]
+fn a_move_run_again_over_an_interrupted_install_finishes_it() {
+    // audit120's B1 on #1872: c's install of p1's set stopped after its first rename, its
+    // marker left, as a crash there leaves it. A rerun of the move sends nothing (c says the
+    // install is in progress) and goes on to the stamp, which finishes the install; the move
+    // then checks the set as usual. Before `installing`, the renamed file had no staged copy
+    // to say complete, its upload was refused while the marker was there, and the move never
+    // reached its stamp.
+    let t = Cluster::start();
+    let b = t.ports[1];
+    let marker = t.dirs[2].join(".phdb-incoming/p1.installing");
+    t.rt.block_on(async {
+        super::super::stamp::FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(t.dirs[2].clone());
+        let e = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("c's install fails after its first rename");
+        assert!(
+            e.message().contains("after the first rename"),
+            "{}",
+            e.message()
+        );
+        assert!(marker.exists(), "the install's marker is left");
+
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun failed: {}", e.message()));
+        let doc = &r.document;
+        for f in doc["copied"].as_array().unwrap() {
+            assert_eq!(f["sent"], 0, "the install in progress takes no upload: {f}");
+        }
+        assert_eq!(doc["epoch"], 2, "{doc:?}");
+        assert!(!marker.exists(), "the stamp finished the install");
+        eventually("c to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn another_partitions_install_in_progress_doesnt_skip_a_moves_copy() {
+    // The coordinator's case on #1872: `installing` is the asked partition's. c holds p2's
+    // interrupted install (its marker); a move of p1 to c meanwhile still uploads p1's set
+    // and stamps it, and p2's move, run again, then finishes its own install.
+    let t = Cluster::start();
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        put(b, "zed", "2").await;
+        super::super::stamp::FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(t.dirs[2].clone());
+        let e = within(super::super::moving::run(&t.args, "p2", "c", false, None))
+            .await
+            .err()
+            .expect("c's install of p2 fails after its first rename");
+        assert!(
+            e.message().contains("after the first rename"),
+            "{}",
+            e.message()
+        );
+        assert!(t.dirs[2].join(".phdb-incoming/p2.installing").exists());
+
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("p1's move failed: {}", e.message()));
+        for f in r.document["copied"].as_array().unwrap() {
+            assert_eq!(f["sent"], f["bytes"], "p1's files are sent: {f}");
+        }
+        let r = within(super::super::moving::run(&t.args, "p2", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("p2's rerun failed: {}", e.message()));
+        for f in r.document["copied"].as_array().unwrap() {
+            assert_eq!(
+                f["sent"], 0,
+                "p2's install in progress takes no upload: {f}"
+            );
+        }
+        assert!(!t.dirs[2].join(".phdb-incoming/p2.installing").exists());
+        for (row, value) in [("alice", "1"), ("zed", "2")] {
+            eventually(&format!("c to serve {row}"), async || {
+                get_row(b, row).await.ok().flatten() == Some(value.as_bytes().to_vec())
+            })
+            .await;
+        }
+    });
+}

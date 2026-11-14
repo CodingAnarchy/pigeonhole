@@ -222,8 +222,9 @@ impl Router {
         &self,
         caller: &Caller,
         upload_id: &str,
+        partition: &str,
     ) -> Result<super::proto::PartitionUploadStatusReply, ApiError> {
-        self.uploads_for(caller)?.status(upload_id)
+        self.uploads_for(caller)?.status(upload_id, partition)
     }
 
     fn uploads_for(

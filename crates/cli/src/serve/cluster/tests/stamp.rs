@@ -124,7 +124,10 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
         // Staged, then an install that fails after its first rename, as a crash would
         // leave it: the marker stays, and the next stamp finishes it.
         let manifest = upload_set(c, "p3", &main, 1).await;
-        *super::super::stamp::FAIL_AFTER_FIRST_RENAME.lock().unwrap() = Some(dirs[2].clone());
+        super::super::stamp::FAIL_AFTER_FIRST_RENAME
+            .lock()
+            .unwrap()
+            .push(dirs[2].clone());
         let e = stamp(c, 1, 2, false).await.unwrap_err();
         assert!(e.message().contains("after the first rename"), "{e}");
         assert!(dirs[2].join(".phdb-incoming/p3.installing").exists());
@@ -591,6 +594,74 @@ fn relocate_copy_refuses_a_copy_that_isnt_the_old_nodes_closed_files() {
             get_row(b, "alice").await.ok().flatten() == Some(b"2".to_vec())
         })
         .await;
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// #1848: an upload's status said complete from its `.ready.header` alone. An install that
+/// stopped after its renames left the headers with no file behind them (since fixed: they
+/// go before the marker now), and a move's rerun then sent nothing and stamped nothing, for
+/// good. The status needs the staged file too.
+#[test]
+fn an_upload_is_complete_only_while_its_staged_file_is_there() {
+    use super::upload::admin;
+    use crate::serve::proto::PartitionUploadStatusRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let c = ports[2];
+    // p1's files, closed in a directory of their own: a's are open, which Windows locks.
+    let source = test_dir();
+    test_partition_with(&source, "p1", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
+    rt.block_on(async {
+        upload_set(c, "p1", &source.join("p1.phdb"), 7).await;
+        // The main file's upload (the first, id 0700…).
+        let id = format!("{:02x}{:02x}", 7, 0).repeat(8);
+        let status = async || {
+            admin(c)
+                .await
+                .partition_upload_status(PartitionUploadStatusRequest {
+                    upload_id: id.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        assert!(status().await.complete);
+        // The staged file goes, its header stays, as an install stopped after its renames
+        // used to leave it: not complete, so a rerun sends it again.
+        let staged = dirs[2]
+            .join(super::super::upload::INCOMING)
+            .join("p1.phdb.ready");
+        assert!(staged.exists(), "{}", staged.display());
+        std::fs::remove_file(&staged).unwrap();
+        let st = status().await;
+        assert!(!st.complete, "{st:?}");
+        assert_eq!(st.received, 0, "{st:?}");
     });
     drop(stops);
     for db in dbs {
