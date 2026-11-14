@@ -61,18 +61,8 @@ fn parse_fenced(json: &str) -> Result<BTreeSet<String>, String> {
 
 /// Writes `fenced` as `dir`'s fenced partitions, atomically, as the map file is written.
 fn write_fenced(dir: &Path, fenced: &BTreeSet<String>) -> std::io::Result<()> {
-    use std::io::Write;
     let json = serde_json::json!({ "fenced": fenced }).to_string();
-    let tmp = dir.join(format!("{FENCED_FILE}.tmp"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, dir.join(FENCED_FILE))?;
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    super::write_synced(dir, FENCED_FILE, json.as_bytes())
 }
 
 /// A partition served here: its gate, and its file's epoch (what a map must name this node
