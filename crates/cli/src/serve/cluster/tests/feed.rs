@@ -42,6 +42,11 @@ fn runtime() -> tokio::runtime::Runtime {
 
 impl Three {
     fn start() -> Self {
+        Self::start_with(crate::serve::server_tests::limits())
+    }
+
+    /// [`Three::start`] with `limits` on every node.
+    fn start_with(limits: crate::serve::config::Limits) -> Self {
         let rt = runtime();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -61,7 +66,7 @@ impl Three {
         let mut nodes = Vec::new();
         for (i, l) in listeners.into_iter().enumerate() {
             let node_rt = runtime();
-            let (stop, db) = data_node(&node_rt, &dirs[i], IDS[i], PARTS[i], l);
+            let (stop, db) = data_node_with(&node_rt, &dirs[i], IDS[i], PARTS[i], l, limits);
             stops.push(Some(stop));
             dbs.push(db);
             nodes.push(Some(node_rt));
@@ -776,5 +781,337 @@ fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
             .await
             .unwrap();
         assert!(r.document.contains_key("done"), "{:?}", r.document);
+    });
+}
+
+/// A gauge or counter on node `port`'s `/metrics` (`Admin.Metrics`).
+async fn metric(port: u16, name: &str) -> u64 {
+    use crate::serve::proto::{Empty, admin_client::AdminClient};
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let text = AdminClient::new(channel)
+        .metrics(Empty {})
+        .await
+        .unwrap()
+        .into_inner()
+        .text;
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or_else(|| panic!("{name} isn't in:\n{text}"))
+}
+
+/// Waits up to 10 s for `name` on `port` to satisfy `ok`.
+async fn metric_until(port: u16, name: &str, ok: impl Fn(u64) -> bool) -> u64 {
+    for _ in 0..200 {
+        let v = metric(port, name).await;
+        if ok(v) {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "{name} on {port} never got there: {}",
+        metric(port, name).await
+    );
+}
+
+const MERGES: &str = "pigeonhole_serve_feed_cluster_merges";
+const MEMBERS: &str = "pigeonhole_serve_feed_cluster_hub_members";
+
+/// Each commit's rows, once each, in each partition's order: what every reader of a
+/// subscription over `want` gets.
+fn exactly(seen: &[Seen], want: &[String]) {
+    in_order(seen);
+    let got: Vec<&str> = seen
+        .iter()
+        .flat_map(|s| s.rows.iter().map(String::as_str))
+        .collect();
+    let set: BTreeSet<&str> = got.iter().copied().collect();
+    assert_eq!(set.len(), got.len(), "a row twice");
+    assert_eq!(set, want.iter().map(String::as_str).collect(), "every row");
+}
+
+#[test]
+fn one_requests_subscribers_share_one_merge_and_anothers_get_their_own() {
+    // #1798's B: subscribers of one request (and one token) share one merge, however many;
+    // another request has its own. The last to leave ends its hub and its parts.
+    let t = Three::start();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut shared = Vec::new();
+        for _ in 0..3 {
+            shared.push(subscribe(c, users()).await.unwrap());
+        }
+        metric_until(c, MEMBERS, |n| n == 3).await;
+        assert_eq!(
+            metric(c, MERGES).await,
+            1,
+            "one merge for three subscribers"
+        );
+        let mut narrow = subscribe(
+            c,
+            SubscribeRequest {
+                prefix: b"a".to_vec().into(),
+                ..users()
+            },
+        )
+        .await
+        .unwrap();
+        metric_until(c, MEMBERS, |n| n == 4).await;
+        assert_eq!(metric(c, MERGES).await, 2, "another request, another merge");
+        let want = rows("share-", 30);
+        for (i, row) in want.iter().enumerate() {
+            put([a, b, c][i % 3], row, "v").await;
+        }
+        for s in &mut shared {
+            let (seen, _) = commits(s, want.len()).await;
+            exactly(&seen, &want);
+            assert!(seen[0].token.is_some(), "the first commit is a checkpoint");
+        }
+        let (seen, _) = commits(&mut narrow, want.len() / 2).await;
+        let a_rows: Vec<String> = want
+            .iter()
+            .filter(|r| r.starts_with('a'))
+            .cloned()
+            .collect();
+        exactly(&seen, &a_rows);
+        drop((shared, narrow));
+        metric_until(c, MERGES, |n| n == 0).await;
+        assert_eq!(metric(c, MEMBERS).await, 0);
+    });
+}
+
+#[test]
+fn a_joiner_passes_over_a_local_commit_made_while_it_joined() {
+    // simp724's Q2 on #1798's B: a `Now` joiner takes the ring's head, then each local
+    // partition's seqno, and a local commit between the two is passed over, as a single
+    // node's `Now` passes over what predates it (F5 on #1518). a serves p1.
+    let t = Three::start();
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        let mut first = subscribe(a, users()).await.unwrap();
+        metric_until(a, MEMBERS, |n| n == 1).await;
+        let (go, wait) = tokio::sync::oneshot::channel();
+        crate::serve::cluster::hub::HOLD_JOIN
+            .lock()
+            .unwrap()
+            .push((t.dirs[0].clone(), wait));
+        let joining = tokio::spawn(subscribe(a, users()));
+        // Joined (counted), then held between its head and its seqnos.
+        metric_until(a, MEMBERS, |n| n == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        put(a, "a-between", "v").await;
+        // On the ring, past the joiner's head.
+        let (seen, _) = commits(&mut first, 1).await;
+        assert_eq!(seen[0].rows, ["a-between"]);
+        go.send(()).unwrap();
+        let mut second = joining.await.unwrap().unwrap();
+        put(a, "a-after", "v").await;
+        let (seen, _) = commits(&mut second, 1).await;
+        assert_eq!(
+            seen[0].rows,
+            ["a-after"],
+            "not the commit from before its seqno"
+        );
+    });
+}
+
+/// A value large enough that a few hundred commits overrun a client's HTTP/2 window
+/// (hyper's 2 MiB a stream), so one that stops reading holds events untaken.
+fn big() -> String {
+    "v".repeat(16 << 10)
+}
+
+/// Limits with a tiny ring, so a subscriber that stops reading falls off it.
+fn small_ring() -> crate::serve::config::Limits {
+    let mut l = crate::serve::server_tests::limits();
+    l.feed_ring_bytes = 4096;
+    l.feed_client_events = 1;
+    l.stream_idle = Duration::from_secs(600);
+    l
+}
+
+#[test]
+fn a_member_off_the_ring_catches_up_on_its_own_merge_and_rejoins_with_nothing_lost_or_repeated() {
+    // #1798's B, §2.4: c routes only, so its hub merges two remote partitions, interleaved.
+    // A subscriber that reads nothing while 300 commits pass falls off c's small ring, goes
+    // on from its last checkpoint on a merge of its own, and rejoins the ring.
+    // Checkpoints 8 commits apart: its last one trails what it delivered, so its own merge
+    // delivers some of it again, which it passes over by its own positions.
+    let t = Three::start_with(small_ring());
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    let every8 = || SubscribeRequest {
+        checkpoint_every: 8,
+        ..users()
+    };
+    t.rt.block_on(async {
+        let mut fast = subscribe(c, every8()).await.unwrap();
+        let mut slow = subscribe(c, every8()).await.unwrap();
+        metric_until(c, MEMBERS, |n| n == 2).await;
+        let value = big();
+        let want = rows("fb-", 300);
+        for (i, row) in want.iter().enumerate() {
+            put([a, b][i % 2], row, &value).await;
+        }
+        let (seen, _) = commits(&mut fast, want.len()).await;
+        exactly(&seen, &want);
+        let (seen, _) = commits(&mut slow, want.len()).await;
+        exactly(&seen, &want);
+        assert!(metric(c, "pigeonhole_serve_feed_cluster_fell_behind_total").await >= 1);
+        // Caught up: back on the ring, and what comes next arrives once.
+        metric_until(c, "pigeonhole_serve_feed_cluster_rejoined_total", |n| {
+            n >= 1
+        })
+        .await;
+        let more = rows("more-", 10);
+        for (i, row) in more.iter().enumerate() {
+            put([a, b][i % 2], row, "v").await;
+        }
+        let (seen, _) = commits(&mut slow, more.len()).await;
+        exactly(&seen, &more);
+        assert_eq!(metric(c, MERGES).await, 1, "only the hub's merge again");
+    });
+}
+
+#[test]
+fn a_fallen_member_waits_for_a_catch_up_slot_delivering_nothing_then_goes_on() {
+    // simp724's S2 on #1798's B: a member off its ring needs a --max-catch-up slot for its
+    // own merge. With the one slot held by another, it delivers nothing until the slot is
+    // free, then everything, once.
+    let mut l = small_ring();
+    l.max_catch_up = 1;
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut holder = subscribe(c, users()).await.unwrap();
+        let mut waiter = subscribe(c, users()).await.unwrap();
+        metric_until(c, MEMBERS, |n| n == 2).await;
+        let value = big();
+        let want = rows("slot-", 300);
+        for (i, row) in want.iter().enumerate() {
+            put([a, b][i % 2], row, &value).await;
+        }
+        // `holder` reads a little: off the ring, onto its own merge with the slot, which
+        // fills its buffer again while it stops reading.
+        let (mut held, _) = commits(&mut holder, 100).await;
+        metric_until(c, "pigeonhole_serve_feed_cluster_fell_behind_total", |n| {
+            n >= 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // `waiter` gets what its buffer held, then nothing: no slot.
+        let mut got = Vec::new();
+        while let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(1), waiter.message())
+            .await
+            .map(Result::unwrap)
+        {
+            got.push(e);
+        }
+        let commits_got = got
+            .iter()
+            .filter(|e| matches!(e.event, Some(Event::Commit(_))))
+            .count();
+        assert!(
+            commits_got < want.len(),
+            "it waits for a slot: {commits_got}"
+        );
+        // `holder` catches up and rejoins, giving the slot back; `waiter` then goes on.
+        let (rest, _) = commits(&mut holder, want.len() - held.len()).await;
+        held.extend(rest);
+        exactly(&held, &want);
+        let (rest, _) = commits(&mut waiter, want.len() - commits_got).await;
+        let mut seen: Vec<Seen> = got
+            .iter()
+            .filter_map(|e| match &e.event {
+                Some(Event::Commit(c)) => Some(Seen {
+                    partition: e.partition.clone(),
+                    seqno: c.seqno,
+                    rows: c
+                        .changes
+                        .iter()
+                        .map(|ch| String::from_utf8(ch.row.to_vec()).unwrap())
+                        .collect(),
+                    token: None,
+                }),
+                _ => None,
+            })
+            .collect();
+        seen.extend(rest);
+        exactly(&seen, &want);
+    });
+}
+
+#[test]
+fn a_key_past_the_hub_limit_runs_its_own_merge() {
+    // simp724's S1 on #1798's B: hubs are capped at --max-feed-hubs; a key past it runs a
+    // merge of its own rather than being refused.
+    let mut l = crate::serve::server_tests::limits();
+    l.max_feed_hubs = 1;
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut shared = subscribe(c, users()).await.unwrap();
+        let mut own = subscribe(
+            c,
+            SubscribeRequest {
+                prefix: b"a".to_vec().into(),
+                ..users()
+            },
+        )
+        .await
+        .unwrap();
+        metric_until(c, MERGES, |n| n == 2).await;
+        assert_eq!(
+            metric(c, MEMBERS).await,
+            1,
+            "one on the hub, one on its own merge"
+        );
+        let want = rows("cap-", 20);
+        for (i, row) in want.iter().enumerate() {
+            put([a, b][i % 2], row, "v").await;
+        }
+        let (seen, _) = commits(&mut shared, want.len()).await;
+        exactly(&seen, &want);
+        let (seen, _) = commits(&mut own, want.len() / 2).await;
+        let a_rows: Vec<String> = want
+            .iter()
+            .filter(|r| r.starts_with('a'))
+            .cloned()
+            .collect();
+        exactly(&seen, &a_rows);
+    });
+}
+
+#[test]
+fn a_member_that_stops_reading_is_dropped_without_holding_up_the_others() {
+    // A hub never waits for a member: one that stops reading ends at its idle limit, and
+    // the others read on meanwhile.
+    let mut l = crate::serve::server_tests::limits();
+    l.stream_idle = Duration::from_millis(500);
+    l.feed_client_events = 1;
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut reader = subscribe(c, users()).await.unwrap();
+        let _stopped = subscribe(c, users()).await.unwrap();
+        metric_until(c, MEMBERS, |n| n == 2).await;
+        let value = big();
+        let want = rows("idle-", 200);
+        // The reader reads as the commits come.
+        let n = want.len();
+        let reading = tokio::spawn(async move {
+            let seen = commits(&mut reader, n).await.0;
+            (reader, seen)
+        });
+        for (i, row) in want.iter().enumerate() {
+            put([a, b][i % 2], row, &value).await;
+        }
+        let (_reader, seen) = reading.await.unwrap();
+        exactly(&seen, &want);
+        metric_until(c, "pigeonhole_serve_feed_idle_drops_total", |n| n == 1).await;
+        metric_until(c, MEMBERS, |n| n == 1).await;
     });
 }

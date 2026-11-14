@@ -15,6 +15,7 @@ pub(crate) mod fanout;
 pub(crate) mod feed;
 pub(crate) mod fence;
 pub(crate) mod forward;
+pub(crate) mod hub;
 pub(crate) mod identity;
 pub(crate) mod map;
 pub(crate) mod moving;
@@ -187,6 +188,8 @@ pub(crate) struct Node {
     opening: tokio::sync::Mutex<()>,
     /// This node, for the tasks an install starts.
     me: std::sync::Weak<Node>,
+    /// Its cluster feed hubs (#1798): one merge per subscription key.
+    pub(crate) feed_hubs: hub::Hubs,
 }
 
 /// A node's partitions' reconcile to a map, each partition's outcome by id; `None` once the
@@ -254,6 +257,7 @@ impl Node {
             fences: fence::Fences::default(),
             opener: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
+            feed_hubs: hub::Hubs::default(),
             me: me.clone(),
         })
     }

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 /// `cluster` (a node of a D317 cluster calling another) stands apart: it includes none of
 /// them, and none of them includes it, so an admin token can't push a map and a node's
 /// token can't read data. Not ordered: [`Scope::allows`] is the only comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Scope {
     Read,
     Write,
@@ -53,6 +53,29 @@ impl Principal {
     }
 }
 
+/// Which configured token a caller matched: its line's place among the token file's entries,
+/// or [`TokenId::ANONYMOUS`] without one. Tokens are read once at startup and never reloaded,
+/// so it names the same token for the server's life. What a shared resource is keyed on
+/// when it must be one token's alone (a cluster feed hub, #1798): never the digest, which a
+/// key would carry into the dump (simp724 on #1798's design).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TokenId(u32);
+
+impl TokenId {
+    /// No token: a server without tokens, or a forwarded caller there.
+    pub(crate) const ANONYMOUS: TokenId = TokenId(u32::MAX);
+}
+
+impl std::fmt::Debug for TokenId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if *self == Self::ANONYMOUS {
+            f.write_str("anonymous")
+        } else {
+            write!(f, "token #{}", self.0)
+        }
+    }
+}
+
 /// Redacted (cli692's R1 on ticket 3): a `Caller` or session printed with `{:?}` shows
 /// whether it's anonymous, never the digest.
 impl std::fmt::Debug for Principal {
@@ -74,6 +97,8 @@ pub(crate) const ANONYMOUS: Principal = Principal([0; 32]);
 pub(crate) struct Caller {
     /// Whose sessions it may use, and whose per-token cap it counts against.
     pub principal: Principal,
+    /// The token it matched (#1798): what a cluster feed hub is shared by.
+    pub token: TokenId,
     pub scope: Scope,
     /// `None`: every namespace. `Some`: a token limited to these memory namespaces, which
     /// reaches only the memory calls ([`memory_only`](Self::memory_only)).
@@ -96,11 +121,17 @@ impl Caller {
     pub(crate) fn anonymous() -> Self {
         Self {
             principal: ANONYMOUS,
+            token: TokenId::ANONYMOUS,
             scope: Scope::Admin,
             namespaces: None,
             json: false,
         }
     }
+}
+
+/// The id of the token file's `i`th entry.
+fn token_id(i: usize) -> TokenId {
+    TokenId(u32::try_from(i).unwrap_or(u32::MAX - 1))
 }
 
 struct Entry {
@@ -184,10 +215,11 @@ impl Tokens {
     /// it isn't listed. Compared as [`caller`](Self::caller) compares.
     pub(crate) fn caller_by_digest(&self, digest: &[u8; 32]) -> Option<Caller> {
         let mut found = None;
-        for e in &self.0 {
+        for (i, e) in self.0.iter().enumerate() {
             if constant_time_eq(&e.digest, digest) && found.is_none() {
                 found = Some(Caller {
                     principal: Principal::from_digest(e.digest),
+                    token: token_id(i),
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                     json: false,
@@ -202,10 +234,11 @@ impl Tokens {
     pub(crate) fn caller(&self, token: &str) -> Option<Caller> {
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let mut found = None;
-        for e in &self.0 {
+        for (i, e) in self.0.iter().enumerate() {
             if constant_time_eq(&e.digest, &digest) && found.is_none() {
                 found = Some(Caller {
                     principal: Principal::from_digest(e.digest),
+                    token: token_id(i),
                     scope: e.scope,
                     namespaces: e.namespaces.clone(),
                     json: false,

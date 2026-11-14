@@ -381,7 +381,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 - **These are a fresh server's numbers.** A server restarted before #1699 reopened with one shard per core, and its mask fell back to the shards' SMT siblings, where the mask mostly hurt (section 2 of the write-up). Since #1699 a restart keeps the default, and since #1697 a host with too few free cores gets no mask rather than the siblings.
 
 ## Metrics
-- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (service time: from the decoded request to its answer, on every path, so the wait for the request's body, an HTTP/1.1 pre-read included, isn't in it; a scan's runs to the end of its stream), open sessions by kind, the oldest open session's age, the feed's shared subscriptions, their memory, and the streams that fell behind or are catching up, and a running bulk load's phase, vectors and bytes. After those come the engine's metrics for the served database, under the names and labels the [observability guide](observability.md#the-metrics) lists (`pigeonhole_commits_total`, `pigeonhole_write_stall_time_seconds_total` and the rest, each with `pigeonhole_db_name`), with its alerts and dashboard. On Unix, `kill -USR1 <pid>` makes the server write its feed hubs to stderr (it doesn't stop the server): the hub thread count, then for each hub, how far its engine feed is behind the database, its ring against its share of `--feed-ring-bytes`, and its streams on the ring (entries behind its head), on their own catch-up streams, and waiting for a `--max-catch-up` slot.
+- **`GET /v1/health`** answers without a token. `GET /metrics` serves Prometheus text with read scope: request counts by RPC and outcome, each RPC's durations as a histogram (service time: from the decoded request to its answer, on every path, so the wait for the request's body, an HTTP/1.1 pre-read included, isn't in it; a scan's runs to the end of its stream), open sessions by kind, the oldest open session's age, the feed's shared subscriptions, their memory, and the streams that fell behind or are catching up, and a running bulk load's phase, vectors and bytes. After those come the engine's metrics for the served database, under the names and labels the [observability guide](observability.md#the-metrics) lists (`pigeonhole_commits_total`, `pigeonhole_write_stall_time_seconds_total` and the rest, each with `pigeonhole_db_name`), with its alerts and dashboard. On Unix, `kill -USR1 <pid>` makes the server write its feed hubs to stderr (it doesn't stop the server): the hub thread count, then for each hub, how far its engine feed is behind the database, its ring against its share of `--feed-ring-bytes`, and its streams on the ring (entries behind its head), on their own catch-up streams, and waiting for a `--max-catch-up` slot. A cluster node then writes its shared feed merges: for each, its tables, prefix length, visibility and token (`token #N`, its line in the token file, never the token), its ring, and its subscribers on the ring, on their own merges and waiting for a slot. It also writes how many subscribers run their own merge, by reason.
 
 Serve's own metrics, before the engine's:
 
@@ -408,7 +408,10 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_feed_hub_threads` | gauge | The threads that read the engine's feed into the shared subscriptions (`--feed-hub-threads`). |
 | `pigeonhole_serve_feed_solo_hubs` | gauge | Shared subscriptions with a single stream, running on the feed threads beside it. |
 | `pigeonhole_serve_feed_hub_moves_total` | counter | Shared subscriptions that moved between the feed threads and the hub threads as their second stream joined or their last but one left. |
-| `pigeonhole_serve_feed_cluster_merges` | gauge | Cluster feed subscriptions entered on this node whose merge is running now, on the feed threads (`phdb-serve-feed`). |
+| `pigeonhole_serve_feed_cluster_merges` | gauge | Cluster feed merges running now on this node's feed threads (`phdb-serve-feed`): one per shared merge, and one per subscriber running its own. |
+| `pigeonhole_serve_feed_cluster_hub_members` | gauge | Cluster feed subscriptions on a shared merge now (#1798). |
+| `pigeonhole_serve_feed_cluster_fell_behind_total` | counter | Cluster feed subscriptions that fell behind their shared merge's ring and went on alone. |
+| `pigeonhole_serve_feed_cluster_rejoined_total` | counter | Cluster feed subscriptions that caught up and rejoined their shared merge. |
 | `pigeonhole_serve_feed_hub_failures_total` | counter | Shared subscriptions that failed. Their streams end with the error. |
 | `pigeonhole_serve_bulk_load_phase` | gauge | A `Vectors.BulkLoad`'s phase: 0 none, 1 receiving, 2 writing and rebalancing. |
 | `pigeonhole_serve_bulk_load_vectors`, `pigeonhole_serve_bulk_load_bytes` | gauge | The vectors and message bytes handed to the running load. |
@@ -633,6 +636,9 @@ Scans and multi-gets read across the partitions, in key order, and return what o
 - **`partition`** on each event names where it came from. A commit's `seqno` is its partition's own, comparable only with seqnos of the same partition.
 - **`partition_state`** events report a partition that went away or came back (see [When a partition's node is down](#when-a-partitions-node-is-down)).
 - **Progress events** keep a quiet stream's position fresh, as on a single node.
+- **A subscription from now** gets every commit made after the call returns.
+  - From a partition the entry node serves itself, it gets nothing committed before the call, as on a single node.
+  - From another node's partition, it may also get commits made shortly before the call. When the entry node's feed threads are saturated, its first commits can be older than the call by that backlog.
 
 #### Tokens and resuming
 
@@ -678,6 +684,14 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
 #### Limits
 - **Stream slots:** a subscription holds a `--max-streams` place on the node it entered, and one on each followed partition's node. An entry node that serves one of the partitions itself holds two.
 - **Memory:** it buffers up to 256 KiB on each partition's node, so partitions × 256 KiB at most, outside `--inflight-bytes`, like a single node's feed. The entry node merges the partitions' events on its feed threads (`phdb-serve-feed`, not the threads that serve requests) and buffers up to the client's own 256 KiB, as a single node's stream does.
+- **Shared merges** (#1798): subscriptions from now that enter the same node with the same token and the same request share one merge there.
+  - The same request means the same tables, prefix, visibility, `allow_partial` and `checkpoint_every`.
+  - A shared merge keeps a ring of its merged events, as a single node's hub does. Its ring takes a share of `--feed-ring-bytes`, and a node has at most `--max-feed-hubs` shared merges. Past that, a new request runs a merge of its own.
+  - Starts from a token, from the oldest commit, or with `skip_through` run a merge of their own until they catch up, then join the shared one.
+  - The saving needs subscribers that share a token and a request. Each token or request of its own costs about what a subscription did before.
+- **Falling behind a shared merge:** a subscriber more than its ring behind goes on alone from its last checkpoint, with nothing skipped or repeated, and rejoins once caught up.
+  - Going on alone takes a `--max-catch-up` slot, as a single node's catch-up stream does.
+  - With no slot free, it waits, delivering nothing, until one is free or the client goes away. `--stream-idle-ms` doesn't end the wait: it counts only events the client left untaken.
 - **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens: the limit counts how long an event waits untaken, so it ends a client that stopped reading, never one that's waiting for a commit. On a feed with no commits, a client that stopped reading is first left an event by the next quiet progress event (about 10 s), then ended `--stream-idle-ms` after that, as on a single node.
 
 #### Expiry and what isn't supported
