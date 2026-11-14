@@ -15,8 +15,8 @@ pub(crate) mod fanout;
 pub(crate) mod feed;
 pub(crate) mod fence;
 pub(crate) mod forward;
+pub(crate) mod hub;
 pub(crate) mod identity;
-pub(crate) mod idle;
 pub(crate) mod map;
 pub(crate) mod moving;
 pub(crate) mod open;
@@ -194,6 +194,8 @@ pub(crate) struct Node {
     opening: tokio::sync::Mutex<()>,
     /// This node, for the tasks an install starts.
     me: std::sync::Weak<Node>,
+    /// Its cluster feed hubs (#1798): one merge per subscription key.
+    pub(crate) feed_hubs: hub::Hubs,
 }
 
 /// How long a node change's `SetMap` goes on pushing it, in push timeouts, for a majority of
@@ -280,6 +282,7 @@ impl Node {
             fences: fence::Fences::default(),
             server: std::sync::OnceLock::new(),
             opening: tokio::sync::Mutex::new(()),
+            feed_hubs: hub::Hubs::default(),
             me: me.clone(),
         })
     }

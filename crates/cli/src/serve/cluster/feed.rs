@@ -36,11 +36,10 @@ use prost::bytes::{Buf, BufMut, Bytes};
 use tonic::transport::Channel;
 
 use super::Node;
-use super::idle::Watched;
 use super::token::{At, ClusterToken, subscription_hash};
 use crate::serve::auth::Caller;
 use crate::serve::errors::ApiError;
-use crate::serve::feed::{FeedEvents, Out, SKIP_LIMIT};
+use crate::serve::feed::{FeedEvents, Out, SKIP_LIMIT, TakeClock};
 use crate::serve::proto::{self, subscribe_request::Start as S};
 use crate::serve::service::Service;
 
@@ -51,9 +50,6 @@ pub(crate) const MAX_EVERY: u64 = SKIP_LIMIT;
 /// Token bytes per event the checkpoint cadence aims for, on average.
 const TOKEN_BYTES_PER_EVENT: usize = 150;
 
-/// The keepalive's shortest interval ([`Merging`]).
-const ALIVE_FLOOR: Duration = Duration::from_millis(10);
-
 /// How long an unavailable partition waits between attempts to open it again.
 const RETRY: Duration = Duration::from_secs(1);
 
@@ -61,21 +57,21 @@ const RETRY: Duration = Duration::from_secs(1);
 const OPENS: usize = 8;
 
 /// `FeedEvent`'s fields, as the merge reads and writes them.
-const TOKEN_FIELD: u32 = 1;
+pub(super) const TOKEN_FIELD: u32 = 1;
 const COMMIT_FIELD: u32 = 2;
 const PROGRESS_FIELD: u32 = 4;
 const PARTITION_FIELD: u32 = 5;
 
 /// What a subscription needs to open (and open again) its components: shared by its task.
-struct Ctx {
-    node: Arc<Node>,
+pub(super) struct Ctx {
+    pub(super) node: Arc<Node>,
     /// The partitions served here, each with its service (D317 ticket 8a).
-    parts: crate::serve::router::Parts,
+    pub(super) parts: crate::serve::router::Parts,
     /// The node's service: its stream slots, limits and timeouts.
-    service: Arc<Service>,
+    pub(super) service: Arc<Service>,
     caller: Caller,
     prefix: Bytes,
-    visible: bool,
+    pub(super) visible: bool,
     /// Opens the node-to-node streams' connections, apart from forwarded unary calls'.
     forwarder: Arc<super::forward::Forwarder>,
     /// The subscription's connection to each peer (S1): a stream lease of its own, taken on
@@ -87,12 +83,12 @@ struct Ctx {
 type Events = Pin<Box<dyn Stream<Item = Result<Bytes, ApiError>> + Send>>;
 
 /// One partition's part of the subscription.
-struct Part {
+pub(super) struct Part {
     partition: String,
     /// The subscription's tables placed on it, sorted.
     tables: Vec<String>,
     epoch: u64,
-    at: At,
+    pub(super) at: At,
     /// Commits through this seqno after `at` are passed over (`skip_through`); 0: none.
     skip: u64,
     events: Option<Events>,
@@ -101,7 +97,7 @@ struct Part {
     /// An open of it is running in the background.
     opening: bool,
     /// Reported unavailable, and not yet available again.
-    unavailable: bool,
+    pub(super) unavailable: bool,
 }
 
 /// `Feed.Subscribe` on a cluster node: opens every component, then merges them on a task of
@@ -141,7 +137,6 @@ pub(crate) async fn subscribe(
             placed.entry(p.to_owned()).or_default().push(t.clone());
         }
     }
-    let epoch = |p: &str| routes.owner(p).map_or(0, |o| o.epoch);
     let history = |p: &str| routes.owner(p).map_or(0, |o| o.history_epoch);
     let subscription = subscription_hash(&tables, &r.prefix, r.visible);
     let mut skips: HashMap<String, u64> = HashMap::new();
@@ -155,6 +150,12 @@ pub(crate) async fn subscribe(
         skips.insert(s.partition.clone(), s.seqno);
     }
     let resumed = matches!(r.start, Some(S::Resume(_)));
+    let oldest = matches!(r.start, Some(S::FromOldest(true)));
+    // A member's first position on a merge of its own: the token it resumes from.
+    let token = match &r.start {
+        Some(S::Resume(bytes)) => bytes.clone(),
+        _ => Bytes::new(),
+    };
     let starts: BTreeMap<String, At> = match r.start {
         None | Some(S::FromOldest(false)) => placed.keys().map(|p| (p.clone(), At::Now)).collect(),
         Some(S::FromOldest(true)) => placed.keys().map(|p| (p.clone(), At::Oldest)).collect(),
@@ -176,20 +177,6 @@ pub(crate) async fn subscribe(
         return Err(ApiError::invalid("skip_through needs a resume token"));
     }
     let map_version = routes.map_version();
-    let parts: Vec<Part> = placed
-        .into_iter()
-        .map(|(partition, tables)| Part {
-            epoch: epoch(&partition),
-            at: starts[&partition].clone(),
-            skip: skips.get(&partition).copied().unwrap_or(0),
-            partition,
-            tables,
-            events: None,
-            retry: None,
-            opening: false,
-            unavailable: false,
-        })
-        .collect();
     let cluster_id = routes.cluster_id().to_owned();
     drop(guard);
     // One `--max-streams` place here for the whole subscription (simp724's C); each
@@ -205,108 +192,175 @@ pub(crate) async fn subscribe(
         visible: r.visible,
         channels: Mutex::new(HashMap::new()),
     });
-    let mut merge = Merge {
+    let every = u64::from(r.checkpoint_every);
+    let plan = Plan {
         ctx,
-        parts,
+        placed,
         allow_partial: r.allow_partial,
-        every: u64::from(r.checkpoint_every),
+        every,
         map_version,
         subscription,
         cluster_id,
-        since_checkpoint: 0,
-        next_checkpoint: 1,
-        moved: false,
-        states: Vec::new(),
-        token: Vec::new(),
-        cache: super::token::TokenCache::default(),
-        tail: tail_buffer(),
-        opens: tokio::task::JoinSet::new(),
     };
-    merge.open_all().await?;
-    // The merge runs as the client polls (#1758's B): no task or queue of its own between
-    // the parts and the client. Its state, the slot included, is watched for the idle limit,
-    // which nothing inside an unpolled stream could enforce (simp724's R1).
-    let limits = service.feed_limits();
-    let metrics = Arc::clone(&service.metrics);
-    let partitions: Vec<String> = merge.parts.iter().map(|p| p.partition.clone()).collect();
-    let started = std::time::Instant::now();
-    let idle = limits.stream_idle;
-    let watched = Watched::new(
-        Merging::new(merge, slot, limits.quiet, idle),
-        idle,
-        move || {
-            metrics
-                .feed_idle_drops
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            metrics.count(
-                crate::serve::service::FEED,
-                Some("DeadlineExceeded"),
-                started.elapsed(),
-            );
-            eprintln!(
-                "phdb serve: a cluster feed subscription over {partitions:?} took no event for \
-             --stream-idle-ms ({} ms): ended",
-                idle.as_millis()
-            );
-        },
+    // A `Now` start shares its key's merge (#1798's B): one per key, not one per subscriber.
+    let key = super::hub::Key::new(
+        &tables,
+        &r.prefix,
+        r.visible,
+        r.allow_partial,
+        every,
+        caller,
     );
-    Ok(FeedEvents::merged(ClusterEvents {
-        watched,
-        idle,
-        done: false,
-    }))
+    super::hub::subscribe(super::hub::Subscribe {
+        plan,
+        key,
+        starts,
+        shareable: !resumed && !oldest && skips.is_empty(),
+        skips,
+        slot,
+        token,
+    })
+    .await
 }
 
-/// A cluster subscription as its client's stream (#1758's B): each poll does what one turn
-/// of the merge does, so an event goes from its part to the client through no queue of the
-/// merge's own (one per event, as on a single node, not two).
-pub(crate) struct ClusterEvents {
-    watched: Watched<Merging>,
-    idle: Duration,
-    /// Ended: nothing more.
-    done: bool,
+/// What a subscription's merges are made from: its hub's, and each member's own (#1798).
+#[derive(Clone)]
+pub(super) struct Plan {
+    pub(super) ctx: Arc<Ctx>,
+    /// Each partition the subscription covers, with its tables on it.
+    placed: BTreeMap<String, Vec<String>>,
+    allow_partial: bool,
+    every: u64,
+    map_version: u64,
+    subscription: u64,
+    cluster_id: String,
 }
 
-impl ClusterEvents {
-    pub(crate) fn poll_out(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
-        // Every poll is the client asking: a reader of a quiet subscription keeps it
-        // (simp724's point 1).
-        self.watched.took();
-        let mut state = self.watched.lock();
-        let Some(m) = state.as_mut() else {
-            // The watchdog dropped it: the client took nothing for the idle limit.
-            self.done = true;
-            return Poll::Ready(Some(Err(ApiError::deadline(format!(
-                "the client took no feed event for --stream-idle-ms ({} ms); resume from the \
-                 last event's token",
-                self.idle.as_millis()
-            )))));
+impl Plan {
+    /// The partitions, in the merge's parts' order.
+    pub(super) fn partitions(&self) -> Vec<String> {
+        self.placed.keys().cloned().collect()
+    }
+
+    /// A merge from `starts`, its parts not opened yet; `shared`: a hub's
+    /// ([`crate::serve::feed::Spec::internal`] for its local components).
+    pub(super) fn merge(
+        &self,
+        starts: &BTreeMap<String, At>,
+        skips: &HashMap<String, u64>,
+        shared: bool,
+    ) -> Merge {
+        let epochs: Vec<u64> = {
+            let routes = self.ctx.node.routes();
+            self.placed
+                .keys()
+                .map(|p| {
+                    routes
+                        .as_ref()
+                        .and_then(|r| r.owner(p))
+                        .map_or(0, |o| o.epoch)
+                })
+                .collect()
         };
-        let out = m.poll(cx);
-        if matches!(out, Poll::Ready(None)) {
-            self.done = true;
+        let parts = self
+            .placed
+            .iter()
+            .zip(epochs)
+            .map(|((partition, tables), epoch)| Part {
+                epoch,
+                at: starts.get(partition).cloned().unwrap_or(At::Now),
+                skip: skips.get(partition).copied().unwrap_or(0),
+                partition: partition.clone(),
+                tables: tables.clone(),
+                events: None,
+                retry: None,
+                opening: false,
+                unavailable: false,
+            })
+            .collect();
+        Merge {
+            ctx: Arc::clone(&self.ctx),
+            parts,
+            allow_partial: self.allow_partial,
+            every: self.every,
+            map_version: self.map_version,
+            subscription: self.subscription,
+            cluster_id: self.cluster_id.clone(),
+            since_checkpoint: 0,
+            next_checkpoint: 1,
+            moved: false,
+            states: Vec::new(),
+            token: Vec::new(),
+            cache: super::token::TokenCache::default(),
+            tail: tail_buffer(),
+            opens: tokio::task::JoinSet::new(),
+            shared,
+            last: None,
         }
-        out
+    }
+
+    /// Each part's start from one of this subscription's checkpoints, as a resume checks
+    /// it: a member that fell off its hub's ring goes on from its last one (#1798).
+    pub(super) fn starts_from(&self, token: &[u8]) -> Result<BTreeMap<String, At>, ApiError> {
+        let t = ClusterToken::decode(token).map_err(|why| {
+            ApiError::internal(format!("a member's checkpoint can't be read: {why}"))
+        })?;
+        let routes = self.ctx.node.routes();
+        let history = |p: &str| {
+            routes
+                .as_ref()
+                .and_then(|r| r.owner(p))
+                .map_or(0, |o| o.history_epoch)
+        };
+        resume_starts(
+            &t,
+            &self.cluster_id,
+            self.subscription,
+            &self.placed,
+            history,
+        )
     }
 }
 
-/// A merge with what its stream holds: its `--max-streams` place, its timers, and what goes
-/// out before anything else.
-struct Merging {
-    merge: Merge,
-    /// The subscription's `--max-streams` place, freed with it.
-    _slot: tokio::sync::OwnedSemaphorePermit,
+/// Since when the client has left events untaken: its last take, or when its buffer last
+/// went from empty to holding events (`waiting_since`), whichever is later.
+pub(super) fn untaken_since(
+    taken: &TakeClock,
+    waiting_since: tokio::time::Instant,
+) -> tokio::time::Instant {
+    taken.last_or_start().max(waiting_since)
+}
+
+/// A subscription ended at its idle limit: counted, said, and its error left for a client
+/// that never reads it.
+pub(super) fn drop_idle(
+    metrics: &crate::serve::service::Metrics,
+    partitions: &[String],
+    started: std::time::Instant,
+    idle: Duration,
+) {
+    metrics
+        .feed_idle_drops
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    metrics.count(
+        crate::serve::service::FEED,
+        Some("DeadlineExceeded"),
+        started.elapsed(),
+    );
+    eprintln!(
+        "phdb serve: a cluster feed subscription over {partitions:?} left events untaken for \
+         --stream-idle-ms ({} ms): ended",
+        idle.as_millis()
+    );
+}
+
+/// A merge with what its stream holds: its timers, what goes out before anything else, and
+/// a test's `--max-streams` place (a cluster subscription's member holds its own, #1798).
+pub(super) struct Merging {
+    pub(super) merge: Merge,
+    _slot: Option<tokio::sync::OwnedSemaphorePermit>,
     retry: Timer,
     quiet: Quiet,
-    /// Wakes the stream every half idle limit with nothing else to do, so a client that
-    /// reads a quiet subscription is polled, and so counted as taking, in time: with
-    /// `--stream-idle-ms` below the quiet interval, nothing else would (simp724's point 1).
-    /// A stuck client isn't polled even then, as its window is full.
-    alive: Timer,
-    alive_every: Duration,
     turn: usize,
     /// Out first: parts' states, and the last checkpoint then the error that ends the stream
     /// (simp724's R2).
@@ -315,25 +369,16 @@ struct Merging {
 }
 
 impl Merging {
-    fn new(
+    pub(super) fn new(
         merge: Merge,
-        slot: tokio::sync::OwnedSemaphorePermit,
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
         quiet: Duration,
-        idle: Duration,
     ) -> Self {
-        // Half the limit, so a poll always lands inside it; at least 10 ms, so a limit set
-        // near zero doesn't spin the stream (simp724's N1 on #1777). A higher floor would
-        // break the half-limit guarantee for limits under twice it.
-        let alive_every = (idle / 2).max(ALIVE_FLOOR);
-        let mut alive = Timer::new();
-        alive.set(Some(tokio::time::Instant::now() + alive_every));
         Self {
             merge,
             _slot: slot,
             retry: Timer::new(),
             quiet: Quiet::new(quiet),
-            alive,
-            alive_every,
             turn: 0,
             queued: VecDeque::new(),
             ended: false,
@@ -342,7 +387,7 @@ impl Merging {
 
     /// The next item, registering every wake source when there's none: an open finishing,
     /// the retry timer, a part's event, the quiet timer (simp724's R3).
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Out, ApiError>>> {
         loop {
             if let Some(item) = self.queued.pop_front() {
                 if item.is_ok() {
@@ -407,11 +452,6 @@ impl Merging {
                 } else {
                     self.quiet.sent();
                 }
-                continue;
-            }
-            if self.alive.poll(cx).is_ready() {
-                self.alive
-                    .set(Some(tokio::time::Instant::now() + self.alive_every));
                 continue;
             }
             return Poll::Pending;
@@ -480,11 +520,11 @@ fn expired(message: String) -> ApiError {
     ApiError::from_code(pigeonhole::ErrorCode::FeedExpired, &message)
 }
 
-/// The subscription's task.
-struct Merge {
+/// A subscription's merge: its hub's (#1798), or a member's own.
+pub(super) struct Merge {
     ctx: Arc<Ctx>,
-    parts: Vec<Part>,
-    allow_partial: bool,
+    pub(super) parts: Vec<Part>,
+    pub(super) allow_partial: bool,
     /// `checkpoint_every`; 0: from the token's size.
     every: u64,
     map_version: u64,
@@ -500,7 +540,7 @@ struct Merge {
     /// The last checkpoint's token ([`Merge::checkpoint`]), kept so a checkpoint per event
     /// allocates nothing (#1758), and what it was built from: only a part that moved is
     /// encoded again (2a).
-    token: Vec<u8>,
+    pub(super) token: Vec<u8>,
     cache: super::token::TokenCache,
     /// Each commit's tail is written here and split off ([`Merge::cover`]).
     tail: prost::bytes::BytesMut,
@@ -508,6 +548,11 @@ struct Merge {
     /// unreachable partitions never stop the merge from reading the others (simp724's S1 on
     /// #1700).
     opens: tokio::task::JoinSet<(usize, Opened)>,
+    /// A cluster feed hub's merge (#1798): its local components don't give their hubs'
+    /// rings a full share ([`crate::serve::feed::Spec::internal`]).
+    shared: bool,
+    /// The last commit [`Merge::cover`] sent: its part, and whether it carried a checkpoint.
+    pub(super) last: Option<(usize, bool)>,
 }
 
 /// What a component's event was.
@@ -518,9 +563,23 @@ enum Kind {
 }
 
 impl Merge {
+    /// Whether every part has said where it is (its first event), or is unavailable
+    /// (`allow_partial`): a hub's first checkpoint then names every part (#1798).
+    pub(super) fn placed(&self) -> bool {
+        self.parts
+            .iter()
+            .all(|p| p.unavailable || matches!(p.at, At::Token(_)))
+    }
+
+    /// A checkpoint now, as its token's bytes.
+    pub(super) fn checkpoint_now(&mut self) -> Vec<u8> {
+        self.checkpoint();
+        self.token.clone()
+    }
+
     /// Opens every component, at most [`OPENS`] at once. A failure fails the call, unless
     /// `allow_partial`: then the part starts unavailable, reported in a first event.
-    async fn open_all(&mut self) -> Result<(), ApiError> {
+    pub(super) async fn open_all(&mut self) -> Result<(), ApiError> {
         let mut set = tokio::task::JoinSet::new();
         let mut opened: Vec<Option<Opened>> = (0..self.parts.len()).map(|_| None).collect();
         let mut next = 0;
@@ -561,6 +620,7 @@ impl Merge {
             skip: p.skip,
             map_version: self.map_version,
             epoch: p.epoch,
+            internal: self.shared,
         }
     }
 
@@ -672,10 +732,12 @@ impl Merge {
                     PARTITION_FIELD,
                     self.parts[i].partition.as_bytes(),
                 );
-                if self.since_checkpoint >= self.next_checkpoint {
+                let checkpoint = self.since_checkpoint >= self.next_checkpoint;
+                if checkpoint {
                     self.checkpoint();
                     put_field(&mut self.tail, TOKEN_FIELD, &self.token);
                 }
+                self.last = Some((i, checkpoint));
                 Ok(Some(Out::Spliced {
                     body,
                     tail: self.tail.split().freeze(),
@@ -992,7 +1054,7 @@ fn split(bytes: Bytes) -> Result<(Bytes, Bytes, Kind), String> {
 }
 
 /// Appends a length-delimited field.
-fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
+pub(super) fn put_field(out: &mut impl BufMut, field: u32, value: &[u8]) {
     prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, out);
     prost::encoding::encode_varint(value.len() as u64, out);
     out.put_slice(value);
@@ -1011,6 +1073,8 @@ struct Open {
     /// The epoch the part's position is from: the open refuses a partition whose history
     /// began after it (D317 ticket 6).
     epoch: u64,
+    /// A cluster feed hub's component (#1798, [`crate::serve::feed::Spec::internal`]).
+    internal: bool,
 }
 
 impl Ctx {
@@ -1112,7 +1176,7 @@ impl Ctx {
                 )));
             };
             let events = here
-                .subscribe_part(open.request, &self.caller, open.skip, true)
+                .subscribe_part(open.request, &self.caller, open.skip, true, open.internal)
                 .await
                 .map_err(|e| closed_since(&self.parts, &open.partition, &here, e))?;
             still_owner(&self.node, &open.partition)?;
@@ -1307,7 +1371,7 @@ pub(crate) async fn serve(
     #[cfg(test)]
     hold_subscribe(node.dir(), &req.partition).await;
     let events = service
-        .subscribe_part(r, &caller, req.skip_through, true)
+        .subscribe_part(r, &caller, req.skip_through, true, false)
         .await
         .map_err(|e| closed_since(parts, &req.partition, &service, e))?;
     still_owner(node, &req.partition)?;
@@ -1482,7 +1546,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::serve::cluster::token::Component;
 
@@ -1523,7 +1587,7 @@ mod tests {
     }
 
     /// A runtime on a paused clock: virtual time, advanced only when every task waits.
-    fn paused() -> tokio::runtime::Runtime {
+    pub(in crate::serve::cluster) fn paused() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -1642,7 +1706,7 @@ mod tests {
         });
     }
 
-    fn event(token: &[u8], commit_seqno: Option<u64>) -> Bytes {
+    pub(in crate::serve::cluster) fn event(token: &[u8], commit_seqno: Option<u64>) -> Bytes {
         let e = proto::FeedEvent {
             token: Bytes::copy_from_slice(token),
             event: Some(match commit_seqno {
@@ -1660,7 +1724,7 @@ mod tests {
 
     /// A D310 version-2 token of 4 streams at `n`: what a one-partition subscription's part
     /// carries on every event.
-    fn d310_token(n: u64) -> Vec<u8> {
+    pub(in crate::serve::cluster) fn d310_token(n: u64) -> Vec<u8> {
         let mut t = vec![2u8];
         t.extend_from_slice(&[7u8; 16]);
         t.extend_from_slice(&4u32.to_le_bytes());
@@ -1685,7 +1749,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
         let (_feed, events) = fed();
-        let mut m = merging(vec![Some(events)], QUIET, IDLE);
+        let mut m = merging(vec![Some(events)], QUIET);
         let batch: Vec<Bytes> = (0..10_000u64)
             .map(|n| event(&d310_token(n), Some(n + 1)))
             .collect();
@@ -1743,9 +1807,10 @@ mod tests {
         }
     }
 
-    type Feed = tokio::sync::mpsc::UnboundedSender<Result<Bytes, ApiError>>;
+    pub(in crate::serve::cluster) type Feed =
+        tokio::sync::mpsc::UnboundedSender<Result<Bytes, ApiError>>;
 
-    fn fed() -> (Feed, Events) {
+    pub(in crate::serve::cluster) fn fed() -> (Feed, Events) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (tx, Box::pin(Fed(rx)))
     }
@@ -1753,7 +1818,10 @@ mod tests {
     /// A merge of `n` parts (`p0`, `p1`, ...), each fed by the test or not open yet
     /// (`None`), with `allow_partial`, as its client's stream would hold it. Its node has no
     /// map, so a reopen fails as unavailable.
-    fn merging(events: Vec<Option<Events>>, quiet: Duration, idle: Duration) -> Merging {
+    pub(in crate::serve::cluster) fn merging(
+        events: Vec<Option<Events>>,
+        quiet: Duration,
+    ) -> Merging {
         let dir = super::super::tests::test_dir();
         let node = super::super::tests::node(&dir, "a");
         let db = pigeonhole::Pigeonhole::open(
@@ -1808,11 +1876,13 @@ mod tests {
             cache: super::super::token::TokenCache::default(),
             tail: tail_buffer(),
             opens: tokio::task::JoinSet::new(),
+            shared: false,
+            last: None,
         };
         let slot = Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
             .unwrap();
-        Merging::new(merge, slot, quiet, idle)
+        Merging::new(merge, Some(slot), quiet)
     }
 
     /// The next item, within `d` of virtual time: `None` if nothing woke the stream with one.
@@ -1822,7 +1892,9 @@ mod tests {
             .ok()
     }
 
-    fn commit_of(item: Option<Option<Result<Out, ApiError>>>) -> (String, u64) {
+    pub(in crate::serve::cluster) fn commit_of(
+        item: Option<Option<Result<Out, ApiError>>>,
+    ) -> (String, u64) {
         let e = item
             .expect("woken")
             .expect("not ended")
@@ -1834,15 +1906,32 @@ mod tests {
         }
     }
 
-    const QUIET: Duration = Duration::from_secs(10);
-    const IDLE: Duration = Duration::from_secs(30);
+    pub(in crate::serve::cluster) const QUIET: Duration = Duration::from_secs(10);
+
+    /// `m`'s subscription as a [`Plan`] (#1798's member tests).
+    pub(in crate::serve::cluster) fn plan_of(m: &Merging) -> Plan {
+        let merge = &m.merge;
+        Plan {
+            ctx: Arc::clone(&merge.ctx),
+            placed: merge
+                .parts
+                .iter()
+                .map(|p| (p.partition.clone(), p.tables.clone()))
+                .collect(),
+            allow_partial: merge.allow_partial,
+            every: merge.every,
+            map_version: merge.map_version,
+            subscription: merge.subscription,
+            cluster_id: merge.cluster_id.clone(),
+        }
+    }
 
     #[test]
     fn the_quiet_tick_alone_wakes_the_stream_with_a_checkpoint() {
         // simp724's R3: with the parts quiet, the quiet timer is what wakes the stream.
         paused().block_on(async {
             let (p0, events) = fed();
-            let mut m = merging(vec![Some(events)], QUIET, IDLE);
+            let mut m = merging(vec![Some(events)], QUIET);
             p0.send(Ok(event(b"t1", Some(1)))).unwrap();
             // The part's own progress moves the position past the last checkpoint (one
             // part: every commit is one), and sends nothing.
@@ -1853,8 +1942,8 @@ mod tests {
                 ("p0".into(), 1)
             );
             // Nothing more from the part: the next item is the quiet checkpoint, at the
-            // quiet interval after the last send exactly. Only the keepalive (every half idle limit) and the
-            // quiet timer could wake it; the quiet one comes first.
+            // quiet interval after the last send exactly: only the quiet timer could wake
+            // it.
             let e = next_within(&mut m, QUIET * 2)
                 .await
                 .expect("woken by the quiet timer")
@@ -1873,7 +1962,7 @@ mod tests {
     #[test]
     fn an_open_finishing_alone_wakes_the_stream() {
         paused().block_on(async {
-            let mut m = merging(vec![None], QUIET, IDLE);
+            let mut m = merging(vec![None], QUIET);
             let (p0, events) = fed();
             m.merge.opens.spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1891,7 +1980,7 @@ mod tests {
     #[test]
     fn the_retry_timer_alone_wakes_the_stream_to_reopen_a_part() {
         paused().block_on(async {
-            let mut m = merging(vec![None], QUIET, IDLE);
+            let mut m = merging(vec![None], QUIET);
             m.merge.parts[0].opening = false;
             let start = tokio::time::Instant::now();
             m.merge.parts[0].retry = Some(start + RETRY);
@@ -1917,7 +2006,7 @@ mod tests {
         // next, rather than returning Pending with nothing to wake it.
         paused().block_on(async {
             let (p0, events) = fed();
-            let mut m = merging(vec![Some(events)], QUIET, IDLE);
+            let mut m = merging(vec![Some(events)], QUIET);
             p0.send(Ok(event(b"t1", None))).unwrap();
             p0.send(Ok(event(b"t2", None))).unwrap();
             p0.send(Ok(event(b"t3", Some(3)))).unwrap();
@@ -1935,7 +2024,7 @@ mod tests {
         paused().block_on(async {
             let (p0, e0) = fed();
             let (p1, e1) = fed();
-            let mut m = merging(vec![Some(e0), Some(e1)], QUIET, IDLE);
+            let mut m = merging(vec![Some(e0), Some(e1)], QUIET);
             for s in 1..=10 {
                 p0.send(Ok(event(format!("t{s}").as_bytes(), Some(s))))
                     .unwrap();
