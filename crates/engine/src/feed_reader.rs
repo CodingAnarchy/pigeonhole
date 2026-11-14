@@ -1319,6 +1319,16 @@ impl FeedReader {
         }
     }
 
+    /// Whether the writer's session stopped its sidecar appends (D315): the writer's own
+    /// flag in its process, or the stop it published in shared memory in a reader process
+    /// (D315 amendment, #1869).
+    fn appends_stopped(&self) -> bool {
+        match &self.writer {
+            Some(feed) => feed.appends_stopped(),
+            None => self.shm.feed_appends_stopped(),
+        }
+    }
+
     /// Whether a catalog change may have been rooted since this feed last loaded the sidecar:
     /// the writer's count moved, or (a reader process) unknown.
     fn catalog_moved(&self) -> bool {
@@ -1710,11 +1720,12 @@ impl FeedReader {
         if self.expired.is_some() {
             return Ok(Polled::Expired);
         }
-        // A feed of every table in the writer's process, once the session's sidecar appends
-        // stopped: no later catalog change can reach it, and the frozen catalog hold keeps
-        // the frontier from moving, so this is checked before the frontier is (simp724 on
-        // #1493).
-        if self.tables.is_empty() && self.writer.as_ref().is_some_and(|f| f.appends_stopped()) {
+        // A feed of every table, once the session's sidecar appends stopped: no later catalog
+        // change can reach it, and the frozen catalog hold keeps the frontier from moving, so
+        // this is checked before the frontier is (simp724 on #1493). In a reader process, from
+        // the stop the writer published in shared memory (D315 amendment, #1869), not by
+        // waiting at the hold until the writer restarts.
+        if self.tables.is_empty() && self.appends_stopped() {
             self.expired = Some(expiry(
                 "the change feed's sidecar can no longer be written: catalog changes after this point can't be delivered",
             ));

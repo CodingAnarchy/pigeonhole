@@ -493,6 +493,10 @@ pub(crate) struct Feed {
     /// every table in this process expire on seeing it; the manifest pump freezes the catalog
     /// hold (`catalog_hold_frozen`) so no feed's frontier passes a change that has no entry.
     appends_stopped: std::sync::atomic::AtomicBool,
+    /// The writer's shared-memory region, once the open built it (after this session): where
+    /// a stop is published for reader processes, whose feeds of every table expire on it
+    /// (D315 amendment, #1869). See [`Feed::stop_appends`] and [`Feed::publish_to`].
+    shm: OnceLock<pigeonhole_shm::ShmRegion>,
     /// The catalog hold is frozen for the rest of the session (set once, by the manifest
     /// pump, after `appends_stopped`): never released.
     catalog_hold_frozen: std::sync::atomic::AtomicBool,
@@ -511,11 +515,11 @@ pub(crate) struct Feed {
     catalog_waiters: Mutex<FastMap<u64, std::task::Waker>>,
     /// Whether `catalog_waiters` may be non-empty.
     has_catalog_waiters: std::sync::atomic::AtomicBool,
+    /// Catalog changes of this session whose Root entry is written (`catalog_roots`).
+    catalog_roots: AtomicU64,
     /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
     /// observer waits before it records the root, widening the window between a durable
     /// superblock and its sidecar entry. 0 (the default) waits nothing.
-    /// Catalog changes of this session whose Root entry is written (`catalog_roots`).
-    catalog_roots: AtomicU64,
     #[cfg(feature = "test-hooks")]
     pub(crate) root_observer_delay_nanos: AtomicU64,
     /// A hold seam (`Engine::delay_root_intent`, D315 amendment): nanoseconds each root
@@ -523,6 +527,43 @@ pub(crate) struct Feed {
     /// window between the intent and the superblock. 0 (the default) waits nothing.
     #[cfg(feature = "test-hooks")]
     pub(crate) root_intent_delay_nanos: AtomicU64,
+    /// A fault seam (`Engine::fail_next_sidecar_sync`, #1869): the next sidecar sync
+    /// completes as failed, once, though the VFS's succeeded.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fail_next_sidecar_sync: std::sync::atomic::AtomicBool,
+    /// A fault seam (`Engine::before_next_root_write`, #1869): runs once, in the root-commit
+    /// observer, after the root's intent landed and before its Root entry is written, so a
+    /// test fails that write alone.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) before_root_write: OnceHook,
+}
+
+/// A test's one-shot callback (`Feed::before_root_write`).
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+pub(crate) struct OnceHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(feature = "test-hooks")]
+impl OnceHook {
+    /// Arms `f` for the next run, replacing one not yet run.
+    pub(crate) fn arm(&self, f: Box<dyn FnOnce() + Send>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Runs the armed callback, if any, once.
+    fn run(&self) {
+        let f = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(f) = f {
+            f();
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl std::fmt::Debug for OnceHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnceHook")
+    }
 }
 
 /// A catalog change staged for its root commit's `Catalog` sidecar entry (D315).
@@ -582,6 +623,7 @@ impl Feed {
             checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
             staged_catalog: Mutex::default(),
             appends_stopped: std::sync::atomic::AtomicBool::new(false),
+            shm: OnceLock::new(),
             catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
             hold_waiters: Mutex::default(),
             has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
@@ -592,6 +634,10 @@ impl Feed {
             root_observer_delay_nanos: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             root_intent_delay_nanos: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            fail_next_sidecar_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-hooks")]
+            before_root_write: OnceHook::default(),
         }
     }
 
@@ -872,7 +918,7 @@ impl Feed {
         if let Err(e) = appended {
             crate::shard::trace!("feed: sidecar append of intent {sequence} failed: {e}");
             *sidecar = None;
-            self.appends_stopped.store(true, Ordering::Release);
+            self.stop_appends();
         }
         drop(sidecar);
         #[cfg(feature = "test-hooks")]
@@ -895,6 +941,7 @@ impl Feed {
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_nanos(delay));
             }
+            self.before_root_write.run();
         }
         // A catalog change whose intent didn't append it (no intent hook ran): its entry
         // goes first, in the same append as the Root entry.
@@ -936,7 +983,7 @@ impl Feed {
             if let Err(e) = written {
                 crate::shard::trace!("feed: sidecar write of root {sequence} failed: {e}");
                 *sidecar = None;
-                self.appends_stopped.store(true, Ordering::Release);
+                self.stop_appends();
                 return;
             }
             if catalog {
@@ -968,6 +1015,35 @@ impl Feed {
     /// Whether the session's sidecar appends stopped (D315): see `appends_stopped`.
     pub(crate) fn appends_stopped(&self) -> bool {
         self.appends_stopped.load(Ordering::Acquire)
+    }
+
+    /// Stops the session's sidecar appends (D315; simp724 on #1493): terminal. Also
+    /// publishes the stop in the writer's shared-memory region for reader processes (D315
+    /// amendment, #1869), if the open has built it yet; [`publish_to`](Self::publish_to)
+    /// publishes a stop made before then.
+    fn stop_appends(&self) {
+        self.appends_stopped.store(true, Ordering::SeqCst);
+        // A Dekker pair with `publish_to`'s set-then-load (SeqCst both sides): either this
+        // load sees the region, or that load sees the stop, so a stop made as the open
+        // attaches the region is published once at least.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if let Some(shm) = self.shm.get() {
+            shm.publish_feed_appends_stopped();
+        }
+    }
+
+    /// Gives the session the writer's shared-memory region, once the open built it (D315
+    /// amendment, #1869), and publishes a stop already made: root commits of this open
+    /// (`finish`'s upgrade) may have stopped the appends before the region existed.
+    pub(crate) fn publish_to(&self, shm: pigeonhole_shm::ShmRegion) {
+        let set = self.shm.set(shm);
+        debug_assert!(set.is_ok(), "a session is handed its region once");
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.appends_stopped.load(Ordering::SeqCst)
+            && let Some(shm) = self.shm.get()
+        {
+            shm.publish_feed_appends_stopped();
+        }
     }
 
     /// Marks the catalog hold frozen for the rest of the session: the hold `release_catalog`
@@ -1019,13 +1095,22 @@ impl Feed {
         let again = Arc::clone(&file);
         // `sync_all`: an append grows the file, and its new length must be durable with it.
         drop(file.submit_sync_all().map(move |r| {
+            #[cfg(feature = "test-hooks")]
+            let r = if this.fail_next_sidecar_sync.swap(false, Ordering::AcqRel) {
+                Err(pigeonhole_io::Error::new(
+                    pigeonhole_io::ErrorKind::Other,
+                    "injected sidecar sync failure",
+                ))
+            } else {
+                r
+            };
             if let Err(e) = &r {
                 // Fail closed (simp724): no retry, and no append that a later sync could
                 // report clean over pages the kernel dropped. The next open finds the
                 // sequence ahead of the last entry and expires every token.
                 crate::shard::trace!("feed: sidecar sync failed, no more appends: {e}");
                 *this.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                this.appends_stopped.store(true, Ordering::Release);
+                this.stop_appends();
                 let mut st = this
                     .sidecar_sync
                     .lock()
@@ -1324,5 +1409,30 @@ mod tests {
             last_of(&[FeedEntry::Unfed { sequence: 1 }, session(3)]),
             Some(want)
         );
+    }
+
+    /// #1869: a stop made before the open hands the session its region (a root commit of
+    /// the open's own `finish`) is published when it does, and one made after is published
+    /// at once. Mutation-checked: without `publish_to`'s check, the first case fails.
+    #[test]
+    fn a_stop_is_published_whether_it_comes_before_or_after_the_region() {
+        for stop_first in [true, false] {
+            let feed = Feed::new(1, 2, None, FeedTables::All, 1);
+            let shm =
+                pigeonhole_shm::ShmRegion::in_memory([1; 16], &pigeonhole_shm::ShmConfig::new(1));
+            if stop_first {
+                feed.stop_appends();
+                assert!(!shm.feed_appends_stopped(), "no region yet");
+            }
+            feed.publish_to(shm.clone());
+            assert_eq!(shm.feed_appends_stopped(), stop_first, "{stop_first}");
+            if !stop_first {
+                feed.stop_appends();
+            }
+            assert!(
+                feed.appends_stopped() && shm.feed_appends_stopped(),
+                "{stop_first}"
+            );
+        }
     }
 }

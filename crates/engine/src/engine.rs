@@ -1159,6 +1159,11 @@ impl Engine {
         } else {
             ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?
         };
+        // Where the session publishes a stop of its sidecar appends for reader processes,
+        // and a stop this open's own root commits already made (D315 amendment, #1869).
+        if let Some(f) = &feed {
+            f.publish_to(shm.clone());
+        }
         // A new generation, so new zero slots: reader processes re-attach, which clears their
         // caches (D281; every writer open, a recovery's and a handover's too, builds one).
         let row_epochs = Arc::new(crate::row_cache::RowEpochs::new(shm.row_epochs()));

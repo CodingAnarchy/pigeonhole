@@ -33,6 +33,8 @@ mod engine;
 mod error;
 mod feed;
 mod feed_reader;
+#[cfg(all(test, engine_loom))]
+mod feed_stop_loom;
 mod flush;
 mod flushed_roots;
 #[cfg(all(test, engine_loom))]
