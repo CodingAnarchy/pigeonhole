@@ -2450,6 +2450,82 @@ mod tests {
     }
 
     #[test]
+    fn a_single_nodes_hub_placement_is_mains() {
+        // #1798, g102: on a node with no cluster merges, `Driver::moves` decides as main's
+        // did (4a47d2a47): the hub runtime at once with two or more clients, back to the feed
+        // runtime once alone for `solo_after`. B's `internal()` must never read a client-only
+        // hub as a merge's, at any member count, so a single node's placement is unchanged.
+        // `main` is main's rule, written out; every step's answer is checked against it.
+        fn main(place: Place, members: usize, alone_due: bool) -> Option<Place> {
+            match place {
+                Place::Feed => (members >= 2).then_some(Place::Hubs),
+                Place::Hubs if members >= 2 => None,
+                Place::Hubs => alone_due.then_some(Place::Feed),
+            }
+        }
+        let (_, db, dir) = commits("feedpin", 0);
+        let t = db.table("t").unwrap().open().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let hub = Arc::new(Hub::new(
+            Ring::new(SingleRing::default()),
+            rt.spawn(async {}).abort_handle(),
+            true,
+            Arc::default(),
+            Arc::new(AtomicU64::new(1)),
+            Arc::default(),
+        ));
+        let snapshot = db.snapshot().unwrap();
+        let stream = open(std::slice::from_ref(&t), true, &Start::Snapshot(snapshot)).unwrap();
+        let mut d = Driver {
+            stream: FeedStream::new(stream),
+            hub: Arc::downgrade(&hub),
+            ring_bytes: 16 << 20,
+            runtimes: Some((rt.handle().clone(), rt.handle().clone())),
+            solo_after: Duration::ZERO,
+            place: Place::Feed,
+            alone: None,
+        };
+        // One step, checked against main's rule; `alone_due`: main's answer alone on the hub
+        // runtime (the step after the one that started the `solo_after` clock).
+        let step = |d: &mut Driver, alone_due: bool| {
+            let members = hub.members();
+            assert!(!hub.internal(), "a client-only hub with {members} members");
+            let got = d.moves(&hub);
+            let want = main(d.place, members, alone_due);
+            assert_eq!(got, want, "{members} members at {:?}", d.place);
+            if let Some(p) = got {
+                d.place = p;
+            }
+            got
+        };
+        let join = || hub.join(&Arc::new(Tracker::default()), false);
+        let mut joined = Vec::new();
+        assert_eq!(step(&mut d, false), None, "no members yet");
+        joined.push(join());
+        assert_eq!(step(&mut d, false), None, "one client: solo, beside it");
+        joined.push(join());
+        assert_eq!(step(&mut d, false), Some(Place::Hubs), "a second client");
+        joined.push(join());
+        assert_eq!(step(&mut d, false), None, "three: stays");
+        joined.truncate(2);
+        assert_eq!(step(&mut d, false), None, "two: stays");
+        joined.truncate(1);
+        assert_eq!(step(&mut d, false), None, "alone: the clock starts");
+        assert_eq!(
+            step(&mut d, true),
+            Some(Place::Feed),
+            "alone past solo_after"
+        );
+        joined.clear();
+        assert_eq!(step(&mut d, false), None, "none left, on the feed runtime");
+        drop((d, t));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_hub_read_only_by_cluster_merges_runs_on_the_hub_runtime_with_a_full_share() {
         // #1798, g100: a partition hub whose one member is a cluster hub's merge isn't solo.
         // Its reader runs on the feed runtime, which also delivers every cluster subscriber's
