@@ -1,5 +1,6 @@
 //! Hold and fault seams for tests (`__unstable-hooks` only). They pause or skip, or (one,
-//! [`split_row_bytes`]) change the size a bound is computed from; they never run another path.
+//! [`split_row_bytes`](crate::hooks::split_row_bytes)) change the size a bound is computed
+//! from; they never run another path.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
