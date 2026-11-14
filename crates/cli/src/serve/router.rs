@@ -420,6 +420,7 @@ impl Router {
             };
             p.set_state(state);
             p.set_fence_reason(reason);
+            p.awaiting_peers = cluster.node.awaiting_peers(id);
             if let Some(part) = open.get(id) {
                 let db = part.db.clone();
                 let info = self.service.blocking(move || Ok(db.info()?)).await?;

@@ -337,6 +337,7 @@ fn opened_off_the_others_cores_alone() {
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
@@ -665,6 +666,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        previous_nodes: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     // One 1-shard partition: 64 MiB of memtables and 448 MiB of caches.
@@ -769,6 +771,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
         map_version: 1,
+        previous_nodes: Vec::new(),
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),

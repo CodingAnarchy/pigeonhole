@@ -440,6 +440,7 @@ mod tests {
         ClusterMap {
             cluster_id: "c1".into(),
             map_version: version,
+            previous_nodes: Vec::new(),
             nodes: vec![Node {
                 id: "n1".into(),
                 address: "a:1".into(),

@@ -911,3 +911,257 @@ fn a_close_whose_drain_fails_leaves_the_partition_open_under_the_operators_fence
         assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
     });
 }
+
+#[test]
+fn a_moves_wait_for_a_majority_to_take_its_map_gives_up_at_its_timeout() {
+    // #1760 (the coordinator's call on Q4): after its map step, a move waits until a
+    // majority of the map's nodes hold the map. With two of three nodes down, only one
+    // does: the wait ends at its limit, saying how many hold it.
+    let mut t = Cluster::start();
+    let a = t.ports[0];
+    let map = t.rt.block_on(async {
+        client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    for i in [1, 2] {
+        let _ = t.stops.remove(1);
+        let port = t.ports[i];
+        t.rt.block_on(eventually("the node to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+        }));
+    }
+    t.rt.block_on(async {
+        let args = super::super::cli::NodeArgs {
+            node: format!("http://127.0.0.1:{a}"),
+            token_file: None,
+            ca: None,
+        };
+        // All three nodes up a moment ago: a majority held the map then.
+        let e = within(super::super::moving::majority_holds(
+            &args,
+            &map,
+            map.map_version,
+            Some(Duration::from_secs(2)),
+        ))
+        .await
+        .expect_err("one node of three holds it");
+        assert!(
+            e.message().starts_with(&format!(
+                "gave up waiting for a majority of the 3 nodes to take map version {} after \
+                 2s (--timeout): 1 of 3 nodes hold it",
+                map.map_version
+            )),
+            "{}",
+            e.message()
+        );
+    });
+}
+
+#[test]
+fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_after_the_confirm() {
+    // feed1248's test on the #1760 design: the fence guards writes only. c holds a checked
+    // copy of p1 at the next epoch; a and b are down, and the map giving c p1 reaches c
+    // alone, so c opens p1 and can't confirm it (one of three nodes holds the map). A feed
+    // through c subscribes all the same, and writes there answer `Fenced`. When a and b come
+    // back, c's rounds give them the map and confirm p1, and the first write after that
+    // reaches the feed.
+    use crate::serve::proto::feed_client::FeedClient;
+    use crate::serve::proto::{
+        LocalPartitionState, MutateRequest, PushMapRequest, SubscribeRequest, feed_event::Event,
+    };
+    let mut t = Cluster::start();
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        let stopped = within(super::super::moving::run(&t.args, "p1", "c", false, None)).await;
+        assert!(stopped.is_err(), "the move stops after its stamp");
+    });
+    let v2 = t.rt.block_on(async {
+        let mut m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        for p in m.partitions.iter_mut().filter(|p| p.id == "p1") {
+            p.node = "c".into();
+            p.epoch += 1;
+        }
+        m
+    });
+    for i in [0, 1] {
+        let _ = t.stops.remove(0);
+        let port = t.ports[i];
+        t.rt.block_on(eventually("the node to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+        }));
+    }
+    let mut feed = t.rt.block_on(async {
+        client(c)
+            .await
+            .push_map(PushMapRequest { map: Some(v2) })
+            .await
+            .unwrap();
+        eventually("c to open p1, unconfirmed", async || {
+            client(c)
+                .await
+                .status(StatusRequest {})
+                .await
+                .is_ok_and(|s| {
+                    s.into_inner().partitions.iter().any(|lp| {
+                        lp.id == "p1"
+                            && lp.state() == LocalPartitionState::Fenced
+                            && lp.awaiting_peers
+                    })
+                })
+        })
+        .await;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let feed = FeedClient::new(channel)
+            .subscribe(SubscribeRequest {
+                tables: vec!["users".into()],
+                allow_partial: true,
+                ..Default::default()
+            })
+            .await
+            .expect("a feed on an unconfirmed partition subscribes")
+            .into_inner();
+        let e = data(c)
+            .await
+            .mutate(MutateRequest {
+                writes: Some(put_row("amy", "1")),
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Fenced", "{e}");
+        feed
+    });
+    // a and b come back, each with the map c alone held.
+    for (i, (id, p)) in [(0, ("a", "p1")), (1, ("b", "p2"))] {
+        let l = std::net::TcpListener::bind(("127.0.0.1", t.ports[i])).unwrap();
+        let (stop, _) = data_node_full(
+            &t.rt,
+            &t.dirs[i],
+            id,
+            Some(p),
+            l,
+            "",
+            crate::serve::server_tests::limits(),
+            // a's p1 was closed by the move: it opens again from its file. b's is still open.
+            (i == 1).then(|| t.dbs[1].clone()),
+            true,
+        );
+        t.stops.push(stop);
+    }
+    t.rt.block_on(async {
+        eventually("c's rounds to confirm p1", async || {
+            p1_is(c, LocalPartitionState::Serving).await
+        })
+        .await;
+        put(b, "amy", "2").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let e = tokio::time::timeout_at(deadline, feed.message())
+                .await
+                .expect("amy's commit within 10 s")
+                .unwrap()
+                .expect("the stream ended");
+            if let Some(Event::Commit(cm)) = &e.event
+                && cm.changes.iter().any(|ch| ch.row.as_ref() == b"amy")
+            {
+                break;
+            }
+        }
+        let _ = a;
+    });
+}
+
+#[test]
+fn a_node_the_newest_map_removed_doesnt_count_toward_its_majority() {
+    // audit120's F1 on #1899: a round counts holders only among the nodes of the map it
+    // ends with. v2 removes c, which serves nothing (nodes a and b); c alone took it. p1 is
+    // fenced on a by the operator, a is still on v1, and b is down. An unfence of p1 runs a
+    // round from v1: c answers with v2, which a installs, and a and c hold it, but c isn't
+    // one of v2's nodes, so it's 1 of 2 and the unfence is refused. With b back, it lifts.
+    use crate::serve::proto::{GetMapRequest, PartitionRequest, PushMapRequest};
+    let mut t = Cluster::start();
+    let [a, b, c] = t.ports;
+    let p1 = || PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    let v2 = t.rt.block_on(async {
+        client(a).await.fence(p1()).await.unwrap();
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.nodes.retain(|n| n.id != "c");
+        m
+    });
+    // b stops; c takes v2 alone.
+    let _ = t.stops.remove(1);
+    t.rt.block_on(eventually("b to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", b))
+            .await
+            .is_err()
+    }));
+    t.rt.block_on(async {
+        client(c)
+            .await
+            .push_map(PushMapRequest { map: Some(v2) })
+            .await
+            .unwrap();
+        let e = client(a).await.unfence(p1()).await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(
+            e.message().contains("1 of 2 nodes hold map version 2"),
+            "c, removed by v2, isn't counted: {e}"
+        );
+        let m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(m.map_version, 2, "the round took c's newer map");
+    });
+    let l = std::net::TcpListener::bind(("127.0.0.1", b)).unwrap();
+    let (stop, _) = data_node_full(
+        &t.rt,
+        &t.dirs[1],
+        "b",
+        Some("p2"),
+        l,
+        "",
+        crate::serve::server_tests::limits(),
+        Some(t.dbs[1].clone()),
+        true,
+    );
+    t.stops.push(stop);
+    t.rt.block_on(async {
+        eventually("the unfence to be confirmed once b holds v2", async || {
+            client(a).await.unfence(p1()).await.is_ok()
+        })
+        .await;
+    });
+}
