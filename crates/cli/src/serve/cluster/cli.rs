@@ -120,9 +120,17 @@ pub(crate) enum ClusterCommand {
         /// stopped): skip the check that it isn't serving it.
         #[arg(long)]
         old_unreachable: bool,
-        /// Partitions uploaded at once.
-        #[arg(long, value_name = "N", default_value_t = 4)]
-        parallel: usize,
+        /// Partitions uploaded at once (default 4).
+        #[arg(long, value_name = "N")]
+        parallel: Option<usize>,
+        /// Restore only this partition, from the backup's copy, into the live cluster: the
+        /// other partitions and the tables stay as the live map has them, and the partition
+        /// gets a new epoch and a new feed history. Its writes since the backup are lost.
+        #[arg(long, value_name = "P", conflicts_with_all = ["map", "cluster_id", "parallel"])]
+        partition: Option<String>,
+        /// With `--partition`: the node it goes to (default: the node the live map gives it).
+        #[arg(long, value_name = "ID", requires = "partition")]
+        to: Option<String>,
     },
     /// Fence a partition on the node that serves it (`--node`): its writes answer `Fenced`
     /// through every node until it's unfenced, relocated or closed; reads go on. Answers
@@ -284,6 +292,8 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             cluster_id,
             old_unreachable,
             parallel,
+            partition,
+            to,
         } => runtime()?.block_on(super::restore::restore(
             node,
             &super::restore::RestoreArgs {
@@ -291,7 +301,9 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 map: map.clone(),
                 cluster_id: cluster_id.clone(),
                 old_unreachable: *old_unreachable,
-                parallel: *parallel,
+                parallel: parallel.unwrap_or(4),
+                partition: partition.clone(),
+                to: to.clone(),
             },
         )),
         ClusterCommand::Fence { partition, node } => {
@@ -431,17 +443,44 @@ pub(crate) async fn relocate(
     } else {
         CopyCheck::No
     };
-    relocate_as(args, partition, to, old_unreachable, copy).await
+    relocate_as(args, partition, to, old_unreachable, copy, None).await
 }
 
-/// [`relocate`], with who checks a copy ([`CopyCheck`]).
+/// A test's fault seam: the next one-partition restore through this `--node` URL stops
+/// after its stamp, before its map, as a crash or a refused set there would leave it.
+/// Keyed by the URL, so tests running at once don't take each other's.
+#[cfg(test)]
+pub(crate) static RESTORE_STOP_BEFORE_MAP: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// A one-partition restore's stamp and map step (#1832), through [`relocate_as`]: the same
+/// checks, stamp and checked map set as a relocation, with the stamp's `restore` set.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Restoring {
+    /// The epoch the stamp raises from, to `from_epoch + 1`, which the map then gives P: at
+    /// least the map's epoch, and at least every copy's on any node (cli692's design N1).
+    pub(super) from_epoch: u64,
+    /// The target already holds P at `from_epoch + 1`, stamped by an earlier run: no stamp.
+    pub(super) stamped: bool,
+}
+
+/// [`relocate`], with who checks a copy ([`CopyCheck`]), or as a one-partition restore's
+/// step ([`Restoring`]). A restore's stamp accepts the staged backup copy's older epoch,
+/// and P may be absent on its old node (its files lost), where a relocation needs it fenced
+/// or closed.
 pub(super) async fn relocate_as(
     args: &NodeArgs,
     partition: &str,
     to: &str,
     old_unreachable: bool,
     copy: CopyCheck,
+    restoring: Option<Restoring>,
 ) -> Result<Report, Failure> {
+    if restoring.is_some() && copy != CopyCheck::No {
+        return Err(Failure::usage(
+            "a restore starts a new feed history: it can't keep one as a copy",
+        ));
+    }
     let checks = copy == CopyCheck::Check;
     let checked = match &copy {
         CopyCheck::Checked(files) => Some(files.clone()),
@@ -513,7 +552,7 @@ pub(super) async fn relocate_as(
         Some(probe.await?.map(|lp| lp.state()).unwrap_or_default())
     };
     use proto::LocalPartitionState as S;
-    if p.node == to && old_state != Some(S::Closed) {
+    if restoring.is_none() && p.node == to && old_state != Some(S::Closed) {
         let mut r = report(
             "cluster relocate",
             vec![
@@ -528,8 +567,10 @@ pub(super) async fn relocate_as(
         r.status = ExitStatus::SUCCESS;
         return Ok(r);
     }
+    // A restore's old node may have lost P (not listed: `Unspecified`).
     if let Some(state) = old_state
         && !matches!(state, S::Fenced | S::Closed)
+        && !(restoring.is_some() && state == S::Unspecified)
     {
         return Err(Failure::usage(&format!(
             "partition {partition} isn't fenced or closed on node {:?}: fence it there first \
@@ -565,22 +606,37 @@ pub(super) async fn relocate_as(
     } else {
         None
     };
-    let (mut new, new_token) = connect(args, &new_url).await?;
-    let stamped = new
-        .stamp(request(
+    let from = restoring.map_or(p.epoch, |r| r.from_epoch.max(p.epoch));
+    // A restore reusing an earlier run's stamp at `from_epoch + 1` needs the map still
+    // below it: a map moved on since gives P a later epoch than that file's.
+    if let Some(r) = restoring
+        && r.stamped
+        && p.epoch > r.from_epoch
+    {
+        return Err(Failure::usage(&format!(
+            "the map gave {partition} epoch {} since this restore's checks: run it again",
+            p.epoch
+        )));
+    }
+    let stamped = if restoring.is_some_and(|r| r.stamped) {
+        proto::LocalPartition::default()
+    } else {
+        let (mut new, new_token) = connect(args, &new_url).await?;
+        new.stamp(request(
             proto::StampRequest {
                 cluster_id: m.cluster_id.clone(),
                 partition: partition.to_owned(),
-                from_epoch: p.epoch,
-                to_epoch: p.epoch + 1,
-                restore: false,
+                from_epoch: from,
+                to_epoch: from + 1,
+                restore: restoring.is_some(),
                 restore_from_cluster_id: String::new(),
             },
             new_token.as_deref(),
         )?)
         .await
         .map_err(|s| Failure::usage(&format!("{new_url}: stamp: {}", s.message())))?
-        .into_inner();
+        .into_inner()
+    };
     if let Some(closed) = &closed {
         // The map changes only for a copy that is OLD's closed set: a staged set from
         // another close, or a file stamped earlier, would serve without writes OLD
@@ -608,7 +664,7 @@ pub(super) async fn relocate_as(
     }
     for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
-        q.epoch = p.epoch + 1;
+        q.epoch = from + 1;
     }
     m.map_version += 1;
     // Last, just before the map: OLD still holds P closed with exactly the files the copy
@@ -650,6 +706,15 @@ pub(super) async fn relocate_as(
     } else {
         Vec::new()
     };
+    #[cfg(test)]
+    if restoring.is_some() && {
+        let mut armed = RESTORE_STOP_BEFORE_MAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        armed.as_deref() == Some(args.node.as_str()) && armed.take().is_some()
+    } {
+        return Err(Failure::usage("the test's fault after the restore's stamp"));
+    }
     let set = set_map(args, m, false, copies).await?;
     let mut r = report(
         "cluster relocate",
@@ -657,7 +722,7 @@ pub(super) async fn relocate_as(
             ("partition", json!(partition)),
             ("from", json!(p.node)),
             ("node", json!(to)),
-            ("epoch", json!(p.epoch + 1)),
+            ("epoch", json!(from + 1)),
             ("copied", json!(copy)),
             ("installed_files", json!(stamped.files.len())),
             (

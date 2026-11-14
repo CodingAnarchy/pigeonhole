@@ -374,6 +374,7 @@ pub(super) async fn run(
         to,
         false,
         CopyCheck::Checked(files.clone()),
+        None,
     )
     .await?;
     let map_at = Instant::now();
