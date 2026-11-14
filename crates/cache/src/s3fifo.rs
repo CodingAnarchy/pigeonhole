@@ -43,7 +43,7 @@ use crate::Priority;
 use crate::hash::BuildKeyHasher;
 use std::sync::atomic::Ordering;
 
-use crate::sync::{Arc, AtomicU8, AtomicU64, AtomicUsize, RwLock, lock};
+use crate::sync::{Arc, AtomicU8, AtomicU64, AtomicUsize, Mutex, RwLock, lock};
 
 /// Maximum hit count per priority: S3-FIFO's 2 bits for `Normal`, one life for `Low`, and
 /// more lives for `High`, so a hot `High` block outlasts an equally hot `Normal` one in main.
@@ -542,8 +542,13 @@ fn share(capacity: usize, n: usize, i: usize) -> usize {
 pub(crate) struct Sharded<K, V> {
     shards: Box<[Padded<K, V>]>,
     /// The shards' capacities together: read without a lock (the block cache's pinned-bytes
-    /// thresholds, metrics), changed only by [`Sharded::set_capacity`] (#1761).
+    /// thresholds, metrics), changed only by [`Sharded::set_capacity`] (#1761). Stored before
+    /// the shards are resized, so it leads them while a resize runs.
     capacity: AtomicUsize,
+    /// Held across a whole [`Sharded::set_capacity`], so two resizes can't interleave their
+    /// per-shard passes and leave the shards at a mix of both totals (perf2's S1 on #1890).
+    /// Off the get and insert paths.
+    resizing: Mutex<()>,
 }
 
 impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
@@ -570,6 +575,7 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
         Self {
             shards,
             capacity: AtomicUsize::new(capacity),
+            resizing: Mutex::new(()),
         }
     }
 
@@ -578,6 +584,7 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
         Self {
             shards: Box::new([]),
             capacity: AtomicUsize::new(0),
+            resizing: Mutex::new(()),
         }
     }
 
@@ -643,12 +650,17 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
     /// a large shrink never holds one shard's lock for the whole eviction (simp724's S1). It
     /// returns once every shard is at or under its share, or holds only pinned entries over
     /// it: those stay until their handles drop, as at any capacity. A grow evicts nothing.
-    /// No shards (a disabled cache): nothing changes.
+    /// No shards (a disabled cache): nothing changes. Concurrent resizes run one after the
+    /// other, the last to take the lock deciding the capacity.
     pub(crate) fn set_capacity(&self, capacity: usize) {
         let n = self.shards.len();
         if n == 0 {
             return;
         }
+        let _one = self
+            .resizing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.capacity.store(capacity, Ordering::Relaxed);
         for (i, s) in self.shards.iter().enumerate() {
             let mut first = true;
@@ -997,6 +1009,32 @@ mod tests {
             lock(shard).insert(k, Arc::new(vec![0; 10]), 10, Priority::Normal, &mut taken);
         }
         assert_eq!(s.usage(), 2000);
+    }
+
+    /// perf2's S1 on #1890: two resizes at once end at one of the two totals, every shard at
+    /// its share of it, never a mix.
+    #[test]
+    fn concurrent_resizes_end_at_one_total() {
+        for _ in 0..n(200) {
+            let s = Arc::new(filled(4000, 4, 100));
+            let (a, b) = (Arc::clone(&s), Arc::clone(&s));
+            let one = std::thread::spawn(move || a.set_capacity(400));
+            let two = std::thread::spawn(move || b.set_capacity(2000));
+            one.join().unwrap();
+            two.join().unwrap();
+            let total = s.capacity();
+            assert!(total == 400 || total == 2000, "{total}");
+            let mut sum = 0;
+            s.for_each(|sh, _| {
+                assert_eq!(
+                    sh.capacity,
+                    total / 4,
+                    "every shard at its share of {total}"
+                );
+                sum += sh.capacity;
+            });
+            assert_eq!(sum, total);
+        }
     }
 
     /// A disabled (shardless) cache stays disabled.

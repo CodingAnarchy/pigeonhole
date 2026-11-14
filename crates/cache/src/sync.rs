@@ -4,11 +4,11 @@
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 #[cfg(all(loom, test))]
-pub(crate) use loom::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub(crate) use loom::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub(crate) use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Locks a shard for changes (insert, eviction, removal), ignoring poison. A panic inside a
 /// shard's critical section (in practice a debug-build arithmetic overflow in the usage

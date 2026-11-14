@@ -3554,8 +3554,9 @@ impl Engine {
         }
     }
 
-    /// The block and row caches' configured capacities in bytes (a row cache that is off
-    /// reports 0).
+    /// The block and row caches' configured capacities in bytes. A row cache that is off
+    /// reports 0, and so does a reader process's: its row cache is its attachment's (D281),
+    /// which this neither reports nor resizes (perf2's N1 on #1890).
     pub fn cache_capacities(&self) -> (usize, usize) {
         (
             self.inner.shared.cache.capacity(),

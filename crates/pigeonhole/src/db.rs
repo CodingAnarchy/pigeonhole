@@ -1212,7 +1212,8 @@ impl Pigeonhole {
 
     /// The block and row caches' configured capacities in bytes, as
     /// [`set_cache_capacities`](Self::set_cache_capacities) last set them or `Options` at
-    /// open. Not part of the stable API.
+    /// open. A row cache that is off reports 0, as does a reader process's. Not part of the
+    /// stable API.
     #[doc(hidden)]
     pub fn cache_capacities(&self) -> (usize, usize) {
         self.engine().cache_capacities()
