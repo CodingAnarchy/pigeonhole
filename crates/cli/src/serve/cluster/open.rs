@@ -247,13 +247,18 @@ impl Resized {
         if shrinks.is_empty() {
             return Ok(Self(Vec::new()));
         }
-        let undo = shrinks
-            .iter()
-            .map(|(_, s, old, _)| (Arc::clone(s), *old))
-            .collect();
+        // The guard first (simp724's N1 on #1891): a shrink that fails part way (a panic
+        // in the blocking task) returns the error, and dropping the guard puts every cache
+        // back, a not-yet-shrunk one to the size it already has.
+        let guard = Self(
+            shrinks
+                .iter()
+                .map(|(_, s, old, _)| (Arc::clone(s), *old))
+                .collect(),
+        );
         let why = why.to_owned();
         tokio::task::spawn_blocking(move || apply(&shrinks, &why)).await?;
-        Ok(Self(undo))
+        Ok(guard)
     }
 
     /// The open finished: the shrinks stand.
@@ -279,6 +284,9 @@ impl Resized {
     }
 }
 
+/// Grows the caches back in place, on whatever thread drops the guard: an async worker, or
+/// a cancelled open's. That's fine only because a grow evicts nothing (simp724's N2 on
+/// #1891): never add a step here that can block, evict or do I/O.
 impl Drop for Resized {
     fn drop(&mut self) {
         for (s, old) in self.0.drain(..) {
