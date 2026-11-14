@@ -547,6 +547,7 @@ fn a_moves_map_step_refuses_once_the_old_node_was_reopened_since_its_check() {
             "c",
             false,
             super::super::cli::CopyCheck::Checked(checked),
+            None,
         ))
         .await
         .err()

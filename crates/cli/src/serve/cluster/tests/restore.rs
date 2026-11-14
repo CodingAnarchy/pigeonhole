@@ -23,6 +23,8 @@ fn restore_args(dir: &Path) -> RestoreArgs {
         cluster_id: None,
         old_unreachable: false,
         parallel: 2,
+        partition: None,
+        to: None,
     }
 }
 
@@ -420,5 +422,414 @@ fn a_restore_run_again_over_an_interrupted_install_finishes_it() {
             report.document
         );
         assert_eq!(keys(c).await, rows);
+    });
+}
+
+/// `--partition P`'s arguments for [`restore`] (#1832).
+fn part_args(dir: &Path, p: &str, to: Option<&str>) -> RestoreArgs {
+    RestoreArgs {
+        partition: Some(p.into()),
+        to: to.map(Into::into),
+        ..restore_args(dir)
+    }
+}
+
+/// `call` on partition `p` at `port`.
+async fn on(port: u16, p: &str, call: &str) -> Result<(), tonic::Status> {
+    let req = PartitionRequest {
+        partition: p.into(),
+        ..Default::default()
+    };
+    let mut c = client(port).await;
+    match call {
+        "fence" => c.fence(req).await.map(|_| ()),
+        "close" => c.close(req).await.map(|_| ()),
+        "unfence" => c.unfence(req).await.map(|_| ()),
+        _ => unreachable!(),
+    }
+}
+
+/// Whether `p` serves on the node at `port`.
+async fn serves(port: u16, p: &str) -> bool {
+    client(port)
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .partitions
+        .iter()
+        .any(|lp| lp.id == p && lp.state() == LocalPartitionState::Serving)
+}
+
+async fn put_row(port: u16, row: &str, tag: u64) {
+    data(port)
+        .await
+        .mutate(MutateRequest {
+            writes: Some(cells_row(row.as_bytes(), &[3], tag)),
+            durability: 0,
+        })
+        .await
+        .unwrap();
+}
+
+/// p3 (on c) raised past the backup's epoch by a relocation in place, and serving again.
+async fn relocate_p3_in_place(c: u16) {
+    on(c, "p3", "fence").await.unwrap();
+    on(c, "p3", "close").await.unwrap();
+    super::super::cli::relocate(&args(c), "p3", "c", false, false)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if on(c, "p3", "unfence").await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eventually("p3 to serve again after its relocation", async || {
+        serves(c, "p3").await
+    })
+    .await;
+}
+
+/// #1832: one partition put back from a backup into the live cluster, after its epoch moved
+/// past the backup's: its rows are the backup's, the other partitions keep their later
+/// writes, and it serves at a new epoch with a new history. Refused while it serves, or is
+/// open where it goes.
+#[test]
+fn a_partition_restored_alone_holds_the_backups_rows_and_the_others_keep_theirs() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, c) = (ports[0], ports[2]);
+    let mut rows = load(&rt, a, 30);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    rt.block_on(async {
+        // After the backup: a write to p1 (kept) and to p3 (lost), and p3 relocated in place
+        // to epoch 2, past the backup's 1, then written again (lost).
+        put_row(a, "b-later", 100).await;
+        put_row(a, "y-later", 101).await;
+        relocate_p3_in_place(c).await;
+        put_row(a, "z-later", 102).await;
+        let before = the_live_map(c).await;
+        assert_eq!(epochs(&before), [1, 1, 2]);
+
+        // Serving: refused.
+        let e = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.message().contains("fence it there first"),
+            "{}",
+            e.message()
+        );
+        // Fenced, open on c, where it goes: refused.
+        on(c, "p3", "fence").await.unwrap();
+        let e = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.message().contains("close it there first"),
+            "{}",
+            e.message()
+        );
+        // Closed: restored, at epoch 3 (past the live map's 2).
+        on(c, "p3", "close").await.unwrap();
+        let report = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .unwrap();
+        assert_eq!(report.document["epoch"], 3, "{:?}", report.document);
+        assert_eq!(report.document["backup_epoch"], 1, "{:?}", report.document);
+        assert_eq!(report.document["node"], "c", "{:?}", report.document);
+        assert!(!out.join("restore-progress-p3.json").exists());
+        eventually("p3 to serve", async || serves(c, "p3").await).await;
+
+        // The backup's rows, p1's later write kept, p3's later writes gone.
+        let mut want = rows.clone();
+        want.push(b"b-later".to_vec());
+        want.sort();
+        assert_eq!(keys(c).await, want);
+        // p3 alone moved: a new epoch and history; p1 and p2 and the tables as they were.
+        let m = the_live_map(c).await;
+        assert!(m.map_version > before.map_version);
+        assert_eq!(epochs(&m), [1, 1, 3]);
+        let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+        assert_eq!((p3.node.as_str(), p3.history_epoch), ("c", 3));
+        assert_eq!(m.tables, before.tables);
+        // It takes writes.
+        put_row(a, "y-after", 200).await;
+        assert!(keys(c).await.contains(&b"y-after".to_vec()));
+    });
+}
+
+/// #1832: `--to` another node, with p3's node stopped (`--old-unreachable`).
+#[test]
+fn a_partition_restored_alone_to_another_node_while_its_node_is_down() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, ports, _dbs) = three_nodes(&rt);
+    let (a, b) = (ports[0], ports[1]);
+    let mut rows = load(&rt, a, 30);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(a), &out, false, 2)).unwrap();
+    rt.block_on(async {
+        put_row(a, "y-later", 100).await;
+        // c's process stops: its p3 can't be fenced or closed.
+        let _ = stops.remove(2).send(());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let e = restore(&args(a), &part_args(&out, "p3", Some("b")))
+            .await
+            .err()
+            .unwrap();
+        assert!(e.message().contains("--old-unreachable"), "{}", e.message());
+        let report = restore(
+            &args(a),
+            &RestoreArgs {
+                old_unreachable: true,
+                ..part_args(&out, "p3", Some("b"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.document["node"], "b", "{:?}", report.document);
+        assert_eq!(report.document["epoch"], 2, "{:?}", report.document);
+        assert_eq!(
+            report.document["close_and_drop_on"][0]["node"], "c",
+            "{:?}",
+            report.document
+        );
+        eventually("p3 to serve on b", async || serves(b, "p3").await).await;
+        assert_eq!(keys(a).await, rows);
+        let m = the_live_map(a).await;
+        let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+        assert_eq!((p3.node.as_str(), p3.epoch), ("b", 2));
+    });
+}
+
+/// #1832: refused for a partition the backup lacks, with `--map`, and once p3's range of a
+/// table changed since the backup; a split moved elsewhere in the table isn't a change of
+/// p3's range (it gets as far as the serving check).
+#[test]
+fn a_partition_restore_is_refused_where_it_cant_be_put_back_alone() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, c) = (ports[0], ports[2]);
+    load(&rt, a, 6);
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    rt.block_on(async {
+        let e = restore(&args(a), &part_args(&out, "p9", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.message().contains("no partition \"p9\""),
+            "{}",
+            e.message()
+        );
+        let e = restore(
+            &args(a),
+            &RestoreArgs {
+                map: Some(out.join("map.json")),
+                ..part_args(&out, "p3", None)
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(e.message().contains("--map"), "{}", e.message());
+
+        // Forced maps reshape `users`: first g to h (p1 and p2's bound), then m to n (p3's).
+        let reshape = async |at: &str, key: &str| {
+            let mut m = the_live_map(c).await;
+            m.map_version += 1;
+            let i = m.tables[0]
+                .splits
+                .iter()
+                .position(|k| *k == text(at))
+                .unwrap();
+            m.tables[0].splits[i] = text(key);
+            client(c)
+                .await
+                .set_map(SetMapRequest {
+                    force: true,
+                    expected_map_version: 0,
+                    map: Some(m),
+                    copies: Vec::new(),
+                })
+                .await
+                .unwrap();
+        };
+        reshape("g", "h").await;
+        let e = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.message().contains("fence it there first"),
+            "{}",
+            e.message()
+        );
+        reshape("m", "n").await;
+        let e = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.message().contains("key range of table \"users\" changed"),
+            "{}",
+            e.message()
+        );
+    });
+}
+
+/// #1832, simp724's R2: a run stopped after its stamp, run again, reuses the stamp (no
+/// upload); one stopped there whose map then moved on (a concurrent change, here a forced
+/// map raising p3's epoch) stamps again past it; one stopped after its map only waits and
+/// unfences. The rows are the backup's at each step.
+#[test]
+fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
+    use crate::serve::cluster::cli::RESTORE_STOP_BEFORE_MAP;
+    use crate::serve::cluster::restore::FAIL_AT;
+    use std::sync::atomic::Ordering::SeqCst;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, c) = (ports[0], ports[2]);
+    let mut rows = load(&rt, a, 12);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    let progress = out.join("restore-progress-p3.json");
+    rt.block_on(async {
+        on(c, "p3", "fence").await.unwrap();
+        on(c, "p3", "close").await.unwrap();
+        // Stopped after the stamp at 2, before the map; run again: the stamp is reused.
+        RESTORE_STOP_BEFORE_MAP.store(true, SeqCst);
+        let e = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(e.message().contains("the test's fault"), "{}", e.message());
+        assert!(progress.exists());
+        let report = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .unwrap();
+        assert_eq!(report.document["epoch"], 2, "{:?}", report.document);
+        assert_eq!(report.document["uploaded"], false, "{:?}", report.document);
+        eventually("p3 to serve at 2", async || serves(c, "p3").await).await;
+        assert_eq!(keys(c).await, rows);
+
+        // Again, stopped after the stamp at 3; then the map moves on (p3 at 5, forced).
+        on(c, "p3", "fence").await.unwrap();
+        on(c, "p3", "close").await.unwrap();
+        RESTORE_STOP_BEFORE_MAP.store(true, SeqCst);
+        restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        let mut m = the_live_map(c).await;
+        m.map_version += 1;
+        m.partitions
+            .iter_mut()
+            .find(|p| p.id == "p3")
+            .unwrap()
+            .epoch = 5;
+        client(c)
+            .await
+            .set_map(SetMapRequest {
+                force: true,
+                expected_map_version: 0,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // c holds p3's file at 3, which the map's 5 doesn't name: it tries the open once the
+        // map lands (`Opening`, which a restore refuses), and leaves it closed.
+        eventually("p3 not opening on c", async || {
+            client(c)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| {
+                    lp.id == "p3"
+                        && !matches!(
+                            lp.state(),
+                            LocalPartitionState::Opening | LocalPartitionState::Serving
+                        )
+                })
+        })
+        .await;
+        // Run again, stopped after its map: the stamp at 3 doesn't fit, so it stamps at 6.
+        *FAIL_AT.lock().unwrap() = Some((out.clone(), "mapped"));
+        let e = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.message().contains("the test's fault after mapped"),
+            "{}",
+            e.message()
+        );
+        let m = the_live_map(c).await;
+        assert_eq!(epochs(&m), [1, 1, 6]);
+        // And again: only the waits and the unfence are left.
+        let report = restore(&args(a), &part_args(&out, "p3", None))
+            .await
+            .unwrap();
+        assert_eq!(report.document["epoch"], 6, "{:?}", report.document);
+        assert!(
+            report.document.contains_key("resumed"),
+            "{:?}",
+            report.document
+        );
+        assert!(!progress.exists());
+        eventually("p3 to serve at 6", async || serves(c, "p3").await).await;
+        assert_eq!(keys(c).await, rows);
+    });
+}
+
+/// #1832, simp724's N1: a copy of p3 stamped past the map's epoch, as a relocation that
+/// failed after its stamp leaves one (here c's closed p3, stamped from 1 to 2 with no map
+/// change). The restore to b passes it, at 3, so no two histories share epoch 2.
+#[test]
+fn a_partition_restore_passes_every_copys_epoch_not_only_the_maps() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    let mut rows = load(&rt, a, 12);
+    rows.sort();
+    let out = test_dir().join("backup");
+    rt.block_on(backup(&args(c), &out, false, 2)).unwrap();
+    rt.block_on(async {
+        on(c, "p3", "fence").await.unwrap();
+        on(c, "p3", "close").await.unwrap();
+        let m = the_live_map(c).await;
+        client(c)
+            .await
+            .stamp(super::super::proto::StampRequest {
+                cluster_id: m.cluster_id.clone(),
+                partition: "p3".into(),
+                from_epoch: 1,
+                to_epoch: 2,
+                restore: false,
+                restore_from_cluster_id: String::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(epochs(&the_live_map(c).await), [1, 1, 1]);
+        let report = restore(&args(a), &part_args(&out, "p3", Some("b")))
+            .await
+            .unwrap();
+        assert_eq!(report.document["epoch"], 3, "{:?}", report.document);
+        eventually("p3 to serve on b", async || serves(b, "p3").await).await;
+        assert_eq!(keys(a).await, rows);
     });
 }
