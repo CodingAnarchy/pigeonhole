@@ -1,0 +1,4 @@
+### Changed
+- **A cluster partition takes writes after a restart, or after it opens on a running node, only once a majority of the map's nodes hold the newest map and it still names that node** (#1760, D317 amendment 3). In 1.2.0 one peer's map was enough, so a peer that had missed the same move could confirm a copy another node now served. A node now gives its map to peers that are behind before counting them. A newer map that moved the partition keeps it fenced. `phdb cluster unfence` without `--force` asks the same, and its refusal says how many nodes hold the map. In a two-node cluster both must answer.
+- **`phdb cluster set-map` refuses a map that changes the cluster's nodes and also moves a partition or raises its epoch** (#1760). Set them as two maps.
+- **`phdb cluster move` waits, after setting the map, for a majority of the nodes to hold it** before it waits for the new node to serve. `--timeout` bounds that wait too.
