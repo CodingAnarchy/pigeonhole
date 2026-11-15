@@ -739,7 +739,6 @@ async fn copy_file(
                 .map_err(stalled)?
                 .map_err(|s| old.failed(&format!("download {what}"), &s))?
                 .into_inner();
-            let gone = |_| Failure::usage(&format!("node {:?} ended the upload of {what}", new.id));
             loop {
                 let Some(chunk) = tokio::time::timeout(STALL, chunks.message())
                     .await
@@ -759,7 +758,11 @@ async fn copy_file(
                         feed.at()
                     )));
                 }
-                feed.send(chunk.data).await.map_err(gone)?;
+                if feed.send(chunk.data).await.is_err() {
+                    // NEW ended the upload. That isn't the download's error: NEW's answer
+                    // says why, and `upload_file` reports it.
+                    return Ok(feed.at() - from);
+                }
                 if chunk.total != 0 {
                     if chunk.total != f.bytes || chunk.sha256 != f.sha256 {
                         return Err(Failure::usage(&format!(
