@@ -81,6 +81,8 @@ pub struct Options {
     change_feed: Option<FeedRetention>,
     /// `change_feed_off()`: no feed, and nothing inherited.
     feed_off: bool,
+    /// `change_feed_keep_last` (#1786): not part of the stable API.
+    feed_keep_last: bool,
     feed_tables: Option<Vec<String>>,
 }
 
@@ -316,6 +318,7 @@ impl Default for Options {
             auto_recover: Recovery::Off,
             change_feed: None,
             feed_off: false,
+            feed_keep_last: false,
             feed_tables: None,
         }
     }
@@ -874,6 +877,18 @@ impl Options {
     /// values plus 16 bytes a cell; default 4 KiB). Larger rows are read as usual.
     pub fn row_cache_max_row(mut self, bytes: usize) -> Self {
         self.row_cache_max_row = Some(bytes);
+        self
+    }
+
+    /// With [`change_feed`](Self::change_feed): keep at least the retention the feed's last
+    /// session kept, if that was more, so the open drops none of its history.
+    ///
+    /// **A serve-only hook, not part of the stable API, with no 1.x promise:** `phdb serve`
+    /// sets it on a cluster partition it opens while serving (#1786), so a moved partition
+    /// keeps its history until the node restarts.
+    #[doc(hidden)]
+    pub fn change_feed_keep_last(mut self, keep: bool) -> Self {
+        self.feed_keep_last = keep;
         self
     }
 
@@ -1953,6 +1968,7 @@ impl Options {
         };
         // Unset (neither `change_feed` nor `change_feed_off`): inherit the last session's.
         o.feed_inherit = self.change_feed.is_none() && !self.feed_off;
+        o.feed_keep_last = self.feed_keep_last;
         o.tablet_changes = self.tablet_changes;
         o.balance_pack = self.tablet_packing;
         if let Some(window) = self.commit_spin {
