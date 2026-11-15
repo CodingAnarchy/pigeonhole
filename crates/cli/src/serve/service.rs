@@ -3575,9 +3575,10 @@ impl Service {
     /// or `limit` runs out. Each page is a new read, at its own snapshot (simp724's D1 on
     /// #1510), unless the selection names a pinned one, which the stream holds. The request is checked before the stream starts, so a bad one fails the call;
     /// a failure later ends the stream with the error, a panic in the task as `Internal`. The
-    /// scan holds a `--max-scans` slot until its last page is handed to the stream: a stream
-    /// outlives its request's `--max-concurrent` slot. TODO(#398, #1286): async scan pages,
-    /// so a page read holds no blocking thread.
+    /// scan holds a `--max-scans` slot until the server's stream has taken its last page (or
+    /// the idle limit ends it), not until the client has read it: a stream outlives its
+    /// request's `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read
+    /// holds no blocking thread.
     async fn scan(
         &self,
         r: proto::ScanRequest,
@@ -4377,9 +4378,10 @@ pub(crate) struct ScanOpener {
 impl ScanOpener {
     /// Starts `r`'s scan: its pages, read one ahead at most by a task of its own, then its
     /// error if it fails. A failure before the first page (a bad position) is returned here.
-    /// The scan holds `slot` (a `--max-scans` slot) until its task ends: once it has handed
-    /// its last page to the stream (or failed), not once the client has read it. One
-    /// partition's part of a cluster scan holds none, since the fanned-out stream holds it.
+    /// The scan holds `slot` (a `--max-scans` slot) until its task ends: once the server's
+    /// stream has taken its last page (or the idle limit, or a failure, ends it), not once the
+    /// client has read it. One partition's part of a cluster scan holds none, since the
+    /// fanned-out stream holds it.
     /// With `metrics`, its outcome is counted as a `Data.Scan` when it ends.
     pub(crate) fn open(
         &self,

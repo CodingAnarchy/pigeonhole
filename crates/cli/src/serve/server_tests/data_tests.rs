@@ -690,7 +690,7 @@ fn a_scan_over_http_is_ndjson_or_server_sent_events() {
     assert_eq!(err["code"], "TableNotFound", "{status} {err}");
 }
 
-/// A scan holds its `--max-scans` slot until its last page is handed to the connection. The
+/// A scan holds its `--max-scans` slot until the server's stream has taken its last page. The
 /// held scan waits after its first page (the hold seam), since a connection would otherwise
 /// drain its pages, and the scan give its slot back, before the second scan asks (#1947).
 #[test]
