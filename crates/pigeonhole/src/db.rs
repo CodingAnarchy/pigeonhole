@@ -1211,10 +1211,14 @@ impl Pigeonhole {
     }
 
     /// The change feed's retention its last session requested before this open, if the feed
-    /// is on and there was one. `phdb serve` compares it with this open's
+    /// is on and there was one: the request, not what was in effect then, so comparing it
+    /// with [`FeedInfo::retention_bytes`](crate::FeedInfo::retention_bytes) can miss a small
+    /// drop, never report one that didn't happen.
+    ///
+    /// **A serve-only hook, not part of the stable API, with no 1.x promise:** `phdb serve`
+    /// compares it with this open's
     /// ([`FeedInfo::retention_bytes`](crate::FeedInfo::retention_bytes)) to say when a
-    /// cluster partition's share of `--change-feed` kept less history (#1786). Not part of
-    /// the stable API.
+    /// cluster partition's share of `--change-feed` kept less history (#1786).
     #[doc(hidden)]
     pub fn feed_previous_retention(&self) -> Result<Option<u64>> {
         Ok(self

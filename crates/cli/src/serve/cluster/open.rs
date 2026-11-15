@@ -225,10 +225,13 @@ pub(crate) fn options_for(
 }
 
 /// Logs what the node's partitions keep of `--change-feed` (`total`) once they're open
-/// (#1786): each partition whose history is shorter than its feed's last session kept (the
-/// oldest is gone, and a subscriber or token further back answers `FeedExpired`), and the
-/// node over its total (the engine's floor of two WAL segments a stream, or a partition
-/// opened while serving that kept its history). `why` says when.
+/// (#1786), and `why` says when:
+/// - each partition whose history is shorter than its feed's last session asked for: the
+///   oldest is gone, and a subscriber or token further back answers `FeedExpired`. It
+///   compares a request with what's in effect now, so a small drop can go unsaid, but none
+///   is invented (feed1248's N1);
+/// - the node over its total: the engine's floor of two WAL segments a stream, or a
+///   partition opened while serving that kept the history it came with.
 pub(crate) fn log_feed(total: u64, parts: &[(&str, &pigeonhole::Pigeonhole)], why: &str) {
     let mut kept = 0u64;
     for (id, db) in parts {

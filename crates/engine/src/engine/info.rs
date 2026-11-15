@@ -52,8 +52,10 @@ pub struct FeedStorage {
     /// Blob bytes kept only for the history's horizon: files no SST points into any more
     /// (dead data) that a retained WAL record may still name.
     pub held_blob_bytes: u64,
-    /// The retention the feed's last session requested before this open, if there was one:
-    /// a lower `retention_bytes` now means this open kept less history (#1786).
+    /// The retention the feed's last session requested before this open, if there was one
+    /// (#1786). It's the request, not what was in effect then (`retention_bytes` rounds up),
+    /// so comparing it with `retention_bytes` can miss a small drop, never report one that
+    /// didn't happen (feed1248's N1).
     pub previous_retention_bytes: Option<u64>,
 }
 

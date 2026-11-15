@@ -67,6 +67,12 @@ pub(crate) fn default_compaction_threads(shards: usize) -> usize {
 /// shards, `total × shards ÷ all_shards`, so every stream on the node keeps the same history,
 /// as one database of all the node's shards would. The engine rounds it up to whole WAL
 /// segments, at least two per stream, so a small total can be kept as more.
+///
+/// `shards` is the partition's planned share ([`Share::shards`]). A partition whose feed
+/// recorded another stream count opens with that count (ICR 0132), and the engine splits its
+/// bytes over the streams it has. The node's total is then still what the shares add up to,
+/// but that partition's streams each keep more or less than the others' (feed1248's note on
+/// #1917).
 pub(crate) fn feed_share(total: u64, shards: usize, all_shards: usize) -> u64 {
     let part = u128::from(total) * shards as u128 / all_shards.max(1) as u128;
     u64::try_from(part).unwrap_or(u64::MAX)
