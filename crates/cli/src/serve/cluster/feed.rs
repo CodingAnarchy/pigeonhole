@@ -1547,6 +1547,36 @@ pub(super) mod tests {
         assert!(e.message.contains("\"p2\" has another history"), "{e:?}");
     }
 
+    #[test]
+    fn forward_subscribe_decodes_a_request_within_the_forward_envelope() {
+        // audit120's S-C2: a forwarded subscription carries a request the entry node took
+        // within its `--max-request-bytes`, inside an envelope, so this node decodes that
+        // much more. And it is mounted on its one path, so it refuses none (feed1248's S1
+        // on #1923: these two are all that tells it from `Feed.Subscribe` in the shell).
+        use crate::serve::grpc::Events;
+        use crate::serve::service::{Metrics, Service};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let limits = crate::serve::server_tests::limits();
+        let metrics = Arc::new(Metrics::default());
+        let service = Service::routing_only(limits, 2, Arc::clone(&metrics), None);
+        let forward = ForwardSubscribeGrpc {
+            node: crate::serve::cluster::tests::node(&dir, "a"),
+            shared: Arc::new(crate::serve::Shared {
+                router: crate::serve::router::Router::single(service),
+                tokens: crate::serve::auth::Tokens::parse("", "tokens").unwrap(),
+                limits,
+                metrics,
+                feed_runtimes: std::sync::OnceLock::new(),
+            }),
+            max_request_bytes: 1 << 20,
+        };
+        assert_eq!(
+            forward.max_request_bytes(),
+            (1 << 20) + crate::serve::cluster::forward::FORWARD_ENVELOPE
+        );
+        assert!(ForwardSubscribeGrpc::refuses("/pigeonhole.v1.Cluster/Other").is_none());
+    }
+
     /// A runtime on a paused clock: virtual time, advanced only when every task waits.
     pub(in crate::serve::cluster) fn paused() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()

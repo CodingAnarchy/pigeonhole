@@ -1182,3 +1182,21 @@ impl Data for DataGrpc {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_serves_subscribe_and_refuses_any_other_path() {
+        // `Feed` is mounted on every path under its service, and routed by hand: its
+        // `refuses` is all that keeps another method's request from being read as a
+        // `Subscribe` (feed1248's S1 on #1923).
+        assert!(FeedGrpc::refuses("/pigeonhole.v1.Feed/Subscribe").is_none());
+        for path in ["/pigeonhole.v1.Feed/Other", "/pigeonhole.v1.Feed/", ""] {
+            let refused = FeedGrpc::refuses(path).unwrap_or_else(|| panic!("{path:?}"));
+            assert_eq!(refused.code(), tonic::Code::Unimplemented, "{path:?}");
+            assert_eq!(refused.message(), "no such method in pigeonhole.v1.Feed");
+        }
+    }
+}
