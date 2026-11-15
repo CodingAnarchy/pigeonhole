@@ -280,7 +280,27 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
             );
         }
         assert!(r.document["installed_files"].as_u64().unwrap() >= 1);
-        eventually("c to serve p1", async || {
+        // `relocate` answers once the map is set; c opens p1 and serves it once a majority
+        // of the nodes confirm it there (#1760). A read can come sooner than that (the wait
+        // gates writes), so the write waits for the confirmation itself: Windows' slower
+        // runners wrote in between (main at ee6f306d3). It waits for c's p1 to be SERVING:
+        // `awaiting_peers` is false for a partition not open there yet too, which a stamped
+        // file waiting to open is (#1909's first try passed on that, and failed again).
+        eventually("c to take writes for p1", async || {
+            client(c)
+                .await
+                .status(crate::serve::proto::StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .any(|lp| {
+                    lp.id == "p1" && lp.state() == crate::serve::proto::LocalPartitionState::Serving
+                })
+        })
+        .await;
+        eventually("c to serve p1 through b", async || {
             get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
         })
         .await;
