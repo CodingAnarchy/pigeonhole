@@ -5,7 +5,7 @@ mod common;
 
 use common::{config, sized};
 use pigeonhole_format::wal::{
-    Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, FrameEncoder,
+    Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, FrameEncoder, Within,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -392,4 +392,137 @@ fn a_decoder_starting_at_a_pad_reads_the_record_after_it() {
     assert!(spans[1].0 > resume, "a pad between them");
     let (got, _) = read(&seg, 4, resume);
     assert_eq!(got, [(spans[1].0, vec![2; 50])]);
+}
+
+/// Replays `truth` from `start` as a feed cursor that re-read only part of one frame (#1901):
+/// in the frame holding segment offset `cut`, the bytes from `cut` on are `stale` ones (left
+/// from an earlier read) until the decoder asks for more, and then the whole true frame is
+/// fresh. Every other frame is read whole. What it returns must be what [`read`] returns.
+fn read_with_stale_tail(
+    truth: &[u8],
+    stale: &[u8],
+    epoch: u32,
+    start: u64,
+    cut: u64,
+) -> (Vec<(u64, Vec<u8>)>, Option<u64>) {
+    let mut dec = FrameDecoder::new(epoch, start);
+    let mut out = Vec::new();
+    let first_frame = start as usize / FRAME_SIZE;
+    let cut_frame = cut as usize / FRAME_SIZE;
+    for (i, frame) in truth.chunks(FRAME_SIZE).enumerate().skip(first_frame) {
+        let mut mixed;
+        let mut view: &[u8] = frame;
+        let mut fresh = FRAME_SIZE;
+        if i == cut_frame {
+            let at = cut as usize % FRAME_SIZE;
+            mixed = frame.to_vec();
+            mixed[at..].copy_from_slice(&stale[i * FRAME_SIZE + at..(i + 1) * FRAME_SIZE]);
+            view = &mixed;
+            fresh = at;
+        }
+        loop {
+            match dec.decode_within(view, fresh).unwrap() {
+                Within::More => {
+                    // The cursor reads the rest of the frame: all of it is now fresh.
+                    assert!(fresh < FRAME_SIZE, "more with the whole frame fresh");
+                    mixed = frame.to_vec();
+                    view = &mixed;
+                    fresh = FRAME_SIZE;
+                }
+                Within::Decoded(Some(Decoded::Record { offset })) => {
+                    out.push((offset, dec.record().to_vec()));
+                }
+                Within::Decoded(Some(Decoded::Stop { offset })) => {
+                    return (out, Some(offset));
+                }
+                Within::Decoded(None) => break,
+            }
+        }
+    }
+    (out, None)
+}
+
+/// What a stale tail holds: unwritten zeros, junk, or real fragments of this epoch at the
+/// wrong offsets (the bytes of another part of the segment).
+fn stale_kind() -> impl Strategy<Value = u8> {
+    0u8..3
+}
+
+proptest! {
+    #![proptest_config(config(300))]
+
+    /// #1901: a decoder told that only a frame's first bytes are fresh decides nothing on
+    /// the rest. Whatever the stale tail holds, a replay that asks for more when it reaches it
+    /// returns exactly what replaying the true segment does, pads included.
+    #[test]
+    fn nothing_is_decided_on_bytes_past_the_fresh_ones(
+        records in vec((pad_unit(), record()), 0..sized(12, 4)),
+        epoch in 1u32..,
+        start in start_offset(),
+        cut_at in 0.0f64..1.0,
+        kind in stale_kind(),
+        junk in any::<u64>(),
+    ) {
+        let (truth, _) = write_padded(epoch, start, &records);
+        let cut = start + ((truth.len() as u64 - start) as f64 * cut_at) as u64;
+        let stale: Vec<u8> = match kind {
+            0 => vec![0; truth.len()],
+            1 => (0..truth.len()).map(|i| (junk.wrapping_mul(i as u64 + 1) >> 13) as u8).collect(),
+            _ => {
+                // The segment rotated by a few hundred bytes: CRC-valid fragments of this
+                // epoch, at offsets where they don't belong.
+                let k = 1 + (junk as usize % 997);
+                (0..truth.len()).map(|i| truth[(i + k) % truth.len()]).collect()
+            }
+        };
+        let (want, want_stop) = read(&truth, epoch, start);
+        let (got, got_stop) = read_with_stale_tail(&truth, &stale, epoch, start, cut);
+        prop_assert_eq!(got, want);
+        prop_assert_eq!(got_stop, want_stop);
+    }
+}
+
+/// #1901: `decode_within` returns `More` for a header, then for a payload, past the fresh
+/// bytes, consuming nothing; with the whole frame fresh it decodes as `decode` does.
+#[test]
+fn a_fragment_past_the_fresh_bytes_asks_for_more_and_consumes_nothing() {
+    let start = FRAME_SIZE as u64;
+    let mut enc = FrameEncoder::new(7, start);
+    let mut frame = Vec::new();
+    enc.encode(&[1u8; 100], &mut frame);
+    let second = frame.len();
+    enc.encode(&[2u8; 100], &mut frame);
+    frame.resize(FRAME_SIZE, 0);
+    let mut dec = FrameDecoder::new(7, start);
+    // The header itself isn't fresh.
+    assert_eq!(dec.decode_within(&frame, 4).unwrap(), Within::More);
+    // The header is, the payload isn't.
+    assert_eq!(
+        dec.decode_within(&frame, FRAGMENT_HEADER_LEN + 50).unwrap(),
+        Within::More
+    );
+    // The first record whole, the second's header only.
+    assert_eq!(
+        dec.decode_within(&frame, second + FRAGMENT_HEADER_LEN)
+            .unwrap(),
+        Within::Decoded(Some(Decoded::Record { offset: start }))
+    );
+    assert_eq!(dec.record(), &[1u8; 100][..]);
+    assert_eq!(
+        dec.decode_within(&frame, second + FRAGMENT_HEADER_LEN)
+            .unwrap(),
+        Within::More
+    );
+    // Fresh to the end: the second record, then the stop just past it.
+    assert_eq!(
+        dec.decode_within(&frame, FRAME_SIZE).unwrap(),
+        Within::Decoded(Some(Decoded::Record {
+            offset: start + second as u64
+        }))
+    );
+    assert_eq!(dec.record(), &[2u8; 100][..]);
+    assert!(matches!(
+        dec.decode_within(&frame, FRAME_SIZE).unwrap(),
+        Within::Decoded(Some(Decoded::Stop { .. }))
+    ));
 }
