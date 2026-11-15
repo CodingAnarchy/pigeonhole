@@ -574,18 +574,16 @@ impl Node {
         // Reopened: its files change from here, so the hashes a close kept go (feed1248).
         self.fences.closed().remove(id);
         let gate = self.open_gate(id, epoch);
+        let config = crate::serve::service::PartitionConfig {
+            backups: Arc::clone(&server.backups),
+            placement: Some(Arc::clone(&server.placement)),
+            pinning: opened.pinning,
+            engine_memory: Some(opened.memory),
+        };
         let service = shared
             .router
             .service
-            .for_partition(
-                opened.db.clone(),
-                id,
-                &server.backups,
-                opened.pinning,
-                opened.memory,
-                gate,
-            )
-            .placement(&server.placement);
+            .for_partition(opened.db.clone(), id, gate, config);
         if let Some(part) = service.part_opt()
             && let Some((feeds, hubs)) = shared.feed_runtimes.get()
         {
@@ -606,16 +604,16 @@ impl Node {
         Ok(())
     }
 
-    /// A partition opened here starts a run of confirmation rounds, which confirm it once a
-    /// majority of the map's nodes hold a map naming this node for it (#1760): a move's new
-    /// owner serves only then, so it and the old owner are never both confirmed. Spawned:
-    /// the open answers at once.
+    /// A partition opened here asks for its lease at once (D326), and the node's renewals
+    /// run if they don't yet: a move's new owner serves only once a majority of the map's
+    /// nodes hold a map naming it and grant it, so it and the old owner never both serve
+    /// (#1760). Spawned: the open answers at once.
     fn confirm_opened(&self) {
-        let (Some(node), Ok(rt)) = (self.me.upgrade(), tokio::runtime::Handle::try_current())
-        else {
+        let Some(node) = self.me.upgrade() else {
             return;
         };
-        rt.spawn(async move { node.confirm_until_done().await });
+        node.renew_leases();
+        node.confirm_soon();
     }
 
     /// Opens every partition the newest map gives this node that isn't open here, each

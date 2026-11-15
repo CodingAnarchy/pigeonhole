@@ -512,16 +512,18 @@ pub(crate) fn single<'a>(
         );
     }
     let metrics = Arc::new(service::Metrics::default());
+    let backups = backup::Backups::new(args.backup_dir.as_deref(), args.max_backups)
+        .map_err(|e| Failure::usage(&e))?;
     let mut service = service::Service::new(
         db.clone(),
         limits,
         placement.blocking_threads,
         Arc::clone(&metrics),
+        service::PartitionConfig {
+            placement: Some(Arc::clone(&placement)),
+            ..service::PartitionConfig::new(backups)
+        },
     )
-    .backups(args.backup_dir.as_deref(), args.max_backups)
-    .map_err(|e| Failure::usage(&e))?
-    // Before `replica`: it rebuilds the indexes, whose rebalancing a replica pauses.
-    .placement(&placement)
     .memory_opt(
         memory(args, &db, replica.is_none(), &placement, stderr)?,
         args.memory_calls.unwrap_or(0),
