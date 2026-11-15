@@ -642,6 +642,12 @@ pub(crate) const FOLLOW: usize = 36;
 /// `Memory.Watch`'s index in `RPCS`.
 pub(crate) const MEMORY_WATCH: usize = 49;
 
+/// A recall's step's recall, decoded (#1915).
+fn step_recall(r: Option<proto::RecallRequest>) -> Result<crate::memcore::RecallArgs, ApiError> {
+    r.ok_or_else(|| ApiError::invalid("a recall's step carries no recall"))
+        .and_then(super::memory::recall)
+}
+
 pub(crate) const RPCS: [&str; 52] = [
     "Data.Get",
     "Data.MultiGet",
@@ -2197,9 +2203,18 @@ impl Service {
                 .await
                 .map(ServiceReply::Forget)
             }
-            ServiceOp::RecallPool(_) | ServiceOp::RecallBodies(_) => {
+            // Each step's request moved out of `op`, never `op` itself: an arm that uses `op`
+            // whole keeps it alive across every await of this match, which grew every call's
+            // future by its size (serve-get's and serve-mutate's counts on #1939).
+            ServiceOp::RecallPool(r) => {
                 drop(budget);
-                self.recall_step(op, caller)
+                self.recall_pool(r, caller)
+                    .await
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::RecallBodies(r) => {
+                drop(budget);
+                self.recall_bodies(r, caller)
                     .await
                     .map_err(ApiError::for_read)
             }
@@ -2382,8 +2397,12 @@ impl Service {
                 .await
                 .map(ServiceReply::Nearest)
                 .map_err(ApiError::for_read),
-            ServiceOp::RecallPool(_) | ServiceOp::RecallBodies(_) => self
-                .recall_step(op, caller)
+            ServiceOp::RecallPool(r) => self
+                .recall_pool(r, caller)
+                .await
+                .map_err(ApiError::for_read),
+            ServiceOp::RecallBodies(r) => self
+                .recall_bodies(r, caller)
                 .await
                 .map_err(ApiError::for_read),
             _ => Err(ApiError::internal(
@@ -3836,58 +3855,64 @@ impl Service {
     }
 
     /// A step of a recall whose namespaces are on several partitions, on this one (#1915,
-    /// ICR 0139): its pool, a hop's part, or its hits' bodies, as versioned bytes. The
-    /// caller's namespaces are checked here again. A hop in a version this node doesn't
-    /// read is `FailedPrecondition`: the nodes' builds differ.
-    async fn recall_step(&self, op: ServiceOp, caller: &Caller) -> Result<ServiceReply, ApiError> {
+    /// ICR 0139): its pool, or a hop's part, as versioned bytes. The caller's namespaces are
+    /// checked here again. A hop in a version this node doesn't read is
+    /// `FailedPrecondition`: the nodes' builds differ.
+    async fn recall_pool(
+        &self,
+        r: proto::RecallPoolRequest,
+        caller: &Caller,
+    ) -> Result<ServiceReply, ApiError> {
         let core = self.memory_core().await?;
         let namespaces = caller.namespaces.clone();
-        let recall = |r: Option<proto::RecallRequest>| {
-            r.ok_or_else(|| ApiError::invalid("a recall's step carries no recall"))
-                .and_then(super::memory::recall)
-        };
-        match op {
-            ServiceOp::RecallPool(r) => {
-                if r.now_us == 0 {
-                    return Err(ApiError::invalid("a recall's step carries no clock"));
-                }
-                let hop =
-                    if r.hop.is_empty() {
-                        None
-                    } else {
-                        Some(pigeonhole_memory::RecallHop::from_bytes(&r.hop).map_err(|e| {
-                        ApiError::failed_precondition(format!(
-                            "a recall's hop from another node that this node can't read: {e}"
-                        ))
-                    })?)
-                    };
-                let a = recall(r.request)?;
-                let now = r.now_us;
-                let pool = self
-                    .memory_blocking(move || {
-                        let scope = crate::memcore::Scope(namespaces.as_deref());
-                        Ok(core.recall_pool(scope, a, now, hop.as_ref())?)
-                    })
-                    .await?;
-                Ok(ServiceReply::RecallPool(proto::RecallPoolResponse {
-                    pool: pool.into(),
-                }))
-            }
-            ServiceOp::RecallBodies(r) => {
-                let ids = super::memory::ids(&r.ids)?;
-                let a = recall(r.request)?;
-                let bodies = self
-                    .memory_blocking(move || {
-                        let scope = crate::memcore::Scope(namespaces.as_deref());
-                        Ok(core.recall_bodies(scope, a, &ids)?)
-                    })
-                    .await?;
-                Ok(ServiceReply::RecallBodies(proto::RecallBodiesResponse {
-                    bodies: bodies.into(),
-                }))
-            }
-            _ => Err(ApiError::internal("not a recall's step")),
+        if r.now_us == 0 {
+            return Err(ApiError::invalid("a recall's step carries no clock"));
         }
+        let hop = if r.hop.is_empty() {
+            None
+        } else {
+            Some(
+                pigeonhole_memory::RecallHop::from_bytes(&r.hop).map_err(|e| {
+                    ApiError::failed_precondition(format!(
+                        "a recall's hop from another node that this node can't read: {e}"
+                    ))
+                })?,
+            )
+        };
+        let a = step_recall(r.request)?;
+        let now = r.now_us;
+        let pool = self
+            .memory_blocking(move || {
+                let scope = crate::memcore::Scope(namespaces.as_deref());
+                Ok(core.recall_pool(scope, a, now, hop.as_ref())?)
+            })
+            .await?;
+        Ok(ServiceReply::RecallPool(proto::RecallPoolResponse {
+            pool: pool.into(),
+        }))
+    }
+
+    /// A step of a recall whose namespaces are on several partitions, on this one (#1915,
+    /// ICR 0139): its hits' bodies, as versioned bytes. The caller's namespaces are checked
+    /// here again.
+    async fn recall_bodies(
+        &self,
+        r: proto::RecallBodiesRequest,
+        caller: &Caller,
+    ) -> Result<ServiceReply, ApiError> {
+        let core = self.memory_core().await?;
+        let namespaces = caller.namespaces.clone();
+        let ids = super::memory::ids(&r.ids)?;
+        let a = step_recall(r.request)?;
+        let bodies = self
+            .memory_blocking(move || {
+                let scope = crate::memcore::Scope(namespaces.as_deref());
+                Ok(core.recall_bodies(scope, a, &ids)?)
+            })
+            .await?;
+        Ok(ServiceReply::RecallBodies(proto::RecallBodiesResponse {
+            bodies: bodies.into(),
+        }))
     }
 
     /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
