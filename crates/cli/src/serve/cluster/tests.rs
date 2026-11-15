@@ -3469,149 +3469,278 @@ fn fanned_out_nearest_and_traversals_at_seeds_that_failed() {
     nearest_traverse_model(1794386011110329000);
 }
 
+/// Three nodes holding the users table's vectors at qualifiers "", "x" and "y" (each row's
+/// three through different nodes), and one database holding them all. `old` has those nodes
+/// act as a build before `nearest_qualifiers` ([`super::OLD_NEAREST`]), from the start.
+struct QualifierVectors {
+    rt: tokio::runtime::Runtime,
+    _stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    ports: Vec<u16>,
+    dirs: [PathBuf; 3],
+    _oracle_dir: PathBuf,
+    t: pigeonhole::Table,
+}
+
+impl QualifierVectors {
+    const QUERY: [f32; 4] = [2.0, 1.0, 0.0, 0.5];
+
+    fn start(old: &[(usize, super::OldNearest)]) -> Self {
+        use super::proto::{
+            MutateRequest, Put, RowKey, RowWrites, Value, Vector, Write, value, write,
+        };
+        let dirs = [test_dir(), test_dir(), test_dir()];
+        super::OLD_NEAREST
+            .lock()
+            .unwrap()
+            .extend(old.iter().map(|&(n, how)| (dirs[n].clone(), how)));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (stops, ports, _dbs) = three_nodes_in(&rt, &dirs);
+        let oracle_dir = test_dir();
+        let oracle = pigeonhole::Pigeonhole::open(
+            oracle_dir.join("oracle.phdb"),
+            pigeonhole::Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        let t = users(&oracle);
+        let rows: Vec<Vec<u8>> = ["a", "c", "g", "h", "m", "q", "s", "z"]
+            .iter()
+            .flat_map(|p| (0..2).map(move |i| format!("{p}{i}").into_bytes()))
+            .collect();
+        let qualifiers: [&[u8]; 3] = [b"", b"x", b"y"];
+        rt.block_on(async {
+            for (i, row) in rows.iter().enumerate() {
+                for (j, q) in qualifiers.iter().enumerate() {
+                    let v = [(i % 5) as f32, j as f32, (i % 2) as f32, 0.5];
+                    let put = Write {
+                        op: Some(write::Op::Put(Put {
+                            family: "emb".into(),
+                            qualifier: q.to_vec().into(),
+                            timestamp: None,
+                            value: Some(Value {
+                                kind: Some(value::Kind::Vector(Vector {
+                                    element: super::proto::Element::F32 as i32,
+                                    dim: 4,
+                                    data: f32_bytes(&v).into(),
+                                })),
+                            }),
+                        })),
+                    };
+                    data(ports[(i + j) % 3])
+                        .await
+                        .mutate(MutateRequest {
+                            writes: Some(RowWrites {
+                                row: Some(RowKey {
+                                    table: "users".into(),
+                                    row: row.clone().into(),
+                                }),
+                                writes: vec![put],
+                            }),
+                            durability: 0,
+                        })
+                        .await
+                        .unwrap();
+                    t.mutate(row).put_vector_f32("emb", q, &v).commit().unwrap();
+                }
+            }
+        });
+        Self {
+            rt,
+            _stops: stops,
+            ports,
+            dirs,
+            _oracle_dir: oracle_dir,
+            t,
+        }
+    }
+
+    /// The oracle's ranking of [`Self::QUERY`]'s `k` nearest under `select`.
+    fn want(
+        &self,
+        k: usize,
+        select: impl FnOnce(pigeonhole::Scan<'_>) -> pigeonhole::Scan<'_>,
+    ) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
+        select(self.t.scan_prefix(b"").family("emb"))
+            .nearest_f32(&Self::QUERY, k)
+            .run_within(1 << 20)
+            .unwrap()
+            .into_neighbours()
+            .into_iter()
+            .map(|n| (n.row, n.qualifier, n.distance))
+            .collect()
+    }
+
+    /// Node `n`'s answer to [`Self::QUERY`]'s `k` nearest under `qualifiers`.
+    fn nearest(
+        &self,
+        n: usize,
+        k: u32,
+        qualifiers: Option<super::proto::QualifierSelection>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, f64)>, tonic::Status> {
+        use super::proto::{NearestRequest, Vector};
+        self.rt.block_on(async {
+            let channel = tonic::transport::Endpoint::from_shared(format!(
+                "http://127.0.0.1:{}",
+                self.ports[n]
+            ))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+            let got = super::proto::vectors_client::VectorsClient::new(channel)
+                .nearest(NearestRequest {
+                    table: "users".into(),
+                    family: "emb".into(),
+                    query: Some(Vector {
+                        element: super::proto::Element::F32 as i32,
+                        dim: 4,
+                        data: f32_bytes(&Self::QUERY).into(),
+                    }),
+                    k,
+                    qualifiers,
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            Ok(got
+                .neighbours
+                .iter()
+                .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
+                .collect())
+        })
+    }
+}
+
+impl Drop for QualifierVectors {
+    fn drop(&mut self) {
+        super::OLD_NEAREST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(d, _)| !self.dirs.contains(d));
+    }
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn qualifier_bound(key: &[u8], inclusive: bool) -> super::proto::Bound {
+    super::proto::Bound {
+        key: key.to_vec().into(),
+        inclusive,
+    }
+}
+
 /// `NearestRequest.qualifiers` (#1915 PR 3) on a cluster: every partition's part applies the
 /// selection, so the merged ranking is one database's under it, through any node: a prefix,
 /// inclusive bounds, an exclusive end, and none.
 #[test]
 fn a_fanned_out_nearest_ranks_only_the_qualifiers_it_selects() {
-    use super::proto::{
-        Bound, MutateRequest, NearestRequest, Put, QualifierSelection, RowKey, RowWrites, Value,
-        Vector, Write, value, write,
-    };
+    use super::proto::QualifierSelection;
     use std::ops::Bound as B;
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_stops, ports, _dbs) = three_nodes(&rt);
-    let oracle_dir = test_dir();
-    let oracle = pigeonhole::Pigeonhole::open(
-        oracle_dir.join("oracle.phdb"),
-        pigeonhole::Options::default().create_if_missing(true),
-    )
-    .unwrap();
-    let t = users(&oracle);
-    let rows: Vec<Vec<u8>> = ["a", "c", "g", "h", "m", "q", "s", "z"]
-        .iter()
-        .flat_map(|p| (0..2).map(move |i| format!("{p}{i}").into_bytes()))
-        .collect();
-    let qualifiers: [&[u8]; 3] = [b"", b"x", b"y"];
-    let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-    rt.block_on(async {
-        for (i, row) in rows.iter().enumerate() {
-            for (j, q) in qualifiers.iter().enumerate() {
-                let v = [(i % 5) as f32, j as f32, (i % 2) as f32, 0.5];
-                let put = Write {
-                    op: Some(write::Op::Put(Put {
-                        family: "emb".into(),
-                        qualifier: q.to_vec().into(),
-                        timestamp: None,
-                        value: Some(Value {
-                            kind: Some(value::Kind::Vector(Vector {
-                                element: super::proto::Element::F32 as i32,
-                                dim: 4,
-                                data: f32s(&v).into(),
-                            })),
-                        }),
-                    })),
-                };
-                data(ports[(i + j) % 3])
-                    .await
-                    .mutate(MutateRequest {
-                        writes: Some(RowWrites {
-                            row: Some(RowKey {
-                                table: "users".into(),
-                                row: row.clone().into(),
-                            }),
-                            writes: vec![put],
-                        }),
-                        durability: 0,
-                    })
-                    .await
-                    .unwrap();
-                t.mutate(row).put_vector_f32("emb", q, &v).commit().unwrap();
-            }
+    let c = QualifierVectors::start(&[]);
+    let cases: Vec<(
+        &str,
+        Option<QualifierSelection>,
+        Vec<(Vec<u8>, Vec<u8>, f64)>,
+    )> = vec![
+        ("none", None, c.want(12, |s| s)),
+        (
+            "prefix x",
+            Some(QualifierSelection {
+                prefix: b"x".to_vec().into(),
+                ..Default::default()
+            }),
+            c.want(12, |s| s.qualifier_prefix(b"x")),
+        ),
+        (
+            "x to y",
+            Some(QualifierSelection {
+                start: Some(qualifier_bound(b"x", true)),
+                end: Some(qualifier_bound(b"y", true)),
+                ..Default::default()
+            }),
+            c.want(12, |s| {
+                s.qualifier_bounds(B::Included(&b"x"[..]), B::Included(&b"y"[..]))
+            }),
+        ),
+        (
+            "before x",
+            Some(QualifierSelection {
+                end: Some(qualifier_bound(b"x", false)),
+                ..Default::default()
+            }),
+            c.want(12, |s| {
+                s.qualifier_bounds(B::Unbounded, B::Excluded(&b"x"[..]))
+            }),
+        ),
+    ];
+    for (name, qualifiers, want) in cases {
+        assert!(!want.is_empty(), "{name}");
+        for n in 0..3 {
+            let got = c
+                .nearest(n, 12, qualifiers.clone())
+                .unwrap_or_else(|e| panic!("{name} via node {n}: {e}"));
+            assert_eq!(got, want, "{name} via node {n}");
         }
-        let query = [2.0f32, 1.0, 0.0, 0.5];
-        let bound = |key: &[u8], inclusive| Bound {
-            key: key.to_vec().into(),
-            inclusive,
-        };
-        let cases: Vec<(
-            &str,
-            Option<QualifierSelection>,
-            Vec<(Vec<u8>, Vec<u8>, f64)>,
-        )> = {
-            let ranked = |s: pigeonhole::Scan<'_>| {
-                s.nearest_f32(&query, 12)
-                    .run_within(1 << 20)
-                    .unwrap()
-                    .into_neighbours()
-                    .into_iter()
-                    .map(|n| (n.row, n.qualifier, n.distance))
-                    .collect::<Vec<_>>()
-            };
-            let all = || t.scan_prefix(b"").family("emb");
-            vec![
-                ("none", None, ranked(all())),
-                (
-                    "prefix x",
-                    Some(QualifierSelection {
-                        prefix: b"x".to_vec().into(),
-                        ..Default::default()
-                    }),
-                    ranked(all().qualifier_prefix(b"x")),
-                ),
-                (
-                    "x to y",
-                    Some(QualifierSelection {
-                        start: Some(bound(b"x", true)),
-                        end: Some(bound(b"y", true)),
-                        ..Default::default()
-                    }),
-                    ranked(all().qualifier_bounds(B::Included(&b"x"[..]), B::Included(&b"y"[..]))),
-                ),
-                (
-                    "before x",
-                    Some(QualifierSelection {
-                        end: Some(bound(b"x", false)),
-                        ..Default::default()
-                    }),
-                    ranked(all().qualifier_bounds(B::Unbounded, B::Excluded(&b"x"[..]))),
-                ),
-            ]
-        };
-        for (name, qualifiers, want) in cases {
-            assert!(!want.is_empty(), "{name}");
-            for (n, port) in ports.iter().enumerate() {
-                let channel =
-                    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-                        .unwrap()
-                        .connect()
-                        .await
-                        .unwrap();
-                let got = super::proto::vectors_client::VectorsClient::new(channel)
-                    .nearest(NearestRequest {
-                        table: "users".into(),
-                        family: "emb".into(),
-                        query: Some(Vector {
-                            element: super::proto::Element::F32 as i32,
-                            dim: 4,
-                            data: f32s(&query).into(),
-                        }),
-                        k: 12,
-                        qualifiers: qualifiers.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap_or_else(|e| panic!("{name} via node {n}: {e}"))
-                    .into_inner();
-                let got: Vec<(Vec<u8>, Vec<u8>, f64)> = got
-                    .neighbours
-                    .iter()
-                    .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
-                    .collect();
-                assert_eq!(got, want, "{name} via node {n}");
-            }
-        }
-    });
+    }
+}
+
+/// A node that reports a build before `nearest_qualifiers` (#1915 PR 3): a nearest search
+/// with `qualifiers` whose parts it holds is refused with `FailedPrecondition` naming it,
+/// through every node, rather than answered with fewer than `k`. One without `qualifiers`
+/// still answers.
+#[test]
+fn a_nearest_with_qualifiers_is_refused_while_a_node_runs_an_older_build() {
+    use super::proto::QualifierSelection;
+    let c = QualifierVectors::start(&[(1, super::OldNearest::Status)]);
+    let x = QualifierSelection {
+        prefix: b"x".to_vec().into(),
+        ..Default::default()
+    };
+    for n in [0, 2] {
+        let e = c.nearest(n, 12, Some(x.clone())).unwrap_err();
+        assert_eq!(
+            e.code(),
+            tonic::Code::FailedPrecondition,
+            "via node {n}: {e:?}"
+        );
+        assert!(
+            e.message().contains("b (an older build)"),
+            "via node {n}: {}",
+            e.message()
+        );
+        assert_eq!(
+            c.nearest(n, 12, None).unwrap(),
+            c.want(12, |s| s),
+            "via node {n}"
+        );
+    }
+}
+
+/// A node whose parts ignore `qualifiers` though it reported the feature (a build changed
+/// within the entry node's features cache): the entry node applies the selection to every
+/// part's answer again, so no neighbour at another qualifier comes back, and with `k` past
+/// every vector the answer is the oracle's.
+#[test]
+fn an_entry_node_filters_a_parts_neighbours_by_the_selection_again() {
+    use super::proto::QualifierSelection;
+    let c = QualifierVectors::start(&[(1, super::OldNearest::Parts)]);
+    let x = QualifierSelection {
+        prefix: b"x".to_vec().into(),
+        ..Default::default()
+    };
+    for n in 0..3 {
+        let some = c.nearest(n, 5, Some(x.clone())).unwrap();
+        assert!(
+            !some.is_empty() && some.iter().all(|(_, q, _)| q == b"x"),
+            "via node {n}: {some:?}"
+        );
+        assert_eq!(
+            c.nearest(n, 100, Some(x.clone())).unwrap(),
+            c.want(100, |s| s.qualifier_prefix(b"x")),
+            "via node {n}"
+        );
+    }
 }
 
 /// D317 §12's model test, ticket 4b, against one database holding every row: nearest

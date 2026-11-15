@@ -97,6 +97,12 @@ Design: `.coord/ai1249-1915-pr3-mcp.md`, reviewed by simp724 (`.coord/simp724-re
 **proto (additive, this amendment; numbers from the coordinator, recorded in `.coord/numbers.md`):**
 - `QualifierSelection { prefix = 1 (bytes), start = 2 (Bound), end = 3 (Bound) }` in common.proto. No existing message held these: `Selection` and `TraverseRequest` carry them as inline fields.
 - `NearestRequest.qualifiers = 10`: a nearest search ranks only the vectors at the qualifiers it selects, applied as a read's `Selection` applies its qualifier fields. On a cluster, each partition's part applies it. The `/mcp` `nearest` tool's `qualifier` and `qualifier_prefix` need it once the tool is a `Nearest` call.
+- **`NodeStatus.map_features` widened** (the coordinator's option (a)): it lists what a build supports that its peers rely on. That's the map fields it keeps, as before, and now the request fields it applies. The first of those is `nearest_qualifiers`.
+- **Mixed versions** (simp724's point; the coordinator's call):
+  - A node built before `qualifiers` ignores field 10 and ranks every qualifier.
+  - So a cluster nearest search with `qualifiers` asks each node that holds a part of it for its features. Answers are cached on the entry node for 30 s per peer.
+  - It is refused with `FailedPrecondition`, naming each node that lacks `nearest_qualifiers` or doesn't answer. A silent short result would be worse.
+  - The entry node also applies the selection to every part's answer again. That covers a peer whose build changed within the cache: never a neighbour at another qualifier.
 
 **`--mcp-blocking` (default 8; the coordinator's routine call, 2026-11-15):**
 - **What:** the most `/mcp` messages running at once. Each runs on a blocking-pool thread under a place of its own, not a `--blocking-threads` permit, and tokio's blocking-thread cap grows by the same count.

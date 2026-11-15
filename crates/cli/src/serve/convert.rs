@@ -469,6 +469,23 @@ fn bound(b: Option<&proto::Bound>) -> Bound<&[u8]> {
     }
 }
 
+/// Whether `sel` selects qualifier `q`, as a read's qualifier selection does: it starts with
+/// the prefix and lies within the bounds (byte order, the engine's qualifier order). For an
+/// entry node checking a peer's nearest answer (#1915 PR 3).
+pub(crate) fn qualifier_selected(sel: &proto::QualifierSelection, q: &[u8]) -> bool {
+    let above = match bound(sel.start.as_ref()) {
+        Bound::Included(s) => q >= s,
+        Bound::Excluded(s) => q > s,
+        Bound::Unbounded => true,
+    };
+    let below = match bound(sel.end.as_ref()) {
+        Bound::Included(e) => q <= e,
+        Bound::Excluded(e) => q < e,
+        Bound::Unbounded => true,
+    };
+    q.starts_with(&sel.prefix) && above && below
+}
+
 /// Applies a selection to any of the read builders, which share these methods.
 macro_rules! select {
     ($s:expr, $snap:expr, $r:expr) => {{
@@ -1227,5 +1244,37 @@ pub(crate) fn family_out(i: &pigeonhole::FamilyInfo) -> proto::FamilySpec {
             pigeonhole::Compaction::FifoByTime => proto::CompactionStyle::FifoByTime,
             _ => proto::CompactionStyle::Unspecified,
         } as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_qualifier_selection_checks_its_prefix_and_bounds() {
+        let b = |key: &[u8], inclusive| proto::Bound {
+            key: key.to_vec().into(),
+            inclusive,
+        };
+        let sel = |prefix: &[u8], start, end| proto::QualifierSelection {
+            prefix: prefix.to_vec().into(),
+            start,
+            end,
+        };
+        let all = sel(b"", None, None);
+        assert!(qualifier_selected(&all, b"") && qualifier_selected(&all, b"zz"));
+        let x = sel(b"x", None, None);
+        assert!(qualifier_selected(&x, b"x") && qualifier_selected(&x, b"x1"));
+        assert!(!qualifier_selected(&x, b"") && !qualifier_selected(&x, b"y"));
+        let x_to_y = sel(b"", Some(b(b"x", true)), Some(b(b"y", false)));
+        assert!(qualifier_selected(&x_to_y, b"x") && qualifier_selected(&x_to_y, b"x9"));
+        assert!(!qualifier_selected(&x_to_y, b"y") && !qualifier_selected(&x_to_y, b"w"));
+        let after_x = sel(b"", Some(b(b"x", false)), Some(b(b"y", true)));
+        assert!(!qualifier_selected(&after_x, b"x") && qualifier_selected(&after_x, b"y"));
+        // Both: the prefix and the bounds.
+        let both = sel(b"x", None, Some(b(b"x5", true)));
+        assert!(qualifier_selected(&both, b"x4") && !qualifier_selected(&both, b"x6"));
+        assert!(!qualifier_selected(&both, b"a"));
     }
 }

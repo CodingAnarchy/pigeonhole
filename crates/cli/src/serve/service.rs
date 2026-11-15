@@ -3234,6 +3234,13 @@ impl Service {
             qualifier_end: q.end.clone(),
             ..Default::default()
         });
+        // A fault seam (tests): a partition acting as a build before `qualifiers`.
+        #[cfg(test)]
+        let qualifiers = qualifiers.filter(|_| {
+            !self.part().is_ok_and(|p| {
+                super::cluster::old_nearest(p.db.path(), super::cluster::OldNearest::Parts)
+            })
+        });
         let select = convert::Select::new(qualifiers.as_ref())?.at(at);
         let k = r.k as usize;
         let search = match &r.source {

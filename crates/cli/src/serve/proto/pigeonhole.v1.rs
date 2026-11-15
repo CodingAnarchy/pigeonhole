@@ -6198,9 +6198,14 @@ pub struct NodeStatus {
     /// memory). 0 once it's over.
     #[prost(uint64, tag = "6")]
     pub grace_remaining_ms: u64,
-    /// The map fields this node's build keeps (ICR 0138, 0139): `indexes`, `memory`. A map's
-    /// writer adds such a field only once every node reports it, since a node that drops a
-    /// field from its copy reads as holding a different map (divergent). Empty from older nodes.
+    /// What this node's build supports that its peers rely on (ICR 0138, 0139):
+    ///
+    /// * the map fields it keeps: `indexes`, `memory`. A map's writer adds such a field only
+    ///   once every node reports it, since a node that drops a field from its copy reads as
+    ///   holding a different map (divergent);
+    /// * request fields it applies: `nearest_qualifiers` (`NearestRequest.qualifiers`). A node
+    ///   refuses a request that needs one while a node holding a part of it doesn't report it.
+    ///   Empty from older nodes.
     #[prost(string, repeated, tag = "7")]
     pub map_features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }

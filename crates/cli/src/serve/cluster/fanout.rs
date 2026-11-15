@@ -879,6 +879,24 @@ impl Router {
                 },
             ));
         }
+        // A node built before `qualifiers` would rank every qualifier: refused rather than
+        // answered short (the coordinator's call on #1915 PR 3). The entry node's filter
+        // below covers a peer that changed build within the features' cache.
+        if r.qualifiers.is_some() {
+            let owners = parts.iter().filter_map(|(p, _)| {
+                routes
+                    .owner(&p.partition)
+                    .map(|o| (o.node.clone(), o.address.clone()))
+            });
+            cluster
+                .node
+                .owners_keep(
+                    owners,
+                    super::NEAREST_QUALIFIERS_FEATURE,
+                    "a nearest search with `qualifiers`",
+                )
+                .await?;
+        }
         type Answer = Result<NearestResponse, ApiError>;
         let reads: Vec<Pin<Box<dyn Future<Output = Answer> + Send + '_>>> = parts
             .iter()
@@ -911,7 +929,15 @@ impl Router {
             |i, answer| match answer {
                 Ok(a) => {
                     some_cut |= a.cut_by_budget;
-                    kept = merge_nearest(std::mem::take(&mut kept), a.neighbours, k, budget);
+                    let mut found = a.neighbours;
+                    // A part from a node built before `qualifiers` (#1915 PR 3) ranked every
+                    // qualifier: the selection again here, which a part that applied it
+                    // passes whole (simp724's mixed-version point).
+                    if let Some(q) = &r.qualifiers {
+                        found
+                            .retain(|n| crate::serve::convert::qualifier_selected(q, &n.qualifier));
+                    }
+                    kept = merge_nearest(std::mem::take(&mut kept), found, k, budget);
                     Ok(())
                 }
                 Err(e) if r.allow_partial && skippable(&e) => {
