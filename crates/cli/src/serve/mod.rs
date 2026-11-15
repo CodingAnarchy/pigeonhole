@@ -27,6 +27,7 @@ mod charge;
 mod cluster;
 mod config;
 mod convert;
+mod download;
 mod errors;
 mod feed;
 mod gate;
