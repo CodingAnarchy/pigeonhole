@@ -4,6 +4,14 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-15
+
+Two change feed fixes. Upgrade if you serve change feeds with `phdb serve`, or resume durable feeds from tokens after a power loss. The file format, the shared-memory layout and the feed token layout are unchanged, so 1.2.x processes work together, and files move freely between them.
+
+### Fixed
+- `phdb serve`: a change-feed subscription opened while its tables were being written could receive nothing (only quiet heartbeats, no error) until every subscriber to those tables disconnected. A new fan-out hub's task could stop at its first commit, before the hub was ready; it now starts after the hub is made (#1926).
+- Change feeds: a durable feed resumed from a token after a power loss could expire ("records the feed read were lost") although nothing it had read or delivered was lost. This needed a rare coincidence (the last synced WAL record ending within 12 bytes of a 32 KiB frame's end while a durable subscriber held the next, unsynced record). A token's resume position now never points past where recovery cuts the log (#1937).
+
 ## [1.2.1] - 2026-11-14
 
 Change feed and replica fixes for a database rolled back to 1.1.x and changed there, and the release to roll back to from 1.3. Upgrade if you use a feed of every table (`Pigeonhole::feed()`) or `phdb serve --replica-of`, or may move a database back from 1.3 with such a feed. The file format, the shared-memory layout and the feed token layout 1.2.1 writes are unchanged, so 1.2.0 and 1.2.1 processes work together, and files move freely between them.
@@ -992,7 +1000,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.2.0
 [1.1.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...v1.1.3
