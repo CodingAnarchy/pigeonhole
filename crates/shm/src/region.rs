@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_format::shm::{
-    DIRECTORY_MAGIC, HEADER_LEN, READER_SLOT_LEN, ROW_EPOCH_LEN, ShmHeader, ViewRecord,
-    WATERMARK_STRIDE, directory, directory_name, header, reader_slot, region_name, watermark,
+    DIRECTORY_MAGIC, FEED_APPENDS_STOPPED, HEADER_LEN, READER_SLOT_LEN, ROW_EPOCH_LEN, ShmHeader,
+    ViewRecord, WATERMARK_STRIDE, directory, directory_name, header, reader_slot, region_name,
+    watermark,
 };
 use pigeonhole_format::superblock::READER_LOCK_BASE;
 use pigeonhole_format::{ManifestVersion, Seqno, ShmLayoutVersion};
@@ -944,6 +945,23 @@ impl ShmRegion {
         self.inner
             .h64(header::CATALOG_HOLD)
             .store(ceiling, Ordering::Release);
+    }
+
+    /// Publishes, with release ordering, that the session's change-feed sidecar appends
+    /// stopped (D315 amendment, #1869): the header's `FEED_FLAGS` bit 0, set once for the
+    /// rest of this generation. Idempotent.
+    pub fn publish_feed_appends_stopped(&self) {
+        self.inner
+            .h32(header::FEED_FLAGS)
+            .fetch_or(FEED_APPENDS_STOPPED, Ordering::Release);
+    }
+
+    /// Whether the writer published that its session's change-feed sidecar appends stopped
+    /// ([`publish_feed_appends_stopped`](Self::publish_feed_appends_stopped)), with acquire
+    /// ordering. A region built by a writer that doesn't know the flag reads `false`: its
+    /// header page is zero there.
+    pub fn feed_appends_stopped(&self) -> bool {
+        self.inner.h32(header::FEED_FLAGS).load(Ordering::Acquire) & FEED_APPENDS_STOPPED != 0
     }
 
     /// Publishes `shard`'s synced watermark with release ordering (layout version 7, D310):

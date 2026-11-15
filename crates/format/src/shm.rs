@@ -43,6 +43,11 @@ pub const ROW_EPOCH_HASH_XXH3: u32 = 1;
 /// [`header::ROW_EPOCH_FLAGS`] bit: the writer raises the slots (its row cache is on). A
 /// reader caches only when it is set.
 pub const ROW_EPOCHS_MAINTAINED: u32 = 1;
+/// [`header::FEED_FLAGS`] bit (D315 amendment, #1869): the session's change-feed sidecar
+/// appends stopped (an append or a sync failed), so no later catalog change can get its
+/// `Catalog` entry. A reader process's feed of every table expires on it, as one in the
+/// writer's process does.
+pub const FEED_APPENDS_STOPPED: u32 = 1;
 
 /// The hash that picks a row's row-epoch slot (FORMAT §11.7, D281):
 /// `xxh3_64_with_seed(seed + table, row)`, the seed plus the table id wrapping in `u64`; the
@@ -132,6 +137,11 @@ pub mod header {
     /// change feed's frontier stays below it; `u64::MAX` when none. Stored as the writer's
     /// written watermark is: the lowest seqno held.
     pub const CATALOG_HOLD: usize = 200;
+    /// `u32` atomic (D315 amendment, #1869; layout version 9, from the zeroed reserved area):
+    /// change-feed flags, 0 at init. Bit 0 [`FEED_APPENDS_STOPPED`](super::FEED_APPENDS_STOPPED),
+    /// set once with `fetch_or` (Release) and never cleared within a generation; other bits
+    /// reserved, 0. A build that doesn't know it never reads it.
+    pub const FEED_FLAGS: usize = 208;
 }
 
 /// Byte offsets within a watermark line.

@@ -41,7 +41,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::backup::{RESUMES, digest, hex, resumable};
-use super::cli::{NodeArgs, channel, column, report, request, set_map, url_of};
+use super::cli::{
+    CopyCheck, NodeArgs, Restoring, channel, column, relocate_as, report, request, set_map, url_of,
+};
 use super::map;
 use crate::exit::Failure;
 use crate::output::Report;
@@ -64,6 +66,10 @@ pub(crate) struct RestoreArgs {
     pub old_unreachable: bool,
     /// Uploads at once.
     pub parallel: usize,
+    /// Restore only this partition into the live cluster (#1832).
+    pub partition: Option<String>,
+    /// With `partition`: the node it goes to, if not the live map's.
+    pub to: Option<String>,
 }
 
 /// How long a restored partition may take to open on its node once the map is set.
@@ -193,6 +199,12 @@ struct Job {
 
 /// `phdb cluster restore DIR`.
 pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, Failure> {
+    if let Some(p) = &r.partition {
+        return restore_partition(args, r, p).await;
+    }
+    if r.to.is_some() {
+        return Err(Failure::usage("--to goes with --partition"));
+    }
     let (backup_cluster, copies) = read_manifest(&r.dir)?;
     let map_path = r.map.clone().unwrap_or_else(|| r.dir.join("map.json"));
     let mut m = map::parse_json(
@@ -377,7 +389,28 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         {
             old_owners.push(json!({"partition": p.id, "node": o.node}));
         }
-        let epoch = 1 + copy.epoch.max(p.epoch).max(old.map_or(0, |o| o.epoch));
+        // Past every copy of the partition a node reports too (simp724's N1 on #1832): a
+        // move or relocation that failed after its stamp leaves one past the map's epoch.
+        // Not this restore's own, recorded by an earlier run, which it reuses.
+        let own = progress.as_ref().and_then(|pr| pr.stamped.get(&p.id));
+        let floor = states
+            .iter()
+            .flat_map(|(id, s)| {
+                s.iter()
+                    .flatten()
+                    .filter(move |lp| lp.id == p.id)
+                    .filter(move |lp| {
+                        own.is_none_or(|st| !(st.node == *id && st.epoch == lp.epoch))
+                    })
+                    .map(|lp| lp.epoch)
+            })
+            .max()
+            .unwrap_or(0);
+        let epoch = 1 + copy
+            .epoch
+            .max(p.epoch)
+            .max(old.map_or(0, |o| o.epoch))
+            .max(floor);
         // Stamped by an earlier run under this live map, and its node's file says so.
         let earlier = progress.as_ref().is_some_and(|pr| {
             pr.stamped.get(&p.id)
@@ -510,6 +543,374 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         out.document.insert("warning".into(), json!(why));
     }
     Ok(out)
+}
+
+/// One partition's restore progress (#1832), in `DIR/restore-progress-<P>.json`, apart from
+/// a whole restore's: the node and epoch its stamp is for, recorded before the stamp, and
+/// the map's version once set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PartProgress {
+    cluster_id: String,
+    partition: String,
+    node: String,
+    epoch: u64,
+    map_version: Option<u64>,
+}
+
+fn part_progress_path(dir: &Path, partition: &str) -> PathBuf {
+    dir.join(format!("restore-progress-{partition}.json"))
+}
+
+fn read_part_progress(dir: &Path, partition: &str) -> Option<PartProgress> {
+    let text = std::fs::read_to_string(part_progress_path(dir, partition)).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    Some(PartProgress {
+        cluster_id: v["cluster_id"].as_str()?.to_owned(),
+        partition: v["partition"].as_str()?.to_owned(),
+        node: v["node"].as_str()?.to_owned(),
+        epoch: v["epoch"].as_u64()?,
+        map_version: v["map_version"].as_u64(),
+    })
+}
+
+/// Records `p`, as [`record`] does: a backup that can't be written to warns once.
+fn record_part(dir: &Path, p: &PartProgress, unwritable: &mut Option<String>) {
+    if unwritable.is_some() {
+        return;
+    }
+    let doc = json!({
+        "cluster_id": p.cluster_id,
+        "partition": p.partition,
+        "node": p.node,
+        "epoch": p.epoch,
+        "map_version": p.map_version,
+    });
+    let path = part_progress_path(dir, &p.partition);
+    let tmp = path.with_extension("json.tmp");
+    let written = std::fs::write(&tmp, serde_json::to_vec_pretty(&doc).expect("serializes"))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        let why = format!(
+            "write {}: {e}: the restore's progress isn't recorded, so a run again after a \
+             failure redoes the restore",
+            path.display()
+        );
+        eprintln!("phdb cluster restore: warning: {why}");
+        *unwritable = Some(why);
+    }
+}
+
+/// A key range of a table's: its first key (`None`: the empty key) and its end (`None`:
+/// open-ended), as bytes.
+type Range = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// The ranges `m` gives `partition` in each table that has one there, by table: its
+/// `created`, and the ranges as the splits bound them.
+fn ranges_of(m: &ClusterMap, partition: &str) -> BTreeMap<String, (u64, Vec<Range>)> {
+    let mut out = BTreeMap::new();
+    for t in &m.tables {
+        let keys: Vec<Vec<u8>> = t
+            .splits
+            .iter()
+            .map(|k| map::split_key_bytes(k).unwrap_or_default())
+            .collect();
+        let ranges: Vec<Range> = t
+            .partitions
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| *q == partition)
+            .map(|(i, _)| {
+                (
+                    i.checked_sub(1).map(|j| keys[j].clone()),
+                    keys.get(i).cloned(),
+                )
+            })
+            .collect();
+        if !ranges.is_empty() {
+            out.insert(t.name.clone(), (t.created, ranges));
+        }
+    }
+    out
+}
+
+/// What the live map's schema does to the backup's copy of `partition` once it opens
+/// (D317 ticket 5's reconcile), or why it can't be restored alone: a table both maps have
+/// (the same `created`) must give it the same ranges, since no reconcile moves rows
+/// between partitions (cli692's design Q1). Tables created on it since come back empty,
+/// and tables dropped since go. Their names, in that order.
+fn schema_against(
+    backup: &ClusterMap,
+    live: &ClusterMap,
+    partition: &str,
+) -> Result<(Vec<String>, Vec<String>), Failure> {
+    let (in_backup, in_live) = (ranges_of(backup, partition), ranges_of(live, partition));
+    let same = |name: &str, created: u64| {
+        backup
+            .tables
+            .iter()
+            .any(|t| t.name == name && t.created == created)
+    };
+    let mut empty = Vec::new();
+    for (name, (created, ranges)) in &in_live {
+        if !same(name, *created) {
+            empty.push(name.clone());
+            continue;
+        }
+        let before = in_backup.get(name).map(|(_, r)| r);
+        if before != Some(ranges) {
+            return Err(Failure::usage(&format!(
+                "partition {partition}'s key range of table {name:?} changed since the backup \
+                 (its splits or partitions): the copy holds the backup's range, and no \
+                 reconcile moves rows between partitions. Restore the whole cluster, or put \
+                 the table's splits back first"
+            )));
+        }
+    }
+    let dropped = in_backup
+        .iter()
+        .filter(|(name, (created, _))| !in_live.get(*name).is_some_and(|(c, _)| c == created))
+        .map(|(name, _)| name.clone())
+        .collect();
+    Ok((empty, dropped))
+}
+
+/// `phdb cluster restore DIR --partition P [--to ID]` (#1832): P's copy put back into the
+/// live cluster alone. The other partitions and the tables stay as the live map has them;
+/// P gets a new epoch, past every copy of it, and a new history.
+///
+/// The map goes through a relocation's step ([`relocate_as`] with [`Restoring`]): the same
+/// checks and checked map set, with the stamp's `restore` set, so it waits as a relocation
+/// does; then a majority of the nodes holding the map ([`majority_holds`]), then P opened
+/// and unfenced on its node.
+async fn restore_partition(
+    args: &NodeArgs,
+    r: &RestoreArgs,
+    partition: &str,
+) -> Result<Report, Failure> {
+    if r.map.is_some() || r.cluster_id.is_some() {
+        return Err(Failure::usage(
+            "--partition restores one partition into the live cluster as its map has it: \
+             --map and --cluster-id don't go with it",
+        ));
+    }
+    let (backup_cluster, mut copies) = read_manifest(&r.dir)?;
+    let Some(copy) = copies.remove(partition) else {
+        return Err(Failure::usage(&format!(
+            "the backup has no partition {partition:?}"
+        )));
+    };
+    check_copy(&copy)?;
+    let ours = r.dir.join("map.json");
+    let backed_up = map::parse_json(
+        &std::fs::read_to_string(&ours)
+            .map_err(|e| Failure::io(&format!("read {}", ours.display()), &e))?,
+    )
+    .map_err(|e| Failure::usage(&format!("{}: {e}", ours.display())))?;
+
+    let (channel_v, token) = channel(args, &args.node).await?;
+    let token: Option<Arc<str>> = token.map(Arc::from);
+    let Some(live) = live_map(channel_v, token.as_deref(), &args.node).await? else {
+        return Err(Failure::usage(&format!(
+            "{} has no cluster map: --partition restores into a live cluster",
+            args.node
+        )));
+    };
+    if live.cluster_id != backup_cluster {
+        return Err(Failure::usage(&format!(
+            "{} is in cluster {:?}, and the backup is cluster {backup_cluster:?}'s: \
+             --partition restores into the cluster it came from",
+            args.node, live.cluster_id
+        )));
+    }
+    let Some(now) = live.partitions.iter().find(|q| q.id == partition).cloned() else {
+        return Err(Failure::usage(&format!(
+            "the live map (version {}) has no partition {partition:?}: --partition restores \
+             a partition the map still lists",
+            live.map_version
+        )));
+    };
+    let target = r.to.clone().unwrap_or_else(|| now.node.clone());
+    let nodes: BTreeMap<String, String> = live
+        .nodes
+        .iter()
+        .map(|n| (n.id.clone(), url_of(args, &n.address)))
+        .collect();
+    let Some(url) = nodes.get(&target).cloned() else {
+        return Err(Failure::usage(&format!(
+            "the live map has no node {target:?}"
+        )));
+    };
+    let (empty_since, dropped_since) = schema_against(&backed_up, &live, partition)?;
+
+    let job = |epoch: u64| Job {
+        copy: copy.clone(),
+        node: target.clone(),
+        url: url.clone(),
+        epoch,
+        earlier: false,
+    };
+    let progress = read_part_progress(&r.dir, partition)
+        .filter(|pr| pr.cluster_id == live.cluster_id && pr.partition == partition);
+    let mut unwritable = None;
+    // An earlier run set the map, and it still places P so: only the waits are left.
+    if let Some(pr) = &progress
+        && let Some(v) = pr.map_version
+        && live.map_version >= v
+        && now.node == pr.node
+        && now.epoch == pr.epoch
+    {
+        super::moving::majority_holds(args, &live, v, Some(OPEN_WAIT)).await?;
+        serve(args, token.as_deref(), &job(pr.epoch)).await?;
+        let _ = std::fs::remove_file(part_progress_path(&r.dir, partition));
+        let mut out = part_report(&job(pr.epoch), v, &empty_since, &dropped_since, None);
+        out.document
+            .insert("resumed".into(), json!("the map was set by an earlier run"));
+        return Ok(out);
+    }
+
+    // P on every node that answers: serving nowhere, not open where it goes, and every
+    // copy's epoch, which the new one passes.
+    let mut target_has = None;
+    let mut floor = 0;
+    let mut reached = BTreeSet::new();
+    // A copy at the epoch an earlier run recorded for its stamp is that run's, which this
+    // one reuses: it doesn't raise the floor (simp724's R2 and N1 on the design).
+    let mine = progress
+        .as_ref()
+        .filter(|pr| pr.map_version.is_none())
+        .map(|pr| (pr.node.clone(), pr.epoch));
+    for (id, node_url) in &nodes {
+        let got = async {
+            let (c, _) = channel(args, node_url).await?;
+            proto::cluster_client::ClusterClient::new(c)
+                .status(request(StatusRequest {}, token.as_deref())?)
+                .await
+                .map(|r| r.into_inner().partitions)
+                .map_err(|s| Failure::usage(s.message()))
+        };
+        let Ok(Ok(listed)) = tokio::time::timeout(Duration::from_secs(10), got).await else {
+            if *id == target {
+                return Err(Failure::usage(&format!(
+                    "node {target:?}, which partition {partition} is restored to, can't be \
+                     reached"
+                )));
+            }
+            continue;
+        };
+        reached.insert(id.clone());
+        let Some(lp) = listed.into_iter().find(|lp| lp.id == partition) else {
+            continue;
+        };
+        let state = lp.state();
+        if matches!(
+            state,
+            LocalPartitionState::Serving | LocalPartitionState::Opening
+        ) {
+            return Err(Failure::usage(&format!(
+                "partition {partition} is serving on node {id:?}: fence it there first (phdb \
+                 cluster fence), and close it on node {target:?}, which it's restored to"
+            )));
+        }
+        if *id == target && state == LocalPartitionState::Fenced {
+            return Err(Failure::usage(&format!(
+                "partition {partition} is open (fenced) on node {id:?}, which it's restored \
+                 to: close it there first (phdb cluster close)"
+            )));
+        }
+        if mine.as_ref() == Some(&(id.clone(), lp.epoch)) {
+            if *id == target {
+                target_has = Some(lp.epoch);
+            }
+            continue;
+        }
+        floor = floor.max(lp.epoch);
+    }
+    if now.node != target && !r.old_unreachable && !reached.contains(&now.node) {
+        return Err(Failure::usage(&format!(
+            "node {:?}, which the live map gives partition {partition} to, can't be reached: \
+             pass --old-unreachable if its process is stopped",
+            now.node
+        )));
+    }
+    let e = copy.epoch.max(now.epoch).max(floor);
+    // Stamped by an earlier run at this epoch still: no upload, no stamp.
+    let stamped = mine == Some((target.clone(), e + 1)) && target_has == Some(e + 1);
+    let mut pr = PartProgress {
+        cluster_id: live.cluster_id.clone(),
+        partition: partition.to_owned(),
+        node: target.clone(),
+        epoch: e + 1,
+        map_version: None,
+    };
+    record_part(&r.dir, &pr, &mut unwritable);
+    if !stamped {
+        upload(args, token.as_deref(), &backup_cluster, &job(e + 1)).await?;
+    }
+    let set = relocate_as(
+        args,
+        partition,
+        &target,
+        r.old_unreachable,
+        CopyCheck::No,
+        Some(Restoring {
+            from_epoch: e,
+            stamped,
+        }),
+    )
+    .await?;
+    let version = set
+        .document
+        .get("map_version")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    pr.map_version = Some(version);
+    record_part(&r.dir, &pr, &mut unwritable);
+    fault(&r.dir, "mapped")?;
+    super::moving::majority_holds(args, &live, version, Some(OPEN_WAIT)).await?;
+    serve(args, token.as_deref(), &job(e + 1)).await?;
+    let _ = std::fs::remove_file(part_progress_path(&r.dir, partition));
+    let old = (now.node != target).then_some(now.node.as_str());
+    let mut out = part_report(&job(e + 1), version, &empty_since, &dropped_since, old);
+    out.document.insert("uploaded".into(), json!(!stamped));
+    if let Some(why) = unwritable {
+        out.document.insert("warning".into(), json!(why));
+    }
+    Ok(out)
+}
+
+/// A one-partition restore's report.
+fn part_report(
+    job: &Job,
+    map_version: u64,
+    empty_since: &[String],
+    dropped_since: &[String],
+    old: Option<&str>,
+) -> Report {
+    let mut out = report(
+        "cluster restore",
+        vec![
+            ("partition", json!(job.copy.partition)),
+            ("node", json!(job.node)),
+            ("epoch", json!(job.epoch)),
+            ("backup_epoch", json!(job.copy.epoch)),
+            ("bytes", json!(job.copy.bytes)),
+            ("map_version", json!(map_version)),
+        ],
+        Value::Null,
+    );
+    out.document
+        .insert("tables_empty_since_backup".into(), json!(empty_since));
+    out.document
+        .insert("tables_dropped_since_backup".into(), json!(dropped_since));
+    // Its copy there stays fenced or closed, and its files until dropped.
+    out.document.insert(
+        "close_and_drop_on".into(),
+        json!(
+            old.map(|n| vec![json!({"partition": job.copy.partition, "node": n})])
+                .unwrap_or_default()
+        ),
+    );
+    out
 }
 
 /// The restore's report.
@@ -822,6 +1223,74 @@ async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table(name: &str, created: u64, splits: &[&str], parts: &[&str]) -> proto::TablePlacement {
+        proto::TablePlacement {
+            name: name.into(),
+            created,
+            splits: splits
+                .iter()
+                .map(|k| proto::SplitKey {
+                    key: Some(proto::split_key::Key::Text((*k).into())),
+                })
+                .collect(),
+            partitions: parts.iter().map(|p| (*p).into()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn with(tables: Vec<proto::TablePlacement>) -> ClusterMap {
+        ClusterMap {
+            tables,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_partition_restores_alone_only_onto_the_ranges_it_had() {
+        // #1832, Q1: p3's range of `users` is [m, end) in both maps. A split moved elsewhere
+        // in the table (g to h, between p1 and p2) doesn't change it.
+        let backup = with(vec![table("users", 1, &["g", "m"], &["p1", "p2", "p3"])]);
+        let moved_elsewhere = with(vec![table("users", 1, &["h", "m"], &["p1", "p2", "p3"])]);
+        assert_eq!(
+            schema_against(&backup, &moved_elsewhere, "p3").unwrap(),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+        // p3's own bound moved (m to n): refused, since no reconcile moves rows.
+        let moved = with(vec![table("users", 1, &["g", "n"], &["p1", "p2", "p3"])]);
+        let e = schema_against(&backup, &moved, "p3").unwrap_err();
+        assert!(
+            e.message().contains("key range of table \"users\""),
+            "{}",
+            e.message()
+        );
+        // p3 given a second range of the table: refused too.
+        let more = with(vec![table("users", 1, &["g", "m"], &["p3", "p2", "p3"])]);
+        assert!(schema_against(&backup, &more, "p3").is_err());
+    }
+
+    #[test]
+    fn tables_created_or_dropped_since_the_backup_are_the_reconciles() {
+        // #1832, Q1: a table created on p3 since (or dropped and created again: another
+        // `created`) comes back empty; one the live map dropped goes. Neither refuses.
+        let backup = with(vec![
+            table("users", 1, &["m"], &["p1", "p3"]),
+            table("old", 2, &[], &["p3"]),
+            table("again", 3, &[], &["p3"]),
+        ]);
+        let live = with(vec![
+            table("users", 1, &["m"], &["p1", "p3"]),
+            table("again", 9, &[], &["p3"]),
+            table("new", 10, &[], &["p3"]),
+        ]);
+        assert_eq!(
+            schema_against(&backup, &live, "p3").unwrap(),
+            (
+                vec!["again".to_owned(), "new".to_owned()],
+                vec!["again".to_owned(), "old".to_owned()]
+            )
+        );
+    }
 
     #[test]
     fn unhex_reads_a_sha256_and_refuses_anything_else() {
