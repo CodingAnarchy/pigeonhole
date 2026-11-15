@@ -307,6 +307,7 @@ pub(crate) fn read_options(
         // A point get or a single-row read stops at its row's end: an SST cursor need not
         // read the block after a row-end separator (ICR 0039).
         o.one_row = true;
+        o.stop_jumps = true;
     }
     o.cache_only = cache_only;
     o
@@ -331,6 +332,7 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     // A scan of one row (`RowRead::cells`, the text crate's posting reads) ends at its row
     // as a row read does: a filtered cursor's jump past it stops there (#1924).
     opts.one_row = one_row;
+    opts.stop_jumps = one_row;
     let reader = |sst: &OpenSst| {
         if CACHE_ONLY {
             sst.reader_cache_only(set, priority)

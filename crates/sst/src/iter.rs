@@ -297,6 +297,10 @@ fn loaded(slot: &mut Option<BlockIter<BlockHandle>>) -> Result<&mut BlockIter<Bl
 impl SstIter {
     #[inline]
     pub(crate) fn new(reader: Arc<SstReader>, filter: ScanFilter, options: ReadOptions) -> Self {
+        debug_assert!(
+            !options.one_row || options.stop_jumps,
+            "a one-row read stops its jumps: set stop_jumps with one_row"
+        );
         Self {
             reader,
             filter_all: filter.is_all(),
@@ -744,7 +748,7 @@ impl SstIter {
                 Verdict::SkipRow => {
                     self.skip_row_raw()?;
                     // A row skip leaves the row: a one-row read is done.
-                    if self.stops_jumps() {
+                    if self.options.stop_jumps {
                         self.stopped = true;
                         return Ok(());
                     }
@@ -752,7 +756,7 @@ impl SstIter {
                 Verdict::Seek => {
                     let hint = std::mem::take(&mut self.hint);
                     let r = self.seek_forward(&hint);
-                    let left = self.stops_jumps() && r.is_ok() && self.left_row(&hint);
+                    let left = self.options.stop_jumps && r.is_ok() && self.left_row(&hint);
                     self.hint = hint;
                     r?;
                     if left {
@@ -764,13 +768,6 @@ impl SstIter {
             }
         }
         Ok(())
-    }
-
-    /// Whether a jump that leaves its row stops there: [`ReadOptions::stop_jumps`], or a
-    /// one-row read's. Read only after a jump, so a cursor's construction pays nothing.
-    #[inline]
-    fn stops_jumps(&self) -> bool {
-        self.options.one_row || self.options.stop_jumps
     }
 
     /// Whether the cursor stands past the row of `hint` (a row prefix and a qualifier

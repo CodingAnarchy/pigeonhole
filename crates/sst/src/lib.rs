@@ -559,13 +559,15 @@ pub struct ReadOptions {
     /// The read stays within one row: its caller stops at the first key past the row of the
     /// keys it reads (a point get or a single-row read). Leaving a data block whose index
     /// separator marks the end of a row (the writer's row-end separators, ICR 0039), the
-    /// cursor ends instead of reading the next block, which holds only later rows.
+    /// cursor ends instead of reading the next block, which holds only later rows. Set
+    /// [`ReadOptions::stop_jumps`] with it.
     pub one_row: bool,
     /// A filtered jump (a seek to the filter's hint, a row skip) that leaves the row it
     /// jumped from stops there, valid but not admitted ([`SstIter::take_stopped`]), instead of
-    /// jumping on row by row through the rest of the file (#1924, #1931). Implied by
-    /// [`ReadOptions::one_row`]; set alone by a read of several rows whose caller moves the
-    /// cursor forward row by row (a multi-get), without `one_row`'s end at a row-end block.
+    /// jumping on row by row through the rest of the file (#1924, #1931). A one-row read
+    /// sets it with [`ReadOptions::one_row`] (the cursor tests this flag alone after a
+    /// jump); a read of several rows whose caller moves the cursor forward row by row (a
+    /// multi-get) sets it alone, without `one_row`'s end at a row-end block.
     pub stop_jumps: bool,
 }
 
