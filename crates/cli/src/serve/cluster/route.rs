@@ -136,6 +136,14 @@ impl Routes {
         p.partitions.get(i).map(String::as_str)
     }
 
+    /// Every partition the memory store is placed on, in the placement's order; empty when
+    /// the map places none.
+    pub(crate) fn memory_partitions(&self) -> &[String] {
+        self.memory
+            .as_ref()
+            .map_or(&[], |(_, p)| p.partitions.as_slice())
+    }
+
     pub(crate) fn map_version(&self) -> u64 {
         self.map_version
     }

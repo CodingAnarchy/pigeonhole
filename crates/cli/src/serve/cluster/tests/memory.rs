@@ -768,3 +768,265 @@ fn a_split_memory_write_names_what_applied_and_says_when_a_part_may_have() {
         });
     }
 }
+
+/// A watch of `namespaces` through the node at `port`, from `resume` (empty: now).
+async fn watch(
+    port: u16,
+    namespaces: &[&str],
+    resume: Vec<u8>,
+) -> Result<tonic::Streaming<crate::serve::proto::MemoryEvent>, tonic::Status> {
+    memory(port)
+        .await
+        .watch(crate::serve::proto::MemoryWatchRequest {
+            namespaces: namespaces.iter().map(|n| (*n).to_owned()).collect(),
+            resume: resume.into(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// The next `n` memories a watch delivers, each with its token; progress passed over.
+async fn memories(
+    events: &mut tonic::Streaming<crate::serve::proto::MemoryEvent>,
+    n: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let e = tokio::time::timeout(Duration::from_secs(10), events.message())
+            .await
+            .expect("an event in time")
+            .unwrap()
+            .expect("the watch goes on");
+        if let Some(crate::serve::proto::memory_event::Event::Memory(m)) = e.event {
+            out.push((m.text, e.token.to_vec()));
+        }
+    }
+    out
+}
+
+/// #1915 PR 2b: a watch over namespaces on both partitions, through a node holding neither
+/// (both components forwarded) and through one holding p1 (one here, one forwarded),
+/// delivers every new memory once. A resume from any event's token delivers exactly the
+/// events after it, on either node.
+#[test]
+fn a_watch_across_partitions_delivers_each_memory_once_and_resumes_from_any_token() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [a, _b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut via_c = watch(c, &["alice", "zed"], Vec::new()).await.unwrap();
+        let mut via_a = watch(a, &["zed", "alice"], Vec::new()).await.unwrap();
+        let texts = [
+            "alice one",
+            "zed one",
+            "alice two",
+            "zed two",
+            "alice three",
+        ];
+        for t in texts {
+            let ns = t.split(' ').next().unwrap();
+            remember(c, ns, t).await.unwrap();
+        }
+        // Not in the watch: never delivered.
+        remember(c, "bob", "bob one").await.unwrap();
+        let mut resumed_all = Vec::new();
+        for events in [&mut via_c, &mut via_a] {
+            let got = memories(events, texts.len()).await;
+            let mut seen: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+            // Each partition's in order.
+            for ns in ["alice", "zed"] {
+                let mine: Vec<&str> = seen.iter().copied().filter(|t| t.starts_with(ns)).collect();
+                let want: Vec<&str> = texts
+                    .iter()
+                    .copied()
+                    .filter(|t| t.starts_with(ns))
+                    .collect();
+                assert_eq!(mine, want);
+            }
+            seen.sort_unstable();
+            let mut want = texts.to_vec();
+            want.sort_unstable();
+            assert_eq!(seen, want);
+            // From each event's token, through either node: the events after it.
+            for (i, (_, token)) in got.iter().enumerate() {
+                for port in [a, c] {
+                    let mut resumed = watch(port, &["alice", "zed"], token.clone()).await.unwrap();
+                    let rest = memories(&mut resumed, got.len() - i - 1).await;
+                    let mut rest: Vec<&str> = rest.iter().map(|(t, _)| t.as_str()).collect();
+                    let mut after: Vec<&str> =
+                        got[i + 1..].iter().map(|(t, _)| t.as_str()).collect();
+                    rest.sort_unstable();
+                    after.sort_unstable();
+                    assert_eq!(rest, after, "from event {i} through {port}");
+                    // Kept from the first token only: each watch holds a `--max-streams`
+                    // place on every node it reaches, and the test nodes have 16.
+                    if i == 0 {
+                        resumed_all.push(resumed);
+                    }
+                }
+            }
+        }
+        // And nothing more: each resumed watch's next memory is the next one written.
+        remember(c, "zed", "zed later").await.unwrap();
+        for (i, resumed) in resumed_all
+            .iter_mut()
+            .chain([&mut via_c, &mut via_a])
+            .enumerate()
+        {
+            let next = memories(resumed, 1).await;
+            assert_eq!(next[0].0, "zed later", "watch {i}");
+        }
+    });
+}
+
+/// #1915 PR 2b: a watch resumes only from its own token: not a single node's, not one of a
+/// watch over other namespaces. A watch of every namespace covers both partitions.
+#[test]
+fn a_cluster_watch_refuses_another_watchs_token_and_watches_every_namespace() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [_a, b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut alice = watch(c, &["alice"], Vec::new()).await.unwrap();
+        let mut all = watch(b, &[], Vec::new()).await.unwrap();
+        remember(c, "alice", "alice one").await.unwrap();
+        remember(c, "zed", "zed one").await.unwrap();
+        let (_, token) = memories(&mut alice, 1).await.remove(0);
+        let mut both: Vec<String> = memories(&mut all, 2)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        both.sort();
+        assert_eq!(both, ["alice one", "zed one"]);
+        for (namespaces, resume, says) in [
+            (vec!["alice", "bob"], token.clone(), "another watch's"),
+            (vec![], token.clone(), "another watch's"),
+            (
+                vec!["alice"],
+                vec![1, 2, 3],
+                "isn't a cluster memory watch's token",
+            ),
+        ] {
+            let e = watch(c, &namespaces, resume).await.unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{}", e.message());
+            assert!(e.message().contains(says), "{}", e.message());
+        }
+    });
+}
+
+/// The next event of a watch that should end: its error.
+async fn ended(events: &mut tonic::Streaming<crate::serve::proto::MemoryEvent>) -> tonic::Status {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), events.message())
+            .await
+            .expect("the end in time")
+        {
+            Ok(Some(e)) => assert!(
+                !matches!(
+                    e.event,
+                    Some(crate::serve::proto::memory_event::Event::Memory(_))
+                ),
+                "no memory: {e:?}"
+            ),
+            Ok(None) => panic!("the watch ended without an error"),
+            Err(status) => return status,
+        }
+    }
+}
+
+async fn admin(port: u16, op: &str, p: &str) {
+    let request = crate::serve::proto::PartitionRequest {
+        partition: p.into(),
+        ..Default::default()
+    };
+    let mut c = client(port).await;
+    match op {
+        "fence" => c.fence(request).await.map(drop),
+        "close" => c.close(request).await.map(drop),
+        _ => c.unfence(request).await.map(drop),
+    }
+    .unwrap();
+}
+
+/// #1915 PR 2b (S2 of the design): a partition's close ends a watch over it with
+/// `PartitionUnavailable`, and once it reopens, a resume from the last token delivers what
+/// came after, once.
+#[test]
+fn a_close_ends_a_watch_and_its_token_resumes_after_the_reopen() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [a, b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut w = watch(c, &["alice", "zed"], Vec::new()).await.unwrap();
+        remember(c, "alice", "alice one").await.unwrap();
+        let (_, token) = memories(&mut w, 1).await.remove(0);
+        admin(a, "fence", "p1").await;
+        admin(a, "close", "p1").await;
+        let e = ended(&mut w).await;
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{}", e.message());
+        assert!(e.message().contains("closed"), "{}", e.message());
+        // Closed, p1 refuses a watch over it; p2 alone still watches.
+        assert!(watch(c, &["alice"], Vec::new()).await.is_err());
+        let mut zed = watch(b, &["zed"], Vec::new()).await.unwrap();
+        remember(c, "zed", "zed one").await.unwrap();
+        assert_eq!(memories(&mut zed, 1).await[0].0, "zed one");
+        admin(a, "unfence", "p1").await;
+        remember(c, "alice", "alice two").await.unwrap();
+        let mut resumed = watch(b, &["alice", "zed"], token).await.unwrap();
+        let mut got: Vec<String> = memories(&mut resumed, 2)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        got.sort();
+        assert_eq!(got, ["alice two", "zed one"]);
+        remember(c, "zed", "zed two").await.unwrap();
+        assert_eq!(
+            memories(&mut resumed, 1).await[0].0,
+            "zed two",
+            "nothing more"
+        );
+    });
+}
+
+/// #1915 PR 2b (simp724's S1): `phdb cluster move` takes p1 from a to c. A watch with a
+/// component on a ends (the move closes p1 there before the map moves it, so with
+/// `PartitionUnavailable`; a map that moves an open partition ends it with
+/// `WrongPartition`, `serve::memory`'s M1 test), and its token from before the move
+/// resumes after it, through another node, with no gap and no repeat: the token's epoch
+/// and map version hold across the move.
+#[test]
+fn a_move_ends_a_watch_and_its_token_from_before_resumes_after() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [a, b, c]) = three_nodes(&rt);
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    rt.block_on(async {
+        let mut w = watch(b, &["alice", "zed"], Vec::new()).await.unwrap();
+        remember(c, "alice", "alice one").await.unwrap();
+        let (_, token) = memories(&mut w, 1).await.remove(0);
+        remember(c, "alice", "alice two").await.unwrap();
+        assert_eq!(memories(&mut w, 1).await[0].0, "alice two");
+        let r = within(super::super::moving::run(&args, "p1", "c", true, None))
+            .await
+            .unwrap();
+        assert_eq!(r.document["verified"], true, "{:?}", r.document);
+        let e = ended(&mut w).await;
+        assert!(e.message().contains("\"p1\""), "{}", e.message());
+        remember(a, "alice", "alice three").await.unwrap();
+        let mut resumed = watch(b, &["alice", "zed"], token).await.unwrap();
+        let got: Vec<String> = memories(&mut resumed, 2)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(got, ["alice two", "alice three"], "no gap and no repeat");
+        remember(c, "zed", "zed one").await.unwrap();
+        assert_eq!(
+            memories(&mut resumed, 1).await[0].0,
+            "zed one",
+            "nothing more"
+        );
+    });
+}
