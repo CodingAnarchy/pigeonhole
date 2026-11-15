@@ -1317,6 +1317,8 @@ impl Partition {
             Some(id) => pigeonhole_otel::Config::new().attribute(PARTITION_ATTRIBUTE, id),
             None => pigeonhole_otel::Config::new(),
         };
+        // The node's one `Backups` keeps the first placement it's given (a `OnceLock`): a
+        // cluster node's partitions all pass the node's, so the later calls change nothing.
         if let Some(p) = &config.placement {
             config.backups.place(p);
         }
