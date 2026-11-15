@@ -60,13 +60,20 @@ pub(crate) enum Msg {
     Failed(ApiError),
 }
 
-/// The loader: `Index::bulk_load_*` for the element type of the first vector
-/// ([`load`]). A parameter, so a test can run one that's slow.
-pub(crate) type Loader = Arc<
-    dyn Fn(&Index, u64, &mut dyn Iterator<Item = Item>) -> Result<BulkStats, ApiError>
-        + Send
-        + Sync,
->;
+/// A fault seam (tests): what the next load does around the loader ([`load`]). Taken by
+/// the load that meets it, so it acts once.
+#[cfg(test)]
+pub(crate) enum Seam {
+    /// A slow loader: once it has taken the load's first vector it sends on `started`,
+    /// then waits for `release` (or for its sender to drop) before it takes the rest.
+    Hold {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
+    /// A failure inside the vector crate mid-load: this many vectors are taken, then the
+    /// loader fails, with nothing said of the batches still waiting.
+    FailAfter(usize),
+}
 
 /// `Vectors.BulkLoad`'s request, as the router passes it: the index and the expected count
 /// from the first message, and the messages through `input`.
@@ -159,7 +166,31 @@ fn batch(
     })
 }
 
-/// The production loader: `bulk_load_*` for the first vector's element type.
+#[cfg(test)]
+impl Seam {
+    /// [`load`], with this fault.
+    fn load(
+        self,
+        index: &Index,
+        expected: u64,
+        input: &mut dyn Iterator<Item = Item>,
+    ) -> Result<BulkStats, ApiError> {
+        match self {
+            Seam::Hold { started, release } => {
+                let first = input.next();
+                let _ = started.send(());
+                let _ = release.recv();
+                load(index, expected, &mut first.into_iter().chain(input))
+            }
+            Seam::FailAfter(vectors) => {
+                let _ = input.take(vectors).count();
+                Err(ApiError::internal("the crate failed mid-load"))
+            }
+        }
+    }
+}
+
+/// The loader: `bulk_load_*` for the first vector's element type.
 ///
 /// **Every failure leaves the index loaded up to the vector that failed** (ai1249's M1 on
 /// #1580). Each vector is checked against the index's spec here, by the crate's rule, before
@@ -168,7 +199,7 @@ fn batch(
 /// it, as for a stream that ended, and the call fails with `InvalidArgument`. (The crate's
 /// own check would return at once instead, dropping the batches still waiting and skipping
 /// the rebalance.)
-pub(crate) fn load(
+fn load(
     index: &Index,
     expected: u64,
     input: &mut dyn Iterator<Item = Item>,
@@ -376,7 +407,9 @@ pub(crate) struct Gauges {
 /// The server's bulk loads: one at a time, each on a thread of its own.
 pub(crate) struct BulkLoads {
     slot: Arc<Semaphore>,
-    pub(crate) loader: Loader,
+    /// The next load's fault ([`Seam`]).
+    #[cfg(test)]
+    pub(crate) seam: Mutex<Option<Seam>>,
     pub(crate) placement: Option<Arc<Placement>>,
     /// The running (or last) load's thread, for `close` to wait for.
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -401,7 +434,8 @@ impl BulkLoads {
     pub(crate) fn new(placement: Option<Arc<Placement>>) -> Self {
         Self {
             slot: Arc::new(Semaphore::new(1)),
-            loader: Arc::new(load),
+            #[cfg(test)]
+            seam: Mutex::new(None),
             placement,
             thread: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -481,7 +515,12 @@ impl BulkLoads {
             reserved,
         };
         let (tx, done) = oneshot::channel();
-        let loader = Arc::clone(&self.loader);
+        #[cfg(test)]
+        let seam = self
+            .seam
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         let placement = self.placement.clone();
         let gauges = Arc::clone(&self.gauges);
         let (expected, rx) = (op.expected, op.input);
@@ -519,7 +558,13 @@ impl BulkLoads {
                             gate,
                             sizing,
                         };
-                        let r = loader(&index, expected, &mut input);
+                        #[cfg(test)]
+                        let r = match seam {
+                            Some(seam) => seam.load(&index, expected, &mut input),
+                            None => load(&index, expected, &mut input),
+                        };
+                        #[cfg(not(test))]
+                        let r = load(&index, expected, &mut input);
                         // A load that took vectors and then failed left them loaded, so the
                         // index isn't empty and the call can't be sent again, whatever its
                         // code says of itself (the audit's P2-C9: a stall's DeadlineExceeded,

@@ -1790,9 +1790,20 @@ pub(crate) fn run(
             // Unset, the library's own defaults, exactly as before.
             memories: memories.as_deref(),
         },
-        |share, memory| open::options_for(&served, share, memory),
+        |share, memory| {
+            let feed = args.change_feed.map(|t| {
+                let all = shares.iter().map(|s| s.shards).sum();
+                super::placement::feed_share(t, share.shards, all)
+            });
+            open::options_for(&served, share, memory, feed, false)
+        },
         stderr,
     )?;
+    if let Some(total) = args.change_feed {
+        let parts: Vec<(&str, &pigeonhole::Pigeonhole)> =
+            opened.iter().map(|o| (o.id.as_str(), &o.db)).collect();
+        open::log_feed(total, &parts, "at start");
+    }
     let dbs: Vec<&pigeonhole::Pigeonhole> = opened.iter().map(|o| &o.db).collect();
     let mut placement = if dbs.is_empty() {
         super::placement::Placement::routes_only(args.io_threads, args.blocking_threads)
@@ -1912,6 +1923,7 @@ pub(crate) fn run(
             shards: total_shards,
             compaction: total_compaction,
             engine_memory: args.engine_memory,
+            change_feed: args.change_feed,
             reserved: reserved.clone(),
         },
     );

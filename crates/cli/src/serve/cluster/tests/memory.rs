@@ -112,6 +112,7 @@ fn a_memory_call_goes_to_the_partition_that_holds_its_namespace_through_any_node
             false,
             placement,
             None,
+            None,
             Some(recipe()),
         )
     };
@@ -195,6 +196,7 @@ fn a_cluster_without_a_placed_store_answers_memory_calls_unsupported() {
         crate::serve::server_tests::limits(),
         false,
         placement,
+        None,
         None,
         Some(recipe()),
     );
@@ -307,6 +309,7 @@ fn one_node(
         crate::serve::server_tests::limits(),
         false,
         placement,
+        None,
         None,
         memory,
     );

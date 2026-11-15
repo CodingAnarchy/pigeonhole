@@ -423,3 +423,82 @@ fn a_segment_still_short_of_its_successor_on_the_second_look_is_corrupt() {
     };
     assert!(e.to_string().contains("predecessor end mismatch"), "{e}");
 }
+
+#[test]
+fn a_record_after_a_skipped_frame_tail_resumes_from_before_the_tail_across_a_power_loss() {
+    // #1937: a record that ends within 12 bytes of its frame's end leaves a tail the encoder
+    // skips, so the next record's fragment starts at the next frame. A durable feed holds that
+    // next record, not yet synced, and its token's hint is the record's `start`. A power loss
+    // takes the record; recovery cuts the log at the end of the record before the tail. The
+    // hint must not be past that cut, or the feed resumed from the token is `Cut` (expired:
+    // "records the feed read were lost") though nothing it read or delivered was.
+    let sim = pigeonhole_io::sim::SimVfs::new(1937);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let o = fed(8, 2, 8);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    let first = append(&mut wal, 1);
+    // Record 2 sized to end 1 to 12 bytes before a frame's end.
+    let frame = pigeonhole_format::wal::FRAME_SIZE as u64;
+    let at = u64::from(first.offset());
+    let size = (1..2 * frame as usize)
+        .find(|&size| {
+            let mut bytes = Vec::new();
+            batch(2, size).record().encode(&mut bytes);
+            let enc = pigeonhole_format::wal::FrameEncoder::new(first.epoch(), at);
+            let end = at + enc.encoded_len(bytes.len()) as u64;
+            (1..=12).contains(&(frame - end % frame))
+        })
+        .unwrap();
+    let second = wal
+        .append(&batch(2, size).record(), Durability::GroupSync)
+        .unwrap()
+        .end;
+    wal.sync().unwrap();
+    let tail = frame - u64::from(second.offset()) % frame;
+    assert!(
+        (1..=12).contains(&tail),
+        "record 2 ends {tail} bytes before its frame's end"
+    );
+    // Record 3 written, not synced: its fragment starts at the next frame, past the tail.
+    wal.append(&batch(3, 100).record(), Durability::None)
+        .unwrap();
+    wal.write().unwrap();
+
+    // The feed reads records 2 and 3 and holds 3 (not yet durable): its hint is 3's `start`.
+    let mut cursor = FeedCursor::open(&vfs, db(), STREAM, DB_ID, first).unwrap();
+    let mut starts = Vec::new();
+    loop {
+        match cursor.step().unwrap() {
+            pigeonhole_wal::Step::Record { start, record, .. } => {
+                starts.push((seqno_of(&record), start))
+            }
+            pigeonhole_wal::Step::End => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(starts.iter().map(|s| s.0).collect::<Vec<_>>(), [2, 3]);
+    let hint = starts[1].1;
+    assert_eq!(
+        hint, second,
+        "a record's start is the end of the record before it"
+    );
+    drop(cursor);
+    drop(wal);
+
+    // The power loss takes record 3; the next session's recovery cuts the log at 2's end.
+    sim.crash(pigeonhole_io::sim::CrashKind::Power);
+    let mut r = Recovery::open(&vfs, db(), STREAM, DB_ID, Lsn::default()).unwrap();
+    let mut recovered = Vec::new();
+    while let Some((_, rec)) = r.next_record().unwrap() {
+        recovered.push(seqno_of(&rec));
+    }
+    assert_eq!(recovered, [1, 2]);
+    let mut next = fed(8, 2, 8);
+    next.feed_session = 0x5e55_1937;
+    let mut wal = r.into_stream(next).unwrap();
+    append(&mut wal, 10);
+
+    // Resumed from the hint: the cursor follows the next session, never `Cut`.
+    let mut resumed = FeedCursor::open(&vfs, db(), STREAM, DB_ID, hint).unwrap();
+    assert_eq!(drain(&mut resumed).unwrap().0, [10]);
+}

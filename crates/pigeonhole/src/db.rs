@@ -1210,6 +1210,24 @@ impl Pigeonhole {
         self.engine().set_cache_capacities(block_bytes, row_bytes);
     }
 
+    /// The change feed's retention its last session requested before this open, if the feed
+    /// is on and there was one: the request, not what was in effect then, so comparing it
+    /// with [`FeedInfo::retention_bytes`](crate::FeedInfo::retention_bytes) can miss a small
+    /// drop, never report one that didn't happen.
+    ///
+    /// **A serve-only hook, not part of the stable API, with no 1.x promise:** `phdb serve`
+    /// compares it with this open's
+    /// ([`FeedInfo::retention_bytes`](crate::FeedInfo::retention_bytes)) to say when a
+    /// cluster partition's share of `--change-feed` kept less history (#1786).
+    #[doc(hidden)]
+    pub fn feed_previous_retention(&self) -> Result<Option<u64>> {
+        Ok(self
+            .engine()
+            .info()?
+            .feed
+            .and_then(|f| f.previous_retention_bytes))
+    }
+
     /// The block and row caches' configured capacities in bytes, as
     /// [`set_cache_capacities`](Self::set_cache_capacities) last set them or `Options` at
     /// open. A row cache that is off reports 0, as does a reader process's. Not part of the

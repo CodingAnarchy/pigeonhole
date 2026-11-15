@@ -330,6 +330,8 @@ pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
 /// The change feed's session at open (D310): `None` with the feed off, after appending
 /// "fed: none" to an existing sidecar. With it on: the retention per stream (`bytes / N`,
 /// at least two segments), a random session id, and the session's sidecar entry, synced.
+/// `previous_retention` is the last session's, for `DbInfo` (#1786).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_session(
     vfs: &VfsRef,
     path: &Path,
@@ -338,6 +340,7 @@ pub(crate) fn open_session(
     options: &EngineOptions,
     shards: usize,
     opened: OpenedRoot,
+    previous_retention: Option<u64>,
 ) -> Result<Option<Arc<Feed>>> {
     let opened_at = opened.sequence;
     let Some(cfg) = &options.feed else {
@@ -389,6 +392,7 @@ pub(crate) fn open_session(
         .ok_or_else(|| Error::Corruption("the feed sidecar could not be created".into()))?;
     let mut feed = Feed::new(session, retain, cfg.max_age_micros, tables, shards);
     feed.retain_bytes_per_stream = cfg.retention_bytes / streams;
+    feed.previous_retention_bytes = previous_retention;
     if let Some(us) = cfg.sync_interval_micros {
         feed.sync_interval_nanos = us.saturating_mul(1_000).max(1);
     }
@@ -461,6 +465,8 @@ pub(crate) struct Feed {
     /// The retention in effect, for the whole database: the request, rounded up to whole
     /// segments per stream and raised to two of them (`DatabaseInfo` reports it).
     pub retention_bytes: u64,
+    /// The retention the sidecar's last session requested, if there was one (#1786).
+    pub previous_retention_bytes: Option<u64>,
     /// Retention age, microseconds of the VFS clock.
     pub age_micros: Option<u64>,
     /// The tables this session feeds.
@@ -610,6 +616,7 @@ impl Feed {
             retain_segments,
             retain_bytes_per_stream: 0,
             retention_bytes: 0,
+            previous_retention_bytes: None,
             age_micros,
             tables,
             flush_interval_nanos: FLUSH_INTERVAL_NANOS,
