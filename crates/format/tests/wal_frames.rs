@@ -230,3 +230,166 @@ proptest! {
         prop_assert_eq!(&framed[1..], &whole[..]);
     }
 }
+
+/// D327 (#1708): lays out `records` like [`write`], but a record with a unit is preceded by a
+/// pad to that unit, framed into the same buffer as it is written. Returns the segment and
+/// each record's (first fragment, end) span.
+fn write_padded(
+    epoch: u32,
+    start: u64,
+    records: &[(Option<usize>, Vec<u8>)],
+) -> (Vec<u8>, Vec<(u64, u64)>) {
+    let mut seg = vec![0; FRAMES * FRAME_SIZE];
+    let mut enc = FrameEncoder::new(epoch, start);
+    let mut pos = start;
+    let mut spans = Vec::new();
+    for (unit, r) in records {
+        let pad = unit.map_or(0, |u| enc.pad_len(u));
+        let mut out = Vec::new();
+        if let Some(u) = unit {
+            assert_eq!(enc.pad(*u, &mut out), pad);
+        }
+        let need = pad + enc.encoded_len(r.len());
+        if pos as usize + need > seg.len() {
+            break;
+        }
+        let end = enc.encode(r, &mut out);
+        assert_eq!(out.len(), need);
+        seg[pos as usize..end as usize].copy_from_slice(&out);
+        let after_pad = pos + pad as u64;
+        let first = if FRAME_SIZE - (after_pad as usize % FRAME_SIZE) <= FRAGMENT_HEADER_LEN {
+            after_pad.next_multiple_of(FRAME_SIZE as u64)
+        } else {
+            after_pad
+        };
+        if let Some(u) = unit {
+            assert_eq!(first % *u as u64, 0, "a padded record starts on its unit");
+        }
+        spans.push((first, end));
+        pos = end;
+    }
+    (seg, spans)
+}
+
+fn pad_unit() -> impl Strategy<Value = Option<usize>> {
+    prop_oneof![
+        2 => Just(None),
+        1 => Just(Some(32)),
+        1 => Just(Some(512)),
+        2 => Just(Some(4096)),
+        1 => Just(Some(FRAME_SIZE)),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config(300))]
+
+    /// Pads between records are stepped over: every record comes back at its offset, and the
+    /// stop is the end of the last record, never past a pad.
+    #[test]
+    fn padded_records_roundtrip(
+        records in vec((pad_unit(), record()), 0..sized(12, 4)),
+        epoch in 1u32..,
+        start in start_offset(),
+    ) {
+        let (seg, spans) = write_padded(epoch, start, &records);
+        let (got, stop) = read(&seg, epoch, start);
+        prop_assert_eq!(got.len(), spans.len());
+        for ((off, rec), ((_, want), (first, _))) in got.iter().zip(records.iter().zip(&spans)) {
+            prop_assert_eq!(rec, want);
+            prop_assert_eq!(*off, *first);
+        }
+        if let Some(stop) = stop {
+            prop_assert_eq!(stop, spans.last().map_or(start, |s| s.1));
+        }
+    }
+
+    /// A cut anywhere, in a pad or in the record after it, stops at the end of the last
+    /// complete record: a pad whose record was torn off is not data (D327, §4 of the design).
+    #[test]
+    fn a_torn_padded_tail_stops_at_the_last_complete_record(
+        records in vec((pad_unit(), record()), 1..sized(10, 4)),
+        epoch in 1u32..,
+        start in start_offset(),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let (seg, spans) = write_padded(epoch, start, &records);
+        let end = spans.last().map_or(start, |s| s.1) as usize;
+        let cut = start as usize + cut.index(end - start as usize + 1);
+        let mut torn = seg.clone();
+        torn[cut..].fill(0);
+        let (got, stop) = read(&torn, epoch, start);
+        let complete = spans
+            .iter()
+            .take_while(|s| torn[start as usize..s.1 as usize] == seg[start as usize..s.1 as usize])
+            .count();
+        prop_assert_eq!(got.len(), complete);
+        let want_stop = if complete == 0 { start } else { spans[complete - 1].1 };
+        prop_assert_eq!(stop, Some(want_stop));
+    }
+}
+
+#[test]
+fn a_pad_reaches_the_next_unit_and_needs_room_for_its_header() {
+    let f = FRAME_SIZE as u64;
+    // Aligned already: nothing.
+    assert_eq!(FrameEncoder::new(1, f + 4096).pad_len(4096), 0);
+    // A gap with room for a header: just the gap.
+    assert_eq!(FrameEncoder::new(1, f + 100).pad_len(4096), 3996);
+    // A gap too short for a header (under 12 bytes): to the boundary after. A gap of
+    // exactly 12 is a header-only pad.
+    assert_eq!(FrameEncoder::new(1, f + 4090).pad_len(4096), 6 + 4096);
+    assert_eq!(FrameEncoder::new(1, f + 4085).pad_len(4096), 11 + 4096);
+    assert_eq!(FrameEncoder::new(1, f + 4084).pad_len(4096), 12);
+    // A frame tail too short for any fragment: the next record starts the next frame anyway.
+    assert_eq!(FrameEncoder::new(1, 2 * f - 12).pad_len(4096), 0);
+    // A frame's last unit: the pad ends exactly at the frame's end.
+    assert_eq!(FrameEncoder::new(1, 2 * f - 100).pad_len(4096), 100);
+    let mut out = Vec::new();
+    let mut enc = FrameEncoder::new(1, f + 100);
+    assert_eq!(enc.pad(4096, &mut out), 3996);
+    assert_eq!(out.len(), 3996);
+    assert_eq!(out[10], 5, "fragment type Pad");
+    assert!(
+        out[FRAGMENT_HEADER_LEN..].iter().all(|&b| b == 0),
+        "a pad's payload is zeros"
+    );
+    assert_eq!(enc.pad(4096, &mut out), 0, "aligned after a pad");
+}
+
+#[test]
+#[should_panic(expected = "a pad unit is a power of two")]
+fn a_pad_unit_must_divide_a_frame() {
+    FrameEncoder::new(1, FRAME_SIZE as u64 + 1).pad_len(3000);
+}
+
+/// A pad is only valid between records: one inside a First…Last sequence is out of sequence,
+/// so replay stops before that record, as for any fragment out of order.
+#[test]
+fn a_pad_inside_a_record_stops_replay() {
+    let start = FRAME_SIZE as u64;
+    let big = vec![0xA5; FRAME_SIZE + 100];
+    let (mut seg, spans) = write(3, start, &[vec![1; 10], big, vec![2; 10]], 0);
+    // The big record's second fragment (its Last, at the start of frame 2): retype it a pad.
+    let at = 2 * FRAME_SIZE;
+    assert_eq!(seg[at + 10], 4, "the big record's Last fragment");
+    seg[at + 10] = 5;
+    let len = usize::from(u16::from_le_bytes([seg[at + 8], seg[at + 9]]));
+    let crc = pigeonhole_format::checksum::crc32c(&seg[at + 4..at + FRAGMENT_HEADER_LEN + len]);
+    seg[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+    let (got, stop) = read(&seg, 3, start);
+    assert_eq!(got.len(), 1);
+    assert_eq!(stop, Some(spans[0].1));
+}
+
+/// A reader that starts at a pad (a feed cursor resuming at the end of the last record it
+/// read, D310) steps over it to the record after.
+#[test]
+fn a_decoder_starting_at_a_pad_reads_the_record_after_it() {
+    let start = FRAME_SIZE as u64;
+    let (seg, spans) = write_padded(4, start, &[(None, vec![1; 100]), (Some(4096), vec![2; 50])]);
+    let resume = spans[0].1;
+    assert!(spans[1].0 > resume, "a pad between them");
+    let (got, _) = read(&seg, 4, resume);
+    assert_eq!(got, [(spans[1].0, vec![2; 50])]);
+}

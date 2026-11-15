@@ -36,7 +36,8 @@ use pigeonhole_format::superblock::{
     ExtentRef, FIRST_DATA_PAGE, SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock,
 };
 use pigeonhole_format::wal::{
-    Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, FrameEncoder, SegmentHeader, WalRecord,
+    Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, FrameEncoder, PAD_FRAGMENT,
+    SegmentHeader, WalRecord,
 };
 use pigeonhole_format::{BlobFileId, Cursor, Lsn, PAGE_SIZE, StreamId};
 use pigeonhole_io::{FileRef, OpenOptions, VfsRef};
@@ -1300,22 +1301,29 @@ impl WalScan {
     }
 }
 
-/// Whether `frame` starts with a fragment of `epoch` whose checksum holds.
-fn fragment_ok(frame: &[u8], epoch: u32) -> bool {
-    if frame.len() < FRAGMENT_HEADER_LEN {
-        return false;
+/// Whether `frame` starts with a record's fragment of `epoch` whose checksum holds, after any
+/// intact pads (D327: a pad is not data, but the record it was written before is).
+fn fragment_ok(mut frame: &[u8], epoch: u32) -> bool {
+    loop {
+        if frame.len() < FRAGMENT_HEADER_LEN {
+            return false;
+        }
+        let h = &frame[..FRAGMENT_HEADER_LEN];
+        let len = usize::from(u16::from_le_bytes([h[8], h[9]]));
+        let end = FRAGMENT_HEADER_LEN + len;
+        let ty = h[10];
+        let intact = u32::from_le_bytes(h[4..8].try_into().expect("4 bytes")) == epoch
+            && end <= frame.len()
+            && pigeonhole_format::checksum::crc32c_append(
+                pigeonhole_format::checksum::crc32c(&h[4..]),
+                &frame[FRAGMENT_HEADER_LEN..end],
+            ) == u32::from_le_bytes(h[..4].try_into().expect("4 bytes"));
+        if intact && ty == PAD_FRAGMENT {
+            frame = &frame[end..];
+            continue;
+        }
+        return intact && (1..=4).contains(&ty);
     }
-    let h = &frame[..FRAGMENT_HEADER_LEN];
-    let len = usize::from(u16::from_le_bytes([h[8], h[9]]));
-    let end = FRAGMENT_HEADER_LEN + len;
-    let ty = h[10];
-    (1..=4).contains(&ty)
-        && u32::from_le_bytes(h[4..8].try_into().expect("4 bytes")) == epoch
-        && end <= frame.len()
-        && pigeonhole_format::checksum::crc32c_append(
-            pigeonhole_format::checksum::crc32c(&h[4..]),
-            &frame[FRAGMENT_HEADER_LEN..end],
-        ) == u32::from_le_bytes(h[..4].try_into().expect("4 bytes"))
 }
 
 /// The pager's extent rules: past the reserved first pages, a power of two from 64 KiB to
@@ -1362,7 +1370,26 @@ fn names(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_extent;
+    use super::{fragment_ok, valid_extent};
+    use pigeonhole_format::wal::{FRAME_SIZE, FrameEncoder};
+
+    /// D327: the scan for records after a stop steps over intact pads, and finds the record
+    /// after one; a pad with nothing valid after it is not a record.
+    #[test]
+    fn a_record_after_a_pad_is_found_and_a_pad_alone_is_not() {
+        let start = FRAME_SIZE as u64 + 100;
+        let mut enc = FrameEncoder::new(7, start);
+        let mut out = Vec::new();
+        assert!(enc.pad(4096, &mut out) > 0);
+        let pad = out.len();
+        enc.encode(b"a record", &mut out);
+        assert!(fragment_ok(&out, 7), "a pad, then a record");
+        assert!(!fragment_ok(&out, 8), "another epoch's");
+        let mut torn = out.clone();
+        torn[pad..].fill(0);
+        assert!(!fragment_ok(&torn, 7), "a pad with zeros after it");
+        assert!(fragment_ok(&out[pad..], 7), "the record alone");
+    }
 
     /// The pager's extent rules. Unreachable from a file (the manifest and superblock
     /// decoders refuse such an extent first), so tested here.
