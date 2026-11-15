@@ -739,7 +739,8 @@ fn open_lanes(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let (mut opts, filter) = ctx.read.resolve_opts(meta, ctx.snapshot.seqno, ctx.now);
+        let (mut opts, mut filter) = ctx.read.resolve_opts(meta, ctx.snapshot.seqno, ctx.now);
+        super::filter_stop(&mut filter, g.hi.as_deref());
         let resolver_blobs = super::ResolverBlobs::attach(&mut opts, &view.ssts);
         let mut resolver = take_scan_resolver();
         let filled = view.scan_sources_located::<false>(

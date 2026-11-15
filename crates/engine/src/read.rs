@@ -298,6 +298,17 @@ pub(crate) struct ResolverBlobs {
     error: Mutex<Option<Error>>,
 }
 
+/// Gives a filtered read's sources its upper bound `end`, the resolver's own (#1924): a
+/// source whose filter jumps (a seek to its hint, a row skip) stops once it lands at or past
+/// it, where the resolver ends the read, instead of seeking on row by row through the rest
+/// of its file. An unfiltered read never jumps, so it gets none, and costs nothing more.
+#[inline]
+pub(crate) fn filter_stop(filter: &mut ScanFilter, end: Option<&[u8]>) {
+    if !filter.is_all() {
+        filter.stop = end.map(<[u8]>::to_vec);
+    }
+}
+
 impl ResolverBlobs {
     /// Sets `opts.blobs` when the resolver may need a separated value and `ssts` names blob
     /// files; returns the handle to check after each resolver step. It may need one for a
@@ -1436,10 +1447,11 @@ impl ScanCursor {
             let Some(meta) = view.catalog.family(family) else {
                 continue;
             };
-            let (mut opts, filter) =
+            let (mut opts, mut filter) =
                 self.spec
                     .read
                     .resolve_opts(meta, self.snapshot.seqno, self.now);
+            filter_stop(&mut filter, end);
             let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
             let mut resolver = take_scan_resolver();
             let filled = view.scan_sources_located::<CACHE_ONLY>(
@@ -2060,7 +2072,8 @@ fn read_row_with(
         let Some(meta) = view.catalog.family(family) else {
             continue;
         };
-        let (mut opts, filter) = spec.resolve_opts(meta, seqno, now);
+        let (mut opts, mut filter) = spec.resolve_opts(meta, seqno, now);
+        filter_stop(&mut filter, Some(&past));
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let cursor = resolver.cursor_mut();
         cursor.sources_mut().clear();

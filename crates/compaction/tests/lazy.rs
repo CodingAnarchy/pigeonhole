@@ -382,3 +382,51 @@ fn a_source_with_nothing_admissible_stops_at_the_merge_frontier() {
         }
     }
 }
+
+#[test]
+fn a_lone_filtered_source_stops_its_jumps_at_the_filters_stop() {
+    // #1924: one memtable source alone in the merge (`settle_until(None)`, or the eager
+    // settle): a row with no qualifier the filter keeps sends it jumping, by a seek to the
+    // hint (prefix `~`, after `q`) or a row skip (prefix `a`, before it), and without a
+    // stop each jump lands on the next row, through all 1000. With the read's upper bound as
+    // the filter's stop, it stops on the first key at or past it, where the read ends.
+    let rows: Entries = (0..1000u16)
+        .map(|i| {
+            let mut k = Vec::new();
+            encode_key(&mut k, &i.to_be_bytes(), b"q", 1, 1, Kind::Put).unwrap();
+            (k, vec![])
+        })
+        .collect();
+    let mut prefix = Vec::new();
+    pigeonhole_format::key::encode_row_prefix(&mut prefix, &0u16.to_be_bytes()).unwrap();
+    let mut past = prefix.clone();
+    *past.last_mut().unwrap() += 1;
+    for lazy in [true, false] {
+        for keep in [&b"~"[..], b"a"] {
+            for stop in [true, false] {
+                let mut filter = ScanFilter::all();
+                filter.qualifiers = QualifierFilter::Prefix(keep.to_vec());
+                filter.stop = stop.then(|| past.clone());
+                let (mut m, moves) = merge(std::slice::from_ref(&rows), &filter, lazy);
+                m.seek(&prefix).unwrap();
+                let what = format!("lazy {lazy}, prefix {keep:?}, stop {stop}");
+                assert!(!m.valid() || m.key() >= past.as_slice(), "{what}");
+                let moved = moves[0].get();
+                if stop {
+                    assert!(moved <= 4, "{what}: the source moved {moved} times");
+                } else {
+                    assert!(moved > 1000, "{what}: the source moved {moved} times");
+                }
+            }
+        }
+        // A prefix that keeps the row's column: its entry, stop or not.
+        for stop in [true, false] {
+            let mut filter = ScanFilter::all();
+            filter.qualifiers = QualifierFilter::Prefix(b"q".to_vec());
+            filter.stop = stop.then(|| past.clone());
+            let (mut m, _) = merge(std::slice::from_ref(&rows), &filter, lazy);
+            m.seek(&prefix).unwrap();
+            assert_eq!(at(&m), Some(rows[0].clone()), "lazy {lazy}, stop {stop}");
+        }
+    }
+}

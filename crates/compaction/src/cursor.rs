@@ -535,6 +535,8 @@ impl<C: Cursor> FilteredCursor<C> {
         }
     }
 
+    /// To the first admitted entry, or the first a jump lands on at or past the filter's
+    /// stop (#1924), as `SstIter` settles.
     fn settle_filtered(&mut self) -> Result<(), C::Error> {
         while self.inner.valid() {
             match self.filter.check(self.inner.key(), &mut self.hint) {
@@ -542,7 +544,13 @@ impl<C: Cursor> FilteredCursor<C> {
                 // Nothing later in this row can be admitted.
                 Verdict::SkipRow => self.inner.skip_row()?,
                 Verdict::Seek => self.inner.seek(&self.hint)?,
-                Verdict::Next => self.inner.next()?,
+                Verdict::Next => {
+                    self.inner.next()?;
+                    continue;
+                }
+            }
+            if self.inner.valid() && self.filter.past_stop(self.inner.key()) {
+                break;
             }
         }
         Ok(())
@@ -588,6 +596,12 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
                 Verdict::Next => self.inner.next()?,
             }
             if !self.inner.valid() {
+                break;
+            }
+            // A jump at or past the filter's stop (#1924) ends the read here: settled, so a
+            // lone source (`bound` `None`) doesn't seek on through the rest of its rows. Only
+            // jumps are tested, as in `SstIter`: a step (`Next`) moves one entry.
+            if verdict != Verdict::Next && self.filter.past_stop(self.inner.key()) {
                 break;
             }
             verdict = self.filter.check(self.inner.key(), &mut self.hint);

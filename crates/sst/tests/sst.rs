@@ -824,6 +824,73 @@ fn a_blob_writer_reserves_exactly_the_extents_an_append_adds() {
     }
 }
 
+// ---- a filtered read's jumps stop at its upper bound (#1924) ----
+
+#[test]
+fn a_filtered_reads_jumps_stop_at_its_upper_bound() {
+    // #1924: a row with no qualifier the filter keeps makes the cursor jump past it, by a
+    // seek to the filter's hint (a prefix after every qualifier: `~` after `q`) or a row skip
+    // (one before them: `a`). Without a stop the jump lands on the next row, which jumps
+    // again, through the rest of the file. With the read's upper bound as the filter's stop,
+    // the cursor stops on the first key at or past it, valid, where the reader ends: at most
+    // one block past its seek (the jump can land at the start of the next block), however
+    // many rows follow. A prefix that keeps the row's column reads it as before.
+    let (_vfs, r, want) = many_blocks(25);
+    let mut o = ReadOptions::default();
+    o.fill_cache = false;
+    let mut walked = 0;
+    for i in [0u32, 10, 400, 798, 799] {
+        let mut prefix = Vec::new();
+        pigeonhole_format::key::encode_row_prefix(&mut prefix, format!("row{i:05}").as_bytes())
+            .unwrap();
+        let mut past = prefix.clone();
+        *past.last_mut().unwrap() += 1;
+        let row_entries: Vec<(Vec<u8>, Vec<u8>)> = want
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let ((), seek_reads) = pigeonhole_sst::counting_file_reads(|| {
+            r.iter(ScanFilter::all(), o).seek(&prefix).unwrap();
+        });
+        let read = |keep: &[u8], stop: bool| {
+            let mut f = ScanFilter::all();
+            f.qualifiers = pigeonhole_format::scan::QualifierFilter::Prefix(keep.to_vec());
+            f.stop = stop.then(|| past.clone());
+            pigeonhole_sst::counting_file_reads(|| {
+                let mut it = r.iter(f, o);
+                it.seek(&prefix).unwrap();
+                let mut got = Vec::new();
+                while it.valid() && it.key() < past.as_slice() {
+                    got.push((it.key().to_vec(), it.value().to_vec()));
+                    it.next().unwrap();
+                }
+                // Stopped at or past the bound, or at the file's end: never short of it.
+                assert!(!it.valid() || it.key() >= past.as_slice(), "row {i}");
+                got
+            })
+        };
+        for keep in [&b"~"[..], b"a"] {
+            let (got, reads) = read(keep, true);
+            assert!(got.is_empty(), "row {i}, prefix {keep:?}");
+            assert!(
+                reads <= seek_reads + 1,
+                "row {i}, prefix {keep:?}: {reads} block reads past a seek of {seek_reads}"
+            );
+            let (got, unstopped) = read(keep, false);
+            assert!(got.is_empty(), "row {i}, prefix {keep:?}");
+            if unstopped > seek_reads + 1 {
+                walked += 1;
+            }
+        }
+        for stop in [true, false] {
+            assert_eq!(read(b"q", stop).0, row_entries, "row {i}, stop {stop}");
+        }
+    }
+    // Without the stop, the rows early in the file do walk it (the reason for the stop).
+    assert!(walked >= 4, "{walked}");
+}
+
 // ---- one-row reads stop at a row-end separator (ICR 0039) ----
 
 #[test]

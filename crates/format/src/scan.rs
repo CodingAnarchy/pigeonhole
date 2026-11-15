@@ -36,6 +36,15 @@ pub struct ScanFilter {
     pub qualifiers: QualifierFilter,
     /// Keep puts with `min <= ts < max`.
     pub time_range: Option<(Timestamp, Timestamp)>,
+    /// Where a filtered cursor's jumps end (#1924): an encoded key, exclusive, compared as
+    /// bytes, the read's own upper bound (its row's end for a row read, its end for a
+    /// bounded scan). A cursor that seeks to the filter's hint or skips a row and lands at or
+    /// past it stops there, valid but not admitted, rather than seeking on row by row
+    /// through the rest of its source: the read ends at that key as it would at an
+    /// unfiltered source's. `None` (an unbounded read) jumps on as before. Forward reads
+    /// only: no filtered cursor reads backwards. It admits nothing by itself, so
+    /// [`is_all`](Self::is_all) ignores it.
+    pub stop: Option<Vec<u8>>,
 }
 
 /// Qualifier selection.
@@ -164,6 +173,13 @@ impl CompiledFilter {
     #[inline]
     pub fn is_all(&self) -> bool {
         self.0.is_all()
+    }
+
+    /// Whether `key`, where a jump (a seek to the hint, a row skip) landed, is at or past
+    /// the filter's [`stop`](ScanFilter::stop): the cursor stops there (#1924).
+    #[inline]
+    pub fn past_stop(&self, key: &[u8]) -> bool {
+        self.0.stop.as_deref().is_some_and(|s| key >= s)
     }
 
     /// Where a qualifier stands relative to the selection: its escaped bytes compared with

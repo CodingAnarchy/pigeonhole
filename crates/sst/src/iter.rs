@@ -703,7 +703,10 @@ impl SstIter {
         r
     }
 
-    /// Advances to the first admitted entry at or after the current one.
+    /// Advances to the first admitted entry at or after the current one, or to the first
+    /// entry a jump lands on at or past the filter's stop (#1924): there the read ends, and
+    /// without the stop a row whose qualifiers the filter passes over would send the cursor
+    /// seeking row by row through the rest of the file.
     fn settle(&mut self) -> Result<()> {
         if self.filter_all {
             return Ok(());
@@ -711,17 +714,33 @@ impl SstIter {
         while let Some(data) = self.data.as_ref().filter(|d| d.valid()) {
             match self.filter.check(data.key(), &mut self.hint) {
                 Verdict::Admit => return Ok(()),
-                Verdict::SkipRow => self.skip_row_raw()?,
+                Verdict::SkipRow => {
+                    self.skip_row_raw()?;
+                    if self.past_stop() {
+                        return Ok(());
+                    }
+                }
                 Verdict::Seek => {
                     let hint = std::mem::take(&mut self.hint);
                     let r = self.seek_forward(&hint);
                     self.hint = hint;
                     r?;
+                    if self.past_stop() {
+                        return Ok(());
+                    }
                 }
                 Verdict::Next => self.next_raw()?,
             }
         }
         Ok(())
+    }
+
+    /// Whether the cursor stands at or past the filter's stop, after a jump.
+    #[inline]
+    fn past_stop(&self) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|d| d.valid() && self.filter.past_stop(d.key()))
     }
 
     /// Runs a move and settles; on error the cursor becomes invalid.
