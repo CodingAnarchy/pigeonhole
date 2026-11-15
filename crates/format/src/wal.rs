@@ -380,6 +380,18 @@ impl FrameEncoder {
     }
 }
 
+/// What [`FrameDecoder::decode_within`] found: what [`decode`](FrameDecoder::decode) would
+/// return, or that the next fragment reaches past the frame's fresh bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Within {
+    /// As [`FrameDecoder::decode`] returns, decided on fresh bytes only.
+    Decoded(Option<Decoded>),
+    /// The next fragment's header or payload reaches past the fresh bytes: call again, with
+    /// the same frame and more of it fresh. Nothing about that fragment was consumed or
+    /// decided.
+    More,
+}
+
 /// What the decoder found at a position.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decoded {
@@ -442,26 +454,48 @@ impl FrameDecoder {
     /// ends without a `Stop`, its data stops at the end of the last record (a record still
     /// being assembled is incomplete).
     pub fn decode(&mut self, frame: &[u8]) -> crate::Result<Option<Decoded>> {
+        match self.decode_within(frame, FRAME_SIZE)? {
+            Within::Decoded(d) => Ok(d),
+            Within::More => unreachable!("a whole frame is fresh"),
+        }
+    }
+
+    /// [`decode`](Self::decode) where only the frame's first `fresh` bytes may be trusted:
+    /// the rest may predate the writer (a feed cursor that re-read only the tail past where
+    /// it stopped, #1901). Nothing is decided on a byte at or past `fresh`. A fragment whose
+    /// header or payload reaches there returns [`Within::More`] with the decoder as it was
+    /// before that fragment, and a call with more of the frame fresh goes on from it. The
+    /// skipped frame tail (12 bytes or fewer) needs no fresh bytes. With `fresh` the whole
+    /// frame, this is `decode`.
+    pub fn decode_within(&mut self, frame: &[u8], fresh: usize) -> crate::Result<Within> {
         if frame.len() != FRAME_SIZE {
             return Err(Error::Corrupt {
                 what: "wal frame length",
             });
         }
         if self.stopped {
-            return Ok(Some(Decoded::Stop {
+            return Ok(Within::Decoded(Some(Decoded::Stop {
                 offset: self.record_end,
-            }));
+            })));
         }
         loop {
             let at = (self.pos - self.frame_start) as usize;
             if at + MIN_FRAGMENT_ROOM > FRAME_SIZE {
                 self.frame_start += FRAME_SIZE as u64;
                 self.pos = self.frame_start;
-                return Ok(None);
+                return Ok(Within::Decoded(None));
+            }
+            if at + FRAGMENT_HEADER_LEN > fresh {
+                return Ok(Within::More);
             }
             let h = &frame[at..at + FRAGMENT_HEADER_LEN];
             let len = usize::from(u16::from_le_bytes([h[8], h[9]]));
             let end = at + FRAGMENT_HEADER_LEN + len;
+            // The payload too, before anything that reads it is decided: a header of another
+            // epoch, or one running past the frame, is a stop on its own bytes.
+            if le_u32(h, 4) == self.epoch && end <= FRAME_SIZE && end > fresh {
+                return Ok(Within::More);
+            }
             let ty = h[10];
             let sequenced = match ty {
                 // A pad (D327) sits only between records, never inside one.
@@ -486,9 +520,9 @@ impl FrameDecoder {
             }
             if !sequenced || !intact {
                 self.stopped = true;
-                return Ok(Some(Decoded::Stop {
+                return Ok(Within::Decoded(Some(Decoded::Stop {
                     offset: self.record_end,
-                }));
+                })));
             }
             let start = self.pos;
             let payload = &frame[at + FRAGMENT_HEADER_LEN..end];
@@ -508,7 +542,7 @@ impl FrameDecoder {
                 self.partial.clear();
                 self.record_end = self.pos;
                 let offset = self.partial_start.take().unwrap_or(start);
-                return Ok(Some(Decoded::Record { offset }));
+                return Ok(Within::Decoded(Some(Decoded::Record { offset })));
             }
         }
     }

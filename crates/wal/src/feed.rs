@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pigeonhole_format::wal::{Decoded, FRAME_SIZE, FrameDecoder, FrameEncoder, WalRecord};
+use pigeonhole_format::wal::{Decoded, FRAME_SIZE, FrameDecoder, FrameEncoder, WalRecord, Within};
 use pigeonhole_format::{Lsn, StreamId};
 use pigeonhole_io::{FileRef, OpenOptions, VfsRef};
 
@@ -15,6 +15,13 @@ use crate::{FeedMarks, Result, stream_path};
 
 /// Frames read from the file at a time.
 const CHUNK_FRAMES: u64 = 32;
+
+/// A resume's first tail read (#1901) reaches at least this far past where the cursor
+/// stopped... These two only size that read: what's trusted is `fresh_end`, and a fragment
+/// past it is read before it's decided (`Within::More`).
+const TAIL_MIN: u64 = 512;
+/// ...to the next multiple of this (a page), so a record of a typical commit is read in one.
+const TAIL_PAGE: u64 = 4096;
 
 /// What [`FeedCursor::step`] found.
 #[derive(Debug)]
@@ -134,6 +141,12 @@ pub struct FeedCursor {
     chunk_slot: usize,
     /// Segment offset of `chunk[0]`.
     chunk_start: u64,
+    /// Segment offset below which `chunk`'s bytes are known current. A resume re-reads only
+    /// past it (#1901): bytes a cursor already decoded don't change while their segment is
+    /// in the file, and a frame's bytes past it may predate the writer.
+    fresh_end: u64,
+    /// The next tail read after a resume is a small window, not the rest of the frame.
+    tail_window: bool,
     /// A stop short of its successor's recorded end, deferred once (#1370): `(epoch, stop)`.
     deferred: Option<(u32, u64)>,
 }
@@ -189,6 +202,8 @@ impl FeedCursor {
             chunk: Vec::new(),
             chunk_slot: usize::MAX,
             chunk_start: 0,
+            fresh_end: 0,
+            tail_window: false,
             deferred: None,
         };
         this.cur = this.place(at);
@@ -294,7 +309,15 @@ impl FeedCursor {
         let have = self.chunk_slot == slot
             && frame >= self.chunk_start
             && frame + FRAME <= self.chunk_start + self.chunk.len() as u64;
-        if have {
+        // Cached: decoded from as far as `fresh_end`, and the decoder asks (`Within::More`)
+        // when a fragment reaches past it. A resume's frame (#1901) is current up to where the
+        // cursor stopped, so its first load reads only a window past that: to the next 4 KiB
+        // page, at least 512 bytes on.
+        if have && self.fresh_end >= frame {
+            if std::mem::take(&mut self.tail_window) {
+                let window = (self.fresh_end + TAIL_MIN).next_multiple_of(TAIL_PAGE);
+                return self.read_tail(slot, window.min(frame + FRAME));
+            }
             return Ok(());
         }
         let segment_size = self.segment_size();
@@ -313,6 +336,24 @@ impl FeedCursor {
         }
         self.chunk_slot = slot;
         self.chunk_start = frame;
+        self.fresh_end = frame + len as u64;
+        Ok(())
+    }
+
+    /// Reads `chunk`'s current frame from `fresh_end` to `to` (both in it), making them fresh.
+    fn read_tail(&mut self, slot: usize, to: u64) -> Result<()> {
+        let from = self.fresh_end;
+        if to > from {
+            let at = (from - self.chunk_start) as usize;
+            let len = (to - from) as usize;
+            let pos = slot as u64 * self.segment_size() + from;
+            self.file.read_at(&mut self.chunk[at..at + len], pos)?;
+            #[cfg(test)]
+            {
+                self.reads.1 += len as u64;
+            }
+            self.fresh_end = to;
+        }
         Ok(())
     }
 
@@ -328,8 +369,6 @@ impl FeedCursor {
         {
             self.reads.0 += 1;
         }
-        // Cached frames may predate a rewrite of the slot.
-        self.chunk_slot = usize::MAX;
         self.short_load = true;
         let here = self
             .grid
@@ -337,8 +376,12 @@ impl FeedCursor {
             .and_then(|g| g.headers.get(slot).copied().flatten())
             .is_some_and(|h| h.epoch == epoch);
         if !here {
+            // Cached frames may predate a rewrite of the slot.
+            self.chunk_slot = usize::MAX;
             self.cur = None;
         }
+        // Still here: the cached frames are this segment's, current up to `fresh_end`, which
+        // a resume keeps (#1901).
         Ok(here)
     }
 
@@ -401,8 +444,22 @@ impl FeedCursor {
             // carry another epoch and read as a stop, which reads them (below), and a
             // successor is looked for at the stop too.
             self.stopped = false;
-            self.chunk_slot = usize::MAX;
-            self.short_load = true;
+            // Its bytes up to where the cursor stopped are kept (#1901): only the tail is read
+            // again. Without the frame cached, the frame is read whole, as before.
+            match &self.cur {
+                Some(cur)
+                    if self.chunk_slot == cur.slot
+                        && cur.frame >= self.chunk_start
+                        && cur.frame + FRAME <= self.chunk_start + self.chunk.len() as u64 =>
+                {
+                    self.fresh_end = self.fresh_end.min(cur.last_end).max(cur.frame);
+                    self.tail_window = true;
+                }
+                _ => {
+                    self.chunk_slot = usize::MAX;
+                    self.short_load = true;
+                }
+            }
         }
         loop {
             let Some(cur) = &self.cur else {
@@ -425,8 +482,18 @@ impl FeedCursor {
                 self.load(slot, frame)?;
                 let at = (frame - self.chunk_start) as usize;
                 let bytes = &self.chunk[at..at + FRAME_SIZE];
+                let fresh = (self.fresh_end.saturating_sub(frame) as usize).min(FRAME_SIZE);
                 let cur = self.cur.as_mut().expect("checked above");
-                match cur.dec.decode(bytes)? {
+                let decoded = match cur.dec.decode_within(bytes, fresh)? {
+                    Within::Decoded(d) => d,
+                    // A fragment reaches past what was read again: the rest of the frame.
+                    Within::More => {
+                        self.read_tail(slot, frame + FRAME)?;
+                        continue;
+                    }
+                };
+                let cur = self.cur.as_mut().expect("checked above");
+                match decoded {
                     Some(Decoded::Record { offset }) if cut.is_some_and(|c| offset >= c) => {
                         // A frame past the cut (above): never delivered.
                         self.cur = None;
@@ -472,7 +539,10 @@ impl FeedCursor {
                 }
                 Chained::No => {}
             }
-            // Not moved: resume just past the last complete record next time.
+            // Not moved: resume just past the last complete record next time. Every re-decode of
+            // this segment after a stop comes back through `stopped`'s resume, which trusts the
+            // cached frame only below `last_end` (#1901), so a deferred stop's second look
+            // (#1370) reads the gap fresh rather than stopping again on bytes read before it.
             let cur = self.cur.as_mut().expect("refresh kept it");
             cur.dec = FrameDecoder::new(epoch, cur.last_end);
             cur.frame = cur.last_end - cur.last_end % FRAME;
@@ -645,10 +715,12 @@ mod read_tests {
     }
 
     /// D310 PR 5b (the subscriber cost on the AX102): a stop reads the segment headers once,
-    /// not on resuming and again at the stop, and a resume reads one frame, not a 1 MiB
-    /// chunk. Without the writer's marks (a reader process) every stop reads the headers.
+    /// not on resuming and again at the stop. A resume reads only past where it stopped, a
+    /// window to the next 4 KiB page at least 512 bytes on (#1901: it was the whole 32 KiB
+    /// frame, half of a hub thread in g111), not a frame or a 1 MiB chunk. Without the
+    /// writer's marks (a reader process) every stop reads the headers.
     #[test]
-    fn a_stop_reads_the_headers_once_and_a_resume_one_frame() {
+    fn a_stop_reads_the_headers_once_and_a_resume_only_the_tail() {
         let vfs: VfsRef = SimVfs::new(5);
         let mut wal = stream(&vfs, 64);
         append(&mut wal, 1, 8);
@@ -658,7 +730,11 @@ mod read_tests {
             let before = c.reads;
             assert!(drain(&mut c).is_empty());
             assert_eq!(c.reads.0 - before.0, 1, "one header read per idle stop");
-            assert_eq!(c.reads.1 - before.1, FRAME, "one frame per resume");
+            let tail = c.reads.1 - before.1;
+            assert!(
+                (TAIL_MIN..=TAIL_MIN + TAIL_PAGE).contains(&tail),
+                "a resume read {tail} bytes: one tail window, not a frame"
+            );
         }
         for s in 2..=4 {
             append(&mut wal, s, 8);
@@ -669,6 +745,40 @@ mod read_tests {
             c.reads.0 - before.0,
             1,
             "one header read at the stop after records"
+        );
+    }
+
+    /// #1901: a record that runs past a resume's tail window is read whole: the decoder asks
+    /// for more rather than stopping on the cached bytes past the window (zeros when they were
+    /// read, the record now), and the rest of the frame is read once. A small record after it
+    /// costs one window again.
+    #[test]
+    fn a_resume_reads_a_record_past_its_tail_window_whole() {
+        let vfs: VfsRef = SimVfs::new(9);
+        let mut wal = stream(&vfs, 64);
+        append(&mut wal, 1, 8);
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        assert_eq!(drain(&mut c), [1]);
+        // Cached past the stop: the frame as it was, zeros after record 1.
+        assert!(drain(&mut c).is_empty());
+        // A record of 12 KB starts right where the cursor stopped: past any window.
+        append(&mut wal, 2, 12_000);
+        let before = c.reads;
+        assert_eq!(drain(&mut c), [2], "read whole, not stopped at the window");
+        let read = c.reads.1 - before.1;
+        assert!(
+            read > TAIL_PAGE && read <= FRAME,
+            "the window, then the rest of the frame once: {read} bytes"
+        );
+        append(&mut wal, 3, 8);
+        let before = c.reads;
+        assert_eq!(drain(&mut c), [3]);
+        let n = c.reads.1 - before.1;
+        assert!(
+            n <= TAIL_MIN + TAIL_PAGE,
+            "one window for a small record: {n} bytes, {} header reads, at {:?}",
+            c.reads.0 - before.0,
+            c.position()
         );
     }
 
