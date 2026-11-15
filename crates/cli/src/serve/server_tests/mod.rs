@@ -455,6 +455,11 @@ fn put(row: &str, family: &str, qualifier: &str, value: Json) -> Json {
 
 /// Rows `r00`..`r29` with three 400-byte cells each, and `x1` outside the `r` prefix.
 fn seed_rows(s: &Server, c: &mut DataClient<tonic::transport::Channel>) {
+    seed_rows_in(s, c, "t");
+}
+
+/// [`seed_rows`], into `table`.
+fn seed_rows_in(s: &Server, c: &mut DataClient<tonic::transport::Channel>, table: &str) {
     let mut rows: Vec<String> = (0..30).map(|i| format!("r{i:02}")).collect();
     rows.push("x1".into());
     for row in rows {
@@ -473,7 +478,7 @@ fn seed_rows(s: &Server, c: &mut DataClient<tonic::transport::Channel>) {
         s.block_on(c.mutate(proto::MutateRequest {
             writes: Some(proto::RowWrites {
                 row: Some(proto::RowKey {
-                    table: "t".into(),
+                    table: table.into(),
                     row: row.into_bytes().into(),
                 }),
                 writes,
