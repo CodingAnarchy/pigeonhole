@@ -60,7 +60,18 @@ pub enum FragmentType {
     Middle = 3,
     /// The last piece.
     Last = 4,
+    /// Padding (D327, FORMAT §10.2): zeros the decoder steps over, written only directly
+    /// before a record's first fragment, in the same write, so a stream's next group starts
+    /// on a fresh page while a sync holds the page before it (#1708). Its payload is zeros,
+    /// covered by the CRC like any fragment's. Needs [`INCOMPAT_WAL_PAD`].
+    Pad = 5,
 }
+
+/// Superblock `incompat` bit 1 (D327): the database's WAL may hold [`FragmentType::Pad`]
+/// fragments, which a build without D327 would refuse mid-replay. Set in both superblock
+/// pages before the first segment that may hold one is written, and never cleared: retained
+/// feed segments (D310) can keep pads long after a checkpoint.
+pub const INCOMPAT_WAL_PAD: u64 = 1 << 1;
 
 /// The header in frame 0 of every segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +220,9 @@ const V3_CRC_AT: usize = 56;
 /// fragment except an empty record's carries payload. Shorter frame tails are skipped.
 const MIN_FRAGMENT_ROOM: usize = FRAGMENT_HEADER_LEN + 1;
 
+/// The smallest unit [`FrameEncoder::pad`] aligns to: room for a pad's header twice over.
+const MIN_PAD_UNIT: usize = 32;
+
 /// Bytes left in the frame at segment offset `pos`.
 fn frame_room(pos: u64) -> usize {
     FRAME_SIZE - (pos % FRAME_SIZE as u64) as usize
@@ -290,6 +304,57 @@ impl FrameEncoder {
                 return self.pos;
             }
         }
+    }
+
+    /// Bytes [`pad`](Self::pad) would append to start the next record at a multiple of `unit`
+    /// (0 when it already would). See [`pad`](Self::pad) for `unit`'s bounds.
+    pub fn pad_len(&self, unit: usize) -> usize {
+        assert!(
+            unit.is_power_of_two() && (MIN_PAD_UNIT..=FRAME_SIZE).contains(&unit),
+            "a pad unit is a power of two from {MIN_PAD_UNIT} to a frame, not {unit}"
+        );
+        let room = frame_room(self.pos);
+        // A frame tail too short for a fragment: the next record starts the next frame,
+        // which is aligned already.
+        if room < MIN_FRAGMENT_ROOM {
+            return 0;
+        }
+        let gap = match (self.pos % unit as u64) as usize {
+            0 => return 0,
+            r => unit - r,
+        };
+        // A pad needs its header: a gap too short for one pads to the boundary after. `unit`
+        // divides a frame, so a boundary short of the frame's end has a whole unit after it.
+        if gap < FRAGMENT_HEADER_LEN {
+            gap + unit
+        } else {
+            gap
+        }
+    }
+
+    /// Appends a [`FragmentType::Pad`] fragment (D327) so the next record starts at a multiple
+    /// of `unit` bytes of the segment, and returns the bytes appended (0 when it already
+    /// would). `unit` is a power of two from 32 bytes to a frame, so a pad never crosses a
+    /// frame. Call it only directly before encoding a record into the same buffer: a pad is
+    /// never the last thing written, so the segment's stop offset and `prev_end` stay the end
+    /// of the last record (FORMAT §10.2).
+    pub fn pad(&mut self, unit: usize, out: &mut Vec<u8>) -> usize {
+        let n = self.pad_len(unit);
+        if n == 0 {
+            return 0;
+        }
+        let payload = n - FRAGMENT_HEADER_LEN;
+        let mut header = [0u8; FRAGMENT_HEADER_LEN];
+        header[4..8].copy_from_slice(&self.epoch.to_le_bytes());
+        header[8..10].copy_from_slice(&(payload as u16).to_le_bytes());
+        header[10] = FragmentType::Pad as u8;
+        let at = out.len();
+        out.extend_from_slice(&header);
+        out.resize(at + n, 0);
+        let crc = crate::checksum::crc32c(&out[at + 4..]);
+        out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+        self.pos += n as u64;
+        n
     }
 
     /// Bytes that encoding a record of `len` bytes would append (for segment-full checks).
@@ -396,7 +461,8 @@ impl FrameDecoder {
             let end = at + FRAGMENT_HEADER_LEN + len;
             let ty = h[10];
             let sequenced = match ty {
-                1 | 2 => self.partial_start.is_none(),
+                // A pad (D327) sits only between records, never inside one.
+                1 | 2 | 5 => self.partial_start.is_none(),
                 3 | 4 => self.partial_start.is_some(),
                 _ => false,
             };
@@ -409,7 +475,7 @@ impl FrameDecoder {
             // A fragment of this segment's epoch whose CRC passes is real data, not a torn
             // tail: a type this build does not know means a newer build wrote it (#496).
             // Zeroed and recycled frames fail the epoch or the CRC and stay a stop.
-            if intact && !(1..=4).contains(&ty) {
+            if intact && !(1..=5).contains(&ty) {
                 return Err(Error::UnsupportedFeature {
                     what: "wal fragment type",
                     value: u64::from(ty),
@@ -424,6 +490,11 @@ impl FrameDecoder {
             let start = self.pos;
             let payload = &frame[at + FRAGMENT_HEADER_LEN..end];
             self.pos += (FRAGMENT_HEADER_LEN + len) as u64;
+            // A pad is stepped over: the stop offset stays the end of the last record, so a
+            // pad whose record was torn off is not counted as data.
+            if ty == FragmentType::Pad as u8 {
+                continue;
+            }
             if ty == FragmentType::First as u8 || ty == FragmentType::Full as u8 {
                 self.partial.clear();
                 self.partial_start = Some(start);

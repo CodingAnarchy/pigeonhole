@@ -4847,3 +4847,26 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - *A 1.1.x patch marking catalog-changing roots.* 1.1.3 is already shipped, and a rollback to it is what this decision has to survive.
 
 **Owner's approval (2026-11-13).** Yes to the version 3 layout in 1.3.0, with the upgrade note saying a 1.3 every-table token is `InvalidArgument` on 1.2.0. 1.2.1 ships #1857, plus the parse of version 3 once its layout is settled on main.
+
+<a id="d327"></a>
+## D327 — WAL pad fragments: at GroupSync, the next group starts on a fresh page while a sync holds the tail (perf2, design; owner, 2026-11-14; wal, format, engine, #1708, #1621, ICR 0137) · D324
+
+**Problem (#1621's residue after #1681, #1708).** At GroupSync a group's buffered `pwrite` ends partway into a page. The group's `fdatasync`, on an io_uring worker, locks that page's folio while it submits the page's writeback into a deep queue. The next group's `pwrite` starts in the same page, so it waits in `iomap_write_begin → folio_wait_bit_common` until that submit returns. g69 counted 104/94 driver pwrites ≥ 5 ms, mostly in a sustained session's tail. D324 removed the waits with direct writes but cost more than it saved, and was not shipped.
+
+**Decision.** Stay buffered, and never append into a page a sync of this stream is writing back. While such a sync is in flight and the append position is partway into an alignment unit U, the writer puts a **Pad fragment** before the next record, in the same write, so the record starts on the next multiple of U. Nothing else changes: visibility stays at `pwrite` return (D227), durability at sync completion, and the group-commit order and LSN arithmetic as they are.
+
+**Format** (FORMAT §10.2, §8.2):
+- **Fragment type 5, Pad.** A fragment header like any other (CRC, the segment's epoch, `len`), with `len` zero bytes of payload under the CRC. It sits only between records: written only directly before a record's first fragment, in the same buffer, so it is never the last thing written. U is a power of two from 32 bytes to a frame, so a pad never crosses a frame and its `len` fits.
+- **Replay steps over it** and leaves the stop offset where it was. The stop stays the end of the last complete record, so `prev_end`, and rules 1 and 2 of §10.1, don't change. A torn pad, or an intact pad whose record is torn, stops where the record before it ended, the same answer as any torn tail. A pad inside a First…Last sequence is out of sequence and stops the data.
+- **`incompat` bit 1, sticky.** Set in both superblock pages at the first open that enables padding, before any WAL write; never cleared, because retained feed segments (D310) keep pads long after a checkpoint. A build without D327 refuses the file at open, and refuses an intact type 5 fragment anyway (#496). The segment header's `features` field isn't used: the superblock bit refuses the database before any segment is read.
+
+**Rejected** (the design note's §2.2):
+- *A record replay ignores, such as an empty Batch.* It burns a seqno (D26), and every older build's replay and feed would have to be proved to treat it as a no-op.
+- *A replay rule that skips zeros to the next boundary.* It changes what a torn tail means for every segment, and an older build would read the gap as the end of the log, dropping data silently.
+
+**Delivery, in order:**
+1. **The format and replay** (this record's first PR): the fragment type, the decoder, `FrameEncoder::pad`, the known bit, and `phdb check`'s scan for records after a stop stepping over pads. Nothing writes a pad yet.
+2. **The writer, behind an option** (ICR 0137, off by default): pads only at GroupSync and Sync streams with a sync of the stream in flight over the tail, at most one pad per sync; the open that enables it sets the bit. Its crash tests (a torn pad, a pad's page lost but the record's kept, a pad never last before a rollover) come with it.
+3. **A box A/B on g69's session** (perf287), which decides the default and U (measured from the waited folios' order on xfs; a frame if that is unclear).
+
+**Acceptance (owner, 2026-11-14).** WAL bytes at most 1.2× on g69's session and the ycsb rows; `Buffered` unchanged; and the A/B shows the tail-page waits gone.
