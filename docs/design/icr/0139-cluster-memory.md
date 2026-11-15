@@ -101,7 +101,8 @@ Design: `.coord/ai1249-1915-pr3-mcp.md`, reviewed by simp724 (`.coord/simp724-re
 - **Mixed versions** (simp724's point; the coordinator's call):
   - A node built before `qualifiers` ignores field 10 and ranks every qualifier.
   - So a cluster nearest search with `qualifiers` asks each node that holds a part of it for its features. Answers are cached on the entry node for 30 s per peer.
-  - It is refused with `FailedPrecondition`, naming each node that lacks `nearest_qualifiers` or doesn't answer. A silent short result would be worse.
+  - It is refused with `FailedPrecondition`, naming each node that answers without `nearest_qualifiers`. A silent short result would be worse.
+  - A node that doesn't answer is unavailable, not an older build (the coordinator's call on simp724's question): with `allow_partial` its parts are skipped and named in `missing`, otherwise `PartitionUnavailable`. Its no-answer is cached for 5 s, so searches while it's down don't each wait a push timeout.
   - The entry node also applies the selection to every part's answer again. That covers a peer whose build changed within the cache: never a neighbour at another qualifier.
 
 **`--mcp-blocking` (default 8; the coordinator's routine call, 2026-11-15):**

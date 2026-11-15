@@ -3553,6 +3553,18 @@ impl QualifierVectors {
         }
     }
 
+    /// Cuts node `i` off from its peers both ways, or joins it again (`CUT_OFF`).
+    fn cut(&self, i: usize, off: bool) {
+        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
+        let mut cut = super::CUT_OFF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cut.retain(|e| *e != entry);
+        if off {
+            cut.push(entry);
+        }
+    }
+
     /// The oracle's ranking of [`Self::QUERY`]'s `k` nearest under `select`.
     fn want(
         &self,
@@ -3576,6 +3588,19 @@ impl QualifierVectors {
         k: u32,
         qualifiers: Option<super::proto::QualifierSelection>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>, f64)>, tonic::Status> {
+        self.nearest_partial(n, k, qualifiers, false)
+            .map(|(found, _)| found)
+    }
+
+    /// [`Self::nearest`] with `allow_partial`, and the partitions it names as missing.
+    #[allow(clippy::type_complexity)]
+    fn nearest_partial(
+        &self,
+        n: usize,
+        k: u32,
+        qualifiers: Option<super::proto::QualifierSelection>,
+        allow_partial: bool,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>, f64)>, Vec<String>), tonic::Status> {
         use super::proto::{NearestRequest, Vector};
         self.rt.block_on(async {
             let channel = tonic::transport::Endpoint::from_shared(format!(
@@ -3597,15 +3622,18 @@ impl QualifierVectors {
                     }),
                     k,
                     qualifiers,
+                    allow_partial,
                     ..Default::default()
                 })
                 .await?
                 .into_inner();
-            Ok(got
-                .neighbours
-                .iter()
-                .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
-                .collect())
+            Ok((
+                got.neighbours
+                    .iter()
+                    .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
+                    .collect(),
+                got.missing.iter().map(|m| m.partition.clone()).collect(),
+            ))
         })
     }
 }
@@ -3715,6 +3743,43 @@ fn a_nearest_with_qualifiers_is_refused_while_a_node_runs_an_older_build() {
             "via node {n}"
         );
     }
+}
+
+/// A node that doesn't answer the features check is unavailable, not an older build (the
+/// coordinator's call on #1915 PR 3): with `allow_partial` its partition is skipped and named
+/// in `missing`, the rest answered exactly; without, `PartitionUnavailable`.
+/// Its no-answer is cached, so the next search doesn't ask again: rejoined within the cache,
+/// its partition is still skipped.
+#[test]
+fn a_nearest_with_qualifiers_skips_a_node_that_doesnt_answer() {
+    use super::proto::QualifierSelection;
+    let c = QualifierVectors::start(&[]);
+    let x = QualifierSelection {
+        prefix: b"x".to_vec().into(),
+        ..Default::default()
+    };
+    c.cut(1, true);
+    for n in [0, 2] {
+        let e = c.nearest(n, 12, Some(x.clone())).unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "via node {n}: {e:?}");
+        let (found, missing) = c.nearest_partial(n, 100, Some(x.clone()), true).unwrap();
+        assert_eq!(missing, ["p2"], "via node {n}");
+        assert!(
+            !found.is_empty() && found.iter().all(|(_, q, _)| q == b"x"),
+            "via node {n}: {found:?}"
+        );
+        // The oracle's, without p2's rows ([g, m) in `three_way`).
+        let want: Vec<_> = c
+            .want(100, |s| s.qualifier_prefix(b"x"))
+            .into_iter()
+            .filter(|(row, _, _)| !(&b"g"[..]..&b"m"[..]).contains(&row.as_slice()))
+            .collect();
+        assert_eq!(found, want, "via node {n}");
+    }
+    // Rejoined: node 0's no-answer is still cached, so its search still skips p2.
+    c.cut(1, false);
+    let (_, missing) = c.nearest_partial(0, 100, Some(x.clone()), true).unwrap();
+    assert_eq!(missing, ["p2"]);
 }
 
 /// A node whose parts ignore `qualifiers` though it reported the feature (a build changed
