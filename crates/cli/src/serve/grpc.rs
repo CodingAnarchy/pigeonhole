@@ -529,10 +529,10 @@ impl proto::transactions_server::Transactions for TxnGrpc {
 
 /// `Feed` over gRPC (D313 R2): the fan-out's events, an error as the stream's final status.
 ///
-/// Routed by hand rather than through the generated `FeedServer`, for its codec: a ring entry
-/// sent to every client with no prefix is written as the bytes it was encoded to once, not
-/// built and encoded again per subscriber (perf287's profile on #1536). The wire format is
-/// the generated one; `Feed` has the one RPC.
+/// Routed by hand ([`EventsGrpc`]) rather than through the generated `FeedServer`, for its
+/// codec: a ring entry sent to every client with no prefix is written as the bytes it was
+/// encoded to once, not built and encoded again per subscriber (perf287's profile on
+/// #1536). The wire format is the generated one; `Feed` has the one RPC.
 #[derive(Debug, Clone)]
 pub(crate) struct FeedGrpc {
     pub(crate) shared: Arc<Shared>,
@@ -552,15 +552,16 @@ impl Stream for GrpcEvents {
     }
 }
 
-/// `Feed.Subscribe`'s codec: requests are decoded as the generated codec does, and events
-/// written by [`Out::encode`].
-struct FeedCodec;
+/// A feed stream's codec, for `Feed.Subscribe` and a cluster's `ForwardSubscribe`: a
+/// request `R` is decoded as the generated codec does, and events are written by
+/// [`Out::encode`].
+struct OutCodec<R>(std::marker::PhantomData<fn() -> R>);
 
-impl tonic::codec::Codec for FeedCodec {
+impl<R: prost::Message + Default + Send + 'static> tonic::codec::Codec for OutCodec<R> {
     type Encode = Out;
-    type Decode = proto::SubscribeRequest;
+    type Decode = R;
     type Encoder = OutEncoder;
-    type Decoder = tonic_prost::ProstDecoder<proto::SubscribeRequest>;
+    type Decoder = tonic_prost::ProstDecoder<R>;
 
     fn encoder(&mut self) -> Self::Encoder {
         OutEncoder
@@ -571,7 +572,7 @@ impl tonic::codec::Codec for FeedCodec {
     }
 }
 
-pub(crate) struct OutEncoder;
+struct OutEncoder;
 
 impl tonic::codec::Encoder for OutEncoder {
     type Item = Out;
@@ -584,26 +585,47 @@ impl tonic::codec::Encoder for OutEncoder {
     }
 }
 
-struct SubscribeSvc(Arc<Shared>);
+/// What answers a feed RPC routed by hand ([`EventsGrpc`]): `Feed.Subscribe`, and a cluster
+/// node's `ForwardSubscribe`.
+pub(crate) trait Events: Clone + Send + 'static {
+    type Request: prost::Message + Default + Send + 'static;
 
-impl tonic::server::ServerStreamingService<proto::SubscribeRequest> for SubscribeSvc {
+    /// The longest request it decodes.
+    fn max_request_bytes(&self) -> usize;
+
+    /// Its answer to a request for `path` it doesn't serve; `None` for one it does. A
+    /// service mounted on its one method's path serves whatever reaches it.
+    fn refuses(_path: &str) -> Option<Status> {
+        None
+    }
+
+    /// The request's events.
+    fn events(
+        self,
+        req: Request<Self::Request>,
+    ) -> tonic::codegen::BoxFuture<Response<GrpcEvents>, Status>;
+}
+
+/// One server-streaming feed RPC over gRPC, routed by hand for its codec ([`OutCodec`]):
+/// the shell around an [`Events`].
+#[derive(Debug, Clone)]
+pub(crate) struct EventsGrpc<E>(pub(crate) E);
+
+struct EventsSvc<E>(E);
+
+impl<E: Events> tonic::server::ServerStreamingService<E::Request> for EventsSvc<E> {
     type Response = Out;
     type ResponseStream = GrpcEvents;
     type Future = tonic::codegen::BoxFuture<Response<GrpcEvents>, Status>;
 
-    fn call(&mut self, req: Request<proto::SubscribeRequest>) -> Self::Future {
-        let shared = Arc::clone(&self.0);
-        Box::pin(async move {
-            match call(&shared, req, ServiceOp::Subscribe).await? {
-                ServiceReply::Feed(events) => Ok(Response::new(GrpcEvents(events))),
-                _ => Err(unexpected()),
-            }
-        })
+    fn call(&mut self, req: Request<E::Request>) -> Self::Future {
+        self.0.clone().events(req)
     }
 }
 
-impl<B> tower::Service<http::Request<B>> for FeedGrpc
+impl<E, B> tower::Service<http::Request<B>> for EventsGrpc<E>
 where
+    E: Events,
     B: tonic::codegen::Body + Send + 'static,
     B::Error: Into<tonic::codegen::StdError> + Send + 'static,
 {
@@ -616,22 +638,45 @@ where
     }
 
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
-        if req.uri().path() != "/pigeonhole.v1.Feed/Subscribe" {
-            return Box::pin(async {
-                Ok(Status::unimplemented("no such method in pigeonhole.v1.Feed").into_http())
-            });
+        if let Some(refused) = E::refuses(req.uri().path()) {
+            return Box::pin(async move { Ok(refused.into_http()) });
         }
-        let svc = SubscribeSvc(Arc::clone(&self.shared));
-        let max = self.max_request_bytes;
+        let events = self.0.clone();
         Box::pin(async move {
-            let mut grpc = tonic::server::Grpc::new(FeedCodec)
-                .apply_max_message_size_config(Some(max), Some(usize::MAX));
-            Ok(grpc.server_streaming(svc, req).await)
+            let codec = OutCodec::<E::Request>(std::marker::PhantomData);
+            let mut grpc = tonic::server::Grpc::new(codec)
+                .apply_max_message_size_config(Some(events.max_request_bytes()), Some(usize::MAX));
+            Ok(grpc.server_streaming(EventsSvc(events), req).await)
         })
     }
 }
 
-impl tonic::server::NamedService for FeedGrpc {
+impl Events for FeedGrpc {
+    type Request = proto::SubscribeRequest;
+
+    fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
+
+    fn refuses(path: &str) -> Option<Status> {
+        (path != "/pigeonhole.v1.Feed/Subscribe")
+            .then(|| Status::unimplemented("no such method in pigeonhole.v1.Feed"))
+    }
+
+    fn events(
+        self,
+        req: Request<proto::SubscribeRequest>,
+    ) -> tonic::codegen::BoxFuture<Response<GrpcEvents>, Status> {
+        Box::pin(async move {
+            match call(&self.shared, req, ServiceOp::Subscribe).await? {
+                ServiceReply::Feed(events) => Ok(Response::new(GrpcEvents(events))),
+                _ => Err(unexpected()),
+            }
+        })
+    }
+}
+
+impl tonic::server::NamedService for EventsGrpc<FeedGrpc> {
     const NAME: &'static str = proto::feed_server::SERVICE_NAME;
 }
 
