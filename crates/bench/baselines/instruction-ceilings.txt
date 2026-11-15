@@ -443,8 +443,14 @@ commit-if-returning-async 29264 0.3
 # +14 a commit (+0.2%) on x86 only, from codegen in the feed reader's poll (a scratch A/B by
 # function; the arm VM measured -7). A reader that falls behind now drains in time linear in
 # its backlog. feed-drain-all (6172) stays under its ceiling.
-feed-drain 6176 0.3
-feed-drain-all 6177 0.3
+# Raised by D195 for #1935 (#1901 stage 1: a resumed feed cursor re-reads only the tail past where
+# it stopped, not its whole 32 KiB frame; the coordinator's standing approval, 2026-11-15): CI's
+# head counts on 7f863d3be (main 260658503, with #1941; run 43741465605) times 1.003.
+# feed-drain 6159 -> 6174 (+0.24%), feed-drain-all 6174 -> 6189 (+0.24%): +15 a commit, the
+# decoder's fresh-bytes bound and the cursor's fresh end, after a cut from +34 (one compare per
+# fragment on a fresh frame). The re-read was 47.5% of each hub thread (g111).
+feed-drain 6193 0.3
+feed-drain-all 6208 0.3
 replicate-apply 6764 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
