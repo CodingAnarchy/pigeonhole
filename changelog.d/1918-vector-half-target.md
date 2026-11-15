@@ -1,0 +1,2 @@
+### Fixed
+- **A new `f16` or `bf16` vector index sizes its lists for two bytes a dimension** (#1882). The target list length is scaled down so a list at its split length fits a 4 MiB row, but half-precision vectors were counted at one byte a dimension, so above about 1,000 dimensions their lists could grow to 8 MiB rows before splitting. An index keeps the options it was created with, so an existing half-precision index is unchanged; its larger rows cost larger reads, not errors.
