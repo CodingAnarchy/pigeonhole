@@ -665,3 +665,101 @@ fn mark_used_and_forget_across_partitions_split_and_sum() {
     assert_eq!(namespaces_in(&p1), Vec::<String>::new());
     assert_eq!(namespaces_in(&p2), Vec::<String>::new());
 }
+
+#[test]
+fn a_split_memory_write_names_what_applied_and_says_when_a_part_may_have() {
+    // a serves p1 and c routes; p2's node b is a closed port (nothing sent: the part
+    // failed), then a listener that takes connections and never answers (sent, no answer:
+    // the part may have applied). Either way the call names the partition that applied.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for silent in [false, true] {
+        let listeners: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+        let mut map = the_map(1, &ports);
+        map.partitions.retain(|p| p.id != "p3");
+        map.memory = Some(placement());
+        let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+        for dir in &dirs {
+            super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        }
+        let mut it = listeners.into_iter();
+        let (la, lb, lc) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        // b: closed, or silent (its accepted sockets held open, unread).
+        let _held = if silent {
+            Some(std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for s in lb.incoming() {
+                    held.push(s);
+                }
+            }))
+        } else {
+            drop(lb);
+            None
+        };
+        let mut limits = crate::serve::server_tests::limits();
+        limits.request_timeout = std::time::Duration::from_millis(800);
+        let start = |dir: &Path, id: &str, local: Option<&str>, listener| {
+            let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+            let locals = local.map(|p| (p, None)).into_iter().collect();
+            data_node_served(
+                &rt,
+                dir,
+                id,
+                locals,
+                listener,
+                "",
+                limits.clone(),
+                false,
+                placement,
+                None,
+                Some(recipe()),
+            )
+        };
+        let (_stop_a, _, _) = start(&dirs[0], "a", Some("p1"), la);
+        let (_stop_c, _, _) = start(&dirs[2], "c", None, lc);
+        rt.block_on(async {
+            let alice = remember(ports[2], "alice", "alice ate lunch")
+                .await
+                .unwrap();
+            // A memory id in zed's namespace (on p2): its part goes to b whether or not
+            // such a memory exists.
+            let zed = pigeonhole_memory::MemoryId::from_bytes(
+                &[&3u16.to_le_bytes()[..], b"zed", &[7u8; 16]].concat(),
+            )
+            .unwrap()
+            .to_bytes();
+            let e = memory(ports[2])
+                .await
+                .forget(ForgetRequest {
+                    ids: vec![alice.into(), zed.into()],
+                })
+                .await
+                .unwrap_err();
+            let want = if silent {
+                "OutcomeUnknown"
+            } else {
+                "PartitionUnavailable"
+            };
+            assert_eq!(code(&e), want, "silent {silent}: {e}");
+            assert!(e.message().contains("p2"), "silent {silent}: {e}");
+            assert!(
+                e.message().contains("applied on: p1 (1)"),
+                "silent {silent}: {e}"
+            );
+            assert_eq!(
+                e.message().contains("may or may not have applied"),
+                silent,
+                "{e}"
+            );
+            // p1's part applied.
+            assert!(
+                recall(ports[0], &["alice"], "lunch")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+}

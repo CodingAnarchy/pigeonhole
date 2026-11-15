@@ -770,6 +770,7 @@ impl MemCore {
     /// One partition's step of a recall whose namespaces are on several (#1915): its pool's
     /// bytes, or with `hop` its part of that hop, at the recall's clock `now_us`. The same
     /// checks as [`recall`](Self::recall); the namespaces are this partition's.
+    #[cfg(feature = "serve")]
     pub(crate) fn recall_pool(
         &self,
         scope: Scope<'_>,
@@ -787,6 +788,7 @@ impl MemCore {
 
     /// The bodies of a recall's best hits on this partition (#1915): `ids`, each in one of
     /// the recall's namespaces.
+    #[cfg(feature = "serve")]
     pub(crate) fn recall_bodies(
         &self,
         scope: Scope<'_>,
