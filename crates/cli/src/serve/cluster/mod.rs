@@ -809,29 +809,37 @@ impl Node {
     /// node that doesn't answer counts as one that doesn't: the refusal names it, and a
     /// forced map skips this as it skips the majority.
     async fn every_node_keeps(
-        &self,
+        self: &Arc<Self>,
         map: &ClusterMap,
         feature: &str,
         what: &str,
     ) -> Result<(), ApiError> {
-        let mut lacking = Vec::new();
+        // Every node at once, as a confirm round asks them (simp724's n2 on #1920): k nodes
+        // that don't answer cost one push timeout, not k.
+        let mut asks = tokio::task::JoinSet::new();
         for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let answer = async {
-                let mut client = self.client(&n.address).await?;
-                let req = self.request(proto::StatusRequest {})?;
-                client
-                    .status(req)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| s.message().to_owned())
-            };
-            match tokio::time::timeout(self.peers.push_timeout, answer).await {
-                Ok(Ok(st)) if st.map_features.iter().any(|f| f == feature) => {}
-                Ok(Ok(_)) => lacking.push(format!("{} (an older build)", n.id)),
-                Ok(Err(e)) => lacking.push(format!("{} (no answer: {e})", n.id)),
-                Err(_) => lacking.push(format!("{} (no answer in time)", n.id)),
-            }
+            let (node, id, address) = (Arc::clone(self), n.id.clone(), n.address.clone());
+            let feature = feature.to_owned();
+            asks.spawn(async move {
+                let answer = async {
+                    let mut client = node.client(&address).await?;
+                    let req = node.request(proto::StatusRequest {})?;
+                    client
+                        .status(req)
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(|s| s.message().to_owned())
+                };
+                match tokio::time::timeout(node.peers.push_timeout, answer).await {
+                    Ok(Ok(st)) if st.map_features.contains(&feature) => None,
+                    Ok(Ok(_)) => Some(format!("{id} (an older build)")),
+                    Ok(Err(e)) => Some(format!("{id} (no answer: {e})")),
+                    Err(_) => Some(format!("{id} (no answer in time)")),
+                }
+            });
         }
+        let mut lacking: Vec<String> = asks.join_all().await.into_iter().flatten().collect();
+        lacking.sort();
         if lacking.is_empty() {
             Ok(())
         } else {
