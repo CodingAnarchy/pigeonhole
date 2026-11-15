@@ -21,9 +21,15 @@ const CHUNK_FRAMES: u64 = 32;
 pub enum Step<'a> {
     /// A complete record.
     Record {
-        /// Where the record starts (its first fragment).
+        /// Where to read again from to get this record: the cursor's position before it, the
+        /// end of the record before. That's the record's first fragment, or, when a skipped
+        /// frame tail (FORMAT §10.2) lies between, the position just before it, which a
+        /// cursor opened there steps over. A resume position (a feed token's hint) is then
+        /// never past where a recovery may cut the log before a record the cursor never read:
+        /// with the record lost to a power loss, the cut is the end of the record before the
+        /// tail, and the hint is too (#1937).
         start: Lsn,
-        /// Just past the record: where the next one starts.
+        /// Just past the record: where the next one's `start` is.
         end: Lsn,
         /// The `feed_session` of the segment holding it (FORMAT §10.2): 0 for a segment a
         /// session without the feed wrote.
@@ -407,7 +413,8 @@ impl FeedCursor {
                         let len = cur.dec.record().len();
                         let end = offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;
                         cur.last_end = end;
-                        let start = Lsn::new(epoch, offset as u32);
+                        // The resume position, not the fragment's offset: see `Step::Record`.
+                        let start = Lsn::new(epoch, last_end as u32);
                         let session = cur.session;
                         let cur = self.cur.as_ref().expect("checked above");
                         let record = WalRecord::decode(cur.dec.record())?;
