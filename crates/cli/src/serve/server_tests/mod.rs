@@ -113,6 +113,7 @@ pub(super) fn limits() -> Limits {
             cache_bytes: 8 << 20,
         },
         mcp_session_requests: 8,
+        mcp_blocking: 8,
     }
 }
 

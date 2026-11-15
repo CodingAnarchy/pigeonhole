@@ -39,6 +39,7 @@ mod indexes;
 mod lease;
 mod listener;
 mod mcp;
+mod mcp_backend;
 mod memory;
 mod memslot;
 mod placement;
@@ -584,8 +585,10 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(placement.io_threads)
         // Tokio's own blocking threads (file I/O, `spawn_blocking`): ours are bounded by the
-        // service's semaphore, below this.
-        .max_blocking_threads(placement.blocking_threads + 16)
+        // service's semaphore, below this. The `/mcp` messages' threads come on top, under
+        // their own places (`--mcp-blocking`), so a message's thread never takes the place of
+        // an op its tools wait on (ICR 0139's PR 3 section).
+        .max_blocking_threads(placement.blocking_threads + 16 + shared.limits.mcp_blocking)
         .thread_name("phdb-serve")
         .on_thread_start(move || enter.enter_network())
         .on_thread_unpark(move || unpark.unpark_network())

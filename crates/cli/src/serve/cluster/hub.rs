@@ -944,6 +944,8 @@ impl Member {
             } => {
                 self.hub = Some(joined);
                 self.own = own;
+                // Where it starts ([`FeedEvents::start`]): the ring's position it joins at.
+                self.sink.started(&token);
                 self.token = token;
                 for state in out {
                     let event = Out::Spliced {
@@ -965,6 +967,11 @@ impl Member {
             } => {
                 self.hub = joined;
                 self.own = own;
+                // A resume starts at its token; one from now or the oldest, once its merge
+                // places every partition (`read_own`).
+                if !token.is_empty() {
+                    self.sink.started(&token);
+                }
                 self.token = token.clone();
                 self.sent = token;
                 Source::Own(merging, None, count)
@@ -1261,6 +1268,11 @@ impl Member {
             };
             let merge = &mut merging.merge;
             positions(merge, &mut at);
+            // Every partition placed: where a stream from now or the oldest starts
+            // ([`FeedEvents::start`]).
+            if self.sink.starting() && merge.placed() {
+                self.sink.started(&Bytes::from(merge.checkpoint_now()));
+            }
             match out {
                 Out::Spliced { .. } => {
                     let Some((i, checkpoint)) = merge.last.take() else {

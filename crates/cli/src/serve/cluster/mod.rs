@@ -79,6 +79,9 @@ const PEER_FEATURES_TTL: std::time::Duration = std::time::Duration::from_secs(30
 /// back up serves again soon.
 const PEER_DOWN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A peer's features as it last answered `Status`, and when (`None`: it didn't answer).
+type PeerFeatures = (std::time::Instant, Option<Vec<String>>);
+
 /// What a peer said about a feature ([`Node::features_of`]).
 pub(crate) enum PeerFeature {
     Has,
@@ -261,7 +264,7 @@ pub(crate) struct Node {
     /// Peers' features as they last answered `Status` (`map_features`), by node id, with
     /// when (`None`: it didn't answer): asked again after [`PEER_FEATURES_TTL`], or
     /// [`PEER_DOWN_TTL`] for no answer ([`Node::owners_keep`]).
-    peer_features: Mutex<HashMap<String, (std::time::Instant, Option<Vec<String>>)>>,
+    peer_features: Mutex<HashMap<String, PeerFeatures>>,
     /// Whether this node has taken its peers' newer maps since it started (cleared by
     /// [`run`] for a node that restarts with a map, set by [`Node::sync_on_start`]). The
     /// map's writer changes the map only once it has (D317 amendment 1): a writer back from

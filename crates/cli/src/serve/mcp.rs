@@ -30,21 +30,21 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use pigeonhole::{Family, FamilyInfo, Pigeonhole, Table};
+use pigeonhole::Pigeonhole;
 use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
 
 use super::Shared;
 use super::auth::{Caller, Scope};
 use super::errors::ApiError;
+use super::mcp_backend::{ServeBackend, ServeFeed, failure};
 use super::service::Admit;
 use crate::exit::Failure;
-use crate::mcp::backend::Backend;
+use crate::mcp::backend::FeedSource;
 use crate::mcp::memory::{Memory, Store as MemStore};
 use crate::mcp::protocol::{self, Core, Host, Transport};
 use crate::mcp::tools::{Outcome, Tools};
 use crate::memcore::MemCore;
-use crate::open::Handle;
 
 /// The session's header (Streamable HTTP, 2025-03-26).
 const SESSION: &str = "mcp-session-id";
@@ -69,6 +69,7 @@ impl McpSession {
         let writable = caller.scope.allows(Scope::Write) && !refuses_writes(shared);
         let backend = ServeBackend {
             shared: Arc::downgrade(shared),
+            caller: caller.clone(),
             db,
             writable,
             replica: service.replica.is_some(),
@@ -111,97 +112,6 @@ fn refuses_writes(shared: &Shared) -> bool {
         .is_some_and(|r| r.refuses_writes())
 }
 
-/// The tools' database surface on the service layer (D313 §7 as amended in 8c-2). Its
-/// calls run on the blocking thread a `/mcp` request already holds, so they use the
-/// service's sync paths (`table_blocking`, `create_blocking`): taking a second pool thread
-/// from inside one could wait forever on a full pool (ai1249's B1 on #1666).
-struct ServeBackend {
-    /// Weak: the session table, inside the service, holds the session that holds this.
-    shared: Weak<Shared>,
-    /// The served database, for a `write` batch. A replica's re-bootstrap replaces the
-    /// engine under this handle, not the handle.
-    db: Pigeonhole,
-    writable: bool,
-    replica: bool,
-}
-
-impl ServeBackend {
-    fn shared(&self) -> Result<Arc<Shared>, Failure> {
-        self.shared
-            .upgrade()
-            .ok_or_else(|| failure(ApiError::unavailable("the server is shutting down")))
-    }
-
-    /// `table`, through the service's own table cache and its rules.
-    fn table(&self, table: &str) -> Result<Table, Failure> {
-        let shared = self.shared()?;
-        shared
-            .router
-            .service
-            .table_blocking(table)
-            .map_err(|e| failure(e).within(&format!("table {table}")))
-    }
-}
-
-impl Backend for ServeBackend {
-    fn mode(&self) -> &'static str {
-        if self.replica { "replica" } else { "server" }
-    }
-
-    fn lists_feed(&self) -> bool {
-        self.db.info().is_ok_and(|i| i.feed.is_some())
-    }
-
-    fn tables(&self) -> Vec<String> {
-        self.shared()
-            .map(|s| s.router.service.user_tables())
-            .unwrap_or_default()
-    }
-
-    fn families(&self, table: &str) -> Result<Vec<FamilyInfo>, Failure> {
-        let t = self.table(table)?;
-        Ok(t.families()
-            .into_iter()
-            .filter_map(|f| t.family_info(f))
-            .collect())
-    }
-
-    fn handle(&self, table: &str) -> Result<Handle, Failure> {
-        self.table(table).map(Handle::Writer)
-    }
-
-    fn writer(&self) -> Option<&Pigeonhole> {
-        // Safe to hand out: the batch commits only to tables `open_for_write` gave (the
-        // service's own handles), and `write` passed `admit` with the write scope.
-        self.writable.then_some(&self.db)
-    }
-
-    fn open_for_write(&self, table: &str) -> Option<Result<Table, Failure>> {
-        self.writable.then(|| self.table(table))
-    }
-
-    fn create_table(
-        &self,
-        table: &str,
-        families: Vec<(String, Family)>,
-    ) -> Option<Result<Table, Failure>> {
-        if !self.writable {
-            return None;
-        }
-        Some(self.shared().and_then(|shared| {
-            shared
-                .router
-                .service
-                .create_blocking(table, families, true)
-                .map_err(|e| failure(e).within(&format!("create_table {table}")))
-        }))
-    }
-
-    fn close(self: Box<Self>) -> Result<(), Failure> {
-        Ok(())
-    }
-}
-
 /// The served memory store, as the memory tools reach it: through the service's own slot,
 /// which a catalog change or a replica's re-bootstrap opens again.
 struct ServeStore {
@@ -232,11 +142,6 @@ impl MemStore for ServeStore {
     }
 }
 
-/// A service refusal as a tool's failure: its code and message.
-fn failure(e: ApiError) -> Failure {
-    Failure::served(&e.code, e.code_num, &e.message)
-}
-
 /// What one `/mcp` request's messages reach: the session's tools, each call admitted first.
 struct Gate<'a> {
     session: &'a McpSession,
@@ -244,6 +149,9 @@ struct Gate<'a> {
     caller: &'a Caller,
     /// Whether `post` took a memory place (M6) for this message, before its pool thread.
     memory_place: bool,
+    /// The feed a `feed_poll` message's poll reads: opened and waited on by `post` before
+    /// its `/mcp` place (simp724's M2).
+    feed: std::sync::Mutex<Option<ServeFeed>>,
 }
 
 impl Host for Gate<'_> {
@@ -304,19 +212,17 @@ impl Host for Gate<'_> {
         } else {
             None
         };
-        // A poll holds a `--max-streams` place, as a feed stream does (ai1249's note on 8c),
-        // though it needs no hub. It never waits here, on the pool thread: `post` waited for
-        // its first commit before taking that thread (the audit's F7).
+        // A poll is a subscription, whose op holds its `--max-streams` place (simp724's S2).
+        // It never waits here, holding the `/mcp` place: `post` waited for its first commit
+        // before taking it (the audit's F7, simp724's M2), so the call takes what's ready.
         if name == "feed_poll" {
-            let _stream = match service.stream_slot() {
-                Ok(p) => p,
-                Err(e) => return Some(Err(failure(e))),
-            };
-            let mut args = args.clone();
-            if args.contains_key("wait_ms") {
-                args.insert("wait_ms".into(), 0.into());
-            }
-            return self.session.tools.call(name, &args);
+            let feed = self
+                .feed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .map(|f| Box::new(f) as Box<dyn FeedSource>);
+            return Some(self.session.tools.feed_poll_now(args, feed));
         }
         self.session.tools.call(name, args)
     }
@@ -455,23 +361,12 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     if session.catalog.swap(now, Ordering::AcqRel) != now {
         session.protocol.catalog_moved();
     }
-    // A `feed_poll` that waits waits here, on the runtime (the audit's F7): `Gate::call`
-    // then runs it on the pool without a wait, taking what's ready. One "from now" (no
-    // token) is pinned to where the waiting feed started, so the call reads what woke it.
-    let text = match feed_wait(&text) {
-        Some((mut message, args)) => {
-            let pin = !args.contains_key("token")
-                && args.get("from_oldest").and_then(Value::as_bool) != Some(true);
-            match poll_wait(service, &caller, &session, args).await {
-                Some(start) if pin => {
-                    message["params"]["arguments"]["token"] =
-                        crate::cmd::schema::base64_encode(start.as_bytes()).into();
-                    message.to_string()
-                }
-                _ => text,
-            }
-        }
-        None => text,
+    // A `feed_poll` that waits waits here, on the runtime, holding no `/mcp` place (the
+    // audit's F7, simp724's M2): its subscription opened and its first commit waited for,
+    // then handed to `Gate::call`, which takes what's ready.
+    let feed = match feed_wait(&text) {
+        Some(args) => poll_wait(&shared, &caller, &session, &args, until).await,
+        None => None,
     };
     // A memory tool runs under the memory sub-limit (M6), whose place is taken before the
     // pool's, as the RPCs take it: never the other way round (see `Service::memory_place`).
@@ -486,18 +381,23 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
     let memory_place = _memory.is_some();
     let caller_owned = caller.clone();
     let shared_owned = Arc::clone(&shared);
+    // On a blocking thread under a `/mcp` place, outside `--blocking-threads` (ICR 0139's
+    // PR 3 section): its tools' ops take their own permits.
     let answered = service
-        .blocking(move || {
+        .mcp_blocking(until.into(), move || {
             let gate = Gate {
                 session: &session,
                 shared: &shared_owned,
                 caller: &caller_owned,
                 memory_place,
+                feed: std::sync::Mutex::new(feed),
             };
-            let core = Core::new(Transport::Http);
-            let reply = core.message(&gate, &session.protocol, &text);
-            let note = core.list_changed(&gate, &session.protocol);
-            Ok((reply, note))
+            super::mcp_backend::within(until, || {
+                let core = Core::new(Transport::Http);
+                let reply = core.message(&gate, &session.protocol, &text);
+                let note = core.list_changed(&gate, &session.protocol);
+                Ok((reply, note))
+            })
         })
         .await;
     drop(budget);
@@ -600,8 +500,8 @@ fn calls_memory(text: &str) -> bool {
 }
 
 /// The arguments of a `feed_poll` that waits (`wait_ms` above 0), if `text` is one: a single
-/// message, not a batch, whose calls then don't wait (`Gate::call` drops their `wait_ms`).
-fn feed_wait(text: &str) -> Option<(Value, Map<String, Value>)> {
+/// message, not a batch, whose calls then don't wait (`Gate::call` takes what's ready).
+fn feed_wait(text: &str) -> Option<Map<String, Value>> {
     if !text.contains("feed_poll") {
         return None;
     }
@@ -612,20 +512,20 @@ fn feed_wait(text: &str) -> Option<(Value, Map<String, Value>)> {
         return None;
     }
     let args = m["params"]["arguments"].as_object()?.clone();
-    (args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0) > 0).then_some((m, args))
+    (args.get("wait_ms").and_then(Value::as_u64).unwrap_or(0) > 0).then_some(args)
 }
 
-/// Waits, on the runtime, for the first commit a `feed_poll` with `args` would read, up to
-/// its `wait_ms`, under a `--max-streams` place: the feed opened on the pool, then polled
-/// here (`Feed::poll_next`), holding no pool thread while it waits. Returns where the feed
-/// started. Whatever happens, the call then runs and reports: a caller it refuses, a busy
-/// server, a bad argument or a failed open just skip the wait.
+/// Opens the subscription a `feed_poll` with `args` reads, and waits on the runtime for its
+/// first commit, up to its `wait_ms`: holding no `/mcp` place or blocking thread while it
+/// waits (simp724's M2). Whatever fails, the call then runs and reports it: a caller it
+/// refuses, a bad argument or a failed open just skip the wait.
 async fn poll_wait(
-    service: &super::service::Service,
+    shared: &Shared,
     caller: &Caller,
-    session: &Arc<McpSession>,
-    args: Map<String, Value>,
-) -> Option<pigeonhole::FeedToken> {
+    session: &McpSession,
+    args: &Map<String, Value>,
+    until: Instant,
+) -> Option<ServeFeed> {
     let admit = Admit {
         what: "feed_poll",
         scope: Scope::Read,
@@ -633,17 +533,14 @@ async fn poll_wait(
         size: 0,
         memory: false,
     };
-    service.check(&admit, caller).ok()?;
-    let _place = service.stream_slot().ok()?;
-    let tools = Arc::clone(session);
-    let (mut feed, wait) = service
-        .blocking(move || Ok(tools.tools.feed_poll_waiter(&args)))
+    shared.router.service.check(&admit, caller).ok()?;
+    let p = session.tools.feed_poll_args(args).ok()?;
+    let mut feed = super::mcp_backend::subscribe(shared, caller, &p.feed(), Some(until))
         .await
-        .ok()??;
-    let start = feed.token();
-    let first = std::future::poll_fn(|cx| feed.poll_next(cx).map(|r| r.map(|_| ())));
-    let _ = tokio::time::timeout(wait, first).await;
-    Some(start)
+        .ok()?;
+    let wait = p.wait.min(until.saturating_duration_since(Instant::now()));
+    feed.wait(wait).await.ok()?;
+    Some(feed)
 }
 
 /// Whether `text` is one `initialize` request (not a batch: 2025-03-26 forbids one there).

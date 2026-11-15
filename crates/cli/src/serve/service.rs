@@ -1189,6 +1189,10 @@ pub(crate) struct Service {
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
     blocking: Arc<Semaphore>,
+    /// `/mcp` messages running at once (`--mcp-blocking`), each on a blocking thread of
+    /// its own, outside `blocking`, whose permits its tools' ops take (ICR 0139's PR 3
+    /// section).
+    mcp_places: Arc<Semaphore>,
     /// Scans streaming at once (`--max-scans`).
     scans: Arc<Semaphore>,
     /// `--bulk-load-bytes`, in KiB: what the node's bulk loads hold at most, each its worst
@@ -1518,6 +1522,7 @@ impl Service {
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
+            mcp_places: Arc::clone(&self.mcp_places),
             scans: Arc::clone(&self.scans),
             bulk_budget: Arc::clone(&self.bulk_budget),
             sessions: super::sessions::Sessions::sharing(
@@ -1571,6 +1576,7 @@ impl Service {
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
+            mcp_places: Arc::new(Semaphore::new(limits.mcp_blocking.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             bulk_budget: super::bulk::budget_pool(limits.bulk_load_bytes),
             sessions: super::sessions::Sessions::sharing(
@@ -2528,23 +2534,6 @@ impl Service {
         }
     }
 
-    /// [`table`](Self::table) on a blocking thread the caller already holds (a `/mcp`
-    /// request's): a miss opens the table here, never on a second pool thread, which a full
-    /// pool would never give (ai1249's B1 on #1666).
-    pub(crate) fn table_blocking(&self, name: &str) -> Result<Table, ApiError> {
-        loop {
-            let generation = match self.cached(name) {
-                Ok(t) => return Ok(t),
-                Err(generation) => generation,
-            };
-            reserved(name)?;
-            let table = self.part()?.db.table(name)?.open()?;
-            if let Some(t) = self.keep_table(name, &table, generation) {
-                return Ok(t);
-            }
-        }
-    }
-
     /// The cached handle for `name`, or the cache's generation to open it at.
     fn cached(&self, name: &str) -> Result<Table, u64> {
         // No partition, no cache: the open after it answers that.
@@ -2620,21 +2609,6 @@ impl Service {
         let owned = name.clone();
         let table = held(place, move || create_in(&db, &owned, families, if_missing)).await?;
         self.created(name, &table);
-        Ok(table)
-    }
-
-    /// [`create_with`](Self::create_with) on a blocking thread the caller already holds (a
-    /// `/mcp` request's), for the reason [`table_blocking`](Self::table_blocking) gives.
-    pub(crate) fn create_blocking(
-        &self,
-        name: &str,
-        families: Vec<(String, pigeonhole::Family)>,
-        if_missing: bool,
-    ) -> Result<Table, ApiError> {
-        reserved(name)?;
-        let _schema = self.part()?.schema.blocking_lock();
-        let table = create_in(&self.part()?.db, name, families, if_missing)?;
-        self.created(name.to_owned(), &table);
         Ok(table)
     }
 
@@ -2998,8 +2972,35 @@ impl Service {
         })
     }
 
-    /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once: a
-    /// call's own, or a `/mcp` request's messages, whose tools make sync database calls.
+    /// Runs a `/mcp` message on a blocking thread under a `--mcp-blocking` place, never a
+    /// `--blocking-threads` permit: its tools' calls are ops through the router, and each
+    /// takes a permit of its own (ICR 0139's PR 3 section). The conditions this rests on
+    /// (simp724's review of #1915 PR 3):
+    /// - (a) the place is awaited here, on the async side, before the thread;
+    /// - (b) only `/mcp` threads wait on blocking work: an op's own blocking work never
+    ///   waits on another's;
+    /// - (c) every other wait on the dispatch path is a try or bounded (`--max-concurrent`
+    ///   sheds, a forward to a full node answers `Overloaded`, the memory place waits
+    ///   within the request timeout, the stream and scan places are tries);
+    /// - (d) tokio's blocking-thread cap leaves room for the ops beside the messages
+    ///   (`--blocking-threads` + 16 + `--mcp-blocking`, `serve_shared`).
+    ///
+    /// Waits for a place until `until`, then `Overloaded`.
+    pub(crate) async fn mcp_blocking<T: Send + 'static>(
+        &self,
+        until: tokio::time::Instant,
+        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let place = tokio::time::timeout_at(until, Arc::clone(&self.mcp_places).acquire_owned())
+            .await
+            .map_err(|_| {
+                ApiError::overloaded("the server is at its `/mcp` message limit (--mcp-blocking)")
+            })?
+            .map_err(|_| ApiError::internal("the `/mcp` places closed"))?;
+        held(place, f).await
+    }
+
+    /// Runs a sync-only call on the blocking pool, at most `--blocking-threads` at once.
     pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,

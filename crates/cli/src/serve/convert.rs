@@ -3,6 +3,7 @@
 //! (a missing field, a vector of the wrong size) are `InvalidArgument`, before anything is
 //! submitted.
 
+use crate::cmd::schema::{FamilyDef, FamilyKind};
 use std::ops::Bound;
 
 use pigeonhole::{Element, RowMutation, Table, WriteBatch};
@@ -345,8 +346,9 @@ pub(crate) fn mutation<'t>(
     Ok(m)
 }
 
-/// Applies one row's `writes` to a batch, one at a time. A batch takes neither `u64` nor
-/// vector puts, nor aggregate inputs: refused as they come, before their values decode.
+/// Applies one row's `writes` to a batch, one at a time: whatever a mutation takes (#1915
+/// PR 3 lifted the batch's refusals of `u64` and vector puts and aggregate inputs, which
+/// the library's batch takes as a row mutation does).
 pub(crate) fn batch(
     b: &mut WriteBatch,
     table: &Table,
@@ -354,26 +356,6 @@ pub(crate) fn batch(
     writes: &[proto::Write],
 ) -> Result<()> {
     for w in writes {
-        // The batch's only guard against u64 and vector puts and aggregate inputs: `dispatch!`
-        // expands those arms for `WriteBatch` too (ai1249's N2 on #1555).
-        match w.op.as_ref() {
-            Some(write::Op::Put(p))
-                if matches!(
-                    p.value.as_ref().and_then(|v| v.kind.as_ref()),
-                    Some(value::Kind::U64(_) | value::Kind::Vector(_))
-                ) =>
-            {
-                return Err(ApiError::invalid(
-                    "a batch put takes bytes, i64 or f64 (use Mutate for u64 and vectors)",
-                ));
-            }
-            Some(write::Op::Aggregate(_)) => {
-                return Err(ApiError::invalid(
-                    "a batch doesn't take aggregate inputs (use Mutate)",
-                ));
-            }
-            _ => {}
-        }
         let op = txn_op(w, VectorInput::RefuseFirst)?;
         macro_rules! on_batch {
             ($method:ident, $($a:expr),*) => {{
@@ -720,6 +702,16 @@ pub(crate) fn value_out(v: pigeonhole::Value<'_>) -> proto::Value {
     proto::Value { kind: Some(kind) }
 }
 
+/// An element's proto code (`element_out`, for the `/mcp` backend).
+pub(crate) fn element_code(e: Element) -> i32 {
+    element_out(e)
+}
+
+/// The element a proto code names, if it's one this build knows.
+pub(crate) fn element_of(e: i32) -> Option<Element> {
+    element_in(e).ok()
+}
+
 fn element_out(e: Element) -> i32 {
     (match e {
         Element::F32 => proto::Element::F32,
@@ -1059,24 +1051,34 @@ pub(crate) fn vector_spec_in(v: &proto::VectorSpec) -> Result<pigeonhole::Vector
 
 /// A `FamilySpec` as the `Family` to create: unset options take the library's defaults.
 pub(crate) fn family_in(s: &proto::FamilySpec) -> Result<pigeonhole::Family> {
-    use pigeonhole::{Aggregation as A, BloomParams, Family, HistogramParams, QuantileParams};
+    Ok(family_def_in(s)?.family())
+}
+
+/// A family spec's options (#1915 PR 3: the `/mcp` tools read a table's families through
+/// `DescribeTable`): unset fields are `None`, and a `ttl_micros` of 0 is no TTL, as
+/// `DescribeTable` reports it.
+pub(crate) fn family_def_in(s: &proto::FamilySpec) -> Result<FamilyDef> {
+    use pigeonhole::{Aggregation as A, BloomParams, HistogramParams, QuantileParams};
     use proto::family_spec::Kind;
     let bad = |what: &str, e: pigeonhole::Error| {
         ApiError::invalid(format!("family {}: {what}: {}", s.name, e.message()))
     };
     let narrow =
         |what: &str| ApiError::invalid(format!("family {}: {what} is out of range", s.name));
-    let mut f = match &s.kind {
-        None => Family::default(),
-        Some(Kind::MergeOperator(op)) => Family::default().merge_operator(op),
-        Some(Kind::Vector(v)) => Family::vector(
-            pigeonhole::VectorSpec::new(v.dim, element_in(v.element)?, metric_in(v.metric)?)
-                .map_err(|e| bad("the vector spec", e))?,
+    let (kind, merge_operator) = match &s.kind {
+        None => (FamilyKind::Plain, None),
+        Some(Kind::MergeOperator(op)) => (FamilyKind::Plain, Some(op.clone())),
+        Some(Kind::Vector(v)) => (
+            FamilyKind::Vector(
+                pigeonhole::VectorSpec::new(v.dim, element_in(v.element)?, metric_in(v.metric)?)
+                    .map_err(|e| bad("the vector spec", e))?,
+            ),
+            None,
         ),
         Some(Kind::Aggregate(a)) => {
             use proto::AggregationKind as K;
             let kind = K::try_from(a.kind).unwrap_or(K::Unspecified);
-            Family::aggregate(match kind {
+            let agg = match kind {
                 K::Sum => A::Sum,
                 K::Min => A::Min,
                 K::Max => A::Max,
@@ -1116,53 +1118,139 @@ pub(crate) fn family_in(s: &proto::FamilySpec) -> Result<pigeonhole::Family> {
                         s.name
                     )));
                 }
-            })
+            };
+            (FamilyKind::Aggregate(agg), None)
         }
     };
-    if let Some(n) = s.max_versions {
-        f = f.max_versions(n);
-    }
+    let mut f = FamilyDef::new(s.name.clone(), kind);
+    f.merge_operator = merge_operator;
+    f.max_versions = s.max_versions;
     // 0 is "no TTL", as `DescribeTable` reports it, so a described family creates again.
-    if let Some(us) = s.ttl_micros.filter(|&us| us > 0) {
-        f = f.ttl(std::time::Duration::from_micros(us));
-    }
-    if let Some(n) = s.bloom_bits {
-        f = f.bloom_bits(u8::try_from(n).map_err(|_| narrow("bloom_bits"))?);
-    }
-    if let Some(n) = s.blob_threshold {
-        f = f.blob_threshold(n);
-    }
-    if let Some(n) = s.block_size {
-        f = f.block_size(n);
-    }
+    f.ttl = s
+        .ttl_micros
+        .filter(|&us| us > 0)
+        .map(std::time::Duration::from_micros);
+    f.bloom_bits = s
+        .bloom_bits
+        .map(|n| u8::try_from(n).map_err(|_| narrow("bloom_bits")))
+        .transpose()?;
+    f.blob_threshold = s.blob_threshold;
+    f.block_size = s.block_size;
     if let Some(c) = &s.compression {
         use proto::CompressionCodec as C;
-        f = match C::try_from(c.codec).unwrap_or(C::Unspecified) {
-            C::Unspecified => f,
-            C::None => f.compression(pigeonhole::Compression::None),
-            C::Lz4 => f.compression(pigeonhole::Compression::Lz4),
-            C::Zstd => f.compression(pigeonhole::Compression::Zstd(if c.zstd_level == 0 {
+        f.compression = match C::try_from(c.codec).unwrap_or(C::Unspecified) {
+            C::Unspecified => None,
+            C::None => Some(pigeonhole::Compression::None),
+            C::Lz4 => Some(pigeonhole::Compression::Lz4),
+            C::Zstd => Some(pigeonhole::Compression::Zstd(if c.zstd_level == 0 {
                 3
             } else {
                 i8::try_from(c.zstd_level).map_err(|_| narrow("zstd_level"))?
             })),
         };
     }
-    f = match proto::Priority::try_from(s.cache_priority).unwrap_or(proto::Priority::Unspecified) {
-        proto::Priority::Unspecified => f,
-        proto::Priority::Low => f.cache_priority(pigeonhole::Priority::Low),
-        proto::Priority::Normal => f.cache_priority(pigeonhole::Priority::Normal),
-        proto::Priority::High => f.cache_priority(pigeonhole::Priority::High),
-    };
-    f = match proto::CompactionStyle::try_from(s.compaction)
+    f.cache_priority =
+        match proto::Priority::try_from(s.cache_priority).unwrap_or(proto::Priority::Unspecified) {
+            proto::Priority::Unspecified => None,
+            proto::Priority::Low => Some(pigeonhole::Priority::Low),
+            proto::Priority::Normal => Some(pigeonhole::Priority::Normal),
+            proto::Priority::High => Some(pigeonhole::Priority::High),
+        };
+    f.compaction = match proto::CompactionStyle::try_from(s.compaction)
         .unwrap_or(proto::CompactionStyle::Unspecified)
     {
-        proto::CompactionStyle::Unspecified => f,
-        proto::CompactionStyle::Leveled => f.compaction(pigeonhole::Compaction::Leveled),
-        proto::CompactionStyle::Tiered => f.compaction(pigeonhole::Compaction::Tiered),
-        proto::CompactionStyle::FifoByTime => f.compaction(pigeonhole::Compaction::FifoByTime),
+        proto::CompactionStyle::Unspecified => None,
+        proto::CompactionStyle::Leveled => Some(pigeonhole::Compaction::Leveled),
+        proto::CompactionStyle::Tiered => Some(pigeonhole::Compaction::Tiered),
+        proto::CompactionStyle::FifoByTime => Some(pigeonhole::Compaction::FifoByTime),
     };
     Ok(f)
+}
+
+/// A family's options as a spec to create it with (#1915 PR 3: the `/mcp` `create_table`
+/// tool): only the options it sets, so the rest take the server's defaults.
+pub(crate) fn family_def_out(f: &FamilyDef) -> proto::FamilySpec {
+    use pigeonhole::Aggregation as A;
+    use proto::AggregationKind as K;
+    use proto::family_spec::Kind;
+    let kind = match &f.kind {
+        FamilyKind::Aggregate(a) => {
+            let mut out = proto::Aggregation::default();
+            out.kind = match a {
+                A::Sum => K::Sum,
+                A::Min => K::Min,
+                A::Max => K::Max,
+                A::Hll => K::Hll,
+                A::BitOr => K::BitOr,
+                A::BitAnd => K::BitAnd,
+                A::BitXor => K::BitXor,
+                A::MinF64 => K::MinF64,
+                A::MaxF64 => K::MaxF64,
+                A::SumF64 => K::SumF64,
+                A::MeanVar => K::MeanVar,
+                A::Set => K::Set,
+                A::Histogram(p) => {
+                    out.histogram_bounds = p.bounds();
+                    K::Histogram
+                }
+                A::Quantiles(q) => {
+                    out.quantile_mantissa_bits = Some(u32::from(q.get_mantissa_bits()));
+                    out.quantile_max_buckets = Some(u32::from(q.get_max_buckets()));
+                    K::Quantiles
+                }
+                A::Bloom(b) => {
+                    out.bloom_bits = b.bits();
+                    out.bloom_hashes = u32::from(b.hashes());
+                    K::Bloom
+                }
+                _ => K::Unspecified,
+            } as i32;
+            Some(Kind::Aggregate(out))
+        }
+        FamilyKind::Vector(v) => Some(Kind::Vector(proto::VectorSpec {
+            dim: v.dim(),
+            element: element_out(v.element()),
+            metric: metric_out(v.metric()),
+        })),
+        FamilyKind::Plain => f.merge_operator.clone().map(Kind::MergeOperator),
+    };
+    proto::FamilySpec {
+        name: f.name.clone(),
+        kind,
+        max_versions: f.max_versions,
+        ttl_micros: f
+            .ttl
+            .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX)),
+        bloom_bits: f.bloom_bits.map(u32::from),
+        blob_threshold: f.blob_threshold,
+        compression: f.compression.map(|c| {
+            let (codec, zstd_level) = match c {
+                pigeonhole::Compression::None => (proto::CompressionCodec::None, 0),
+                pigeonhole::Compression::Lz4 => (proto::CompressionCodec::Lz4, 0),
+                pigeonhole::Compression::Zstd(l) => (proto::CompressionCodec::Zstd, i32::from(l)),
+                _ => (proto::CompressionCodec::Unspecified, 0),
+            };
+            proto::Compression {
+                codec: codec as i32,
+                zstd_level,
+            }
+        }),
+        block_size: f.block_size,
+        cache_priority: match f.cache_priority {
+            None => proto::Priority::Unspecified,
+            Some(pigeonhole::Priority::Low) => proto::Priority::Low,
+            Some(pigeonhole::Priority::Normal) => proto::Priority::Normal,
+            Some(pigeonhole::Priority::High) => proto::Priority::High,
+            Some(_) => proto::Priority::Unspecified,
+        } as i32,
+        compaction: match f.compaction {
+            None => proto::CompactionStyle::Unspecified,
+            Some(pigeonhole::Compaction::Leveled) => proto::CompactionStyle::Leveled,
+            Some(pigeonhole::Compaction::Tiered) => proto::CompactionStyle::Tiered,
+            Some(pigeonhole::Compaction::FifoByTime) => proto::CompactionStyle::FifoByTime,
+            Some(_) => proto::CompactionStyle::Unspecified,
+        } as i32,
+    }
 }
 
 /// A family as `DescribeTable` returns it: every option set, as stored.
@@ -1250,6 +1338,106 @@ pub(crate) fn family_out(i: &pigeonhole::FamilyInfo) -> proto::FamilySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1915 PR 3: the `/mcp` tools describe a family from its `DescribeTable` spec, and
+    /// stdio `phdb mcp` from the database's `FamilyInfo`: the same JSON as `phdb info`'s
+    /// `family_json`, for every kind and option; and a spec built from a family's options
+    /// creates that family.
+    #[test]
+    fn a_familys_json_is_the_same_from_its_info_and_from_its_spec() {
+        use crate::cmd::schema::family_json;
+        use pigeonhole::{
+            Aggregation, BloomParams, Compaction, Compression, Family, HistogramParams, Metric,
+            Priority, QuantileParams, VectorSpec,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "phdb-family-json-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("f.phdb"),
+            pigeonhole::Options::default()
+                .create_if_missing(true)
+                .shards(1)
+                .pin_threads(false),
+        )
+        .unwrap();
+        let families: Vec<(&str, Family)> = vec![
+            ("plain", Family::default()),
+            (
+                "tuned",
+                Family::default()
+                    .max_versions(3)
+                    .ttl(std::time::Duration::from_secs(60))
+                    .bloom_bits(7)
+                    .blob_threshold(1000)
+                    .compression(Compression::Zstd(5))
+                    .block_size(8192)
+                    .cache_priority(Priority::High)
+                    .compaction(Compaction::Tiered),
+            ),
+            ("bare", Family::default().compression(Compression::None)),
+            (
+                "legacy",
+                Family::default().merge_operator("pigeonhole.i64_add"),
+            ),
+            ("count", Family::counter()),
+            ("bits", Family::aggregate(Aggregation::BitXor)),
+            ("set", Family::aggregate(Aggregation::Set)),
+            (
+                "hist",
+                Family::aggregate(Aggregation::Histogram(
+                    HistogramParams::new(vec![1.0, 10.0, 100.0]).unwrap(),
+                )),
+            ),
+            (
+                "quant",
+                Family::aggregate(Aggregation::Quantiles(
+                    QuantileParams::default().mantissa_bits(6).max_buckets(300),
+                )),
+            ),
+            (
+                "bloom",
+                Family::aggregate(Aggregation::Bloom(BloomParams::new(4096, 4).unwrap())),
+            ),
+            (
+                "emb",
+                Family::vector(
+                    VectorSpec::new(8, pigeonhole::Element::BF16, Metric::Cosine).unwrap(),
+                ),
+            ),
+        ];
+        let mut b = db.table("t").unwrap();
+        for (name, f) in &families {
+            b = b.family(name, f.clone());
+        }
+        let t = b.create().unwrap();
+        for name in t.families() {
+            let info = t.family_info(name).unwrap();
+            let want = family_json(&info);
+            assert_eq!(
+                FamilyDef::from_info(&info).json(),
+                want,
+                "{name} from its info"
+            );
+            let spec = family_out(&info);
+            let def = family_def_in(&spec).unwrap();
+            assert_eq!(def.json(), want, "{name} from its spec");
+            // The spec `/mcp`'s create_table sends defines the same family.
+            assert_eq!(
+                family_in(&family_def_out(&def)).unwrap(),
+                info.family,
+                "{name} created again"
+            );
+        }
+        drop(t);
+        db.close().unwrap();
+    }
 
     #[test]
     fn a_qualifier_selection_checks_its_prefix_and_bounds() {

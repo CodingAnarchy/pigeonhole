@@ -171,6 +171,11 @@ impl Failure {
     }
 
     /// The same failure, naming the part of a request it came from (`ops[3]: …`).
+    /// The failure's code: an `ErrorCode` name, or a CLI name.
+    pub(crate) fn code(&self) -> &str {
+        &self.code
+    }
+
     pub(crate) fn within(mut self, what: &str) -> Self {
         self.message = format!("{what}: {}", self.message);
         self

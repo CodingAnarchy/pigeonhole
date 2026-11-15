@@ -115,4 +115,6 @@ Design: `.coord/ai1249-1915-pr3-mcp.md`, reviewed by simp724 (`.coord/simp724-re
   - the cap leaves room for the ops.
 - **Default:** 8 holds a few agents' sessions at once while keeping the extra threads small beside `--blocking-threads`.
 
+**A lifted refusal (the coordinator's call):** `Data.Batch` takes what `Mutate` takes. Before, it refused `u64` and vector puts and aggregate inputs, a limit from serve's skeleton (#1501) from before the library's `WriteBatch` had them. `/mcp`'s `write` tool commits through `Batch`, and stdio `phdb mcp`'s takes all three. Vectors are checked against the family's spec first, as `Mutate` checks them. On a cluster, a peer still on the older build refuses them with `InvalidArgument` during an upgrade.
+
 **Still refused in PR 3a:** `/mcp` on a cluster node (PR 3b).

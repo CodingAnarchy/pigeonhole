@@ -3570,7 +3570,7 @@ impl QualifierVectors {
         &self,
         k: usize,
         select: impl FnOnce(pigeonhole::Scan<'_>) -> pigeonhole::Scan<'_>,
-    ) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
+    ) -> Ranked {
         select(self.t.scan_prefix(b"").family("emb"))
             .nearest_f32(&Self::QUERY, k)
             .run_within(1 << 20)
@@ -3587,20 +3587,19 @@ impl QualifierVectors {
         n: usize,
         k: u32,
         qualifiers: Option<super::proto::QualifierSelection>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, f64)>, tonic::Status> {
+    ) -> Result<Ranked, tonic::Status> {
         self.nearest_partial(n, k, qualifiers, false)
             .map(|(found, _)| found)
     }
 
     /// [`Self::nearest`] with `allow_partial`, and the partitions it names as missing.
-    #[allow(clippy::type_complexity)]
     fn nearest_partial(
         &self,
         n: usize,
         k: u32,
         qualifiers: Option<super::proto::QualifierSelection>,
         allow_partial: bool,
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>, f64)>, Vec<String>), tonic::Status> {
+    ) -> Result<(Ranked, Vec<String>), tonic::Status> {
         use super::proto::{NearestRequest, Vector};
         self.rt.block_on(async {
             let channel = tonic::transport::Endpoint::from_shared(format!(
@@ -3647,6 +3646,9 @@ impl Drop for QualifierVectors {
     }
 }
 
+/// A nearest search's neighbours: row, qualifier, distance.
+type Ranked = Vec<(Vec<u8>, Vec<u8>, f64)>;
+
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -3666,11 +3668,7 @@ fn a_fanned_out_nearest_ranks_only_the_qualifiers_it_selects() {
     use super::proto::QualifierSelection;
     use std::ops::Bound as B;
     let c = QualifierVectors::start(&[]);
-    let cases: Vec<(
-        &str,
-        Option<QualifierSelection>,
-        Vec<(Vec<u8>, Vec<u8>, f64)>,
-    )> = vec![
+    let cases: Vec<(&str, Option<QualifierSelection>, Ranked)> = vec![
         ("none", None, c.want(12, |s| s)),
         (
             "prefix x",

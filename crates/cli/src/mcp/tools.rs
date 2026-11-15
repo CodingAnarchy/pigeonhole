@@ -23,21 +23,21 @@ use std::ops::Bound;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pigeonhole::{
-    Aggregation, CellEntry, Element, KeySet, RowPosition, Table, Value as Cell, VectorSpec,
-};
+use pigeonhole::{Aggregation, Element, KeySet, Value as Cell, VectorSpec};
 use serde_json::{Map, Value, json};
 
 use super::Limits;
-use super::backend::Backend;
+use super::backend::{
+    Backend, CellOut, CellValue, CommitOut, FeedArgs, FeedSource, Input, NearestArgs, Query,
+    RowWrite, Selection, TraverseArgs, TraverseOut, WriteOp,
+};
 use super::cursor::Cursor;
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{
-    Components, JsonValue, base64_decode, base64_encode, bytes_from_json, bytes_json, element_name,
-    family_from_json, family_json, value_from_json, vector_spec_json,
+    Components, FamilyDef, JsonValue, base64_decode, base64_encode, bytes_from_json, bytes_json,
+    element_name, family_def_from_json, value_from_json, vector_spec_json,
 };
 use crate::exit::Failure;
-use crate::open::Handle;
 
 /// The aggregation kinds `create_table` takes (`family_from_json`'s names).
 const AGGREGATIONS: &[&str] = &[
@@ -118,7 +118,7 @@ struct CachedTraversal {
     /// The call's fingerprint and run id, which its cursors carry.
     fingerprint: u64,
     run: u64,
-    traversal: pigeonhole::Traversal,
+    traversal: TraverseOut,
 }
 
 impl Tools {
@@ -221,11 +221,20 @@ impl Tools {
 
     /// Whether any table has a vector family.
     fn has_vector_family(&self) -> bool {
-        self.db.tables().iter().any(|t| {
+        self.db.tables().unwrap_or_default().iter().any(|t| {
             self.db
                 .families(t)
-                .is_ok_and(|fs| fs.iter().any(|f| f.vector.is_some()))
+                .is_ok_and(|fs| fs.iter().any(|f| f.vector().is_some()))
         })
+    }
+
+    /// `table`'s family `family`: `FamilyNotFound` if it has none of that name.
+    fn family(&self, table: &str, family: &str) -> Result<FamilyDef, Failure> {
+        self.db
+            .families(table)?
+            .into_iter()
+            .find(|f| f.name == family)
+            .ok_or_else(|| Failure::family_not_found(table, family))
     }
 
     fn list_tables(&self, a: Args<'_>) -> Outcome {
@@ -233,7 +242,7 @@ impl Tools {
         let names = match a.opt_str("table")? {
             Some(t) => vec![t.to_owned()],
             None => {
-                let mut all = self.db.tables();
+                let mut all = self.db.tables()?;
                 all.sort();
                 all
             }
@@ -264,62 +273,37 @@ impl Tools {
         ])?;
         let table = a.str("table")?;
         let row = a.bytes("row")?;
-        let sel = Selection::parse(&a)?;
+        let sel = selection(&a)?;
         let max_value = self.max_value(&a)?;
+        // The backend's own resume, carried without being read here.
         let resume = match Cursor::decode(a.0).map_err(|m| Failure::usage(&m))? {
             None => None,
-            Some(Cursor::Row(b)) => {
-                Some(RowPosition::from_bytes(&b).map_err(|e| Failure::db("cursor", &e))?)
-            }
+            Some(Cursor::Row(b)) => Some(b),
             Some(_) => return Err(Failure::usage("cursor: not a read_row cursor")),
         };
-        let read = |e: pigeonhole::Error| Failure::db(&format!("read_row {table}"), &e);
         let mut budget = Budget::new(self.limits.result_bytes);
         let mut cells = Vec::new();
         let mut cut = None;
-        macro_rules! go {
-            ($t:expr) => {{
-                let mut r = $t.row(&row).versions(sel.versions);
-                if !sel.families.is_empty() {
-                    r = r.families(sel.families.iter().map(String::as_str));
+        let mut last: Option<Vec<u8>> = None;
+        self.db.read_row(
+            table,
+            &row,
+            &sel,
+            resume.as_deref(),
+            &mut |column, after| {
+                let column: Vec<Value> = column.iter().map(|c| cell_json(c, max_value)).collect();
+                if !budget.take(&column) {
+                    cut = last.take();
+                    return false;
                 }
-                if let Some(q) = &sel.qualifier_prefix {
-                    r = r.qualifier_prefix(q);
-                }
-                if let Some(q) = &sel.qualifier {
-                    r = r.qualifier_bounds(Bound::Included(q), Bound::Included(q));
-                }
-                if let Some(p) = &resume {
-                    r = r.resume_after(p);
-                }
-                // Pages of one cell end on column boundaries: each is one column, all its
-                // versions, and its position resumes after it.
-                let mut pages = r.pages(1).map_err(read)?;
-                let mut last = None;
-                loop {
-                    let column: Vec<Value> = match pages.next().map_err(read)? {
-                        None => break,
-                        Some(page) => page.iter().map(|e| cell_json(&e, max_value)).collect(),
-                    };
-                    if !budget.take(&column) {
-                        cut = last;
-                        break;
-                    }
-                    cells.extend(column);
-                    last = pages.position();
-                }
-            }};
-        }
-        match self.db.handle(table)? {
-            Handle::Writer(t) => go!(t),
-            Handle::Reader(t) => go!(t),
-        }
+                cells.extend(column);
+                last = Some(after);
+                true
+            },
+        )?;
         let mut out = object(json!({"table": table, "row": bytes_json(&row), "cells": cells}));
-        if let Some(p) = cut {
-            out.insert(
-                "cursor".into(),
-                Cursor::Row(p.to_bytes()).encode(a.0).into(),
-            );
+        if let Some(p) = cut.filter(|p| !p.is_empty()) {
+            out.insert("cursor".into(), Cursor::Row(p).encode(a.0).into());
         }
         Ok(out)
     }
@@ -340,7 +324,7 @@ impl Tools {
             "cursor",
         ])?;
         let table = a.str("table")?;
-        let sel = Selection::parse(&a)?;
+        let sel = selection(&a)?;
         let max_value = self.max_value(&a)?;
         let limit = a.u64_or("limit", 100, 1, MAX_ROWS)?;
         let columns = a.u64_or("columns_per_row", 100, 1, MAX_ROWS)?;
@@ -356,78 +340,74 @@ impl Tools {
             }
             Some(_) => return Err(Failure::usage("cursor: not a scan cursor")),
         }
-        let read = |e: pigeonhole::Error| Failure::db(&format!("scan {table}"), &e);
         let mut budget = Budget::new(self.limits.result_bytes);
         let mut rows = Vec::new();
         let mut cut = None;
-        macro_rules! go {
-            ($t:expr) => {{
-                let mut s = $t
-                    .scan_bounds(
-                        lo.as_ref().map(Vec::as_slice),
-                        hi.as_ref().map(Vec::as_slice),
-                    )
-                    .versions(sel.versions)
-                    .column_limit(columns as u32)
-                    // One row past the limit says whether there are more.
-                    .limit(limit + 1);
-                if !sel.families.is_empty() {
-                    s = s.families(sel.families.iter().map(String::as_str));
+        let range = (
+            lo.as_ref().map(Vec::as_slice),
+            hi.as_ref().map(Vec::as_slice),
+        );
+        // One row past the limit says whether there are more.
+        self.db.scan(
+            table,
+            range.0,
+            range.1,
+            &sel,
+            columns as u32,
+            limit + 1,
+            &mut |key, cells| {
+                let key = key.to_vec();
+                if rows.len() as u64 == limit {
+                    cut = Some(Cursor::Scan {
+                        key,
+                        inclusive: true,
+                    });
+                    return false;
                 }
-                if let Some(q) = &sel.qualifier_prefix {
-                    s = s.qualifier_prefix(q);
+                let mut cols: Vec<Vec<Value>> = Vec::new();
+                let mut at: Option<(&str, &[u8])> = None;
+                for e in &cells {
+                    if at != Some((e.family.as_str(), e.qualifier.as_slice())) {
+                        at = Some((e.family.as_str(), e.qualifier.as_slice()));
+                        cols.push(Vec::new());
+                    }
+                    cols.last_mut()
+                        .expect("pushed")
+                        .push(cell_json(e, max_value));
                 }
-                if let Some(q) = &sel.qualifier {
-                    s = s.qualifier_bounds(Bound::Included(q), Bound::Included(q));
+                let capped = cols.len() as u64 == columns;
+                let head = json!({"row": bytes_json(&key)});
+                let size = budget.size(&head) + cols.iter().map(|c| budget.sum(c)).sum::<usize>();
+                if budget.used + size <= budget.limit {
+                    budget.used += size;
+                    rows.push(row_json(&key, cols.concat(), capped, false));
+                    return true;
                 }
-                let mut it = s.iter().map_err(read)?;
-                while let Some(row) = it.next_ref().map_err(read)? {
-                    let key = row.key().to_vec();
-                    if rows.len() as u64 == limit {
-                        cut = Some(Cursor::Scan { key, inclusive: true });
+                if !rows.is_empty() {
+                    cut = Some(Cursor::Scan {
+                        key,
+                        inclusive: true,
+                    });
+                    return false;
+                }
+                // A first row too big for the result alone: as many columns as fit (one at
+                // least), and the scan goes on after it. read_row pages through the rest.
+                budget.used += budget.size(&head);
+                let mut kept = Vec::new();
+                for c in cols {
+                    if !kept.is_empty() && !budget.take(&c) {
                         break;
                     }
-                    let mut cols: Vec<Vec<Value>> = Vec::new();
-                    let mut at: Option<(&str, &[u8])> = None;
-                    for e in row.iter() {
-                        if at != Some((e.family, e.qualifier)) {
-                            at = Some((e.family, e.qualifier));
-                            cols.push(Vec::new());
-                        }
-                        cols.last_mut().expect("pushed").push(cell_json(&e, max_value));
-                    }
-                    let capped = cols.len() as u64 == columns;
-                    let head = json!({"row": bytes_json(&key)});
-                    let size = budget.size(&head) + cols.iter().map(|c| budget.sum(c)).sum::<usize>();
-                    if budget.used + size <= budget.limit {
-                        budget.used += size;
-                        rows.push(row_json(&key, cols.concat(), capped, false));
-                        continue;
-                    }
-                    if !rows.is_empty() {
-                        cut = Some(Cursor::Scan { key, inclusive: true });
-                        break;
-                    }
-                    // A first row too big for the result alone: as many columns as fit (one at
-                    // least), and the scan goes on after it. read_row pages through the rest.
-                    budget.used += budget.size(&head);
-                    let mut kept = Vec::new();
-                    for c in cols {
-                        if !kept.is_empty() && !budget.take(&c) {
-                            break;
-                        }
-                        kept.extend(c);
-                    }
-                    rows.push(row_json(&key, kept, capped, true));
-                    cut = Some(Cursor::Scan { key, inclusive: false });
-                    break;
+                    kept.extend(c);
                 }
-            }};
-        }
-        match self.db.handle(table)? {
-            Handle::Writer(t) => go!(t),
-            Handle::Reader(t) => go!(t),
-        }
+                rows.push(row_json(&key, kept, capped, true));
+                cut = Some(Cursor::Scan {
+                    key,
+                    inclusive: false,
+                });
+                false
+            },
+        )?;
         let mut out = object(json!({"table": table, "rows": rows}));
         if let Some(c) = cut {
             out.insert("cursor".into(), c.encode(a.0).into());
@@ -468,27 +448,16 @@ impl Tools {
             Some(_) => return Err(Failure::usage("cursor: not a traverse cursor")),
         };
         let seeds = KeySet::from_unsorted(&seeds);
-        let read = |e: pigeonhole::Error| Failure::db(&format!("traverse {table}"), &e);
-        macro_rules! go {
-            ($t:expr) => {{
-                let mut t = $t
-                    .traverse(&seeds)
-                    .family(family)
-                    .hops(hops)
-                    .max_nodes(max_nodes)
-                    .parents(parents);
-                if let Some(n) = per_node {
-                    t = t.per_node_limit(n as u32);
-                }
-                if let Some(n) = hop_limit {
-                    t = t.hop_limit(n);
-                }
-                if let Some(q) = &qualifier_prefix {
-                    t = t.qualifier_prefix(q);
-                }
-                t.run().map_err(read)?
-            }};
-        }
+        let args = TraverseArgs {
+            family,
+            seeds: &seeds,
+            hops,
+            per_node_limit: per_node.map(|n| n as u32),
+            hop_limit,
+            max_nodes,
+            parents,
+            qualifier_prefix: qualifier_prefix.as_deref(),
+        };
         // A cursor of the cached run pages from it (#1254). Otherwise (no cursor, or its run
         // is no longer cached) the traversal runs: it is deterministic, so over unchanged
         // data the pages of a re-run join up exactly.
@@ -505,30 +474,29 @@ impl Tools {
         });
         let (traversal, run) = match cached {
             Some(c) => (c.traversal, c.run),
-            None => {
-                let t = match self.db.handle(table)? {
-                    Handle::Writer(t) => go!(t),
-                    Handle::Reader(t) => go!(t),
-                };
-                (t, self.runs.fetch_add(1, Ordering::Relaxed))
-            }
+            None => (
+                self.db.traverse(table, &args)?,
+                self.runs.fetch_add(1, Ordering::Relaxed),
+            ),
         };
         let mut budget = Budget::new(self.limits.result_bytes);
         let mut out_hops = Vec::new();
         let mut cut = None;
-        'hops: for (h, hop) in traversal.hops().iter().enumerate().skip(from_hop) {
-            let prev = if h == 0 {
-                &seeds
-            } else {
-                traversal.hops()[h - 1].nodes()
+        'hops: for (h, hop) in traversal.hops.iter().enumerate().skip(from_hop) {
+            let prev = |i: usize| -> &[u8] {
+                if h == 0 {
+                    seeds.get(i)
+                } else {
+                    &traversal.hops[h - 1].nodes[i]
+                }
             };
             let first = if h == from_hop { from_index } else { 0 };
             let mut nodes = Vec::new();
-            for (i, node) in hop.nodes().iter().enumerate().skip(first) {
-                let v = match hop.parents() {
+            for (i, node) in hop.nodes.iter().enumerate().skip(first) {
+                let v = match &hop.parents {
                     Some(p) => json!({
                         "node": bytes_json(node),
-                        "parent": bytes_json(prev.get(p[i] as usize)),
+                        "parent": bytes_json(prev(p[i] as usize)),
                     }),
                     None => bytes_json(node),
                 };
@@ -538,36 +506,26 @@ impl Tools {
                         index: i as u64,
                         run,
                     });
-                    out_hops.push(hop_json(h, first, hop.nodes().len(), nodes));
+                    out_hops.push(hop_json(h, first, hop.nodes.len(), nodes));
                     break 'hops;
                 }
                 nodes.push(v);
             }
-            out_hops.push(hop_json(h, first, hop.nodes().len(), nodes));
+            out_hops.push(hop_json(h, first, hop.nodes.len(), nodes));
         }
-        let stats = traversal.stats();
         let mut out = object(json!({
             "table": table,
             "hops": out_hops,
             "stats": {
-                "rows": stats.rows,
-                "edges": stats.edges,
-                "cut_by_max_nodes": stats.cut_by_max_nodes,
+                "rows": traversal.rows,
+                "edges": traversal.edges,
+                "cut_by_max_nodes": traversal.cut_by_max_nodes,
             },
         }));
         if let Some(c) = cut {
             out.insert("cursor".into(), c.encode(a.0).into());
             // Kept for the cursor's next page, unless too large (then it runs again).
-            let bytes: usize = traversal
-                .hops()
-                .iter()
-                .map(|h| {
-                    let parents = if h.parents().is_some() { 4 } else { 0 };
-                    (0..h.nodes().len())
-                        .map(|i| h.nodes().get(i).len() + parents)
-                        .sum::<usize>()
-                })
-                .sum();
+            let bytes = traversal.bytes();
             if bytes <= self.limits.cache_bytes {
                 *self.traversal.lock().expect("not poisoned") = Some(CachedTraversal {
                     fingerprint,
@@ -616,44 +574,25 @@ impl Tools {
         let query = a
             .get("query")
             .ok_or_else(|| Failure::usage("query is required"))?;
-        let read = |e: pigeonhole::Error| Failure::db(&format!("nearest {table}"), &e);
-        macro_rules! go {
-            ($t:expr) => {{
-                let spec = $t
-                    .family_info(family)
-                    .ok_or_else(|| Failure::family_not_found(table, family))?
-                    .vector
-                    .ok_or_else(|| {
-                        Failure::usage(&format!(
-                            "family: {family} is not a vector family (list_tables shows each \
-                             family's vector spec)"
-                        ))
-                    })?;
-                let query = Query::parse(query, &spec)?;
-                let mut s = $t
-                    .scan_bounds(
-                        lo.as_ref().map(Vec::as_slice),
-                        hi.as_ref().map(Vec::as_slice),
-                    )
-                    .family(family);
-                if let Some(q) = &qualifier_prefix {
-                    s = s.qualifier_prefix(q);
-                }
-                if let Some(q) = &qualifier {
-                    s = s.qualifier_bounds(Bound::Included(q), Bound::Included(q));
-                }
-                let n = match &query {
-                    Query::F32(q) => s.nearest_f32(q, k),
-                    Query::I8(q) => s.nearest_i8(q, k),
-                    Query::Bits(q) => s.nearest_bits(q, k),
-                };
-                (spec, n.run().map_err(read)?)
-            }};
-        }
-        let (spec, found) = match self.db.handle(table)? {
-            Handle::Writer(t) => go!(t),
-            Handle::Reader(t) => go!(t),
-        };
+        let spec = *self.family(table, family)?.vector().ok_or_else(|| {
+            Failure::usage(&format!(
+                "family: {family} is not a vector family (list_tables shows each family's \
+                     vector spec)"
+            ))
+        })?;
+        let query = Query::parse(query, &spec)?;
+        let found = self.db.nearest(
+            table,
+            &NearestArgs {
+                family,
+                lo: lo.as_ref().map(Vec::as_slice),
+                hi: hi.as_ref().map(Vec::as_slice),
+                qualifier: qualifier.as_deref(),
+                qualifier_prefix: qualifier_prefix.as_deref(),
+                query: &query,
+                k,
+            },
+        )?;
         let mut budget = Budget::new(self.limits.result_bytes);
         let mut neighbours = Vec::new();
         let mut truncated = false;
@@ -684,26 +623,32 @@ impl Tools {
     }
 
     fn feed_poll(&self, a: Args<'_>) -> Outcome {
-        let p = self.feed_poll_open(&a)?;
-        self.feed_poll_gather(p)
+        let p = self.feed_poll_args(a.0)?;
+        let feed = self.db.feed(&p.feed())?;
+        self.feed_poll_gather(feed, &p)
     }
 
-    /// For `phdb serve`'s `/mcp` (the audit's F7): the feed a `feed_poll` call with these
-    /// arguments reads, and how long it would wait for its first commit, so the server can
-    /// wait for that asynchronously (`Feed::poll_next`) and then run the call without a wait,
-    /// never holding a blocking-pool thread for it. `None` without a wait, or when the
-    /// arguments or the open fail: the call itself then reports that.
+    /// For `phdb serve`'s `/mcp` (simp724's M2 on #1915 PR 3): a `feed_poll` that takes what
+    /// is ready, its wait having been taken already, before the message's `/mcp` place: from
+    /// `feed` if the server opened and waited on it, else from a feed it opens.
     #[cfg(feature = "serve")]
-    pub(crate) fn feed_poll_waiter(
+    pub(crate) fn feed_poll_now(
         &self,
         args: &Map<String, Value>,
-    ) -> Option<(pigeonhole::Feed, std::time::Duration)> {
-        let p = self.feed_poll_open(&Args(args)).ok()?;
-        (!p.wait.is_zero()).then_some((p.feed, p.wait))
+        feed: Option<Box<dyn FeedSource + '_>>,
+    ) -> Outcome {
+        let mut p = self.feed_poll_args(args)?;
+        p.wait = std::time::Duration::ZERO;
+        let feed = match feed {
+            Some(f) => f,
+            None => self.db.feed(&p.feed())?,
+        };
+        self.feed_poll_gather(feed, &p)
     }
 
-    /// `feed_poll`'s arguments checked, and its feed opened.
-    fn feed_poll_open(&self, a: &Args<'_>) -> Result<FeedPoll, Failure> {
+    /// `feed_poll`'s arguments, checked.
+    pub(crate) fn feed_poll_args(&self, args: &Map<String, Value>) -> Result<FeedPoll, Failure> {
+        let a = &Args(args);
         a.only(&[
             "tables",
             "prefix",
@@ -714,8 +659,8 @@ impl Tools {
             "wait_ms",
             "max_value_bytes",
         ])?;
-        let names = a.str_list("tables")?;
-        if names.is_empty() {
+        let tables = a.str_list("tables")?;
+        if tables.is_empty() {
             return Err(Failure::usage("tables: at least one table name"));
         }
         let prefix = a.opt_bytes("prefix")?;
@@ -731,74 +676,42 @@ impl Tools {
         if token.is_some() && from_oldest {
             return Err(Failure::usage("token or from_oldest, not both"));
         }
-        let visible = a.bool_or("visible", false)?;
-        let max_commits = a.u64_or("max_commits", 100, 1, MAX_COMMITS)? as usize;
-        let wait = std::time::Duration::from_millis(a.u64_or("wait_ms", 0, 0, MAX_WAIT_MS)?);
-        let max_value = self.max_value(a)?;
-        // As the writer or as a reader process (D310 PR 4, #1361): a reader follows the
-        // writer's feed from shared memory, so `--read-only` serves it too.
-        let mut handles = Vec::with_capacity(names.len());
-        for n in &names {
-            handles.push(self.db.handle(n)?);
-        }
-        let start = |h: &Handle| match h {
-            Handle::Writer(t) => t.feed(),
-            Handle::Reader(t) => t.feed(),
-        };
-        let mut b = start(&handles[0]);
-        for h in &handles[1..] {
-            b = match h {
-                Handle::Writer(t) => b.table(t),
-                Handle::Reader(t) => b.read_table(t),
-            };
-        }
-        if let Some(p) = &prefix {
-            b = b.prefix(p);
-        }
-        if visible {
-            b = b.visible();
-        }
-        if from_oldest {
-            b = b.from_oldest();
-        }
-        if let Some(t) = token {
-            b = b.resume(&pigeonhole::FeedToken::from_bytes(t));
-        }
-        let feed = b.open().map_err(feed_failure)?;
         Ok(FeedPoll {
-            feed,
-            max_commits,
-            wait,
-            max_value,
+            tables,
+            prefix,
+            token,
+            from_oldest,
+            visible: a.bool_or("visible", false)?,
+            max_commits: a.u64_or("max_commits", 100, 1, MAX_COMMITS)? as usize,
+            wait: std::time::Duration::from_millis(a.u64_or("wait_ms", 0, 0, MAX_WAIT_MS)?),
+            max_value: self.max_value(a)?,
         })
     }
 
     /// `feed_poll`'s commits from its open feed: the first waited for up to its wait.
-    fn feed_poll_gather(&self, p: FeedPoll) -> Outcome {
-        let FeedPoll {
-            mut feed,
-            max_commits,
-            wait,
-            max_value,
-        } = p;
+    pub(crate) fn feed_poll_gather(
+        &self,
+        mut feed: Box<dyn FeedSource + '_>,
+        p: &FeedPoll,
+    ) -> Outcome {
         let mut budget = Budget::new(self.limits.result_bytes);
         let start = feed.token();
-        let (commits, token, more) = gather(max_commits, &mut budget, start, |first| {
+        let (commits, token, more) = gather(p.max_commits, &mut budget, start, |first| {
             // Wait for the first commit only; then take what is ready.
             let next = if first {
-                feed.next(wait)
+                feed.next(p.wait)
             } else {
                 feed.try_next()
             };
-            let v = match next.map_err(feed_failure)? {
-                Some(c) => commit_json(c, max_value),
+            let v = match next? {
+                Some(c) => commit_json(&c, p.max_value),
                 None => return Ok(None),
             };
             Ok(Some((v, feed.token())))
         })?;
         let mut out = object(json!({
             "commits": commits,
-            "token": base64_encode(token.as_bytes()),
+            "token": base64_encode(&token),
         }));
         if more {
             out.insert("more".into(), true.into());
@@ -816,48 +729,38 @@ impl Tools {
                 "ops: between 1 and {MAX_ITEMS} operations"
             )));
         }
-        let Some(db) = self.db.writer().filter(|_| self.writable) else {
+        if !self.writable || !self.db.writes() {
             return Err(Failure::read_only(self.db.mode()));
-        };
-        // Every table first: the batch borrows them.
-        let mut tables: HashMap<String, Table> = HashMap::new();
-        for (i, op) in ops.iter().enumerate() {
-            let name = op["table"]
-                .as_str()
-                .ok_or_else(|| Failure::usage(&format!("ops[{i}]: table: a table name")))?;
-            if !tables.contains_key(name) {
-                let t = self
-                    .db
-                    .open_for_write(name)
-                    .ok_or_else(|| Failure::read_only(self.db.mode()))?
-                    .map_err(|f| f.within(&format!("ops[{i}]")))?;
-                tables.insert(name.to_owned(), t);
-            }
         }
-        let mut batch = db.write_batch();
+        // Each table's families, once: the operations are checked against them, and a
+        // table that doesn't exist fails here, naming its operation.
+        let mut families: HashMap<String, Vec<FamilyDef>> = HashMap::new();
+        let mut writes = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
             let Value::Object(op) = op else {
                 return Err(Failure::usage(&format!("ops[{i}]: an object")));
             };
-            write_op(&mut batch, &tables, Args(op)).map_err(|f| f.within(&format!("ops[{i}]")))?;
+            let w = (|| {
+                let args = Args(op);
+                let name = args.str("table")?;
+                if !families.contains_key(name) {
+                    let fs = self.db.families(name)?;
+                    families.insert(name.to_owned(), fs);
+                }
+                write_op(&families[name], Args(op))
+            })()
+            .map_err(|f| f.within(&format!("ops[{i}]")))?;
+            writes.push(w);
         }
-        let n = batch.len();
-        let info = batch.commit().map_err(|e| {
-            let f = Failure::db("write", &e);
-            // The library's message may name its Rust methods; say what to check here.
-            if e.code() == pigeonhole::ErrorCode::InvalidArgument {
-                f.hint("check each family's kind and options with list_tables")
-            } else {
-                f
-            }
-        })?;
-        Ok(object(json!({"committed": n, "seqno": info.seqno})))
+        let n = writes.len();
+        let seqno = self.db.write(&writes)?;
+        Ok(object(json!({"committed": n, "seqno": seqno})))
     }
 
     fn create_table(&self, a: Args<'_>) -> Outcome {
         a.only(&["table", "families"])?;
         let table = a.str("table")?;
-        if self.db.writer().is_none() || !self.writable {
+        if !self.writes() {
             return Err(Failure::read_only(self.db.mode()));
         }
         let Some(Value::Array(families)) = a.0.get("families") else {
@@ -873,21 +776,29 @@ impl Tools {
                 other => other.clone(),
             };
             specs.push(
-                family_from_json(&spec)
+                family_def_from_json(&spec)
                     .map_err(|m| Failure::usage(&format!("families[{i}]: {m}")))?,
             );
         }
-        let t = self
+        // After the families, as the library checks them: the same refusal on every backend.
+        if table.is_empty() {
+            return Err(Failure::coded(
+                pigeonhole::ErrorCode::InvalidArgument,
+                "create_table: empty table name".into(),
+            ));
+        }
+        let families: Vec<Value> = self
             .db
-            .create_table(table, specs)
-            .ok_or_else(|| Failure::read_only(self.db.mode()))??;
-        let families: Vec<Value> = t
-            .families()
-            .into_iter()
-            .filter_map(|f| t.family_info(f))
-            .map(|f| family_brief(&f))
+            .create_table(table, &specs)?
+            .iter()
+            .map(family_brief)
             .collect();
         Ok(object(json!({"table": table, "families": families})))
+    }
+
+    /// Whether this session's writes can succeed.
+    fn writes(&self) -> bool {
+        self.writable && self.db.writes()
     }
 
     /// A read's value limit: its `max_value_bytes`, at most the result limit.
@@ -903,21 +814,23 @@ impl Tools {
     }
 }
 
-/// One `write` operation, added to `batch`.
-fn write_op(
-    batch: &mut pigeonhole::WriteBatch,
-    tables: &HashMap<String, Table>,
-    op: Args<'_>,
-) -> Result<(), Failure> {
+/// One `write` operation, checked against its table's `families`.
+fn write_op(families: &[FamilyDef], op: Args<'_>) -> Result<RowWrite, Failure> {
     let usage = |m: String| Failure::usage(&m);
     let kind = op.str("op")?;
-    let t = &tables[op.str("table")?];
+    let table = op.str("table")?;
     let row = op.bytes("row")?;
     let ts = op.opt_u64("ts", 0, u64::MAX)?;
     let family = op.opt_str("family")?;
     let qualifier = op.opt_bytes("qualifier")?;
+    let def = |f: &str| {
+        families
+            .iter()
+            .find(|d| d.name == f)
+            .ok_or_else(|| Failure::family_not_found(table, f))
+    };
     let column = || match (family, &qualifier) {
-        (Some(f), Some(q)) => Ok((f, q.as_slice())),
+        (Some(f), Some(q)) => Ok((f.to_owned(), q.clone())),
         _ => Err(usage(format!("{kind} needs a family and a qualifier"))),
     };
     let value = || {
@@ -925,29 +838,21 @@ fn write_op(
             .ok_or_else(|| usage(format!("{kind} needs a value")))
     };
     let value_of = |v: &Value| value_from_json(v).map_err(|m| usage(format!("value: {m}")));
-    match kind {
+    let op_of = match kind {
         "put" => {
             op.only(&["op", "table", "row", "family", "qualifier", "value", "ts"])?;
             let (f, q) = column()?;
-            match (value_of(value()?)?, ts) {
-                (JsonValue::Bytes(b), None) => batch.put(t, &row, f, q, &b),
-                (JsonValue::Bytes(b), Some(ts)) => batch.put_at(t, &row, f, q, ts, &b),
-                (JsonValue::I64(n), None) => batch.put_i64(t, &row, f, q, n),
-                (JsonValue::I64(n), Some(ts)) => batch.put_i64_at(t, &row, f, q, ts, n),
-                (JsonValue::F64(x), None) => batch.put_f64(t, &row, f, q, x),
-                (JsonValue::F64(x), Some(ts)) => batch.put_f64_at(t, &row, f, q, ts, x),
-                (
-                    JsonValue::Vector {
-                        element,
-                        dim,
-                        components,
-                    },
-                    ts,
-                ) => {
-                    let spec = t
-                        .family_info(f)
-                        .ok_or_else(|| Failure::family_not_found(t.name(), f))?
-                        .vector
+            let value = match value_of(value()?)? {
+                JsonValue::Bytes(b) => CellValue::Bytes(b),
+                JsonValue::I64(n) => CellValue::I64(n),
+                JsonValue::F64(x) => CellValue::F64(x),
+                JsonValue::Vector {
+                    element,
+                    dim,
+                    components,
+                } => {
+                    let spec = *def(&f)?
+                        .vector()
                         .ok_or_else(|| usage(format!("put: {f} is not a vector family")))?;
                     if spec.element() != element || spec.dim() != dim {
                         return Err(usage(format!(
@@ -957,27 +862,26 @@ fn write_op(
                             spec.dim()
                         )));
                     }
-                    match (components, ts) {
-                        (Components::Floats(xs), None) => batch.put_vector_f32(t, &row, f, q, &xs),
-                        (Components::Floats(xs), Some(ts)) => {
-                            batch.put_vector_f32_at(t, &row, f, q, ts, &xs)
-                        }
-                        (Components::Ints(xs), None) => batch.put_vector_i8(t, &row, f, q, &xs),
-                        (Components::Ints(xs), Some(ts)) => {
-                            batch.put_vector_i8_at(t, &row, f, q, ts, &xs)
-                        }
-                        (Components::Bits(b), None) => batch.put_vector_bits(t, &row, f, q, &b),
-                        (Components::Bits(b), Some(ts)) => {
-                            batch.put_vector_bits_at(t, &row, f, q, ts, &b)
-                        }
+                    let v = match components {
+                        Components::Floats(xs) => pigeonhole::Vector::from_f32(&xs),
+                        Components::Ints(xs) => pigeonhole::Vector::from_i8(&xs),
+                        Components::Bits(b) => pigeonhole::Vector::from_bits(dim, &b),
                     }
+                    .map_err(|e| usage(format!("put: {e}")))?;
+                    CellValue::Vector(v)
                 }
             };
+            WriteOp::Put {
+                family: f,
+                qualifier: q,
+                ts,
+                value,
+            }
         }
         "incr" => {
             op.only(&["op", "table", "row", "family", "qualifier", "value", "ts"])?;
             let (f, q) = column()?;
-            if !is_counter(t, f)? {
+            if !is_counter(def(&f)?) {
                 return Err(usage(format!(
                     "incr adds to a counter (sum) family, and {f} is not one: use put for a \
                      plain family, aggregate for another aggregate family (list_tables shows \
@@ -989,82 +893,73 @@ fn write_op(
                 .as_i64()
                 .or_else(|| v.get("i64").and_then(Value::as_i64))
                 .ok_or_else(|| usage("incr: value is an integer delta".into()))?;
-            match ts {
-                None => batch.incr(t, &row, f, q, delta),
-                Some(ts) => batch.incr_at(t, &row, f, q, ts, delta),
-            };
+            WriteOp::Incr {
+                family: f,
+                qualifier: q,
+                ts,
+                delta,
+            }
         }
         "aggregate" => {
             op.only(&["op", "table", "row", "family", "qualifier", "value", "ts"])?;
             let (f, q) = column()?;
-            let Some(agg) = family_kind(t, f)? else {
+            let Some(agg) = def(&f)?.aggregation().cloned() else {
                 return Err(usage(format!(
                     "aggregate writes to an aggregate family, and {f} is a plain family: use put"
                 )));
             };
-            match (aggregate_input(&agg, value()?)?, ts) {
-                (Input::I64(n), None) => batch.aggregate(t, &row, f, q, n),
-                (Input::I64(n), Some(ts)) => batch.aggregate_at(t, &row, f, q, ts, n),
-                (Input::U64(n), None) => batch.aggregate_u64(t, &row, f, q, n),
-                (Input::U64(n), Some(ts)) => batch.aggregate_u64_at(t, &row, f, q, ts, n),
-                (Input::F64(x), None) => batch.aggregate_f64(t, &row, f, q, x),
-                (Input::F64(x), Some(ts)) => batch.aggregate_f64_at(t, &row, f, q, ts, x),
-                (Input::Bytes(b), None) => batch.aggregate_bytes(t, &row, f, q, &b),
-                (Input::Bytes(b), Some(ts)) => batch.aggregate_bytes_at(t, &row, f, q, ts, &b),
-            };
+            WriteOp::Aggregate {
+                input: aggregate_input(&agg, value()?)?,
+                family: f,
+                qualifier: q,
+                ts,
+            }
         }
         "delete" => {
             op.only(&["op", "table", "row", "family", "qualifier", "ts"])?;
             match (family, &qualifier, ts) {
-                (None, None, None) => batch.delete_row(t, &row),
-                (Some(f), None, None) => batch.delete_family(t, &row, f),
-                (Some(f), Some(q), None) => batch.delete_column(t, &row, f, q),
-                (Some(f), Some(q), Some(ts)) => batch.delete_cell(t, &row, f, q, ts),
+                (None, None, None) => WriteOp::DeleteRow,
+                (Some(f), None, None) => WriteOp::DeleteFamily {
+                    family: f.to_owned(),
+                },
+                (Some(f), Some(q), None) => WriteOp::DeleteColumn {
+                    family: f.to_owned(),
+                    qualifier: q.clone(),
+                },
+                (Some(f), Some(q), Some(ts)) => WriteOp::DeleteCell {
+                    family: f.to_owned(),
+                    qualifier: q.clone(),
+                    ts,
+                },
                 _ => {
                     return Err(usage(
                         "delete: a qualifier needs its family, and ts needs both".into(),
                     ));
                 }
-            };
+            }
         }
         other => {
             return Err(usage(format!(
                 "op: {other:?} is not put, incr, aggregate or delete"
             )));
         }
-    }
-    Ok(())
-}
-
-/// `family`'s aggregation in `t`: `None` for a plain family. A family `t` doesn't have
-/// fails with `FamilyNotFound`, as the commit would.
-fn family_kind(t: &Table, family: &str) -> Result<Option<Aggregation>, Failure> {
-    match t.family_info(family) {
-        Some(info) => Ok(info.aggregation),
-        None => Err(Failure::family_not_found(t.name(), family)),
-    }
+    };
+    Ok(RowWrite {
+        table: table.to_owned(),
+        row,
+        op: op_of,
+    })
 }
 
 /// Whether `incr` adds to `family`: a counter (`sum`) family, or a standard family that
 /// names the built-in `i64` add operator, as 0.1.0 made counters (D41).
-fn is_counter(t: &Table, family: &str) -> Result<bool, Failure> {
-    let info = t
-        .family_info(family)
-        .ok_or_else(|| Failure::family_not_found(t.name(), family))?;
-    Ok(matches!(info.aggregation, Some(Aggregation::Sum))
-        || info.merge_operator.as_deref() == Some(I64_ADD))
+fn is_counter(f: &FamilyDef) -> bool {
+    matches!(f.aggregation(), Some(Aggregation::Sum))
+        || f.merge_operator.as_deref() == Some(I64_ADD)
 }
 
 /// D41's counter operator.
 const I64_ADD: &str = "pigeonhole.i64_add";
-
-/// An aggregate family's input.
-enum Input {
-    I64(i64),
-    U64(u64),
-    F64(f64),
-    Bytes(Vec<u8>),
-}
 
 /// `v` as an input to a family of kind `agg`, by the family's kind rather than the JSON
 /// number's shape: an agent writes `3` to an f64 family as often as `3.0`.
@@ -1100,26 +995,17 @@ fn aggregate_input(agg: &Aggregation, v: &Value) -> Result<Input, Failure> {
 }
 
 /// The selection `read_row` and `scan` share.
-struct Selection {
-    families: Vec<String>,
-    qualifier: Option<Vec<u8>>,
-    qualifier_prefix: Option<Vec<u8>>,
-    versions: u32,
-}
-
-impl Selection {
-    fn parse(a: &Args<'_>) -> Result<Self, Failure> {
-        let s = Self {
-            families: a.str_list("families")?,
-            qualifier: a.opt_bytes("qualifier")?,
-            qualifier_prefix: a.opt_bytes("qualifier_prefix")?,
-            versions: a.u64_or("versions", 1, 1, MAX_VERSIONS)? as u32,
-        };
-        if s.qualifier.is_some() && s.qualifier_prefix.is_some() {
-            return Err(Failure::usage("qualifier or qualifier_prefix, not both"));
-        }
-        Ok(s)
+fn selection(a: &Args<'_>) -> Result<Selection, Failure> {
+    let s = Selection {
+        families: a.str_list("families")?,
+        qualifier: a.opt_bytes("qualifier")?,
+        qualifier_prefix: a.opt_bytes("qualifier_prefix")?,
+        versions: a.u64_or("versions", 1, 1, MAX_VERSIONS)? as u32,
+    };
+    if s.qualifier.is_some() && s.qualifier_prefix.is_some() {
+        return Err(Failure::usage("qualifier or qualifier_prefix, not both"));
     }
+    Ok(s)
 }
 
 /// A result's size so far, in bytes of JSON.
@@ -1161,46 +1047,37 @@ impl Budget {
 
 /// A cell in a read's result: `dump`'s shape without the table and row, with a byte value
 /// longer than `max_value` replaced by its length.
-fn cell_json(e: &CellEntry<'_>, max_value: usize) -> Value {
-    let value = typed_json(e.cell.typed(), max_value);
+fn cell_json(e: &CellOut, max_value: usize) -> Value {
     json!({
         "family": e.family,
-        "qualifier": bytes_json(e.qualifier),
-        "ts": e.cell.timestamp(),
-        "value": value,
+        "qualifier": bytes_json(&e.qualifier),
+        "ts": e.ts,
+        "value": typed_json(&e.value, max_value),
     })
 }
 
-/// A `feed_poll` call's open feed and its limits.
-struct FeedPoll {
-    feed: pigeonhole::Feed,
-    max_commits: usize,
-    wait: std::time::Duration,
+/// A `feed_poll` call's checked arguments.
+pub(crate) struct FeedPoll {
+    tables: Vec<String>,
+    prefix: Option<Vec<u8>>,
+    token: Option<Vec<u8>>,
+    from_oldest: bool,
+    visible: bool,
+    pub(crate) max_commits: usize,
+    pub(crate) wait: std::time::Duration,
     max_value: usize,
 }
 
-/// A `feed_poll` failure, with a hint for the codes a caller can act on.
-fn feed_failure(e: pigeonhole::Error) -> Failure {
-    let f = Failure::db("feed_poll", &e);
-    match e.code() {
-        pigeonhole::ErrorCode::FeedExpired => f.hint(
-            "the history this token needs is gone: re-read the tables (scan) and \
-             call feed_poll again without a token",
-        ),
-        pigeonhole::ErrorCode::SnapshotExpired => f.hint(
-            "the application is restarting under this reader: call feed_poll again \
-             with the same token",
-        ),
-        pigeonhole::ErrorCode::NoWriter => f.hint(
-            "the application isn't running: call feed_poll again with the same token \
-             once it is",
-        ),
-        pigeonhole::ErrorCode::InvalidArgument => f.hint(
-            "the database's change feed must be on (the application's, or \
-             --change-feed) and follow these tables, and the token must come from this \
-             database",
-        ),
-        _ => f,
+impl FeedPoll {
+    /// The feed it reads.
+    pub(crate) fn feed(&self) -> FeedArgs<'_> {
+        FeedArgs {
+            tables: &self.tables,
+            prefix: self.prefix.as_deref(),
+            token: self.token.as_deref(),
+            from_oldest: self.from_oldest,
+            visible: self.visible,
+        }
     }
 }
 
@@ -1239,55 +1116,44 @@ fn gather<T, E>(
 
 /// A change-feed commit in a `feed_poll` result: its changes in `dump`'s shapes, a value
 /// longer than `max_value` replaced as reads replace it.
-fn commit_json(c: &pigeonhole::Commit, max_value: usize) -> Value {
+fn commit_json(c: &CommitOut, max_value: usize) -> Value {
     let changes: Vec<Value> = c
-        .changes()
+        .changes
         .iter()
         .map(|ch| {
             let mut m = object(json!({
-                "table": ch.table(),
-                "family": ch.family(),
-                "kind": change_kind(ch.kind()),
-                "row": bytes_json(ch.row()),
-                "qualifier": bytes_json(ch.qualifier()),
-                "ts": ch.timestamp(),
+                "table": ch.table,
+                "family": ch.family,
+                "kind": ch.kind,
+                "row": bytes_json(&ch.row),
+                "qualifier": bytes_json(&ch.qualifier),
+                "ts": ch.ts,
             }));
-            if let Some(v) = ch.value() {
+            if let Some(v) = &ch.value {
                 m.insert("value".into(), typed_json(v, max_value));
             }
             Value::Object(m)
         })
         .collect();
-    json!({"seqno": c.seqno(), "ts": c.timestamp(), "changes": changes})
-}
-
-fn change_kind(kind: pigeonhole::ChangeKind) -> &'static str {
-    use pigeonhole::ChangeKind as K;
-    match kind {
-        K::Put => "put",
-        K::Merge => "merge",
-        K::DeleteCell => "delete_cell",
-        K::DeleteColumn => "delete_column",
-        K::DeleteFamily => "delete_family",
-        _ => "unknown",
-    }
+    json!({"seqno": c.seqno, "ts": c.ts, "changes": changes})
 }
 
 /// A value in a result: `dump`'s shape, with a byte value longer than `max_value` replaced
 /// by its length, and a vector whose payload is, by its shape.
-fn typed_json(v: Cell<'_>, max_value: usize) -> Value {
-    match v {
-        Cell::Bytes(b) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
-        Cell::Vector(v) if v.as_bytes().len() > max_value => json!({
+fn typed_json(v: &CellValue, max_value: usize) -> Value {
+    match v.value() {
+        Some(Cell::Bytes(b)) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
+        Some(Cell::Vector(v)) if v.as_bytes().len() > max_value => json!({
             "omitted_vector": {"element": element_name(v.element()), "dim": v.dim()},
         }),
-        v => value_json(v),
+        Some(v) => value_json(v),
+        None => json!({ "unknown_type": true }),
     }
 }
 
 /// A family's options as `phdb info` shows them, without the unset ones.
-fn family_brief(f: &pigeonhole::FamilyInfo) -> Value {
-    let mut m = family_json(f);
+fn family_brief(f: &FamilyDef) -> Value {
+    let mut m = f.json();
     m.retain(|_, v| !v.is_null());
     Value::Object(m)
 }
@@ -1330,13 +1196,6 @@ fn key_range(a: &Args<'_>, tool: &str) -> Result<KeyRange, Failure> {
             end.map_or(Bound::Unbounded, Bound::Excluded),
         ),
     })
-}
-
-/// A `nearest` query, in its family's element type.
-enum Query {
-    F32(Vec<f32>),
-    I8(Vec<i8>),
-    Bits(Vec<u8>),
 }
 
 impl Query {

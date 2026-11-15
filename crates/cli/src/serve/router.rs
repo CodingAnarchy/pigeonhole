@@ -550,7 +550,7 @@ impl Router {
     /// keeps this future within a margin of `Service::call`'s; one of them that outgrows it
     /// is boxed as the others are. The serve callgrind shapes (`serveshapes.rs`) count what
     /// a growth of `Service::call` itself costs.
-    async fn dispatch_by(
+    pub(crate) async fn dispatch_by(
         &self,
         op: ServiceOp,
         caller: &Caller,
