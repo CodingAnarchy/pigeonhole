@@ -369,6 +369,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 | Set | Bit | Feature |
 |---|---|---|
 | `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 15, and a family's `kind_params`, §9.2.1), and vector families with value tag `0x04` (D303; `kind` 16, §3.7). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 1 | WAL pad fragments (D327, §10.2 fragment type 5): a stream's WAL may hold padding before a record, which a build without D327 refuses mid-replay. Set, in both pages, at an open that enables padding, before any WAL write; never cleared (sticky), since retained feed segments (D310, §10.4) can keep pads long after a checkpoint. |
 | `ro_compat` | 0 | A replica's state (D315 PR 3): the reserved table of §9's rule, created by a replica's first apply. Set, in both pages, before the manifest commit that creates it, so a build that doesn't know it opens the file read-only and can't drop the replica's state or write into the tables it mirrors. Created only by a replica's bootstrap or its first apply, and kept while the table exists. Promoting a replica to a primary (#1436, ICR 0125) drops the table in one manifest commit, then clears the bit in both pages before the next one, once the drop is durable; a writable open that finds the bit with no state table (a crash between the two) clears it. |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
@@ -526,10 +527,12 @@ Frames 1.. hold **fragments**. Fragment header (12 bytes):
 | 0 | 4 | `crc` u32: CRC32C of header bytes 4..12 followed by the payload |
 | 4 | 4 | `epoch` u32: must equal the segment's epoch |
 | 8 | 2 | `len` u16: payload length |
-| 10 | 1 | `type`: 1 Full, 2 First, 3 Middle, 4 Last (0 = unused space) |
+| 10 | 1 | `type`: 1 Full, 2 First, 3 Middle, 4 Last, 5 Pad (D327, `incompat` bit 1) (0 = unused space) |
 | 11 | 1 | reserved |
 
 A record that fits in the rest of the current frame is one Full fragment; otherwise it is split into First, Middle..., Last fragments across frames. Fragments never span frames. If 12 bytes or fewer remain in a frame (no room for a header and any payload), the writer zero-pads them, the reader skips them whatever they contain, and the next fragment starts at the next frame. So every fragment carries payload except the Full fragment of an empty record. A record never spans segments: if it does not fit, the writer moves to a new segment. A record larger than a segment's payload fails with `RecordTooLarge`.
+
+**Pad fragments (D327, `incompat` bit 1).** A Pad fragment's payload is `len` zero bytes, covered by its CRC like any fragment's. It sits only between records: a writer puts one directly before a record's first fragment, in the same write, so the record starts at a multiple of the writer's alignment unit (a power of two from 32 bytes to a frame, so a pad never crosses a frame; a gap shorter than a header pads to the boundary after it, and a frame tail of 12 bytes or fewer is skipped as before). The reader steps over an intact pad between records, whether it resumes before the pad (at the previous record's end) or after it (at the next record's start), and leaves the stop offset where it was, so a pad is never data: the stop is still the end of the last complete record, and a pad whose record was torn off ends nothing. A pad inside a First…Last sequence is out of sequence and stops the segment's data like any fragment out of order. A build without D327 refuses an intact fragment of type 5 (`UnsupportedFeature`, #496); the superblock bit refuses the file before replay reaches one.
 
 **Where a segment's data stops.** The stop offset is always the end of the last complete record (the starting offset if there is none), never a position after a skipped frame tail; a writer whose segment fills records exactly this offset (where its last record ended) as the successor's `prev_end`. Replay of a segment stops at the first fragment header (read only where more than 12 bytes remain in the frame) that has type 0, an epoch different from the segment's (stale data from a previous use of the slot), a bad CRC, or a First/Middle whose Last never arrives before the segment ends. Whether that stop is the end of the segment or the end of the log is decided by chaining (§10.1), never by the stop condition itself. Data after the end of the log is never read again: the next segment starts fresh.
 
@@ -801,6 +804,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.
 - Golden files for every structure are frozen at 1.0 (format brief).
+- **WAL pad fragments (D327, 1.3)** take `incompat` bit 1 (§8.2) and fragment type 5 (§10.2): no version change. A 1.2 or earlier build refuses a database with the bit set, at open.
 - **Version 4 is the last 1.x version.** A later 1.x feature takes a feature bit (§8.2) and the room §13.1 names for it (§13.2 lists the paths for tracked features); 2.0 is format 5.
 
 ## 13. Compatibility promise

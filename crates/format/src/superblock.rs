@@ -125,8 +125,10 @@ impl Features {
     /// ([`RO_COMPAT_REPLICA`](crate::manifest::RO_COMPAT_REPLICA), D315 PR 3).
     pub const KNOWN_RO_COMPAT: u64 = crate::manifest::RO_COMPAT_REPLICA;
     /// The `incompat` bits this build knows: bit 0, the Min, Max and Hll family kinds
-    /// ([`INCOMPAT_AGGREGATES`](crate::manifest::INCOMPAT_AGGREGATES), D294).
-    pub const KNOWN_INCOMPAT: u64 = crate::manifest::INCOMPAT_AGGREGATES;
+    /// ([`INCOMPAT_AGGREGATES`](crate::manifest::INCOMPAT_AGGREGATES), D294); bit 1, WAL pad
+    /// fragments ([`INCOMPAT_WAL_PAD`](crate::wal::INCOMPAT_WAL_PAD), D327).
+    pub const KNOWN_INCOMPAT: u64 =
+        crate::manifest::INCOMPAT_AGGREGATES | crate::wal::INCOMPAT_WAL_PAD;
 
     /// `incompat` bits this build does not know.
     pub fn unknown_incompat(&self) -> u64 {
