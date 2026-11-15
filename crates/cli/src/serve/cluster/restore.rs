@@ -1140,7 +1140,9 @@ async fn upload(
             async move {
                 let mut f = tokio::fs::File::open(&path).await?;
                 f.seek(std::io::SeekFrom::Start(from)).await?;
-                let mut buf = vec![0u8; feed.max()];
+                // A node can name any chunk size; a read is at most 4 MiB, and `send` cuts
+                // it to the node's.
+                let mut buf = vec![0u8; feed.max().min(4 << 20)];
                 loop {
                     let n = f.read(&mut buf).await?;
                     // The header goes first even with nothing left to send: the node then
