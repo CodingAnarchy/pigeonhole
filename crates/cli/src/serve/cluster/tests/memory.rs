@@ -427,6 +427,7 @@ fn three_nodes(
             false,
             placement,
             None,
+            None,
             Some(recipe()),
         );
         stops.push(stop);
@@ -716,6 +717,7 @@ fn a_split_memory_write_names_what_applied_and_says_when_a_part_may_have() {
                 limits,
                 false,
                 placement,
+                None,
                 None,
                 Some(recipe()),
             )
