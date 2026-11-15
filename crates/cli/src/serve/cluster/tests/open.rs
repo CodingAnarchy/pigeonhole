@@ -703,6 +703,8 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
     let (kept, new): (Memory, Memory) = (kept[0], new.unwrap());
     map.map_version = 2;
     map.partitions.push(part("p3"));
+    // The passes before the install, so the wait below is for the pass it starts.
+    let before = super::super::open::missing_passes(&dir);
     rt.block_on(async {
         client(port)
             .await
@@ -717,7 +719,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         // The install opens p3 in the background, and it fails: wait it out, or it opens
         // p3 just after the open below and shrinks p1 again before the asserts (#1928).
         eventually("the install's background open to run", async || {
-            super::super::open::missing_passes(&dir) >= 1
+            super::super::open::missing_passes(&dir) > before
         })
         .await;
         // p3's file isn't here yet: the open fails after p1's caches shrank, and they're
