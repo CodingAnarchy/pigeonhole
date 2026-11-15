@@ -446,20 +446,25 @@ impl Rig {
     }
 
     /// Starts node `i` again on its directory, as a restarted node: every partition fenced.
-    fn restart(&mut self, i: usize) {
+    /// Returns the node, to watch its start sync.
+    fn restart(&mut self, i: usize) -> Arc<Node> {
         let l = std::net::TcpListener::bind(("127.0.0.1", self.ports[i])).unwrap();
-        let (stop, _) = data_node_full(
+        // Unpinned, as `data_node_many` starts the rig's nodes.
+        let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+        let (stop, _, node) = data_node_placed(
             &self.rt,
             &self.dirs[i],
             NODES[i].0,
-            Some(NODES[i].1),
+            vec![(NODES[i].1, self.dbs[i].clone())],
             l,
             "",
             crate::serve::server_tests::limits(),
-            self.dbs[i].clone(),
             true,
+            placement,
+            None,
         );
         self.stops[i] = Some(stop);
+        node
     }
 }
 
@@ -593,7 +598,7 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
     // map that lists only itself, so it tells nobody.
     t.stop(2);
     t.restart(0);
-    t.restart(1);
+    let b_node = t.restart(1);
     // c only once b has settled: a restarted node asks its peers for their maps until its
     // partitions are confirmed, and takes a newer one from any that answers. With c back
     // before b's p2 was confirmed (by a's version 1), b's next round took version 2 from c,
@@ -602,6 +607,16 @@ fn a_peer_that_missed_the_same_move_doesnt_confirm_an_unfence() {
     t.rt.block_on(eventually(
         "b's p2 to be confirmed by a, which ends b's asking",
         async || state(b, "p2").await == LocalPartitionState::Serving,
+    ));
+    // And once b's start sync has asked every peer: it asks them one at a time and confirms
+    // after each answer, so p2 serves once a answers, before b has asked c. With c back by
+    // then, b took version 2 from c (#1936, #1932's Linux run). Past `synced`, b asks again
+    // only for a partition still unconfirmed, and p2 was confirmed by a's answer in the
+    // sync (a is up before b starts; only a 500 ms timeout of that answer would leave p2 to
+    // a later round).
+    t.rt.block_on(eventually(
+        "b's start sync to have asked every peer",
+        async || b_node.synced.load(std::sync::atomic::Ordering::Acquire),
     ));
     t.restart(2);
     t.rt.block_on(async {
