@@ -32,6 +32,7 @@ use super::cli::{CopyCheck, NodeArgs, channel, connect, relocate_as, report, req
 use super::transfer::{Feed, Stopped, upload_file};
 use crate::exit::Failure;
 use crate::output::Report;
+use crate::serve::download::STALL;
 use crate::serve::proto::{
     self, BackupDownloadRequest, GetMapRequest, LocalPartition, LocalPartitionState, PartitionFile,
     PartitionRequest, PartitionUploadHeader, PartitionUploadPurpose, StatusRequest,
@@ -62,7 +63,7 @@ impl At {
         let (ch, token) = channel(&args, &args.node).await?;
         Ok(Self {
             id: id.to_owned(),
-            admin: Admin::new(ch).max_decoding_message_size(4 << 20),
+            admin: crate::serve::download::admin(ch),
             args,
             token,
         })
@@ -714,26 +715,34 @@ async fn copy_file(
     let download = |from: u64, mut feed: Feed| {
         let what = &what;
         async move {
-            let mut chunks = old
-                .admin
-                .clone()
-                .backup_download(request(
-                    BackupDownloadRequest {
-                        partition: p.to_owned(),
-                        fenced_file: Some(f.name.clone()),
-                        offset: from,
-                        ..Default::default()
-                    },
-                    old.token.as_deref(),
-                )?)
+            // One pass, with every wait bounded: OLD sends a closed file without pause, so
+            // `STALL` of nothing is a stalled stream, and the operator runs the move again.
+            let stalled = |_| {
+                Failure::usage(&format!(
+                    "node {:?} sent nothing of {what} for {} s: run the move again to resume",
+                    old.id,
+                    STALL.as_secs()
+                ))
+            };
+            let mut admin = old.admin.clone();
+            let asked = admin.backup_download(request(
+                BackupDownloadRequest {
+                    partition: p.to_owned(),
+                    fenced_file: Some(f.name.clone()),
+                    offset: from,
+                    ..Default::default()
+                },
+                old.token.as_deref(),
+            )?);
+            let mut chunks = tokio::time::timeout(STALL, asked)
                 .await
+                .map_err(stalled)?
                 .map_err(|s| old.failed(&format!("download {what}"), &s))?
                 .into_inner();
-            let gone = |_| Failure::usage(&format!("node {:?} ended the upload of {what}", new.id));
             loop {
-                let Some(chunk) = chunks
-                    .message()
+                let Some(chunk) = tokio::time::timeout(STALL, chunks.message())
                     .await
+                    .map_err(stalled)?
                     .map_err(|s| old.failed(&format!("download {what}"), &s))?
                 else {
                     return Err(Failure::usage(&format!(
@@ -749,8 +758,14 @@ async fn copy_file(
                         feed.at()
                     )));
                 }
-                feed.send(chunk.data).await.map_err(gone)?;
-                if chunk.total != 0 {
+                if feed.send(chunk.data).await.is_err() {
+                    // NEW ended the upload. That isn't the download's error: NEW's answer
+                    // says why, and `upload_file` reports it.
+                    return Ok(feed.at() - from);
+                }
+                // The last chunk carries the hash. An empty file's has it too, with a
+                // total of 0 (a crash can leave an empty WAL stream file in a set).
+                if !chunk.sha256.is_empty() {
                     if chunk.total != f.bytes || chunk.sha256 != f.sha256 {
                         return Err(Failure::usage(&format!(
                             "node {:?} sent {what} as {} bytes with another SHA-256 than its \

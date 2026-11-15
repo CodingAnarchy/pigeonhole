@@ -28,9 +28,10 @@ use super::cli::{NodeArgs, channel, report, request};
 use super::map;
 use crate::exit::Failure;
 use crate::output::Report;
+use crate::serve::download::{Break, Failed, STALL, Sink, Waits, admin, download};
 use crate::serve::proto::{self, BackupDownloadRequest, ClusterMap, GetMapRequest};
 
-/// A copy's stream may break this many times; each break resumes from what was written.
+/// A restore's upload may break this many times; each break resumes from what the node holds.
 pub(super) const RESUMES: u32 = 5;
 
 /// What the backup of one partition gave.
@@ -203,70 +204,63 @@ impl Job {
     ) -> Result<Copied, Failure> {
         let started = std::time::Instant::now();
         let partial = dir.join(format!("{}.phdb.partial", self.partition));
-        let mut file = tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&partial)
             .await
             .map_err(|e| Failure::io(&format!("create {}", partial.display()), &e))?;
         let what = |m: &str| format!("partition {} from node {}: {m}", self.partition, self.node);
-        let (channel, _) = channel(args, &self.url).await?;
-        let mut admin =
-            proto::admin_client::AdminClient::new(channel).max_decoding_message_size(4 << 20);
-        let (mut backup_id, mut offset) = (String::new(), 0u64);
-        let mut breaks = 0;
-        let last = loop {
-            let req = request(
-                BackupDownloadRequest {
-                    fenced_file: None,
-                    durable,
-                    backup_id: backup_id.clone(),
-                    offset,
-                    replica: false,
-                    partition: self.partition.clone(),
-                },
-                token,
-            )?;
-            let got = async {
-                let mut stream = admin.backup_download(req).await?.into_inner();
-                while let Some(chunk) = stream.message().await? {
-                    if backup_id.is_empty() {
-                        backup_id.clone_from(&chunk.backup_id);
-                    }
-                    if !chunk.data.is_empty() {
-                        if chunk.offset != offset {
-                            return Err(tonic::Status::data_loss(format!(
-                                "a chunk at {} where {offset} was expected",
-                                chunk.offset
-                            )));
-                        }
-                        file.seek(std::io::SeekFrom::Start(offset))
-                            .await
-                            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-                        file.write_all(&chunk.data)
-                            .await
-                            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-                        offset += chunk.data.len() as u64;
-                    }
-                    if chunk.total != 0 {
-                        return Ok(Some(chunk));
-                    }
-                }
-                Ok(None)
+        let (first, _) = channel(args, &self.url).await?;
+        let mut sink = Partial(file);
+        let secs = |d: Duration| d.as_secs();
+        // A break resumes from what was written, on a new connection; three in a row
+        // without progress give up. A stream that sends nothing for `STALL` is a break.
+        let copy = download(
+            admin(first),
+            || async {
+                let (ch, _) = channel(args, &self.url)
+                    .await
+                    .map_err(|f| f.message().to_owned())?;
+                Ok(admin(ch))
+            },
+            |message| request(message, token).map_err(|f| f.message().to_owned()),
+            BackupDownloadRequest {
+                fenced_file: None,
+                durable,
+                backup_id: String::new(),
+                offset: 0,
+                replica: false,
+                partition: self.partition.clone(),
+            },
+            &mut sink,
+            Waits {
+                answer: STALL,
+                data: STALL,
+            },
+            |b| match b {
+                Break::Connect(e) => e.to_owned(),
+                Break::NoAnswer(wait) => format!("no answer within {} s", secs(wait)),
+                Break::NoChunk(wait) => format!("no chunk within {} s", secs(wait)),
+                Break::Ended => "the stream ended early".to_owned(),
+                Break::Status(status) => status.message().to_owned(),
+            },
+            |_| {},
+        )
+        .await
+        .map_err(|e| match e {
+            Failed::Request(e) | Failed::GaveUp(e) => Failure::usage(&what(&e)),
+            Failed::Refused(status) => Failure::usage(&what(status.message())),
+            Failed::Sink(e) => Failure::io(&format!("write {}", partial.display()), &e),
+            Failed::Offset { got, expected } => Failure::usage(&what(&format!(
+                "a chunk at {got} where {expected} was expected"
+            ))),
+            Failed::TooLong(why) => {
+                Failure::usage(&what(&format!("a chunk over this command's limit: {why}")))
             }
-            .await;
-            match got {
-                Ok(Some(chunk)) => break chunk,
-                // A refusal is final; a break resumes from what was written.
-                Err(s) if !resumable(&s) => return Err(Failure::usage(&what(s.message()))),
-                Ok(None) | Err(_) if breaks < RESUMES && !backup_id.is_empty() => {
-                    breaks += 1;
-                    tokio::time::sleep(Duration::from_millis(200 * u64::from(breaks))).await;
-                }
-                Ok(None) => return Err(Failure::usage(&what("the stream ended early"))),
-                Err(s) => return Err(Failure::usage(&what(s.message()))),
-            }
-        };
+        })?;
+        let (last, offset) = (copy.last, copy.bytes);
+        let file = sink.0;
         file.sync_all()
             .await
             .map_err(|e| Failure::io(&format!("sync {}", partial.display()), &e))?;
@@ -313,7 +307,22 @@ impl Job {
     }
 }
 
-/// Whether a download's error is a break to resume from, not a refusal.
+/// A copy's file as it is written.
+struct Partial(tokio::fs::File);
+
+impl Sink for Partial {
+    async fn write(&mut self, data: &prost::bytes::Bytes) -> std::io::Result<()> {
+        self.0.write_all(data).await
+    }
+
+    async fn restart(&mut self) -> std::io::Result<()> {
+        self.0.set_len(0).await?;
+        self.0.seek(std::io::SeekFrom::Start(0)).await?;
+        Ok(())
+    }
+}
+
+/// Whether an upload's error is a break to resume from, not a refusal.
 pub(super) fn resumable(s: &tonic::Status) -> bool {
     matches!(
         s.code(),
@@ -435,6 +444,38 @@ pub(crate) fn moved(start: &ClusterMap, end: &ClusterMap) -> Option<String> {
 mod tests {
     use super::*;
     use crate::serve::proto::{Node, Partition, TablePlacement};
+
+    #[tokio::test]
+    async fn a_restarted_partial_holds_only_what_is_written_after() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phdb-partial-{}-{nanos}.phdb.partial",
+            std::process::id()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let mut sink = Partial(file);
+        sink.write(&prost::bytes::Bytes::from_static(b"the first copy"))
+            .await
+            .unwrap();
+        sink.restart().await.unwrap();
+        // Shorter than the first: bytes kept from it, or a write from its old offset,
+        // would show.
+        sink.write(&prost::bytes::Bytes::from_static(b"next"))
+            .await
+            .unwrap();
+        sink.0.flush().await.unwrap();
+        let held = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(held, b"next");
+    }
 
     fn map(version: u64, epoch: u64, splits: &[&str]) -> ClusterMap {
         ClusterMap {

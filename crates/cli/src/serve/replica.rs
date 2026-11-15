@@ -1034,204 +1034,128 @@ impl Replica {
         Ok(())
     }
 
-    /// `Admin.BackupDownload` with `replica` into `side`, resumed after a broken stream,
-    /// checked against its SHA-256. Returns the copy's feed token.
+    /// `Admin.BackupDownload` with `replica` into `side`, resumed after a broken stream
+    /// ([`download`](super::download::download)), checked against its SHA-256. Returns the
+    /// copy's feed token.
     async fn download(&self, side: &Path, idle: Duration) -> Result<Vec<u8>, String> {
-        use tokio::io::AsyncWriteExt;
+        use super::download::{Break, Failed, Step, Waits, admin, download};
+        let primary = &self.config.primary;
         self.set_bootstrap("connecting", 0);
-        let admin =
-            |c| proto::admin_client::AdminClient::new(c).max_decoding_message_size(usize::MAX);
-        // `None` after a break: the next pass connects again, and a failed connect is that
-        // pass's break (cli692's R2 on #1609), so a blip doesn't restart a long download.
-        let mut client = Some(admin(self.connect().await?));
-        let mut file = tokio::fs::File::create(side)
-            .await
-            .map_err(|e| format!("creating {}: {e}", side.display()))?;
-        let mut hash = sha2::Sha256::new();
-        let (mut backup_id, mut offset, mut token) = (String::new(), 0u64, Vec::new());
-        let mut breaks = Breaks::default();
-        loop {
-            let req = self.request(proto::BackupDownloadRequest {
+        let first = admin(self.connect().await?);
+        let mut sink = SideFile::create(side).await?;
+        // The primary answers at once and sends a heartbeat (a chunk with no data) every
+        // second while it writes its copy (#1611), so every wait is bounded however long
+        // the copy takes: `BEAT_WAIT` (or the idle limit, if longer) for the answer and
+        // between heartbeats, the stream idle limit for the copy's data (#1595: a stalled
+        // stream used to hold the bootstrap for ever, with nothing in Info).
+        let waits = Waits {
+            answer: idle.max(BEAT_WAIT),
+            data: idle,
+        };
+        let say = |b: Break<'_>| match b {
+            Break::Connect(e) => e.to_owned(),
+            Break::NoAnswer(wait) => format!(
+                "{primary} sent no bootstrap copy within {} ms",
+                wait.as_millis()
+            ),
+            Break::NoChunk(wait) => format!(
+                "no chunk of the bootstrap copy from {primary} within {} ms",
+                wait.as_millis()
+            ),
+            Break::Ended => "the stream ended before the last chunk".to_owned(),
+            Break::Status(status) => status.message().to_owned(),
+        };
+        // Info says where the bootstrap is, and why it's resuming (#1595), while the state
+        // stays `bootstrapping`.
+        let step = |s: Step<'_>| match s {
+            Step::Waiting => self.set_bootstrap("waiting for the primary's copy", 0),
+            Step::Data(bytes) => self.set_bootstrap("downloading", bytes),
+            Step::Resuming(broke) => {
+                self.status().last_error = format!("downloading the bootstrap copy: {broke}");
+            }
+            Step::Fresh(why) => {
+                self.status().last_error =
+                    format!("downloading the bootstrap copy: {why}; starting a fresh copy");
+            }
+        };
+        let copy = download(
+            first,
+            || async { self.connect().await.map(admin) },
+            |message| self.request(message),
+            proto::BackupDownloadRequest {
                 fenced_file: None,
                 durable: true,
-                backup_id: backup_id.clone(),
-                offset,
+                backup_id: String::new(),
+                offset: 0,
                 replica: true,
                 partition: String::new(),
-            })?;
-            // The primary answers at once and sends a heartbeat (a chunk with no data) every
-            // second while it writes its copy (#1611), so every wait is bounded however long
-            // the copy takes: `BEAT_WAIT` (or the idle limit, if longer) for the answer and
-            // between heartbeats, the stream idle limit for the copy's data (#1595: a stalled
-            // stream used to hold the bootstrap for ever, with nothing in Info).
-            if offset == 0 {
-                self.set_bootstrap("waiting for the primary's copy", 0);
+            },
+            &mut sink,
+            waits,
+            say,
+            step,
+        )
+        .await
+        .map_err(|e| match e {
+            Failed::Request(e) => e,
+            Failed::Refused(status) => format!("bootstrap from {primary}: {}", status.message()),
+            Failed::GaveUp(why) => format!("downloading the bootstrap copy: {why}"),
+            Failed::Sink(e) => format!("writing {}: {e}", side.display()),
+            Failed::Offset { got, expected } => {
+                format!("the bootstrap copy's chunk is at {got}, expected {expected}")
             }
-            let connected = match client.take() {
-                Some(c) => Ok(c),
-                None => self.connect().await.map(admin),
-            };
-            let broke = match connected {
-                Err(e) => e,
-                Ok(mut c) => {
-                    // Dropped with this pass: a broken stream's connection isn't reused.
-                    let beat_wait = idle.max(BEAT_WAIT);
-                    let answered = tokio::time::timeout(beat_wait, c.backup_download(req)).await;
-                    match answered {
-                        Err(_) => format!(
-                            "{} sent no bootstrap copy within {} ms",
-                            self.config.primary,
-                            beat_wait.as_millis()
-                        ),
-                        Ok(Ok(r)) => {
-                            let mut stream = r.into_inner();
-                            // Until the copy's data starts, the primary may be writing it.
-                            let mut wait = beat_wait;
-                            loop {
-                                let Ok(next) = tokio::time::timeout(wait, stream.message()).await
-                                else {
-                                    break format!(
-                                        "no chunk of the bootstrap copy from {} within {} ms",
-                                        self.config.primary,
-                                        wait.as_millis()
-                                    );
-                                };
-                                match next {
-                                    Ok(Some(chunk)) => {
-                                        if chunk.offset != offset {
-                                            return Err(format!(
-                                                "the bootstrap copy's chunk is at {}, expected {offset}",
-                                                chunk.offset
-                                            ));
-                                        }
-                                        backup_id = chunk.backup_id;
-                                        if token.is_empty() {
-                                            token = chunk.feed_token.to_vec();
-                                        }
-                                        file.write_all(&chunk.data).await.map_err(|e| {
-                                            format!("writing {}: {e}", side.display())
-                                        })?;
-                                        hash.update(&chunk.data);
-                                        offset += chunk.data.len() as u64;
-                                        // A heartbeat while the primary writes its copy
-                                        // carries no data: still waiting for the copy.
-                                        if !chunk.data.is_empty() {
-                                            self.set_bootstrap("downloading", offset);
-                                            wait = idle;
-                                        }
-                                        if !chunk.sha256.is_empty() {
-                                            if hash.finalize().as_slice() != chunk.sha256.as_ref() {
-                                                return Err(
-                                                    "the bootstrap copy's SHA-256 doesn't match"
-                                                        .to_owned(),
-                                                );
-                                            }
-                                            file.sync_all().await.map_err(|e| {
-                                                format!("syncing {}: {e}", side.display())
-                                            })?;
-                                            if token.is_empty() {
-                                                return Err(format!(
-                                                    "{} sent no feed token with its bootstrap copy",
-                                                    self.config.primary
-                                                ));
-                                            }
-                                            return Ok(token);
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        break "the stream ended before the last chunk".to_owned();
-                                    }
-                                    Err(status) => break status.message().to_owned(),
-                                }
-                            }
-                        }
-                        Ok(Err(status)) if backup_id.is_empty() => {
-                            return Err(format!(
-                                "bootstrap from {}: {}",
-                                self.config.primary,
-                                status.message()
-                            ));
-                        }
-                        // The copy is gone: it failed on the primary (its error came first, as
-                        // this break's cause) or expired. Start again with a fresh copy, within
-                        // the same tries (cli692's R2 on #1628).
-                        Ok(Err(status)) if status.code() == tonic::Code::NotFound => {
-                            backup_id.clear();
-                            offset = 0;
-                            token.clear();
-                            hash = sha2::Sha256::new();
-                            file = tokio::fs::File::create(side)
-                                .await
-                                .map_err(|e| format!("creating {}: {e}", side.display()))?;
-                            if let Some(why) = breaks.gone(status.message()) {
-                                return Err(format!("downloading the bootstrap copy: {why}"));
-                            }
-                            self.status().last_error = format!(
-                                "downloading the bootstrap copy: {}; starting a fresh copy",
-                                status.message()
-                            );
-                            self.set_bootstrap("waiting for the primary's copy", 0);
-                            client = None;
-                            continue;
-                        }
-                        Ok(Err(status)) => status.message().to_owned(),
-                    }
-                }
-            };
-            let give_up = breaks.note(offset, &broke);
-            // A fresh request that broke before its answer named a copy: nothing to resume.
-            if let Some(why) = give_up.or_else(|| backup_id.is_empty().then(|| breaks.cause())) {
-                return Err(format!("downloading the bootstrap copy: {why}"));
-            }
-            // Info says why it's resuming (#1595), while the state stays `bootstrapping`.
-            self.status().last_error = format!("downloading the bootstrap copy: {broke}");
-            tokio::time::sleep(Duration::from_millis(200 * breaks.tries)).await;
-            // On a new connection: a stalled one stays stalled for every later request on it.
-            client = None;
+            Failed::TooLong(why) => format!(
+                "{primary} sent a chunk of its bootstrap copy over this replica's limit: {why}"
+            ),
+        })?;
+        if sink.hash.finalize().as_slice() != copy.last.sha256.as_ref() {
+            return Err("the bootstrap copy's SHA-256 doesn't match".to_owned());
         }
+        sink.file
+            .sync_all()
+            .await
+            .map_err(|e| format!("syncing {}: {e}", side.display()))?;
+        if copy.feed_token.is_empty() {
+            return Err(format!(
+                "{primary} sent no feed token with its bootstrap copy"
+            ));
+        }
+        Ok(copy.feed_token.to_vec())
     }
 }
 
-/// A bootstrap download's breaks: three in a row without progress give up, and progress
-/// starts the count again (cli692's N1 on #1583), so a long copy over a flaky link isn't
-/// restarted. The error a download that gives up reports is the first break since its last
-/// progress (cli692's R2 and N5 on #1628): a copy that failed on the primary says why, through
-/// the NotFound of the resumes after it, and an old blip isn't a later failure's reason.
-#[derive(Debug, Default)]
-struct Breaks {
-    tries: u64,
-    /// The offset reached at the last break.
-    at_last_break: u64,
-    /// The first break's reason since the last progress.
-    cause: Option<String>,
+/// A bootstrap copy's side file, hashed as it is written.
+struct SideFile {
+    path: PathBuf,
+    file: tokio::fs::File,
+    hash: sha2::Sha256,
 }
 
-impl Breaks {
-    /// A break at `offset` for `why`. Returns the error to give up with, after the third in a
-    /// row without progress.
-    fn note(&mut self, offset: u64, why: &str) -> Option<String> {
-        if offset > self.at_last_break {
-            self.tries = 0;
-            self.at_last_break = offset;
-            self.cause = None;
-        }
-        self.cause.get_or_insert_with(|| why.to_owned());
-        self.tries += 1;
-        (self.tries > 3).then(|| self.cause())
+impl SideFile {
+    async fn create(path: &Path) -> Result<Self, String> {
+        let file = tokio::fs::File::create(path)
+            .await
+            .map_err(|e| format!("creating {}: {e}", path.display()))?;
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            hash: sha2::Sha256::new(),
+        })
+    }
+}
+
+impl super::download::Sink for SideFile {
+    async fn write(&mut self, data: &prost::bytes::Bytes) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.file.write_all(data).await?;
+        self.hash.update(data);
+        Ok(())
     }
 
-    /// The copy is gone (`why`, a resume's NotFound): a fresh copy starts at offset 0, within
-    /// the same tries, and the cause stays the break before it. Returns the error to give up
-    /// with, as for [`note`](Self::note).
-    fn gone(&mut self, why: &str) -> Option<String> {
-        self.at_last_break = 0;
-        self.tries += 1;
-        (self.tries > 3).then(|| self.cause.clone().unwrap_or_else(|| why.to_owned()))
-    }
-
-    /// The reason to report now: the first break since the last progress.
-    fn cause(&self) -> String {
-        self.cause.clone().unwrap_or_default()
+    async fn restart(&mut self) -> std::io::Result<()> {
+        self.file = tokio::fs::File::create(&self.path).await?;
+        self.hash = sha2::Sha256::new();
+        Ok(())
     }
 }
 
@@ -1297,8 +1221,6 @@ fn side_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::Breaks;
-
     #[test]
     fn a_replica_config_never_formats_its_token() {
         let c = super::ReplicaConfig {
@@ -1311,43 +1233,6 @@ mod tests {
         assert!(
             text.contains("<set>") && text.contains("primary:7448"),
             "{text}"
-        );
-    }
-
-    #[test]
-    fn a_bootstrap_gives_up_with_the_first_break_since_its_last_progress() {
-        // Three breaks in a row without progress give up, with the first one's reason.
-        let mut b = Breaks::default();
-        assert_eq!(b.note(0, "stalled"), None);
-        assert_eq!(b.note(0, "refused"), None);
-        assert_eq!(b.note(0, "refused").as_deref(), None);
-        assert_eq!(b.note(0, "refused").as_deref(), Some("stalled"));
-        // Progress starts the count and the cause again (cli692's N5 on #1628): an early blip
-        // isn't the reason a later failure reports.
-        let mut b = Breaks::default();
-        assert_eq!(b.note(0, "an early blip"), None);
-        assert_eq!(b.note(1 << 20, "stalled"), None);
-        assert_eq!(b.note(1 << 20, "refused"), None);
-        assert_eq!(b.note(1 << 20, "refused"), None);
-        assert_eq!(b.note(1 << 20, "refused").as_deref(), Some("stalled"));
-        // A copy that failed on the primary (R2): its error, then the resumes' NotFound, each
-        // a fresh copy within the same tries; giving up reports the copy's error.
-        let mut b = Breaks::default();
-        assert_eq!(b.note(0, "disk full"), None);
-        assert_eq!(b.gone("no such backup download"), None);
-        assert_eq!(b.note(0, "disk full"), None);
-        assert_eq!(
-            b.gone("no such backup download").as_deref(),
-            Some("disk full")
-        );
-        // Gone with no break before it: the NotFound itself.
-        let mut b = Breaks {
-            tries: 3,
-            ..Breaks::default()
-        };
-        assert_eq!(
-            b.gone("no such backup download").as_deref(),
-            Some("no such backup download")
         );
     }
 }
