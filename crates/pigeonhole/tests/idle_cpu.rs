@@ -184,6 +184,13 @@ fn process_cpu() -> Duration {
     Duration::from_secs_f64(secs)
 }
 
+/// Sleeps until `t` (not at all if it has passed).
+fn sleep_until(t: Instant) {
+    if let Some(left) = t.checked_duration_since(Instant::now()) {
+        thread::sleep(left);
+    }
+}
+
 /// Splits failed reads into compaction attempts (reads less than 300 ms apart belong to one).
 fn attempts(log: &[Instant]) -> Vec<Instant> {
     let mut out: Vec<Instant> = Vec::new();
@@ -304,20 +311,37 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
         let a = attempts(&failed.lock().unwrap());
         (a[1], a[2])
     };
-    // Inside the backoff after the third failure (at least 4 s): the process idles.
-    thread::sleep(Duration::from_millis(300));
-    let (cpu0, wall0) = (process_cpu(), Instant::now());
-    thread::sleep(Duration::from_millis(3_000));
-    let (cpu, wall) = (process_cpu() - cpu0, wall0.elapsed());
-    assert_eq!(
-        attempts(&failed.lock().unwrap()).len(),
-        3,
-        "retried during the backoff"
-    );
-    assert!(
-        cpu.as_secs_f64() < wall.as_secs_f64() * 0.01,
-        "{cpu:?} of CPU in {wall:?} of backoff (issue #92)"
-    );
+    // Inside a backoff (at least 4 s after the third failure), the process idles. The window
+    // is timed from the failure that started the backoff, not from when the poll above saw
+    // it: a late look or a long sleep on a busy runner used up the old 0.7 s margin, and a
+    // retry that was on time fell in the window (#1908). If the window still overruns its
+    // backoff (a retry lands in it, or less than 2.5 s of it is left, which would bring #92's
+    // 1% bound down toward one 10 ms CPU tick; ai1249's N1), it is measured again in the next
+    // backoff, which is longer. Whether a retry came early is the gap check's to say.
+    let mut from = third;
+    for window in 0.. {
+        assert!(window < 3, "no backoff left a 2.5 s window free of retries");
+        sleep_until(from + Duration::from_millis(300));
+        let before = attempts(&failed.lock().unwrap()).len();
+        let (cpu0, wall0) = (process_cpu(), Instant::now());
+        sleep_until(from + Duration::from_millis(3_300));
+        let (cpu, wall) = (process_cpu() - cpu0, wall0.elapsed());
+        let seen = attempts(&failed.lock().unwrap());
+        if seen.len() == before && wall >= Duration::from_millis(2_500) {
+            assert!(
+                cpu.as_secs_f64() < wall.as_secs_f64() * 0.01,
+                "{cpu:?} of CPU in {wall:?} of backoff (issue #92)"
+            );
+            break;
+        }
+        // The next backoff starts at the retry that fell in this window (or the next one).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while attempts(&failed.lock().unwrap()).len() <= before {
+            assert!(Instant::now() < deadline, "the backoff never retried");
+            thread::sleep(Duration::from_millis(20));
+        }
+        from = *attempts(&failed.lock().unwrap()).last().unwrap();
+    }
     // The retry fires on time: the backoff doubled, from 2 s before the third failure to 4 s
     // after it. Each gap is checked against its nominal wait, not against the other: a
     // timer that woke late on the earlier gap (2.31 s on a loaded macOS runner, #1806) made
