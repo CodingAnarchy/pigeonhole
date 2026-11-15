@@ -64,7 +64,7 @@
 - `RecallBodies`: `merge`, `len`, `is_empty`, `to_bytes`, `from_bytes`.
 - In place of the design's `expand_from(seeds)` and `RecallRanking::expanded(pool)`: the walk above. `Recall::run`'s signature is unchanged, and it runs these steps in process.
 
-**A recall across partitions:** the entry node checks it (scope, `k`, the byte budget against its own `--memory-*` limits, at most 64 namespaces), embeds its text once if it has an embedder, and fixes one clock (`now_us`). Then:
+**A recall across partitions:** the entry node, which needs `--memory` for this (a node without it answers `Unsupported`, though it forwards a one-partition recall), checks it (scope, `k`, the byte budget against its own `--memory-*` limits, at most 64 namespaces), embeds its text once if it has an embedder, and fixes one clock (`now_us`). Then:
 1. each partition holding some of its namespaces returns its pool;
 2. the entry node merges and ranks them, then walks the graph expansion hop by hop;
 3. the partitions holding the best `k + 4` return their bodies, and the entry node cuts the hits to `k` and the budget, skipping any memory gone since its pool.

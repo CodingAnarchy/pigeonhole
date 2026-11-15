@@ -1098,7 +1098,7 @@ fn memory_route<'a>(
     namespaces: impl IntoIterator<Item = &'a str>,
     what: &str,
 ) -> Result<String, ApiError> {
-    let parts = memory_partitions(routes, namespaces, what)?;
+    let parts = memory_partitions(routes, namespaces)?;
     let mut it = parts.into_iter();
     match (it.next(), it.next()) {
         (Some((p, _)), None) => Ok(p),
@@ -1118,7 +1118,6 @@ fn memory_route<'a>(
 pub(crate) fn memory_partitions<'a>(
     routes: &Routes,
     namespaces: impl IntoIterator<Item = &'a str>,
-    what: &str,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, ApiError> {
     if routes.memory_store().is_none() {
         return Err(ApiError::unsupported(
@@ -1143,7 +1142,6 @@ pub(crate) fn memory_partitions<'a>(
             list.push(ns.to_owned());
         }
     }
-    let _ = what;
     Ok(out)
 }
 

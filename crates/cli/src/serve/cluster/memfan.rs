@@ -61,13 +61,13 @@ impl Router {
         let Some(routes) = routes.as_ref() else {
             return Ok(None);
         };
-        let (namespaces, what): (Vec<String>, _) = match op {
-            ServiceOp::Recall(r) => (r.namespaces.clone(), "Memory.Recall"),
-            ServiceOp::MarkUsed(r) => (id_namespaces(&r.ids)?, "Memory.MarkUsed"),
-            ServiceOp::Forget(r) => (id_namespaces(&r.ids)?, "Memory.Forget"),
+        let namespaces: Vec<String> = match op {
+            ServiceOp::Recall(r) => r.namespaces.clone(),
+            ServiceOp::MarkUsed(r) => id_namespaces(&r.ids)?,
+            ServiceOp::Forget(r) => id_namespaces(&r.ids)?,
             _ => return Ok(None),
         };
-        let parts = memory_partitions(routes, namespaces.iter().map(String::as_str), what)?;
+        let parts = memory_partitions(routes, namespaces.iter().map(String::as_str))?;
         Ok((parts.len() > 1).then_some(parts))
     }
 
@@ -148,11 +148,7 @@ impl Router {
             .max(1);
         let reach = Reach::until(self, cluster, deadline);
         let routes = reach.routes()?;
-        let parts = memory_partitions(
-            &routes,
-            r.namespaces.iter().map(String::as_str),
-            "Memory.Recall",
-        )?;
+        let parts = memory_partitions(&routes, r.namespaces.iter().map(String::as_str))?;
         let of: BTreeMap<String, String> = parts
             .iter()
             .flat_map(|(p, nss)| nss.iter().map(move |ns| (ns.clone(), p.clone())))
@@ -333,7 +329,7 @@ impl Router {
         let mut by_part: BTreeMap<String, Vec<_>> = BTreeMap::new();
         for raw in ids {
             let id = crate::serve::memory::id(raw)?;
-            let p = memory_partitions(&routes, [id.namespace()], op.name())?
+            let p = memory_partitions(&routes, [id.namespace()])?
                 .into_keys()
                 .next()
                 .ok_or_else(|| ApiError::internal("a namespace with no partition"))?;
