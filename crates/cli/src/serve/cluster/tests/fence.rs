@@ -1341,3 +1341,161 @@ fn a_scan_running_past_its_partitions_lease_ends_with_the_lease_error() {
     });
     cut(&t, 0, false);
 }
+
+/// The child side of `a_paused_old_owner_never_commits_once_a_new_owner_took_writes`: node
+/// b, serving p2 with real lease rounds (a restart), in a process of its own so the parent
+/// can stop it with SIGSTOP. Ignored, so a plain run skips it; the parent runs it with
+/// `--ignored` and `PHDB_LEASE_CHILD` set to "dir|port".
+#[test]
+#[ignore = "the child process of a lease pause test"]
+fn lease_pause_child() {
+    let Ok(spec) = std::env::var("PHDB_LEASE_CHILD") else {
+        return;
+    };
+    let (dir, port) = spec.split_once('|').expect("dir|port");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let l = std::net::TcpListener::bind(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    let _node = data_node_full(
+        &rt,
+        Path::new(dir),
+        "b",
+        Some("p2"),
+        l,
+        "",
+        crate::serve::server_tests::limits(),
+        None,
+        true,
+    );
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+/// A child process killed when dropped.
+#[cfg(unix)]
+struct ChildNode(std::process::Child);
+
+#[cfg(unix)]
+impl ChildNode {
+    /// Sends it `signal` (`-STOP`, `-CONT`) through `kill(1)`: the crate forbids `unsafe`.
+    fn signal(&self, signal: &str) {
+        let ok = std::process::Command::new("kill")
+            .args([signal, &self.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "kill {signal}");
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildNode {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_paused_old_owner_never_commits_once_a_new_owner_took_writes() {
+    // #1486 and D326, the coordinator's process-pause test: b, p2's owner, runs in a process
+    // of its own and is stopped (SIGSTOP) past its lease, so it can't know it's been
+    // deposed. p2 is relocated to c (`--old-unreachable`, from a copy), which takes writes.
+    // b is resumed (SIGCONT): its writes are refused, or answer `OutcomeUnknown`, or reach
+    // c through the newer map. None commits on b's deposed copy.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let [a, b, c] = ports;
+    let map = three_way(&ports);
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+    }
+    let mut listeners = listeners.into_iter();
+    let la = listeners.next().unwrap();
+    drop(listeners.next()); // b's port, for the child to take
+    let lc = listeners.next().unwrap();
+    let child = ChildNode(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "serve::cluster::tests::fence::lease_pause_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PHDB_LEASE_CHILD", format!("{}|{b}", dirs[1].display()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let limits = crate::serve::server_tests::limits();
+    let (_stop_a, _db_a) =
+        data_node_full(&rt, &dirs[0], "a", Some("p1"), la, "", limits, None, false);
+    let (_stop_c, _db_c) =
+        data_node_full(&rt, &dirs[2], "c", Some("p3"), lc, "", limits, None, false);
+    // "hank" is p2's (between the splits "g" and "m").
+    rt.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while try_put(b, "hank", "1").await.is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "b's p2 never took a write under its lease"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // b stops, as a paused VM or a stalled process would, past its lease.
+    child.signal("-STOP");
+    std::thread::sleep(TEST_LEASE * 2);
+    // c gets p2 from a copy (the lost-node recipe), and takes writes.
+    test_partition(&dirs[2], "p2").close().unwrap();
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{a}"),
+        token_file: None,
+        ca: None,
+    };
+    rt.block_on(async {
+        within(super::super::cli::relocate(&args, "p2", "c", true, false))
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while try_put(a, "hank", "new").await.is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "c's p2 never took writes"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(get_row(c, "hank").await.unwrap(), Some(b"new".to_vec()));
+    });
+
+    // b resumes, its lease long gone on its own clock, which counted the pause.
+    child.signal("-CONT");
+    rt.block_on(async {
+        for i in 0..30 {
+            let value = format!("old{i}");
+            match try_put(b, "hank", &value).await {
+                // Refused (no lease, fenced, the partition gone) or unknown: nothing kept on
+                // b's copy as a commit after c's.
+                Err(_) => {}
+                // Taken: only through the newer map, so it's on c, the new owner.
+                Ok(()) => assert_eq!(
+                    get_row(c, "hank").await.unwrap(),
+                    Some(value.into_bytes()),
+                    "a write through b that succeeded must be c's"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // And b's own copy serves nothing.
+        let lp = local(b, "p2").await;
+        assert_ne!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+    });
+    drop(child);
+}

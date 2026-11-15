@@ -397,6 +397,183 @@ struct StreamRead {
     delivered_end: Lsn,
     /// From a token: the delivered records reached here, so the stream must too.
     must_reach: Option<Lsn>,
+    /// What a capped reader learned of the stream past its hint (#1827).
+    index: SkipIndex,
+}
+
+/// #1827: a run of a stream's records in one segment, read while the reader was capped
+/// (D320), so a later pass can jump over it when it would only pass every one over.
+#[derive(Debug, Clone, Copy)]
+struct Chunk {
+    /// Its first record's start: where a jump leaves the stream's hint.
+    start: Lsn,
+    /// Just past its last record: where a jump moves the cursor.
+    end: Lsn,
+    /// The lowest key a record in it can matter at, by `read_one`'s tests for passing a
+    /// record over: a Single's seqno, and a Prepare's or a Decision's round id + 1. A
+    /// Decision is keyed by its round, not its apply seqno: passing it over drops its round's
+    /// held shares, which matters only for a round whose id is below the cutoff, and a chunk
+    /// keyed that way is never jumped while such a share may be held (rule C would otherwise
+    /// drop it as aborted). A record of any other type is 0, never jumped.
+    min_key: Seqno,
+    /// Its segment's feed session.
+    session: u64,
+}
+
+/// #1827: the most chunks a stream's skip index keeps (perf2's S1 on #1922). Past it, adjacent
+/// chunks of a segment are merged pairwise, so a capped reader's index takes a constant
+/// memory, under 64 B a chunk: about 256 KiB a stream, outside the read-ahead budget.
+const SKIP_INDEX_CHUNKS: usize = 4096;
+
+/// #1827: one stream's chunks, by the cursor's position just before each one's first
+/// record. Built while the reader is capped, at the stream's indexed end only (a pass that
+/// reads inside the index adds nothing); trimmed to the hint at each rewind and dropped once
+/// a pass reads to the end without passing anything over.
+///
+/// At most `cap` chunks (perf2's S1 on #1922): once over it, adjacent chunks of one segment
+/// are merged pairwise. A merged chunk's key is the lower of the two lowest keys, so a jump
+/// over it is a jump over both, exactly; it still never crosses a segment, and its key is
+/// still a cursor position. If no pair can merge (every chunk alone in its segment), the
+/// index stops growing until a rewind trims it: the tail past it is stepped, as without one.
+#[derive(Debug)]
+struct SkipIndex {
+    chunks: BTreeMap<Lsn, Chunk>,
+    /// The chunk being built, its key, and the log bytes in it.
+    open: Option<(Lsn, Chunk, u64)>,
+    cap: usize,
+    /// At the cap with nothing left to merge: nothing is added until a trim.
+    full: bool,
+    /// Merging passes run (an inspection count for tests).
+    #[cfg(any(test, feature = "test-hooks"))]
+    coarsenings: u64,
+}
+
+impl SkipIndex {
+    fn new(cap: usize) -> Self {
+        Self {
+            chunks: BTreeMap::new(),
+            open: None,
+            cap: cap.max(2),
+            full: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            coarsenings: 0,
+        }
+    }
+
+    /// Notes a record read at the cursor's position `before`, `start..end`, keyed `key`, in
+    /// a segment of `session`: it extends the open chunk when it's the next record after it
+    /// in the same segment, and begins one past the index's end. One inside the index adds
+    /// nothing, nor does any while the index is full.
+    fn note(&mut self, before: Lsn, start: Lsn, end: Lsn, key: Seqno, session: u64, size: u64) {
+        if self.full {
+            return;
+        }
+        let len = u64::from(end.offset().saturating_sub(start.offset()));
+        if let Some((_, c, bytes)) = &mut self.open
+            && c.end == before
+            && c.start.epoch() == start.epoch()
+        {
+            c.end = end;
+            c.min_key = c.min_key.min(key);
+            *bytes += len;
+            if *bytes >= size {
+                self.close();
+            }
+            return;
+        }
+        let indexed_end = match &self.open {
+            Some((_, c, _)) => Some(c.end),
+            None => self.chunks.last_key_value().map(|(_, c)| c.end),
+        };
+        if indexed_end.is_some_and(|e| before < e) {
+            return;
+        }
+        self.close();
+        if self.full {
+            return;
+        }
+        let c = Chunk {
+            start,
+            end,
+            min_key: key,
+            session,
+        };
+        self.open = Some((before, c, len));
+        if len >= size {
+            self.close();
+        }
+    }
+
+    /// Closes the open chunk, merging pairwise once over the cap.
+    fn close(&mut self) {
+        if let Some((key, c, _)) = self.open.take() {
+            self.chunks.insert(key, c);
+        }
+        if self.chunks.len() > self.cap {
+            self.coarsen();
+            // Nothing merged: the newest goes, and the tail past the index is stepped.
+            while self.chunks.len() > self.cap {
+                self.chunks.pop_last();
+                self.full = true;
+            }
+        }
+    }
+
+    /// Merges each chunk with the next where the next starts where it ends, in its segment.
+    fn coarsen(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.coarsenings += 1;
+        }
+        let mut old = std::mem::take(&mut self.chunks).into_iter().peekable();
+        while let Some((key, mut c)) = old.next() {
+            if let Some((next_key, next)) = old.peek()
+                && *next_key == c.end
+                && next.start.epoch() == c.start.epoch()
+            {
+                c.end = next.end;
+                c.min_key = c.min_key.min(next.min_key);
+                old.next();
+            }
+            self.chunks.insert(key, c);
+        }
+    }
+
+    /// The closed chunk the cursor at `at` is just before: keyed there, or starting there (a
+    /// cursor reopened at a hint is at the chunk's first record, past a key at the previous
+    /// segment's end: perf2's N1 on #1922).
+    fn at(&self, at: Lsn) -> Option<Chunk> {
+        let (&key, c) = self.chunks.range(..=at).next_back()?;
+        (key == at || c.start == at).then_some(*c)
+    }
+
+    /// Drops the chunks with a record before `hint`: everything there was delivered. A chunk
+    /// keyed before the hint but starting at or after it stays.
+    fn trim(&mut self, hint: Lsn) {
+        let mut kept = self.chunks.split_off(&hint);
+        if let Some((&k, &c)) = self.chunks.last_key_value()
+            && c.start >= hint
+        {
+            kept.insert(k, c);
+        }
+        self.chunks = kept;
+        if self.open.as_ref().is_some_and(|(_, c, _)| c.start < hint) {
+            self.open = None;
+        }
+        self.full = false;
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.open = None;
+        self.full = false;
+    }
+
+    /// Its chunks, the open one too (an inspection count for tests).
+    #[cfg(feature = "test-hooks")]
+    fn len(&self) -> usize {
+        self.chunks.len() + usize::from(self.open.is_some())
+    }
 }
 
 /// Each stream's starts of the records read but not delivered (`ready` and `held`), as a
@@ -505,6 +682,15 @@ pub struct FeedReader {
     read_through: Option<Seqno>,
     /// Polls that read the streams (an inspection count for tests).
     stream_reads: u64,
+    /// Records the stream cursors stepped (an inspection count for tests, #1827).
+    #[cfg(feature = "test-hooks")]
+    record_steps: u64,
+    /// #1827: whether the streams' skip indexes are built. Set once a pass is capped (D320)
+    /// and cleared, with the indexes, once a pass reads to the end passing nothing over: a
+    /// reader that keeps up never builds one.
+    indexing: bool,
+    /// Chunks jumped over (an inspection count for tests, #1827).
+    chunk_skips: u64,
     /// Polls of any kind (an inspection count for tests, #1417).
     polls: u64,
     /// [`wait`](Self::wait)'s re-polls without parking: its waker's registration found the
@@ -969,6 +1155,10 @@ impl ReadAhead {
     }
 }
 
+/// A record [`FeedReader::read_one`] read: its start and end, its segment's feed session,
+/// the lowest key it can matter at (`Chunk::min_key`, #1827), and what it is.
+type ReadRecord = (Lsn, Lsn, u64, Seqno, Item);
+
 /// A delivered commit's packed changes: a single's record, or a round's shares.
 enum Packs {
     One(Raws),
@@ -1063,6 +1253,10 @@ impl FeedReader {
             frontier: 0,
             read_through: None,
             stream_reads: 0,
+            #[cfg(feature = "test-hooks")]
+            record_steps: 0,
+            indexing: false,
+            chunk_skips: 0,
             polls: 0,
             unparked_repolls: 0,
             parks: 0,
@@ -1214,6 +1408,7 @@ impl FeedReader {
                 cursor,
                 delivered_end: at,
                 must_reach,
+                index: SkipIndex::new(SKIP_INDEX_CHUNKS),
             });
         }
         // A feed of every table: the catalog changes before its start are passed over, their
@@ -1809,6 +2004,12 @@ impl FeedReader {
                 self.expired = Some(e);
                 return Ok(Polled::Expired);
             }
+            // #1827: a pass that passed nothing over keeps everything past the hints; the
+            // skip indexes have nothing left to jump.
+            if self.indexing && !self.ahead.capped() {
+                self.indexing = false;
+                self.streams.iter_mut().for_each(|st| st.index.clear());
+            }
             self.frontier = self.frontier.max(frontier);
             self.read_through = Some(frontier);
             // A feed of every table (D315): the catalog changes up to the frontier, after it was
@@ -1858,6 +2059,7 @@ impl FeedReader {
         }
         for (s, at) in hints.into_iter().enumerate() {
             self.streams[s].cursor = self.open_cursor(s, at)?;
+            self.streams[s].index.trim(at);
         }
         self.ready.clear();
         self.held.clear();
@@ -1875,22 +2077,55 @@ impl FeedReader {
     /// D320: evicts the largest-keyed records kept while the read-ahead is over its budget,
     /// or past the cutoff, lowering the cutoff below each. A held share counts at its id + 1
     /// (its round's apply seqno is above its id), and goes with every share of its round; a
-    /// decided round goes with its shares.
-    fn trim(&mut self) {
+    /// decided round goes with its shares. Returns whether it evicted anything.
+    ///
+    /// Run after every record a pass keeps: the check stays inline and the eviction is out
+    /// of line, so a reader that keeps up pays only the check (callgrind's feed-drain on
+    /// x86, #1922: with the eviction in it, `trim` stopped being inlined).
+    #[inline]
+    fn trim(&mut self) -> bool {
+        let (top_ready, top_held) = self.trim_tops();
+        if !self.trim_due(top_ready, top_held) {
+            return false;
+        }
+        self.evict_over();
+        true
+    }
+
+    /// The largest key kept, and the largest held share's id + 1 (not a share of a round
+    /// whose id + 1 is at or below `delivered`, simp724's N1 on #1622: a rewind can re-read a
+    /// delivered round's share without its Decision, and evicting it would put the cutoff at
+    /// or below `delivered` for nothing; rule C drops it).
+    #[inline]
+    fn trim_tops(&self) -> (Option<Seqno>, Option<Seqno>) {
+        let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
+        let top_held = self
+            .held
+            .range((self.delivered, 0)..)
+            .next_back()
+            .map(|(&(id, _), _)| id.saturating_add(1));
+        (top_ready, top_held)
+    }
+
+    /// Whether [`trim`](Self::trim) has anything to evict.
+    #[inline]
+    fn trim_due(&self, top_ready: Option<Seqno>, top_held: Option<Seqno>) -> bool {
+        let c = self.ahead.cutoff;
+        self.ahead.bytes > self.ahead.budget
+            || top_ready.is_some_and(|k| k > c)
+            || top_held.is_some_and(|k| k > c)
+    }
+
+    /// [`trim`](Self::trim)'s eviction, once it's due.
+    #[cold]
+    #[inline(never)]
+    fn evict_over(&mut self) {
+        // The cutoff falls only here: the streams' skip indexes are built from now on
+        // (#1827), and a reader that never gets here pays nothing for them per record.
+        self.indexing = true;
         loop {
-            let c = self.ahead.cutoff;
-            let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
-            // Not a share of a round whose id + 1 is at or below `delivered` (simp724's N1 on
-            // #1622): a rewind can re-read a delivered round's share without its Decision, and
-            // evicting it would put the cutoff at or below `delivered` for nothing. Rule C
-            // drops it.
-            let top_held = self
-                .held
-                .range((self.delivered, 0)..)
-                .next_back()
-                .map(|(&(id, _), _)| id.saturating_add(1));
-            let over = self.ahead.bytes > self.ahead.budget;
-            if !over && top_ready.is_none_or(|k| k <= c) && top_held.is_none_or(|k| k <= c) {
+            let (top_ready, top_held) = self.trim_tops();
+            if !self.trim_due(top_ready, top_held) {
                 return;
             }
             match (top_ready, top_held) {
@@ -1953,6 +2188,46 @@ impl FeedReader {
         self.stream_reads
     }
 
+    /// Records the stream cursors stepped since the reader opened (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn record_steps(&self) -> u64 {
+        self.record_steps
+    }
+
+    /// Indexed chunks jumped over since the reader opened (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn chunk_skips(&self) -> u64 {
+        self.chunk_skips
+    }
+
+    /// The chunks in the streams' skip indexes now (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn indexed_chunks(&self) -> usize {
+        self.streams.iter().map(|st| st.index.len()).sum()
+    }
+
+    /// The most chunks one stream's skip index keeps (#1827, perf2's S1 on #1922).
+    #[cfg(feature = "test-hooks")]
+    pub fn skip_index_cap() -> usize {
+        SKIP_INDEX_CHUNKS
+    }
+
+    /// The largest skip index of any stream now (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn largest_skip_index(&self) -> usize {
+        self.streams
+            .iter()
+            .map(|st| st.index.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The skip indexes' merging passes since the reader opened (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn skip_index_coarsenings(&self) -> u64 {
+        self.streams.iter().map(|st| st.index.coarsenings).sum()
+    }
+
     /// Polls of any kind since the reader opened (#1417).
     #[cfg(feature = "test-hooks")]
     pub fn polls(&self) -> u64 {
@@ -1974,11 +2249,55 @@ impl FeedReader {
 
     /// Reads stream `s` to its readable end. Returns `false` once the feed expired.
     fn read_stream(&mut self, s: usize) -> Result<bool> {
+        if self.indexing {
+            self.read_stream_as::<true>(s)
+        } else {
+            self.read_stream_as::<false>(s)
+        }
+    }
+
+    /// [`read_stream`](Self::read_stream), with the skip indexes built and used (#1827) or,
+    /// for a reader that has never been capped since the indexes were last dropped, not:
+    /// that instance is main's loop, with nothing of the index in it per record (callgrind's
+    /// feed-drain). An eviction that turns indexing on mid-stream hands the rest of the
+    /// stream to the indexing instance, so the index has no hole.
+    fn read_stream_as<const INDEXING: bool>(&mut self, s: usize) -> Result<bool> {
+        let chunk_bytes = (self.ahead.base / 16).clamp(256, 1 << 20);
         loop {
             let before = self.streams[s].cursor.position();
-            let Some((start, end, session, item)) = self.read_one(s)? else {
+            // #1827: a chunk an earlier capped pass indexed whose every record this pass
+            // would pass over (keys past the cutoff, which is at least `delivered`): jumped
+            // whole, as passing each over would leave it (the hint at its start, its session
+            // raised), without stepping its records. Not while a token's delivered records
+            // must still be reached: they're at or below `delivered`. A reader that isn't
+            // indexing has no chunks, and pays only the flag's test (callgrind's feed-drain).
+            if INDEXING
+                && self.streams[s].must_reach.is_none()
+                && let Some(c) = self.streams[s].index.at(before)
+                && c.min_key > self.ahead.cutoff
+            {
+                debug_assert!(c.min_key > self.delivered, "a chunk at or below delivered");
+                self.ahead.skip(s, c.start);
+                if self.history.holds(c.session) {
+                    self.raise_session(c.session);
+                }
+                self.chunk_skips += 1;
+                if !self.streams[s].cursor.skip_to(c.end)? {
+                    self.expired = Some(expiry(
+                        "retention passed the feed: a segment it was reading was recycled",
+                    ));
+                    return Ok(false);
+                }
+                continue;
+            }
+            let Some((start, end, session, key, item)) = self.read_one::<INDEXING>(s)? else {
                 return Ok(self.expired.is_none());
             };
+            if INDEXING {
+                self.streams[s]
+                    .index
+                    .note(before, start, end, key, session, chunk_bytes);
+            }
             // A token's delivered records must still be there (a torn tail or a restart
             // that lost them expires it, M2).
             if let Some(m) = self.streams[s].must_reach {
@@ -2096,14 +2415,16 @@ impl FeedReader {
                     }
                 }
             }
-            self.trim();
+            if self.trim() && !INDEXING {
+                return self.read_stream_as::<true>(s);
+            }
         }
     }
 
     /// Stream `s`'s next record as an owned item, its mutations filtered to the feed's
     /// tables and prefix; `None` at the readable end, or once its segment is gone (which
     /// expires the feed).
-    fn read_one(&mut self, s: usize) -> Result<Option<(Lsn, Lsn, u64, Item)>> {
+    fn read_one<const INDEXING: bool>(&mut self, s: usize) -> Result<Option<ReadRecord>> {
         let (tables, prefix) = (&self.tables, &self.prefix);
         // D320: a record past the read-ahead's cutoff is passed over before its mutations
         // are filtered or copied. One at or below `delivered` takes its usual path.
@@ -2116,7 +2437,13 @@ impl FeedReader {
                 end,
                 session,
                 record,
-            } => (start, end, session, record),
+            } => {
+                #[cfg(feature = "test-hooks")]
+                {
+                    self.record_steps += 1;
+                }
+                (start, end, session, record)
+            }
             Step::End => return Ok(None),
             Step::Gone => {
                 self.expired = Some(expiry(
@@ -2130,6 +2457,16 @@ impl FeedReader {
                 ));
                 return Ok(None);
             }
+        };
+        // The lowest key it can matter at (`Chunk::min_key`, #1827), needed only while the
+        // skip indexes are built.
+        let key = match &record {
+            _ if !INDEXING => 0,
+            WalRecord::Batch { seqno, .. } => *seqno,
+            WalRecord::Prepare { seqno, .. } | WalRecord::Decision { seqno, .. } => {
+                seqno.saturating_add(1)
+            }
+            _ => 0,
         };
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
@@ -2170,7 +2507,7 @@ impl FeedReader {
             },
             _ => Item::Other,
         };
-        Ok(Some((start, end, session, item)))
+        Ok(Some((start, end, session, key, item)))
     }
 
     /// Adds a record read to `ready`, counting its start. A key already there (never expected:
@@ -3130,6 +3467,79 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
 mod tests {
     use super::*;
     use pigeonhole_format::manifest::Edit;
+
+    /// perf2's S1 on #1922: a skip index over its cap merges adjacent chunks of a segment
+    /// pairwise and stays at the cap; each merged chunk's key is the lowest of the records it
+    /// covers (so a jump over it is exact), it covers them contiguously, never across a
+    /// segment; and at the cap with nothing to merge it stops growing until a trim.
+    #[test]
+    fn a_skip_index_over_its_cap_merges_exactly_within_segments() {
+        const CAP: usize = 8;
+        // 3 segments of 40 records, 100 bytes each, every record its own chunk (size 100);
+        // keys falling and rising so a merge's minimum isn't its first record's.
+        let mut index = SkipIndex::new(CAP);
+        let mut records = Vec::new();
+        let mut before = Lsn::new(1, 4096);
+        for epoch in 1..=3u32 {
+            for i in 0..40u32 {
+                let start = Lsn::new(epoch, 4096 + i * 100);
+                let end = Lsn::new(epoch, 4096 + (i + 1) * 100);
+                let key = 1000 + u64::from(epoch) * 100 + u64::from((i * 7) % 40);
+                index.note(before, start, end, key, u64::from(epoch), 100);
+                records.push((start, end, key));
+                before = end;
+                assert!(index.chunks.len() <= CAP, "{} chunks", index.chunks.len());
+            }
+        }
+        assert!(index.coarsenings > 0, "the cap bit");
+        assert!(!index.full, "pairs were left to merge");
+        let mut covered = 0;
+        for (&key, c) in &index.chunks {
+            assert_eq!(c.start.epoch(), c.end.epoch(), "a chunk crossed a segment");
+            assert_eq!(u64::from(c.start.epoch()), c.session);
+            assert!(
+                key <= c.start,
+                "the key is a cursor position before the chunk"
+            );
+            let inside: Vec<_> = records
+                .iter()
+                .filter(|(s, e, _)| *s >= c.start && *e <= c.end)
+                .collect();
+            assert!(!inside.is_empty());
+            assert_eq!(
+                inside.first().unwrap().0,
+                c.start,
+                "contiguous from its start"
+            );
+            assert_eq!(inside.last().unwrap().1, c.end, "contiguous to its end");
+            covered += inside.len();
+            let min = inside.iter().map(|(_, _, k)| *k).min().unwrap();
+            assert_eq!(
+                c.min_key, min,
+                "a merged chunk's key is its records' lowest"
+            );
+            assert!(index.at(key).is_some() && index.at(c.start).is_some());
+        }
+        assert_eq!(covered + usize::from(index.open.is_some()), records.len());
+
+        // Every chunk alone in its segment, more segments than the cap: full, then a trim
+        // lets it grow again.
+        let mut index = SkipIndex::new(2);
+        let mut before = Lsn::new(1, 4096);
+        for epoch in 1..=4u32 {
+            let start = Lsn::new(epoch, 4096);
+            let end = Lsn::new(epoch, 4196);
+            index.note(before, start, end, u64::from(epoch), 0, 100);
+            before = end;
+        }
+        assert!(index.full, "nothing left to merge");
+        assert!(index.chunks.len() <= 2);
+        index.trim(Lsn::new(2, 4096));
+        assert!(!index.full);
+        // A chunk keyed at segment 1's end but starting in segment 2 survives a trim to its
+        // start, and is found there (perf2's N1).
+        assert!(index.at(Lsn::new(2, 4096)).is_some());
+    }
 
     /// A catalog with tables `ids` and the counters given (feed1248's S2 on #1870: `Derive`
     /// on hand-built catalogs).

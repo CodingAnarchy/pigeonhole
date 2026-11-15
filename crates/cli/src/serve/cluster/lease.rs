@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use super::proto::{ClusterMap, LeasePart, LeaseRequest, LeaseResponse, LeaseWithheld};
+use super::proto::{
+    ClusterMap, LeasePart, LeaseRequest, LeaseResponse, LeaseWithheld, ReleaseRequest,
+};
 use crate::serve::errors::ApiError;
 use crate::serve::gate::LeaseClock;
 
@@ -229,6 +231,41 @@ impl Grants {
             },
         );
         Ok(out)
+    }
+
+    /// `Cluster.Release` (D326 PR 2): node `req.node_id` closed the partitions it names, so
+    /// its grant here drops them now. Only a grant of the same start, at a round no older
+    /// than the grant's: a delayed release from an earlier start, or one that a newer lease
+    /// round already passed, would end a grant that's live, and the holder may be serving
+    /// under it. Whether anything was dropped.
+    pub(crate) fn release(&self, req: &ReleaseRequest) -> bool {
+        let now = self.clock.now();
+        let mut by = self
+            .by_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        by.retain(|_, g| g.until > now);
+        let Some(g) = by.get_mut(&req.node_id) else {
+            return false;
+        };
+        if g.start != req.start || g.round > req.round {
+            eprintln!(
+                "phdb serve: node {}'s release (start {}, round {}) is older than its grant \
+                 here (start {}, round {}): ignored",
+                req.node_id, req.start, req.round, g.start, g.round
+            );
+            return false;
+        }
+        // From here, a lease request of an older round is ignored too, so it can't put back
+        // what this release dropped.
+        g.round = req.round;
+        let before = g.parts.len();
+        for LeasePart { partition, epoch } in &req.parts {
+            if g.parts.get(partition) == Some(epoch) {
+                g.parts.remove(partition);
+            }
+        }
+        g.parts.len() < before
     }
 }
 
@@ -442,5 +479,77 @@ mod tests {
             granted(&grant(&g, &v2, &ask("b", 2, 1, &[("p2", 2)]))),
             ["p2"]
         );
+    }
+
+    fn release(node: &str, start: u64, round: u64, parts: &[(&str, u64)]) -> ReleaseRequest {
+        ReleaseRequest {
+            cluster_id: "c1".into(),
+            node_id: node.into(),
+            round,
+            parts: parts
+                .iter()
+                .map(|(p, e)| LeasePart {
+                    partition: (*p).into(),
+                    epoch: *e,
+                })
+                .collect(),
+            start,
+        }
+    }
+
+    #[test]
+    fn a_release_frees_a_partition_at_once_and_a_lease_round_older_than_it_is_ignored() {
+        // D326 PR 2: a planned move's old node closes P and releases it, so a grantor
+        // stops withholding P at once rather than when the grant runs out.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = map(1, &[("p1", "a", 1), ("p2", "a", 1)]);
+        assert_eq!(
+            grant(&g, &v1, &ask("a", 1, 5, &[("p1", 1), ("p2", 1)]))
+                .granted
+                .len(),
+            2
+        );
+        assert!(g.release(&release("a", 1, 6, &[("p1", 1)])));
+        let v2 = map(2, &[("p1", "b", 2), ("p2", "a", 1)]);
+        assert_eq!(
+            granted(&grant(&g, &v2, &ask("b", 2, 1, &[("p1", 2)]))),
+            ["p1"]
+        );
+        // a's lease round 5, delayed past its release, can't take p1 back: it's older.
+        let r = grant(&g, &v1, &ask("a", 1, 5, &[("p1", 1), ("p2", 1)]));
+        assert!(r.granted.is_empty() && r.newer_map_version == 0, "{r:?}");
+    }
+
+    #[test]
+    fn a_delayed_release_from_a_previous_start_never_ends_a_live_grant() {
+        // The coordinator's case on ReleaseRequest.start: node a releases p1 and restarts;
+        // its new start is granted p1 again and serves under it. The old start's release,
+        // delayed past that, must not drop p1 from the live grant, or another node could
+        // gather p1's lease while a serves.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = map(1, &[("p1", "a", 1)]);
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask("a", 1, 9, &[("p1", 1)]))),
+            ["p1"]
+        );
+        let stale = release("a", 1, 10, &[("p1", 1)]);
+        let restarted = LeaseRequest {
+            start: 2,
+            ..ask("a", 1, 1, &[("p1", 1)])
+        };
+        assert_eq!(granted(&grant(&g, &v1, &restarted)), ["p1"]);
+        assert!(!g.release(&stale), "a release of the earlier start");
+        // p1 is still a's here: b is refused it.
+        let v2 = map(2, &[("p1", "b", 2)]);
+        let r = grant(&g, &v2, &ask("b", 2, 1, &[("p1", 2)]));
+        assert!(r.granted.is_empty(), "{r:?}");
+        assert_eq!(r.withheld[0].holder, "a", "{r:?}");
+        // The same start's release at an older round is ignored as well.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask("a", 1, 9, &[("p1", 1)]))),
+            ["p1"]
+        );
+        assert!(!g.release(&release("a", 1, 8, &[("p1", 1)])));
     }
 }

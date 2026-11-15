@@ -3854,26 +3854,36 @@ impl Service {
         };
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
-        self.part()?.feeds.subscribe(
-            super::feed::Spec {
-                tables,
-                prefix: r.prefix.to_vec(),
-                visible: r.visible,
-                start,
-                skip,
-                announce,
-                internal,
-            },
-            slot,
-            move |e| {
-                // A client's own subscription that hit the idle limit; a cluster
-                // subscription's part (`announce`) is counted with its subscription.
-                if !announce && e.is_some_and(|e| e.code == "DeadlineExceeded") {
-                    metrics.feed_idle_drops.fetch_add(1, Ordering::Relaxed);
-                }
-                metrics.count(FEED, e.map(|e| e.code.as_str()), started.elapsed());
-            },
-        )
+        self.part()?
+            .feeds
+            .subscribe(
+                super::feed::Spec {
+                    tables,
+                    prefix: r.prefix.to_vec(),
+                    visible: r.visible,
+                    start,
+                    skip,
+                    announce,
+                    internal,
+                },
+                slot,
+                move |e| {
+                    // A client's own subscription that hit the idle limit; a cluster
+                    // subscription's part (`announce`) is counted with its subscription.
+                    if !announce && e.is_some_and(|e| e.code == "DeadlineExceeded") {
+                        metrics.feed_idle_drops.fetch_add(1, Ordering::Relaxed);
+                    }
+                    metrics.count(FEED, e.map(|e| e.code.as_str()), started.elapsed());
+                },
+            )
+            .and_then(|events| match &self.gate {
+                // A cluster partition's: delivered only under its lease (D326 PR 2). A
+                // subscribe isn't a read for the gate (feed1248's F1): it waits for a lease
+                // it hasn't had yet, and is refused only where it lapsed or the node can't
+                // reach a majority (F2).
+                Some(gate) => events.leased(Arc::clone(gate)),
+                None => Ok(events),
+            })
     }
 
     /// The feed fan-out's limits: a cluster subscription's buffer and idle limit are a
