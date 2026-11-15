@@ -4699,14 +4699,17 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
     - a Single counts at its seqno;
     - a Prepare counts at its round id + 1;
     - **a Decision counts at its round id + 1, not its apply seqno.** Passing a Decision over drops its round's held shares, which matters only for a round whose id is under the cutoff. A chunk keyed that way is never jumped while one of its round's shares may be held. Otherwise rule C would drop the share as aborted, and the Decision read after the rewind would expire the feed as a gap.
-- **The jump:** a later pass that finds its cursor at a chunk whose lowest key is past the cutoff C jumps it whole, with `FeedCursor::skip_to`. That reads nothing unless the target segment is missing from the headers as last read.
+- **The jump:** a later pass that finds its cursor at a chunk (at its key, or at its first record's start, where a rewind reopens a cursor) whose lowest key is past the cutoff C jumps it whole, with `FeedCursor::skip_to`. That reads nothing unless the target segment is missing from the headers as last read.
   - It leaves the hint at the chunk's start and raises the session. Passing each record over would do the same.
   - C is at least `delivered`, so a jumped record is never one at or below it, and the `delivered_end` and gap paths are never bypassed.
   - No jump happens while a token's delivered records must still be reached.
   - A jump into a recycled segment expires the feed for retention, as a step into one does.
 - **Unchanged:** M1, rule C (every stream is still read to its end, and the tail past the index is always stepped), tokens and hints, `read_through`, the liveness doubling and the budget.
-- **Lifetime:** a reader that keeps up is never capped and builds nothing. A rewind trims each index to its hint. A pass that reads to the end without passing anything over drops the indexes.
-- **The bound:** the indexes are outside the budget, at under 64 B a chunk with the map's overhead: under 64 KiB per GiB of a capped stream's backlog at the default budget.
+- **Lifetime:** a reader that keeps up is never capped and builds nothing. A rewind drops the chunks with a record before its hint. A pass that reads to the end without passing anything over drops the indexes.
+- **The bound (perf2's S1 on #1922):** a stream's index holds at most 4,096 chunks, under 64 B each with the map's overhead: about 256 KiB per stream per capped reader, outside the budget, whatever the retention.
+  - **Past the cap:** adjacent chunks of one segment are merged pairwise. A merged chunk's lowest key is the lower of the two, so a jump over it is exact, and it still never crosses a segment.
+  - **If nothing can merge** (every chunk alone in its segment), the newest chunk goes, and the index stops growing until a rewind trims it. The tail past it is stepped, as without an index.
+  - **The cost of coarser chunks:** more records a pass in the chunk straddling the cutoff. `it::feed_reader`'s 43,200-record drain at the cap took 3.8 record steps a record.
 - **The cost:** each record is stepped about once to index it, once to deliver it, and in a bounded slice per pass: the chunk straddling the cutoff on each stream, and what the first stream kept before the others lowered the cutoff. `it::feed_reader`'s 7,200-record drain, at 125 passes, went from 453,576 record steps (63 a record) to 21,157 (2.9). The drain is linear, apart from O(1) per jumped chunk per pass.
 - **PR 2 (the writer logs a group's DECISIONs ahead of its Singles) is dropped.** It needed a FORMAT line and an ICR, touched every cross-shard commit, and wouldn't help segments already retained from older builds.
 

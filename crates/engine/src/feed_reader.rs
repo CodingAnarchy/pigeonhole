@@ -420,24 +420,54 @@ struct Chunk {
     session: u64,
 }
 
+/// #1827: the most chunks a stream's skip index keeps (perf2's S1 on #1922). Past it, adjacent
+/// chunks of a segment are merged pairwise, so a capped reader's index takes a constant
+/// memory, under 64 B a chunk: about 256 KiB a stream, outside the read-ahead budget.
+const SKIP_INDEX_CHUNKS: usize = 4096;
+
 /// #1827: one stream's chunks, by the cursor's position just before each one's first
 /// record. Built while the reader is capped, at the stream's indexed end only (a pass that
 /// reads inside the index adds nothing); trimmed to the hint at each rewind and dropped once
-/// a pass reads to the end without passing anything over. Outside the read-ahead budget: 40
-/// bytes or so a chunk, a chunk being up to `chunk_bytes` of log.
-#[derive(Debug, Default)]
+/// a pass reads to the end without passing anything over.
+///
+/// At most `cap` chunks (perf2's S1 on #1922): once over it, adjacent chunks of one segment
+/// are merged pairwise. A merged chunk's key is the lower of the two lowest keys, so a jump
+/// over it is a jump over both, exactly; it still never crosses a segment, and its key is
+/// still a cursor position. If no pair can merge (every chunk alone in its segment), the
+/// index stops growing until a rewind trims it: the tail past it is stepped, as without one.
+#[derive(Debug)]
 struct SkipIndex {
     chunks: BTreeMap<Lsn, Chunk>,
     /// The chunk being built, its key, and the log bytes in it.
     open: Option<(Lsn, Chunk, u64)>,
+    cap: usize,
+    /// At the cap with nothing left to merge: nothing is added until a trim.
+    full: bool,
+    /// Merging passes run (an inspection count for tests).
+    #[cfg(any(test, feature = "test-hooks"))]
+    coarsenings: u64,
 }
 
 impl SkipIndex {
+    fn new(cap: usize) -> Self {
+        Self {
+            chunks: BTreeMap::new(),
+            open: None,
+            cap: cap.max(2),
+            full: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            coarsenings: 0,
+        }
+    }
+
     /// Notes a record read at the cursor's position `before`, `start..end`, keyed `key`, in
     /// a segment of `session`: it extends the open chunk when it's the next record after it
     /// in the same segment, and begins one past the index's end. One inside the index adds
-    /// nothing.
+    /// nothing, nor does any while the index is full.
     fn note(&mut self, before: Lsn, start: Lsn, end: Lsn, key: Seqno, session: u64, size: u64) {
+        if self.full {
+            return;
+        }
         let len = u64::from(end.offset().saturating_sub(start.offset()));
         if let Some((_, c, bytes)) = &mut self.open
             && c.end == before
@@ -459,6 +489,9 @@ impl SkipIndex {
             return;
         }
         self.close();
+        if self.full {
+            return;
+        }
         let c = Chunk {
             start,
             end,
@@ -471,30 +504,73 @@ impl SkipIndex {
         }
     }
 
+    /// Closes the open chunk, merging pairwise once over the cap.
     fn close(&mut self) {
         if let Some((key, c, _)) = self.open.take() {
             self.chunks.insert(key, c);
         }
+        if self.chunks.len() > self.cap {
+            self.coarsen();
+            // Nothing merged: the newest goes, and the tail past the index is stepped.
+            while self.chunks.len() > self.cap {
+                self.chunks.pop_last();
+                self.full = true;
+            }
+        }
     }
 
-    /// The closed chunk the cursor at `at` is just before.
+    /// Merges each chunk with the next where the next starts where it ends, in its segment.
+    fn coarsen(&mut self) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.coarsenings += 1;
+        }
+        let mut old = std::mem::take(&mut self.chunks).into_iter().peekable();
+        while let Some((key, mut c)) = old.next() {
+            if let Some((next_key, next)) = old.peek()
+                && *next_key == c.end
+                && next.start.epoch() == c.start.epoch()
+            {
+                c.end = next.end;
+                c.min_key = c.min_key.min(next.min_key);
+                old.next();
+            }
+            self.chunks.insert(key, c);
+        }
+    }
+
+    /// The closed chunk the cursor at `at` is just before: keyed there, or starting there (a
+    /// cursor reopened at a hint is at the chunk's first record, past a key at the previous
+    /// segment's end: perf2's N1 on #1922).
     fn at(&self, at: Lsn) -> Option<Chunk> {
-        self.chunks.get(&at).copied()
+        let (&key, c) = self.chunks.range(..=at).next_back()?;
+        (key == at || c.start == at).then_some(*c)
     }
 
-    /// Drops the chunks before `hint`: everything there was delivered.
+    /// Drops the chunks with a record before `hint`: everything there was delivered. A chunk
+    /// keyed before the hint but starting at or after it stays.
     fn trim(&mut self, hint: Lsn) {
-        self.chunks = self.chunks.split_off(&hint);
-        if self.open.as_ref().is_some_and(|(k, _, _)| *k < hint) {
+        let mut kept = self.chunks.split_off(&hint);
+        if let Some((&k, &c)) = self.chunks.last_key_value()
+            && c.start >= hint
+        {
+            kept.insert(k, c);
+        }
+        self.chunks = kept;
+        if self.open.as_ref().is_some_and(|(_, c, _)| c.start < hint) {
             self.open = None;
         }
+        self.full = false;
     }
 
     fn clear(&mut self) {
         self.chunks.clear();
         self.open = None;
+        self.full = false;
     }
 
+    /// Its chunks, the open one too (an inspection count for tests).
+    #[cfg(feature = "test-hooks")]
     fn len(&self) -> usize {
         self.chunks.len() + usize::from(self.open.is_some())
     }
@@ -1330,7 +1406,7 @@ impl FeedReader {
                 cursor,
                 delivered_end: at,
                 must_reach,
-                index: SkipIndex::default(),
+                index: SkipIndex::new(SKIP_INDEX_CHUNKS),
             });
         }
         // A feed of every table: the catalog changes before its start are passed over, their
@@ -2093,6 +2169,28 @@ impl FeedReader {
     #[cfg(feature = "test-hooks")]
     pub fn indexed_chunks(&self) -> usize {
         self.streams.iter().map(|st| st.index.len()).sum()
+    }
+
+    /// The most chunks one stream's skip index keeps (#1827, perf2's S1 on #1922).
+    #[cfg(feature = "test-hooks")]
+    pub fn skip_index_cap() -> usize {
+        SKIP_INDEX_CHUNKS
+    }
+
+    /// The largest skip index of any stream now (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn largest_skip_index(&self) -> usize {
+        self.streams
+            .iter()
+            .map(|st| st.index.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The skip indexes' merging passes since the reader opened (#1827).
+    #[cfg(feature = "test-hooks")]
+    pub fn skip_index_coarsenings(&self) -> u64 {
+        self.streams.iter().map(|st| st.index.coarsenings).sum()
     }
 
     /// Polls of any kind since the reader opened (#1417).
@@ -3313,6 +3411,79 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
 mod tests {
     use super::*;
     use pigeonhole_format::manifest::Edit;
+
+    /// perf2's S1 on #1922: a skip index over its cap merges adjacent chunks of a segment
+    /// pairwise and stays at the cap; each merged chunk's key is the lowest of the records it
+    /// covers (so a jump over it is exact), it covers them contiguously, never across a
+    /// segment; and at the cap with nothing to merge it stops growing until a trim.
+    #[test]
+    fn a_skip_index_over_its_cap_merges_exactly_within_segments() {
+        const CAP: usize = 8;
+        // 3 segments of 40 records, 100 bytes each, every record its own chunk (size 100);
+        // keys falling and rising so a merge's minimum isn't its first record's.
+        let mut index = SkipIndex::new(CAP);
+        let mut records = Vec::new();
+        let mut before = Lsn::new(1, 4096);
+        for epoch in 1..=3u32 {
+            for i in 0..40u32 {
+                let start = Lsn::new(epoch, 4096 + i * 100);
+                let end = Lsn::new(epoch, 4096 + (i + 1) * 100);
+                let key = 1000 + u64::from(epoch) * 100 + u64::from((i * 7) % 40);
+                index.note(before, start, end, key, u64::from(epoch), 100);
+                records.push((start, end, key));
+                before = end;
+                assert!(index.chunks.len() <= CAP, "{} chunks", index.chunks.len());
+            }
+        }
+        assert!(index.coarsenings > 0, "the cap bit");
+        assert!(!index.full, "pairs were left to merge");
+        let mut covered = 0;
+        for (&key, c) in &index.chunks {
+            assert_eq!(c.start.epoch(), c.end.epoch(), "a chunk crossed a segment");
+            assert_eq!(u64::from(c.start.epoch()), c.session);
+            assert!(
+                key <= c.start,
+                "the key is a cursor position before the chunk"
+            );
+            let inside: Vec<_> = records
+                .iter()
+                .filter(|(s, e, _)| *s >= c.start && *e <= c.end)
+                .collect();
+            assert!(!inside.is_empty());
+            assert_eq!(
+                inside.first().unwrap().0,
+                c.start,
+                "contiguous from its start"
+            );
+            assert_eq!(inside.last().unwrap().1, c.end, "contiguous to its end");
+            covered += inside.len();
+            let min = inside.iter().map(|(_, _, k)| *k).min().unwrap();
+            assert_eq!(
+                c.min_key, min,
+                "a merged chunk's key is its records' lowest"
+            );
+            assert!(index.at(key).is_some() && index.at(c.start).is_some());
+        }
+        assert_eq!(covered + usize::from(index.open.is_some()), records.len());
+
+        // Every chunk alone in its segment, more segments than the cap: full, then a trim
+        // lets it grow again.
+        let mut index = SkipIndex::new(2);
+        let mut before = Lsn::new(1, 4096);
+        for epoch in 1..=4u32 {
+            let start = Lsn::new(epoch, 4096);
+            let end = Lsn::new(epoch, 4196);
+            index.note(before, start, end, u64::from(epoch), 0, 100);
+            before = end;
+        }
+        assert!(index.full, "nothing left to merge");
+        assert!(index.chunks.len() <= 2);
+        index.trim(Lsn::new(2, 4096));
+        assert!(!index.full);
+        // A chunk keyed at segment 1's end but starting in segment 2 survives a trim to its
+        // start, and is found there (perf2's N1).
+        assert!(index.at(Lsn::new(2, 4096)).is_some());
+    }
 
     /// A catalog with tables `ids` and the counters given (feed1248's S2 on #1870: `Derive`
     /// on hand-built catalogs).

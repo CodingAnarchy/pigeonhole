@@ -2594,3 +2594,48 @@ fn a_capped_readers_skip_index_keeps_tokens_and_retention_as_they_were() {
     drop(r);
     db.close().unwrap();
 }
+
+/// #1827, perf2's S1 on #1922: a capped reader's skip index stays within its per-stream cap
+/// however long the backlog: past the cap it merges adjacent chunks, and the jumps over
+/// merged chunks stay exact (every commit once, whole and in order) and the drain linear.
+#[test]
+fn a_skip_index_stays_within_its_cap_and_its_merged_jumps_stay_exact() {
+    const BUDGET: u64 = 4 << 10;
+    const N: u32 = 36_000;
+    let cap = FeedReader::skip_index_cap();
+    let vfs = SimVfs::new(3206);
+    let db = open(&vfs, Some(feed(64 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    r.set_read_ahead(BUDGET);
+    let want = small_commits(&db, &a, &b, N);
+    let steps_before = r.record_steps();
+    let mut largest = 0;
+    for (i, &w) in want.iter().enumerate() {
+        let c = next(&mut r);
+        assert_eq!(c.seqno, w, "commit {i}");
+        assert!(!c.changes.is_empty());
+        largest = largest.max(r.largest_skip_index());
+    }
+    assert!(matches!(r.try_next().unwrap(), Next::Pending));
+    let steps = r.record_steps() - steps_before;
+    let records = u64::from(N) + 2 * u64::from(N / 10);
+    // The open chunk counts beside the cap's closed ones.
+    assert!(
+        largest <= cap + 1,
+        "a stream's index reached {largest} chunks"
+    );
+    assert!(
+        r.skip_index_coarsenings() > 0,
+        "the backlog never reached the cap"
+    );
+    assert!(r.chunk_skips() > 0);
+    // Linear still: merged chunks are coarser, so the one straddling the cutoff on each
+    // stream holds more records a pass than T1's (3.8 a record here, where T1 is 2.9).
+    assert!(
+        steps <= 5 * records,
+        "{steps} record steps for {records} records"
+    );
+    drop(r);
+    db.close().unwrap();
+}
