@@ -1151,14 +1151,25 @@ impl FamilyRead {
 /// cleared; the miss fails the positioning, [`FamilyRead::unwind`] sets `reseek`, and the
 /// retry seeks every source afresh, which settles it anyway. The retry's probe fetches only
 /// the seek's first blocks; a later miss is fetched by the same `WouldBlock` loop.
+///
+/// Inlined into the key loop, as it was before the re-settle (#1954's callgrind: an out-of-line
+/// `move_to` cost multi-get-dense 0.3%); the re-settle itself is out of line.
+#[inline]
 fn move_to(src: &mut Source, target: &[u8], fresh: bool, filtered: bool) -> Result<()> {
     if fresh || !src.valid() {
         src.seek(target)
     } else if src.key() < target {
         src.seek_forward(target)
     } else if filtered && src.take_stopped() {
-        src.resettle()
+        resettle(src)
     } else {
         Ok(())
     }
+}
+
+/// [`move_to`]'s rare case: a source a jump stop left on a key its filter didn't admit.
+#[cold]
+#[inline(never)]
+fn resettle(src: &mut Source) -> Result<()> {
+    src.resettle()
 }
