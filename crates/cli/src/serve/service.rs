@@ -3624,9 +3624,10 @@ impl Service {
     /// or `limit` runs out. Each page is a new read, at its own snapshot (simp724's D1 on
     /// #1510), unless the selection names a pinned one, which the stream holds. The request is checked before the stream starts, so a bad one fails the call;
     /// a failure later ends the stream with the error, a panic in the task as `Internal`. The
-    /// scan holds a `--max-scans` slot until its stream ends: a stream outlives its request's
-    /// `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read holds
-    /// no blocking thread.
+    /// scan holds a `--max-scans` slot until the server's stream has taken its last page (or
+    /// the idle limit ends it), not until the client has read it: a stream outlives its
+    /// request's `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read
+    /// holds no blocking thread.
     async fn scan(
         &self,
         r: proto::ScanRequest,
@@ -4453,6 +4454,32 @@ fn between_reads(table: &str) {
     }
 }
 
+/// A hold seam (tests): a scan of `table` waits, once, after it hands a page to its stream,
+/// until the armed sender sends or is dropped. A scan task the client's connection drains at
+/// once ends, and gives back its `--max-scans` slot, before a client that reads nothing more
+/// can ask for another scan (#1947); held, its slot stays taken. The wait is on the scan's own
+/// task, so the server keeps taking calls. Process-wide and keyed by table name only: each
+/// test that arms it uses a table name of its own.
+#[cfg(test)]
+pub(crate) static HOLD_AFTER_PAGE: std::sync::Mutex<Vec<(String, oneshot::Receiver<()>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+async fn hold_after_page(table: &str) {
+    let armed = {
+        let mut armed = HOLD_AFTER_PAGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        armed
+            .iter()
+            .position(|(t, _)| t == table)
+            .map(|i| armed.swap_remove(i).1)
+    };
+    if let Some(release) = armed {
+        let _ = release.await;
+    }
+}
+
 /// A table's scan, ready to start: see [`Service::scan_opener`].
 pub(crate) struct ScanOpener {
     table: Table,
@@ -4469,9 +4496,11 @@ pub(crate) struct ScanOpener {
 impl ScanOpener {
     /// Starts `r`'s scan: its pages, read one ahead at most by a task of its own, then its
     /// error if it fails. A failure before the first page (a bad position) is returned here.
-    /// The scan holds `slot` (a `--max-scans` slot) until its stream ends; one partition's
-    /// part of a cluster scan holds none, since the fanned-out stream holds it. With
-    /// `metrics`, its outcome is counted as a `Data.Scan` when it ends.
+    /// The scan holds `slot` (a `--max-scans` slot) until its task ends: once the server's
+    /// stream has taken its last page (or the idle limit, or a failure, ends it), not once the
+    /// client has read it. One partition's part of a cluster scan holds none, since the
+    /// fanned-out stream holds it.
+    /// With `metrics`, its outcome is counted as a `Data.Scan` when it ends.
     pub(crate) fn open(
         &self,
         r: proto::ScanRequest,
@@ -4689,6 +4718,8 @@ impl ScanTask {
             let slot: PageSlot = Arc::new(std::sync::Mutex::new(Some((page, paid))));
             space.send(Arc::clone(&slot));
             queued = Some(slot);
+            #[cfg(test)]
+            hold_after_page(&r.table).await;
             if end {
                 // The stream ends once the client has the last page, or the idle timeout
                 // takes it back: an unread page doesn't keep its budget.
