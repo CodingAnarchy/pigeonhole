@@ -118,7 +118,10 @@ pub(crate) async fn watch(
         map_version,
         channels: Vec::new(),
     };
-    // Every component open, and its start mark taken, before anything is delivered.
+    // Every component open, and its start mark taken, before anything is delivered: all
+    // within the request timeout, since a component delivers nothing, its start mark
+    // included, before its partition's first lease (simp724's S5).
+    let deadline = tokio::time::Instant::now() + within;
     let mut components = Vec::with_capacity(placed.len());
     for (p, ns) in placed {
         let (epoch, resume) = starts.remove(&p).expect("a start for every partition");
@@ -126,16 +129,27 @@ pub(crate) async fn watch(
             namespaces: ns,
             resume,
         };
-        let mut events = open.open(&p, request).await?;
-        let start = match next(&mut events).await {
-            Some(Ok(proto::MemoryEvent {
-                token,
-                event: Some(proto::memory_event::Event::Progress(_)),
-            })) => token,
-            Some(Err(e)) => return Err(e),
-            _ => {
-                return Err(ApiError::internal(format!(
+        let started = tokio::time::timeout_at(deadline, async {
+            let mut events = open.open(&p, request).await?;
+            match next(&mut events).await {
+                Some(Ok(proto::MemoryEvent {
+                    token,
+                    event: Some(proto::memory_event::Event::Progress(_)),
+                })) => Ok((events, token)),
+                Some(Err(e)) => Err(e),
+                _ => Err(ApiError::internal(format!(
                     "partition {p:?}'s watch didn't start with its position"
+                ))),
+            }
+        })
+        .await;
+        let (events, start) = match started {
+            Ok(started) => started?,
+            Err(_) => {
+                return Err(ApiError::partition_unavailable(format!(
+                    "partition {p:?}'s watch didn't start within {} ms (its node may hold no \
+                     lease for it yet): watch again",
+                    within.as_millis()
                 )));
             }
         };
