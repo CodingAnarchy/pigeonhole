@@ -742,6 +742,33 @@ struct Driver {
     place: Place,
     /// When the task first saw its hub alone on the hub runtime, and the joins then.
     alone: Option<(Instant, u64)>,
+    /// Set once the task has tried its hub with its first item (`Feeds::after_hub_spawn`'s
+    /// hold seam, #1926).
+    #[cfg(test)]
+    started: Option<Arc<Started>>,
+}
+
+/// A drive task's first item handled: what [`Feeds::after_hub_spawn`] waits for (#1926).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Started(Mutex<bool>, std::sync::Condvar);
+
+#[cfg(test)]
+impl Started {
+    fn set(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.1.notify_all();
+    }
+
+    /// Waits up to `within` for the task's first item.
+    pub(crate) fn wait(&self, within: Duration) -> bool {
+        let g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (g, _) = self
+            .1
+            .wait_timeout_while(g, within, |set| !*set)
+            .unwrap_or_else(PoisonError::into_inner);
+        *g
+    }
 }
 
 impl Driver {
@@ -800,7 +827,14 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                 polled
             })
             .await;
-            let Some(hub) = d.hub.upgrade() else { return };
+            // `None` only once every client has let the hub go: the task starts after its hub
+            // is made (`Feeds::hub`, #1926).
+            let hub = d.hub.upgrade();
+            #[cfg(test)]
+            if let Some(started) = d.started.take() {
+                started.set();
+            }
+            let Some(hub) = hub else { return };
             match item {
                 Some(Ok(commit)) => {
                     let at = d.stream.position().seqno();
@@ -877,6 +911,11 @@ pub(crate) struct Feeds {
     /// Ends every cluster component stream (`Spec::announce`) open on this partition, with
     /// the error sent: the node's map no longer gives it the partition (audit120's S-C5).
     parts_ended: watch::Sender<Option<ApiError>>,
+    /// A hold seam (#1926): run in [`hub`](Self::hub) right after a new hub's task is
+    /// spawned, with what the task sets once it has handled its first item.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_hub_spawn: Mutex<Option<Box<dyn Fn(&Arc<Started>) + Send>>>,
 }
 
 /// A hub's place in the node's live count (`--max-feed-hubs`, D317 ticket 8a), taken before
@@ -975,6 +1014,8 @@ impl Feeds {
             live: Arc::clone(&shared.live),
             sharers: Arc::clone(&shared.sharers),
             parts_ended: watch::Sender::new(None),
+            #[cfg(test)]
+            after_hub_spawn: Mutex::new(None),
         })
     }
 
@@ -1208,34 +1249,56 @@ impl Feeds {
             .get()
             .cloned()
             .zip(self.hub_runtime.get().cloned());
-        let hub = Arc::new_cyclic(|weak: &Weak<Hub>| {
-            let driver = Driver {
-                stream,
-                hub: weak.clone(),
-                ring_bytes: self.limits.ring_bytes,
-                runtimes: runtimes.clone(),
-                solo_after: self.limits.solo_after,
-                place: Place::Feed,
-                alone: None,
-            };
-            let task = match &runtimes {
-                Some((feed, _)) => feed.spawn(drive(driver)),
-                None => self.spawn_hub(drive(driver)),
-            };
-            Hub::new(
-                Ring::new(SingleRing {
-                    start_seqno,
-                    passed: start_seqno,
-                    passed_token: start_token,
-                    failed: false,
-                }),
-                task.abort_handle(),
-                runtimes.is_some(),
-                stats,
-                live,
-                sharers,
-            )
-        });
+        // The hub first, its task after, holding it: a task spawned while the hub was still
+        // being made (`Arc::new_cyclic`) could finish its first poll before the hub existed,
+        // find nothing to upgrade, and stop, leaving the hub's clients nothing ever again
+        // (#1926). Its handle is set under the map's lock, which `fail_all` takes, before the
+        // hub is in the map: nothing fails or replaces it in between.
+        let hub = Arc::new(Hub::new(
+            Ring::new(SingleRing {
+                start_seqno,
+                passed: start_seqno,
+                passed_token: start_token,
+                failed: false,
+            }),
+            tokio::runtime::Handle::current()
+                .spawn(async {})
+                .abort_handle(),
+            runtimes.is_some(),
+            stats,
+            live,
+            sharers,
+        ));
+        #[cfg(test)]
+        let started = Arc::new(Started::default());
+        let driver = Driver {
+            stream,
+            hub: Arc::downgrade(&hub),
+            ring_bytes: self.limits.ring_bytes,
+            runtimes: runtimes.clone(),
+            solo_after: self.limits.solo_after,
+            place: Place::Feed,
+            alone: None,
+            #[cfg(test)]
+            started: Some(Arc::clone(&started)),
+        };
+        let task = match &runtimes {
+            Some((feed, _)) => feed.spawn(drive(driver)),
+            None => self.spawn_hub(drive(driver)),
+        };
+        #[cfg(test)]
+        if let Some(seam) = &*self
+            .after_hub_spawn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            seam(&started);
+        }
+        // An overwrite with no check, and safe: the slot still holds the placeholder. The only
+        // other writer is the task's own runtime move (`drive`), which needs two members or a
+        // cluster merge, and nobody can join a hub before it's in the map, below (cli692's N1
+        // on #1927).
+        hub.set_task(task.abort_handle());
         hubs.insert(key, Arc::downgrade(&hub));
         Ok(hub)
     }
@@ -2681,6 +2744,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1926: a new hub whose task handles its first item before [`Feeds::hub`] returns still
+    /// delivers. The task used to be spawned while its hub was being made (`Arc::new_cyclic`):
+    /// at a commit already waiting, it found no hub to upgrade and stopped, and the
+    /// subscription got nothing ever again (1 run in 15-60 of the cluster pin test). The seam
+    /// holds `hub` right after the spawn, commits, and waits for the task's first item, so
+    /// that order happens every time.
+    #[test]
+    fn a_hub_whose_task_runs_before_the_hub_is_returned_still_delivers() {
+        let (_, db, dir) = commits("hubstart", 0);
+        let (requests, delivery, hubs) = server_runtimes(1);
+        let t = db.table("t").unwrap().open().unwrap();
+        let feeds = Feeds::new(
+            db.clone(),
+            limits_solo_after(Duration::from_secs(60)),
+            &FeedShared::new(1),
+        );
+        feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
+        let seam_db = db.clone();
+        *feeds.after_hub_spawn.lock().unwrap() = Some(Box::new(move |started: &Arc<Started>| {
+            // A commit the hub's stream starts before, which its task reads while the hub is
+            // still being opened.
+            let t = seam_db.table("t").unwrap().open().unwrap();
+            t.mutate(b"r0").put("f", b"q", b"v").commit().unwrap();
+            assert!(
+                started.wait(Duration::from_secs(10)),
+                "the hub's task never handled its first item"
+            );
+        }));
+        let slots = Arc::new(Semaphore::new(8));
+        requests.block_on(async {
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut a = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
+            *feeds.after_hub_spawn.lock().unwrap() = None;
+            let s1 = t.mutate(b"r1").put("f", b"q", b"v").commit().unwrap().seqno;
+            assert_eq!(
+                seqnos(&mut a, Duration::from_millis(500)).await,
+                [s1],
+                "the hub delivers after its task handled a commit before it was returned"
+            );
+            drop(a);
+        });
+        drop(t);
+        drop(requests);
+        drop(delivery);
+        drop(hubs);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_single_nodes_hub_placement_is_mains() {
         // #1798, g102: on a node with no cluster merges, `Driver::moves` decides as main's
@@ -2718,6 +2830,7 @@ mod tests {
             solo_after: Duration::ZERO,
             place: Place::Feed,
             alone: None,
+            started: None,
         };
         // One step, checked against main's rule; `alone_due`: main's answer alone on the hub
         // runtime (the step after the one that started the `solo_after` clock).
