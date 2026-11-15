@@ -53,6 +53,7 @@ mod feed_retention;
 mod feed_written;
 mod fifo_expiry;
 mod file_growth;
+mod filtered_read_stop;
 mod flush_fold;
 mod flush_gc;
 mod flush_publish;

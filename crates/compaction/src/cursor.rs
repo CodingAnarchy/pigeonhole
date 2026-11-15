@@ -447,6 +447,10 @@ pub struct FilteredCursor<C> {
     /// While parked, the current entry's verdict (with its hint in `hint`), so settling
     /// does not check it again.
     verdict: Verdict,
+    /// A one-row read (#1924): a jump (a seek to the hint, a row skip) that lands past the
+    /// row ends the settle there, valid but not admitted, where the read ends, instead of
+    /// jumping on row by row. Beside the other flags, so the cursor is no larger.
+    one_row: bool,
 }
 
 impl<C: Cursor> FilteredCursor<C> {
@@ -460,7 +464,27 @@ impl<C: Cursor> FilteredCursor<C> {
             lazy: false,
             parked: false,
             verdict: Verdict::Admit,
+            one_row: false,
         }
+    }
+
+    /// Marks the cursor's reads as one-row (#1924): its caller stops at the first key past
+    /// the row, so a jump that leaves the row ends the settle there.
+    pub fn one_row(mut self, one_row: bool) -> Self {
+        self.one_row = one_row;
+        self
+    }
+
+    /// Whether a jump of a one-row read just left the row it started in: past the row of
+    /// `hint` after a seek to it (`seek`), or after a row skip.
+    #[inline]
+    fn jumped_out(&self, seek: bool) -> bool {
+        self.one_row
+            && self.inner.valid()
+            && (!seek || {
+                let k = self.inner.key();
+                !k.starts_with(&self.hint) && left_row_of(k, &self.hint)
+            })
     }
 
     /// Wraps `inner` in lazy mode (D288), for a source under a [`MergingCursor`]: a move
@@ -537,12 +561,25 @@ impl<C: Cursor> FilteredCursor<C> {
 
     fn settle_filtered(&mut self) -> Result<(), C::Error> {
         while self.inner.valid() {
-            match self.filter.check(self.inner.key(), &mut self.hint) {
+            let seek = match self.filter.check(self.inner.key(), &mut self.hint) {
                 Verdict::Admit => break,
                 // Nothing later in this row can be admitted.
-                Verdict::SkipRow => self.inner.skip_row()?,
-                Verdict::Seek => self.inner.seek(&self.hint)?,
-                Verdict::Next => self.inner.next()?,
+                Verdict::SkipRow => {
+                    self.inner.skip_row()?;
+                    false
+                }
+                Verdict::Seek => {
+                    self.inner.seek(&self.hint)?;
+                    true
+                }
+                Verdict::Next => {
+                    self.inner.next()?;
+                    continue;
+                }
+            };
+            // A one-row read's jump past its row ends it there (#1924), as in `SstIter`.
+            if self.jumped_out(seek) {
+                break;
             }
         }
         Ok(())
@@ -588,6 +625,11 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
                 Verdict::Next => self.inner.next()?,
             }
             if !self.inner.valid() {
+                break;
+            }
+            // A one-row read's jump past its row ends it there, settled (#1924): alone in
+            // the merge (`bound` `None`) it would otherwise jump on through its later rows.
+            if verdict != Verdict::Next && self.jumped_out(verdict == Verdict::Seek) {
                 break;
             }
             verdict = self.filter.check(self.inner.key(), &mut self.hint);
@@ -697,4 +739,11 @@ impl Cursor for VecCursor {
         }
         Ok(())
     }
+}
+
+/// Whether `key` is past the row `hint` (a row prefix and a qualifier bound) starts with
+/// ([`FilteredCursor::one_row`]'s slow case, once a key doesn't start with the whole hint).
+#[cold]
+fn left_row_of(key: &[u8], hint: &[u8]) -> bool {
+    pigeonhole_format::key::row_prefix_len(hint).is_ok_and(|n| !key.starts_with(&hint[..n]))
 }

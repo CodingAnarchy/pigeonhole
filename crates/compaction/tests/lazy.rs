@@ -382,3 +382,60 @@ fn a_source_with_nothing_admissible_stops_at_the_merge_frontier() {
         }
     }
 }
+
+#[test]
+fn a_lone_one_row_source_stops_its_jumps_at_its_row() {
+    // #1924: one memtable source alone in the merge (`settle_until(None)`, or the eager
+    // settle): a row with no qualifier the filter keeps sends it jumping, by a seek to the
+    // hint (prefix `~`, after `q`) or a row skip (prefix `a`, before it). A scan's lands on
+    // the next row and jumps again, through all 1000. A one-row read's (`one_row`) stops on
+    // the first key past its row, settled, where the read ends.
+    let rows: Entries = (0..1000u16)
+        .map(|i| {
+            let mut k = Vec::new();
+            encode_key(&mut k, &i.to_be_bytes(), b"q", 1, 1, Kind::Put).unwrap();
+            (k, vec![])
+        })
+        .collect();
+    let mut prefix = Vec::new();
+    pigeonhole_format::key::encode_row_prefix(&mut prefix, &0u16.to_be_bytes()).unwrap();
+    let mut past = prefix.clone();
+    *past.last_mut().unwrap() += 1;
+    let lone = |keep: &[u8], lazy: bool, one_row: bool| {
+        let (p, moves, _) = Probe::new(rows.clone());
+        let mut filter = ScanFilter::all();
+        filter.qualifiers = QualifierFilter::Prefix(keep.to_vec());
+        let c = if lazy {
+            FilteredCursor::lazy(p, filter)
+        } else {
+            FilteredCursor::new(p, filter)
+        };
+        let mut m = MergingCursor::new(vec![c.one_row(one_row)]);
+        m.seek(&prefix).unwrap();
+        (m, moves)
+    };
+    for lazy in [true, false] {
+        for keep in [&b"~"[..], b"a"] {
+            for one_row in [true, false] {
+                let (m, moves) = lone(keep, lazy, one_row);
+                let what = format!("lazy {lazy}, prefix {keep:?}, one_row {one_row}");
+                assert!(!m.valid() || m.key() >= past.as_slice(), "{what}");
+                let moved = moves.get();
+                if one_row {
+                    assert!(moved <= 4, "{what}: the source moved {moved} times");
+                } else {
+                    assert!(moved > 1000, "{what}: the source moved {moved} times");
+                }
+            }
+        }
+        // A prefix that keeps the row's column: its entry either way.
+        for one_row in [true, false] {
+            let (m, _) = lone(b"q", lazy, one_row);
+            assert_eq!(
+                at(&m),
+                Some(rows[0].clone()),
+                "lazy {lazy}, one_row {one_row}"
+            );
+        }
+    }
+}
