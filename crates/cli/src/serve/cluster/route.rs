@@ -59,6 +59,8 @@ pub(crate) struct Routes {
     map_version: u64,
     tables: HashMap<String, Placement>,
     owners: HashMap<String, Owner>,
+    /// The memory store's name and its namespaces' placement (#1915), if the map has one.
+    memory: Option<(String, Placement)>,
 }
 
 impl Routes {
@@ -100,12 +102,38 @@ impl Routes {
                 (t.name.clone(), placement)
             })
             .collect();
+        let memory = map.memory.as_ref().map(|m| {
+            let placement = Placement {
+                splits: m
+                    .splits
+                    .iter()
+                    .filter_map(|k| split_key_bytes(k).ok())
+                    .collect(),
+                partitions: m.partitions.clone(),
+            };
+            (m.store.clone(), placement)
+        });
         Self {
             cluster_id: map.cluster_id.clone(),
             map_version: map.map_version,
             tables,
             owners,
+            memory,
         }
+    }
+
+    /// The memory store the map places, if any (#1915).
+    pub(crate) fn memory_store(&self) -> Option<&str> {
+        self.memory.as_ref().map(|(s, _)| s.as_str())
+    }
+
+    /// The partition holding namespace `ns` of the memory store; `None` when the map places
+    /// no store. Split keys have no `\0` (validated), so comparing the namespace itself
+    /// places every row of it (`{ns}\0…`) in the same range.
+    pub(crate) fn memory_partition(&self, ns: &str) -> Option<&str> {
+        let (_, p) = self.memory.as_ref()?;
+        let i = p.splits.partition_point(|s| s.as_slice() <= ns.as_bytes());
+        p.partitions.get(i).map(String::as_str)
     }
 
     pub(crate) fn map_version(&self) -> u64 {
@@ -276,6 +304,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 7,
             previous_nodes: Vec::new(),
+            memory: None,
             nodes: vec![
                 Node {
                     id: "a".into(),

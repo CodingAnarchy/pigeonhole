@@ -137,6 +137,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
+        memory: None,
         nodes: ["a", "b", "c"]
             .iter()
             .zip(ports)
@@ -1151,6 +1152,42 @@ fn data_node_placed(
     Vec<pigeonhole::Pigeonhole>,
     Arc<Node>,
 ) {
+    data_node_served(
+        rt,
+        dir,
+        id,
+        locals,
+        listener,
+        tokens,
+        limits,
+        restart,
+        placement,
+        engine_memory,
+        change_feed,
+        None,
+    )
+}
+
+/// [`data_node_placed`], started with `--memory` as `memory` gives it (#1915).
+#[allow(clippy::too_many_arguments)]
+fn data_node_served(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    id: &str,
+    locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)>,
+    listener: std::net::TcpListener,
+    tokens: &str,
+    limits: crate::serve::config::Limits,
+    restart: bool,
+    placement: crate::serve::placement::Placement,
+    engine_memory: Option<u64>,
+    change_feed: Option<u64>,
+    memory: Option<crate::serve::memslot::Recipe>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+    Arc<Node>,
+) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
     // A fresh node stands for one that has served for a while: past its start grace, so it
@@ -1203,7 +1240,7 @@ fn data_node_placed(
         dbs.push(db);
     }
     let shared = Arc::new(Shared {
-        router: Router::cluster(service, Arc::clone(&node), parts),
+        router: Router::cluster(service, Arc::clone(&node), parts).memory_recipe(memory),
         tokens: Tokens::parse(tokens, "tokens").unwrap(),
         limits,
         metrics,
@@ -3756,6 +3793,7 @@ fn split_nodes(
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
+        memory: None,
         nodes: ports
             .iter()
             .enumerate()
@@ -4537,6 +4575,7 @@ mod close;
 mod feed;
 mod fence;
 mod idle;
+mod memory;
 mod metrics;
 mod moving;
 mod open;

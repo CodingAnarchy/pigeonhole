@@ -455,6 +455,12 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::Nearest(r) => Op::Nearest(r),
         ServiceOp::CreateTable(r) => Op::CreateTable(r),
         ServiceOp::DropTable(r) => Op::DropTable(r),
+        ServiceOp::Remember(r) => Op::Remember(r),
+        ServiceOp::Recall(r) => Op::Recall(r),
+        ServiceOp::MarkUsed(r) => Op::MarkUsed(r),
+        ServiceOp::Supersede(r) => Op::Supersede(r),
+        ServiceOp::Link(r) => Op::Link(r),
+        ServiceOp::Forget(r) => Op::Forget(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -487,6 +493,12 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::Nearest(r) => ServiceOp::Nearest(r),
             Op::CreateTable(r) => ServiceOp::CreateTable(r),
             Op::DropTable(r) => ServiceOp::DropTable(r),
+            Op::Remember(r) => ServiceOp::Remember(r),
+            Op::Recall(r) => ServiceOp::Recall(r),
+            Op::MarkUsed(r) => ServiceOp::MarkUsed(r),
+            Op::Supersede(r) => ServiceOp::Supersede(r),
+            Op::Link(r) => ServiceOp::Link(r),
+            Op::Forget(r) => ServiceOp::Forget(r),
         },
     )
 }
@@ -511,6 +523,10 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Table(r) => Reply::Table(r),
         ServiceReply::Empty(r) => Reply::Empty(r),
         ServiceReply::Nearest(r) => Reply::Nearest(r),
+        ServiceReply::Remember(r) => Reply::Remember(r),
+        ServiceReply::Recall(r) => Reply::Recall(r),
+        ServiceReply::MarkUsed(r) => Reply::MarkUsed(r),
+        ServiceReply::Forget(r) => Reply::Forget(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -540,6 +556,10 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Table(r) => ServiceReply::Table(r),
             Reply::Empty(r) => ServiceReply::Empty(r),
             Reply::Nearest(r) => ServiceReply::Nearest(r),
+            Reply::Remember(r) => ServiceReply::Remember(r),
+            Reply::Recall(r) => ServiceReply::Recall(r),
+            Reply::MarkUsed(r) => ServiceReply::MarkUsed(r),
+            Reply::Forget(r) => ServiceReply::Forget(r),
         },
     )
 }

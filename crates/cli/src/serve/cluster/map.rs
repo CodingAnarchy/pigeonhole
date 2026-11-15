@@ -173,6 +173,75 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
                 .map_err(|e| format!("table {:?}, family {:?}: {}", t.name, f.name, e.message))?;
         }
     }
+    if let Some(m) = &map.memory {
+        validate_memory(m, &partitions, &tables)?;
+    }
+    Ok(())
+}
+
+/// Checks the memory store's placement (#1915): a store name whose tables no table placement
+/// takes, and namespace split keys that, without `\0`, never fall inside a namespace's rows
+/// (`{ns}\0…`): for such a key `k`, `k <= ns` exactly when `k <= ns\0…`.
+fn validate_memory(
+    m: &crate::serve::proto::MemoryPlacement,
+    partitions: &HashMap<&str, &crate::serve::proto::Partition>,
+    tables: &HashSet<&str>,
+) -> Result<(), Refusal> {
+    if m.store.is_empty() {
+        return Err("the memory placement names no store".into());
+    }
+    if let Some(t) = pigeonhole_memory::Store::table_names(&m.store)
+        .into_iter()
+        .find(|t| tables.contains(t.as_str()))
+    {
+        return Err(format!(
+            "table {t:?} is placed as a table, but it's memory store {:?}'s own",
+            m.store
+        ));
+    }
+    let mut last: Option<Vec<u8>> = None;
+    for k in &m.splits {
+        let k = split_key_bytes(k).map_err(|e| format!("memory store {:?}: {e}", m.store))?;
+        if k.is_empty() {
+            return Err(format!(
+                "memory store {:?}: a split key is empty (the first range starts there already)",
+                m.store
+            ));
+        }
+        if k.contains(&0) {
+            return Err(format!(
+                "memory store {:?}: a split key contains \\0, so a namespace's rows could \
+                 straddle it (namespaces can't contain \\0)",
+                m.store
+            ));
+        }
+        if last.as_ref().is_some_and(|l| *l >= k) {
+            return Err(format!(
+                "memory store {:?}: split keys must be distinct and in increasing order",
+                m.store
+            ));
+        }
+        last = Some(k);
+    }
+    if m.partitions.len() != m.splits.len() + 1 {
+        return Err(format!(
+            "memory store {:?}: {} split key(s) make {} ranges, but {} partition(s) are given",
+            m.store,
+            m.splits.len(),
+            m.splits.len() + 1,
+            m.partitions.len()
+        ));
+    }
+    if let Some(p) = m
+        .partitions
+        .iter()
+        .find(|p| !partitions.contains_key(p.as_str()))
+    {
+        return Err(format!(
+            "memory store {:?} is placed on partition {p:?}, which the map doesn't list",
+            m.store
+        ));
+    }
     Ok(())
 }
 
@@ -255,12 +324,34 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         }
         used.extend(t.partitions.iter().map(String::as_str));
     }
+    // The memory placement is fixed once written, as a table's is (#1915): its namespaces'
+    // memories and index entries are in its partitions' stores.
+    if let Some(m) = &old.memory {
+        // Split keys compare as bytes: `text` and `raw` forms of one key are the same key.
+        let same = |n: &crate::serve::proto::MemoryPlacement| {
+            let keys = |p: &crate::serve::proto::MemoryPlacement| -> Vec<Vec<u8>> {
+                p.splits
+                    .iter()
+                    .map(|k| split_key_bytes(k).unwrap_or_default())
+                    .collect()
+            };
+            n.store == m.store && n.partitions == m.partitions && keys(n) == keys(m)
+        };
+        if !new.memory.as_ref().is_some_and(same) {
+            return Err(format!(
+                "memory store {:?}'s placement changed or went away: it's fixed once written \
+                 (moving namespaces is later work, #1499)",
+                m.store
+            ));
+        }
+        used.extend(m.partitions.iter().map(String::as_str));
+    }
     let new_partitions: HashMap<&str, _> =
         new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
     for p in &old.partitions {
         if !new_partitions.contains_key(p.id.as_str()) && used.contains(p.id.as_str()) {
             return Err(format!(
-                "partition {:?} holds a table placement and can't be dropped",
+                "partition {:?} holds a table or memory placement and can't be dropped",
                 p.id
             ));
         }
@@ -373,14 +464,18 @@ pub(crate) fn with_history(
 /// else `raw`. Two maps that say the same thing are equal after it.
 pub(crate) fn canonical(map: &ClusterMap) -> ClusterMap {
     let mut m = map.clone();
-    for t in &mut m.tables {
-        for k in &mut t.splits {
-            if let Ok(b) = split_key_bytes(k) {
-                k.key = Some(match String::from_utf8(b) {
-                    Ok(s) => split_key::Key::Text(s),
-                    Err(e) => split_key::Key::Raw(e.into_bytes().into()),
-                });
-            }
+    let memory = m.memory.iter_mut().flat_map(|p| p.splits.iter_mut());
+    for k in m
+        .tables
+        .iter_mut()
+        .flat_map(|t| t.splits.iter_mut())
+        .chain(memory)
+    {
+        if let Ok(b) = split_key_bytes(k) {
+            k.key = Some(match String::from_utf8(b) {
+                Ok(s) => split_key::Key::Text(s),
+                Err(e) => split_key::Key::Raw(e.into_bytes().into()),
+            });
         }
     }
     m
@@ -454,6 +549,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 1,
             previous_nodes: Vec::new(),
+            memory: None,
             nodes: vec![node("a", 7001), node("b", 7002)],
             partitions: vec![part("p1", "a"), part("p2", "b"), part("p3", "b")],
             tables: vec![
@@ -564,6 +660,105 @@ mod tests {
         let mut m = map();
         m.tables[0].name = "__phdb_cluster".into();
         refused(validate(&m, true), "reserved");
+    }
+
+    /// The memory store `notes`: namespaces below "m" on p1, the rest on p2.
+    fn with_memory() -> ClusterMap {
+        let mut m = map();
+        m.memory = Some(crate::serve::proto::MemoryPlacement {
+            store: "notes".into(),
+            splits: vec![text("m")],
+            partitions: vec!["p1".into(), "p2".into()],
+        });
+        m
+    }
+
+    #[test]
+    fn a_memory_placement_takes_no_table_and_no_split_inside_a_namespace() {
+        validate(&with_memory(), true).unwrap();
+        let set = |f: &dyn Fn(&mut crate::serve::proto::MemoryPlacement)| {
+            let mut m = with_memory();
+            f(m.memory.as_mut().unwrap());
+            m
+        };
+        refused(validate(&set(&|p| p.store.clear()), true), "names no store");
+        // `{ns}\0…` rows: a key with `\0` could fall inside one namespace's.
+        refused(
+            validate(&set(&|p| p.splits = vec![raw(b"m\0x")]), true),
+            "contains \\0",
+        );
+        refused(
+            validate(&set(&|p| p.splits = vec![text("m"), text("c")]), true),
+            "increasing order",
+        );
+        refused(
+            validate(&set(&|p| p.splits = vec![text("")]), true),
+            "split key is empty",
+        );
+        refused(
+            validate(&set(&|p| p.partitions.push("p3".into())), true),
+            "2 ranges, but 3",
+        );
+        refused(
+            validate(&set(&|p| p.partitions[1] = "p9".into()), true),
+            "doesn't list",
+        );
+        // The store's own tables can't be placed as tables.
+        for t in ["mem_notes", "mem_notes_text", "mem_notes_ivf"] {
+            let mut m = with_memory();
+            m.tables[0].name = t.into();
+            refused(validate(&m, true), "memory store \"notes\"'s own");
+        }
+    }
+
+    #[test]
+    fn a_memory_placement_is_fixed_once_written_and_holds_its_partitions() {
+        let old = with_memory();
+        let next = |f: &dyn Fn(&mut ClusterMap)| {
+            let mut m = with_memory();
+            m.map_version = 2;
+            f(&mut m);
+            m
+        };
+        // The same placement, a key in its other form included: allowed.
+        validate_change(&old, &next(&|_| {})).unwrap();
+        validate_change(
+            &old,
+            &next(&|m| m.memory.as_mut().unwrap().splits = vec![raw(b"m")]),
+        )
+        .unwrap();
+        for (why, change) in [
+            (
+                "dropped",
+                &(|m: &mut ClusterMap| m.memory = None) as &dyn Fn(&mut ClusterMap),
+            ),
+            ("re-split", &|m: &mut ClusterMap| {
+                m.memory.as_mut().unwrap().splits = vec![text("k")];
+            }),
+            ("moved", &|m: &mut ClusterMap| {
+                m.memory.as_mut().unwrap().partitions = vec!["p1".into(), "p3".into()];
+            }),
+            ("renamed", &|m: &mut ClusterMap| {
+                m.memory.as_mut().unwrap().store = "x".into()
+            }),
+        ] {
+            let e = validate_change(&old, &next(change)).expect_err(why);
+            assert!(e.contains("fixed once written"), "{why}: {e}");
+        }
+        // A store placed on a partition keeps it in the map, as a table does.
+        let mut m = next(&|_| {});
+        m.tables.retain(|t| t.name != "users");
+        m.partitions.retain(|p| p.id != "p1");
+        refused(
+            validate_change(&old, &m),
+            "holds a table or memory placement",
+        );
+        // A first placement is a change like any other.
+        validate_change(&map(), &next(&|_| {})).unwrap();
+        // Both forms of a key print as one.
+        let mut raw_form = with_memory();
+        raw_form.memory.as_mut().unwrap().splits = vec![raw(b"m")];
+        assert_eq!(canonical_json(&raw_form), canonical_json(&with_memory()));
     }
 
     #[test]

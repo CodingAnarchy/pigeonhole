@@ -19,12 +19,6 @@ use pigeonhole_vector::{Index, IndexOptions, Rebalance, Rebalancer};
 
 use super::errors::ApiError;
 
-/// How long a rebalancer works between looks at whether the index closed.
-const SLICE: Duration = Duration::from_millis(50);
-
-/// How long a rebalancer with nothing to do waits before it looks again.
-const IDLE: Duration = Duration::from_secs(1);
-
 pub(crate) struct Indexes {
     db: Pigeonhole,
     open: Mutex<super::handles::Handles<Index>>,
@@ -167,18 +161,15 @@ impl Indexes {
         {
             let running = Arc::clone(&self.running);
             running.fetch_add(1, Ordering::Relaxed);
-            let index_name = name.to_owned();
-            let placement = self.placement.clone();
-            let gate = self.gate.clone();
-            let spawned = std::thread::Builder::new()
-                .name("phdb-serve-rebalance".into())
-                .spawn(move || {
-                    if let Some(p) = placement {
-                        p.enter();
-                    }
-                    rebalance(rebalancer, &index_name, gate.as_ref());
-                    running.fetch_sub(1, Ordering::Relaxed);
-                });
+            let what = format!("index {name}: rebalancing");
+            let counted = Counted(rebalancer, Arc::clone(&running));
+            let spawned = super::gated::spawn(
+                counted,
+                "phdb-serve-rebalance",
+                what,
+                self.gate.clone(),
+                self.placement.clone(),
+            );
             match spawned {
                 Ok(h) => self
                     .rebalancers
@@ -186,8 +177,8 @@ impl Indexes {
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(h),
                 // Lists stay marked: the next open (or an inline write) rebalances them.
+                // The unspawned loop dropped its count.
                 Err(e) => {
-                    self.running.fetch_sub(1, Ordering::Relaxed);
                     eprintln!("phdb serve: index {name}: no rebalancing thread: {e}");
                 }
             }
@@ -263,30 +254,25 @@ fn closed() -> ApiError {
     )
 }
 
-/// A background index's rebalancer, run until its index closes: the loop the crate's
-/// rustdoc gives. An error leaves the list marked for a later call.
-fn rebalance(mut r: Rebalancer, name: &str, gate: Option<&Arc<super::gate::WriteGate>>) {
-    while !r.closed() {
-        // Each slice's writes under the partition's gate: a fenced partition's wait for its
-        // writes waits for one slice at most.
-        let held = match gate.map(|g| g.enter()) {
-            Some(Err(_)) => {
-                r.wait(IDLE);
-                continue;
-            }
-            Some(Ok(h)) => Some(h),
-            None => None,
-        };
-        let worked = r.run_once(SLICE);
-        drop(held);
-        match worked {
-            Ok(true) => {}
-            Ok(false) => r.wait(IDLE),
-            Err(e) => {
-                eprintln!("phdb serve: index {name}: rebalancing: {e}");
-                r.wait(IDLE);
-            }
-        }
+/// A background index's rebalancer, counted in `running` until its loop ([`super::gated`])
+/// ends with its index. An error leaves the list marked for a later call.
+struct Counted(Rebalancer, Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.1.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl super::gated::Slices for Counted {
+    fn closed(&self) -> bool {
+        super::gated::Slices::closed(&self.0)
+    }
+    fn run_once(&mut self, budget: Duration) -> Result<bool, String> {
+        super::gated::Slices::run_once(&mut self.0, budget)
+    }
+    fn wait(&mut self, timeout: Duration) {
+        super::gated::Slices::wait(&mut self.0, timeout);
     }
 }
 
