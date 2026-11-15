@@ -2639,3 +2639,54 @@ fn a_skip_index_stays_within_its_cap_and_its_merged_jumps_stay_exact() {
     drop(r);
     db.close().unwrap();
 }
+
+/// #1929 (audit120's S3, D327): the open that first sets the WAL pad bit, on a file that
+/// already has feed history, keeps that history: the bit's two superblock commits are this
+/// session's roots, recorded after the feed's hooks, so a token from the first session reads
+/// on through the second. Also across a crash right after that open, before any commit: the
+/// commits that set the bit leave a chain the next open reads, not an expiry.
+#[test]
+fn the_open_that_sets_the_wal_pad_bit_keeps_the_feeds_history() {
+    use pigeonhole_io::sim::CrashKind;
+    let vfs = SimVfs::new(3105);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _b) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let seqnos: Vec<Seqno> = (0..4u8)
+        .map(|i| single(&db, &a, &[b'a', i], Durability::GroupSync))
+        .collect();
+    assert_eq!(next(&mut r).seqno, seqnos[0]);
+    let token = r.token();
+    drop(r);
+    db.close().unwrap();
+
+    let padded = || {
+        let mut o = options(&vfs, Some(feed(1 << 20)));
+        o.wal.pad_unit = 4096;
+        o
+    };
+    // The open that sets the bit, then a crash before anything commits.
+    let db = Engine::open(Path::new(DB), padded()).unwrap();
+    vfs.crash(CrashKind::Process);
+    drop(db);
+
+    let db = Engine::open(Path::new(DB), padded()).unwrap();
+    let mut r = db
+        .feed(spec(&[&a], FeedStart::Token(token.clone())))
+        .unwrap();
+    for want in &seqnos[1..] {
+        assert_eq!(next(&mut r).seqno, *want);
+    }
+    let later = single(&db, &a, b"later", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, later);
+    drop(r);
+    db.close().unwrap();
+    // And with the bit set for good, an open without the option reads the same history.
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    for want in seqnos[1..].iter().chain([&later]) {
+        assert_eq!(next(&mut r).seqno, *want);
+    }
+    drop(r);
+    db.close().unwrap();
+}

@@ -223,8 +223,9 @@ const V3_CRC_AT: usize = 56;
 /// fragment except an empty record's carries payload. Shorter frame tails are skipped.
 const MIN_FRAGMENT_ROOM: usize = FRAGMENT_HEADER_LEN + 1;
 
-/// The smallest unit [`FrameEncoder::pad`] aligns to: room for a pad's header twice over.
-const MIN_PAD_UNIT: usize = 32;
+/// The smallest unit [`FrameEncoder::pad`] aligns to (D327): room for a pad's header twice
+/// over. The largest is a frame, [`FRAME_SIZE`].
+pub const MIN_PAD_UNIT: usize = 32;
 
 /// Bytes left in the frame at segment offset `pos`.
 fn frame_room(pos: u64) -> usize {

@@ -952,8 +952,9 @@ impl Engine {
             ));
         }
         // D327: checked before the open can set the file's sticky pad bit.
-        let unit = options.wal.pad_unit;
-        if unit != 0 && (!unit.is_power_of_two() || !(32..=32 * 1024).contains(&unit)) {
+        let unit = options.wal.pad_unit as usize;
+        let units = pigeonhole_format::wal::MIN_PAD_UNIT..=pigeonhole_format::wal::FRAME_SIZE;
+        if unit != 0 && (!unit.is_power_of_two() || !units.contains(&unit)) {
             return Err(Error::InvalidArgument(format!(
                 "the WAL pad unit must be a power of two from 32 bytes to 32 KiB, not {unit}"
             )));
@@ -1101,19 +1102,6 @@ impl Engine {
         {
             pager.set_grow_ahead(block, from)?;
         }
-        // D327: a writable open that pads its WAL flags the file before any stream writes,
-        // in both superblock pages, so a build without D327 refuses it rather than meeting
-        // a pad mid-replay. Sticky: retained feed segments keep pads past a checkpoint.
-        if !no_writes && options.wal.pad_unit != 0 {
-            let features = pager.features();
-            let bit = pigeonhole_format::wal::INCOMPAT_WAL_PAD;
-            if features.incompat & bit == 0 {
-                pager.set_features(pigeonhole_format::superblock::Features {
-                    incompat: features.incompat | bit,
-                    ..features
-                })?;
-            }
-        }
         let read_only = no_writes;
         // The change feed (D310): the session's sidecar entry, written and synced before any
         // WAL segment; then every root commit of this open appends its sequence.
@@ -1155,6 +1143,23 @@ impl Engine {
             // recovery's checkpoint edits and repairs all come after (simp724's Q1, #1316).
             for sequence in opened_at + 1..=pager.sequence() {
                 f.note_root(sequence);
+            }
+        }
+        // D327: a writable open that pads its WAL flags the file before any stream writes,
+        // in both superblock pages, so a build without D327 refuses it rather than meeting
+        // a pad mid-replay. Sticky: retained feed segments keep pads past a checkpoint. After
+        // the feed's hooks, not before: the two feature commits are then this session's roots
+        // like any other, each with its intent and Root entry, so a crash between them and the
+        // session's first commit leaves a chain the feed reads through (audit120's N1 on
+        // #1929), and the catch-up loop above stays `finish`'s alone.
+        if !no_writes && options.wal.pad_unit != 0 {
+            let features = pager.features();
+            let bit = pigeonhole_format::wal::INCOMPAT_WAL_PAD;
+            if features.incompat & bit == 0 {
+                pager.set_features(pigeonhole_format::superblock::Features {
+                    incompat: features.incompat | bit,
+                    ..features
+                })?;
             }
         }
         let mut wal_opts = options.wal;

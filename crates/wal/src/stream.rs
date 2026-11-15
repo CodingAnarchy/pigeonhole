@@ -43,8 +43,9 @@ pub(crate) fn check_options(opts: &WalOptions) -> Result<()> {
             what: "wal segment size",
         });
     }
-    let unit = opts.pad_unit;
-    if unit != 0 && (!unit.is_power_of_two() || !(32..=FRAME as u32).contains(&unit)) {
+    let unit = opts.pad_unit as usize;
+    let units = pigeonhole_format::wal::MIN_PAD_UNIT..=FRAME_SIZE;
+    if unit != 0 && (!unit.is_power_of_two() || !units.contains(&unit)) {
         return Err(Error::InvalidArgument {
             what: "wal pad unit",
         });
@@ -440,6 +441,8 @@ impl WalCounters {
 
     /// Groups that started on a fresh alignment unit behind a pad fragment, because a sync
     /// of the stream was in flight (D327, [`WalOptions::pad_unit`](crate::WalOptions::pad_unit)).
+    /// Only syncs submitted for the stream's records count: a rollover's sync covers the
+    /// previous segment and never causes a pad.
     pub fn pads(&self) -> u64 {
         self.pads.load(Ordering::Relaxed)
     }
@@ -2157,9 +2160,9 @@ impl WalStream {
                 let end = self.enc.encode_parts(parts, &mut self.buf);
                 return Ok(Lsn::new(self.epoch, end as u32));
             }
-            // Pad and record don't fit: roll over without the pad (a new segment's first
-            // record starts a frame, aligned already). A pad is never the last thing in a
-            // segment.
+            // Pad and record don't fit: the record goes without the pad, rolling over only if
+            // it doesn't fit either (a new segment's first record starts a frame, aligned
+            // already). A pad is never the last thing in a segment.
         }
         let need = self.enc.encoded_len(len) as u64;
         if self.append_pos() + need > self.segment_size {

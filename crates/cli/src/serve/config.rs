@@ -232,6 +232,14 @@ pub(crate) struct ServeArgs {
     /// tail while they grow.
     #[arg(long)]
     pub no_wal_preallocate: bool,
+    /// While a shard's previous log sync is still in flight, start its next commit group on a
+    /// fresh `BYTES`-aligned span of the log, behind padding, so the group's write never waits
+    /// on the page that sync is writing back (D327, #1708; `Options::wal_pad_unit`, ICR 0137).
+    /// A power of two from 32 to 32768 (4096 is a page); 0, the default, never pads. Costs
+    /// log bytes, at most one pad per sync. **The first start with it set flags the database
+    /// so that builds before 1.3 refuse to open it**, and the flag stays.
+    #[arg(long, value_name = "BYTES", default_value_t = 0)]
+    pub wal_pad_unit: u32,
     /// Serve this database as a replica of the primary server at this URL (`http://` or
     /// `https://`): it bootstraps from the primary's backup, then follows its durable
     /// commits, and refuses writes until `Admin.Promote`. Reads see a consistent prefix of

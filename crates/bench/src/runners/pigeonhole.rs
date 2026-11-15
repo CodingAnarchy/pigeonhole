@@ -75,6 +75,9 @@ pub(crate) struct Settings {
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
+    /// A GroupSync group starts on a fresh unit of this many bytes while its stream's sync is
+    /// in flight (`Options::wal_pad_unit`, D327); `None`: the library default (off).
+    pub(crate) wal_pad_unit: Option<u32>,
     /// The inline driver splits the table over every shard before loading it (D213).
     pub(crate) presplit: bool,
     /// Riders on the measured phase (D247): snapshot and durable-snapshot readers, then a
@@ -652,6 +655,21 @@ impl PigeonholeRunner {
         self
     }
 
+    /// A GroupSync group starts on a fresh `bytes`-aligned span of its WAL stream while that
+    /// stream's sync is in flight (`Options::wal_pad_unit`, D327, ICR 0137); off when not set.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("wal_pad"));
+    /// let r = PigeonholeRunner::default().wal_pad_unit(4096);
+    /// assert!(r.describe().contains(" wal_pad=4096"));
+    /// ```
+    pub fn wal_pad_unit(mut self, bytes: u32) -> Self {
+        self.settings.wal_pad_unit = Some(bytes);
+        self
+    }
+
     /// `true`: [`run_inline`](Self::run_inline) splits the table at the loaded rows'
     /// quantiles and hands one piece to each shard before loading it, so every shard owns
     /// rows from the start instead of waiting for the balancer to spread them (D213's
@@ -923,6 +941,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if let Some(us) = s.commit_spin_micros {
         options = options.commit_spin(Duration::from_micros(us));
+    }
+    if let Some(bytes) = s.wal_pad_unit {
+        options = options.wal_pad_unit(bytes);
     }
     if s.presplit {
         // The pre-split placement stays fixed (D213): no balancer pass ever falls due, and no
@@ -1310,6 +1331,9 @@ impl Runner for PigeonholeRunner {
         }
         if let Some(us) = s.commit_spin_micros {
             _ = write!(d, " commit_spin={us}us");
+        }
+        if let Some(bytes) = s.wal_pad_unit {
+            _ = write!(d, " wal_pad={bytes}");
         }
         if s.presplit_writes {
             d.push_str(" presplit=writes");

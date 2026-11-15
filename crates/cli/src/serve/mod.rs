@@ -313,9 +313,11 @@ fn candle_advice(
 pub(crate) fn served_options(cli: &Cli, args: &ServeArgs) -> Options {
     // The server's shard poll (D198 amendment 4): none by default. The logs are sized at
     // start-up, not while commits wait on them (#1621, ICR 0130).
-    let mut options = args
-        .shard_spin
-        .apply(Options::default().wal_preallocate(!args.no_wal_preallocate));
+    let mut options = args.shard_spin.apply(
+        Options::default()
+            .wal_preallocate(!args.no_wal_preallocate)
+            .wal_pad_unit(args.wal_pad_unit),
+    );
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);
     }

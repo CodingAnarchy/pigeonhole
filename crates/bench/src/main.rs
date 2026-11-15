@@ -194,6 +194,9 @@ OPTIONS:
                            --no-adaptive-shard-threads the controller only observes
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
+    --wal-pad-unit BYTES   Pigeonhole: a GroupSync group starts on a fresh BYTES-aligned span
+                           of its WAL while the previous sync is in flight (D327, ICR 0137);
+                           flags the file for 1.3+ [default: off]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
                            retry a conflict after RetryPolicy's full-jitter backoff from
                            US µs (0: at once), a reported variant (D274)
@@ -277,6 +280,7 @@ struct Args {
     adaptive_shard_threads: Option<bool>,
     driver_trace: Option<std::path::PathBuf>,
     commit_spin: Option<u64>,
+    wal_pad_unit: Option<u32>,
     txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
     json: Option<PathBuf>,
@@ -372,6 +376,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-adaptive-shard-threads" => a.adaptive_shard_threads = Some(false),
             "--driver-trace" => a.driver_trace = Some(parse(&arg, it.next())?),
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
+            "--wal-pad-unit" => a.wal_pad_unit = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
             "--tablet-changes" => a.no_tablet_changes = false,
@@ -504,6 +509,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);
+    }
+    if let Some(bytes) = a.wal_pad_unit {
+        r = r.wal_pad_unit(bytes);
     }
     if let Some(us) = a.txn_backoff {
         r = r.txn_backoff_micros(us);
@@ -992,6 +1000,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(args("ycsb-a --commit-spin 0").commit_spin, Some(0));
+        assert_eq!(args("ycsb-a --wal-pad-unit 4096").wal_pad_unit, Some(4096));
         assert_eq!(args("transfer --txn-backoff 0").txn_backoff, Some(0));
         assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));
         assert!(
