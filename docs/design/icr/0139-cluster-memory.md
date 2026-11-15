@@ -22,7 +22,7 @@
 
 **`phdb serve --cluster` with `--memory NAME`:** accepted (ICR 0117 refused it).
 - The node's map may place `NAME` now or later; a map placing another store refuses the start.
-- Each partition the map places the store on opens it at the partition's reconcile (at start, on each map taken, and when a partition opens while the node serves), creating it with the `--memory-*` options if missing, and checks it against the node's pin, `--memory-dim` and `--memory-normalization`. A mismatch is kept as that partition's answer to its memory calls (`FailedPrecondition`), not a failed start: other partitions serve.
+- Each partition the map places the store on opens it at the partition's reconcile (at start, on each map taken, and when a partition opens while the node serves), creating it with the `--memory-*` options if missing, and checks it against the node's pin, `--memory-dim` and `--memory-normalization`. A mismatch is kept as that partition's answer to its memory calls (`FailedPrecondition`), not a failed start: other partitions serve, and the partition's `Status` lists it in `reconcile_errors`. A partition the map places the store on whose node runs without `--memory` does the same, naming the flag.
 - The store's forgetter and IVF rebalancer run on the server's threads, each slice under the partition's write gate (a fenced partition writes nothing in the background), not on the crate's threads. They end when the partition closes.
 
 **Routing:** a memory call goes to the partition holding the namespace it names, served there or forwarded (`Cluster.Forward`), with the owner checking the caller's scope and namespaces again:

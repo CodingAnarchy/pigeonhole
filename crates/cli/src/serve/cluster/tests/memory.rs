@@ -264,3 +264,116 @@ fn the_writer_adds_a_memory_store_only_once_every_node_keeps_it() {
         assert_eq!(version(ports[0]).await, 2);
     });
 }
+
+/// A one-node cluster on `port` with p1 and the store placed on it, its node started with
+/// `memory` (`None`: without `--memory`) and serving `db` if given.
+fn one_node(
+    rt: &tokio::runtime::Runtime,
+    listener: std::net::TcpListener,
+    db: Option<pigeonhole::Pigeonhole>,
+    memory: Option<crate::serve::memslot::Recipe>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    Vec<pigeonhole::Pigeonhole>,
+    PathBuf,
+) {
+    let port = listener.local_addr().unwrap().port();
+    let mut map = the_map(1, &[port, port, port]);
+    map.nodes.truncate(1);
+    map.partitions.truncate(1);
+    map.tables[0].splits.clear();
+    map.tables[0].partitions = vec!["p1".into()];
+    map.memory = Some(MemoryPlacement {
+        store: "notes".into(),
+        splits: Vec::new(),
+        partitions: vec!["p1".into()],
+    });
+    let dir = test_dir();
+    super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+    let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+    let (stop, dbs, _) = data_node_served(
+        rt,
+        &dir,
+        "a",
+        vec![("p1", db)],
+        listener,
+        "",
+        crate::serve::server_tests::limits(),
+        false,
+        placement,
+        None,
+        memory,
+    );
+    (stop, dbs, dir)
+}
+
+/// p1's reconcile errors, as `Cluster.Status` gives them.
+async fn reconcile_errors(port: u16) -> Vec<String> {
+    let status = client(port)
+        .await
+        .status(super::super::proto::StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let p1 = status.partitions.iter().find(|p| p.id == "p1").unwrap();
+    p1.reconcile_errors.clone()
+}
+
+#[test]
+fn a_partition_whose_store_doesnt_match_the_node_says_so_in_status_and_its_calls() {
+    // simp724's ask 1 on #1920: p1's store is pinned to model m4, the node runs with
+    // --memory-model other. The partition serves (it isn't failed), its Status says why its
+    // store isn't, and its memory calls answer FailedPrecondition.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dir = test_dir();
+    let db = test_partition(&dir, "p1");
+    let model = pigeonhole_memory::EmbeddingModel::new("m4", 4, pigeonhole::Element::F32).unwrap();
+    let store = pigeonhole_memory::Store::create(
+        &db,
+        "notes",
+        pigeonhole_memory::StoreOptions::new().embedding(model),
+    )
+    .unwrap();
+    drop(store);
+    let mut other = recipe();
+    other.args.memory_model = Some("other".into());
+    let (_stop, _dbs, _dir) = one_node(&rt, listener, Some(db), Some(other));
+    rt.block_on(async {
+        let errors = reconcile_errors(port).await;
+        assert!(
+            errors.iter().any(|e| e.contains("memory store notes")),
+            "{errors:?}"
+        );
+        let e = remember(port, "alice", "x").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        // The partition's data calls serve: only its store is refused.
+        assert_eq!(get_row(port, "alice").await.unwrap(), None);
+    });
+}
+
+#[test]
+fn a_node_without_memory_holding_a_placed_partition_names_the_missing_flag() {
+    // simp724's ask 2 on #1920: the map places the store on p1, whose node was started
+    // without --memory. Its Status and its memory calls say so, not a generic Unsupported.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (_stop, dbs, _dir) = one_node(&rt, listener, None, None);
+    assert!(!dbs[0].tables().contains(&"mem_notes".to_owned()));
+    rt.block_on(async {
+        let errors = reconcile_errors(port).await;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("started without --memory")),
+            "{errors:?}"
+        );
+        let e = remember(port, "alice", "x").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.message().contains("--memory"), "{e}");
+        let e = recall(port, &["alice"], "x").await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+    });
+}

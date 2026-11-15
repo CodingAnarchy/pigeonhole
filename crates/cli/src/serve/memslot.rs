@@ -97,10 +97,10 @@ impl std::fmt::Debug for Recipe {
 
 impl Recipe {
     /// A partition's slot, as its writer with `loops`, and its store opened now (created if
-    /// missing), so its background loops run before any call. A failure of the node's own
-    /// configuration (a pin mismatch) is kept and answered by the partition's memory calls;
-    /// any other is logged, and the next call opens again.
-    pub(crate) fn open(&self, db: &Pigeonhole, loops: Loops) -> MemSlot {
+    /// missing), so its background loops run before any call; with why it isn't open, if it
+    /// isn't. A failure of the node's own configuration (a pin mismatch) is kept and answered
+    /// by the partition's memory calls; after any other, the next call opens again.
+    pub(crate) fn open(&self, db: &Pigeonhole, loops: Loops) -> (MemSlot, Result<(), String>) {
         let partition = loops.partition.clone();
         let slot = MemSlot::new(
             db,
@@ -113,23 +113,24 @@ impl Recipe {
             Some(loops),
         );
         let created = !slot.exists();
-        if self.reopen(&slot, &partition) && created {
+        let opened = self.reopen(&slot);
+        if opened.is_ok() && created && slot.exists() {
             eprintln!(
                 "phdb serve: memory store {} on partition {partition}: created",
                 self.name
             );
         }
-        slot
+        (slot, opened)
     }
 
     /// Opens `slot`'s store now if it isn't open (a reconcile cleared it), and checks it
     /// against `--memory-*`: a mismatch is kept as the slot's failure, which its calls
-    /// answer. Whether the store is open.
-    pub(crate) fn reopen(&self, slot: &MemSlot, partition: &str) -> bool {
+    /// answer. `Err`: why the store isn't open, for the partition's reconcile errors.
+    pub(crate) fn reopen(&self, slot: &MemSlot) -> Result<(), String> {
         let failed = match slot.cached().map_or_else(|| slot.get(), Ok) {
             Ok(Entry::Core(core)) => {
                 match crate::memcore::check_reopened(&self.args, &self.name, &core) {
-                    Ok(()) => return true,
+                    Ok(()) => return Ok(()),
                     Err(f) => {
                         let e = ApiError::failed_precondition(f.message().to_owned());
                         slot.fail(e.clone());
@@ -137,14 +138,11 @@ impl Recipe {
                     }
                 }
             }
-            Ok(Entry::Missing) => return false,
+            // A writer's open creates a missing store: not reached.
+            Ok(Entry::Missing) => return Ok(()),
             Ok(Entry::Failed(e)) | Err(e) => e,
         };
-        eprintln!(
-            "phdb serve: memory store {} on partition {partition}: {}",
-            self.name, failed.message
-        );
-        false
+        Err(format!("memory store {}: {}", self.name, failed.message))
     }
 }
 

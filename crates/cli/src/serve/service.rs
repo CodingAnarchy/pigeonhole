@@ -1676,6 +1676,22 @@ impl Service {
         self.part.as_ref()?.memory.get()
     }
 
+    /// A memory call's answer where no store is served. On a cluster partition a memory
+    /// call reaches here only because the map places the store on it, so its node lacks
+    /// `--memory` (simp724's ask 2 on #1920): `FailedPrecondition`, naming the flag.
+    fn no_memory(&self) -> ApiError {
+        match &self.gate {
+            Some(_) => ApiError::failed_precondition(
+                "the cluster map places the memory store on this partition, but its node was \
+                 started without --memory: restart it with --memory NAME and the memory flags \
+                 the other nodes have",
+            ),
+            None => {
+                ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
+            }
+        }
+    }
+
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
     #[cfg(test)]
     pub(crate) fn inflight_available(&self) -> usize {
@@ -3630,9 +3646,12 @@ impl Service {
     /// while its copy is still arriving, else `Unavailable` (the primary hasn't created it,
     /// or the replica hasn't applied that yet; ICR 0112).
     async fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        let slot = self.part()?.memory.get().cloned().ok_or_else(|| {
-            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
-        })?;
+        let slot = self
+            .part()?
+            .memory
+            .get()
+            .cloned()
+            .ok_or_else(|| self.no_memory())?;
         let entry = match slot.cached() {
             Some(entry) => entry,
             None => {
@@ -3649,9 +3668,7 @@ impl Service {
     /// place (M6) and a pool place: a `/mcp` memory tool's (8c-3b). It opens the store here
     /// if need be.
     pub(crate) fn memory_core_blocking(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        let slot = self.part()?.memory.get().ok_or_else(|| {
-            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
-        })?;
+        let slot = self.part()?.memory.get().ok_or_else(|| self.no_memory())?;
         let entry = slot.get()?;
         self.entry_core(slot, entry)
     }
@@ -3798,9 +3815,7 @@ impl Service {
         let swaps = self.part()?.memory.get().map(|m| m.swaps());
         let core = self.memory_core().await?;
         let Some(swaps) = swaps else {
-            return Err(ApiError::unsupported(
-                "this server has no memory store (phdb serve --memory NAME)",
-            ));
+            return Err(self.no_memory());
         };
         let slot = self.stream_slot()?;
         super::memory::watch(
