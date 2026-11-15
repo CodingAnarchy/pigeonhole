@@ -1,6 +1,6 @@
 # 0139: agent memory and `/mcp` on cluster nodes (`ClusterMap.memory`, memory forwards, recall's pool API)
 
-**Status:** Approved. The numbers are from the coordinator (`.coord/numbers.md`), for #1915. The design (`.coord/ai1249-design-memory-mcp.md`) was reviewed by simp724, who confirmed the revised recall (M1) and the lease rules (M2); the coordinator chose the two-phase exact recall. This file grows with #1915's PRs: PR 1 (below) places the store and routes the calls that touch one partition; PR 2 adds the calls that span partitions; PR 3, `/mcp`.
+**Status:** Approved. The numbers are from the coordinator (`.coord/numbers.md`), for #1915. The design (`.coord/ai1249-design-memory-mcp.md`) was reviewed by simp724, who confirmed the revised recall (M1) and the lease rules (M2); the coordinator chose the two-phase exact recall. This file grows with #1915's PRs: PR 1 (below) places the store and routes the calls that touch one partition; PR 2 adds the calls that span partitions (Watch in PR 2b); PR 3, `/mcp`.
 
 ## PR 1: a store per partition, and routing by namespace
 
@@ -36,12 +36,47 @@
 | `Recall` | every named namespace |
 
 - An empty namespace, or one containing `\0`, answers `InvalidArgument` before routing.
-- A call whose namespaces are on more than one partition answers `Unsupported` until PR 2.
-- `Memory.Watch` answers `Unsupported` until PR 2.
+- A call whose namespaces are on more than one partition answered `Unsupported` until PR 2.
+- `Memory.Watch` answers `Unsupported` until PR 2b.
 - A map with no memory placement: every memory call answers `Unsupported`.
 
 **Callers:** `phdb serve --cluster`, and clients of `Memory` through any cluster node.
 
-## PR 2 and PR 3 (numbers assigned, sections to come)
-- `ForwardRequest.op` `recall_pool = 40`, `recall_bodies = 41`; `ForwardResponse.reply` `recall_pool = 23`, `recall_bodies = 24`; `RecallPoolRequest`, `RecallPoolResponse`, `RecallBodiesRequest`, `RecallBodiesResponse`, `ForwardMemoryWatchRequest` (fields from 1); `Cluster.ForwardMemoryWatch`.
-- `pigeonhole-memory`: the opaque `RecallPool`, `RecallRanking` and `RecallBodies`, and `Recall::gather`, `expand_from` and `bodies` (exact signatures may settle in PR 2 as an amendment).
+## PR 2: recall, `MarkUsed` and `Forget` across partitions
+
+**Amendments to the design, from building it** (simp724 confirmed both, `.coord/simp724-review-1915-pr2-exactness.md`):
+- **The graph expansion goes hop by hop.** Its bounds (`Expand::max`, and the byte budget its links are read within) are shared by every seed, so one walk per partition isn't one store's walk once either binds. The entry node drives the walk, and each hop is one round trip to the partitions holding its memories. The cut is exact: a store's hop cuts iff its links' bytes pass the budget left, whatever their order. So a partition's part that passes it cuts, and so do parts that pass it together.
+- **Each namespace doubles its own `n`** when the gather's filters leave a list short, single node included. An IVF list depends on `n`, so with one `n` for the whole recall, another namespace in the call could change a namespace's IVF candidates, which a partition can't reproduce. Recalls over one namespace, and exact lists, are unchanged.
+
+**proto (`cluster.proto`, additive):**
+- `ForwardRequest.op` arms `recall_pool = 40` (`RecallPoolRequest`) and `recall_bodies = 41` (`RecallBodiesRequest`); `ForwardResponse.reply` arms `recall_pool = 23` (`RecallPoolResponse`) and `recall_bodies = 24` (`RecallBodiesResponse`).
+- `RecallPoolRequest { request = 1 (RecallRequest), now_us = 2, hop = 3 (bytes) }`: the pool, or with `hop` (a `RecallHop`'s bytes) the partition's part of that hop. Field 3 was `repeated bytes seeds` in the design and is `bytes hop` (this amendment, unshipped).
+- `RecallPoolResponse { pool = 1 }`: a `RecallPool`'s bytes, or a `RecallHopPart`'s for a hop.
+- `RecallBodiesRequest { request = 1, ids = 2 }`, `RecallBodiesResponse { bodies = 1 }`.
+- `ForwardMemoryWatchRequest { map_version = 1, caller = 2, partition = 3, request = 4 }` and `Cluster.ForwardMemoryWatch` are defined here and served from PR 2b (Watch).
+
+**`pigeonhole-memory`'s public API** (additive; opaque, versioned bytes on ICR 0138's pattern; a version this build doesn't read is `InvalidArgument`, which serve answers as `FailedPrecondition`):
+- `Recall::gather(self) -> Result<RecallPool>`, `Recall::hop(self, &RecallHop) -> Result<RecallHopPart>`, `Recall::bodies(self, &[MemoryId]) -> Result<RecallBodies>`. `hop` and `bodies` refuse a memory outside the recall's namespaces.
+- `RecallPool`: `merge`, `len`, `is_empty`, `to_bytes`, `from_bytes`, `rank(Fusion, Weights) -> RecallRanking`. A memory in two merged pools is `InvalidArgument`.
+- `RecallRanking`: `top(k)`, `walk(Expand, Option<u64>) -> RecallWalk`, `finish(RecallBodies, k, Option<u64>, with_signals) -> (Vec<RecallHit>, RecallStats)`.
+- `RecallWalk`: `next_hop() -> Option<RecallHop>`, `settle(parts)`, `finish() -> RecallRanking`.
+- `RecallHop`: `namespaces`, `split(by) -> BTreeMap<K, RecallHop>`, `to_bytes`, `from_bytes`. `RecallHopPart`: `to_bytes`, `from_bytes`.
+- `RecallBodies`: `merge`, `len`, `is_empty`, `to_bytes`, `from_bytes`.
+- In place of the design's `expand_from(seeds)` and `RecallRanking::expanded(pool)`: the walk above. `Recall::run`'s signature is unchanged, and it runs these steps in process.
+
+**A recall across partitions:** the entry node checks it (scope, `k`, the byte budget against its own `--memory-*` limits, at most 64 namespaces), embeds its text once if it has an embedder, and fixes one clock (`now_us`). Then:
+1. each partition holding some of its namespaces returns its pool;
+2. the entry node merges and ranks them, then walks the graph expansion hop by hop;
+3. the partitions holding the best `k + 4` return their bodies, and the entry node cuts the hits to `k` and the budget, skipping any memory gone since its pool.
+
+Each step is a fan-out part (`Service::fanout_part`): lease-gated before and after its read, counted against the entry node's `--inflight-bytes`. A partition that can't be reached fails the recall (`PartitionUnavailable`); there's no partial answer.
+- **Exact against one store holding every namespace** but for the keyword signal (each partition's BM25 statistics are its own), and only when quiescent: each step reads each partition at its own snapshot.
+- A recall whose namespaces are on one partition is forwarded whole, as in PR 1, with a single node's rules (no 64 cap).
+
+**`MarkUsed` and `Forget` across partitions:** split, each partition's ids one call (served or forwarded as a write), sent together, the counts summed. A part that's refused, or unreachable before its send, fails the call with its error. A part whose outcome is unknown makes it `OutcomeUnknown`, naming the partition. Either message names the partitions that applied and their counts. Retrying the whole call is safe: `Forget` skips what's gone, and `MarkUsed` is advisory.
+
+**Still refused:** `Memory.Watch` (`Unsupported` until PR 2b), and `/mcp` (PR 3).
+
+## PR 2b and PR 3 (numbers assigned, sections to come)
+- `Cluster.ForwardMemoryWatch` and `ForwardMemoryWatchRequest` (above): Watch across partitions, merged as the cluster feed is, each partition's part lease-gated.
+- `/mcp` on a cluster node.
