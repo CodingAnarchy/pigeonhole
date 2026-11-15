@@ -210,6 +210,62 @@ fn nearest_ranks_a_ranges_or_a_key_lists_vectors() {
     assert_eq!(r["cut_by_budget"], json!(true), "{r}");
 }
 
+/// `qualifiers` (#1915 PR 3) ranks only the vectors at the qualifiers it selects: a prefix,
+/// bounds, or neither (every qualifier of the family).
+#[test]
+fn nearest_ranks_only_the_qualifiers_it_selects() {
+    let s = Server::start("", limits());
+    let v = vectors(&s);
+    // Nearer than every vector at the empty qualifier: a at `x`, c at `y`.
+    for (row, q, y) in [(&b"a"[..], &b"x"[..], 0.0f32), (b"c", b"y", 0.5)] {
+        v.mutate(row)
+            .put_vector_f32("emb", q, &[0.0, y])
+            .commit()
+            .unwrap();
+    }
+    let q = f32_query(&[0.0, 0.0]);
+    let near = |qualifiers: Option<Json>| {
+        let mut req = json!({"table": "v", "family": "emb", "query": q, "k": 10});
+        if let Some(qs) = qualifiers {
+            req["qualifiers"] = qs;
+        }
+        let (status, r) = s.rpc("Vectors/Nearest", &req, None);
+        assert_eq!(status, 200, "{req}: {r}");
+        r["neighbours"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["row"].as_str().unwrap().to_owned(),
+                    n["qualifier"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let at = |row: &[u8], q: &[u8]| (b64(row), if q.is_empty() { String::new() } else { b64(q) });
+    assert_eq!(near(Some(json!({"prefix": b64(b"x")}))), [at(b"a", b"x")]);
+    let x_to_y = |inclusive| {
+        json!({
+            "start": {"key": b64(b"x"), "inclusive": true},
+            "end": {"key": b64(b"y"), "inclusive": inclusive},
+        })
+    };
+    assert_eq!(near(Some(x_to_y(true))), [at(b"a", b"x"), at(b"c", b"y")]);
+    assert_eq!(near(Some(x_to_y(false))), [at(b"a", b"x")]);
+    // No selection: every qualifier, by distance.
+    assert_eq!(
+        near(None),
+        [
+            at(b"a", b"x"),
+            at(b"c", b"y"),
+            at(b"a", b""),
+            at(b"b", b""),
+            at(b"c", b""),
+        ]
+    );
+}
+
 #[test]
 fn nearest_refuses_a_query_it_cannot_run() {
     let s = Server::start("", limits());

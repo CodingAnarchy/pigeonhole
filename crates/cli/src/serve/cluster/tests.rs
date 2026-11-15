@@ -3469,6 +3469,151 @@ fn fanned_out_nearest_and_traversals_at_seeds_that_failed() {
     nearest_traverse_model(1794386011110329000);
 }
 
+/// `NearestRequest.qualifiers` (#1915 PR 3) on a cluster: every partition's part applies the
+/// selection, so the merged ranking is one database's under it, through any node: a prefix,
+/// inclusive bounds, an exclusive end, and none.
+#[test]
+fn a_fanned_out_nearest_ranks_only_the_qualifiers_it_selects() {
+    use super::proto::{
+        Bound, MutateRequest, NearestRequest, Put, QualifierSelection, RowKey, RowWrites, Value,
+        Vector, Write, value, write,
+    };
+    use std::ops::Bound as B;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let oracle_dir = test_dir();
+    let oracle = pigeonhole::Pigeonhole::open(
+        oracle_dir.join("oracle.phdb"),
+        pigeonhole::Options::default().create_if_missing(true),
+    )
+    .unwrap();
+    let t = users(&oracle);
+    let rows: Vec<Vec<u8>> = ["a", "c", "g", "h", "m", "q", "s", "z"]
+        .iter()
+        .flat_map(|p| (0..2).map(move |i| format!("{p}{i}").into_bytes()))
+        .collect();
+    let qualifiers: [&[u8]; 3] = [b"", b"x", b"y"];
+    let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    rt.block_on(async {
+        for (i, row) in rows.iter().enumerate() {
+            for (j, q) in qualifiers.iter().enumerate() {
+                let v = [(i % 5) as f32, j as f32, (i % 2) as f32, 0.5];
+                let put = Write {
+                    op: Some(write::Op::Put(Put {
+                        family: "emb".into(),
+                        qualifier: q.to_vec().into(),
+                        timestamp: None,
+                        value: Some(Value {
+                            kind: Some(value::Kind::Vector(Vector {
+                                element: super::proto::Element::F32 as i32,
+                                dim: 4,
+                                data: f32s(&v).into(),
+                            })),
+                        }),
+                    })),
+                };
+                data(ports[(i + j) % 3])
+                    .await
+                    .mutate(MutateRequest {
+                        writes: Some(RowWrites {
+                            row: Some(RowKey {
+                                table: "users".into(),
+                                row: row.clone().into(),
+                            }),
+                            writes: vec![put],
+                        }),
+                        durability: 0,
+                    })
+                    .await
+                    .unwrap();
+                t.mutate(row).put_vector_f32("emb", q, &v).commit().unwrap();
+            }
+        }
+        let query = [2.0f32, 1.0, 0.0, 0.5];
+        let bound = |key: &[u8], inclusive| Bound {
+            key: key.to_vec().into(),
+            inclusive,
+        };
+        let cases: Vec<(
+            &str,
+            Option<QualifierSelection>,
+            Vec<(Vec<u8>, Vec<u8>, f64)>,
+        )> = {
+            let ranked = |s: pigeonhole::Scan<'_>| {
+                s.nearest_f32(&query, 12)
+                    .run_within(1 << 20)
+                    .unwrap()
+                    .into_neighbours()
+                    .into_iter()
+                    .map(|n| (n.row, n.qualifier, n.distance))
+                    .collect::<Vec<_>>()
+            };
+            let all = || t.scan_prefix(b"").family("emb");
+            vec![
+                ("none", None, ranked(all())),
+                (
+                    "prefix x",
+                    Some(QualifierSelection {
+                        prefix: b"x".to_vec().into(),
+                        ..Default::default()
+                    }),
+                    ranked(all().qualifier_prefix(b"x")),
+                ),
+                (
+                    "x to y",
+                    Some(QualifierSelection {
+                        start: Some(bound(b"x", true)),
+                        end: Some(bound(b"y", true)),
+                        ..Default::default()
+                    }),
+                    ranked(all().qualifier_bounds(B::Included(&b"x"[..]), B::Included(&b"y"[..]))),
+                ),
+                (
+                    "before x",
+                    Some(QualifierSelection {
+                        end: Some(bound(b"x", false)),
+                        ..Default::default()
+                    }),
+                    ranked(all().qualifier_bounds(B::Unbounded, B::Excluded(&b"x"[..]))),
+                ),
+            ]
+        };
+        for (name, qualifiers, want) in cases {
+            assert!(!want.is_empty(), "{name}");
+            for (n, port) in ports.iter().enumerate() {
+                let channel =
+                    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                        .unwrap()
+                        .connect()
+                        .await
+                        .unwrap();
+                let got = super::proto::vectors_client::VectorsClient::new(channel)
+                    .nearest(NearestRequest {
+                        table: "users".into(),
+                        family: "emb".into(),
+                        query: Some(Vector {
+                            element: super::proto::Element::F32 as i32,
+                            dim: 4,
+                            data: f32s(&query).into(),
+                        }),
+                        k: 12,
+                        qualifiers: qualifiers.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{name} via node {n}: {e}"))
+                    .into_inner();
+                let got: Vec<(Vec<u8>, Vec<u8>, f64)> = got
+                    .neighbours
+                    .iter()
+                    .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
+                    .collect();
+                assert_eq!(got, want, "{name} via node {n}");
+            }
+        }
+    });
+}
+
 /// D317 §12's model test, ticket 4b, against one database holding every row: nearest
 /// searches over every source kind (vectors repeat, so distances tie and the order's row
 /// and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross the

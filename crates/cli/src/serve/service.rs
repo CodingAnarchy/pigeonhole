@@ -3227,7 +3227,14 @@ impl Service {
         let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
         let at = pinned.as_ref().map(|p| p.snapshot().clone());
-        let select = convert::Select::new(None)?.at(at);
+        // The qualifier selection (`qualifiers`, #1915 PR 3), applied as a read's own.
+        let qualifiers = r.qualifiers.as_ref().map(|q| proto::Selection {
+            qualifier_prefix: q.prefix.clone(),
+            qualifier_start: q.start.clone(),
+            qualifier_end: q.end.clone(),
+            ..Default::default()
+        });
+        let select = convert::Select::new(qualifiers.as_ref())?.at(at);
         let k = r.k as usize;
         let search = match &r.source {
             Some(Source::Keys(keys)) => {

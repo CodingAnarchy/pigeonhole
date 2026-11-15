@@ -101,6 +101,12 @@ curl -s localhost:7448/v1/Data/Get -H 'Content-Type: application/json' \
 curl -s localhost:7448/v1/Data/Scan -H 'Content-Type: application/json' \
   -d '{"table": "users", "range": {"prefix": "dXNlcjo="}}'
 # {"rows":[{"key":"dXNlcjox","cells":[...]}],"bytes":"29"}
+
+# The 5 vectors of family emb nearest a query, among qualifiers starting with "img:".
+curl -s localhost:7448/v1/Vectors/Nearest -H 'Content-Type: application/json' -d '{
+  "table": "docs", "family": "emb", "k": 5, "qualifiers": {"prefix": "aW1nOg=="},
+  "query": {"element": "ELEMENT_F32", "dim": 2, "data": "AAAAAAAAgD8="}}'
+# {"neighbours":[{"row":"...","qualifier":"aW1nOjE=","distance":0.5,"timestamp":"..."}]}
 ```
 
 An error is its status with an `ErrorDetail` body:
@@ -201,6 +207,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 - **Graph and vector reads** run on the request's task, holding no blocking thread, and take a `snapshot_id` as the other reads do.
   - `Graph.Traverse` walks one edge family from its seeds, hop by hop: a node is a row, an edge a column whose qualifier is the destination's row key. `hops` is at most 64 (0 is 1), and `per_node_limit`, `hop_limit` and `max_nodes` bound it (0 for each is the library's default). Its reply is byte-budgeted like a `MultiGet`'s: `page_bytes` of nodes (a node counts its key and 16 bytes, plus 4 with `parents`), 0 for the server's default of 1 MiB, capped at 8 MiB. The hop the budget cuts keeps its in-budget prefix, the traversal ends there, and `stats.cut_by_budget` says so. The edge selection is `qualifier_prefix` or bounds, a time range and a value filter. With `parents`, each hop gives each node's source as an index into the hop before (the seeds, for hop 1).
   - `Vectors.Nearest` is the exact top `k` of one vector family over a key range (`range`) or a key list (`keys`), nearest first by the family's metric. `k` is 1 to 10,000. The query is an `f32`, `i8` or bit vector: query an `f16` or `bf16` family with `f32` components, as in Rust, since the server refuses an `f16` or `bf16` query. The result is cut to `page_bytes` by D308's measure (each neighbour counts its row, its qualifier and 16 bytes), 0 for the server's default of 1 MiB, capped at 8 MiB, and `cut_by_budget` says it was. A ranking can't resume where it stopped: ask again with a smaller `k` or a narrower source.
+    - **`qualifiers`** (a `QualifierSelection`, #1915) ranks only the vectors at the qualifiers it selects: a `prefix`, `start` and `end` bounds, or both, as a read's `Selection` applies its qualifier fields. Absent, every qualifier of the family is ranked. On a cluster node, each partition's part applies it.
 - **The IVF vector index** (`pigeonhole-vector`, ICR 0100): `Vectors.CreateIndex` (a spec, and the index options; `if_missing` opens an existing one as it is, without comparing its spec or options to the request's), `Insert`, `Delete`, `Search` (the `k` nearest ids, at most 10,000, with `nprobe`, `id_prefix`, `max_probe`, and `stats` on request) and `Verify`.
   - A vector is in the index's element type: all five work (`f32`, `i8`, bit, `f16`, `bf16`). Another type, or another dimension, is `InvalidArgument`.
   - The server keeps one handle per index, opened on first use. `Insert` and `Delete` are writes, so they answer their real outcome even if the client goes away. `Search` holds no blocking thread once the index is open.

@@ -90,5 +90,22 @@ The design is `.coord/ai1249-1915-pr2b-watch.md`, reviewed by simp724 (`.coord/s
 - **`--max-streams`:** one place on the node called, and one per component on its partition's node, as a cluster subscription.
 - **An older node** answers `ForwardMemoryWatch` with `Unimplemented`, which the merge answers as `Unsupported`, naming the node.
 
-## PR 3 (numbers assigned, section to come)
-- `/mcp` on a cluster node.
+## PR 3: `/mcp` through the router, then on a cluster node
+
+Design: `.coord/ai1249-1915-pr3-mcp.md`, reviewed by simp724 (`.coord/simp724-review-1915-pr3-mcp.md`). PR 3a sends serve's `/mcp` tools through `Router::dispatch` on one node. PR 3b lifts the cluster refusal.
+
+**proto (additive, this amendment; numbers from the coordinator, recorded in `.coord/numbers.md`):**
+- `QualifierSelection { prefix = 1 (bytes), start = 2 (Bound), end = 3 (Bound) }` in common.proto. No existing message held these: `Selection` and `TraverseRequest` carry them as inline fields.
+- `NearestRequest.qualifiers = 10`: a nearest search ranks only the vectors at the qualifiers it selects, applied as a read's `Selection` applies its qualifier fields. On a cluster, each partition's part applies it. The `/mcp` `nearest` tool's `qualifier` and `qualifier_prefix` need it once the tool is a `Nearest` call.
+
+**`--mcp-blocking` (default 8; the coordinator's routine call, 2026-11-15):**
+- **What:** the most `/mcp` messages running at once. Each runs on a blocking-pool thread under a place of its own, not a `--blocking-threads` permit, and tokio's blocking-thread cap grows by the same count.
+- **Why:** a tool's database call is now a service op through `Router::dispatch`, which takes a `--blocking-threads` permit of its own. If `/mcp` messages held those permits while waiting on their ops, a pool full of them would wait for ever. With a place of their own, they never hold a permit their ops need.
+- **The conditions it rests on (simp724's review):**
+  - the place is awaited on the async side, before the pool thread;
+  - only `/mcp` threads wait on blocking work;
+  - every other wait on the dispatch path is a try or bounded;
+  - the cap leaves room for the ops.
+- **Default:** 8 holds a few agents' sessions at once while keeping the extra threads small beside `--blocking-threads`.
+
+**Still refused in PR 3a:** `/mcp` on a cluster node (PR 3b).

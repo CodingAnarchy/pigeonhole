@@ -197,6 +197,14 @@ message TimeRange {
   uint64 end = 2;
 }
 
+// Which qualifiers a call selects, as `Selection`'s qualifier fields do: a prefix, bounds,
+// or both (ICR 0139's amendment, #1915 PR 3; `NearestRequest.qualifiers`).
+message QualifierSelection {
+  bytes prefix = 1;
+  Bound start = 2;
+  Bound end = 3;
+}
+
 // What a read selects within each row (the Rust `RowRead`/`Scan` builders' selection).
 message Selection {
   // Families to read, in this order; empty reads every family.
