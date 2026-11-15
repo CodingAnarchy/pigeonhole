@@ -2892,7 +2892,6 @@ mod tests {
             .unwrap();
         let hub = Arc::new(Hub::new(
             Ring::new(SingleRing::default()),
-            rt.spawn(async {}).abort_handle(),
             false,
             Arc::default(),
             Arc::new(AtomicU64::new(1)),
