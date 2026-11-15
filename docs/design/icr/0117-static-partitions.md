@@ -197,6 +197,7 @@
 - **Tables the map doesn't place** answer `NotFound`.
 - **A start from a snapshot** is `Unsupported` (the coordinator's call; a one-partition version is #1701, Post-1.0).
 - **A cluster node takes `--change-feed`** for its partition, as a single node does.
+  - **Amendment (#1786, 1.3.0, the owner's call):** it's the node's total, split across its partitions by their shards (`total × shards ÷ the node's shards`), as `--engine-memory` is; 1.2 gave each partition all of it. The engine still keeps at least two WAL segments a stream. A partition opened while serving takes its share for the new set, and keeps at least the retention its feed's last session had (a moved partition's history, simp724's R1) until a restart re-splits it; the open and the start log a node over its total and a partition whose history shrank. Serve-only hooks, not stable API: `Options::change_feed_keep_last` and `Pigeonhole::feed_previous_retention` (the engine's `feed_keep_last` and `FeedStorage::previous_retention_bytes`).
 
 **Tokens are checkpoints** (D317 §8 as amended; option (C), the coordinator's call after perf287's numbers):
 - **What a checkpoint is:** a cluster token holds every partition's position. That's its own D310 token, compacted losslessly: varints, deltas between a stream's positions, the writer session as its 8 bytes, and the original bytes whenever the compaction doesn't expand back exactly. The token also holds each partition's epoch, the map version, the cluster id and a hash of the subscription (tables, prefix, visibility).

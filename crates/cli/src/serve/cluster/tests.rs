@@ -1125,7 +1125,7 @@ fn data_node_many(
     // Unpinned: the rig's partitions share the test process's CPUs.
     let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
     let (stop, dbs, _) = data_node_placed(
-        rt, dir, id, locals, listener, tokens, limits, restart, placement, None,
+        rt, dir, id, locals, listener, tokens, limits, restart, placement, None, None,
     );
     (stop, dbs)
 }
@@ -1146,6 +1146,7 @@ fn data_node_placed(
     restart: bool,
     placement: crate::serve::placement::Placement,
     engine_memory: Option<u64>,
+    change_feed: Option<u64>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     Vec<pigeonhole::Pigeonhole>,
@@ -1162,6 +1163,7 @@ fn data_node_placed(
         restart,
         placement,
         engine_memory,
+        change_feed,
         None,
     )
 }
@@ -1179,6 +1181,7 @@ fn data_node_served(
     restart: bool,
     placement: crate::serve::placement::Placement,
     engine_memory: Option<u64>,
+    change_feed: Option<u64>,
     memory: Option<crate::serve::memslot::Recipe>,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
@@ -1254,6 +1257,7 @@ fn data_node_served(
             shards: 1,
             compaction: 0,
             engine_memory,
+            change_feed,
             reserved: None,
         },
     );

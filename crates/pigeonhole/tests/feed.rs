@@ -978,3 +978,73 @@ fn a_feed_s_position_and_a_table_s_feed_id() {
     drop((feed, a, b));
     db.close().unwrap();
 }
+
+/// #1786: an open with a smaller retention reports the last session's
+/// (`feed_previous_retention`), and keeps it with `change_feed_keep_last` (a cluster
+/// partition opened while serving, whose history moved with it, simp724's R1); without it, the
+/// smaller one is in effect.
+#[test]
+fn a_smaller_retention_keeps_the_last_sessions_history_only_with_keep_last() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    // 1 MiB segments, one shard: retention counts in whole segments, at least two.
+    let with = |bytes: u64| {
+        Options::default()
+            .create_if_missing(true)
+            .shards(1)
+            .wal_segment_size(1 << 20)
+            .change_feed(FeedRetention::bytes(bytes))
+    };
+    let db = Pigeonhole::open(&path, with(8 << 20)).unwrap();
+    assert_eq!(db.feed_previous_retention().unwrap(), None, "a new feed");
+    assert_eq!(db.info().unwrap().feed.unwrap().retention_bytes, 8 << 20);
+    db.close().unwrap();
+
+    // Less asked, keeping the last session's: 8 MiB still.
+    let db = Pigeonhole::open(&path, with(2 << 20).change_feed_keep_last(true)).unwrap();
+    assert_eq!(db.feed_previous_retention().unwrap(), Some(8 << 20));
+    assert_eq!(db.info().unwrap().feed.unwrap().retention_bytes, 8 << 20);
+    db.close().unwrap();
+
+    // Less asked, as a restart re-splits it: 2 MiB, with the last session's reported.
+    let db = Pigeonhole::open(&path, with(2 << 20)).unwrap();
+    assert_eq!(db.feed_previous_retention().unwrap(), Some(8 << 20));
+    assert_eq!(db.info().unwrap().feed.unwrap().retention_bytes, 2 << 20);
+    db.close().unwrap();
+
+    // More asked than the last: keep-last changes nothing.
+    let db = Pigeonhole::open(&path, with(4 << 20).change_feed_keep_last(true)).unwrap();
+    assert_eq!(db.feed_previous_retention().unwrap(), Some(2 << 20));
+    assert_eq!(db.info().unwrap().feed.unwrap().retention_bytes, 4 << 20);
+    db.close().unwrap();
+}
+
+/// #1786, feed1248's test: a keep-last open after a session that turned the feed off
+/// (`change_feed_off`, "fed: none") has no last retention to keep: it takes the one asked,
+/// and reports none before it.
+#[test]
+fn keep_last_after_a_feed_off_session_takes_the_retention_asked() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    let base = || {
+        Options::default()
+            .create_if_missing(true)
+            .shards(1)
+            .wal_segment_size(1 << 20)
+    };
+    let db = Pigeonhole::open(&path, base().change_feed(FeedRetention::bytes(8 << 20))).unwrap();
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, base().change_feed_off()).unwrap();
+    assert!(db.info().unwrap().feed.is_none());
+    db.close().unwrap();
+    let db = Pigeonhole::open(
+        &path,
+        base()
+            .change_feed(FeedRetention::bytes(2 << 20))
+            .change_feed_keep_last(true),
+    )
+    .unwrap();
+    assert_eq!(db.feed_previous_retention().unwrap(), None);
+    assert_eq!(db.info().unwrap().feed.unwrap().retention_bytes, 2 << 20);
+    db.close().unwrap();
+}

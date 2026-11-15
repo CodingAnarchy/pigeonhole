@@ -63,6 +63,21 @@ pub(crate) fn default_compaction_threads(shards: usize) -> usize {
     (pigeonhole_io::sys::default_shards() / 4).clamp(1, shards.max(1))
 }
 
+/// A partition's share of a cluster node's `--change-feed` (#1786): the node's total split by
+/// shards, `total × shards ÷ all_shards`, so every stream on the node keeps the same history,
+/// as one database of all the node's shards would. The engine rounds it up to whole WAL
+/// segments, at least two per stream, so a small total can be kept as more.
+///
+/// `shards` is the partition's planned share ([`Share::shards`]). A partition whose feed
+/// recorded another stream count opens with that count (ICR 0132), and the engine splits its
+/// bytes over the streams it has. The node's total is then still what the shares add up to,
+/// but that partition's streams each keep more or less than the others' (feed1248's note on
+/// #1917).
+pub(crate) fn feed_share(total: u64, shards: usize, all_shards: usize) -> u64 {
+    let part = u128::from(total) * shards as u128 / all_shards.max(1) as u128;
+    u64::try_from(part).unwrap_or(u64::MAX)
+}
+
 /// One partition's share of a node's thread budget (D317 ticket 8a, §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Share {
@@ -1072,6 +1087,19 @@ mod tests {
     /// D313 R1's mask, on a 4-core, 8-CPU topology (CPU `c`'s sibling is `c ^ 4`): the
     /// shards' cores and their siblings are left out while two cores stay free, and below
     /// that no mask at all, never the shards' siblings (the coordinator on #1697).
+    #[test]
+    fn a_nodes_change_feed_is_split_by_shards() {
+        // #1786: 4 GiB over partitions of 2, 2 and 4 shards: by shard share.
+        let total: u64 = 4 << 30;
+        assert_eq!(super::feed_share(total, 2, 8), 1 << 30);
+        assert_eq!(super::feed_share(total, 4, 8), 2 << 30);
+        // A single partition holds it all; no shards counted takes none of it apart.
+        assert_eq!(super::feed_share(total, 8, 8), total);
+        assert_eq!(super::feed_share(total, 1, 0), total);
+        // No overflow near the top.
+        assert_eq!(super::feed_share(u64::MAX, 3, 3), u64::MAX);
+    }
+
     #[test]
     fn the_mask_keeps_off_the_shards_cores_or_sets_none() {
         use super::{MaskPlan, mask_plan};

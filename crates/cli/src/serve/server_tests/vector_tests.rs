@@ -737,20 +737,19 @@ fn a_bulk_load_stops_past_what_its_expected_sized_its_lists_for() {
     assert_eq!(verified(&s, "ix2"), json!("80"));
 }
 
+/// The server's bulk-load fault seam, to arm for its next load.
+fn bulk_seam(s: &Server) -> std::sync::MutexGuard<'_, Option<super::bulk::Seam>> {
+    let part = s.shared.router.service.part().unwrap();
+    part.bulk.seam.lock().unwrap()
+}
+
 #[test]
 fn a_load_that_failed_inside_the_crate_says_only_some_may_have_loaded() {
     // audit120's S1 on #1839: a failure inside the crate mid-load drops the batches still
     // waiting, so its error can't say every vector before it was loaded, as an input that
     // ended (a stall, a broken stream) does. Here the loader takes three vectors and fails.
-    let s = Server::start_custom("", limits(), 1, |mut svc| {
-        svc.part_mut().bulk.loader = Arc::new(|_index, _expected, input| {
-            let _ = input.take(3).count();
-            Err(super::errors::ApiError::internal(
-                "the crate failed mid-load",
-            ))
-        });
-        svc
-    });
+    let s = Server::start("", limits());
+    *bulk_seam(&s) = Some(super::bulk::Seam::FailAfter(3));
     assert_eq!(
         s.rpc("Vectors/CreateIndex", &index_spec("REBALANCE_INLINE"), None)
             .0,
@@ -843,22 +842,11 @@ fn a_slow_loader_holds_back_a_fast_client() {
     // the budget of two messages at most.
     let (started_tx, started) = std::sync::mpsc::channel::<()>();
     let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
-    let started_tx = std::sync::Mutex::new(started_tx);
-    let gate_rx = std::sync::Mutex::new(gate_rx);
-    let s = Server::start_custom("", limits(), 1, move |mut svc| {
-        // Only the first load is held.
-        let held = std::sync::atomic::AtomicBool::new(false);
-        svc.part_mut().bulk.loader = Arc::new(move |index, expected, input| {
-            if held.swap(true, Ordering::Relaxed) {
-                return super::bulk::load(index, expected, input);
-            }
-            let first = input.next();
-            started_tx.lock().unwrap().send(()).unwrap();
-            let _ = gate_rx.lock().unwrap().recv();
-            let mut rest = first.into_iter().chain(input);
-            super::bulk::load(index, expected, &mut rest)
-        });
-        svc
+    let s = Server::start("", limits());
+    // Only the first load is held: it takes the seam.
+    *bulk_seam(&s) = Some(super::bulk::Seam::Hold {
+        started: started_tx,
+        release: gate_rx,
     });
     // Rebound after the server, so a failed assertion drops the gate first: the server's
     // drop waits for the loader thread, which then ends instead of waiting on the gate.

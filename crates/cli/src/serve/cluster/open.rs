@@ -37,6 +37,8 @@ pub(crate) struct Server {
     pub(crate) compaction: usize,
     /// `--engine-memory`, split as at the start.
     pub(crate) engine_memory: Option<u64>,
+    /// `--change-feed`, the node's total, split by shards as at the start (#1786).
+    pub(crate) change_feed: Option<u64>,
     /// The node's reserved compaction CPUs, as its start reserved them for several
     /// partitions (ICR 0134); `None` for one partition, none, or no pinning. A partition
     /// opened while serving confines its compaction there (#1888).
@@ -163,6 +165,41 @@ pub(crate) static HOLD_OPEN: std::sync::Mutex<
     Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(Vec::new());
 
+/// An inspection seam (tests): how many passes of `open_missing` have finished in each
+/// cluster directory. A test that opens a partition itself waits out the pass its map install
+/// started, which would otherwise open the same partition just before or after it (#1928).
+#[cfg(test)]
+static MISSING_PASSES: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The passes of `open_missing` finished in cluster directory `dir` ([`MISSING_PASSES`]).
+#[cfg(test)]
+pub(crate) fn missing_passes(dir: &std::path::Path) -> u64 {
+    MISSING_PASSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(d, _)| d == dir)
+        .map_or(0, |(_, n)| *n)
+}
+
+/// Counts a pass of `open_missing` in its directory as it ends, however it ends.
+#[cfg(test)]
+struct MissingPass<'a>(&'a std::path::Path);
+
+#[cfg(test)]
+impl Drop for MissingPass<'_> {
+    fn drop(&mut self) {
+        let mut passes = MISSING_PASSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match passes.iter_mut().find(|(d, _)| d == self.0) {
+            Some((_, n)) => *n += 1,
+            None => passes.push((self.0.to_path_buf(), 1)),
+        }
+    }
+}
+
 /// A hold seam (tests): `open_missing` in each listed cluster directory waits after its next
 /// partition opened, before it confirms it, until the sender sends or is dropped. The wait
 /// is on a blocking thread: on a runtime worker it stopped every task queued behind it on
@@ -198,17 +235,63 @@ fn hold_open(dir: &std::path::Path) {
     }
 }
 
-/// A partition's options: the server's, with the partition's share of the node's budget and
-/// its memory, at the node's start and for a partition opened while it serves.
+/// A partition's options: the server's, with the partition's share of the node's budget, its
+/// memory and its share of `--change-feed` (`feed`, bytes), at the node's start and for a
+/// partition opened while it serves. `keep_last` (a partition opened while serving) keeps at
+/// least the history its feed's last session kept: one moved here with its history keeps it
+/// until the node restarts, under a share that may be smaller (#1786, simp724's R1).
 pub(crate) fn options_for(
     served: &pigeonhole::Options,
     share: Share,
     memory: Option<Memory>,
+    feed: Option<u64>,
+    keep_last: bool,
 ) -> pigeonhole::Options {
-    let options = super::partition_options(served.clone(), share);
+    let mut options = super::partition_options(served.clone(), share);
+    if let Some(bytes) = feed {
+        options = options
+            .change_feed(pigeonhole::FeedRetention::bytes(bytes))
+            .change_feed_keep_last(keep_last);
+    }
     match memory {
         Some(m) => m.apply(options),
         None => options,
+    }
+}
+
+/// Logs what the node's partitions keep of `--change-feed` (`total`) once they're open
+/// (#1786), and `why` says when:
+/// - each partition whose history is shorter than its feed's last session asked for: the
+///   oldest is gone, and a subscriber or token further back answers `FeedExpired`. It
+///   compares a request with what's in effect now, so a small drop can go unsaid, but none
+///   is invented (feed1248's N1);
+/// - the node over its total: the engine's floor of two WAL segments a stream, or a
+///   partition opened while serving that kept the history it came with.
+pub(crate) fn log_feed(total: u64, parts: &[(&str, &pigeonhole::Pigeonhole)], why: &str) {
+    let mut kept = 0u64;
+    for (id, db) in parts {
+        let Ok(info) = db.info() else { continue };
+        let Some(feed) = info.feed else { continue };
+        kept = kept.saturating_add(feed.retention_bytes);
+        if let Ok(Some(before)) = db.feed_previous_retention()
+            && before > feed.retention_bytes
+        {
+            eprintln!(
+                "phdb serve: partition {id}'s change feed keeps {} bytes of history over its {} \
+                 shards, its share of --change-feed {total}, where its last open kept {before}: \
+                 the oldest history is gone, and a subscriber or token further back answers \
+                 FeedExpired ({why})",
+                feed.retention_bytes, info.shards
+            );
+        }
+    }
+    if kept > total {
+        eprintln!(
+            "phdb serve: the node's partitions keep {kept} bytes of change-feed history, over \
+             --change-feed {total} ({why}): each keeps at least two WAL segments a shard, and a \
+             partition opened while serving keeps the history it came with until the node \
+             restarts"
+        );
     }
 }
 
@@ -439,6 +522,8 @@ impl Node {
         let n = open_now.len() + 1;
         let shares = crate::serve::placement::split(server.shards, server.compaction, n);
         let share = shares[n - 1];
+        // Its share of --change-feed is by the new set's shards (#1786).
+        let all_shards: usize = shares.iter().map(|s| s.shards).sum();
         let mut resplit: Vec<Resize> = Vec::new();
         let memory = match server.engine_memory {
             None => {
@@ -540,7 +625,12 @@ impl Node {
                                 reserved: confine.as_deref(),
                                 memories: memory.as_ref().map(std::slice::from_ref),
                             },
-                            |s, m| options_for(&server.served, s, m),
+                            |s, m| {
+                                let feed = server.change_feed.map(|t| {
+                                    crate::serve::placement::feed_share(t, s.shards, all_shards)
+                                });
+                                options_for(&server.served, s, m, feed, true)
+                            },
                             &mut log,
                         );
                         eprint!("{}", String::from_utf8_lossy(&log));
@@ -596,6 +686,20 @@ impl Node {
         // Opened: the shrinks stand, and any cache the re-split grew grows now (#1761).
         shrunk.keep();
         Resized::grow(&resplit, &format!("partition {id} opened")).await;
+        // What the partitions keep of --change-feed now (#1786): the new one's share, or the
+        // history it came with, which can put the node over its total until a restart.
+        if let Some(total) = server.change_feed {
+            let parts = cluster.parts.load_full();
+            let why = format!("partition {id} opened");
+            tokio::task::spawn_blocking(move || {
+                let dbs: Vec<(&str, &pigeonhole::Pigeonhole)> = parts
+                    .iter()
+                    .filter_map(|(id, s)| s.part_opt().map(|p| (id.as_str(), &p.db)))
+                    .collect();
+                log_feed(total, &dbs, &why);
+            })
+            .await?;
+        }
         // Its schema follows the map before it's unfenced (D317 ticket 5): the node's map
         // now, not the one the open began with, which a schema change may have passed while
         // the engine opened (audit120's F6). The reconcile covers every open partition.
@@ -620,6 +724,8 @@ impl Node {
     /// unfenced once the node's map confirms it (a relocation's new owner serves at once). A
     /// partition that fails to open is reported and left to the next map, or the operator.
     pub(crate) async fn open_missing(self: &Arc<Self>) {
+        #[cfg(test)]
+        let _pass = MissingPass(&self.dir);
         if self.server.get().is_none() {
             return;
         }

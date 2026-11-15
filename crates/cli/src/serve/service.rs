@@ -1416,14 +1416,6 @@ impl Service {
         self.part.as_ref()
     }
 
-    /// The partition, to set a test's hold on it before the server starts.
-    #[cfg(test)]
-    pub(crate) fn part_mut(&mut self) -> &mut Partition {
-        self.part
-            .as_mut()
-            .expect("a test server serves its partition")
-    }
-
     /// A node serving `db`, opened with `config`.
     pub(crate) fn new(
         db: Pigeonhole,

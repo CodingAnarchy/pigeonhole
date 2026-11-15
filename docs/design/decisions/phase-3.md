@@ -4907,7 +4907,7 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 **Owner's approval (2026-11-14).** Leases required before the fence work ships in 1.3.0, with both effects: `unfence --force` no longer overrides the majority, and a two-node cluster stops serving within L when a node is down.
 
 <a id="d327"></a>
-## D327 — WAL pad fragments: at GroupSync, the next group starts on a fresh page while a sync holds the tail (perf2, design; owner, 2026-11-14; wal, format, engine, #1708, #1621, ICR 0137) · D324
+## D327 — WAL pad fragments: at GroupSync, the next group starts on a fresh page while a sync holds the tail (perf2, design; owner, 2026-11-14; wal, format, engine, #1708, #1621, ICR 0137) · D324 · **SHELVED 2026-11-15** (the writer; the format stays reserved)
 
 **Problem (#1621's residue after #1681, #1708).** At GroupSync a group's buffered `pwrite` ends partway into a page. The group's `fdatasync`, on an io_uring worker, locks that page's folio while it submits the page's writeback into a deep queue. The next group's `pwrite` starts in the same page, so it waits in `iomap_write_begin → folio_wait_bit_common` until that submit returns. g69 counted 104/94 driver pwrites ≥ 5 ms, mostly in a sustained session's tail. D324 removed the waits with direct writes but cost more than it saved, and was not shipped.
 
@@ -4928,3 +4928,13 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 3. **A box A/B on g69's session** (perf287), which decides the default and U (measured from the waited folios' order on xfs; a frame if that is unclear).
 
 **Acceptance (owner, 2026-11-14).** WAL bytes at most 1.2× on g69's session and the ycsb rows; `Buffered` unchanged; and the A/B shows the tail-page waits gone.
+
+**Shelved (2026-11-15, coordinator; the owner is told with #1708's outcome).** The writer (step 2, #1929) is not merged and ICR 0137 is withdrawn. The format and replay (step 1, #1925) stay: `incompat` bit 1 and fragment type 5 remain reserved for pads, the reader still steps over an intact pad, and no build sets the bit.
+- **g112** (#1929 at d4b6e3b7d, g69's session) failed the acceptance:
+  - **Bytes:** WAL bytes were 10.3× at U = 4096 and 82× at 32768. At that load a sync is always in flight and a group is about 1.1 puts, so nearly every group padded, by half a unit on average. (The writer padded each group's first record while any sync of the stream was in flight, not once per sync as step 2 said.)
+  - **Stalls:** driver pwrites ≥ 5 ms were within spread at 4096 and 50% higher at 32768, and put p99 was no better.
+  - **ycsb rows:** passed (1.01–1.14×).
+- **g116 and g117** (unpadded) placed the stalls. All 84 driver pwrites ≥ 5 ms were on WAL files, and 98.9% of their time was blocked in `folio_wait_bit_common` under `iomap_write_begin`. That is a wait on a page-cache folio's lock: not `PG_writeback`, not writeback throttling (wbt) inside the pwrite, and not CPU.
+  - **Who holds the lock:** the in-flight `fdatasync`'s writeback walk locks each dirty folio it reaches while it builds and submits the bio. It reaches every dirty page of the file, including those dirtied after the sync was submitted, not only the page holding the sync's target. So a pad moves a group to fresh pages that the same walk then locks, and the Problem paragraph's premise (only the tail page is at risk) does not hold.
+  - **Why the hold lasts milliseconds** (inferred): submit_bio blocks in the block layer's wbt throttle with the folio still locked. g116 counted about 22M `rq_qos_wait` calls on the io_uring sync workers, and 2.53 s of the WAL thread's 2.69 s of fsync time in wbt.
+- **What #1708 tries next:** a g69-session A/B with wbt on and off on the WAL device (g118). If the stalls go, the remedy is a host-tuning note, not a format or code change. If not, the remaining levers are WAL I/O designs (direct or uncached writes, range-limited writeback before the sync), each its own decision.
