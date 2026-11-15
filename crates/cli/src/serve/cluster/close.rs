@@ -266,6 +266,9 @@ impl Node {
         }
         eprintln!("phdb serve: partition {id} closed: hashing its files");
         self.hash_soon(id);
+        // It serves nothing now: its grants go, so a planned move's new node needn't wait
+        // them out (D326 PR 2).
+        self.release_soon(id, epoch);
         Ok(())
     }
 

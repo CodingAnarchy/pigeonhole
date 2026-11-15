@@ -251,6 +251,35 @@ impl FeedCursor {
             .map_or(Lsn::default(), |c| Lsn::new(c.epoch, c.last_end as u32))
     }
 
+    /// Moves the cursor to `at`, a record boundary in this stream that a cursor read up to
+    /// before, without reading or checking the records between (#1827: a feed reader
+    /// passing over records it indexed on an earlier read). They were checked when first
+    /// read, and a record below the readable end doesn't change while its segment is in the
+    /// file. `at` may be in a later segment than the cursor's. Returns `false`, the cursor
+    /// then gone as [`Step::Gone`] reads, once `at`'s segment isn't in the file (recycled).
+    ///
+    /// Nothing is read unless `at`'s segment isn't in the headers as last read, which are
+    /// then read again. The cached frames are dropped: past where this cursor decoded, they
+    /// may have been read before the writer finished them.
+    pub fn skip_to(&mut self, at: Lsn) -> Result<bool> {
+        if self.cur.is_none() {
+            return Ok(false);
+        }
+        self.chunk_slot = usize::MAX;
+        self.stopped = false;
+        let mut placed = self.place(at);
+        if placed.is_none() {
+            self.grid = Grid::read(&self.file, self.stream, self.db_id)?;
+            #[cfg(test)]
+            {
+                self.reads.0 += 1;
+            }
+            placed = self.place(at);
+        }
+        self.cur = placed;
+        Ok(self.cur.is_some())
+    }
+
     /// Where the successor of segment `epoch` says it ends, as the headers were last read.
     fn cut_of(&self, epoch: u32) -> Option<u64> {
         self.grid.as_ref().and_then(|g| cut_of_grid(g, epoch))
@@ -606,5 +635,46 @@ mod read_tests {
             wal.spares().prepare(2).unwrap();
         }
         assert!(wal.written().epoch() > 5, "the stream rolled over");
+    }
+
+    /// #1827: a cursor moved to a record boundary another cursor reported, in its own
+    /// segment or a later one, reads on from there. (A skip into a recycled segment is the
+    /// engine's `it::feed_reader` T3.)
+    #[test]
+    fn a_skip_reads_on_from_a_boundary_in_this_or_a_later_segment() {
+        let vfs: VfsRef = SimVfs::new(8);
+        // 20 KB records, one a 32 KB frame and 4 frames a segment: 3 records a segment.
+        let mut wal = stream(&vfs, 4);
+        wal.spares().prepare(4).unwrap();
+        for seqno in 1..=9 {
+            append(&mut wal, seqno, 20_000);
+        }
+        let mut first = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        let mut ends = vec![first.position()];
+        loop {
+            match first.step().unwrap() {
+                Step::Record { end, .. } => ends.push(end),
+                Step::End => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(ends.len(), 10);
+        assert_ne!(
+            ends[1].epoch(),
+            ends[7].epoch(),
+            "the records span segments"
+        );
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        // Within the first segment: past seqno 1, to 2.
+        assert!(c.skip_to(ends[1]).unwrap());
+        assert_eq!(
+            drain(&mut c).first(),
+            Some(&2),
+            "read on from the boundary after 1"
+        );
+        // Back to the start's segment, then ahead into a later one: past 7, to 8 and 9.
+        let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+        assert!(c.skip_to(ends[7]).unwrap());
+        assert_eq!(drain(&mut c), [8, 9]);
     }
 }
