@@ -46,10 +46,14 @@ pub(crate) struct RuntimeMasks {
     pub hub: Option<Vec<usize>>,
 }
 
-/// The shard count `phdb serve` gives a database it creates: half the physical cores,
-/// leaving the rest for the network side. A user's `--shards` wins.
+/// The shard count `phdb serve` gives a database without `--shards`: half the physical cores
+/// this process may run on (its affinity mask and CPU quota, as the library counts them),
+/// leaving the rest for the network side. Not the host's: under a `taskset` or in a
+/// restricted container, that gave shards for CPUs the process can't use, and left placement
+/// almost nothing for the network and feed sides (#1921, the trap #1703 fixed for
+/// compaction threads). A user's `--shards` wins.
 pub(crate) fn default_shards() -> usize {
-    (num_cpus::get_physical() / 2).max(1)
+    (pigeonhole_io::sys::default_shards() / 2).max(1)
 }
 
 /// A node's compaction threads when `--compaction-threads` isn't given: the library's
@@ -1511,5 +1515,32 @@ mod tests {
         assert_eq!(super::format_cpu_list(&[]), "");
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1921: the default shard count is half the physical cores this thread may run on, not
+    /// the host's. Two CPUs are at most two physical cores, so one shard, whatever the host
+    /// has. Linux only (elsewhere nothing narrows a thread's CPUs); the affinity is this test
+    /// thread's own, so other tests don't see it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_default_shards_count_the_cpus_this_process_may_run_on() {
+        let narrowed = std::thread::spawn(|| {
+            let set = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+            let mine: Vec<usize> = (0..nix::sched::CpuSet::count())
+                .filter(|&c| set.is_set(c).unwrap_or(false))
+                .collect();
+            let mut two = nix::sched::CpuSet::new();
+            for &c in mine.iter().take(2) {
+                two.set(c).unwrap();
+            }
+            nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &two).unwrap();
+            default_shards()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            narrowed, 1,
+            "two CPUs give one shard, not half the host's cores"
+        );
     }
 }
