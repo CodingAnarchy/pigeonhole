@@ -22,6 +22,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::convert::{self, Elements};
 use super::errors::ApiError;
+use super::feed::TakeClock;
+use super::lease::{DeliveryLease, LeaseHooks};
 use super::proto;
 use crate::memcore::{MemCore, MemError, MemErrorKind, RecallArgs, Remember, Scope};
 
@@ -210,20 +212,107 @@ pub(crate) fn hit(h: RecallHit) -> proto::MemoryHit {
     }
 }
 
-/// A watch's events, then its error if it failed.
-#[derive(Debug)]
-pub(crate) struct MemoryEvents(mpsc::Receiver<Result<proto::MemoryEvent, ApiError>>);
+/// A watch's events, then its error if it failed. On a cluster partition (a component of a
+/// cluster watch, #1915 PR 2b), delivered only under the partition's lease, and ended by the
+/// partition's close or move.
+pub(crate) struct MemoryEvents {
+    events: mpsc::Receiver<Result<proto::MemoryEvent, ApiError>>,
+    /// Each take's time: the watch's idle limit (`--stream-idle-ms`) counts from the last.
+    taken: Arc<TakeClock>,
+    part: Option<Box<Leased>>,
+}
+
+/// A component's lease, and its partition's end.
+struct Leased {
+    lease: DeliveryLease,
+    /// The partition's components' end: a close's `PartitionUnavailable`, or a move's
+    /// `WrongPartition` ([`super::feed::Feeds::end_parts`]).
+    ended: tokio::sync::watch::Receiver<Option<ApiError>>,
+}
+
+impl std::fmt::Debug for MemoryEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.part.is_some() {
+            "MemoryEvents(component)"
+        } else {
+            "MemoryEvents"
+        })
+    }
+}
+
+impl MemoryEvents {
+    /// Events from a channel another task fills (a cluster watch's merge), stamping `taken`
+    /// on each take.
+    pub(crate) fn from_channel(
+        events: mpsc::Receiver<Result<proto::MemoryEvent, ApiError>>,
+        taken: Arc<TakeClock>,
+    ) -> Self {
+        Self {
+            events,
+            taken,
+            part: None,
+        }
+    }
+}
+
+/// The hooks the lease check calls while the partition holds no lease (simp724's M1, M2).
+struct Hooks<'a>(
+    &'a mut tokio::sync::watch::Receiver<Option<ApiError>>,
+    &'a TakeClock,
+);
+
+impl LeaseHooks for Hooks<'_> {
+    fn poll_own_end(&mut self, _cx: &mut Context<'_>) -> Poll<Option<ApiError>> {
+        // The end is a value set once; a look on each poll (every `LEASE_WAIT` while
+        // waiting) sees it.
+        if self.0.has_changed().unwrap_or(false) {
+            return Poll::Ready(self.0.borrow_and_update().clone());
+        }
+        Poll::Pending
+    }
+
+    fn took(&self) {
+        self.1.took();
+    }
+}
 
 impl Stream for MemoryEvents {
     type Item = Result<proto::MemoryEvent, ApiError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
+        let this = &mut *self;
+        if let Some(part) = this.part.as_mut() {
+            let Leased { lease, ended } = &mut **part;
+            if let Some(answer) = lease.before(cx, &mut Hooks(ended, &this.taken)) {
+                return answer;
+            }
+        }
+        let out = this.events.poll_recv(cx);
+        if let Poll::Ready(Some(_)) = out {
+            this.taken.took();
+        }
+        if let Some(part) = this.part.as_mut() {
+            part.lease.after(out.is_pending(), cx);
+        }
+        out
     }
+}
+
+/// A cluster partition's part of a watch (#1915 PR 2b): its lease and its end.
+pub(crate) struct WatchPart {
+    pub(crate) gate: Arc<super::gate::WriteGate>,
+    pub(crate) ended: tokio::sync::watch::Receiver<Option<ApiError>>,
 }
 
 /// Starts a watch of `namespaces` (all of them the caller's: an empty list is refused for a
 /// namespace-scoped token) from `resume`, or from now. The task holds `slot` until it ends.
+///
+/// With `part`, it's a cluster watch's component (ICR 0139, PR 2b), which a merge reads
+/// (here, or over `Cluster.ForwardMemoryWatch`). Its stream then marks commits with
+/// `Progress` events, which the merge takes and never passes on: one first, at the position
+/// it starts from, and one after each commit with memories, with that commit's token, so
+/// the merge moves whole commits ([`super::cluster::memwatch`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn watch(
     core: Arc<MemCore>,
     scope: Scope<'_>,
@@ -232,8 +321,18 @@ pub(crate) fn watch(
     pool: Arc<Semaphore>,
     idle: Duration,
     mut swaps: tokio::sync::watch::Receiver<u64>,
+    part: Option<WatchPart>,
 ) -> Result<MemoryEvents, ApiError> {
     scope.check_all(&r.namespaces)?;
+    // Refused at once where the partition's lease lapsed (feed1248's F2).
+    let part = part
+        .map(|p| -> Result<_, ApiError> {
+            Ok(Leased {
+                lease: DeliveryLease::new(p.gate)?,
+                ended: p.ended,
+            })
+        })
+        .transpose()?;
     let ns: Vec<&str> = r.namespaces.iter().map(String::as_str).collect();
     let mut builder = core.store()?.watch(&ns);
     if !r.resume.is_empty() {
@@ -242,21 +341,70 @@ pub(crate) fn watch(
     let mut w = builder
         .open()
         .map_err(|e| MemError::store_error("watch", &e))?;
+    let marks = part.is_some();
+    let mut ended = part.as_ref().map(|p| p.ended.clone());
+    let taken = Arc::new(TakeClock::new());
     let (tx, rx) = mpsc::channel(EVENTS);
+    let took = Arc::clone(&taken);
     tokio::spawn(async move {
         let _slot = slot;
+        // Room in the channel, within `--stream-idle-ms` of the client's last take: a
+        // component waiting for its first lease stamps the clock as it looks (simp724's M2),
+        // so that wait never trips it.
         let send = |e| async {
-            match tokio::time::timeout(idle, tx.send(e)).await {
-                Ok(Ok(())) => true,
-                // The client went away, or took nothing for --stream-idle-ms.
-                _ => false,
+            let mut e = Some(e);
+            loop {
+                match tokio::time::timeout(idle, tx.reserve()).await {
+                    Ok(Ok(room)) => {
+                        room.send(e.take().expect("sent once"));
+                        return true;
+                    }
+                    // The client went away.
+                    Ok(Err(_)) => return false,
+                    // It took nothing for --stream-idle-ms.
+                    Err(_) if took.last_or_start().elapsed() >= idle => return false,
+                    Err(_) => {}
+                }
             }
         };
+        let progress = |token: &prost::bytes::Bytes| {
+            Ok(proto::MemoryEvent {
+                token: token.clone(),
+                event: Some(proto::memory_event::Event::Progress(proto::Progress {})),
+            })
+        };
+        if marks {
+            // The start mark: where the component starts, so the merge's tokens cover it
+            // from the first event on.
+            let start: prost::bytes::Bytes = w.token().as_bytes().to_vec().into();
+            if !send(progress(&start)).await {
+                return;
+            }
+        }
         loop {
             // A client that went away ends the watch here, and gives its stream slot back,
             // even on a quiet store with no commit to send it (ai1249's R1 on #1617).
             let next = tokio::select! {
+                biased;
                 () = tx.closed() => return,
+                // A cluster partition's close or move ends its components, with its own
+                // error, before the database closes under them.
+                why = async {
+                    // The partition's feeds dropped: nothing ends it this way any more.
+                    let Some(rx) = ended.as_mut() else {
+                        return std::future::pending().await;
+                    };
+                    if rx.changed().await.is_err() {
+                        return std::future::pending().await;
+                    }
+                    rx.borrow().clone()
+                } => {
+                    let why = why.unwrap_or_else(|| {
+                        ApiError::internal("the partition's watches ended this one")
+                    });
+                    let _ = send(Err(why)).await;
+                    return;
+                }
                 // The database was swapped under the store (a replica's re-bootstrap): the
                 // watch is of the old copy, and ends rather than go quiet (#1618).
                 _ = swaps.changed() => {
@@ -286,11 +434,8 @@ pub(crate) fn watch(
                     _ => None,
                 })
                 .collect();
-            let events = if new.is_empty() {
-                vec![Ok(proto::MemoryEvent {
-                    token: token.clone(),
-                    event: Some(proto::memory_event::Event::Progress(proto::Progress {})),
-                })]
+            let mut events = if new.is_empty() {
+                vec![progress(&token)]
             } else {
                 // The new memories' text, kind and time: a read each, on the blocking pool.
                 let core = Arc::clone(&core);
@@ -323,6 +468,18 @@ pub(crate) fn watch(
                     Err(e) => vec![Err(e)],
                 }
             };
+            // A component's commit with memories ends with its mark. (One whose memories
+            // were all forgotten before the read sends nothing, as on a single node.)
+            let memories = matches!(
+                events.first(),
+                Some(Ok(proto::MemoryEvent {
+                    event: Some(proto::memory_event::Event::Memory(_)),
+                    ..
+                }))
+            );
+            if marks && memories {
+                events.push(progress(&token));
+            }
             for e in events {
                 let failed = e.is_err();
                 if !send(e).await || failed {
@@ -331,5 +488,228 @@ pub(crate) fn watch(
             }
         }
     });
-    Ok(MemoryEvents(rx))
+    Ok(MemoryEvents {
+        events: rx,
+        taken,
+        part: part.map(Box::new),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::gate::{LeaseClock, WriteGate};
+
+    /// A store `notes` in a fresh database with a change feed, and its directory.
+    fn core(name: &str) -> (Arc<MemCore>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("phdb-memwatch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = pigeonhole::Pigeonhole::open(
+            dir.join("m.phdb"),
+            pigeonhole::Options::default()
+                .create_if_missing(true)
+                .shards(1)
+                .change_feed(pigeonhole::FeedRetention::bytes(4 << 20)),
+        )
+        .unwrap();
+        let create: Arc<crate::memcore::Create> =
+            Arc::new(|_| Ok(pigeonhole_memory::StoreOptions::new()));
+        let core = MemCore::open_in(
+            &db,
+            "notes",
+            None,
+            None,
+            Some(&*create),
+            (1 << 20, 8 << 20),
+            false,
+        )
+        .ok()
+        .flatten()
+        .expect("the store opens");
+        (Arc::new(core), dir)
+    }
+
+    fn remember(core: &MemCore, text: &str) {
+        core.remember(
+            Scope(None),
+            crate::memcore::Remember {
+                namespace: "alice".into(),
+                text: text.into(),
+                embedding: None,
+                kind: None,
+                importance: None,
+                source: None,
+                session: None,
+                pinned: false,
+                links: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    /// A cluster partition's component of a watch of "alice", idle limit `idle`.
+    fn component(
+        core: &Arc<MemCore>,
+        gate: &Arc<WriteGate>,
+        ended: tokio::sync::watch::Receiver<Option<ApiError>>,
+        idle: Duration,
+    ) -> Result<MemoryEvents, ApiError> {
+        let streams = Arc::new(Semaphore::new(4));
+        let (_swap, swaps) = tokio::sync::watch::channel(0);
+        // The swap sender lives as long as the test: a dropped one would end the watch.
+        std::mem::forget(_swap);
+        watch(
+            Arc::clone(core),
+            Scope(None),
+            proto::MemoryWatchRequest {
+                namespaces: vec!["alice".into()],
+                resume: Default::default(),
+            },
+            streams.try_acquire_owned().unwrap(),
+            Arc::new(Semaphore::new(4)),
+            idle,
+            swaps,
+            Some(WatchPart {
+                gate: Arc::clone(gate),
+                ended,
+            }),
+        )
+    }
+
+    async fn next(events: &mut MemoryEvents) -> Option<Result<proto::MemoryEvent, ApiError>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *events).poll_next(cx)).await
+    }
+
+    fn is_memory(e: &Option<Result<proto::MemoryEvent, ApiError>>) -> bool {
+        matches!(
+            e,
+            Some(Ok(proto::MemoryEvent {
+                event: Some(proto::memory_event::Event::Memory(_)),
+                ..
+            }))
+        )
+    }
+
+    /// #1915 PR 2b (M2, as D326 PR 2's feed components): a memory watch's component on a
+    /// cluster partition delivers only under its lease. Without one since it opened, it
+    /// waits, delivering nothing, its start mark included; once leased, it delivers its
+    /// start mark, then each commit's memories and the commit's end mark; when the lease
+    /// runs out, it ends with the lease's error even with nothing to deliver; and a node
+    /// whose last round reached no majority refuses it.
+    #[tokio::test]
+    async fn a_watch_component_waits_for_a_lease_and_ends_when_it_runs_out() {
+        let (core, dir) = core("lease");
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", false, Arc::clone(&clock));
+        let (_end, ended) = tokio::sync::watch::channel(None);
+        let mut events = component(&core, &gate, ended, Duration::from_secs(5)).unwrap();
+        remember(&core, "alice ate lunch");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next(&mut events))
+                .await
+                .is_err(),
+            "nothing before the lease"
+        );
+        gate.renew(clock.now() + 600_000_000);
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            got.push(
+                tokio::time::timeout(Duration::from_secs(5), next(&mut events))
+                    .await
+                    .expect("delivered once leased"),
+            );
+        }
+        // The start mark, the memory, then its commit's end mark with the memory's token.
+        let token = |e: &Option<Result<proto::MemoryEvent, ApiError>>| match e {
+            Some(Ok(e)) => e.token.clone(),
+            other => panic!("an event: {other:?}"),
+        };
+        assert!(!is_memory(&got[0]) && is_memory(&got[1]) && !is_memory(&got[2]));
+        assert_ne!(token(&got[0]), token(&got[1]));
+        assert_eq!(token(&got[1]), token(&got[2]));
+        let end = tokio::time::timeout(Duration::from_secs(5), next(&mut events))
+            .await
+            .expect("woken at the lease's end");
+        let Some(Err(e)) = end else {
+            panic!("the lease's error, not an event or the end");
+        };
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+        assert!(next(&mut events).await.is_none(), "then the end");
+
+        // A node whose last round reached no majority: refused at once.
+        clock.set_majority(false);
+        let gate = WriteGate::opened("p2", false, Arc::clone(&clock));
+        let (_end, ended) = tokio::sync::watch::channel(None);
+        let e = component(&core, &gate, ended, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+        drop(core);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// simp724's M2 on #1915 PR 2b (feed1248's S1 for the feed): a component waiting for its
+    /// first lease takes nothing, and its idle limit counts from the last take. Each look
+    /// while it waits counts as one, so a backlog that fills its channel meanwhile isn't
+    /// dropped as idle; once leased, every commit is delivered.
+    #[tokio::test]
+    async fn a_watch_component_waiting_for_its_lease_isnt_dropped_as_idle() {
+        let (core, dir) = core("idle");
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", false, Arc::clone(&clock));
+        let (_end, ended) = tokio::sync::watch::channel(None);
+        let mut events = component(&core, &gate, ended, Duration::from_millis(300)).unwrap();
+        // More commits than the channel holds, each a memory and its end mark.
+        let n = EVENTS;
+        for i in 0..n {
+            remember(&core, &format!("alice note {i}"));
+        }
+        // Four idle limits of waiting, the channel full behind it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), next(&mut events))
+                .await
+                .is_err()
+        );
+        gate.renew(clock.now() + 3_600_000_000_000);
+        let mut memories = 0;
+        while memories < n {
+            let got = tokio::time::timeout(Duration::from_secs(5), next(&mut events))
+                .await
+                .unwrap_or_else(|_| panic!("delivered once leased ({memories} so far)"));
+            assert!(matches!(got, Some(Ok(_))), "{got:?}");
+            memories += usize::from(is_memory(&got));
+        }
+        drop(core);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// simp724's M1 on #1915 PR 2b (audit120's S-C5 for the feed): a component whose
+    /// partition moved away ends with the move's `WrongPartition`, not its lease's
+    /// `PartitionUnavailable`, though both are there when it's next polled.
+    #[tokio::test]
+    async fn a_moved_watch_component_ends_with_wrong_partition() {
+        let (core, dir) = core("moved");
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", false, Arc::clone(&clock));
+        let (end, ended) = tokio::sync::watch::channel(None);
+        gate.renew(clock.now() + 300_000_000);
+        let mut events = component(&core, &gate, ended, Duration::from_secs(5)).unwrap();
+        let start = tokio::time::timeout(Duration::from_secs(5), next(&mut events))
+            .await
+            .unwrap();
+        assert!(matches!(start, Some(Ok(_))));
+        // The lease runs out, and the move's end is sent: the poll after sees both.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        end.send_replace(Some(ApiError::wrong_partition(
+            2,
+            "map version 2 moved partition \"p1\" off this node",
+        )));
+        let got = next(&mut events).await;
+        let Some(Err(e)) = got else {
+            panic!("the move's error: {got:?}");
+        };
+        assert_eq!(e.code, "WrongPartition", "{}", e.message);
+        drop(core);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

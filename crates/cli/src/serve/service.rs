@@ -3907,14 +3907,21 @@ impl Service {
         }))
     }
 
-    /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot.
-    async fn memory_watch(
+    /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot. On a
+    /// cluster partition, a cluster watch's component ([`super::cluster::memwatch`]).
+    pub(crate) async fn memory_watch(
         &self,
         r: proto::MemoryWatchRequest,
         caller: &Caller,
     ) -> Result<super::memory::MemoryEvents, ApiError> {
-        // Before the store: a swap from here on ends the watch.
-        let swaps = self.part()?.memory.get().map(|m| m.swaps());
+        // Before the store: a swap from here on ends the watch, and on a cluster partition
+        // so does a close or a move (#1915 PR 2b).
+        let part = self.part()?;
+        let swaps = part.memory.get().map(|m| m.swaps());
+        let cluster = self.gate.as_ref().map(|gate| super::memory::WatchPart {
+            gate: Arc::clone(gate),
+            ended: part.feeds.parts_ended(),
+        });
         let core = self.memory_core().await?;
         let Some(swaps) = swaps else {
             return Err(self.no_memory());
@@ -3928,6 +3935,7 @@ impl Service {
             Arc::clone(&self.blocking),
             self.limits.stream_idle,
             swaps,
+            cluster,
         )
     }
 
