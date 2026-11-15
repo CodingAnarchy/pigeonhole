@@ -39,9 +39,10 @@ pub(crate) fn admin(channel: tonic::transport::Channel) -> Admin {
 
 /// Whether `status` is this side refusing a message over its decoding limit.
 pub(crate) fn too_long(status: &tonic::Status) -> bool {
-    status
-        .message()
-        .contains("decoded message length too large")
+    status.code() == tonic::Code::OutOfRange
+        && status
+            .message()
+            .contains("decoded message length too large")
 }
 
 /// How long a download waits.

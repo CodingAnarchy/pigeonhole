@@ -445,6 +445,38 @@ mod tests {
     use super::*;
     use crate::serve::proto::{Node, Partition, TablePlacement};
 
+    #[tokio::test]
+    async fn a_restarted_partial_holds_only_what_is_written_after() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "phdb-partial-{}-{nanos}.phdb.partial",
+            std::process::id()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let mut sink = Partial(file);
+        sink.write(&prost::bytes::Bytes::from_static(b"the first copy"))
+            .await
+            .unwrap();
+        sink.restart().await.unwrap();
+        // Shorter than the first: bytes kept from it, or a write from its old offset,
+        // would show.
+        sink.write(&prost::bytes::Bytes::from_static(b"next"))
+            .await
+            .unwrap();
+        sink.0.flush().await.unwrap();
+        let held = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(held, b"next");
+    }
+
     fn map(version: u64, epoch: u64, splits: &[&str]) -> ClusterMap {
         ClusterMap {
             cluster_id: "c1".into(),

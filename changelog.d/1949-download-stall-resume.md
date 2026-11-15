@@ -5,3 +5,4 @@
 ### Fixed
 - `phdb cluster backup` and `phdb cluster move` no longer wait for ever on a node that stops sending with the connection up: 60 s of nothing is a break. The backup resumes, and the move fails and says to run it again (#1830).
 - `phdb cluster move`: when the new node refuses an upload part-way through a file, the error gives the node's reason, where it said only that the node ended the upload (#1830).
+- `phdb cluster move` copies an empty file in a partition's closed set (a crash can leave an empty WAL stream file there). It failed with "ended early" (#1830).

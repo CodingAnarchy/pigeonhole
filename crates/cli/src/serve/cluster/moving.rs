@@ -763,7 +763,9 @@ async fn copy_file(
                     // says why, and `upload_file` reports it.
                     return Ok(feed.at() - from);
                 }
-                if chunk.total != 0 {
+                // The last chunk carries the hash. An empty file's has it too, with a
+                // total of 0 (a crash can leave an empty WAL stream file in a set).
+                if !chunk.sha256.is_empty() {
                     if chunk.total != f.bytes || chunk.sha256 != f.sha256 {
                         return Err(Failure::usage(&format!(
                             "node {:?} sent {what} as {} bytes with another SHA-256 than its \
