@@ -315,18 +315,19 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
     // is timed from the failure that started the backoff, not from when the poll above saw
     // it: a late look or a long sleep on a busy runner used up the old 0.7 s margin, and a
     // retry that was on time fell in the window (#1908). If the window still overruns its
-    // backoff (a retry lands in it, or less than 1 s of it is left), it is measured again in
-    // the next backoff, which is longer; whether a retry came early is the gap check's.
+    // backoff (a retry lands in it, or less than 2.5 s of it is left, which would bring #92's
+    // 1% bound down toward one 10 ms CPU tick; ai1249's N1), it is measured again in the next
+    // backoff, which is longer. Whether a retry came early is the gap check's to say.
     let mut from = third;
     for window in 0.. {
-        assert!(window < 3, "no backoff left a 1 s window free of retries");
+        assert!(window < 3, "no backoff left a 2.5 s window free of retries");
         sleep_until(from + Duration::from_millis(300));
         let before = attempts(&failed.lock().unwrap()).len();
         let (cpu0, wall0) = (process_cpu(), Instant::now());
         sleep_until(from + Duration::from_millis(3_300));
         let (cpu, wall) = (process_cpu() - cpu0, wall0.elapsed());
         let seen = attempts(&failed.lock().unwrap());
-        if seen.len() == before && wall >= Duration::from_secs(1) {
+        if seen.len() == before && wall >= Duration::from_millis(2_500) {
             assert!(
                 cpu.as_secs_f64() < wall.as_secs_f64() * 0.01,
                 "{cpu:?} of CPU in {wall:?} of backoff (issue #92)"
