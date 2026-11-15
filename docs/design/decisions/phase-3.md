@@ -4847,3 +4847,39 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - *A 1.1.x patch marking catalog-changing roots.* 1.1.3 is already shipped, and a rollback to it is what this decision has to survive.
 
 **Owner's approval (2026-11-13).** Yes to the version 3 layout in 1.3.0, with the upgrade note saying a 1.3 every-table token is `InvalidArgument` on 1.2.0. 1.2.1 ships #1857, plus the parse of version 3 once its layout is settled on main.
+
+<a id="d326"></a>
+## D326 — Cluster partitions serve under leases: a majority of the map's nodes grant each partition for L on their own clocks (simp724, design; owner, 2026-11-14; reviewed by audit120 and feed1248; cli, #1829, #1760, ICR 0117) · D317 rule 3
+
+**Problem.** After #1899, a partition is confirmed once a majority of the map's nodes hold a map naming its node (D317 amendment 3), and a confirm is permanent while the node runs. An owner cut off from the majority keeps serving what it confirmed. If the operator relocates the partition without it (`relocate --old-unreachable`, or a forced map), both copies take writes. The owner's rule (2026-11-14): an old owner cut off from the majority must not keep serving, and this lands before the fence work ships in 1.3.0.
+
+**Decision: a confirm becomes a lease.**
+- **Grants.** A node's lease round (`Cluster.Lease`, ICR 0117) asks every node of its map that holds that map, itself included, for a grant of the partitions it serves at their epochs. A grantor grants only at its own map's version, only what that map gives the asker, for `--cluster-lease-ms` (L, default 10 s) from receipt on its own clock. A grant replaces the asker's last one, and a request older than the last one taken from the same start of the asker is ignored; a request from another start (a random id per start) replaces it whatever its round.
+- **One L for the cluster (audit120's M1).** The bound below needs the holder's L to be no longer than any grantor's, so a grantor refuses a request whose L isn't its own, naming both.
+- **The withheld vote.** While a grantor's grant of P to one node is live, it withholds P from every other node, and says how long is left. Majorities intersect, so no second node gathers one while the first's lease runs.
+- **The holder.** It takes `t0`, its clock before the round's first request. Once a majority of the map's nodes grant P (and hold the round's map, as #1899 counts), P's lease runs until `t0 + L·(1−ρ)/(1+ρ)` on its clock, with ρ = 1% each clock's drift against real time. Each grantor received the request at or after `t0` and counts L on a clock no faster than `1+ρ`; the holder counts on one no slower than `1−ρ`. So the holder stops, in real time, before the earliest grant it relied on.
+- **Renewal.** A round every L/3, timed from the last round's start, for the node's life. A round asks for leases only from the nodes that answered its map fetch, so a node that's down costs it one push timeout. `--cluster-lease-ms` is refused below 3 × `--cluster-push-timeout-ms`.
+- **What serving means.**
+  - A write is admitted only with a live lease and no operator's fence, and is checked again once its commit returns: past the lease's end it answers `OutcomeUnknown`.
+  - A read (and a transaction's or snapshot's start) needs a live lease, checked again once it has its snapshot (audit120's S3), else `PartitionUnavailable`.
+  - A feed's subscribe isn't read-gated; D326 PR 2 gates its delivery (feed1248's F1–F5).
+- **The clock** counts time the machine was suspended (`pigeonhole_io::sys::boot_clock_ns`: `CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC_RAW` on macOS, which is `mach_continuous_time` and which no NTP or `adjtime` slews (audit120 on #1905), and `QueryInterruptTime` on Windows). std's `Instant` stops during a suspend on Linux and macOS, and a holder suspended past its lease would wake believing it live. macOS's `CLOCK_MONOTONIC` counts sleep too, but it is the wall clock less the boot time, so `adjtime` slews it by up to about 0.55%, more than half of ρ.
+- **The start grace.** Grants live in memory, so a node that starts grants nothing for `L·(1+ρ)`, its own vote included. A grant made just before it stopped was to a holder whose round started before, which stops within `L/(1+ρ)` of real time after; `L·(1+ρ)` on this clock is at least L. There's no exemption for a map that names one node: a forced map that dropped the others clears `previous_nodes`, so nothing tells such a node from one that was always alone (audit120's S4).
+- **A map that moves P away** ends its lease at once, after the install publishes the map; a round sets a lease only while the node's map is still the round's, under the same lock (audit120's S1).
+- **`unfence --force`** lifts only the operator's fence. It never gives a lease (the owner's call).
+- **Backups aren't gated:** an operator's copy of a fenced or lease-less partition is wanted.
+- **A node change (F4's timed half, audit120's L1).** After a node change reaches a majority of both node sets, the writer takes no further change until `L·(1+ρ)` after it saw that: the nodes before may hold grants at the old version that the nodes after never saw. Recomputed, never remembered: a writer that restarts, or another that takes over, counts from its own check.
+
+**What it costs.**
+- One clock read and two atomic loads per write and per read on a cluster partition; nothing on a single node.
+- A cut-off owner stops within L. A relocate's new owner waits for the old owner's grants to run out (up to L). Until D326 PR 2's release, a planned move's new owner waits for them too.
+- A whole cluster restarting serves about L later than before.
+- **Two nodes:** a majority is both, so with one down the other stops serving within L (the owner accepted this). Run three nodes, or a single node.
+
+**Rejected.**
+- *Synchronized wall clocks.* Every comparison is on one node's own clock; only the rate drift is assumed.
+- *Grants per partition.* One round per node every L/3 covers all its partitions.
+- *`unfence --force` granting a lease.* That is exactly the cut-off owner the owner rules out. A minority's recovery is `set-map --force` to a map without the lost nodes.
+- *A flag to keep 1.2's two-node behaviour.* It would be the same cut-off owner.
+
+**Owner's approval (2026-11-14).** Leases required before the fence work ships in 1.3.0, with both effects: `unfence --force` no longer overrides the majority, and a two-node cluster stops serving within L when a node is down.

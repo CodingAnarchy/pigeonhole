@@ -24,6 +24,35 @@ pub fn process_id() -> u32 {
     crate::os::process_id()
 }
 
+/// Nanoseconds since an arbitrary start, on a clock that keeps counting while the machine or
+/// VM is suspended, and never goes back. A cluster partition's lease is timed on it (D326):
+/// std's [`Instant`](std::time::Instant) stops during a suspend on Linux and macOS, so a
+/// node suspended past its lease would wake believing the lease still live.
+///
+/// It counts time across a suspend on each OS:
+/// - **Linux (and Android):** `CLOCK_BOOTTIME`, which includes time suspended
+///   (`CLOCK_MONOTONIC` there doesn't).
+/// - **macOS (Apple platforms):** `CLOCK_MONOTONIC_RAW`, `mach_continuous_time` scaled by
+///   the timebase, which keeps counting while the system sleeps and which no frequency or
+///   time adjustment slews (`CLOCK_UPTIME_RAW`, std's, stops).
+/// - **OpenBSD:** `CLOCK_BOOTTIME`.
+/// - **Other Unix:** `CLOCK_MONOTONIC`. That it counts a suspend there isn't checked.
+/// - **Windows:** `QueryInterruptTime`, which includes time asleep or hibernating
+///   (`QueryUnbiasedInterruptTime` doesn't).
+///
+/// An internal helper, not part of the crate's public contract.
+///
+/// Compiled, not run: Miri runs this crate's doctests and has no `CLOCK_BOOTTIME`.
+///
+/// ```no_run
+/// let a = pigeonhole_io::sys::boot_clock_ns();
+/// let b = pigeonhole_io::sys::boot_clock_ns();
+/// assert!(b >= a);
+/// ```
+pub fn boot_clock_ns() -> u64 {
+    crate::os::boot_clock_ns()
+}
+
 /// Number of CPUs available to this process, honoring affinity masks and cgroup CPU quotas.
 pub fn available_cpus() -> usize {
     crate::os::available_cpus()

@@ -17,6 +17,7 @@ pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod hub;
 pub(crate) mod identity;
+pub(crate) mod lease;
 pub(crate) mod map;
 pub(crate) mod moving;
 pub(crate) mod open;
@@ -100,6 +101,27 @@ fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
     write_synced(dir, MAP_FILE, json.as_bytes())
 }
 
+/// A fault seam (tests): nodes cut off from their peers, each by its cluster directory and
+/// its address. A cut node's dials of its peers fail, and so do its peers' dials of it, for
+/// maps, pushes and leases; its process runs on and answers its own clients (D326's cut-off
+/// owner). One entry per node, so tests running at once don't cut each other's.
+#[cfg(test)]
+pub(crate) static CUT_OFF: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn cut_off(dir: &Path, address: &str) -> bool {
+    CUT_OFF
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|(d, a)| d == dir || a == address)
+}
+
+/// `d` in whole milliseconds, for a proto field.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Writes `bytes` as `dir`'s file `name`: a temporary file (`name.tmp`), synced, renamed
 /// over the old one, then the directory synced, so a crash leaves the old file or the new
 /// one whole.
@@ -143,6 +165,8 @@ struct Peers {
     scheme: &'static str,
     ca: Option<tonic::transport::Certificate>,
     push_timeout: Duration,
+    /// `--cluster-lease-ms` (D326): how long a lease this node grants runs, on its clock.
+    lease: Duration,
 }
 
 /// A cluster node.
@@ -196,6 +220,14 @@ pub(crate) struct Node {
     me: std::sync::Weak<Node>,
     /// Its cluster feed hubs (#1798): one merge per subscription key.
     pub(crate) feed_hubs: hub::Hubs,
+    /// The leases this node grants, and its lease clock (D326).
+    grants: lease::Grants,
+    /// When this writer first saw a majority of both the nodes before and the nodes after
+    /// a node change hold it, by the change's map version, on its lease clock: a further
+    /// change waits a lease past that (audit120's L1 on #1899's F4). In memory: a writer
+    /// that restarts, or another that takes over, checks again and waits from its own
+    /// check.
+    joint_seen: Mutex<Option<(u64, u64)>>,
 }
 
 /// How long a node change's `SetMap` goes on pushing it, in push timeouts, for a majority of
@@ -265,7 +297,10 @@ impl Node {
             .map
             .as_ref()
             .map(|(m, _)| Arc::new(route::Routes::new(m)));
+        let grants = lease::Grants::new(Arc::default(), peers.lease);
         Arc::new_cyclic(|me| Self {
+            grants,
+            joint_seen: Mutex::new(None),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -421,6 +456,13 @@ impl Node {
         st.divergent.clear();
         // Versions at or below this one need no pull again (cli692's N3).
         st.pulled.retain(|v| *v > version);
+        // A lease the map no longer names this node for ends now (audit120's S1), still
+        // under the state lock, so a round reads the new map only once it has (audit120's
+        // M3): its request no longer asks for the partition, and frees its grants. The
+        // state lock, then the served one, as `apply_leases` takes them.
+        if let Some((m, _)) = &st.map {
+            self.fences.lapse_unnamed(m, &self.id);
+        }
         drop(st);
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
@@ -540,6 +582,7 @@ impl Node {
                 if !joint.held() {
                     return Err(ApiError::failed_precondition(joint.refusal(&current)));
                 }
+                self.joint_settled(&current).await;
             }
             map.previous_nodes = if map::same_nodes(&current, &map) {
                 Vec::new()
@@ -575,6 +618,47 @@ impl Node {
         })
     }
 
+    /// A node change `map` that a majority of both its node sets hold: waits until a lease
+    /// has passed since this writer first saw that (audit120's L1 on #1899's F4, D326). The
+    /// nodes before the change may have granted leases at the old version, and the nodes
+    /// after it never saw those grants: until they run out, a majority of the new set could
+    /// grant a partition to a second node. Recomputed, never remembered across a restart or
+    /// a change of writer: such a writer counts from its own check, at most one lease more.
+    async fn joint_settled(&self, map: &ClusterMap) {
+        let now = self.grants.clock().now();
+        let seen = {
+            let mut seen = self
+                .joint_seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match *seen {
+                Some((version, at)) if version == map.map_version => at,
+                _ => {
+                    *seen = Some((map.map_version, now));
+                    now
+                }
+            }
+        };
+        let grace = u64::try_from(lease::grace(self.grants.lease()).as_nanos()).unwrap_or(u64::MAX);
+        let left = seen.saturating_add(grace).saturating_sub(now);
+        if left > 0 {
+            tokio::time::sleep(Duration::from_nanos(left)).await;
+        }
+    }
+
+    /// Records that this writer saw a majority of both of node change `map`'s sets hold it
+    /// now, unless it saw that before ([`Node::joint_settled`]).
+    fn joint_held(&self, map: &ClusterMap) {
+        let now = self.grants.clock().now();
+        let mut seen = self
+            .joint_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*seen, Some((version, _)) if version == map.map_version) {
+            *seen = Some((map.map_version, now));
+        }
+    }
+
     /// Pushes a node change `map` to the nodes before it and after it, until a majority of
     /// each holds it or [`JOINT_PUSHES`] push timeouts have passed: the last pushes.
     async fn joint_wait(self: &Arc<Self>, map: &ClusterMap) -> Vec<NodePush> {
@@ -583,7 +667,11 @@ impl Node {
         loop {
             let (joint, pushed) = self.joint(map).await;
             let left = until.saturating_duration_since(tokio::time::Instant::now());
-            if joint.held() || left.is_zero() {
+            if joint.held() {
+                self.joint_held(map);
+                return pushed;
+            }
+            if left.is_zero() {
                 return pushed;
             }
             tokio::time::sleep(pause.min(left)).await;
@@ -690,9 +778,10 @@ impl Node {
         self.push_all().await;
         self.synced
             .store(true, std::sync::atomic::Ordering::Release);
-        // Its partitions, confirmed by a majority's maps (D317 rule 3, #1760): asked again,
-        // backing off, until they are (cli692's S3).
-        self.confirm_until_done().await;
+        // Its partitions' leases (D326): a round now, then renewed for the node's life, and
+        // asked again sooner while one has none (cli692's S3).
+        self.confirm_round().await;
+        self.renew_leases();
     }
 
     /// Peer `address`'s map.
@@ -888,8 +977,9 @@ impl Node {
                 lp.set_state(state);
                 lp.set_fence_reason(reason);
                 // Both reasons at once (#1829): an operator-fenced partition may still await
-                // its peers' confirmation.
+                // its lease.
                 lp.awaiting_peers = self.awaiting_peers(&lp.id);
+                lp.lease_remaining_ms = millis(self.lease_remaining(&lp.id));
             } else if let Some(closed) = self.fences.closed().get(&lp.id) {
                 closed.describe(lp);
             }
@@ -900,6 +990,7 @@ impl Node {
             cluster_id,
             partitions,
             divergent,
+            grace_remaining_ms: millis(self.grants.grace_remaining()),
         }
     }
 
@@ -908,6 +999,10 @@ impl Node {
         &self,
         address: &str,
     ) -> Result<proto::cluster_client::ClusterClient<tonic::transport::Channel>, String> {
+        #[cfg(test)]
+        if cut_off(&self.dir, address) {
+            return Err(format!("connecting to {address}: cut off (a test's seam)"));
+        }
         let channel = self
             .endpoint(address)?
             .connect()
@@ -1189,6 +1284,24 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let mut lp = self.local(&id).await?;
         lp.files = installed;
         Ok(tonic::Response::new(lp))
+    }
+
+    /// Node to node (D326): a lease round's request for this node's grant. Cluster scope.
+    async fn lease(
+        &self,
+        req: Request<proto::LeaseRequest>,
+    ) -> Result<tonic::Response<proto::LeaseResponse>, Status> {
+        self.caller(&req, &[Scope::Cluster], "ask for a partition lease")?;
+        let req = req.into_inner();
+        let mine = self.0.get_map()?;
+        if req.cluster_id != mine.cluster_id {
+            return Err(ApiError::invalid(format!(
+                "a lease request for cluster {:?} reached a node of cluster {:?}",
+                req.cluster_id, mine.cluster_id
+            ))
+            .into());
+        }
+        Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
     }
 
     async fn get_map(
@@ -1486,6 +1599,18 @@ pub(crate) fn run(
         )),
         None => None,
     };
+    // A renewal round has to fit in a third of a lease, with a push timeout to spare for a
+    // node that's down (D326).
+    if args.cluster_lease_ms == 0
+        || args.cluster_lease_ms < args.cluster_push_timeout_ms.max(1).saturating_mul(3)
+    {
+        return Err(Failure::usage(&format!(
+            "--cluster-lease-ms ({}) must be at least 3 times --cluster-push-timeout-ms ({}): \
+             a lease is renewed every third of it, and a renewal can wait a push timeout for \
+             a node that's down",
+            args.cluster_lease_ms, args.cluster_push_timeout_ms
+        )));
+    }
     let _lock = lock_dir(dir)?;
     // Without TLS the node dials its peers in the clear, with its cluster token: only on
     // loopback (cli692's R3), whether or not it requires tokens itself.
@@ -1508,6 +1633,7 @@ pub(crate) fn run(
             scheme: if tls.is_some() { "https" } else { "http" },
             ca,
             push_timeout: Duration::from_millis(args.cluster_push_timeout_ms.max(1)),
+            lease: Duration::from_millis(args.cluster_lease_ms),
         },
         state,
     );
@@ -1628,14 +1754,14 @@ pub(crate) fn run(
             .map(
                 |(p, epoch)| match (node.fence_of(p), node.awaiting_peers(p)) {
                     (Some(crate::serve::gate::Fence::Operator), true) => format!(
-                        "{p} (epoch {epoch}, fenced: phdb cluster fence, and waiting for a \
-                         peer's map)"
+                        "{p} (epoch {epoch}, fenced: phdb cluster fence, and waiting for its \
+                         lease)"
                     ),
                     (Some(crate::serve::gate::Fence::Operator), false) => {
                         format!("{p} (epoch {epoch}, fenced: phdb cluster fence)")
                     }
                     (Some(_), _) => {
-                        format!("{p} (epoch {epoch}, fenced: waiting for a peer's map)")
+                        format!("{p} (epoch {epoch}, waiting for its lease)")
                     }
                     (None, _) => format!("{p} (epoch {epoch})"),
                 },
