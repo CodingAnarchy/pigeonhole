@@ -21,9 +21,15 @@ const CHUNK_FRAMES: u64 = 32;
 pub enum Step<'a> {
     /// A complete record.
     Record {
-        /// Where the record starts (its first fragment).
+        /// Where to read again from to get this record: the cursor's position before it, the
+        /// end of the record before. That's the record's first fragment, or, when padding
+        /// (D327) or a skipped frame tail lies between, the position just before it, which
+        /// a cursor opened there steps over. A resume position (a feed token's hint) is
+        /// then never past where a recovery may cut the log before a record the cursor never
+        /// read: with a pad's record lost to a power loss, the cut is the end of the record
+        /// before the pad, and the hint is too.
         start: Lsn,
-        /// Just past the record: where the next one starts.
+        /// Just past the record: where the next one's `start` is.
         end: Lsn,
         /// The `feed_session` of the segment holding it (FORMAT §10.2): 0 for a segment a
         /// session without the feed wrote.
@@ -436,7 +442,8 @@ impl FeedCursor {
                         let len = cur.dec.record().len();
                         let end = offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;
                         cur.last_end = end;
-                        let start = Lsn::new(epoch, offset as u32);
+                        // The resume position, not the fragment's offset: see `Step::Record`.
+                        let start = Lsn::new(epoch, last_end as u32);
                         let session = cur.session;
                         let cur = self.cur.as_ref().expect("checked above");
                         let record = WalRecord::decode(cur.dec.record())?;
@@ -549,7 +556,8 @@ mod read_tests {
     /// D327 (feed1248's S1 on #1925): a cursor over a hand-written pad. Records appended
     /// through a stream, then `[pad, record]` written straight into the segment past them,
     /// as the writer will frame them (nothing writes a pad before D327's writer PR). The
-    /// cursor reads the padded record in order, at its own start past the pad; a cursor
+    /// cursor reads the padded record in order, reporting its resume position before the pad
+    /// (its fragment starts past it); a cursor
     /// opened at the record before's end or at the padded record's start reads it; and a
     /// pad whose record isn't written yet (a live tail seen between the pad's page and the
     /// record's) stops at the last record's end, then resumes to the record once it is; and a
@@ -614,7 +622,9 @@ mod read_tests {
                     record: WalRecord::Batch { seqno: 3, .. },
                     ..
                 } => {
-                    assert_eq!(start, Lsn::new(tail.epoch(), rec_start as u32), "{unit}");
+                    // `start` is the resume position, before the pad (a power loss that took
+                    // the record cuts the log there too, #1929's feed_model sweep).
+                    assert_eq!(start, tail, "{unit}");
                     assert_eq!(end, Lsn::new(tail.epoch(), rec_end as u32));
                 }
                 other => panic!("{unit}: {other:?}"),
@@ -638,7 +648,7 @@ mod read_tests {
                     start,
                     record: WalRecord::Batch { seqno: 3, .. },
                     ..
-                } => assert_eq!(start, Lsn::new(tail.epoch(), rec_start as u32), "{unit}"),
+                } => assert_eq!(start, tail, "{unit}"),
                 other => panic!("{unit}: {other:?}"),
             }
         }
