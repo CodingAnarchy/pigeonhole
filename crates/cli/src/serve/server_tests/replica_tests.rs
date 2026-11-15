@@ -853,7 +853,7 @@ fn a_promotion_releases_waiting_reads_and_a_client_deadline_answers_deadline_exc
 /// more (#1595: a primary's stream that stops without ending). Connection number `refuse`
 /// (from 0), if any, is closed as soon as it's accepted: a reconnect that fails. Stops when
 /// `stop` is set.
-fn stalling_proxy(
+pub(super) fn stalling_proxy(
     upstream: &str,
     budget: usize,
     refuse: Option<usize>,

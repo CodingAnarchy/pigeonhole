@@ -767,7 +767,7 @@ A node writes a partition only while its newest map names it for the partition a
     - **The map on a majority:** the map is set; a node that missed it takes it from a peer. Check the nodes that don't answer, and run the move again to go on waiting.
     - **Serving:** the map already gives P to `ID`, so check that node.
 
-    The copy has no limit, since it takes as long as the files do. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
+    The copy has no limit on its length, since it takes as long as the files do. It does stop if the old node sends nothing of a file for 60 s: run the move again, and it resumes from the bytes `ID` holds. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
   - **Run it again** to resume a move that stopped. A move that's finished answers that the map already gives P to `ID`.
     - A rerun before the map changed copies and checks the files again, whatever an earlier run left on `ID`: a copy still staged there is picked up from what arrived, and one already installed is sent whole and installed over the earlier one, which moves aside (`<file>.replaced-<time>`). So if you unfenced P on the old node between two runs, the second run moves the writes it took since.
   - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P. A rerun that finds the map already changed drops nothing; its report gives the `drop-partition` command.
@@ -829,7 +829,7 @@ A node writes a partition only while its newest map names it for the partition a
   - Each node needs `--backup-dir`, and the token admin scope, as for `Admin.Backup`.
   - `--durable` copies only what each writer holds durable.
   - `--parallel N` (4) copies that many partitions at once.
-  - A broken download resumes.
+  - A broken download resumes from the bytes written, on a new connection. A node that sends nothing for 60 s, with its connection up, counts as a break. Three breaks in a row with no new bytes fail the backup with the first one's reason; a break after progress starts the count again, so a long copy over a poor link still finishes. A copy that is gone from the node when the download resumes starts again from nothing, within the same three tries.
 - **Not one point in time.** Each copy is a consistent snapshot of its own partition, and the set is not one point in time across partitions. A commit on one partition can be in the backup while an earlier one on another isn't. A table created during the backup can have rows in one partition's copy and none in another's.
 - **Checked against the map.** The backup checks each copy's cluster, partition and epoch against the map. A copy that differs fails it, naming both, for example `the copy is partition "p2" of cluster "c1" at epoch 2, but the map says partition "p2" of cluster "c1" at epoch 1`. That means the map changed during the backup, or the node holds another file. Run it again once the map is settled.
 - **A map that moves meanwhile:** a partition added, moved or relocated during the backup fails it: `the map changed during the backup`. Tables created or dropped meanwhile don't, but a table dropped and created again under its name does (`table users was dropped and created again`): some copies may hold the old table and others the new. `map.json` is the map at the end, which places them as the copies hold them.
