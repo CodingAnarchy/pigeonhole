@@ -125,6 +125,34 @@ pub(crate) fn subscription_hash(tables: &[String], prefix: &[u8], visible: bool)
     h
 }
 
+/// What a memory watch is, as its token records it (#1915 PR 2b): the store and its
+/// namespaces (sorted, without repeats). FNV-1a, as [`subscription_hash`], behind a domain
+/// tag no feed subscription's hash starts from, so a feed's token and a watch's never pass
+/// for each other. A watch of every namespace hashes a tag of its own (`*`), not an empty
+/// list after the named tag (`=`), so it can't match a named set.
+pub(crate) fn memory_watch_hash(store: &str, namespaces: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    eat(b"\0pigeonhole memory watch\0");
+    eat(&(store.len() as u64).to_le_bytes());
+    eat(store.as_bytes());
+    if namespaces.is_empty() {
+        eat(b"*");
+    } else {
+        eat(b"=");
+        for ns in namespaces {
+            eat(&(ns.len() as u64).to_le_bytes());
+            eat(ns.as_bytes());
+        }
+    }
+    h
+}
+
 /// `v` as a LEB128 varint, as `prost::encoding::encode_varint` writes it, straight into a
 /// `Vec`: a one-partition subscription's checkpoint writes about a dozen of them on every
 /// event (#1798 (b)).

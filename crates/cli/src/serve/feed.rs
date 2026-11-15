@@ -39,6 +39,8 @@ use pigeonhole::{Commit, FeedToken, Snapshot, Table};
 use prost::bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
+use super::lease::DeliveryLease;
+
 use super::convert;
 use super::errors::ApiError;
 use super::proto;
@@ -1038,6 +1040,12 @@ impl Feeds {
         self.parts_ended.send_replace(Some(why));
     }
 
+    /// The end [`end_parts`](Self::end_parts) sends from now on: a cluster memory watch's
+    /// component ends with it too (#1915 PR 2b).
+    pub(crate) fn parts_ended(&self) -> watch::Receiver<Option<ApiError>> {
+        self.parts_ended.subscribe()
+    }
+
     /// Runs the clients' delivery on `runtime` and the hubs on `hubs` from now on, instead of
     /// the caller's: the server's feed runtime (ticket 5's (A)), so delivery never holds a
     /// worker that serves requests, and the hub runtime, so a hub reading its engine feed
@@ -1984,47 +1992,7 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 /// A client's events, then its error if it failed: a single node's, from its [`Sink`]; or
 /// a cluster subscription's, merged as the client polls ([`crate::serve::cluster::feed`],
 /// #1758's B).
-pub(crate) struct FeedEvents(EventSource, Option<Box<FeedLease>>);
-
-/// A cluster partition's component's lease check (D326 PR 2, feed1248's F2, F3 and F5): it
-/// delivers only while the partition holds a lease. Every component of the partition on
-/// this node, its catch-up from a position included, reads through one of these, so the
-/// check is one clock read per event delivered, and nothing on a single node.
-struct FeedLease {
-    gate: Arc<super::gate::WriteGate>,
-    /// Wakes the component at the lease's end while it has nothing to deliver, or for its
-    /// next look while it waits for a lease: a quiet partition's feeds still end on time.
-    /// Tokio's timer doesn't count a suspend and the lease clock does, so after one the
-    /// timer may fire late; that's safe, since every poll checks the lease itself.
-    timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    /// It ended with the lease's error.
-    ended: bool,
-}
-
-/// How often a component waiting for its partition's first lease looks again.
-const LEASE_WAIT: Duration = Duration::from_millis(100);
-
-impl FeedLease {
-    /// Wakes `cx` at `deadline`, or at once if that's passed. The timer is reset only when
-    /// it has fired or its deadline moves by more than a millisecond (feed1248's N2): a
-    /// lease's end stays put between renewals, so most polls only register the waker.
-    fn wake_at(&mut self, deadline: tokio::time::Instant, cx: &mut Context<'_>) {
-        let timer = self
-            .timer
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
-        let at = timer.deadline();
-        let moved = at
-            .checked_duration_since(deadline)
-            .or_else(|| deadline.checked_duration_since(at))
-            .is_some_and(|d| d > Duration::from_millis(1));
-        if timer.is_elapsed() || moved {
-            timer.as_mut().reset(deadline);
-        }
-        if timer.as_mut().poll(cx).is_ready() {
-            cx.waker().wake_by_ref();
-        }
-    }
-}
+pub(crate) struct FeedEvents(EventSource, Option<Box<DeliveryLease>>);
 
 impl EventSource {
     /// The take clock the sink's idle limit reads.
@@ -2152,70 +2120,32 @@ impl FeedEvents {
     /// and end with `PartitionUnavailable` once it lapses or the node doesn't (feed1248's
     /// F2). Refused at once in that last case, so a subscribe never starts there.
     pub(crate) fn leased(mut self, gate: Arc<super::gate::WriteGate>) -> Result<Self, ApiError> {
-        if let super::gate::Delivery::End(e) = gate.delivery() {
-            return Err(e);
-        }
-        self.1 = Some(Box::new(FeedLease {
-            gate,
-            timer: None,
-            ended: false,
-        }));
+        self.1 = Some(Box::new(DeliveryLease::new(gate)?));
         Ok(self)
     }
 
     /// The next event as it left the client, then the client's error if it failed.
     ///
-    /// On a cluster partition, the lease is checked on every poll ([`FeedLease`]): that
+    /// On a cluster partition, the lease is checked on every poll ([`DeliveryLease`]): that
     /// replaces a check once the subscribe is in place (feed1248's F3, `still_leased`), since
     /// a lease that lapsed between the subscribe's checks and its first poll ends it here.
     pub(crate) fn poll_out(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
-        // The lease read once per poll: one clock read per event (feed1248's N1).
-        let delivery = match self.1.as_ref() {
-            Some(lease) if lease.ended => return Poll::Ready(None),
-            Some(lease) => Some(lease.gate.delivery()),
-            None => None,
-        };
-        match delivery {
-            None | Some(super::gate::Delivery::Serve) => {}
-            Some(waiting_or_ended) => {
-                // Without a lease, the stream's own end still comes through first: a map that
-                // moves the partition away ends its lease and its components with
-                // `WrongPartition` at once, and the merge must see that to open it again
-                // where the map puts it (audit120's S-C5). Events not yet delivered go; the
-                // reopen resumes from the last one delivered.
-                let end = match self.as_mut().poll_end(cx) {
-                    Poll::Ready(Some(e)) => Some(e),
-                    _ => match waiting_or_ended {
-                        super::gate::Delivery::End(e) => Some(e),
-                        _ => None,
-                    },
-                };
-                let this = &mut *self;
-                let lease = this.1.as_mut().expect("leased");
-                if let Some(e) = end {
-                    lease.ended = true;
-                    return Poll::Ready(Some(Err(e)));
-                }
-                // Waiting for a first lease. Each look counts as a take, so the sink's idle
-                // limit (`--stream-idle-ms`), which counts from the client's last take, doesn't
-                // drop the component for a wait the server imposes (feed1248's S1). A client
-                // that went away still ends it: its channel closes.
-                this.0.taken().took();
-                lease.wake_at(tokio::time::Instant::now() + LEASE_WAIT, cx);
-                return Poll::Pending;
+        // Without a lease, the sink's own end comes first (audit120's S-C5), and each look
+        // while waiting for a first lease counts as a take (feed1248's S1): see
+        // [`DeliveryLease::before`].
+        if let Some(mut lease) = self.1.take() {
+            let gated = lease.before(cx, &mut *self);
+            self.1 = Some(lease);
+            if let Some(answer) = gated {
+                return answer;
             }
         }
         let out = self.as_mut().poll_events(cx);
-        // Nothing to deliver: woken at the lease's end, so the component ends then even with
-        // no event to carry it (feed1248's F3). A renewal before then only wakes it early.
-        if out.is_pending()
-            && let Some(lease) = self.1.as_mut()
-        {
-            let left = lease.gate.lease_remaining().max(Duration::from_millis(1));
-            lease.wake_at(tokio::time::Instant::now() + left, cx);
+        if let Some(lease) = self.1.as_mut() {
+            lease.after(out.is_pending(), cx);
         }
         out
     }
@@ -2263,6 +2193,16 @@ impl FeedEvents {
         };
         *end = None;
         Poll::Ready(out)
+    }
+}
+
+impl super::lease::LeaseHooks for FeedEvents {
+    fn poll_own_end(&mut self, cx: &mut Context<'_>) -> Poll<Option<ApiError>> {
+        Pin::new(self).poll_end(cx)
+    }
+
+    fn took(&self) {
+        self.0.taken().took();
     }
 }
 

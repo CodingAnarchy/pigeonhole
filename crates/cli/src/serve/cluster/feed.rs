@@ -1416,7 +1416,7 @@ async fn hold_subscribe(dir: &std::path::Path, p: &str) {
 /// component was there to end, and a close doesn't change the map, so [`still_owner`] passes;
 /// the component would then end with the closing database's own error, which ends an
 /// `allow_partial` subscription rather than leaving it to wait (#1848).
-fn still_served(
+pub(super) fn still_served(
     parts: &crate::serve::router::Parts,
     partition: &str,
     service: &Arc<crate::serve::service::Service>,
@@ -1435,7 +1435,7 @@ fn still_served(
 
 /// A component's subscribe that failed: `PartitionUnavailable` if the partition was closed
 /// here meanwhile (its database then refuses), else the error as it is (#1848).
-fn closed_since(
+pub(super) fn closed_since(
     parts: &crate::serve::router::Parts,
     partition: &str,
     service: &Arc<crate::serve::service::Service>,
@@ -1449,7 +1449,7 @@ fn closed_since(
 /// [`Feeds::end_parts`](crate::serve::feed::Feeds::end_parts) may have run before the
 /// component was there to end, and its routes were stored before it ran, so this sees them
 /// (audit120's S-C5).
-fn still_owner(node: &Node, partition: &str) -> Result<(), ApiError> {
+pub(super) fn still_owner(node: &Node, partition: &str) -> Result<(), ApiError> {
     let routes = node.routes();
     let routes = routes.as_ref();
     if routes.is_some_and(|r| r.owner(partition).is_some_and(|o| o.node == node.id())) {
