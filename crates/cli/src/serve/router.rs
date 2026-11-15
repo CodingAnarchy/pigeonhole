@@ -26,6 +26,9 @@ pub(crate) struct Cluster {
     /// Partition files streamed in for a restore or a relocation (D317), staged in the
     /// node's cluster directory.
     pub(crate) uploads: Arc<super::cluster::upload::Uploads>,
+    /// `--memory` on a cluster node (#1915): what each partition the map places the memory
+    /// store on opens its store with, once the map does.
+    pub(crate) memory: Option<Arc<super::memslot::Recipe>>,
 }
 
 /// A cluster node's partitions open here, each served by its own [`Service`] sharing the
@@ -164,8 +167,17 @@ impl Router {
                 parts: Arc::new(arc_swap::ArcSwap::from_pointee(parts)),
                 forwarder,
                 uploads,
+                memory: None,
             }),
         }
+    }
+
+    /// `--memory` on a cluster node (#1915): the recipe its partitions' stores open with.
+    pub(crate) fn memory_recipe(mut self, recipe: Option<super::memslot::Recipe>) -> Self {
+        if let Some(c) = self.cluster.as_mut() {
+            c.memory = recipe.map(Arc::new);
+        }
+        self
     }
 
     /// `--max-uploads`: a cluster node's partition uploads at once.
@@ -997,6 +1009,38 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         // One partition's part of a `Nearest` another node fans out (D317 ticket 4b): its
         // keys, or a range clipped to the partition. A client's fans out before it gets here.
         ServiceOp::Nearest(r) => nearest_partition(routes, r),
+        // Agent memory (#1915, ICR 0139): the partition holding the namespaces the call
+        // names. An id carries its namespace; a link and a supersede stay within one, which
+        // the store checks.
+        ServiceOp::Remember(r) => memory_route(routes, [r.namespace.as_str()], "Memory.Remember"),
+        ServiceOp::Link(r) => {
+            let from = super::memory::id(&r.from)?;
+            memory_route(routes, [from.namespace()], "Memory.Link")
+        }
+        ServiceOp::Supersede(r) => {
+            let old = super::memory::id(&r.old)?;
+            memory_route(routes, [old.namespace()], "Memory.Supersede")
+        }
+        ServiceOp::MarkUsed(r) => {
+            let ids = super::memory::ids(&r.ids)?;
+            memory_route(
+                routes,
+                ids.iter().map(|id| id.namespace()),
+                "Memory.MarkUsed",
+            )
+        }
+        ServiceOp::Forget(r) => {
+            let ids = super::memory::ids(&r.ids)?;
+            memory_route(routes, ids.iter().map(|id| id.namespace()), "Memory.Forget")
+        }
+        ServiceOp::Recall(r) => memory_route(
+            routes,
+            r.namespaces.iter().map(String::as_str),
+            "Memory.Recall",
+        ),
+        ServiceOp::MemoryWatch(_) => Err(ApiError::unsupported(
+            "Memory.Watch isn't served on a cluster node yet (#1915)",
+        )),
         // An index lives in one partition's file, and no D317 ticket routes a search to it
         // (#1722, 1.3.0).
         ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
@@ -1017,6 +1061,50 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
             "this call isn't served by a cluster node (D317)",
         )),
     }
+}
+
+/// The partition holding every namespace a memory call names (#1915): `what`'s. The
+/// namespaces are checked as the store checks them (non-empty, no `\0`), so a bad one is
+/// refused here rather than routed. A call naming none, or none that the map places,
+/// is refused; so, for now, is one whose namespaces are on several partitions.
+fn memory_route<'a>(
+    routes: &Routes,
+    namespaces: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Result<String, ApiError> {
+    if routes.memory_store().is_none() {
+        return Err(ApiError::unsupported(
+            "this cluster has no memory store: its map places none (ClusterMap.memory)",
+        ));
+    }
+    let mut found: Option<(&str, &str)> = None;
+    for ns in namespaces {
+        if ns.is_empty() {
+            return Err(ApiError::invalid("a namespace can't be empty"));
+        }
+        if ns.as_bytes().contains(&0) {
+            return Err(ApiError::invalid(format!(
+                "a namespace can't contain \\0: {ns:?}"
+            )));
+        }
+        let p = routes
+            .memory_partition(ns)
+            .ok_or_else(|| ApiError::internal("the memory placement has no partitions"))?;
+        match found {
+            None => found = Some((p, ns)),
+            Some((q, first)) if q != p => {
+                return Err(ApiError::unsupported(format!(
+                    "{what}'s namespaces are on more than one partition ({first:?} on {q}, \
+                     {ns:?} on {p}), and a cluster node doesn't yet serve a memory call \
+                     across partitions (#1915): make one call per partition"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    found
+        .map(|(p, _)| p.to_owned())
+        .ok_or_else(|| ApiError::invalid(format!("{what} names no namespace")))
 }
 
 /// The partition a forwarded `Nearest` names: all its keys', or its clipped range's, which

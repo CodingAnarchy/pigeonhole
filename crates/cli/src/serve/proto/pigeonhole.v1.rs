@@ -2102,6 +2102,1020 @@ pub mod feed_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+/// A link's type: the built-in ones by name, or a custom number at or above the library's
+/// first custom value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LinkType {
+    #[prost(oneof = "link_type::Kind", tags = "1, 2")]
+    pub kind: ::core::option::Option<link_type::Kind>,
+}
+/// Nested message and enum types in `LinkType`.
+pub mod link_type {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(enumeration = "super::BuiltinLink", tag = "1")]
+        Builtin(i32),
+        #[prost(uint32, tag = "2")]
+        Custom(u32),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemoryLink {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub to: ::prost::bytes::Bytes,
+    #[prost(message, optional, tag = "2")]
+    pub link_type: ::core::option::Option<LinkType>,
+    #[prost(float, tag = "3")]
+    pub weight: f32,
+}
+/// A memory to write.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NewMemory {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// Unset: the server embeds the text with its configured model, if any. In the store's
+    /// element type, packed (perf287's S3 on #1496).
+    #[prost(message, optional, tag = "2")]
+    pub embedding: ::core::option::Option<Vector>,
+    #[prost(enumeration = "MemoryKind", tag = "3")]
+    pub kind: i32,
+    #[prost(double, optional, tag = "4")]
+    pub importance: ::core::option::Option<f64>,
+    #[prost(string, tag = "5")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub session: ::prost::alloc::string::String,
+    #[prost(bool, tag = "7")]
+    pub pinned: bool,
+    #[prost(message, repeated, tag = "8")]
+    pub links: ::prost::alloc::vec::Vec<MemoryLink>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RememberRequest {
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub memory: ::core::option::Option<NewMemory>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RememberResponse {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    #[prost(enumeration = "RememberOutcome", tag = "2")]
+    pub outcome: i32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecallRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub embedding: ::core::option::Option<Vector>,
+    #[prost(uint32, tag = "4")]
+    pub k: u32,
+    /// Cut the hits to this many bytes (0: no budget).
+    #[prost(uint64, tag = "5")]
+    pub byte_budget: u64,
+    /// Graph expansion through links: this many hops (0: none).
+    #[prost(uint32, tag = "6")]
+    pub expand_hops: u32,
+    #[prost(bool, tag = "7")]
+    pub exact: bool,
+    #[prost(bool, tag = "8")]
+    pub include_superseded: bool,
+    #[prost(string, tag = "9")]
+    pub session: ::prost::alloc::string::String,
+    #[prost(bool, tag = "10")]
+    pub with_embeddings: bool,
+    #[prost(bool, tag = "11")]
+    pub with_signals: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RecallResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub hits: ::prost::alloc::vec::Vec<MemoryHit>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemoryHit {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(enumeration = "MemoryKind", tag = "3")]
+    pub kind: i32,
+    #[prost(double, tag = "4")]
+    pub importance: f64,
+    #[prost(uint64, tag = "5")]
+    pub created: u64,
+    #[prost(bool, tag = "6")]
+    pub superseded: bool,
+    #[prost(double, tag = "7")]
+    pub score: f64,
+    /// With `with_embeddings`.
+    #[prost(message, optional, tag = "8")]
+    pub embedding: ::core::option::Option<Vector>,
+    /// With `with_signals`: each ranking signal's score, by name (`vector`, `keyword`,
+    /// `recency`, `graph`).
+    #[prost(map = "string, double", tag = "9")]
+    pub signals: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MarkUsedRequest {
+    #[prost(bytes = "bytes", repeated, tag = "1")]
+    pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MarkUsedResponse {
+    #[prost(uint64, tag = "1")]
+    pub marked: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SupersedeRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub old: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub new: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkRequest {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub from: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub to: ::prost::bytes::Bytes,
+    #[prost(message, optional, tag = "3")]
+    pub link_type: ::core::option::Option<LinkType>,
+    #[prost(float, tag = "4")]
+    pub weight: f32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ForgetRequest {
+    #[prost(bytes = "bytes", repeated, tag = "1")]
+    pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ForgetResponse {
+    #[prost(uint64, tag = "1")]
+    pub forgotten: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemoryWatchRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// After an earlier event's `token`; unset: from now.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub resume: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemoryEvent {
+    /// Where to resume after this event's commit. Opaque. Every event of one commit carries
+    /// the same token, which points after the whole commit, so resume from it once every
+    /// event of that commit is handled: resuming from an earlier one skips the commit's rest.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub token: ::prost::bytes::Bytes,
+    #[prost(oneof = "memory_event::Event", tags = "2, 3")]
+    pub event: ::core::option::Option<memory_event::Event>,
+}
+/// Nested message and enum types in `MemoryEvent`.
+pub mod memory_event {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "2")]
+        Memory(super::WatchedMemory),
+        /// The position moved past writes outside the watched namespaces (perf287's S2).
+        #[prost(message, tag = "3")]
+        Progress(super::Progress),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchedMemory {
+    #[prost(string, tag = "1")]
+    pub namespace: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(enumeration = "MemoryKind", tag = "4")]
+    pub kind: i32,
+    #[prost(uint64, tag = "5")]
+    pub created: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MemoryKind {
+    Unspecified = 0,
+    Episodic = 1,
+    Semantic = 2,
+    Procedural = 3,
+}
+impl MemoryKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MEMORY_KIND_UNSPECIFIED",
+            Self::Episodic => "MEMORY_KIND_EPISODIC",
+            Self::Semantic => "MEMORY_KIND_SEMANTIC",
+            Self::Procedural => "MEMORY_KIND_PROCEDURAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MEMORY_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MEMORY_KIND_EPISODIC" => Some(Self::Episodic),
+            "MEMORY_KIND_SEMANTIC" => Some(Self::Semantic),
+            "MEMORY_KIND_PROCEDURAL" => Some(Self::Procedural),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BuiltinLink {
+    Unspecified = 0,
+    DerivedFrom = 1,
+    SimilarTo = 2,
+    Supersedes = 3,
+}
+impl BuiltinLink {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BUILTIN_LINK_UNSPECIFIED",
+            Self::DerivedFrom => "BUILTIN_LINK_DERIVED_FROM",
+            Self::SimilarTo => "BUILTIN_LINK_SIMILAR_TO",
+            Self::Supersedes => "BUILTIN_LINK_SUPERSEDES",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BUILTIN_LINK_UNSPECIFIED" => Some(Self::Unspecified),
+            "BUILTIN_LINK_DERIVED_FROM" => Some(Self::DerivedFrom),
+            "BUILTIN_LINK_SIMILAR_TO" => Some(Self::SimilarTo),
+            "BUILTIN_LINK_SUPERSEDES" => Some(Self::Supersedes),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RememberOutcome {
+    Unspecified = 0,
+    /// Written as a new memory.
+    New = 1,
+    /// An exact duplicate: `id` is the existing memory.
+    Merged = 2,
+    /// A near duplicate the store's dedup skipped: `id` is the match, not a new memory.
+    Similar = 3,
+}
+impl RememberOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REMEMBER_OUTCOME_UNSPECIFIED",
+            Self::New => "REMEMBER_OUTCOME_NEW",
+            Self::Merged => "REMEMBER_OUTCOME_MERGED",
+            Self::Similar => "REMEMBER_OUTCOME_SIMILAR",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REMEMBER_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+            "REMEMBER_OUTCOME_NEW" => Some(Self::New),
+            "REMEMBER_OUTCOME_MERGED" => Some(Self::Merged),
+            "REMEMBER_OUTCOME_SIMILAR" => Some(Self::Similar),
+            _ => None,
+        }
+    }
+}
+/// Generated client implementations.
+pub mod memory_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct MemoryClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> MemoryClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> MemoryClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            MemoryClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn remember(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RememberRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RememberResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/Remember",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Remember"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn recall(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RecallRequest>,
+        ) -> std::result::Result<tonic::Response<super::RecallResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/Recall",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Recall"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn mark_used(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MarkUsedRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::MarkUsedResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/MarkUsed",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "MarkUsed"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `new` replaces `old`: `old` stops being recalled unless asked for.
+        pub async fn supersede(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SupersedeRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/Supersede",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Supersede"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn link(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LinkRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/Link",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Memory", "Link"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Deletes memories now (the store's own forgetting runs on its policy).
+        pub async fn forget(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForgetRequest>,
+        ) -> std::result::Result<tonic::Response<super::ForgetResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/Forget",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Forget"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// New memories in some namespaces as they're written, until the client goes away.
+        pub async fn watch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MemoryWatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::MemoryEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Memory/Watch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Watch"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod memory_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with MemoryServer.
+    #[async_trait]
+    pub trait Memory: std::marker::Send + std::marker::Sync + 'static {
+        async fn remember(
+            &self,
+            request: tonic::Request<super::RememberRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RememberResponse>,
+            tonic::Status,
+        >;
+        async fn recall(
+            &self,
+            request: tonic::Request<super::RecallRequest>,
+        ) -> std::result::Result<tonic::Response<super::RecallResponse>, tonic::Status>;
+        async fn mark_used(
+            &self,
+            request: tonic::Request<super::MarkUsedRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::MarkUsedResponse>,
+            tonic::Status,
+        >;
+        /// `new` replaces `old`: `old` stops being recalled unless asked for.
+        async fn supersede(
+            &self,
+            request: tonic::Request<super::SupersedeRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        async fn link(
+            &self,
+            request: tonic::Request<super::LinkRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        /// Deletes memories now (the store's own forgetting runs on its policy).
+        async fn forget(
+            &self,
+            request: tonic::Request<super::ForgetRequest>,
+        ) -> std::result::Result<tonic::Response<super::ForgetResponse>, tonic::Status>;
+        /// Server streaming response type for the Watch method.
+        type WatchStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::MemoryEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// New memories in some namespaces as they're written, until the client goes away.
+        async fn watch(
+            &self,
+            request: tonic::Request<super::MemoryWatchRequest>,
+        ) -> std::result::Result<tonic::Response<Self::WatchStream>, tonic::Status>;
+    }
+    #[derive(Debug)]
+    pub struct MemoryServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> MemoryServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for MemoryServer<T>
+    where
+        T: Memory,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Memory/Remember" => {
+                    #[allow(non_camel_case_types)]
+                    struct RememberSvc<T: Memory>(pub Arc<T>);
+                    impl<T: Memory> tonic::server::UnaryService<super::RememberRequest>
+                    for RememberSvc<T> {
+                        type Response = super::RememberResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RememberRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::remember(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RememberSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Memory/Recall" => {
+                    #[allow(non_camel_case_types)]
+                    struct RecallSvc<T: Memory>(pub Arc<T>);
+                    impl<T: Memory> tonic::server::UnaryService<super::RecallRequest>
+                    for RecallSvc<T> {
+                        type Response = super::RecallResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RecallRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::recall(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RecallSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Memory/MarkUsed" => {
+                    #[allow(non_camel_case_types)]
+                    struct MarkUsedSvc<T: Memory>(pub Arc<T>);
+                    impl<T: Memory> tonic::server::UnaryService<super::MarkUsedRequest>
+                    for MarkUsedSvc<T> {
+                        type Response = super::MarkUsedResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::MarkUsedRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::mark_used(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = MarkUsedSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Memory/Supersede" => {
+                    #[allow(non_camel_case_types)]
+                    struct SupersedeSvc<T: Memory>(pub Arc<T>);
+                    impl<T: Memory> tonic::server::UnaryService<super::SupersedeRequest>
+                    for SupersedeSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SupersedeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::supersede(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SupersedeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Memory/Link" => {
+                    #[allow(non_camel_case_types)]
+                    struct LinkSvc<T: Memory>(pub Arc<T>);
+                    impl<T: Memory> tonic::server::UnaryService<super::LinkRequest>
+                    for LinkSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LinkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::link(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LinkSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Memory/Forget" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForgetSvc<T: Memory>(pub Arc<T>);
+                    impl<T: Memory> tonic::server::UnaryService<super::ForgetRequest>
+                    for ForgetSvc<T> {
+                        type Response = super::ForgetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ForgetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::forget(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForgetSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Memory/Watch" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchSvc<T: Memory>(pub Arc<T>);
+                    impl<
+                        T: Memory,
+                    > tonic::server::ServerStreamingService<super::MemoryWatchRequest>
+                    for WatchSvc<T> {
+                        type Response = super::MemoryEvent;
+                        type ResponseStream = T::WatchStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::MemoryWatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Memory>::watch(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for MemoryServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Memory";
+    impl<T> tonic::server::NamedService for MemoryServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListTablesRequest {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -5002,6 +6016,10 @@ pub struct ClusterMap {
     /// the changes after it, and cleared by the first one once both majorities hold it.
     #[prost(message, repeated, tag = "6")]
     pub previous_nodes: ::prost::alloc::vec::Vec<Node>,
+    /// The agent memory store's placement (#1915, ICR 0139), if the cluster serves one: each
+    /// partition named holds a whole store for the namespaces in its range.
+    #[prost(message, optional, tag = "8")]
+    pub memory: ::core::option::Option<MemoryPlacement>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -5058,6 +6076,23 @@ pub struct TablePlacement {
     /// old table and create the new.
     #[prost(uint64, tag = "6")]
     pub created: u64,
+}
+/// Where an agent memory store's namespaces are (#1915, ICR 0139). A store keeps its data in
+/// three tables (`mem_{store}`, `mem_{store}_text`, `mem_{store}_ivf`), whose index rows cover
+/// every namespace in a file, so a partition holds a whole store of its own for the
+/// namespaces in its range, made with the node's `--memory-*` options. Fixed once written.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MemoryPlacement {
+    /// The store's name, as `phdb serve --memory` names it.
+    #[prost(string, tag = "1")]
+    pub store: ::prost::alloc::string::String,
+    /// Sorted, distinct namespaces, none containing `\0` (so no namespace's rows straddle
+    /// one); none: one range. Namespace `ns` is in range i when `splits\[i-1\] <= ns < splits\[i\]`.
+    #[prost(message, repeated, tag = "2")]
+    pub splits: ::prost::alloc::vec::Vec<SplitKey>,
+    /// `splits.len() + 1` partition ids, one per range, as `TablePlacement.partitions`.
+    #[prost(string, repeated, tag = "3")]
+    pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
 /// for any bytes. Both forms of one key are the same key.
@@ -5147,6 +6182,11 @@ pub struct NodeStatus {
     /// memory). 0 once it's over.
     #[prost(uint64, tag = "6")]
     pub grace_remaining_ms: u64,
+    /// The map fields this node's build keeps (ICR 0138, 0139): `indexes`, `memory`. A map's
+    /// writer adds such a field only once every node reports it, since a node that drops a
+    /// field from its copy reads as holding a different map (divergent). Empty from older nodes.
+    #[prost(string, repeated, tag = "7")]
+    pub map_features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5215,7 +6255,7 @@ pub struct ForwardRequest {
     pub fanout_part: bool,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 35, 36, 37, 38, 39"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -5269,6 +6309,21 @@ pub mod forward_request {
         CreateTable(super::CreateTableRequest),
         #[prost(message, tag = "20")]
         DropTable(super::DropTableRequest),
+        /// Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
+        /// that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
+        /// or ids are in several partitions never comes here whole.
+        #[prost(message, tag = "34")]
+        Remember(super::RememberRequest),
+        #[prost(message, tag = "35")]
+        Recall(super::RecallRequest),
+        #[prost(message, tag = "36")]
+        MarkUsed(super::MarkUsedRequest),
+        #[prost(message, tag = "37")]
+        Supersede(super::SupersedeRequest),
+        #[prost(message, tag = "38")]
+        Link(super::LinkRequest),
+        #[prost(message, tag = "39")]
+        Forget(super::ForgetRequest),
     }
 }
 /// One partition's part of a fanned-out scan (D317 ticket 4).
@@ -5309,7 +6364,7 @@ pub struct ForwardedCaller {
 pub struct ForwardResponse {
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 22"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -5345,6 +6400,16 @@ pub mod forward_response {
         /// `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
         #[prost(message, tag = "12")]
         Table(super::TableResponse),
+        /// The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
+        /// answer `empty`.
+        #[prost(message, tag = "19")]
+        Remember(super::RememberResponse),
+        #[prost(message, tag = "20")]
+        Recall(super::RecallResponse),
+        #[prost(message, tag = "21")]
+        MarkUsed(super::MarkUsedResponse),
+        #[prost(message, tag = "22")]
+        Forget(super::ForgetResponse),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8513,1020 +9578,6 @@ pub mod graph_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "pigeonhole.v1.Graph";
     impl<T> tonic::server::NamedService for GraphServer<T> {
-        const NAME: &'static str = SERVICE_NAME;
-    }
-}
-/// A link's type: the built-in ones by name, or a custom number at or above the library's
-/// first custom value.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct LinkType {
-    #[prost(oneof = "link_type::Kind", tags = "1, 2")]
-    pub kind: ::core::option::Option<link_type::Kind>,
-}
-/// Nested message and enum types in `LinkType`.
-pub mod link_type {
-    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Kind {
-        #[prost(enumeration = "super::BuiltinLink", tag = "1")]
-        Builtin(i32),
-        #[prost(uint32, tag = "2")]
-        Custom(u32),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MemoryLink {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub to: ::prost::bytes::Bytes,
-    #[prost(message, optional, tag = "2")]
-    pub link_type: ::core::option::Option<LinkType>,
-    #[prost(float, tag = "3")]
-    pub weight: f32,
-}
-/// A memory to write.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct NewMemory {
-    #[prost(string, tag = "1")]
-    pub text: ::prost::alloc::string::String,
-    /// Unset: the server embeds the text with its configured model, if any. In the store's
-    /// element type, packed (perf287's S3 on #1496).
-    #[prost(message, optional, tag = "2")]
-    pub embedding: ::core::option::Option<Vector>,
-    #[prost(enumeration = "MemoryKind", tag = "3")]
-    pub kind: i32,
-    #[prost(double, optional, tag = "4")]
-    pub importance: ::core::option::Option<f64>,
-    #[prost(string, tag = "5")]
-    pub source: ::prost::alloc::string::String,
-    #[prost(string, tag = "6")]
-    pub session: ::prost::alloc::string::String,
-    #[prost(bool, tag = "7")]
-    pub pinned: bool,
-    #[prost(message, repeated, tag = "8")]
-    pub links: ::prost::alloc::vec::Vec<MemoryLink>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RememberRequest {
-    #[prost(string, tag = "1")]
-    pub namespace: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "2")]
-    pub memory: ::core::option::Option<NewMemory>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RememberResponse {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub id: ::prost::bytes::Bytes,
-    #[prost(enumeration = "RememberOutcome", tag = "2")]
-    pub outcome: i32,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RecallRequest {
-    #[prost(string, repeated, tag = "1")]
-    pub namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "2")]
-    pub text: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "3")]
-    pub embedding: ::core::option::Option<Vector>,
-    #[prost(uint32, tag = "4")]
-    pub k: u32,
-    /// Cut the hits to this many bytes (0: no budget).
-    #[prost(uint64, tag = "5")]
-    pub byte_budget: u64,
-    /// Graph expansion through links: this many hops (0: none).
-    #[prost(uint32, tag = "6")]
-    pub expand_hops: u32,
-    #[prost(bool, tag = "7")]
-    pub exact: bool,
-    #[prost(bool, tag = "8")]
-    pub include_superseded: bool,
-    #[prost(string, tag = "9")]
-    pub session: ::prost::alloc::string::String,
-    #[prost(bool, tag = "10")]
-    pub with_embeddings: bool,
-    #[prost(bool, tag = "11")]
-    pub with_signals: bool,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RecallResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub hits: ::prost::alloc::vec::Vec<MemoryHit>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MemoryHit {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub id: ::prost::bytes::Bytes,
-    #[prost(string, tag = "2")]
-    pub text: ::prost::alloc::string::String,
-    #[prost(enumeration = "MemoryKind", tag = "3")]
-    pub kind: i32,
-    #[prost(double, tag = "4")]
-    pub importance: f64,
-    #[prost(uint64, tag = "5")]
-    pub created: u64,
-    #[prost(bool, tag = "6")]
-    pub superseded: bool,
-    #[prost(double, tag = "7")]
-    pub score: f64,
-    /// With `with_embeddings`.
-    #[prost(message, optional, tag = "8")]
-    pub embedding: ::core::option::Option<Vector>,
-    /// With `with_signals`: each ranking signal's score, by name (`vector`, `keyword`,
-    /// `recency`, `graph`).
-    #[prost(map = "string, double", tag = "9")]
-    pub signals: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MarkUsedRequest {
-    #[prost(bytes = "bytes", repeated, tag = "1")]
-    pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MarkUsedResponse {
-    #[prost(uint64, tag = "1")]
-    pub marked: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SupersedeRequest {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub old: ::prost::bytes::Bytes,
-    #[prost(bytes = "bytes", tag = "2")]
-    pub new: ::prost::bytes::Bytes,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LinkRequest {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub from: ::prost::bytes::Bytes,
-    #[prost(bytes = "bytes", tag = "2")]
-    pub to: ::prost::bytes::Bytes,
-    #[prost(message, optional, tag = "3")]
-    pub link_type: ::core::option::Option<LinkType>,
-    #[prost(float, tag = "4")]
-    pub weight: f32,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ForgetRequest {
-    #[prost(bytes = "bytes", repeated, tag = "1")]
-    pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ForgetResponse {
-    #[prost(uint64, tag = "1")]
-    pub forgotten: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MemoryWatchRequest {
-    #[prost(string, repeated, tag = "1")]
-    pub namespaces: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// After an earlier event's `token`; unset: from now.
-    #[prost(bytes = "bytes", tag = "2")]
-    pub resume: ::prost::bytes::Bytes,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct MemoryEvent {
-    /// Where to resume after this event's commit. Opaque. Every event of one commit carries
-    /// the same token, which points after the whole commit, so resume from it once every
-    /// event of that commit is handled: resuming from an earlier one skips the commit's rest.
-    #[prost(bytes = "bytes", tag = "1")]
-    pub token: ::prost::bytes::Bytes,
-    #[prost(oneof = "memory_event::Event", tags = "2, 3")]
-    pub event: ::core::option::Option<memory_event::Event>,
-}
-/// Nested message and enum types in `MemoryEvent`.
-pub mod memory_event {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Event {
-        #[prost(message, tag = "2")]
-        Memory(super::WatchedMemory),
-        /// The position moved past writes outside the watched namespaces (perf287's S2).
-        #[prost(message, tag = "3")]
-        Progress(super::Progress),
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct WatchedMemory {
-    #[prost(string, tag = "1")]
-    pub namespace: ::prost::alloc::string::String,
-    #[prost(bytes = "bytes", tag = "2")]
-    pub id: ::prost::bytes::Bytes,
-    #[prost(string, tag = "3")]
-    pub text: ::prost::alloc::string::String,
-    #[prost(enumeration = "MemoryKind", tag = "4")]
-    pub kind: i32,
-    #[prost(uint64, tag = "5")]
-    pub created: u64,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum MemoryKind {
-    Unspecified = 0,
-    Episodic = 1,
-    Semantic = 2,
-    Procedural = 3,
-}
-impl MemoryKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "MEMORY_KIND_UNSPECIFIED",
-            Self::Episodic => "MEMORY_KIND_EPISODIC",
-            Self::Semantic => "MEMORY_KIND_SEMANTIC",
-            Self::Procedural => "MEMORY_KIND_PROCEDURAL",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "MEMORY_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "MEMORY_KIND_EPISODIC" => Some(Self::Episodic),
-            "MEMORY_KIND_SEMANTIC" => Some(Self::Semantic),
-            "MEMORY_KIND_PROCEDURAL" => Some(Self::Procedural),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum BuiltinLink {
-    Unspecified = 0,
-    DerivedFrom = 1,
-    SimilarTo = 2,
-    Supersedes = 3,
-}
-impl BuiltinLink {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "BUILTIN_LINK_UNSPECIFIED",
-            Self::DerivedFrom => "BUILTIN_LINK_DERIVED_FROM",
-            Self::SimilarTo => "BUILTIN_LINK_SIMILAR_TO",
-            Self::Supersedes => "BUILTIN_LINK_SUPERSEDES",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "BUILTIN_LINK_UNSPECIFIED" => Some(Self::Unspecified),
-            "BUILTIN_LINK_DERIVED_FROM" => Some(Self::DerivedFrom),
-            "BUILTIN_LINK_SIMILAR_TO" => Some(Self::SimilarTo),
-            "BUILTIN_LINK_SUPERSEDES" => Some(Self::Supersedes),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum RememberOutcome {
-    Unspecified = 0,
-    /// Written as a new memory.
-    New = 1,
-    /// An exact duplicate: `id` is the existing memory.
-    Merged = 2,
-    /// A near duplicate the store's dedup skipped: `id` is the match, not a new memory.
-    Similar = 3,
-}
-impl RememberOutcome {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "REMEMBER_OUTCOME_UNSPECIFIED",
-            Self::New => "REMEMBER_OUTCOME_NEW",
-            Self::Merged => "REMEMBER_OUTCOME_MERGED",
-            Self::Similar => "REMEMBER_OUTCOME_SIMILAR",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "REMEMBER_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
-            "REMEMBER_OUTCOME_NEW" => Some(Self::New),
-            "REMEMBER_OUTCOME_MERGED" => Some(Self::Merged),
-            "REMEMBER_OUTCOME_SIMILAR" => Some(Self::Similar),
-            _ => None,
-        }
-    }
-}
-/// Generated client implementations.
-pub mod memory_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    #[derive(Debug, Clone)]
-    pub struct MemoryClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl<T> MemoryClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> MemoryClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            MemoryClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        pub async fn remember(
-            &mut self,
-            request: impl tonic::IntoRequest<super::RememberRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::RememberResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/Remember",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Remember"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn recall(
-            &mut self,
-            request: impl tonic::IntoRequest<super::RecallRequest>,
-        ) -> std::result::Result<tonic::Response<super::RecallResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/Recall",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Recall"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn mark_used(
-            &mut self,
-            request: impl tonic::IntoRequest<super::MarkUsedRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::MarkUsedResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/MarkUsed",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "MarkUsed"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// `new` replaces `old`: `old` stops being recalled unless asked for.
-        pub async fn supersede(
-            &mut self,
-            request: impl tonic::IntoRequest<super::SupersedeRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/Supersede",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Supersede"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn link(
-            &mut self,
-            request: impl tonic::IntoRequest<super::LinkRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/Link",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Memory", "Link"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Deletes memories now (the store's own forgetting runs on its policy).
-        pub async fn forget(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ForgetRequest>,
-        ) -> std::result::Result<tonic::Response<super::ForgetResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/Forget",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Forget"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// New memories in some namespaces as they're written, until the client goes away.
-        pub async fn watch(
-            &mut self,
-            request: impl tonic::IntoRequest<super::MemoryWatchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::MemoryEvent>>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Memory/Watch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Memory", "Watch"));
-            self.inner.server_streaming(req, path, codec).await
-        }
-    }
-}
-/// Generated server implementations.
-pub mod memory_server {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with MemoryServer.
-    #[async_trait]
-    pub trait Memory: std::marker::Send + std::marker::Sync + 'static {
-        async fn remember(
-            &self,
-            request: tonic::Request<super::RememberRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::RememberResponse>,
-            tonic::Status,
-        >;
-        async fn recall(
-            &self,
-            request: tonic::Request<super::RecallRequest>,
-        ) -> std::result::Result<tonic::Response<super::RecallResponse>, tonic::Status>;
-        async fn mark_used(
-            &self,
-            request: tonic::Request<super::MarkUsedRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::MarkUsedResponse>,
-            tonic::Status,
-        >;
-        /// `new` replaces `old`: `old` stops being recalled unless asked for.
-        async fn supersede(
-            &self,
-            request: tonic::Request<super::SupersedeRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        async fn link(
-            &self,
-            request: tonic::Request<super::LinkRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        /// Deletes memories now (the store's own forgetting runs on its policy).
-        async fn forget(
-            &self,
-            request: tonic::Request<super::ForgetRequest>,
-        ) -> std::result::Result<tonic::Response<super::ForgetResponse>, tonic::Status>;
-        /// Server streaming response type for the Watch method.
-        type WatchStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::MemoryEvent, tonic::Status>,
-            >
-            + std::marker::Send
-            + 'static;
-        /// New memories in some namespaces as they're written, until the client goes away.
-        async fn watch(
-            &self,
-            request: tonic::Request<super::MemoryWatchRequest>,
-        ) -> std::result::Result<tonic::Response<Self::WatchStream>, tonic::Status>;
-    }
-    #[derive(Debug)]
-    pub struct MemoryServer<T> {
-        inner: Arc<T>,
-        accept_compression_encodings: EnabledCompressionEncodings,
-        send_compression_encodings: EnabledCompressionEncodings,
-        max_decoding_message_size: Option<usize>,
-        max_encoding_message_size: Option<usize>,
-    }
-    impl<T> MemoryServer<T> {
-        pub fn new(inner: T) -> Self {
-            Self::from_arc(Arc::new(inner))
-        }
-        pub fn from_arc(inner: Arc<T>) -> Self {
-            Self {
-                inner,
-                accept_compression_encodings: Default::default(),
-                send_compression_encodings: Default::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
-        where
-            F: tonic::service::Interceptor,
-        {
-            InterceptedService::new(Self::new(inner), interceptor)
-        }
-        /// Enable decompressing requests with the given encoding.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.accept_compression_encodings.enable(encoding);
-            self
-        }
-        /// Compress responses with the given encoding, if the client supports it.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.send_compression_encodings.enable(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.max_decoding_message_size = Some(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.max_encoding_message_size = Some(limit);
-            self
-        }
-    }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for MemoryServer<T>
-    where
-        T: Memory,
-        B: Body + std::marker::Send + 'static,
-        B::Error: Into<StdError> + std::marker::Send + 'static,
-    {
-        type Response = http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = BoxFuture<Self::Response, Self::Error>;
-        fn poll_ready(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            match req.uri().path() {
-                "/pigeonhole.v1.Memory/Remember" => {
-                    #[allow(non_camel_case_types)]
-                    struct RememberSvc<T: Memory>(pub Arc<T>);
-                    impl<T: Memory> tonic::server::UnaryService<super::RememberRequest>
-                    for RememberSvc<T> {
-                        type Response = super::RememberResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::RememberRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::remember(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = RememberSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Memory/Recall" => {
-                    #[allow(non_camel_case_types)]
-                    struct RecallSvc<T: Memory>(pub Arc<T>);
-                    impl<T: Memory> tonic::server::UnaryService<super::RecallRequest>
-                    for RecallSvc<T> {
-                        type Response = super::RecallResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::RecallRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::recall(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = RecallSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Memory/MarkUsed" => {
-                    #[allow(non_camel_case_types)]
-                    struct MarkUsedSvc<T: Memory>(pub Arc<T>);
-                    impl<T: Memory> tonic::server::UnaryService<super::MarkUsedRequest>
-                    for MarkUsedSvc<T> {
-                        type Response = super::MarkUsedResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::MarkUsedRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::mark_used(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = MarkUsedSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Memory/Supersede" => {
-                    #[allow(non_camel_case_types)]
-                    struct SupersedeSvc<T: Memory>(pub Arc<T>);
-                    impl<T: Memory> tonic::server::UnaryService<super::SupersedeRequest>
-                    for SupersedeSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::SupersedeRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::supersede(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = SupersedeSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Memory/Link" => {
-                    #[allow(non_camel_case_types)]
-                    struct LinkSvc<T: Memory>(pub Arc<T>);
-                    impl<T: Memory> tonic::server::UnaryService<super::LinkRequest>
-                    for LinkSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::LinkRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::link(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = LinkSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Memory/Forget" => {
-                    #[allow(non_camel_case_types)]
-                    struct ForgetSvc<T: Memory>(pub Arc<T>);
-                    impl<T: Memory> tonic::server::UnaryService<super::ForgetRequest>
-                    for ForgetSvc<T> {
-                        type Response = super::ForgetResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ForgetRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::forget(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ForgetSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Memory/Watch" => {
-                    #[allow(non_camel_case_types)]
-                    struct WatchSvc<T: Memory>(pub Arc<T>);
-                    impl<
-                        T: Memory,
-                    > tonic::server::ServerStreamingService<super::MemoryWatchRequest>
-                    for WatchSvc<T> {
-                        type Response = super::MemoryEvent;
-                        type ResponseStream = T::WatchStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::MemoryWatchRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Memory>::watch(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = WatchSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.server_streaming(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
-            }
-        }
-    }
-    impl<T> Clone for MemoryServer<T> {
-        fn clone(&self) -> Self {
-            let inner = self.inner.clone();
-            Self {
-                inner,
-                accept_compression_encodings: self.accept_compression_encodings,
-                send_compression_encodings: self.send_compression_encodings,
-                max_decoding_message_size: self.max_decoding_message_size,
-                max_encoding_message_size: self.max_encoding_message_size,
-            }
-        }
-    }
-    /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "pigeonhole.v1.Memory";
-    impl<T> tonic::server::NamedService for MemoryServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

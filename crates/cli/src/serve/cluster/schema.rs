@@ -292,7 +292,7 @@ pub(crate) fn reconcile_parts(
         // The partition's schema lock, as a single node's create and drop take it: no
         // create or drop of its own runs across a reconcile.
         let _schema = part.schema.blocking_lock();
-        let outcome = reconcile(&part.db, partition, map);
+        let mut outcome = reconcile(&part.db, partition, map);
         // A family added to a table here changes it as much as a create: the service's
         // cached handles list the old families (audit120's P2-C1).
         if !outcome.created.is_empty() || !outcome.dropped.is_empty() || !outcome.altered.is_empty()
@@ -307,6 +307,9 @@ pub(crate) fn reconcile_parts(
                 map.map_version
             );
         }
+        if let Err(e) = memory(shared, service, partition, map) {
+            outcome.errors.push(e);
+        }
         for e in &outcome.errors {
             eprintln!(
                 "phdb serve: reconciling partition {partition} to map version {}: {e}",
@@ -316,6 +319,71 @@ pub(crate) fn reconcile_parts(
         outcomes.push((partition.clone(), outcome));
     }
     Some(outcomes)
+}
+
+/// Partition `partition`'s memory store, when `map` places the store there (#1915) and the
+/// node was started with `--memory`: its slot is set the first time, and its store opened
+/// again at every reconcile after (a reconcile that changed the partition's tables cleared
+/// it), so the store's background loops keep running. A map can't move a placed store, so
+/// a slot once set stays the partition's. `Err`: why the partition serves no store although
+/// the map places one there, which its Status shows (`reconcile_errors`, simp724's ask 1 on
+/// #1920).
+fn memory(
+    shared: &crate::serve::Shared,
+    service: &crate::serve::service::Service,
+    partition: &str,
+    map: &ClusterMap,
+) -> Result<(), String> {
+    let Some(placed) = map
+        .memory
+        .as_ref()
+        .filter(|m| m.partitions.iter().any(|p| p == partition))
+    else {
+        return Ok(());
+    };
+    let Some(recipe) = shared
+        .router
+        .cluster
+        .as_ref()
+        .and_then(|c| c.memory.as_ref())
+    else {
+        return Err(no_memory_flag(&placed.store));
+    };
+    // Refused at start; the placement is fixed once written.
+    if placed.store != recipe.name {
+        return Err(format!(
+            "the map places memory store {:?}, but this node serves --memory {}",
+            placed.store, recipe.name
+        ));
+    }
+    if let Some(slot) = service.memory_slot() {
+        return if slot.cached().is_none() {
+            recipe.reopen(slot)
+        } else {
+            Ok(())
+        };
+    }
+    let (Ok(part), Some(gate)) = (service.part(), service.gate()) else {
+        return Ok(());
+    };
+    let loops = crate::serve::memslot::Loops {
+        gate: Arc::clone(gate),
+        placement: service.placement_of().cloned(),
+        partition: partition.to_owned(),
+    };
+    let (slot, opened) = recipe.open(&part.db, loops);
+    service.set_memory(slot);
+    opened
+}
+
+/// Why a partition the map places memory store `store` on serves none: its node was started
+/// without `--memory` (simp724's ask 2 on #1920).
+fn no_memory_flag(store: &str) -> String {
+    format!(
+        "the cluster map places memory store {store} on this partition, but its node was \
+         started without --memory: restart it with --memory {store} and the memory flags the \
+         other nodes have"
+    )
 }
 
 impl Node {

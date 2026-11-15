@@ -1245,8 +1245,10 @@ pub(crate) struct Partition {
     /// The text indexes open, and the running rebuild.
     pub(crate) texts: Arc<super::texts::Texts>,
     /// The memory store (`--memory`), if the server serves one: opened when a call needs
-    /// it, and again after the catalog or the engine changes (#1618).
-    memory: Option<Arc<super::memslot::MemSlot>>,
+    /// it, and again after the catalog or the engine changes (#1618). Set once: at start on
+    /// a single node, and on a cluster partition when the map first places the store on it
+    /// (#1915), which it then does for good.
+    memory: std::sync::OnceLock<Arc<super::memslot::MemSlot>>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     ///
@@ -1303,6 +1305,10 @@ impl Partition {
         self.bulk.close();
         self.texts.close();
         self.indexes.close();
+        // The memory store's handles go, and with them its background loops (#1915).
+        if let Some(memory) = self.memory.get() {
+            memory.clear();
+        }
     }
 
     /// Its engine memory now (`--engine-memory`'s share), `None` without one.
@@ -1359,7 +1365,7 @@ impl Partition {
             )),
             bulk: super::bulk::BulkLoads::new(config.placement),
             texts: Arc::new(super::texts::Texts::new(db.clone())),
-            memory: None,
+            memory: std::sync::OnceLock::new(),
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
             engine_metrics: metrics.collector(&db),
@@ -1584,7 +1590,7 @@ impl Service {
     /// seqno opens the store afresh (cli692's D2).
     pub(crate) fn tables_changed(&self) {
         self.handles_changed();
-        if let Some(memory) = self.part.as_ref().and_then(|p| p.memory.as_ref()) {
+        if let Some(memory) = self.part.as_ref().and_then(|p| p.memory.get()) {
             memory.clear();
         }
     }
@@ -1610,7 +1616,7 @@ impl Service {
     pub(crate) fn engine_replaced(&self) {
         self.tables_changed();
         if let Some(part) = &self.part {
-            if let Some(memory) = &part.memory {
+            if let Some(memory) = part.memory.get() {
                 memory.replaced();
             }
             part.feeds.fail_all();
@@ -1619,18 +1625,20 @@ impl Service {
     }
 
     /// Serves the store `slot` holds, if any, as the `Memory` service, with at most `calls`
-    /// memory calls on the blocking pool at once (0: half the pool, at least 1).
+    /// memory calls on the blocking pool at once (0: half the pool, at least 1). A cluster
+    /// node's service takes `calls` alone: its partitions share the limit and set their
+    /// stores later (#1915).
     pub(crate) fn memory_opt(
         mut self,
         slot: Option<super::memslot::MemSlot>,
         calls: usize,
     ) -> Self {
-        let Some(slot) = slot else { return self };
-        if let Some(part) = &mut self.part {
-            part.memory = Some(Arc::new(slot));
-        }
         if calls > 0 {
             self.memory_calls = Arc::new(Semaphore::new(calls));
+        }
+        if let (Some(slot), Some(part)) = (slot, &self.part) {
+            // A new partition's: nothing set it before.
+            let _ = part.memory.set(Arc::new(slot));
         }
         self
     }
@@ -1650,10 +1658,38 @@ impl Service {
             .is_some_and(|p| p.tables.load().map.contains_key(name))
     }
 
+    /// Sets a cluster partition's memory store slot (#1915), unless one is set already.
+    pub(crate) fn set_memory(&self, slot: super::memslot::MemSlot) {
+        if let Some(part) = &self.part {
+            let _ = part.memory.set(Arc::new(slot));
+        }
+    }
+
+    /// The node's CPU placement, if it has one.
+    pub(crate) fn placement_of(&self) -> Option<&Arc<super::placement::Placement>> {
+        self.placement.as_ref()
+    }
+
     /// The memory store's slot: `/mcp`'s memory tools (8c-3b), and a test's inspection of
     /// the store it holds (#1640).
     pub(crate) fn memory_slot(&self) -> Option<&Arc<super::memslot::MemSlot>> {
-        self.part.as_ref()?.memory.as_ref()
+        self.part.as_ref()?.memory.get()
+    }
+
+    /// A memory call's answer where no store is served. On a cluster partition a memory
+    /// call reaches here only because the map places the store on it, so its node lacks
+    /// `--memory` (simp724's ask 2 on #1920): `FailedPrecondition`, naming the flag.
+    fn no_memory(&self) -> ApiError {
+        match &self.gate {
+            Some(_) => ApiError::failed_precondition(
+                "the cluster map places the memory store on this partition, but its node was \
+                 started without --memory: restart it with --memory NAME and the memory flags \
+                 the other nodes have",
+            ),
+            None => {
+                ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
+            }
+        }
     }
 
     /// The in-flight budget's free bytes, for tests to check nothing leaked.
@@ -1979,7 +2015,7 @@ impl Service {
                 // (cli692's D3 on #1618). Its failure doesn't fail the promote (the database
                 // is what's promoted): it's the replica's last error, and memory calls answer
                 // it until the next clear.
-                if let Some(memory) = &self.part()?.memory {
+                if let Some(memory) = self.part()?.memory.get() {
                     memory.promote();
                     let slot = Arc::clone(memory);
                     let opened = self.blocking(move || slot.get()).await;
@@ -2566,7 +2602,7 @@ impl Service {
         // The memory store this server serves keeps its data in its own tables: dropping one
         // would leave the slot over a dropped table, and a restart would re-create the store
         // empty (cli692's N1 on #1650, #1651). The crate names them.
-        if let Some(memory) = &self.part()?.memory {
+        if let Some(memory) = self.part()?.memory.get() {
             let store = memory.name();
             if pigeonhole_memory::Store::table_names(store).contains(&name) {
                 return Err(ApiError::failed_precondition(format!(
@@ -3610,9 +3646,12 @@ impl Service {
     /// while its copy is still arriving, else `Unavailable` (the primary hasn't created it,
     /// or the replica hasn't applied that yet; ICR 0112).
     async fn memory_core(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        let slot = self.part()?.memory.clone().ok_or_else(|| {
-            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
-        })?;
+        let slot = self
+            .part()?
+            .memory
+            .get()
+            .cloned()
+            .ok_or_else(|| self.no_memory())?;
         let entry = match slot.cached() {
             Some(entry) => entry,
             None => {
@@ -3629,9 +3668,7 @@ impl Service {
     /// place (M6) and a pool place: a `/mcp` memory tool's (8c-3b). It opens the store here
     /// if need be.
     pub(crate) fn memory_core_blocking(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        let slot = self.part()?.memory.as_ref().ok_or_else(|| {
-            ApiError::unsupported("this server has no memory store (phdb serve --memory NAME)")
-        })?;
+        let slot = self.part()?.memory.get().ok_or_else(|| self.no_memory())?;
         let entry = slot.get()?;
         self.entry_core(slot, entry)
     }
@@ -3775,12 +3812,10 @@ impl Service {
         caller: &Caller,
     ) -> Result<super::memory::MemoryEvents, ApiError> {
         // Before the store: a swap from here on ends the watch.
-        let swaps = self.part()?.memory.as_ref().map(|m| m.swaps());
+        let swaps = self.part()?.memory.get().map(|m| m.swaps());
         let core = self.memory_core().await?;
         let Some(swaps) = swaps else {
-            return Err(ApiError::unsupported(
-                "this server has no memory store (phdb serve --memory NAME)",
-            ));
+            return Err(self.no_memory());
         };
         let slot = self.stream_slot()?;
         super::memory::watch(
