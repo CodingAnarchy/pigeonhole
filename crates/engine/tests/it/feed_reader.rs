@@ -2408,3 +2408,189 @@ fn every_way_the_sidecar_appends_stop_is_published_for_reader_processes() {
         db.close().unwrap();
     }
 }
+
+/// The backlog of the #1827 tests: `n` one-change commits alternating between `a` and `b`
+/// (one per shard), with a cross-shard round every 10th, at `GroupSync`. Their seqnos.
+fn small_commits(db: &Engine, a: &TableInfo, b: &TableInfo, n: u32) -> Vec<Seqno> {
+    let value = [3u8; 32];
+    (0..n)
+        .map(|i| {
+            let mut wb = WriteBatch::new();
+            let row = format!("s{i:06}");
+            if i % 10 == 9 {
+                put(&mut wb, a, format!("{row}a").as_bytes(), &value);
+                put(&mut wb, b, format!("{row}b").as_bytes(), &value);
+            } else {
+                put(
+                    &mut wb,
+                    if i % 2 == 0 { a } else { b },
+                    row.as_bytes(),
+                    &value,
+                );
+            }
+            db.commit(wb, Some(Durability::GroupSync)).unwrap().seqno
+        })
+        .collect()
+}
+
+/// #1827: a reader far behind steps each record of its backlog a bounded number of times,
+/// however many read-ahead passes (D320) the drain takes. Each pass used to read every stream
+/// from its hint to its end, stepping every record it would pass over again: a drain cost
+/// passes × backlog record steps, quadratic in the backlog with small commits.
+#[test]
+fn a_far_behind_readers_drain_steps_each_record_a_bounded_number_of_times() {
+    const BUDGET: u64 = 16 << 10;
+    const N: u32 = 6000;
+    let vfs = SimVfs::new(3203);
+    let db = open(&vfs, Some(feed(16 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    r.set_read_ahead(BUDGET);
+    let want = small_commits(&db, &a, &b, N);
+    let (reads_before, steps_before) = (r.stream_reads(), r.record_steps());
+    let got: Vec<Seqno> = want.iter().map(|_| next(&mut r).seqno).collect();
+    assert_eq!(got, want);
+    assert!(matches!(r.try_next().unwrap(), Next::Pending));
+    let passes = r.stream_reads() - reads_before;
+    let steps = r.record_steps() - steps_before;
+    // Each round is three records (two shares and a Decision): N singles' worth plus 2 a round.
+    let records = u64::from(N) + 2 * u64::from(N / 10);
+    assert!(passes > 50, "only {passes} read passes: the cap never bit");
+    // Each record is stepped once to index it and once more to deliver it. A pass reads the
+    // streams one after another, so the first stream can fill the budget before the next
+    // lowers the cutoff below some of what it kept, and a pass steps through the one chunk per
+    // stream that straddles the cutoff: a bounded number of steps a pass, not the backlog
+    // again (63× here before #1827).
+    assert!(
+        steps <= 4 * records,
+        "{steps} record steps for {records} records over {passes} passes: the passes re-step \
+         the backlog"
+    );
+    drop(r);
+    db.close().unwrap();
+}
+
+/// #1827: a capped reader's skip index never jumps the Decision of a round in flight across
+/// its cutoff. Rounds are submitted together with singles on both shards, so other seqnos are
+/// allocated between a round's id and its apply seqno, and flushes move the checkpoints so
+/// rule C runs. A round whose shares were kept (id below the cutoff) but whose Decision a
+/// chunk jump passed over (apply above it) would keep its shares held past their checkpoint:
+/// rule C drops them as aborted, and the Decision read after the rewind expires the feed as
+/// a gap. Every commit is delivered once, whole and in order.
+#[test]
+fn a_capped_reader_never_jumps_the_decision_of_a_round_in_flight_across_its_cutoff() {
+    let vfs = SimVfs::new(3204);
+    let (a, b) = {
+        let db = open(&vfs, Some(feed(16 << 20)));
+        let t = tables(&db);
+        db.close().unwrap();
+        t
+    };
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(&vfs, Some(feed(16 << 20)))).unwrap();
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    // A few records: the passes jump chunks of 256 bytes of log, so with these values every
+    // record but a Decision is a chunk of its own.
+    r.set_read_ahead(2000);
+    let value = [5u8; 300];
+    let mut want = Vec::new();
+    let mut got = Vec::new();
+    for i in 0..300u32 {
+        let mut pending = Vec::new();
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &a, format!("r{i:04}a").as_bytes(), &value);
+        put(&mut wb, &b, format!("r{i:04}b").as_bytes(), &value);
+        pending.push(db.submit(wb, Some(Durability::Buffered)).unwrap());
+        for j in 0..3u32 {
+            let mut wb = WriteBatch::new();
+            let t = if (i + j) % 2 == 0 { &a } else { &b };
+            put(&mut wb, t, format!("s{i:04}-{j}").as_bytes(), &value);
+            pending.push(db.submit(wb, Some(Durability::Buffered)).unwrap());
+        }
+        for p in pending {
+            want.push(drive(&mut shards, p).unwrap().seqno);
+        }
+        if i % 25 == 24 {
+            let flush = db.submit_flush().unwrap();
+            drive(&mut shards, flush).unwrap();
+        }
+        // Behind by a few hundred records, then drained, three times over.
+        if i % 100 == 99 {
+            got.extend(drain(&mut r, &mut shards).iter().map(|c| {
+                assert!(!c.changes.is_empty());
+                c.seqno
+            }));
+        }
+    }
+    want.sort_unstable();
+    assert_eq!(got, want, "every commit once, in order");
+    assert!(
+        r.chunk_skips() > 0,
+        "no chunk was jumped: the index never bit"
+    );
+    drop(r);
+    db.close().unwrap();
+    for s in shards {
+        drop(s);
+    }
+}
+
+/// #1827: a capped reader's skip index leaves tokens and retention as they were. A token
+/// taken mid-drain, with the index built, resumes to the same commits on a reader with none;
+/// and once retention passes the reader while it's behind, it expires for retention, never as
+/// a gap or a corruption, after delivering only what it would have.
+#[test]
+fn a_capped_readers_skip_index_keeps_tokens_and_retention_as_they_were() {
+    const BUDGET: u64 = 16 << 10;
+    let vfs = SimVfs::new(3205);
+    // The smallest retention: two 256 KB segments per stream.
+    let db = open(&vfs, Some(feed(1)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    r.set_read_ahead(BUDGET);
+    let want = small_commits(&db, &a, &b, 2000);
+    let mut seen: Vec<Seqno> = (0..600).map(|_| next(&mut r).seqno).collect();
+    assert_eq!(seen, want[..600]);
+    assert!(r.indexed_chunks() > 0, "the index is built while capped");
+    let token = r.token();
+    // From the token, on a reader with no index: the rest, as the capped one would deliver it.
+    let mut t = db.feed(spec(&[&a, &b], FeedStart::Token(token))).unwrap();
+    t.set_read_ahead(BUDGET);
+    let rest: Vec<Seqno> = want[600..].iter().map(|_| next(&mut t).seqno).collect();
+    assert_eq!(rest, want[600..]);
+    drop(t);
+    // Far more than the retention, flushed as it goes so the checkpoints move on and the
+    // segments the capped reader still has to read are recycled.
+    let value = vec![7u8; 20_000];
+    for i in 0..400u32 {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &a, &i.to_be_bytes(), &value);
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+        if i % 40 == 39 {
+            db.flush().unwrap();
+        }
+    }
+    loop {
+        match r.wait(WAIT).unwrap() {
+            Next::Commit(c) => seen.push(c.seqno),
+            Next::Pending => panic!("retention passed the reader and it never expired"),
+            Next::Expired(e) => {
+                assert!(
+                    e.reason.starts_with("retention passed the feed"),
+                    "expired for retention: {e:?}"
+                );
+                break;
+            }
+            Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
+        }
+    }
+    let n = seen.len().min(want.len());
+    assert_eq!(
+        seen[..n],
+        want[..n],
+        "only what it would have delivered, in order"
+    );
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+    drop(r);
+    db.close().unwrap();
+}
