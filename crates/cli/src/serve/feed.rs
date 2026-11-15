@@ -519,8 +519,9 @@ pub(crate) struct HubOf<K: RingKind> {
     ring: Mutex<RingOf<K>>,
     /// The ring's head index, bumped by each push and by a failure.
     pub(crate) head: watch::Sender<u64>,
-    /// Its task: replaced each time the task moves between runtimes ([`drive`]).
-    task: Mutex<tokio::task::AbortHandle>,
+    /// Its task, once it's spawned after the hub is made ([`set_task`](Self::set_task),
+    /// #1926): replaced each time the task moves between runtimes ([`drive`]).
+    task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Its clients, on its ring or on their own streams until they rejoin it: a [`JoinedOf`]
     /// each. At most one, a single node's hub task runs on the feed runtime (#1689).
     members: AtomicUsize,
@@ -547,10 +548,10 @@ pub(crate) struct HubOf<K: RingKind> {
 pub(crate) type Hub = HubOf<Single>;
 
 impl<K: RingKind> HubOf<K> {
-    /// A hub with `ring` and its task's handle, holding a place in `live`.
+    /// A hub with `ring`, holding a place in `live`. Its task is spawned after it, holding
+    /// it, and set with [`set_task`](Self::set_task) (#1926).
     pub(crate) fn new(
         ring: RingOf<K>,
-        task: tokio::task::AbortHandle,
         solo: bool,
         stats: Arc<FeedStats>,
         live: Arc<AtomicU64>,
@@ -560,7 +561,7 @@ impl<K: RingKind> HubOf<K> {
         Self {
             ring: Mutex::new(ring),
             head,
-            task: Mutex::new(task),
+            task: Mutex::new(None),
             members: AtomicUsize::new(0),
             external: AtomicUsize::new(0),
             joins: AtomicU64::new(0),
@@ -576,13 +577,13 @@ impl<K: RingKind> HubOf<K> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn task(&self) -> MutexGuard<'_, tokio::task::AbortHandle> {
+    fn task(&self) -> MutexGuard<'_, Option<tokio::task::AbortHandle>> {
         self.task.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Replaces its task's handle (a cluster hub's task starts after the hub is made).
+    /// Sets its task's handle: the task starts after the hub is made, holding it (#1926).
     pub(crate) fn set_task(&self, task: tokio::task::AbortHandle) {
-        *self.task() = task;
+        *self.task() = Some(task);
     }
 
     /// Makes `tracker`'s client one of this hub's members until the [`JoinedOf`] drops;
@@ -693,10 +694,9 @@ impl Hub {
 impl<K: RingKind> Drop for HubOf<K> {
     fn drop(&mut self) {
         // The last client left: the hub's feed (and its shard wakers) goes.
-        self.task
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .abort();
+        if let Some(task) = self.task.get_mut().unwrap_or_else(PoisonError::into_inner) {
+            task.abort();
+        }
         self.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -854,7 +854,7 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                         if !hub.ring().failed {
                             hub.solo.store(to == Place::Feed, Ordering::Relaxed);
                             hub.stats.hub_moves.fetch_add(1, Ordering::Relaxed);
-                            *task = rt.spawn(drive(d)).abort_handle();
+                            *task = Some(rt.spawn(drive(d)).abort_handle());
                         }
                         return;
                     }
@@ -1191,7 +1191,9 @@ impl Feeds {
             // Under the task's lock, so a task moving runtimes (#1689) either is aborted
             // here or sees the hub failed and stops.
             let task = hub.task();
-            task.abort();
+            if let Some(task) = &*task {
+                task.abort();
+            }
             hub.fail();
             drop(task);
         }
@@ -1261,9 +1263,6 @@ impl Feeds {
                 passed_token: start_token,
                 failed: false,
             }),
-            tokio::runtime::Handle::current()
-                .spawn(async {})
-                .abort_handle(),
             runtimes.is_some(),
             stats,
             live,
@@ -1294,10 +1293,11 @@ impl Feeds {
         {
             seam(&started);
         }
-        // An overwrite with no check, and safe: the slot still holds the placeholder. The only
-        // other writer is the task's own runtime move (`drive`), which needs two members or a
-        // cluster merge, and nobody can join a hub before it's in the map, below (cli692's N1
-        // on #1927).
+        // An overwrite with no check, and safe: the slot is still empty. The only other writer
+        // is the task's own runtime move (`drive`), which needs two members or a cluster merge,
+        // and nobody can join a hub before it's in the map, below (cli692's N1 on #1927). No
+        // placeholder task is spawned for the meantime: one on the caller's runtime was work
+        // of the feed's on the request side.
         hub.set_task(task.abort_handle());
         hubs.insert(key, Arc::downgrade(&hub));
         Ok(hub)
@@ -2412,11 +2412,6 @@ mod tests {
         let hub = || {
             Hub::new(
                 Ring::new(SingleRing::default()),
-                tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap()
-                    .spawn(async {})
-                    .abort_handle(),
                 false,
                 Arc::default(),
                 Arc::new(AtomicU64::new(1)),
@@ -2536,7 +2531,7 @@ mod tests {
             let mut want = vec![w("a1")];
             assert_eq!(seqnos(&mut a, Duration::from_secs(1)).await, want);
             // The shared feed fails (an expiry, say): its engine task ends.
-            first.task().abort();
+            first.task().as_ref().expect("spawned").abort();
             first.fail();
             want.push(w("a2"));
             // A new subscriber gets a fresh hub, and starts now, not from the failed one.
@@ -2814,7 +2809,6 @@ mod tests {
             .unwrap();
         let hub = Arc::new(Hub::new(
             Ring::new(SingleRing::default()),
-            rt.spawn(async {}).abort_handle(),
             true,
             Arc::default(),
             Arc::new(AtomicU64::new(1)),
@@ -3161,7 +3155,7 @@ mod tests {
         let mut want = Vec::new();
         rt.block_on(async {
             let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
-            hub.task().abort();
+            hub.task().as_ref().expect("spawned").abort();
             let mut c = feeds
                 .subscribe(
                     Spec {
@@ -3255,7 +3249,7 @@ mod tests {
         let ended: Arc<Mutex<Option<(tokio::time::Instant, String)>>> = Arc::default();
         rt.block_on(async {
             let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
-            hub.task().abort();
+            hub.task().as_ref().expect("spawned").abort();
             let end = Arc::clone(&ended);
             let mut c = feeds
                 .subscribe(
@@ -3354,7 +3348,7 @@ mod tests {
         rt.block_on(async {
             let hub = feeds.hub(std::slice::from_ref(&t), false).unwrap();
             // The hub's own task stops; the test pushes for it.
-            hub.task().abort();
+            hub.task().as_ref().expect("spawned").abort();
             let mut direct = t.feed().open().unwrap();
             let mut c = feeds
                 .subscribe(
