@@ -396,12 +396,13 @@ impl std::fmt::Debug for BulkLoads {
     }
 }
 
-impl Default for BulkLoads {
-    fn default() -> Self {
+impl BulkLoads {
+    /// No load running, a load's thread placed by `placement`.
+    pub(crate) fn new(placement: Option<Arc<Placement>>) -> Self {
         Self {
             slot: Arc::new(Semaphore::new(1)),
             loader: Arc::new(load),
-            placement: None,
+            placement,
             thread: Mutex::new(None),
             closed: AtomicBool::new(false),
             stopping: Arc::default(),

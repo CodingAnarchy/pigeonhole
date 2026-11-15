@@ -574,18 +574,16 @@ impl Node {
         // Reopened: its files change from here, so the hashes a close kept go (feed1248).
         self.fences.closed().remove(id);
         let gate = self.open_gate(id, epoch);
+        let config = crate::serve::service::PartitionConfig {
+            backups: Arc::clone(&server.backups),
+            placement: Some(Arc::clone(&server.placement)),
+            pinning: opened.pinning,
+            engine_memory: Some(opened.memory),
+        };
         let service = shared
             .router
             .service
-            .for_partition(
-                opened.db.clone(),
-                id,
-                &server.backups,
-                opened.pinning,
-                opened.memory,
-                gate,
-            )
-            .placement(&server.placement);
+            .for_partition(opened.db.clone(), id, gate, config);
         if let Some(part) = service.part_opt()
             && let Some((feeds, hubs)) = shared.feed_runtimes.get()
         {

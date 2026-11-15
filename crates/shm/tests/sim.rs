@@ -811,3 +811,72 @@ fn a_bad_row_epoch_table_is_refused_at_attach() {
         .store(slots, Ordering::Relaxed);
     assert!(r.open(Role::Reader).is_ok(), "restored");
 }
+
+/// #1869 (D315 amendment, FORMAT §11.1): the header's `feed_flags` at 208..212 is zero in a
+/// fresh region, so a reader under a writer that never sets it reads no stop. A stop the
+/// writer publishes reaches a reader attached to the same generation, is set once (a second
+/// publish changes nothing, and the neighbouring `catalog_hold` is untouched), and a new
+/// generation starts at zero again.
+#[test]
+fn the_feed_flags_word_starts_at_zero_and_carries_a_published_stop_to_readers() {
+    let sim = SimVfs::new(41);
+    let w = Proc::start(&sim, pid(1));
+    let (lock, wp, shm) = w.open_writer();
+    let raw = |p: &Proc, generation: u64| {
+        p.vfs
+            .open_shared(
+                &region_name(p.identity.device, p.identity.inode, generation),
+                None,
+                4096,
+                SharedOpen::Attach,
+            )
+            .unwrap()
+    };
+    let region = raw(&w, shm.generation().0);
+    assert_eq!(
+        region
+            .atomic_u32(header::FEED_FLAGS)
+            .load(Ordering::Acquire),
+        0
+    );
+
+    let r = Proc::start(&sim, pid(11));
+    let (_rp, shm_r, _slot) = r.open_reader();
+    assert!(!shm_r.feed_appends_stopped(), "no stop in a fresh region");
+
+    w.enter();
+    shm.publish_feed_appends_stopped();
+    shm.publish_feed_appends_stopped();
+    assert!(
+        shm_r.feed_appends_stopped(),
+        "the reader sees the writer's stop"
+    );
+    assert_eq!(
+        region
+            .atomic_u32(header::FEED_FLAGS)
+            .load(Ordering::Acquire),
+        pigeonhole_format::shm::FEED_APPENDS_STOPPED,
+        "bit 0 alone, set once"
+    );
+    assert_eq!(
+        region
+            .atomic_u64(header::CATALOG_HOLD)
+            .load(Ordering::Acquire),
+        u64::MAX,
+        "the catalog hold is untouched"
+    );
+
+    // A new writer builds a new generation: its header starts at zero.
+    w.crash();
+    std::mem::forget((lock, wp));
+    let w2 = Proc::start(&sim, pid(2));
+    let (_lock2, _wp2, shm2) = w2.open_writer();
+    assert_ne!(shm2.generation(), shm.generation());
+    assert!(!shm2.feed_appends_stopped(), "a new generation has no stop");
+    assert_eq!(
+        raw(&w2, shm2.generation().0)
+            .atomic_u32(header::FEED_FLAGS)
+            .load(Ordering::Acquire),
+        0
+    );
+}

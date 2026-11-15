@@ -353,12 +353,30 @@ impl Server {
                 }
             }
         }
-        let out = self.child.wait_with_output().unwrap();
+        // Over stdio, its stderr is still the child's; over HTTP, a thread took it.
+        let mut err = Vec::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            std::io::Read::read_to_end(&mut e, &mut err).unwrap();
+        }
+        let status = self.child.wait().unwrap();
         let stderr = match &self.io {
-            Io::Stdio { .. } => String::from_utf8_lossy(&out.stderr).into_owned(),
+            Io::Stdio { .. } => String::from_utf8_lossy(&err).into_owned(),
             Io::Http { stderr, .. } => stderr.iter().collect::<Vec<_>>().join("\n"),
         };
-        (out.status.code().unwrap_or(-1), stderr)
+        (status.code().unwrap_or(-1), stderr)
+    }
+}
+
+/// A server a test didn't [`finish`](Server::finish) (it panicked, or never ends the
+/// server): killed, so it doesn't outlive the test. `phdb mcp` would end with its input,
+/// but `phdb serve` runs until it's signalled, and the CI job's cleanup found one left
+/// behind (#1906).
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -482,6 +500,8 @@ fn create_table_reports_a_bad_family_before_a_bad_name() {
     let name = s.fail("create_table", json!({"table": "", "families": ["f"]}));
     let message = name["message"].as_str().unwrap();
     assert!(message.contains("empty table name"), "{name}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
 }
 
 #[test]

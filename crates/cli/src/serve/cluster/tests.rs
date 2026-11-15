@@ -1160,7 +1160,7 @@ fn data_node_placed(
     // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
     node.load_fences().unwrap();
     let metrics = Arc::new(Metrics::default());
-    let service = Service::routing_only(limits, 2, Arc::clone(&metrics));
+    let service = Service::routing_only(limits, 2, Arc::clone(&metrics), None);
     let backup_dir = dir.join(format!("backups-{id}"));
     std::fs::create_dir_all(&backup_dir).unwrap();
     let backups = crate::serve::backup::Backups::new(Some(&backup_dir), 1).unwrap();
@@ -1178,7 +1178,6 @@ fn data_node_placed(
     .unwrap_or_else(|f| panic!("{}", f.message()));
     for (i, (p, db)) in locals.into_iter().enumerate() {
         let db = db.unwrap_or_else(|| test_partition(dir, p));
-        let pinning = crate::serve::service::Pinning::default();
         let memory = memories
             .as_ref()
             .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
@@ -1190,7 +1189,15 @@ fn data_node_placed(
         }
         parts.push((
             p.to_owned(),
-            service.for_partition(db.clone(), p, &backups, pinning, memory, gate),
+            service.for_partition(
+                db.clone(),
+                p,
+                gate,
+                crate::serve::service::PartitionConfig {
+                    engine_memory: Some(memory),
+                    ..crate::serve::service::PartitionConfig::new(Arc::clone(&backups))
+                },
+            ),
         ));
         dbs.push(db);
     }
@@ -1440,6 +1447,28 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
     drop(stop_a);
     let _ = db_a.close();
     let _ = db_b.close();
+}
+
+#[test]
+fn a_partition_the_map_no_longer_lists_is_wrong_partition_not_internal() {
+    // #1896: a fanned-out read's part names its partition from the map it planned with, and
+    // a forced map can drop that partition before the part is placed. That's the operator's
+    // doing, not a server bug: `WrongPartition` with the map's version, so the caller
+    // re-reads the map and routes again.
+    let dir = test_dir();
+    let node = node(&dir, "a");
+    let routes = super::route::Routes::new(&the_map(7, &[1, 2, 3]));
+    let parts: crate::serve::router::Parts = Default::default();
+    let Err(e) = crate::serve::router::place(&node, &parts, &routes, "p9") else {
+        panic!("p9 placed");
+    };
+    assert_eq!(e.code, "WrongPartition", "{}", e.message);
+    assert!(
+        e.message.contains("no longer lists partition \"p9\"")
+            && e.message.contains("map is version 7"),
+        "{}",
+        e.message
+    );
 }
 
 #[test]
