@@ -29,6 +29,7 @@ pub(crate) mod stamp;
 #[cfg(test)]
 mod tests;
 pub(crate) mod token;
+mod transfer;
 pub(crate) mod upload;
 
 use std::collections::{BTreeSet, HashSet};

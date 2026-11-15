@@ -22,8 +22,6 @@
 //! written to between the runs, and nothing else ties NEW's stamped file to what OLD closed
 //! this time. So every move that sets the map compared the copy it serves.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use prost::bytes::Bytes;
@@ -31,12 +29,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::cli::{CopyCheck, NodeArgs, channel, connect, relocate_as, report, request, url_of};
+use super::transfer::{Feed, Stopped, upload_file};
 use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{
     self, BackupDownloadRequest, GetMapRequest, LocalPartition, LocalPartitionState, PartitionFile,
-    PartitionRequest, PartitionUploadChunk, PartitionUploadHeader, PartitionUploadPurpose,
-    PartitionUploadStatusRequest, StatusRequest,
+    PartitionRequest, PartitionUploadHeader, PartitionUploadPurpose, StatusRequest,
 };
 
 /// How often the move asks a node how a step is going.
@@ -44,9 +42,6 @@ const POLL: Duration = Duration::from_millis(200);
 
 /// How often a wait says it's still waiting.
 const SAY_EVERY: Duration = Duration::from_secs(10);
-
-/// A chunk's size when a node doesn't say (`max_chunk` 0, a node from before it).
-const DEFAULT_CHUNK: u64 = 512 << 10;
 
 type Admin = proto::admin_client::AdminClient<tonic::transport::Channel>;
 
@@ -695,17 +690,6 @@ fn upload_id(cluster: &str, p: &str, e: u64, f: &PartitionFile) -> String {
         .collect()
 }
 
-/// An upload's messages, as tonic's client stream.
-struct Chunks(tokio::sync::mpsc::Receiver<PartitionUploadChunk>);
-
-impl futures_core::Stream for Chunks {
-    type Item = PartitionUploadChunk;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
-}
-
 /// Copies file `f` from OLD to an upload on NEW, from what NEW holds of it. Returns the
 /// bytes sent.
 async fn copy_file(
@@ -717,121 +701,86 @@ async fn copy_file(
     f: &PartitionFile,
     set: &[PartitionFile],
 ) -> Result<u64, Failure> {
-    let id = upload_id(cluster, p, e, f);
     let what = format!("{p}'s file {:?}", f.name);
-    let st = new
-        .admin
-        .clone()
-        .partition_upload_status(request(
-            PartitionUploadStatusRequest {
-                upload_id: id.clone(),
-                partition: p.to_owned(),
-            },
-            new.token.as_deref(),
-        )?)
-        .await
-        .map_err(|s| new.failed(&format!("upload status of {what}"), &s))?
-        .into_inner();
-    // An install of a set NEW staged is in progress there (an earlier run stopped in it):
-    // nothing is sent, and the stamp finishes it. The set it installs is compared with the
-    // closed set like any other (#1848).
-    if st.complete || st.installing {
-        return Ok(0);
-    }
-    let from = st.received;
-    let max = usize::try_from(if st.max_chunk == 0 {
-        DEFAULT_CHUNK
-    } else {
-        st.max_chunk
-    })
-    .unwrap_or(usize::MAX);
     let header = PartitionUploadHeader {
         partition: p.to_owned(),
         cluster_id: cluster.to_owned(),
         epoch: e,
-        upload_id: id,
+        upload_id: upload_id(cluster, p, e, f),
         purpose: PartitionUploadPurpose::Relocate as i32,
         file: Some(f.clone()),
         manifest: set.to_vec(),
     };
-    let (tx, rx) = tokio::sync::mpsc::channel(8);
-    let download = async {
-        // Owned here, so the upload's stream ends when the download does.
-        let tx = tx;
-        let mut chunks = old
-            .admin
-            .clone()
-            .backup_download(request(
-                BackupDownloadRequest {
-                    partition: p.to_owned(),
-                    fenced_file: Some(f.name.clone()),
-                    offset: from,
-                    ..Default::default()
-                },
-                old.token.as_deref(),
-            )?)
-            .await
-            .map_err(|s| old.failed(&format!("download {what}"), &s))?
-            .into_inner();
-        let mut at = from;
-        let mut header = Some(header);
-        let gone = || Failure::usage(&format!("node {:?} ended the upload of {what}", new.id));
-        loop {
-            let Some(chunk) = chunks
-                .message()
+    let download = |from: u64, mut feed: Feed| {
+        let what = &what;
+        async move {
+            let mut chunks = old
+                .admin
+                .clone()
+                .backup_download(request(
+                    BackupDownloadRequest {
+                        partition: p.to_owned(),
+                        fenced_file: Some(f.name.clone()),
+                        offset: from,
+                        ..Default::default()
+                    },
+                    old.token.as_deref(),
+                )?)
                 .await
                 .map_err(|s| old.failed(&format!("download {what}"), &s))?
-            else {
-                return Err(Failure::usage(&format!(
-                    "node {:?}'s download of {what} ended early: run the move again to resume",
-                    old.id
-                )));
-            };
-            if !chunk.data.is_empty() && chunk.offset != at {
-                return Err(Failure::usage(&format!(
-                    "node {:?} sent {what} from {} where {at} was expected",
-                    old.id, chunk.offset
-                )));
-            }
-            let data: Bytes = chunk.data;
-            let mut k = 0;
-            // At least one message, so a file with nothing left to send still carries its
-            // header (an empty file; or every byte arrived but the upload isn't complete).
-            while k < data.len() || header.is_some() {
-                let n = (data.len() - k).min(max);
-                tx.send(PartitionUploadChunk {
-                    header: header.take(),
-                    offset: at,
-                    data: data.slice(k..k + n),
-                })
-                .await
-                .map_err(|_| gone())?;
-                k += n;
-                at += n as u64;
-            }
-            if chunk.total != 0 {
-                if chunk.total != f.bytes || chunk.sha256 != f.sha256 {
+                .into_inner();
+            let gone = |_| Failure::usage(&format!("node {:?} ended the upload of {what}", new.id));
+            loop {
+                let Some(chunk) = chunks
+                    .message()
+                    .await
+                    .map_err(|s| old.failed(&format!("download {what}"), &s))?
+                else {
                     return Err(Failure::usage(&format!(
-                        "node {:?} sent {what} as {} bytes with another SHA-256 than its \
-                         close listed ({} bytes): close it again and rerun the move",
-                        old.id, chunk.total, f.bytes
+                        "node {:?}'s download of {what} ended early: run the move again to resume",
+                        old.id
+                    )));
+                };
+                if !chunk.data.is_empty() && chunk.offset != feed.at() {
+                    return Err(Failure::usage(&format!(
+                        "node {:?} sent {what} from {} where {} was expected",
+                        old.id,
+                        chunk.offset,
+                        feed.at()
                     )));
                 }
-                return Ok(at - from);
+                feed.send(chunk.data).await.map_err(gone)?;
+                if chunk.total != 0 {
+                    if chunk.total != f.bytes || chunk.sha256 != f.sha256 {
+                        return Err(Failure::usage(&format!(
+                            "node {:?} sent {what} as {} bytes with another SHA-256 than its \
+                             close listed ({} bytes): close it again and rerun the move",
+                            old.id, chunk.total, f.bytes
+                        )));
+                    }
+                    return Ok(feed.at() - from);
+                }
             }
         }
     };
-    let upload = async {
-        new.admin
-            .clone()
-            .partition_upload(request(Chunks(rx), new.token.as_deref())?)
-            .await
-            .map_err(|s| new.failed(&format!("upload {what}"), &s))
-            .map(tonic::Response::into_inner)
+    let pass = upload_file(
+        &mut new.admin.clone(),
+        new.token.as_deref(),
+        header,
+        download,
+    )
+    .await;
+    let (sent, reply) = match pass {
+        // NEW holds the whole file, or is installing the set an earlier run staged: nothing
+        // is sent. The set it installs is compared with the closed set like any other.
+        Ok(None) => return Ok(0),
+        Ok(Some(done)) => done,
+        Err(Stopped::Request(f) | Stopped::Source(f)) => return Err(f),
+        Err(Stopped::Status(s)) => {
+            return Err(new.failed(&format!("upload status of {what}"), &s));
+        }
+        Err(Stopped::Upload(s)) => return Err(new.failed(&format!("upload {what}"), &s)),
     };
-    let (sent, uploaded) = tokio::join!(download, upload);
-    let sent = sent?;
-    let reply = uploaded?;
     if !reply.complete {
         return Err(Failure::usage(&format!(
             "node {:?} holds {} of {what}'s {} bytes, not complete: run the move again to \

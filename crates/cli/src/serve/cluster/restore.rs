@@ -31,11 +31,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
+use prost::bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -45,12 +44,12 @@ use super::cli::{
     CopyCheck, NodeArgs, Restoring, channel, column, relocate_as, report, request, set_map, url_of,
 };
 use super::map;
+use super::transfer::{Feed, Stopped, upload_file};
 use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{
-    self, ClusterMap, GetMapRequest, LocalPartitionState, PartitionFile, PartitionUploadChunk,
-    PartitionUploadHeader, PartitionUploadPurpose, PartitionUploadStatusRequest, StampRequest,
-    StatusRequest,
+    self, ClusterMap, GetMapRequest, LocalPartitionState, PartitionFile, PartitionUploadHeader,
+    PartitionUploadPurpose, StampRequest, StatusRequest,
 };
 
 /// What `phdb cluster restore` was asked.
@@ -1101,16 +1100,6 @@ async fn live_map(
     }
 }
 
-/// A client stream fed by a channel.
-struct Chunks(tokio::sync::mpsc::Receiver<PartitionUploadChunk>);
-
-impl futures_core::Stream for Chunks {
-    type Item = PartitionUploadChunk;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
-    }
-}
-
 /// Uploads `job`'s copy to its node as a restore's set (the main file alone), resuming
 /// from what the node holds after a break. The upload id comes from the copy and the
 /// node, so a restore run again resumes it.
@@ -1146,65 +1135,35 @@ async fn upload(
     let mut admin = proto::admin_client::AdminClient::new(ch);
     let mut breaks = 0;
     loop {
-        let sent = async {
-            let st = admin
-                .partition_upload_status(
-                    request(
-                        PartitionUploadStatusRequest {
-                            upload_id: header.upload_id.clone(),
-                            partition: header.partition.clone(),
-                        },
-                        token,
-                    )
-                    .map_err(Ok)?,
-                )
-                .await
-                .map_err(Err)?
-                .into_inner();
-            // Complete, or an install of the partition's set is in progress there (a run
-            // that stopped in it): the stamp finishes it (#1848).
-            if st.complete || st.installing {
-                return Ok(true);
-            }
-            let max = usize::try_from(st.max_chunk)
-                .unwrap_or(usize::MAX)
-                .max(1 << 10);
-            let (tx, rx) = tokio::sync::mpsc::channel(4);
-            let (path, header, from) = (c.path.clone(), header.clone(), st.received);
-            let reader = tokio::spawn(async move {
+        let read = |from: u64, mut feed: Feed| {
+            let path = c.path.clone();
+            async move {
                 let mut f = tokio::fs::File::open(&path).await?;
                 f.seek(std::io::SeekFrom::Start(from)).await?;
-                let mut offset = from;
-                let mut first = Some(header);
-                let mut buf = vec![0u8; max];
+                let mut buf = vec![0u8; feed.max()];
                 loop {
                     let n = f.read(&mut buf).await?;
                     // The header goes first even with nothing left to send: the node then
-                    // finishes the file.
-                    if n == 0 && first.is_none() {
+                    // finishes the file. The node ending the upload isn't the reader's
+                    // error: its answer says why.
+                    let sent = feed.send(Bytes::copy_from_slice(&buf[..n])).await;
+                    if sent.is_err() || n == 0 {
                         return Ok::<(), std::io::Error>(());
                     }
-                    let chunk = PartitionUploadChunk {
-                        header: first.take(),
-                        offset,
-                        data: buf[..n].to_vec().into(),
-                    };
-                    offset += n as u64;
-                    if tx.send(chunk).await.is_err() || n == 0 {
-                        return Ok(());
-                    }
                 }
-            });
-            let reply = admin
-                .partition_upload(request(Chunks(rx), token).map_err(Ok)?)
-                .await;
-            reader
-                .await
-                .map_err(|e| Ok(Failure::usage(&what(&e.to_string()))))?
-                .map_err(|e| Ok(Failure::io(&what("read the copy"), &e)))?;
-            Ok::<bool, Result<Failure, tonic::Status>>(reply.map_err(Err)?.into_inner().complete)
-        }
-        .await;
+            }
+        };
+        // `Ok`: whether the node holds the whole file. `Err(Ok)`: final. `Err(Err)`: the
+        // node's status, a refusal or a break.
+        let sent = match upload_file(&mut admin, token, header.clone(), read).await {
+            // Complete, or an install of the partition's set is in progress there (a run
+            // that stopped in it): the stamp finishes it (#1848).
+            Ok(None) => Ok(true),
+            Ok(Some(((), reply))) => Ok(reply.complete),
+            Err(Stopped::Request(f)) => Err(Ok(f)),
+            Err(Stopped::Source(e)) => Err(Ok(Failure::io(&what("read the copy"), &e))),
+            Err(Stopped::Status(s) | Stopped::Upload(s)) => Err(Err(s)),
+        };
         match sent {
             Ok(true) => return Ok(()),
             Err(Ok(f)) => return Err(f),
