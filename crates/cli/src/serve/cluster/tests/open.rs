@@ -351,6 +351,7 @@ fn opened_off_the_others_cores_alone() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        memory: None,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -666,6 +667,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        memory: None,
         previous_nodes: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
@@ -772,6 +774,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
+        memory: None,
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),

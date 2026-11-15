@@ -426,6 +426,11 @@ impl MemCore {
     /// a missing store is `Ok(None)`, and the store starts no thread of
     /// the crate's: its forgetter and IVF rebalancer are taken and dropped, since nothing may
     /// write in the background there.
+    ///
+    /// `own_loops` (a writer on a cluster partition, #1915): the store starts no thread of
+    /// the crate's either, and keeps its forgetter and rebalancer for the caller to run
+    /// ([`take_loops`](Self::take_loops)) under the partition's write gate. A store it creates
+    /// is created without them and opened again as an existing one is.
     pub(crate) fn open_in(
         db: &Pigeonhole,
         name: &str,
@@ -433,8 +438,25 @@ impl MemCore {
         expected: Option<&str>,
         create: Option<&Create>,
         budget: (u64, u64),
+        own_loops: bool,
     ) -> std::result::Result<Option<Self>, OpenError> {
-        let exists = db.tables().iter().any(|t| *t == format!("mem_{name}"));
+        let mut exists = db.tables().iter().any(|t| *t == format!("mem_{name}"));
+        if !exists
+            && own_loops
+            && let Some(create) = create
+        {
+            // Created without the crate's threads, then opened below as an existing store.
+            let options = create(embedder.as_deref()).map_err(OpenError::Create)?;
+            let opened = OpenOptions::new()
+                .without_embeddings()
+                .own_forgetter()
+                .own_rebalancer();
+            let made = Store::create_with(db, name, options, opened).map_err(OpenError::Store)?;
+            drop(made.take_forgetter());
+            drop(made.take_rebalancer());
+            drop(made);
+            exists = true;
+        }
         let store = if exists {
             // A probe reads the pinned model; it owns its forgetter and rebalancer, so it
             // starts no thread.
@@ -457,7 +479,9 @@ impl MemCore {
                 Some(m) => OpenOptions::new().model(m.id()),
                 None => OpenOptions::new().without_embeddings(),
             };
-            if create.is_some() {
+            if create.is_some() && own_loops {
+                Store::open_with(db, name, options.own_forgetter().own_rebalancer())
+            } else if create.is_some() {
                 Store::open_with(db, name, options)
             } else {
                 Store::open_with(db, name, options.own_forgetter().own_rebalancer()).inspect(|s| {
@@ -483,6 +507,22 @@ impl MemCore {
             default_budget: budget.0,
             max_budget: budget.1.max(budget.0),
         }))
+    }
+
+    /// The store's forgetter and IVF rebalancer, once, from a store opened with `own_loops`
+    /// ([`open_in`](Self::open_in)); `None`s otherwise, or once taken. Only `phdb serve`
+    /// runs them itself.
+    #[cfg(feature = "serve")]
+    pub(crate) fn take_loops(
+        &self,
+    ) -> (
+        Option<pigeonhole_memory::Forgetter>,
+        Option<pigeonhole_vector::Rebalancer>,
+    ) {
+        match &self.handle {
+            Handle::Writer { store, .. } => (store.take_forgetter(), store.take_rebalancer()),
+            Handle::Reader(_) => (None, None),
+        }
     }
 
     /// Opens the store `name` through a shared-memory reader, for recall only (`phdb mcp` on
@@ -890,9 +930,17 @@ mod tests {
         let model = EmbeddingModel::new("test-model", DIM as u32, Element::F32).unwrap();
         let ivf = IvfOptions::new().min_namespace_len(1).target_list_len(4);
         drop(Store::create(&db, "m", StoreOptions::new().embedding(model).ivf(ivf)).unwrap());
-        let core = MemCore::open_in(&db, "m", None, Some("test-model"), None, (1 << 20, 8 << 20))
-            .unwrap()
-            .unwrap();
+        let core = MemCore::open_in(
+            &db,
+            "m",
+            None,
+            Some("test-model"),
+            None,
+            (1 << 20, 8 << 20),
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let mut last = None;
         for i in 0..20 {
             let (done, _) = core
