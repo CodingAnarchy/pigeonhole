@@ -618,8 +618,10 @@ impl Router {
                 ServiceOp::Subscribe(_) => {
                     return self.subscribe(cluster, op, caller, prepaid).await;
                 }
+                // Boxed, as the fan-outs are: a cluster-only future awaited in place here
+                // would widen every call's future (#1902).
                 ServiceOp::MemoryWatch(_) => {
-                    return self.memory_watch(cluster, op, caller, prepaid).await;
+                    return Box::pin(self.memory_watch(cluster, op, caller, prepaid)).await;
                 }
                 // Served where the partition is, never forwarded (D317 ticket 8b).
                 ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
