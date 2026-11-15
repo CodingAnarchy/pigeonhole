@@ -127,12 +127,20 @@ impl IndexOptions {
                 self.target, self.nprobe
             )));
         }
+        // A vector's stored bytes: halves are two bytes a dimension (#1882: they were
+        // counted at one, so a half index's lists could reach twice the row bound). The
+        // target is stored with the index, so an index created before keeps its own; its
+        // rows can reach 8 MiB, which is a larger read, not a refusal.
+        let dim = u64::from(spec.dim());
         let bytes = match spec.element() {
-            Element::F32 => 4 * u64::from(spec.dim()),
-            Element::Bit => u64::from(spec.dim()) / 8,
-            _ => u64::from(spec.dim()),
+            Element::F32 => 4 * dim,
+            Element::F16 | Element::BF16 => 2 * dim,
+            Element::I8 => dim,
+            Element::Bit => dim / 8,
+            // A later element type: counted at `f32`'s size until it's sized here.
+            _ => 4 * dim,
         };
-        let cap = (MAX_LIST_BYTES / (2 * bytes)).max(4);
+        let cap = (MAX_LIST_BYTES / (2 * bytes.max(1))).max(4);
         self.target = self.target.min(u32::try_from(cap).unwrap_or(u32::MAX));
         Ok(self)
     }
@@ -3129,6 +3137,27 @@ mod tests {
         let wide = VectorSpec::new(4096, Element::F32, pigeonhole::Metric::L2).unwrap();
         // 2 × target × 16 KiB ≤ 4 MiB.
         assert_eq!(IndexOptions::new().checked(&wide).unwrap().target, 128);
+        // #1882: halves at two bytes a dimension, `i8` at one. 2,048-dim halves: 2 × 512 ×
+        // 4 KiB = 4 MiB (they were counted at one byte, so kept the default 1,000, and a
+        // list at its split length was 8 MiB). 2,048-dim `i8` allows 1,024, so it keeps the
+        // default 1,000; `f32` 256. At 4,096 (the most), `i8` 512 and halves 256.
+        for (element, target) in [
+            (Element::F16, 512),
+            (Element::BF16, 512),
+            (Element::I8, 1_000),
+            (Element::F32, 256),
+        ] {
+            let spec = VectorSpec::new(2048, element, pigeonhole::Metric::L2).unwrap();
+            assert_eq!(
+                IndexOptions::new().checked(&spec).unwrap().target,
+                target,
+                "{element:?}"
+            );
+        }
+        let spec = VectorSpec::new(4096, Element::I8, pigeonhole::Metric::L2).unwrap();
+        assert_eq!(IndexOptions::new().checked(&spec).unwrap().target, 512);
+        let spec = VectorSpec::new(4096, Element::F16, pigeonhole::Metric::L2).unwrap();
+        assert_eq!(IndexOptions::new().checked(&spec).unwrap().target, 256);
         assert!(
             IndexOptions::new()
                 .target_list_len(3)
