@@ -453,7 +453,7 @@ impl Copier<'_> {
                     continue;
                 };
                 let mut sources = Vec::new();
-                mem_sources(set, &all, &mut sources);
+                mem_sources(set, &all, false, &mut sources);
                 let options = writer_options(&meta.options, t.table, f, t.id, self.created);
                 // Sized from the memtables' bytes, as a flush is (#1595: the target
                 // SST size here reserved a 64 MiB-aligned extent per family, so a copy of a

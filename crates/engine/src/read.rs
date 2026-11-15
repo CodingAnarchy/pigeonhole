@@ -1426,6 +1426,12 @@ impl ScanCursor {
         } else {
             self.spec.limit.saturating_sub(self.rows_emitted).max(1)
         });
+        // A scan of one row (`RowRead::cells` walks a row this way) ends at its row as a row
+        // read does: a filtered source's jump past the row stops there (#1924).
+        let one_row = matches!(
+            (&self.spec.start, &self.spec.end),
+            (Bound::Included(a), Bound::Included(b)) if a == b
+        );
         for &family in &self.families {
             // Nothing of this family in the tablet: no resolver, options or sources for it (a
             // table's empty families, #406). Located once, for the sources below too.
@@ -1448,6 +1454,7 @@ impl ScanCursor {
                 start,
                 end,
                 short,
+                one_row,
                 resolver.cursor_mut().sources_mut(),
             );
             if let Err(e) = filled {

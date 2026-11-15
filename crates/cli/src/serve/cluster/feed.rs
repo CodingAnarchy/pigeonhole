@@ -1461,9 +1461,10 @@ fn still_owner(node: &Node, partition: &str) -> Result<(), ApiError> {
     ))
 }
 
-/// `Cluster.ForwardSubscribe` over gRPC, routed by hand as `Feed.Subscribe` is: a ring entry
-/// goes to the forwarding node as the bytes it was encoded to once. Mounted outside the
-/// `Cluster` calls' small limit, since a feed stream lasts; it holds a `--max-streams` place.
+/// `Cluster.ForwardSubscribe` over gRPC, routed by hand as `Feed.Subscribe` is
+/// ([`EventsGrpc`](crate::serve::grpc::EventsGrpc)): a ring entry goes to the forwarding
+/// node as the bytes it was encoded to once. Mounted outside the `Cluster` calls' small
+/// limit, since a feed stream lasts; it holds a `--max-streams` place.
 #[derive(Clone)]
 pub(crate) struct ForwardSubscribeGrpc {
     pub(crate) node: Arc<Node>,
@@ -1471,76 +1472,36 @@ pub(crate) struct ForwardSubscribeGrpc {
     pub(crate) max_request_bytes: usize,
 }
 
-/// Its codec: the request decoded as the generated codec does, the events written by
-/// [`Out::encode`].
-struct ForwardSubscribeCodec;
+impl crate::serve::grpc::Events for ForwardSubscribeGrpc {
+    type Request = proto::ForwardSubscribeRequest;
 
-impl tonic::codec::Codec for ForwardSubscribeCodec {
-    type Encode = Out;
-    type Decode = proto::ForwardSubscribeRequest;
-    type Encoder = crate::serve::grpc::OutEncoder;
-    type Decoder = tonic_prost::ProstDecoder<proto::ForwardSubscribeRequest>;
-
-    fn encoder(&mut self) -> Self::Encoder {
-        crate::serve::grpc::OutEncoder
+    /// A forward carries a call the entry node took within its `--max-request-bytes`,
+    /// inside an envelope.
+    fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+            .saturating_add(super::forward::FORWARD_ENVELOPE)
     }
 
-    fn decoder(&mut self) -> Self::Decoder {
-        tonic_prost::ProstDecoder::default()
-    }
-}
-
-struct ForwardSubscribeSvc(ForwardSubscribeGrpc);
-
-impl tonic::server::ServerStreamingService<proto::ForwardSubscribeRequest> for ForwardSubscribeSvc {
-    type Response = Out;
-    type ResponseStream = crate::serve::grpc::GrpcEvents;
-    type Future = tonic::codegen::BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
-
-    fn call(&mut self, req: tonic::Request<proto::ForwardSubscribeRequest>) -> Self::Future {
-        let this = self.0.clone();
+    fn events(
+        self,
+        req: tonic::Request<proto::ForwardSubscribeRequest>,
+    ) -> tonic::codegen::BoxFuture<tonic::Response<crate::serve::grpc::GrpcEvents>, tonic::Status>
+    {
         Box::pin(async move {
-            let caller = this.node.caller(crate::serve::grpc::auth_header(&req))?;
-            this.node.allowed(
+            let caller = self.node.caller(crate::serve::grpc::auth_header(&req))?;
+            self.node.allowed(
                 &caller,
                 &[crate::serve::auth::Scope::Cluster],
                 "forward a subscription",
             )?;
-            this.node.maybe_pull(&caller, req.metadata());
-            this.node.catch_up(&caller, req.metadata()).await?;
-            let events = this
+            self.node.maybe_pull(&caller, req.metadata());
+            self.node.catch_up(&caller, req.metadata()).await?;
+            let events = self
                 .shared
                 .router
                 .serve_forwarded_subscribe(req.into_inner())
                 .await?;
             Ok(tonic::Response::new(crate::serve::grpc::GrpcEvents(events)))
-        })
-    }
-}
-
-impl<B> tower::Service<tonic::codegen::http::Request<B>> for ForwardSubscribeGrpc
-where
-    B: tonic::codegen::Body + Send + 'static,
-    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
-{
-    type Response = tonic::codegen::http::Response<tonic::body::Body>;
-    type Error = std::convert::Infallible;
-    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: tonic::codegen::http::Request<B>) -> Self::Future {
-        let svc = ForwardSubscribeSvc(self.clone());
-        let max = self.max_request_bytes;
-        Box::pin(async move {
-            let mut grpc = tonic::server::Grpc::new(ForwardSubscribeCodec)
-                .apply_max_message_size_config(
-                    Some(max.saturating_add(super::forward::FORWARD_ENVELOPE)),
-                    Some(usize::MAX),
-                );
-            Ok(grpc.server_streaming(svc, req).await)
         })
     }
 }
@@ -1584,6 +1545,36 @@ pub(super) mod tests {
         let e = starts([2, 3]).unwrap_err();
         assert_eq!(e.code, "FeedExpired", "{e:?}");
         assert!(e.message.contains("\"p2\" has another history"), "{e:?}");
+    }
+
+    #[test]
+    fn forward_subscribe_decodes_a_request_within_the_forward_envelope() {
+        // audit120's S-C2: a forwarded subscription carries a request the entry node took
+        // within its `--max-request-bytes`, inside an envelope, so this node decodes that
+        // much more. And it is mounted on its one path, so it refuses none (feed1248's S1
+        // on #1923: these two are all that tells it from `Feed.Subscribe` in the shell).
+        use crate::serve::grpc::Events;
+        use crate::serve::service::{Metrics, Service};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let limits = crate::serve::server_tests::limits();
+        let metrics = Arc::new(Metrics::default());
+        let service = Service::routing_only(limits, 2, Arc::clone(&metrics), None);
+        let forward = ForwardSubscribeGrpc {
+            node: crate::serve::cluster::tests::node(&dir, "a"),
+            shared: Arc::new(crate::serve::Shared {
+                router: crate::serve::router::Router::single(service),
+                tokens: crate::serve::auth::Tokens::parse("", "tokens").unwrap(),
+                limits,
+                metrics,
+                feed_runtimes: std::sync::OnceLock::new(),
+            }),
+            max_request_bytes: 1 << 20,
+        };
+        assert_eq!(
+            forward.max_request_bytes(),
+            (1 << 20) + crate::serve::cluster::forward::FORWARD_ENVELOPE
+        );
+        assert!(ForwardSubscribeGrpc::refuses("/pigeonhole.v1.Cluster/Other").is_none());
     }
 
     /// A runtime on a paused clock: virtual time, advanced only when every task waits.
