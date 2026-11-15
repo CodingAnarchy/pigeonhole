@@ -466,7 +466,7 @@ impl FrameDecoder {
     /// header or payload reaches there returns [`Within::More`] with the decoder as it was
     /// before that fragment, and a call with more of the frame fresh goes on from it. The
     /// skipped frame tail (12 bytes or fewer) needs no fresh bytes. With `fresh` the whole
-    /// frame, this is `decode`.
+    /// frame or more, this is `decode`.
     pub fn decode_within(&mut self, frame: &[u8], fresh: usize) -> crate::Result<Within> {
         if frame.len() != FRAME_SIZE {
             return Err(Error::Corrupt {
@@ -485,15 +485,18 @@ impl FrameDecoder {
                 self.pos = self.frame_start;
                 return Ok(Within::Decoded(None));
             }
-            if at + FRAGMENT_HEADER_LEN > fresh {
-                return Ok(Within::More);
-            }
             let h = &frame[at..at + FRAGMENT_HEADER_LEN];
             let len = usize::from(u16::from_le_bytes([h[8], h[9]]));
             let end = at + FRAGMENT_HEADER_LEN + len;
-            // The payload too, before anything that reads it is decided: a header of another
-            // epoch, or one running past the frame, is a stop on its own bytes.
-            if le_u32(h, 4) == self.epoch && end <= FRAME_SIZE && end > fresh {
+            // One compare on the usual path: `end` is at least the header's end, so a fragment
+            // wholly fresh passes both checks. Past `fresh`, a header not wholly fresh is never
+            // read; a fresh one's payload must be too before anything that reads it is decided,
+            // but a header of another epoch, or one running past the frame, is a stop on its own
+            // bytes.
+            if end > fresh
+                && (at + FRAGMENT_HEADER_LEN > fresh
+                    || (le_u32(h, 4) == self.epoch && end <= FRAME_SIZE))
+            {
                 return Ok(Within::More);
             }
             let ty = h[10];
