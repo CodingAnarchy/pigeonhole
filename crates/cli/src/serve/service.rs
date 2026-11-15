@@ -505,21 +505,52 @@ fn identity_fields(id: Option<&super::backup::CopyIdentity>) -> proto::BackupChu
     }
 }
 
-/// A download's offset past its copy's end.
-/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::backup::CHUNK) chunks with
-/// `send`, the last carrying the total, the SHA-256 and the identity: a download's copy, or a
-/// closed partition's file (D317 ticket 6). Stops early, `Ok`, once the client went away.
-async fn send_kept<F, Fut>(
+/// A download's chunks on their way to its client: what the task of a backup's download and
+/// of a closed partition's file sends through and ends with.
+struct Chunks {
+    tx: mpsc::Sender<Result<proto::BackupChunk, ApiError>>,
+    /// `--stream-idle-ms`: the longest one send waits.
+    idle: Duration,
+    /// What a client that took no chunk for `idle` is told: how it resumes.
+    stalled: &'static str,
+}
+
+impl Chunks {
+    /// Sends `chunk` within the idle limit; `false` once the client went away (it resumes).
+    async fn send(&self, chunk: proto::BackupChunk) -> Result<bool, ApiError> {
+        match tokio::time::timeout(self.idle, self.tx.send(Ok(chunk))).await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(_)) => Ok(false),
+            Err(_) => Err(ApiError::deadline(self.stalled)),
+        }
+    }
+
+    /// The download's end: counted with its `outcome`, and its error sent. Within the idle
+    /// limit, as a chunk: a heartbeat may still sit in the channel, and a dropped error would
+    /// end the stream as if it were whole (cli692's R1 on #1628).
+    async fn end(&self, outcome: Result<(), ApiError>, metrics: &Metrics, started: Instant) {
+        metrics.count(
+            DOWNLOAD,
+            outcome.as_ref().err().map(|e| e.code.as_str()),
+            started.elapsed(),
+        );
+        if let Err(e) = outcome {
+            let _ = tokio::time::timeout(self.idle, self.tx.send(Err(e))).await;
+        }
+    }
+}
+
+/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::backup::CHUNK) chunks
+/// through `chunks`, the last carrying the total, the SHA-256 and the identity: a download's
+/// copy, or a closed partition's file (D317 ticket 6). Stops early, `Ok`, once the client
+/// went away.
+async fn send_kept(
     kept: &super::backup::Kept,
     start: u64,
     id: &str,
     pool: &Arc<Semaphore>,
-    send: F,
-) -> Result<(), ApiError>
-where
-    F: Fn(proto::BackupChunk) -> Fut,
-    Fut: Future<Output = Result<bool, ApiError>>,
-{
+    chunks: &Chunks,
+) -> Result<(), ApiError> {
     let mut at = start;
     loop {
         let path = kept.path.clone();
@@ -550,13 +581,14 @@ where
             feed_token: kept.feed_token.clone().into(),
             ..identity_fields(last.then_some(kept.identity.as_ref()).flatten())
         };
-        if !send(chunk).await? || last {
+        if !chunks.send(chunk).await? || last {
             return Ok(());
         }
         at = next;
     }
 }
 
+/// A download's offset past its copy's end.
 pub(crate) fn past_the_copy(offset: u64, total: u64) -> ApiError {
     ApiError::invalid(format!(
         "offset {offset} is past the backup's {total} bytes"
@@ -1208,6 +1240,34 @@ pub(crate) struct Partition {
     catalog: AtomicU64,
 }
 
+/// What a partition is opened with, beside its database: [`Service::new`]'s and
+/// [`Service::for_partition`]'s, so each part of a [`Partition`] is built once.
+pub(crate) struct PartitionConfig {
+    /// `--backup-dir`'s backups: the node's one, which a cluster node's partitions share.
+    pub(crate) backups: Arc<super::backup::Backups>,
+    /// The CPUs the threads the server starts run on, off the shards': those of vector
+    /// indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2), the
+    /// backups' and `Replication.Follow`'s (a replica catching up reads and encodes at full
+    /// speed, cli692's F1 on #1583).
+    pub(crate) placement: Option<Arc<super::placement::Placement>>,
+    /// How its engine's threads were placed when it opened.
+    pub(crate) pinning: Pinning,
+    /// Its engine memory as resolved at open: a cluster node's partitions have one.
+    pub(crate) engine_memory: Option<super::placement::Memory>,
+}
+
+impl PartitionConfig {
+    /// A partition with `backups`, its threads not placed.
+    pub(crate) fn new(backups: Arc<super::backup::Backups>) -> Self {
+        Self {
+            backups,
+            placement: None,
+            pinning: Pinning::default(),
+            engine_memory: None,
+        }
+    }
+}
+
 impl Partition {
     /// Ends the threads that use the database, in order, before it closes: a bulk load's
     /// (its input has ended or was stopped, so it writes what came, and rebalances inline if
@@ -1243,24 +1303,36 @@ impl Partition {
     }
 
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
-    /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
+    /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b). Each
+    /// part is built once, from `config` and the partition's write `gate`.
     fn new(
         db: Pigeonhole,
         id: Option<&str>,
         limits: &Limits,
         feeds: &super::feed::FeedShared,
+        gate: Option<&Arc<super::gate::WriteGate>>,
+        config: PartitionConfig,
     ) -> Self {
         let metrics = match id {
             Some(id) => pigeonhole_otel::Config::new().attribute(PARTITION_ATTRIBUTE, id),
             None => pigeonhole_otel::Config::new(),
         };
+        // The node's one `Backups` keeps the first placement it's given (a `OnceLock`): a
+        // cluster node's partitions all pass the node's, so the later calls change nothing.
+        if let Some(p) = &config.placement {
+            config.backups.place(p);
+        }
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
-            pinning: Pinning::default(),
-            engine_memory: std::sync::Mutex::new(None),
-            backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
-            indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None, None)),
-            bulk: super::bulk::BulkLoads::default(),
+            pinning: config.pinning,
+            engine_memory: std::sync::Mutex::new(config.engine_memory),
+            backups: config.backups,
+            indexes: Arc::new(super::indexes::Indexes::new(
+                db.clone(),
+                config.placement.clone(),
+                gate.cloned(),
+            )),
+            bulk: super::bulk::BulkLoads::new(config.placement),
             texts: Arc::new(super::texts::Texts::new(db.clone())),
             memory: None,
             schema: tokio::sync::Mutex::new(()),
@@ -1320,41 +1392,48 @@ impl Service {
             .expect("a test server serves its partition")
     }
 
-    /// A node serving `db`.
+    /// A node serving `db`, opened with `config`.
     pub(crate) fn new(
         db: Pigeonhole,
         limits: Limits,
         blocking_threads: usize,
         metrics: Arc<Metrics>,
+        config: PartitionConfig,
     ) -> Self {
         let feeds = super::feed::FeedShared::new(limits.max_catch_up);
-        let part = Partition::new(db, None, &limits, &feeds);
-        Self::node(Some(part), limits, blocking_threads, metrics, feeds)
+        let placement = config.placement.clone();
+        let part = Partition::new(db, None, &limits, &feeds, None, config);
+        Self::node(
+            Some(part),
+            limits,
+            blocking_threads,
+            metrics,
+            feeds,
+            placement,
+        )
     }
 
     /// Partition `id` on `db`, one of this cluster node's (D317 ticket 8a): its own database,
     /// tables, indexes, feeds and session table (ids `<id>:<hex>`), sharing the node's
     /// budgets, pools, connections, metrics, limits and session caps, and the node's one
-    /// `backups` (simp724's N1 on #1711). Calls are admitted once, by whichever service
-    /// takes them (cli692's Q1).
+    /// `backups` in `config` (simp724's N1 on #1711). Its writes pass `gate`. Calls are
+    /// admitted once, by whichever service takes them (cli692's Q1).
     pub(crate) fn for_partition(
         &self,
         db: Pigeonhole,
         id: &str,
-        backups: &Arc<super::backup::Backups>,
-        pinning: Pinning,
-        memory: super::placement::Memory,
         gate: Arc<super::gate::WriteGate>,
+        config: PartitionConfig,
     ) -> Self {
-        let mut part = Partition::new(db, Some(id), &self.limits, &self.feed_shared);
-        part.indexes = Arc::new(super::indexes::Indexes::new(
-            part.db.clone(),
-            None,
-            Some(Arc::clone(&gate)),
-        ));
-        part.backups = Arc::clone(backups);
-        part.pinning = pinning;
-        part.engine_memory = std::sync::Mutex::new(Some(memory));
+        let placement = config.placement.clone();
+        let part = Partition::new(
+            db,
+            Some(id),
+            &self.limits,
+            &self.feed_shared,
+            Some(&gate),
+            config,
+        );
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
@@ -1375,21 +1454,23 @@ impl Service {
             metrics: Arc::clone(&self.metrics),
             connections: Arc::clone(&self.connections),
             replica: None,
-            placement: None,
+            placement,
             replies: Arc::clone(&self.replies),
             gate: Some(gate),
             part: Some(part),
         }
     }
 
-    /// A cluster node the map gives no partition: it only routes (D317 ticket 2).
+    /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
+    /// threads run on `placement`'s CPUs, as [`PartitionConfig::placement`] says.
     pub(crate) fn routing_only(
         limits: Limits,
         blocking_threads: usize,
         metrics: Arc<Metrics>,
+        placement: Option<Arc<super::placement::Placement>>,
     ) -> Self {
         let feeds = super::feed::FeedShared::new(limits.max_catch_up);
-        Self::node(None, limits, blocking_threads, metrics, feeds)
+        Self::node(None, limits, blocking_threads, metrics, feeds, placement)
     }
 
     fn node(
@@ -1398,6 +1479,7 @@ impl Service {
         blocking_threads: usize,
         metrics: Arc<Metrics>,
         feed_shared: super::feed::FeedShared,
+        placement: Option<Arc<super::placement::Placement>>,
     ) -> Self {
         let session_caps = Arc::new(super::sessions::Caps::default());
         Self {
@@ -1423,7 +1505,7 @@ impl Service {
             limits,
             metrics,
             replica: None,
-            placement: None,
+            placement,
             gate: None,
             part,
         }
@@ -1509,45 +1591,6 @@ impl Service {
             part.feeds.fail_all();
         }
         self.sessions.drop_idle();
-    }
-
-    /// Takes backups in `dir` (`--backup-dir`), at most `max_backups` at once. Without a
-    /// directory, `Backup` and `BackupDownload` are refused. Fails at startup if the
-    /// directory, or its download directory, isn't usable.
-    pub(crate) fn backups(
-        mut self,
-        dir: Option<&std::path::Path>,
-        max_backups: usize,
-    ) -> Result<Self, String> {
-        if let Some(part) = &mut self.part {
-            part.backups = super::backup::Backups::new(dir, max_backups)?;
-            if let Some(p) = &self.placement {
-                part.backups.place(p);
-            }
-        }
-        Ok(self)
-    }
-
-    /// Runs the threads the server starts on `placement`'s CPUs, off the shards': those of
-    /// vector indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2) and
-    /// `Replication.Follow`'s (a replica catching up reads and encodes at full speed,
-    /// cli692's F1 on #1583).
-    pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
-        let paused = self.replica.is_some();
-        if let Some(part) = &mut self.part {
-            let indexes = super::indexes::Indexes::new(
-                part.db.clone(),
-                Some(Arc::clone(placement)),
-                self.gate.clone(),
-            );
-            // A replica's pause survives the rebuild, whichever is set first.
-            indexes.pause_rebalancing(paused);
-            part.indexes = Arc::new(indexes);
-            part.bulk.placement = Some(Arc::clone(placement));
-            part.backups.place(placement);
-        }
-        self.placement = Some(Arc::clone(placement));
-        self
     }
 
     /// Serves the store `slot` holds, if any, as the `Memory` service, with at most `calls`
@@ -2664,31 +2707,18 @@ impl Service {
             return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
-        let (backups, pool, idle) = (
-            Arc::clone(&part.backups),
-            Arc::clone(&self.blocking),
-            self.limits.stream_idle,
-        );
+        let chunks = Chunks {
+            tx,
+            idle: self.limits.stream_idle,
+            stalled: "the client took no backup chunk for --stream-idle-ms; resume with \
+                      backup_id and the offset it reached",
+        };
+        let (backups, pool) = (Arc::clone(&part.backups), Arc::clone(&self.blocking));
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         let (task_id, start, mut task_copy) = (id.clone(), r.offset, copy.clone());
         let want = r.partition;
         tokio::spawn(async move {
-            // Sends `chunk` within the idle limit; `false` once the client went away (it
-            // resumes with the id).
-            let send = |chunk: proto::BackupChunk| {
-                let tx = tx.clone();
-                async move {
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => Ok(true),
-                        Ok(Err(_)) => Ok(false),
-                        Err(_) => Err(ApiError::deadline(
-                            "the client took no backup chunk for --stream-idle-ms; resume \
-                             with backup_id and the offset it reached",
-                        )),
-                    }
-                }
-            };
             let outcome: Result<(), ApiError> = async {
                 // The copy, with heartbeats while it's written (#1611).
                 let kept = loop {
@@ -2707,7 +2737,7 @@ impl Service {
                         feed_token: feed_token.into(),
                         ..Default::default()
                     };
-                    if !send(beat).await? {
+                    if !chunks.send(beat).await? {
                         return Ok(());
                     }
                     tokio::select! {
@@ -2733,19 +2763,10 @@ impl Service {
                         "backup {task_id} is of partition {of:?}, not {want:?}"
                     )));
                 }
-                send_kept(&kept, start, &task_id, &pool, send).await
+                send_kept(&kept, start, &task_id, &pool, &chunks).await
             }
             .await;
-            metrics.count(
-                DOWNLOAD,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            // Within the idle limit, as a chunk: a heartbeat may still sit in the channel, and
-            // a dropped error would end the stream as if it were whole (cli692's R1 on #1628).
-            if let Err(e) = outcome {
-                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
-            }
+            chunks.end(outcome, &metrics, started).await;
             backups.release(&task_id);
             drop(slot);
         });
@@ -2788,33 +2809,19 @@ impl Service {
         }
         let slot = self.stream_slot()?;
         let (tx, rx) = mpsc::channel(1);
-        let (pool, idle) = (Arc::clone(&self.blocking), self.limits.stream_idle);
+        let chunks = Chunks {
+            tx,
+            idle: self.limits.stream_idle,
+            stalled: "the client took no chunk for --stream-idle-ms; resume from the offset \
+                      it reached",
+        };
+        let pool = Arc::clone(&self.blocking);
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         let (start, task_kept) = (r.offset, kept.clone());
         tokio::spawn(async move {
-            let send = |chunk: proto::BackupChunk| {
-                let tx = tx.clone();
-                async move {
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => Ok(true),
-                        Ok(Err(_)) => Ok(false),
-                        Err(_) => Err(ApiError::deadline(
-                            "the client took no chunk for --stream-idle-ms; resume from the \
-                             offset it reached",
-                        )),
-                    }
-                }
-            };
-            let outcome = send_kept(&task_kept, start, "", &pool, send).await;
-            metrics.count(
-                DOWNLOAD,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            if let Err(e) = outcome {
-                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
-            }
+            let outcome = send_kept(&task_kept, start, "", &pool, &chunks).await;
+            chunks.end(outcome, &metrics, started).await;
             drop(slot);
         });
         Ok(super::backup::Download {

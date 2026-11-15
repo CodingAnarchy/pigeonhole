@@ -167,15 +167,17 @@ fn a_call_on_a_partition_closed_under_it_answers_partition_unavailable() {
         crate::serve::server_tests::limits(),
         2,
         Arc::new(crate::serve::service::Metrics::default()),
+        None,
     );
     let backups = crate::serve::backup::Backups::new(None, 1).unwrap();
     let part = service.for_partition(
         db.clone(),
         "p1",
-        &backups,
-        crate::serve::service::Pinning::default(),
-        crate::serve::placement::Memory::defaults(1),
         crate::serve::gate::WriteGate::opened("p1", false),
+        crate::serve::service::PartitionConfig {
+            engine_memory: Some(crate::serve::placement::Memory::defaults(1)),
+            ..crate::serve::service::PartitionConfig::new(backups)
+        },
     );
     db.close().unwrap();
     let get = ServiceOp::Get(super::super::proto::GetRequest {

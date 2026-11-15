@@ -1148,7 +1148,7 @@ fn data_node_placed(
     // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
     node.load_fences().unwrap();
     let metrics = Arc::new(Metrics::default());
-    let service = Service::routing_only(limits, 2, Arc::clone(&metrics));
+    let service = Service::routing_only(limits, 2, Arc::clone(&metrics), None);
     let backup_dir = dir.join(format!("backups-{id}"));
     std::fs::create_dir_all(&backup_dir).unwrap();
     let backups = crate::serve::backup::Backups::new(Some(&backup_dir), 1).unwrap();
@@ -1166,7 +1166,6 @@ fn data_node_placed(
     .unwrap_or_else(|f| panic!("{}", f.message()));
     for (i, (p, db)) in locals.into_iter().enumerate() {
         let db = db.unwrap_or_else(|| test_partition(dir, p));
-        let pinning = crate::serve::service::Pinning::default();
         let memory = memories
             .as_ref()
             .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
@@ -1178,7 +1177,15 @@ fn data_node_placed(
         }
         parts.push((
             p.to_owned(),
-            service.for_partition(db.clone(), p, &backups, pinning, memory, gate),
+            service.for_partition(
+                db.clone(),
+                p,
+                gate,
+                crate::serve::service::PartitionConfig {
+                    engine_memory: Some(memory),
+                    ..crate::serve::service::PartitionConfig::new(Arc::clone(&backups))
+                },
+            ),
         ));
         dbs.push(db);
     }
