@@ -2077,29 +2077,57 @@ impl FeedReader {
     /// D320: evicts the largest-keyed records kept while the read-ahead is over its budget,
     /// or past the cutoff, lowering the cutoff below each. A held share counts at its id + 1
     /// (its round's apply seqno is above its id), and goes with every share of its round; a
-    /// decided round goes with its shares.
+    /// decided round goes with its shares. Returns whether it evicted anything.
+    ///
+    /// Run after every record a pass keeps: the check stays inline and the eviction is out
+    /// of line, so a reader that keeps up pays only the check (callgrind's feed-drain on
+    /// x86, #1922: with the eviction in it, `trim` stopped being inlined).
+    #[inline]
     fn trim(&mut self) -> bool {
-        let mut evicted = false;
+        let (top_ready, top_held) = self.trim_tops();
+        if !self.trim_due(top_ready, top_held) {
+            return false;
+        }
+        self.evict_over();
+        true
+    }
+
+    /// The largest key kept, and the largest held share's id + 1 (not a share of a round
+    /// whose id + 1 is at or below `delivered`, simp724's N1 on #1622: a rewind can re-read a
+    /// delivered round's share without its Decision, and evicting it would put the cutoff at
+    /// or below `delivered` for nothing; rule C drops it).
+    #[inline]
+    fn trim_tops(&self) -> (Option<Seqno>, Option<Seqno>) {
+        let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
+        let top_held = self
+            .held
+            .range((self.delivered, 0)..)
+            .next_back()
+            .map(|(&(id, _), _)| id.saturating_add(1));
+        (top_ready, top_held)
+    }
+
+    /// Whether [`trim`](Self::trim) has anything to evict.
+    #[inline]
+    fn trim_due(&self, top_ready: Option<Seqno>, top_held: Option<Seqno>) -> bool {
+        let c = self.ahead.cutoff;
+        self.ahead.bytes > self.ahead.budget
+            || top_ready.is_some_and(|k| k > c)
+            || top_held.is_some_and(|k| k > c)
+    }
+
+    /// [`trim`](Self::trim)'s eviction, once it's due.
+    #[cold]
+    #[inline(never)]
+    fn evict_over(&mut self) {
+        // The cutoff falls only here: the streams' skip indexes are built from now on
+        // (#1827), and a reader that never gets here pays nothing for them per record.
+        self.indexing = true;
         loop {
-            let c = self.ahead.cutoff;
-            let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
-            // Not a share of a round whose id + 1 is at or below `delivered` (simp724's N1 on
-            // #1622): a rewind can re-read a delivered round's share without its Decision, and
-            // evicting it would put the cutoff at or below `delivered` for nothing. Rule C
-            // drops it.
-            let top_held = self
-                .held
-                .range((self.delivered, 0)..)
-                .next_back()
-                .map(|(&(id, _), _)| id.saturating_add(1));
-            let over = self.ahead.bytes > self.ahead.budget;
-            if !over && top_ready.is_none_or(|k| k <= c) && top_held.is_none_or(|k| k <= c) {
-                return evicted;
+            let (top_ready, top_held) = self.trim_tops();
+            if !self.trim_due(top_ready, top_held) {
+                return;
             }
-            // The cutoff falls only here: the streams' skip indexes are built from now on
-            // (#1827), and a reader that never gets here pays nothing for them per record.
-            self.indexing = true;
-            evicted = true;
             match (top_ready, top_held) {
                 (Some(k), None) => self.evict_ready(k),
                 (Some(k), Some(h)) if k >= h => self.evict_ready(k),
@@ -2111,7 +2139,7 @@ impl FeedReader {
                     self.evict_round(id);
                     self.ahead.lower_cutoff(id);
                 }
-                (None, None) => return evicted,
+                (None, None) => return,
             }
         }
     }
