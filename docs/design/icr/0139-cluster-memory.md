@@ -50,7 +50,7 @@
 
 **proto (`cluster.proto`, additive):**
 - `ForwardRequest.op` arms `recall_pool = 40` (`RecallPoolRequest`) and `recall_bodies = 41` (`RecallBodiesRequest`); `ForwardResponse.reply` arms `recall_pool = 23` (`RecallPoolResponse`) and `recall_bodies = 24` (`RecallBodiesResponse`).
-- `RecallPoolRequest { request = 1 (RecallRequest), now_us = 2, hop = 3 (bytes) }`: the pool, or with `hop` (a `RecallHop`'s bytes) the partition's part of that hop. Field 3 was `repeated bytes seeds` in the design and is `bytes hop` (this amendment, unshipped).
+- `RecallPoolRequest { request = 1 (RecallRequest), now_us = 2, hop = 3 (bytes) }`: the pool, or with `hop` (a `RecallHop`'s bytes) the partition's part of that hop. Field 3 was `repeated bytes seeds` in the design and is `bytes hop` (this amendment, confirmed by the coordinator 2026-11-15 and recorded in `.coord/numbers.md`; allowed because ICR 0139 hadn't shipped).
 - `RecallPoolResponse { pool = 1 }`: a `RecallPool`'s bytes, or a `RecallHopPart`'s for a hop.
 - `RecallBodiesRequest { request = 1, ids = 2 }`, `RecallBodiesResponse { bodies = 1 }`.
 - `ForwardMemoryWatchRequest { map_version = 1, caller = 2, partition = 3, request = 4 }` and `Cluster.ForwardMemoryWatch` are defined here and served from PR 2b (Watch).
