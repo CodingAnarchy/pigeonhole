@@ -748,6 +748,7 @@ fn open_lanes(
             g.lo.as_deref(),
             g.hi.as_deref(),
             false,
+            false,
             resolver.cursor_mut().sources_mut(),
         );
         if let Err(e) = filled {
