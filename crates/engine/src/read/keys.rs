@@ -461,7 +461,7 @@ impl KeyCursor {
             let mut mems = Vec::new();
             if let Some(set) = located.mems {
                 let mut out = Vec::new();
-                mem_sources(set, &filter, &mut out);
+                mem_sources(set, &filter, false, &mut out);
                 mems.extend(out.into_iter().map(Some));
             }
             let (mut ssts, mut levels) = (Vec::new(), Vec::new());
