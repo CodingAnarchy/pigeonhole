@@ -5985,6 +5985,7 @@ impl serde::Serialize for FenceReason {
             Self::Unspecified => "FENCE_REASON_UNSPECIFIED",
             Self::Operator => "FENCE_REASON_OPERATOR",
             Self::AwaitingPeerMap => "FENCE_REASON_AWAITING_PEER_MAP",
+            Self::LeaseLapsed => "FENCE_REASON_LEASE_LAPSED",
         };
         serializer.serialize_str(variant)
     }
@@ -5999,6 +6000,7 @@ impl<'de> serde::Deserialize<'de> for FenceReason {
             "FENCE_REASON_UNSPECIFIED",
             "FENCE_REASON_OPERATOR",
             "FENCE_REASON_AWAITING_PEER_MAP",
+            "FENCE_REASON_LEASE_LAPSED",
         ];
 
         struct GeneratedVisitor;
@@ -6042,6 +6044,7 @@ impl<'de> serde::Deserialize<'de> for FenceReason {
                     "FENCE_REASON_UNSPECIFIED" => Ok(FenceReason::Unspecified),
                     "FENCE_REASON_OPERATOR" => Ok(FenceReason::Operator),
                     "FENCE_REASON_AWAITING_PEER_MAP" => Ok(FenceReason::AwaitingPeerMap),
+                    "FENCE_REASON_LEASE_LAPSED" => Ok(FenceReason::LeaseLapsed),
                     _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
                 }
             }
@@ -8858,6 +8861,613 @@ impl<'de> serde::Deserialize<'de> for KeyRange {
         deserializer.deserialize_struct("pigeonhole.v1.KeyRange", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for LeasePart {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.partition.is_empty() {
+            len += 1;
+        }
+        if self.epoch != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeasePart", len)?;
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        if self.epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("epoch", ToString::to_string(&self.epoch).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for LeasePart {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "partition",
+            "epoch",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Partition,
+            Epoch,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "partition" => Ok(GeneratedField::Partition),
+                            "epoch" => Ok(GeneratedField::Epoch),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = LeasePart;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.LeasePart")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<LeasePart, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut partition__ = None;
+                let mut epoch__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Epoch => {
+                            if epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("epoch"));
+                            }
+                            epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(LeasePart {
+                    partition: partition__.unwrap_or_default(),
+                    epoch: epoch__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.LeasePart", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for LeaseRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.cluster_id.is_empty() {
+            len += 1;
+        }
+        if !self.node_id.is_empty() {
+            len += 1;
+        }
+        if self.map_version != 0 {
+            len += 1;
+        }
+        if self.round != 0 {
+            len += 1;
+        }
+        if !self.parts.is_empty() {
+            len += 1;
+        }
+        if self.lease_ms != 0 {
+            len += 1;
+        }
+        if self.start != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseRequest", len)?;
+        if !self.cluster_id.is_empty() {
+            struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
+        }
+        if !self.node_id.is_empty() {
+            struct_ser.serialize_field("node_id", &self.node_id)?;
+        }
+        if self.map_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("map_version", ToString::to_string(&self.map_version).as_str())?;
+        }
+        if self.round != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("round", ToString::to_string(&self.round).as_str())?;
+        }
+        if !self.parts.is_empty() {
+            struct_ser.serialize_field("parts", &self.parts)?;
+        }
+        if self.lease_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("lease_ms", ToString::to_string(&self.lease_ms).as_str())?;
+        }
+        if self.start != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("start", ToString::to_string(&self.start).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for LeaseRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "cluster_id",
+            "clusterId",
+            "node_id",
+            "nodeId",
+            "map_version",
+            "mapVersion",
+            "round",
+            "parts",
+            "lease_ms",
+            "leaseMs",
+            "start",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            ClusterId,
+            NodeId,
+            MapVersion,
+            Round,
+            Parts,
+            LeaseMs,
+            Start,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "clusterId" | "cluster_id" => Ok(GeneratedField::ClusterId),
+                            "nodeId" | "node_id" => Ok(GeneratedField::NodeId),
+                            "mapVersion" | "map_version" => Ok(GeneratedField::MapVersion),
+                            "round" => Ok(GeneratedField::Round),
+                            "parts" => Ok(GeneratedField::Parts),
+                            "leaseMs" | "lease_ms" => Ok(GeneratedField::LeaseMs),
+                            "start" => Ok(GeneratedField::Start),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = LeaseRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.LeaseRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<LeaseRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut cluster_id__ = None;
+                let mut node_id__ = None;
+                let mut map_version__ = None;
+                let mut round__ = None;
+                let mut parts__ = None;
+                let mut lease_ms__ = None;
+                let mut start__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::ClusterId => {
+                            if cluster_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("clusterId"));
+                            }
+                            cluster_id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::NodeId => {
+                            if node_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nodeId"));
+                            }
+                            node_id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::MapVersion => {
+                            if map_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("mapVersion"));
+                            }
+                            map_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Round => {
+                            if round__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("round"));
+                            }
+                            round__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Parts => {
+                            if parts__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("parts"));
+                            }
+                            parts__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::LeaseMs => {
+                            if lease_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leaseMs"));
+                            }
+                            lease_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Start => {
+                            if start__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("start"));
+                            }
+                            start__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(LeaseRequest {
+                    cluster_id: cluster_id__.unwrap_or_default(),
+                    node_id: node_id__.unwrap_or_default(),
+                    map_version: map_version__.unwrap_or_default(),
+                    round: round__.unwrap_or_default(),
+                    parts: parts__.unwrap_or_default(),
+                    lease_ms: lease_ms__.unwrap_or_default(),
+                    start: start__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.LeaseRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for LeaseResponse {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.newer_map_version != 0 {
+            len += 1;
+        }
+        if !self.granted.is_empty() {
+            len += 1;
+        }
+        if !self.withheld.is_empty() {
+            len += 1;
+        }
+        if self.grace_remaining_ms != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseResponse", len)?;
+        if self.newer_map_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("newer_map_version", ToString::to_string(&self.newer_map_version).as_str())?;
+        }
+        if !self.granted.is_empty() {
+            struct_ser.serialize_field("granted", &self.granted)?;
+        }
+        if !self.withheld.is_empty() {
+            struct_ser.serialize_field("withheld", &self.withheld)?;
+        }
+        if self.grace_remaining_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("grace_remaining_ms", ToString::to_string(&self.grace_remaining_ms).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for LeaseResponse {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "newer_map_version",
+            "newerMapVersion",
+            "granted",
+            "withheld",
+            "grace_remaining_ms",
+            "graceRemainingMs",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            NewerMapVersion,
+            Granted,
+            Withheld,
+            GraceRemainingMs,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "newerMapVersion" | "newer_map_version" => Ok(GeneratedField::NewerMapVersion),
+                            "granted" => Ok(GeneratedField::Granted),
+                            "withheld" => Ok(GeneratedField::Withheld),
+                            "graceRemainingMs" | "grace_remaining_ms" => Ok(GeneratedField::GraceRemainingMs),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = LeaseResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.LeaseResponse")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<LeaseResponse, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut newer_map_version__ = None;
+                let mut granted__ = None;
+                let mut withheld__ = None;
+                let mut grace_remaining_ms__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::NewerMapVersion => {
+                            if newer_map_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("newerMapVersion"));
+                            }
+                            newer_map_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Granted => {
+                            if granted__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("granted"));
+                            }
+                            granted__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Withheld => {
+                            if withheld__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("withheld"));
+                            }
+                            withheld__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::GraceRemainingMs => {
+                            if grace_remaining_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("graceRemainingMs"));
+                            }
+                            grace_remaining_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(LeaseResponse {
+                    newer_map_version: newer_map_version__.unwrap_or_default(),
+                    granted: granted__.unwrap_or_default(),
+                    withheld: withheld__.unwrap_or_default(),
+                    grace_remaining_ms: grace_remaining_ms__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.LeaseResponse", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for LeaseWithheld {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.partition.is_empty() {
+            len += 1;
+        }
+        if !self.holder.is_empty() {
+            len += 1;
+        }
+        if self.remaining_ms != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseWithheld", len)?;
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        if !self.holder.is_empty() {
+            struct_ser.serialize_field("holder", &self.holder)?;
+        }
+        if self.remaining_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("remaining_ms", ToString::to_string(&self.remaining_ms).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for LeaseWithheld {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "partition",
+            "holder",
+            "remaining_ms",
+            "remainingMs",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Partition,
+            Holder,
+            RemainingMs,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "partition" => Ok(GeneratedField::Partition),
+                            "holder" => Ok(GeneratedField::Holder),
+                            "remainingMs" | "remaining_ms" => Ok(GeneratedField::RemainingMs),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = LeaseWithheld;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.LeaseWithheld")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<LeaseWithheld, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut partition__ = None;
+                let mut holder__ = None;
+                let mut remaining_ms__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Holder => {
+                            if holder__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("holder"));
+                            }
+                            holder__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::RemainingMs => {
+                            if remaining_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("remainingMs"));
+                            }
+                            remaining_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(LeaseWithheld {
+                    partition: partition__.unwrap_or_default(),
+                    holder: holder__.unwrap_or_default(),
+                    remaining_ms: remaining_ms__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.LeaseWithheld", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for LinkRequest {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -9329,6 +9939,9 @@ impl serde::Serialize for LocalPartition {
         if self.awaiting_peers {
             len += 1;
         }
+        if self.lease_remaining_ms != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -9377,6 +9990,11 @@ impl serde::Serialize for LocalPartition {
         if self.awaiting_peers {
             struct_ser.serialize_field("awaiting_peers", &self.awaiting_peers)?;
         }
+        if self.lease_remaining_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("lease_remaining_ms", ToString::to_string(&self.lease_remaining_ms).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -9406,6 +10024,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "fenceReason",
             "awaiting_peers",
             "awaitingPeers",
+            "lease_remaining_ms",
+            "leaseRemainingMs",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -9423,6 +10043,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             Files,
             FenceReason,
             AwaitingPeers,
+            LeaseRemainingMs,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -9457,6 +10078,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "files" => Ok(GeneratedField::Files),
                             "fenceReason" | "fence_reason" => Ok(GeneratedField::FenceReason),
                             "awaitingPeers" | "awaiting_peers" => Ok(GeneratedField::AwaitingPeers),
+                            "leaseRemainingMs" | "lease_remaining_ms" => Ok(GeneratedField::LeaseRemainingMs),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -9489,6 +10111,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut files__ = None;
                 let mut fence_reason__ = None;
                 let mut awaiting_peers__ = None;
+                let mut lease_remaining_ms__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -9573,6 +10196,14 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             awaiting_peers__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::LeaseRemainingMs => {
+                            if lease_remaining_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leaseRemainingMs"));
+                            }
+                            lease_remaining_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -9589,6 +10220,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     files: files__.unwrap_or_default(),
                     fence_reason: fence_reason__.unwrap_or_default(),
                     awaiting_peers: awaiting_peers__.unwrap_or_default(),
+                    lease_remaining_ms: lease_remaining_ms__.unwrap_or_default(),
                 })
             }
         }
@@ -12874,6 +13506,9 @@ impl serde::Serialize for NodeStatus {
         if !self.divergent.is_empty() {
             len += 1;
         }
+        if self.grace_remaining_ms != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.NodeStatus", len)?;
         if !self.node_id.is_empty() {
             struct_ser.serialize_field("node_id", &self.node_id)?;
@@ -12891,6 +13526,11 @@ impl serde::Serialize for NodeStatus {
         }
         if !self.divergent.is_empty() {
             struct_ser.serialize_field("divergent", &self.divergent)?;
+        }
+        if self.grace_remaining_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("grace_remaining_ms", ToString::to_string(&self.grace_remaining_ms).as_str())?;
         }
         struct_ser.end()
     }
@@ -12910,6 +13550,8 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             "clusterId",
             "partitions",
             "divergent",
+            "grace_remaining_ms",
+            "graceRemainingMs",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -12919,6 +13561,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             ClusterId,
             Partitions,
             Divergent,
+            GraceRemainingMs,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -12945,6 +13588,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             "clusterId" | "cluster_id" => Ok(GeneratedField::ClusterId),
                             "partitions" => Ok(GeneratedField::Partitions),
                             "divergent" => Ok(GeneratedField::Divergent),
+                            "graceRemainingMs" | "grace_remaining_ms" => Ok(GeneratedField::GraceRemainingMs),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -12969,6 +13613,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                 let mut cluster_id__ = None;
                 let mut partitions__ = None;
                 let mut divergent__ = None;
+                let mut grace_remaining_ms__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::NodeId => {
@@ -13003,6 +13648,14 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             }
                             divergent__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::GraceRemainingMs => {
+                            if grace_remaining_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("graceRemainingMs"));
+                            }
+                            grace_remaining_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(NodeStatus {
@@ -13011,6 +13664,7 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                     cluster_id: cluster_id__.unwrap_or_default(),
                     partitions: partitions__.unwrap_or_default(),
                     divergent: divergent__.unwrap_or_default(),
+                    grace_remaining_ms: grace_remaining_ms__.unwrap_or_default(),
                 })
             }
         }
@@ -13727,6 +14381,9 @@ impl serde::Serialize for PartitionInfo {
         if self.awaiting_peers {
             len += 1;
         }
+        if self.lease_remaining_ms != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionInfo", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -13755,6 +14412,11 @@ impl serde::Serialize for PartitionInfo {
         if self.awaiting_peers {
             struct_ser.serialize_field("awaiting_peers", &self.awaiting_peers)?;
         }
+        if self.lease_remaining_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("lease_remaining_ms", ToString::to_string(&self.lease_remaining_ms).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -13775,6 +14437,8 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
             "fenceReason",
             "awaiting_peers",
             "awaitingPeers",
+            "lease_remaining_ms",
+            "leaseRemainingMs",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -13786,6 +14450,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
             State,
             FenceReason,
             AwaitingPeers,
+            LeaseRemainingMs,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -13814,6 +14479,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                             "state" => Ok(GeneratedField::State),
                             "fenceReason" | "fence_reason" => Ok(GeneratedField::FenceReason),
                             "awaitingPeers" | "awaiting_peers" => Ok(GeneratedField::AwaitingPeers),
+                            "leaseRemainingMs" | "lease_remaining_ms" => Ok(GeneratedField::LeaseRemainingMs),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -13840,6 +14506,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                 let mut state__ = None;
                 let mut fence_reason__ = None;
                 let mut awaiting_peers__ = None;
+                let mut lease_remaining_ms__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -13886,6 +14553,14 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                             }
                             awaiting_peers__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::LeaseRemainingMs => {
+                            if lease_remaining_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("leaseRemainingMs"));
+                            }
+                            lease_remaining_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(PartitionInfo {
@@ -13896,6 +14571,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                     state: state__.unwrap_or_default(),
                     fence_reason: fence_reason__.unwrap_or_default(),
                     awaiting_peers: awaiting_peers__.unwrap_or_default(),
+                    lease_remaining_ms: lease_remaining_ms__.unwrap_or_default(),
                 })
             }
         }

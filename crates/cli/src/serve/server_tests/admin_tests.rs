@@ -330,7 +330,13 @@ fn a_fenced_file_streams_as_it_lies_from_any_offset() {
         Options::default().create_if_missing(true),
     )
     .unwrap();
-    let service = Service::new(db, limits(), 2, Arc::new(Metrics::default()));
+    let service = Service::new(
+        db,
+        limits(),
+        2,
+        Arc::new(Metrics::default()),
+        PartitionConfig::new(crate::serve::backup::Backups::new(None, 1).unwrap()),
+    );
     // Two and a half chunks, not all the same byte.
     let bytes: Vec<u8> = (0..(5u32 << 19)).map(|i| (i % 251) as u8).collect();
     let path = dir.join("p1.phdb-feed");
@@ -644,7 +650,7 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
         true,
     ));
     placed.close().unwrap();
-    let p = Server::start_custom("", limits(), 1, move |svc| svc.placement(&plan));
+    let p = Server::start_placed(limits(), plan);
     let r = Server::start_replica(test_dir(), &p.url, None);
     // A cluster node's partition families too (D317 ticket 8a), rendered for a partition
     // made as `cluster::run` makes one, from the primary's service.
@@ -655,10 +661,11 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
         let part = service.for_partition(
             db,
             "p1",
-            &backups,
-            crate::serve::service::Pinning::default(),
-            crate::serve::placement::Memory::defaults(1),
-            crate::serve::gate::WriteGate::opened("p1", false),
+            crate::serve::gate::WriteGate::opened("p1", false, Default::default()),
+            PartitionConfig {
+                engine_memory: Some(crate::serve::placement::Memory::defaults(1)),
+                ..PartitionConfig::new(backups)
+            },
         );
         service.metrics_text(&[(Some("p1"), part.part().unwrap())], &[&service.sessions])
     };

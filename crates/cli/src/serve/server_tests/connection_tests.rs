@@ -238,7 +238,7 @@ fn metrics_report_the_feed_hub_threads() {
         Some(3),
         true,
     ));
-    let s = Server::start_custom("", limits(), 1, move |svc| svc.placement(&plan));
+    let s = Server::start_placed(limits(), plan);
     let text = s.shared.router.metrics_text();
     assert!(
         text.contains("pigeonhole_serve_feed_hub_threads 3\n"),
