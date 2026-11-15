@@ -328,7 +328,10 @@ commit-one 8647 0.3
 # from pigeonhole_cache: inlining and layout moved when the engine binary changed (x86 scratch
 # run 42145473960, perf287 on #1581). The head count times 1.003.
 commit-sixteen 36521 0.3
-flush 2087 0.3
+# Raised by D195 (#1905, coordinator 2026-11-14): flush 2087 -> 2089 (+0.1%). Base 2086, head 2089
+# (run 43663495450): codegen from pigeonhole-io's new sys::boot_clock_ns (D326's lease clock),
+# which the engine never calls; #1905 changes nothing on the flush path.
+flush 2089 0.3
 compact 2615 0.5
 ycsb-c 39116 1.0
 # ycsb-a (#1305): identical code is usually flat, with occasional outliers up to about 40 per

@@ -173,7 +173,13 @@ fn a_call_on_a_partition_closed_under_it_answers_partition_unavailable() {
     let part = service.for_partition(
         db.clone(),
         "p1",
-        crate::serve::gate::WriteGate::opened("p1", false),
+        {
+            // Serving, with a lease: the call reaches the closed database.
+            let clock = std::sync::Arc::new(crate::serve::gate::LeaseClock::default());
+            let gate = crate::serve::gate::WriteGate::opened("p1", false, clock.clone());
+            gate.renew(clock.now() + super::HOUR_NS);
+            gate
+        },
         crate::serve::service::PartitionConfig {
             engine_memory: Some(crate::serve::placement::Memory::defaults(1)),
             ..crate::serve::service::PartitionConfig::new(backups)

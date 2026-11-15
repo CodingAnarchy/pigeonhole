@@ -260,7 +260,8 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(state(ports[0], "p1").await, LocalPartitionState::Fenced);
         // An operator's unfence of a start fence asks the peers too, and none answers
-        // (cli692's S1); --force lifts it anyway.
+        // (cli692's S1). --force doesn't make it serve either: that takes a majority's
+        // grants (D326, the owner's call).
         let e = unfence(ports[0], "p1").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
         assert!(e.message().contains("not a majority"), "{e}");
@@ -273,7 +274,13 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
+        assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::AwaitingPeerMap, "{lp:?}");
+        assert!(lp.awaiting_peers, "{lp:?}");
+        assert_eq!(
+            code(&try_put(ports[0], "alice", "1").await.unwrap_err()),
+            "Fenced"
+        );
     });
     // Then b and c: each confirms the others, and a its peers, as their maps answer.
     for i in [1, 2] {
@@ -772,7 +779,8 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
     // #1829: the operator's fence and "not confirmed since it opened" are two flags, so a
     // restarted node's operator-fenced partition reports both, and the peers' confirmation
     // clears only the second. `unfence` without --force is refused while no peer answers,
-    // lifts the fence with --force, and once a peer confirms, lifts it plainly.
+    // lifts only the operator's fence with --force (D326: never the wait for a lease), and
+    // once a peer confirms, lifts it plainly.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -823,7 +831,7 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
         .0
     };
     // c alone: p3 is the operator's and unconfirmed. No peer answers, so a plain unfence is
-    // refused; --force lifts both.
+    // refused; --force lifts the operator's fence, but not the wait for a lease (D326).
     stops.push(restart(2));
     rt.block_on(async {
         let lp = local(ports[2], "p3").await;
@@ -847,8 +855,9 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(lp.state(), LocalPartitionState::Serving, "{lp:?}");
-        assert!(!lp.awaiting_peers, "{lp:?}");
+        assert_eq!(lp.state(), LocalPartitionState::Fenced, "{lp:?}");
+        assert_eq!(lp.fence_reason(), FenceReason::AwaitingPeerMap, "{lp:?}");
+        assert!(lp.awaiting_peers, "{lp:?}");
     });
     // a and b: b's p2 is confirmed by its peers' maps, and stays fenced by the operator
     // until a plain unfence, which its peers now confirm.
@@ -1033,15 +1042,301 @@ fn a_node_change_holds_back_every_later_map_until_a_majority_before_and_after_it
     });
 
     // b back: a and b are a majority of the three, so the next map is taken, and it clears
-    // the nodes before (it doesn't change them itself).
+    // the nodes before (it doesn't change them itself). The writer first saw both
+    // majorities hold the change now, so it takes the map only a lease and 1% later
+    // (audit120's L1, D326): the nodes before may still hold grants at version 2 that the
+    // nodes after never saw.
     t.restart(1);
     t.rt.block_on(async {
         let mut next = current().await;
         next.map_version += 1;
+        let since = std::time::Instant::now();
         set(next).await.unwrap();
+        assert!(
+            since.elapsed() >= super::super::lease::grace(TEST_LEASE),
+            "{:?}",
+            since.elapsed()
+        );
         let m = current().await;
         assert_eq!(m.map_version, 3);
         assert!(m.previous_nodes.is_empty(), "{m:?}");
     });
     drop(new_stops);
+}
+
+/// Reads `row` of `users` through node `port`.
+async fn try_get(port: u16, row: &str) -> Result<(), tonic::Status> {
+    data(port)
+        .await
+        .get(crate::serve::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "f".into(),
+            qualifier: b"q".to_vec().into(),
+            ..Default::default()
+        })
+        .await
+        .map(drop)
+}
+
+/// Cuts node `i` of `t` off from its peers (both ways), or joins it again.
+fn cut(t: &Rig, i: usize, off: bool) {
+    let entry = (t.dirs[i].clone(), format!("127.0.0.1:{}", t.ports[i]));
+    let mut cut = super::super::CUT_OFF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cut.retain(|e| *e != entry);
+    if off {
+        cut.push(entry);
+    }
+}
+
+#[test]
+fn a_node_cut_off_from_the_majority_stops_serving_within_its_lease() {
+    // D326, the owner's rule: an owner cut off from the majority must not keep serving. a
+    // restarts, so p1's lease comes from its rounds (a fresh rig node stands for one
+    // already serving), then loses b and c while its process runs on: within a lease its
+    // writes answer `Fenced`, lapsed, and its reads `PartitionUnavailable`. An operator's
+    // `unfence --force` doesn't bring it back (the owner's call); a renewal that reaches
+    // the majority again does.
+    let mut t = Rig::start();
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        eventually("p1 to serve on a after its restart", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        let lp = local(a, "p1").await;
+        assert!(!lp.awaiting_peers, "{lp:?}");
+        assert!(
+            lp.lease_remaining_ms > 0 && lp.lease_remaining_ms <= 1500,
+            "{lp:?}"
+        );
+        try_put(a, "alice", "1").await.unwrap();
+        try_get(a, "alice").await.unwrap();
+    });
+
+    cut(&t, 0, true);
+    let since = std::time::Instant::now();
+    t.rt.block_on(async {
+        eventually("p1's lease on a to run out", async || {
+            reason(a, "p1").await == FenceReason::LeaseLapsed
+        })
+        .await;
+        // Within a lease of its last renewal, which came before the cut.
+        assert!(
+            since.elapsed() < TEST_LEASE + Duration::from_millis(500),
+            "{:?}",
+            since.elapsed()
+        );
+        let lp = local(a, "p1").await;
+        assert!(lp.awaiting_peers && lp.lease_remaining_ms == 0, "{lp:?}");
+        let e = try_put(a, "alice", "2").await.unwrap_err();
+        assert!(e.message().contains("lease"), "{e:?}");
+        let e = try_get(a, "alice").await.unwrap_err();
+        assert!(
+            e.message().contains("no reads") && e.message().contains("ran out"),
+            "{e:?}"
+        );
+        // An operator's fence lifted by force stays without a lease.
+        fence(a, "p1").await.unwrap();
+        let forced = client(a)
+            .await
+            .unfence(PartitionRequest {
+                partition: "p1".into(),
+                force: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            forced.fence_reason(),
+            FenceReason::LeaseLapsed,
+            "{forced:?}"
+        );
+        assert!(try_put(a, "alice", "3").await.is_err());
+    });
+
+    cut(&t, 0, false);
+    t.rt.block_on(async {
+        eventually("p1 to serve on a again", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        try_put(a, "alice", "4").await.unwrap();
+        try_get(a, "alice").await.unwrap();
+    });
+}
+
+#[test]
+fn a_restarted_node_grants_nothing_in_its_start_grace_and_a_majority_still_serves() {
+    // D326: grants live in memory, so a node that starts grants no lease for L·(1+ρ), its
+    // own included, and Status says how long is left. In a cluster of three, the other two
+    // are a majority: the restarted node's partition serves once they grant it, before its
+    // own grace ends.
+    let mut t = Rig::start();
+    t.stop(1);
+    t.restart(1);
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        let status = client(b)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            status.grace_remaining_ms > 0 && status.grace_remaining_ms <= 1515,
+            "{status:?}"
+        );
+        eventually("p2 to serve on b", async || {
+            state(b, "p2").await == LocalPartitionState::Serving
+        })
+        .await;
+        try_put(b, "hank", "1").await.unwrap();
+        eventually("b's grace to end", async || {
+            client(b)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .grace_remaining_ms
+                == 0
+        })
+        .await;
+    });
+}
+
+#[test]
+fn in_a_two_node_cluster_a_node_stops_serving_within_its_lease_when_the_other_is_down() {
+    // D326, the owner's accepted effect: a majority of two is both, and a node can't tell
+    // "the other node is down" from "I'm cut off". a restarts so its lease is a real one,
+    // then b stops: within a lease, a serves nothing.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.nodes.retain(|n| n.id != "c");
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir()];
+    let limits = crate::serve::server_tests::limits();
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    let mut listeners = listeners.into_iter();
+    for (dir, (id, p)) in dirs.iter().zip([("a", "p1"), ("b", "p2")]) {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let l = listeners.next().unwrap();
+        let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, "", limits, None, false);
+        stops.push(Some(stop));
+        dbs.push(db);
+    }
+    let a = ports[0];
+    // a restarts on its directory and database: its p1 waits for both nodes' grants.
+    let _ = stops[0].take().unwrap().send(());
+    rt.block_on(eventually("a to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", a))
+            .await
+            .is_err()
+    }));
+    let l = std::net::TcpListener::bind(("127.0.0.1", a)).unwrap();
+    let (stop, _) = data_node_full(
+        &rt,
+        &dirs[0],
+        "a",
+        Some("p1"),
+        l,
+        "",
+        limits,
+        dbs[0].clone(),
+        true,
+    );
+    stops[0] = Some(stop);
+    rt.block_on(async {
+        eventually("p1 to serve on a", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        try_put(a, "alice", "1").await.unwrap();
+    });
+    let _ = stops[1].take().unwrap().send(());
+    let since = std::time::Instant::now();
+    rt.block_on(async {
+        eventually("p1's lease on a to run out", async || {
+            reason(a, "p1").await == FenceReason::LeaseLapsed
+        })
+        .await;
+        assert!(since.elapsed() < TEST_LEASE + Duration::from_millis(500));
+        assert!(try_put(a, "alice", "2").await.is_err());
+        assert!(try_get(a, "alice").await.is_err());
+    });
+    drop(stops);
+    for db in dbs.into_iter().flatten() {
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn a_scan_running_past_its_partitions_lease_ends_with_the_lease_error() {
+    // audit120's M2: each page of a scan is a read at its own snapshot, so each needs the
+    // partition's lease, not only the scan's start. a restarts so p1's lease is a real one,
+    // a scan of p1 through a reads small pages (two rows each), and a is cut off from its
+    // peers: once its lease runs out, the scan ends with the lease error rather than reading
+    // on.
+    const ROWS: usize = 200;
+    let mut t = Rig::start();
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    let (mut stream, mut rows) = t.rt.block_on(async {
+        eventually("p1 to serve on a after its restart", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        // 32 KiB a row, so the stream's 6.4 MB can't all sit in the connection's buffers and
+        // flow-control windows before the cut: the scan still has pages to read after it.
+        let value = "v".repeat(32 << 10);
+        for i in 0..ROWS {
+            try_put(a, &format!("a{i:03}"), &value).await.unwrap();
+        }
+        let mut stream = data(a)
+            .await
+            .scan(crate::serve::proto::ScanRequest {
+                table: "users".into(),
+                page_bytes: 64 << 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.message().await.unwrap().expect("a first page");
+        assert!(
+            !first.rows.is_empty() && first.rows.len() < ROWS,
+            "{first:?}"
+        );
+        (stream, first.rows.len())
+    });
+    cut(&t, 0, true);
+    t.rt.block_on(async {
+        eventually("p1's lease on a to run out", async || {
+            reason(a, "p1").await == FenceReason::LeaseLapsed
+        })
+        .await;
+        // A page read before the lease ran out may still be on its way; then the error.
+        let e = loop {
+            match stream.message().await {
+                Ok(Some(page)) => rows += page.rows.len(),
+                Ok(None) => panic!("the scan ended cleanly after {rows} of {ROWS} rows"),
+                Err(e) => break e,
+            }
+        };
+        assert!(rows < ROWS, "{rows}");
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+        assert!(e.message().contains("lease"), "{e:?}");
+    });
+    cut(&t, 0, false);
 }

@@ -661,7 +661,7 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
         let part = service.for_partition(
             db,
             "p1",
-            crate::serve::gate::WriteGate::opened("p1", false),
+            crate::serve::gate::WriteGate::opened("p1", false, Default::default()),
             PartitionConfig {
                 engine_memory: Some(crate::serve::placement::Memory::defaults(1)),
                 ..PartitionConfig::new(backups)

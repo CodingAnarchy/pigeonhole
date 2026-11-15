@@ -23,7 +23,8 @@ io-uring = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # `Win32_Security` gates `CreateFileMappingW` (its signature names SECURITY_ATTRIBUTES).
-windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_SystemInformation"] }
+# `Win32_System_WindowsProgramming` gates `QueryInterruptTime` (`sys::boot_clock_ns`).
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_SystemInformation", "Win32_System_WindowsProgramming"] }
 
 # The ring wake's loom model (`ring_wake`): `RUSTFLAGS="--cfg io_loom" cargo test --release
 # -p pigeonhole-io --lib loom`. A cfg of its own: `--cfg loom` would switch other crates'
