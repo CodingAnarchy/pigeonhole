@@ -82,6 +82,12 @@ service Cluster {
   // everything during its start grace. A refusal isn't an error: the reply says what was
   // granted and why the rest wasn't. Cluster scope, gRPC only.
   rpc Lease(LeaseRequest) returns (LeaseResponse);
+  // Node to node (D326): the asking node closed the partitions it names, so this node drops
+  // them from its grant to it at once, rather than when the grant runs out: a planned
+  // move's new node then needn't wait. Applied only to a grant of the same start of the
+  // asking node, at a round no older than the grant's, so a delayed release can never end
+  // a grant that's live. Cluster scope, gRPC only.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
 }
 
 // One partition on the node a `Cluster` call is sent to (D317 ticket 6).
@@ -499,3 +505,21 @@ message LeaseWithheld {
   // The time left on that grant, in milliseconds.
   uint64 remaining_ms = 3;
 }
+
+// D326: a node gives up partitions it closed.
+message ReleaseRequest {
+  // Refused (`InvalidArgument`) if it isn't this node's cluster.
+  string cluster_id = 1;
+  // The releasing node.
+  string node_id = 2;
+  // The releasing node's round, numbered with its lease rounds: a lease request older
+  // than it is then ignored.
+  uint64 round = 3;
+  // The partitions given up, at their epochs.
+  repeated LeasePart parts = 4;
+  // The releasing node's start id, as `LeaseRequest.start`: a release of another start
+  // than the grant's is ignored.
+  uint64 start = 5;
+}
+
+message ReleaseResponse {}

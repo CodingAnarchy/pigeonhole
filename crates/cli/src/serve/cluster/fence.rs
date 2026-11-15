@@ -136,7 +136,7 @@ pub(crate) struct Round {
 
 impl Round {
     /// Whether a majority of `map`'s nodes hold it, with no divergent map among them.
-    fn majority(&self) -> bool {
+    pub(crate) fn majority(&self) -> bool {
         self.divergent.is_empty()
             && self.behind.is_empty()
             && self.holders * 2 > self.map.nodes.len()
@@ -676,6 +676,71 @@ impl Node {
         }
     }
 
+    /// Gives up partition `id` at `epoch`, which this node closed (D326 PR 2): every node of
+    /// its map drops it from its grant to this node, this node's own grants included. In a
+    /// task, best effort, each peer within the push timeout: a release that doesn't arrive
+    /// costs the new owner a wait until the grant runs out, never safety. Numbered as a
+    /// lease round, so an older round's request that arrives after it is ignored.
+    pub(crate) fn release_soon(&self, id: &str, epoch: u64) {
+        let (Some(node), Ok(rt), Ok(map)) = (
+            self.me.upgrade(),
+            tokio::runtime::Handle::try_current(),
+            self.get_map(),
+        ) else {
+            return;
+        };
+        let req = super::proto::ReleaseRequest {
+            cluster_id: map.cluster_id.clone(),
+            node_id: self.id.clone(),
+            round: self
+                .fences
+                .round
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
+            parts: vec![LeasePart {
+                partition: id.to_owned(),
+                epoch,
+            }],
+            start: self.grants.start(),
+        };
+        self.grants.release(&req);
+        #[cfg(test)]
+        if drop_releases(&self.dir) {
+            return;
+        }
+        for n in map.nodes.into_iter().filter(|n| n.id != self.id) {
+            let (node, req) = (Arc::clone(&node), req.clone());
+            rt.spawn(async move {
+                let sent = tokio::time::timeout(
+                    node.peers.push_timeout,
+                    node.send_release(&n.address, req),
+                )
+                .await;
+                if let Ok(Err(e)) = sent {
+                    eprintln!(
+                        "phdb serve: releasing a partition's lease at node {}: {e}",
+                        n.id
+                    );
+                }
+            });
+        }
+    }
+
+    /// Sends a release to the node at `address`.
+    async fn send_release(
+        &self,
+        address: &str,
+        req: super::proto::ReleaseRequest,
+    ) -> Result<(), String> {
+        let mut client = self.client(address).await?;
+        let req = self.request(req)?;
+        client
+            .release(req)
+            .await
+            .map(drop)
+            .map_err(|s| s.message().to_owned())
+    }
+
     /// Asks the node at `address` for a lease grant.
     async fn ask_lease(
         &self,
@@ -763,6 +828,9 @@ impl Node {
             }
         };
         self.apply_leases(&round);
+        // A lease-less partition's feeds wait while the node reaches a majority, and end
+        // once it doesn't (feed1248's F2).
+        self.grants.clock().set_majority(round.majority());
         Some(round)
     }
 
@@ -858,6 +926,21 @@ impl Node {
             }
         });
     }
+}
+
+/// A fault seam (tests): a node in a listed cluster directory sends its releases to no
+/// peer (its own grants still drop them), as if every one were lost: a planned move's new
+/// node then waits out the old node's grants.
+#[cfg(test)]
+pub(crate) static DROP_RELEASES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn drop_releases(dir: &Path) -> bool {
+    DROP_RELEASES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
 }
 
 pub(super) fn not_here(id: &str) -> ApiError {

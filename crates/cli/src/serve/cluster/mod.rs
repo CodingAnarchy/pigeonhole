@@ -1372,6 +1372,25 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
     }
 
+    /// Node to node (D326 PR 2): a node gave up partitions it closed. Cluster scope.
+    async fn release(
+        &self,
+        req: Request<proto::ReleaseRequest>,
+    ) -> Result<tonic::Response<proto::ReleaseResponse>, Status> {
+        self.caller(&req, &[Scope::Cluster], "release a partition lease")?;
+        let req = req.into_inner();
+        let mine = self.0.get_map()?;
+        if req.cluster_id != mine.cluster_id {
+            return Err(ApiError::invalid(format!(
+                "a lease release for cluster {:?} reached a node of cluster {:?}",
+                req.cluster_id, mine.cluster_id
+            ))
+            .into());
+        }
+        self.0.grants.release(&req);
+        Ok(tonic::Response::new(proto::ReleaseResponse {}))
+    }
+
     async fn get_map(
         &self,
         req: Request<GetMapRequest>,
