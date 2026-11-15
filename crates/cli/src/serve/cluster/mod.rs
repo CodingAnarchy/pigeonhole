@@ -20,6 +20,7 @@ pub(crate) mod identity;
 pub(crate) mod lease;
 pub(crate) mod map;
 mod memfan;
+pub(crate) mod memwatch;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
@@ -1498,15 +1499,27 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Box<dyn futures_core::Stream<Item = Result<proto::MemoryEvent, Status>> + Send>,
     >;
 
-    /// Not served yet: `Memory.Watch` on a cluster node comes with #1915's PR 2b, which
-    /// serves this on a route of its own, as `ForwardSubscribe` is.
+    /// Node to node: one partition's component of a memory watch another node merges
+    /// (#1915 PR 2b). Cluster scope; served for the caller it names, if this node's map
+    /// gives it the partition. Mounted on a route of its own, outside the `Cluster` calls'
+    /// small limit, since a watch lasts: it holds a `--max-streams` place on the partition.
     async fn forward_memory_watch(
         &self,
-        _req: Request<proto::ForwardMemoryWatchRequest>,
+        req: Request<proto::ForwardMemoryWatchRequest>,
     ) -> Result<tonic::Response<Self::ForwardMemoryWatchStream>, Status> {
-        Err(Status::unimplemented(
-            "a memory watch across cluster nodes isn't served yet (#1915)",
-        ))
+        let peer = self.caller(&req, &[Scope::Cluster], "forward a memory watch")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        self.0.maybe_pull(&peer, req.metadata());
+        self.0.catch_up(&peer, req.metadata()).await?;
+        let events = shared
+            .router
+            .serve_forwarded_memory_watch(req.into_inner())
+            .await?;
+        Ok(tonic::Response::new(Box::pin(
+            crate::serve::grpc::GrpcStream(events),
+        )))
     }
 
     type ForwardScanStream =
@@ -1598,12 +1611,19 @@ pub(crate) fn routes(
     let idle = shared.as_ref().map(|s| s.limits.stream_idle);
     // A cluster subscription's parts last as long as it does: outside the limit below, each
     // holding a `--max-streams` place instead (D317 ticket 7).
+    // So do a memory watch's (#1915 PR 2b): the `Cluster` service again, on that one path.
     let streams = shared.as_ref().map(|shared| {
-        crate::serve::grpc::EventsGrpc(feed::ForwardSubscribeGrpc {
+        let feeds = crate::serve::grpc::EventsGrpc(feed::ForwardSubscribeGrpc {
             node: Arc::clone(&node),
             shared: Arc::clone(shared),
             max_request_bytes,
-        })
+        });
+        let watches = proto::cluster_server::ClusterServer::new(ClusterGrpc(
+            Arc::clone(&node),
+            Some(Arc::clone(shared)),
+        ))
+        .max_decoding_message_size(max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE));
+        (feeds, watches)
     });
     // A forward carries a call the entry node took within its `--max-request-bytes`, inside
     // an envelope (audit120's S-C2).
@@ -1623,7 +1643,9 @@ pub(crate) fn routes(
     }
     let app = app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS));
     match streams {
-        Some(svc) => app.route_service(feed::FORWARD_SUBSCRIBE, svc),
+        Some((feeds, watches)) => app
+            .route_service(feed::FORWARD_SUBSCRIBE, feeds)
+            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches),
         None => app,
     }
 }

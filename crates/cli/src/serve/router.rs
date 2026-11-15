@@ -618,6 +618,9 @@ impl Router {
                 ServiceOp::Subscribe(_) => {
                     return self.subscribe(cluster, op, caller, prepaid).await;
                 }
+                ServiceOp::MemoryWatch(_) => {
+                    return self.memory_watch(cluster, op, caller, prepaid).await;
+                }
                 // Served where the partition is, never forwarded (D317 ticket 8b).
                 ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
                     return self.backup(cluster, op, caller, prepaid).await;
@@ -756,6 +759,44 @@ impl Router {
         )
         .await
         .map(ServiceReply::Feed)
+    }
+
+    /// `Memory.Watch` on a cluster node (#1915 PR 2b): one stream over every partition the
+    /// watch covers, after this node's own checks, as [`Self::subscribe`].
+    async fn memory_watch(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<ServiceReply, ApiError> {
+        let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
+        drop(budget);
+        let ServiceOp::MemoryWatch(r) = op else {
+            return Err(ApiError::internal("not a memory watch"));
+        };
+        super::cluster::memwatch::watch(
+            Arc::clone(&cluster.node),
+            Arc::clone(&cluster.forwarder),
+            Arc::clone(&cluster.parts),
+            Arc::clone(&self.service),
+            r,
+            caller,
+        )
+        .await
+        .map(ServiceReply::MemoryWatch)
+    }
+
+    /// `Cluster.ForwardMemoryWatch` here (#1915 PR 2b): one partition's component of a
+    /// memory watch that another node merges.
+    pub(crate) async fn serve_forwarded_memory_watch(
+        &self,
+        req: super::proto::ForwardMemoryWatchRequest,
+    ) -> Result<super::memory::MemoryEvents, ApiError> {
+        let Some(cluster) = &self.cluster else {
+            return Err(ApiError::unsupported("this node isn't a cluster node"));
+        };
+        super::cluster::memwatch::serve(&cluster.node, &cluster.parts, req).await
     }
 
     /// `Cluster.ForwardSubscribe` here (D317 ticket 7): one partition's part of a cluster
@@ -1064,8 +1105,9 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
                 .flat_map(|q| q.namespaces.iter().map(String::as_str)),
             "Memory.RecallBodies",
         ),
-        ServiceOp::MemoryWatch(_) => Err(ApiError::unsupported(
-            "Memory.Watch isn't served on a cluster node yet (#1915)",
+        // Merged across its partitions by `dispatch`, never routed to one (#1915 PR 2b).
+        ServiceOp::MemoryWatch(_) => Err(ApiError::internal(
+            "Memory.Watch is merged across partitions, not routed",
         )),
         // An index lives in one partition's file, and no D317 ticket routes a search to it
         // (#1722, 1.3.0).
