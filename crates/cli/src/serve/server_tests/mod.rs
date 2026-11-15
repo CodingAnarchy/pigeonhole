@@ -13,7 +13,7 @@ use super::auth::{Caller, Tokens};
 use super::config::Limits;
 use super::proto::{self, data_client::DataClient};
 use super::router::Router;
-use super::service::{Metrics, Service, ServiceOp};
+use super::service::{Metrics, PartitionConfig, Service, ServiceOp};
 use super::{Shared, http, listener};
 
 // The serve modules the area files reach as `super::<module>`.
@@ -36,6 +36,13 @@ mod vector_tests;
 thread_local! {
     /// The blocking pool of the servers this thread starts (`--blocking-threads`).
     static BLOCKING_THREADS: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+}
+
+thread_local! {
+    /// Where the next server this thread starts places the threads it starts
+    /// ([`Server::start_placed`]): taken by that start.
+    static PLACEMENT: std::cell::RefCell<Option<Arc<super::placement::Placement>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The servers this thread starts get a blocking pool of `n` threads.
@@ -175,6 +182,12 @@ impl Server {
         Self::serve(dir, db, "", limits(), None, |s| s)
     }
 
+    /// [`start`](Self::start), the threads the server starts placed by `plan`.
+    fn start_placed(limits: Limits, plan: Arc<crate::serve::placement::Placement>) -> Self {
+        PLACEMENT.with(|p| p.replace(Some(plan)));
+        Self::start_with("", limits, 1)
+    }
+
     /// `start_with`, its service changed by `f` before it serves.
     fn start_custom(
         tokens: &str,
@@ -274,9 +287,17 @@ impl Server {
     ) -> Self {
         let metrics = Arc::new(Metrics::default());
         let threads = BLOCKING_THREADS.with(std::cell::Cell::get);
-        let mut service = f(Service::new(db, limits, threads, Arc::clone(&metrics))
-            .backups(Some(&dir.join("backups")), 1)
-            .unwrap());
+        let backups = super::backup::Backups::new(Some(&dir.join("backups")), 1).unwrap();
+        let mut service = f(Service::new(
+            db,
+            limits,
+            threads,
+            Arc::clone(&metrics),
+            PartitionConfig {
+                placement: PLACEMENT.with(std::cell::RefCell::take),
+                ..PartitionConfig::new(backups)
+            },
+        ));
         if let Some(r) = &replica {
             service = service.replica(Arc::clone(r));
         }
