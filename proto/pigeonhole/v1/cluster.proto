@@ -49,6 +49,13 @@ service Cluster {
   // subscriber that stops reading can't stall forwarded calls. The events are a single
   // node's: a token on every one, no `partition`. Cluster scope, gRPC only.
   rpc ForwardSubscribe(ForwardSubscribeRequest) returns (stream FeedEvent);
+  // Node to node (#1915, ICR 0139): one partition's part of a `Memory.Watch` whose
+  // namespaces are on several partitions, which the sending node merges with the others.
+  // Served as `ForwardSubscribe` is: only if this node's map gives it the partition, on
+  // connections of their own, and with the stream ending `PartitionUnavailable` when the
+  // partition's lease lapses or it closes. The events are a single node's. Cluster scope,
+  // gRPC only.
+  rpc ForwardMemoryWatch(ForwardMemoryWatchRequest) returns (stream MemoryEvent);
   // D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
   // (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
   // unfenced, or at its new node); its reads go on. Answers once every write admitted before
@@ -380,7 +387,59 @@ message ForwardRequest {
     SupersedeRequest supersede = 37;
     LinkRequest link = 38;
     ForgetRequest forget = 39;
+    // A recall's steps on one partition, when its namespaces are on several (#1915, ICR
+    // 0139): the pool, or a hop of its graph expansion, and the hits' bodies.
+    RecallPoolRequest recall_pool = 40;
+    RecallBodiesRequest recall_bodies = 41;
   }
+}
+
+// One partition's step of a recall whose namespaces are on several partitions (#1915,
+// ICR 0139): its pool of candidates, or with `hop` its part of one hop of the graph
+// expansion. The sending node merges the partitions' answers and ranks them as one store
+// would.
+message RecallPoolRequest {
+  // The client's recall, its namespaces narrowed to this partition's, and its embedding the
+  // one the sending node made from its text (the query is embedded once).
+  RecallRequest request = 1;
+  // The recall's one clock, in µs since the Unix epoch, so recency compares across
+  // partitions.
+  uint64 now_us = 2;
+  // A hop of the graph expansion (`pigeonhole_memory::RecallHop`'s versioned bytes); empty
+  // for the pool. A version this node doesn't read is `FailedPrecondition`.
+  bytes hop = 3;
+}
+
+message RecallPoolResponse {
+  // The pool (`RecallPool`'s versioned bytes), or with `hop` the hop's part
+  // (`RecallHopPart`'s).
+  bytes pool = 1;
+}
+
+// The bodies of a recall's best hits on one partition (#1915, ICR 0139).
+message RecallBodiesRequest {
+  // The client's recall, its namespaces narrowed to this partition's.
+  RecallRequest request = 1;
+  // The memories, in rank order: each in one of `request`'s namespaces.
+  repeated bytes ids = 2;
+}
+
+message RecallBodiesResponse {
+  // `RecallBodies`' versioned bytes.
+  bytes bodies = 1;
+}
+
+// One partition's part of a `Memory.Watch` (#1915, ICR 0139).
+message ForwardMemoryWatchRequest {
+  // The sending node's map version, as for `Forward`.
+  uint64 map_version = 1;
+  // Who the watch is for, checked again here.
+  ForwardedCaller caller = 2;
+  // The partition whose part this is: every namespace in `request` must be placed on it.
+  string partition = 3;
+  // A single node's watch: its namespaces narrowed to this partition's, and `resume` this
+  // partition's own token.
+  MemoryWatchRequest request = 4;
 }
 
 // One partition's part of a fanned-out scan (D317 ticket 4).
@@ -433,6 +492,8 @@ message ForwardResponse {
     RecallResponse recall = 20;
     MarkUsedResponse mark_used = 21;
     ForgetResponse forget = 22;
+    RecallPoolResponse recall_pool = 23;
+    RecallBodiesResponse recall_bodies = 24;
   }
 }
 

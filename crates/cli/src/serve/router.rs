@@ -604,6 +604,17 @@ impl Router {
                     };
                 }
                 ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
+                // A memory call across partitions (#1915): a recall in steps, a `MarkUsed`
+                // or `Forget` split.
+                ServiceOp::Recall(_) | ServiceOp::MarkUsed(_) | ServiceOp::Forget(_)
+                    if Self::memory_span(cluster, &op)?.is_some() =>
+                {
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    return Box::pin(self.fan_memory(cluster, op, caller, prepaid, deadline)).await;
+                }
                 ServiceOp::Subscribe(_) => {
                     return self.subscribe(cluster, op, caller, prepaid).await;
                 }
@@ -643,7 +654,7 @@ impl Router {
     /// `WrongPartition` answer means the owner's map is newer: this node pulls it (awaited,
     /// single-flight) and routes once more; a second one goes to the client. The forwarded
     /// node never forwards on.
-    async fn forward(
+    pub(crate) async fn forward(
         &self,
         cluster: &Cluster,
         op: ServiceOp,
@@ -834,7 +845,7 @@ pub(crate) enum Place {
 
 impl Cluster {
     /// Where `op`'s partition is served: here, or the node serving it.
-    fn target(&self, op: &ServiceOp) -> Result<Place, ApiError> {
+    pub(crate) fn target(&self, op: &ServiceOp) -> Result<Place, ApiError> {
         let routes = self.node.routes();
         let Some(routes) = routes.as_ref() else {
             return Err(ApiError::partition_unavailable(
@@ -1038,6 +1049,21 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
             r.namespaces.iter().map(String::as_str),
             "Memory.Recall",
         ),
+        // A spanning recall's steps (#1915), each on one partition's namespaces.
+        ServiceOp::RecallPool(r) => memory_route(
+            routes,
+            r.request
+                .iter()
+                .flat_map(|q| q.namespaces.iter().map(String::as_str)),
+            "Memory.RecallPool",
+        ),
+        ServiceOp::RecallBodies(r) => memory_route(
+            routes,
+            r.request
+                .iter()
+                .flat_map(|q| q.namespaces.iter().map(String::as_str)),
+            "Memory.RecallBodies",
+        ),
         ServiceOp::MemoryWatch(_) => Err(ApiError::unsupported(
             "Memory.Watch isn't served on a cluster node yet (#1915)",
         )),
@@ -1063,21 +1089,43 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
     }
 }
 
-/// The partition holding every namespace a memory call names (#1915): `what`'s. The
-/// namespaces are checked as the store checks them (non-empty, no `\0`), so a bad one is
-/// refused here rather than routed. A call naming none, or none that the map places,
-/// is refused; so, for now, is one whose namespaces are on several partitions.
+/// The partition holding every namespace a memory call names (#1915): `what`'s. A call
+/// whose namespaces are on several partitions never comes here: the entry node fans a
+/// recall out and splits a `MarkUsed` or `Forget` ([`Router::fan_memory`]), and a call
+/// that can't span (a link's or supersede's ends are in one namespace) routes by one id.
 fn memory_route<'a>(
     routes: &Routes,
     namespaces: impl IntoIterator<Item = &'a str>,
     what: &str,
 ) -> Result<String, ApiError> {
+    let parts = memory_partitions(routes, namespaces, what)?;
+    let mut it = parts.into_iter();
+    match (it.next(), it.next()) {
+        (Some((p, _)), None) => Ok(p),
+        (Some((p, a)), Some((q, b))) => Err(ApiError::cross_partition(format!(
+            "{what}'s namespaces are on more than one partition ({:?} on {p}, {:?} on {q}): \
+             only the node the client called splits it",
+            a[0], b[0]
+        ))),
+        (None, _) => Err(ApiError::invalid(format!("{what} names no namespace"))),
+    }
+}
+
+/// Each partition holding some of the namespaces a memory call names, with its namespaces
+/// in order, each once (#1915). The namespaces are checked as the store checks them
+/// (non-empty, no `\0`), so a bad one is refused here rather than routed. A cluster whose
+/// map places no store refuses every memory call.
+pub(crate) fn memory_partitions<'a>(
+    routes: &Routes,
+    namespaces: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, ApiError> {
     if routes.memory_store().is_none() {
         return Err(ApiError::unsupported(
             "this cluster has no memory store: its map places none (ClusterMap.memory)",
         ));
     }
-    let mut found: Option<(&str, &str)> = None;
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for ns in namespaces {
         if ns.is_empty() {
             return Err(ApiError::invalid("a namespace can't be empty"));
@@ -1090,21 +1138,13 @@ fn memory_route<'a>(
         let p = routes
             .memory_partition(ns)
             .ok_or_else(|| ApiError::internal("the memory placement has no partitions"))?;
-        match found {
-            None => found = Some((p, ns)),
-            Some((q, first)) if q != p => {
-                return Err(ApiError::unsupported(format!(
-                    "{what}'s namespaces are on more than one partition ({first:?} on {q}, \
-                     {ns:?} on {p}), and a cluster node doesn't yet serve a memory call \
-                     across partitions (#1915): make one call per partition"
-                )));
-            }
-            Some(_) => {}
+        let list = out.entry(p.to_owned()).or_default();
+        if !list.iter().any(|n| n == ns) {
+            list.push(ns.to_owned());
         }
     }
-    found
-        .map(|(p, _)| p.to_owned())
-        .ok_or_else(|| ApiError::invalid(format!("{what} names no namespace")))
+    let _ = what;
+    Ok(out)
 }
 
 /// The partition a forwarded `Nearest` names: all its keys', or its clipped range's, which

@@ -19,6 +19,7 @@ pub(crate) mod hub;
 pub(crate) mod identity;
 pub(crate) mod lease;
 pub(crate) mod map;
+mod memfan;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
@@ -1489,6 +1490,20 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
     ) -> Result<tonic::Response<Self::ForwardSubscribeStream>, Status> {
         Err(Status::unimplemented(
             "this node doesn't serve data, so it has no partition to subscribe to",
+        ))
+    }
+
+    type ForwardMemoryWatchStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<proto::MemoryEvent, Status>> + Send>,
+    >;
+
+    /// Served by a route of its own, ahead of this one, as `ForwardSubscribe` is.
+    async fn forward_memory_watch(
+        &self,
+        _req: Request<proto::ForwardMemoryWatchRequest>,
+    ) -> Result<tonic::Response<Self::ForwardMemoryWatchStream>, Status> {
+        Err(Status::unimplemented(
+            "this node doesn't serve data, so it has no partition to watch",
         ))
     }
 
