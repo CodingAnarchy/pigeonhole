@@ -4692,6 +4692,27 @@ Revisit PR 2 only if a profile shows the re-reads costing more than that.
 - **Measured:** a counting-allocator test holds what's kept to within 1.25× of the count (`tests/feed_memory.rs`: 0.93×, where main was 2.6×). The same backlog takes about half the memory it did. "Allocated" here is requested bytes: the allocator's own chunk overhead (glibc adds 8 B per chunk, with a 32 B minimum) is on top, a little for a record's two small allocations.
 - **The cost:** delivery copies each change's bytes out of the pack, where it used to move the vectors. That's one copy of what's delivered; a record read is copied once, from the log into its pack. CPU per put on the 16 × 16 run isn't measured yet; perf287's re-run after this lands gives it.
 
+**Amendment, 2026-11-14: a capped reader jumps what it would only pass over again (coordinator, #1827; recorded in `.coord/numbers.md`, no new D).** The 1.2.0 audit found PR 1's re-read superlinear for a drain from the oldest commit with small commits. After a rewind, a pass stepped through every record from its hint to each stream's end, checking its frames and decoding it, even the records it then passed over. Passes go as the backlog over the budget, so the drain went as the backlog squared: with 64-byte commits, 128 MiB drained at 220 MiB/s but 1 GiB at 106 MiB/s, on a Mac.
+- **The skip index:** while a reader is capped, each stream records the records it reads at its indexed end in chunks.
+  - **A chunk** is up to a sixteenth of the base budget of log (1 MiB at the default), never across a segment. It's keyed by the cursor's position just before its first record.
+  - **Each chunk keeps** its first record's start, its end, its segment's session, and the lowest key any record in it can matter at, by `read_one`'s tests for passing a record over:
+    - a Single counts at its seqno;
+    - a Prepare counts at its round id + 1;
+    - **a Decision counts at its round id + 1, not its apply seqno.** Passing a Decision over drops its round's held shares, which matters only for a round whose id is under the cutoff. A chunk keyed that way is never jumped while one of its round's shares may be held. Otherwise rule C would drop the share as aborted, and the Decision read after the rewind would expire the feed as a gap.
+- **The jump:** a later pass that finds its cursor at a chunk (at its key, or at its first record's start, where a rewind reopens a cursor) whose lowest key is past the cutoff C jumps it whole, with `FeedCursor::skip_to`. That reads nothing unless the target segment is missing from the headers as last read.
+  - It leaves the hint at the chunk's start and raises the session. Passing each record over would do the same.
+  - C is at least `delivered`, so a jumped record is never one at or below it, and the `delivered_end` and gap paths are never bypassed.
+  - No jump happens while a token's delivered records must still be reached.
+  - A jump into a recycled segment expires the feed for retention, as a step into one does.
+- **Unchanged:** M1, rule C (every stream is still read to its end, and the tail past the index is always stepped), tokens and hints, `read_through`, the liveness doubling and the budget.
+- **Lifetime:** a reader that keeps up is never capped and builds nothing. A rewind drops the chunks with a record before its hint. A pass that reads to the end without passing anything over drops the indexes.
+- **The bound (perf2's S1 on #1922):** a stream's index holds at most 4,096 chunks, under 64 B each with the map's overhead: about 256 KiB per stream per capped reader, outside the budget, whatever the retention.
+  - **Past the cap:** adjacent chunks of one segment are merged pairwise. A merged chunk's lowest key is the lower of the two, so a jump over it is exact, and it still never crosses a segment.
+  - **If nothing can merge** (every chunk alone in its segment), the newest chunk goes, and the index stops growing until a rewind trims it. The tail past it is stepped, as without an index.
+  - **The cost of coarser chunks:** more records a pass in the chunk straddling the cutoff. `it::feed_reader`'s 43,200-record drain at the cap took 3.8 record steps a record.
+- **The cost:** each record is stepped about once to index it, once to deliver it, and in a bounded slice per pass: the chunk straddling the cutoff on each stream, and what the first stream kept before the others lowered the cutoff. `it::feed_reader`'s 7,200-record drain, at 125 passes, went from 453,576 record steps (63 a record) to 21,157 (2.9). The drain is linear, apart from O(1) per jumped chunk per pass.
+- **PR 2 (the writer logs a group's DECISIONs ahead of its Singles) is dropped.** It needed a FORMAT line and an ICR, touched every cross-shard commit, and wouldn't help segments already retained from older builds.
+
 <a id="d321"></a>
 ## D321 — Caller-runs: an opt-in commit mode in which a committing thread runs its idle shard's turn (owner decision, 2026-11-09; simp724; runtime, engine, pigeonhole, #1176, #1502, ICR 0128) · amends D198 decision 2 and spec.md's thread-per-core rule
 
