@@ -1208,6 +1208,34 @@ pub(crate) struct Partition {
     catalog: AtomicU64,
 }
 
+/// What a partition is opened with, beside its database: [`Service::new`]'s and
+/// [`Service::for_partition`]'s, so each part of a [`Partition`] is built once.
+pub(crate) struct PartitionConfig {
+    /// `--backup-dir`'s backups: the node's one, which a cluster node's partitions share.
+    pub(crate) backups: Arc<super::backup::Backups>,
+    /// The CPUs the threads the server starts run on, off the shards': those of vector
+    /// indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2), the
+    /// backups' and `Replication.Follow`'s (a replica catching up reads and encodes at full
+    /// speed, cli692's F1 on #1583).
+    pub(crate) placement: Option<Arc<super::placement::Placement>>,
+    /// How its engine's threads were placed when it opened.
+    pub(crate) pinning: Pinning,
+    /// Its engine memory as resolved at open: a cluster node's partitions have one.
+    pub(crate) engine_memory: Option<super::placement::Memory>,
+}
+
+impl PartitionConfig {
+    /// A partition with `backups`, its threads not placed.
+    pub(crate) fn new(backups: Arc<super::backup::Backups>) -> Self {
+        Self {
+            backups,
+            placement: None,
+            pinning: Pinning::default(),
+            engine_memory: None,
+        }
+    }
+}
+
 impl Partition {
     /// Ends the threads that use the database, in order, before it closes: a bulk load's
     /// (its input has ended or was stopped, so it writes what came, and rebalances inline if
@@ -1243,24 +1271,34 @@ impl Partition {
     }
 
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
-    /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b).
+    /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b). Each
+    /// part is built once, from `config` and the partition's write `gate`.
     fn new(
         db: Pigeonhole,
         id: Option<&str>,
         limits: &Limits,
         feeds: &super::feed::FeedShared,
+        gate: Option<&Arc<super::gate::WriteGate>>,
+        config: PartitionConfig,
     ) -> Self {
         let metrics = match id {
             Some(id) => pigeonhole_otel::Config::new().attribute(PARTITION_ATTRIBUTE, id),
             None => pigeonhole_otel::Config::new(),
         };
+        if let Some(p) = &config.placement {
+            config.backups.place(p);
+        }
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
-            pinning: Pinning::default(),
-            engine_memory: std::sync::Mutex::new(None),
-            backups: super::backup::Backups::new(None, 1).expect("no directory to check"),
-            indexes: Arc::new(super::indexes::Indexes::new(db.clone(), None, None)),
-            bulk: super::bulk::BulkLoads::default(),
+            pinning: config.pinning,
+            engine_memory: std::sync::Mutex::new(config.engine_memory),
+            backups: config.backups,
+            indexes: Arc::new(super::indexes::Indexes::new(
+                db.clone(),
+                config.placement.clone(),
+                gate.cloned(),
+            )),
+            bulk: super::bulk::BulkLoads::new(config.placement),
             texts: Arc::new(super::texts::Texts::new(db.clone())),
             memory: None,
             schema: tokio::sync::Mutex::new(()),
@@ -1320,41 +1358,48 @@ impl Service {
             .expect("a test server serves its partition")
     }
 
-    /// A node serving `db`.
+    /// A node serving `db`, opened with `config`.
     pub(crate) fn new(
         db: Pigeonhole,
         limits: Limits,
         blocking_threads: usize,
         metrics: Arc<Metrics>,
+        config: PartitionConfig,
     ) -> Self {
         let feeds = super::feed::FeedShared::new(limits.max_catch_up);
-        let part = Partition::new(db, None, &limits, &feeds);
-        Self::node(Some(part), limits, blocking_threads, metrics, feeds)
+        let placement = config.placement.clone();
+        let part = Partition::new(db, None, &limits, &feeds, None, config);
+        Self::node(
+            Some(part),
+            limits,
+            blocking_threads,
+            metrics,
+            feeds,
+            placement,
+        )
     }
 
     /// Partition `id` on `db`, one of this cluster node's (D317 ticket 8a): its own database,
     /// tables, indexes, feeds and session table (ids `<id>:<hex>`), sharing the node's
     /// budgets, pools, connections, metrics, limits and session caps, and the node's one
-    /// `backups` (simp724's N1 on #1711). Calls are admitted once, by whichever service
-    /// takes them (cli692's Q1).
+    /// `backups` in `config` (simp724's N1 on #1711). Its writes pass `gate`. Calls are
+    /// admitted once, by whichever service takes them (cli692's Q1).
     pub(crate) fn for_partition(
         &self,
         db: Pigeonhole,
         id: &str,
-        backups: &Arc<super::backup::Backups>,
-        pinning: Pinning,
-        memory: super::placement::Memory,
         gate: Arc<super::gate::WriteGate>,
+        config: PartitionConfig,
     ) -> Self {
-        let mut part = Partition::new(db, Some(id), &self.limits, &self.feed_shared);
-        part.indexes = Arc::new(super::indexes::Indexes::new(
-            part.db.clone(),
-            None,
-            Some(Arc::clone(&gate)),
-        ));
-        part.backups = Arc::clone(backups);
-        part.pinning = pinning;
-        part.engine_memory = std::sync::Mutex::new(Some(memory));
+        let placement = config.placement.clone();
+        let part = Partition::new(
+            db,
+            Some(id),
+            &self.limits,
+            &self.feed_shared,
+            Some(&gate),
+            config,
+        );
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
@@ -1375,21 +1420,23 @@ impl Service {
             metrics: Arc::clone(&self.metrics),
             connections: Arc::clone(&self.connections),
             replica: None,
-            placement: None,
+            placement,
             replies: Arc::clone(&self.replies),
             gate: Some(gate),
             part: Some(part),
         }
     }
 
-    /// A cluster node the map gives no partition: it only routes (D317 ticket 2).
+    /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
+    /// threads run on `placement`'s CPUs, as [`PartitionConfig::placement`] says.
     pub(crate) fn routing_only(
         limits: Limits,
         blocking_threads: usize,
         metrics: Arc<Metrics>,
+        placement: Option<Arc<super::placement::Placement>>,
     ) -> Self {
         let feeds = super::feed::FeedShared::new(limits.max_catch_up);
-        Self::node(None, limits, blocking_threads, metrics, feeds)
+        Self::node(None, limits, blocking_threads, metrics, feeds, placement)
     }
 
     fn node(
@@ -1398,6 +1445,7 @@ impl Service {
         blocking_threads: usize,
         metrics: Arc<Metrics>,
         feed_shared: super::feed::FeedShared,
+        placement: Option<Arc<super::placement::Placement>>,
     ) -> Self {
         let session_caps = Arc::new(super::sessions::Caps::default());
         Self {
@@ -1423,7 +1471,7 @@ impl Service {
             limits,
             metrics,
             replica: None,
-            placement: None,
+            placement,
             gate: None,
             part,
         }
@@ -1509,45 +1557,6 @@ impl Service {
             part.feeds.fail_all();
         }
         self.sessions.drop_idle();
-    }
-
-    /// Takes backups in `dir` (`--backup-dir`), at most `max_backups` at once. Without a
-    /// directory, `Backup` and `BackupDownload` are refused. Fails at startup if the
-    /// directory, or its download directory, isn't usable.
-    pub(crate) fn backups(
-        mut self,
-        dir: Option<&std::path::Path>,
-        max_backups: usize,
-    ) -> Result<Self, String> {
-        if let Some(part) = &mut self.part {
-            part.backups = super::backup::Backups::new(dir, max_backups)?;
-            if let Some(p) = &self.placement {
-                part.backups.place(p);
-            }
-        }
-        Ok(self)
-    }
-
-    /// Runs the threads the server starts on `placement`'s CPUs, off the shards': those of
-    /// vector indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2) and
-    /// `Replication.Follow`'s (a replica catching up reads and encodes at full speed,
-    /// cli692's F1 on #1583).
-    pub(crate) fn placement(mut self, placement: &Arc<super::placement::Placement>) -> Self {
-        let paused = self.replica.is_some();
-        if let Some(part) = &mut self.part {
-            let indexes = super::indexes::Indexes::new(
-                part.db.clone(),
-                Some(Arc::clone(placement)),
-                self.gate.clone(),
-            );
-            // A replica's pause survives the rebuild, whichever is set first.
-            indexes.pause_rebalancing(paused);
-            part.indexes = Arc::new(indexes);
-            part.bulk.placement = Some(Arc::clone(placement));
-            part.backups.place(placement);
-        }
-        self.placement = Some(Arc::clone(placement));
-        self
     }
 
     /// Serves the store `slot` holds, if any, as the `Memory` service, with at most `calls`
