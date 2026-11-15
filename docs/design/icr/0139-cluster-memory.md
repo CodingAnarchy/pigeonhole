@@ -37,7 +37,7 @@
 
 - An empty namespace, or one containing `\0`, answers `InvalidArgument` before routing.
 - A call whose namespaces are on more than one partition answered `Unsupported` until PR 2.
-- `Memory.Watch` answers `Unsupported` until PR 2b.
+- `Memory.Watch` answered `Unsupported` until PR 2b.
 - A map with no memory placement: every memory call answers `Unsupported`.
 
 **Callers:** `phdb serve --cluster`, and clients of `Memory` through any cluster node.
@@ -75,8 +75,20 @@ Each step is a fan-out part (`Service::fanout_part`): lease-gated before and aft
 
 **`MarkUsed` and `Forget` across partitions:** split, each partition's ids one call (served or forwarded as a write), sent together, the counts summed. A part that's refused, or unreachable before its send, fails the call with its error. A part whose outcome is unknown makes it `OutcomeUnknown`, naming the partition. Either message names the partitions that applied and their counts. Retrying the whole call is safe: `Forget` skips what's gone, and `MarkUsed` is advisory.
 
-**Still refused:** `Memory.Watch` (`Unsupported` until PR 2b), and `/mcp` (PR 3).
+**Still refused:** `Memory.Watch` (`Unsupported` until PR 2b, below), and `/mcp` (PR 3).
 
-## PR 2b and PR 3 (numbers assigned, sections to come)
-- `Cluster.ForwardMemoryWatch` and `ForwardMemoryWatchRequest` (above): Watch across partitions, merged as the cluster feed is, each partition's part lease-gated.
+## PR 2b: `Memory.Watch` across partitions
+
+The design is `.coord/ai1249-1915-pr2b-watch.md`, reviewed by simp724 (`.coord/simp724-review-1915-pr2b-watch.md`). No new numbers: `Cluster.ForwardMemoryWatch` and `ForwardMemoryWatchRequest` are PR 2's, and the marks below are `MemoryEvent.progress = 3`.
+
+**A watch on a cluster node** has one component per partition holding its namespaces (every partition of the placement for a watch of every namespace), merged on the node called:
+- **Components:** a partition served there is watched there; another node's over `Cluster.ForwardMemoryWatch`, on the watch's own connection to that node. Each is told only its partition's namespaces. The owner checks the caller's scope and namespaces again, and that its map gives it the partition with those namespaces (else `WrongPartition`, never forwarded on).
+- **Whole commits:** a component's stream marks commits with `Progress` events: one first, at its start position, and one after each commit with memories, with that commit's token. The merge takes the marks (the client never sees them) and moves each commit as one, so no other partition's event lands inside a commit, and resuming from any event's token never skips the rest of one. Nothing is delivered before every component's start mark.
+- **The token** is the cluster feed's `ClusterToken` on every event: each partition at its last whole commit delivered, the event's own at its commit's end, with its epoch. Its hash is `memory_watch_hash`: the store and the sorted namespaces behind a domain tag, with a tag of its own for a watch of every namespace, so a feed's token, another watch's (another store or namespace set) or a single node's is refused (`InvalidArgument`). A partition whose history began after the token's epoch is `FeedExpired`, as for the feed.
+- **Leases (M2):** each component is delivered under its partition's lease, through `DeliveryLease` (`serve/lease.rs`), lifted out of the feed's events so both hold one. Without a lease, the stream's own end comes first, so a move's `WrongPartition` isn't reported as the lease's `PartitionUnavailable` (simp724's M1), and each look while waiting for a first lease stamps the stream's take clock, so `--stream-idle-ms` doesn't end it (M2).
+- **Close and move (S2):** a component ends with its partition's `parts_ended` error, as the feed's do: `PartitionUnavailable` on a close, `WrongPartition` on a map that moves it. Any component's error ends the watch (no `allow_partial`); the client resumes from its last token.
+- **`--max-streams`:** one place on the node called, and one per component on its partition's node, as a cluster subscription.
+- **An older node** answers `ForwardMemoryWatch` with `Unimplemented`, which the merge answers as `Unsupported`, naming the node.
+
+## PR 3 (numbers assigned, section to come)
 - `/mcp` on a cluster node.
