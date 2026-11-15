@@ -129,30 +129,11 @@ pub(crate) async fn watch(
             namespaces: ns,
             resume,
         };
-        let started = tokio::time::timeout_at(deadline, async {
-            let mut events = open.open(&p, request).await?;
-            match next(&mut events).await {
-                Some(Ok(proto::MemoryEvent {
-                    token,
-                    event: Some(proto::memory_event::Event::Progress(_)),
-                })) => Ok((events, token)),
-                Some(Err(e)) => Err(e),
-                _ => Err(ApiError::internal(format!(
-                    "partition {p:?}'s watch didn't start with its position"
-                ))),
-            }
+        let (events, start) = started(&p, deadline, within, async {
+            let events = open.open(&p, request).await?;
+            start_mark(&p, events).await
         })
-        .await;
-        let (events, start) = match started {
-            Ok(started) => started?,
-            Err(_) => {
-                return Err(ApiError::partition_unavailable(format!(
-                    "partition {p:?}'s watch didn't start within {} ms (its node may hold no \
-                     lease for it yet): watch again",
-                    within.as_millis()
-                )));
-            }
-        };
+        .await?;
         components.push(Part {
             partition: p,
             epoch,
@@ -181,6 +162,43 @@ pub(crate) async fn watch(
         merge.run(tx, took, idle).await;
     });
     Ok(MemoryEvents::from_channel(rx, taken))
+}
+
+/// A component's open and start mark, `open`, within the watch's `deadline` (`within` from
+/// the call's start): a component delivers nothing, its start mark included, before its
+/// partition's first lease, so a partition that gets none in time fails the call with
+/// `PartitionUnavailable`, naming it (simp724's S5).
+async fn started(
+    partition: &str,
+    deadline: tokio::time::Instant,
+    within: std::time::Duration,
+    open: impl std::future::Future<Output = Result<(Component, Bytes), ApiError>>,
+) -> Result<(Component, Bytes), ApiError> {
+    match tokio::time::timeout_at(deadline, open).await {
+        Ok(started) => started,
+        Err(_) => Err(ApiError::partition_unavailable(format!(
+            "partition {partition:?}'s watch didn't start within {} ms (its node may hold no \
+             lease for it yet): watch again",
+            within.as_millis()
+        ))),
+    }
+}
+
+/// A component's first event, its start mark: the position it starts from.
+async fn start_mark(
+    partition: &str,
+    mut events: Component,
+) -> Result<(Component, Bytes), ApiError> {
+    match next(&mut events).await {
+        Some(Ok(proto::MemoryEvent {
+            token,
+            event: Some(proto::memory_event::Event::Progress(_)),
+        })) => Ok((events, token)),
+        Some(Err(e)) => Err(e),
+        _ => Err(ApiError::internal(format!(
+            "partition {partition:?}'s watch didn't start with its position"
+        ))),
+    }
 }
 
 /// Each component's start from a resume token, after checking that it's this cluster's and
@@ -669,6 +687,67 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
         assert!(rx.recv().await.is_none());
+    }
+
+    /// simp724's S5: a component that doesn't open and send its start mark by the deadline
+    /// fails the watch with `PartitionUnavailable`, naming its partition: one that never
+    /// answers, and a real component whose partition has had no lease yet (`Wait`). Once
+    /// leased, the same component starts.
+    #[tokio::test]
+    async fn a_component_that_doesnt_start_by_the_deadline_fails_the_watch() {
+        use crate::serve::gate::{LeaseClock, WriteGate};
+        let within = std::time::Duration::from_millis(200);
+        let deadline = || tokio::time::Instant::now() + within;
+        let e = started("p1", deadline(), within, std::future::pending())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+        assert!(
+            e.message
+                .contains("\"p1\"'s watch didn't start within 200 ms"),
+            "{}",
+            e.message
+        );
+
+        let (core, dir) = crate::serve::memory::tests::core("s5");
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p2", false, Arc::clone(&clock));
+        let (_end, ended) = tokio::sync::watch::channel(None);
+        let waiting = crate::serve::memory::tests::component(
+            &core,
+            &gate,
+            ended,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let e = started(
+            "p2",
+            deadline(),
+            within,
+            start_mark("p2", Box::pin(waiting)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
+        assert!(e.message.contains("\"p2\""), "{}", e.message);
+
+        gate.renew(clock.now() + 3_600_000_000_000);
+        let (_end, ended) = tokio::sync::watch::channel(None);
+        let leased = crate::serve::memory::tests::component(
+            &core,
+            &gate,
+            ended,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let (_, token) = started("p2", deadline(), within, start_mark("p2", Box::pin(leased)))
+            .await
+            .unwrap();
+        assert!(!token.is_empty());
+        drop(core);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A watch's token: this cluster's, this watch's, every partition's position, and no

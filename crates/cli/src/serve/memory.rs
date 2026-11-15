@@ -496,12 +496,12 @@ pub(crate) fn watch(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::serve::gate::{LeaseClock, WriteGate};
 
     /// A store `notes` in a fresh database with a change feed, and its directory.
-    fn core(name: &str) -> (Arc<MemCore>, std::path::PathBuf) {
+    pub(crate) fn core(name: &str) -> (Arc<MemCore>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("phdb-memwatch-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -550,7 +550,7 @@ mod tests {
     }
 
     /// A cluster partition's component of a watch of "alice", idle limit `idle`.
-    fn component(
+    pub(crate) fn component(
         core: &Arc<MemCore>,
         gate: &Arc<WriteGate>,
         ended: tokio::sync::watch::Receiver<Option<ApiError>>,
