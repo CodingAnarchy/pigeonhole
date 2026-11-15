@@ -36,6 +36,7 @@ mod grpc;
 mod handles;
 mod http;
 mod indexes;
+mod lease;
 mod listener;
 mod mcp;
 mod memory;
