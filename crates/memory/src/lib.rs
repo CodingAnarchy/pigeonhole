@@ -46,8 +46,8 @@ pub use layout::{MemoryId, normalize};
 /// `pigeonhole-text`.
 pub use pigeonhole_text::Normalization;
 pub use recall::{
-    Expand, Fusion, Recall, RecallBodies, RecallHit, RecallPool, RecallRanking, RecallStats,
-    Signal, Signals, Weights,
+    Expand, Fusion, Recall, RecallBodies, RecallHit, RecallHop, RecallHopPart, RecallPool,
+    RecallRanking, RecallStats, RecallWalk, Signal, Signals, Weights,
 };
 pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, PreparedMemory, ReadStore,

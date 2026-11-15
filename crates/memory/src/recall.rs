@@ -13,7 +13,7 @@ use crate::layout::*;
 use crate::store::{EmbeddingModel, Kind};
 
 mod pool;
-pub use pool::{RecallBodies, RecallPool, RecallRanking};
+pub use pool::{RecallBodies, RecallHop, RecallHopPart, RecallPool, RecallRanking, RecallWalk};
 
 /// RRF's constant (Cormack et al., 2009; D311 call 4).
 const RRF_K: f64 = 60.0;
@@ -454,9 +454,12 @@ impl<'a> Recall<'a> {
         let mut ranking = self.pool(&plan)?.rank(self.fusion, self.weights);
         // 2. The graph expansion, seeded by the fused order without it.
         if let Some(x) = self.expand {
-            let seeds = ranking.seeds();
-            self.expand_graph(&plan, &mut ranking, seeds, x)?;
-            ranking.refuse();
+            let mut walk = ranking.walk(x, self.byte_budget);
+            while let Some(hop) = walk.next_hop() {
+                let part = self.hop_part(&plan, &hop)?;
+                walk.settle([part])?;
+            }
+            ranking = walk.finish();
         }
         // 3. The hits, with the bodies read with their candidates.
         Ok(ranking.finish(
@@ -508,6 +511,35 @@ impl<'a> Recall<'a> {
         self.rows
             .read_each(s, &set, |key, row| self.admit(&mut read, key, row, &plan))?;
         Ok(RecallBodies::from_cands(read.into_values()))
+    }
+
+    /// One hop of a graph expansion alone ([`RecallWalk`]): the links of the hop's
+    /// memories in this store, at the recall's snapshot, as [`Expand`] says, with the
+    /// memories they reach that the recall could return scored like its other candidates.
+    /// The walk ([`RecallRanking::walk`]) settles every store's part of the hop together,
+    /// so its bounds ([`Expand::max`], the byte budget) are the one store's.
+    ///
+    /// The same refusals as [`run`](Self::run), and a hop from a memory outside the
+    /// recall's namespaces is `InvalidArgument`.
+    pub fn hop(self, hop: &RecallHop) -> Result<RecallHopPart> {
+        let (text, spec) = self.check()?;
+        self.check_hop(hop)?;
+        let owned = self.own_snapshot()?;
+        let s = self.snapshot.or(owned.as_ref()).expect("a snapshot");
+        let plan = self.plan(s, text, spec);
+        self.hop_part(&plan, hop)
+    }
+
+    /// A hop's memories are in the recall's namespaces.
+    fn check_hop(&self, hop: &RecallHop) -> Result<()> {
+        for ns in hop.namespaces() {
+            if !self.namespaces.contains(&ns) {
+                return Err(Error::InvalidArgument(format!(
+                    "a recall hop from namespace {ns:?}, outside the recall's"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Step 1: the pool, with its IVF counts.
@@ -724,47 +756,30 @@ impl<'a> Recall<'a> {
         next
     }
 
-    /// Walks the links from `seeds` (each with its value, best first) as [`Expand`] says,
-    /// adding the memories it reaches to `cands` and setting their graph values.
-    fn expand_graph(
-        &self,
-        plan: &Plan<'_>,
-        ranking: &mut RecallRanking,
-        seeds: Vec<(Vec<u8>, f64)>,
-        x: Expand,
-    ) -> Result<()> {
+    /// One hop's part in this store ([`hop`](Self::hop)): each of the hop's memories'
+    /// links and backlinks, read within the budget left (a part past it cuts, and so does
+    /// the walk, as one store's hop would), then the rows they reach that aren't known yet,
+    /// read through the recall's filters.
+    fn hop_part(&self, plan: &Plan<'_>, req: &RecallHop) -> Result<RecallHopPart> {
         let s = plan.s;
-        let (cands, stats) = (&mut ranking.cands, &mut ranking.stats);
-        let mut walk = Walk::new(cands, seeds, x, self.byte_budget);
-        for _ in 0..x.hops {
-            if walk.full() {
-                break;
-            }
-            let mut hop = Hop::default();
-            for (q, vq) in &walk.level {
-                for fam in [LINKS, BACKLINKS] {
-                    let (edges, cut) = self.rows.edges(s, q, fam, hop.left(walk.budget))?;
-                    if cut {
-                        walk.cut(stats);
-                        return Ok(());
-                    }
-                    hop.add(*vq, edges, &walk.visited, &walk.ineligible);
+        let mut hop = Hop::default();
+        for (q, vq) in &req.level {
+            for fam in [LINKS, BACKLINKS] {
+                let (edges, cut) = self.rows.edges(s, q, fam, hop.left(req.left))?;
+                if cut {
+                    return Ok(RecallHopPart::cut());
                 }
-            }
-            let unknown = walk.unknown(&hop);
-            let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
-            if !unknown.is_empty() {
-                let set = KeySet::from_unsorted(unknown.iter().copied());
-                self.rows
-                    .read_each(s, &set, |key, row| self.admit(&mut fresh, key, row, plan))?;
-                walk.filtered_out(&unknown, &fresh);
-            }
-            if !walk.settle(hop, fresh, cands, stats) {
-                break;
+                hop.add(*vq, edges, &req.visited, &req.ineligible);
             }
         }
-        stats.expanded = walk.graphed;
-        Ok(())
+        let unknown = req.unknown(&hop);
+        let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+        if !unknown.is_empty() {
+            let set = KeySet::from_unsorted(unknown.iter());
+            self.rows
+                .read_each(s, &set, |key, row| self.admit(&mut fresh, key, row, plan))?;
+        }
+        Ok(RecallHopPart::new(hop, &unknown, fresh))
     }
 
     /// One candidate from its row, or `None` if it's filtered out or gone. Its keyword
@@ -1012,7 +1027,7 @@ impl Pass {
     }
 }
 
-/// A graph expansion's state between hops ([`Recall::expand_graph`]), shared by both forms.
+/// A graph expansion's state between hops ([`RecallWalk`]), on the store or the entry node.
 struct Walk {
     /// Each candidate's index in `cands`.
     at: BTreeMap<Vec<u8>, usize>,
@@ -1029,7 +1044,7 @@ struct Walk {
 
 /// One hop's links: every memory it reaches, valued by its best link, and the bytes read.
 #[derive(Default)]
-struct Hop {
+pub(crate) struct Hop {
     reached: BTreeMap<Vec<u8>, f64>,
     read: u64,
 }
@@ -1095,25 +1110,6 @@ impl Walk {
         stats.expanded = self.graphed;
     }
 
-    /// What `hop` reached that isn't a candidate yet: its rows are read to apply the
-    /// recall's own filters.
-    fn unknown<'h>(&self, hop: &'h Hop) -> Vec<&'h Vec<u8>> {
-        hop.reached
-            .keys()
-            .filter(|k| !self.at.contains_key(*k))
-            .collect()
-    }
-
-    /// Of `unknown`, what the filters left out of `fresh` is neither scored nor walked
-    /// through.
-    fn filtered_out(&mut self, unknown: &[&Vec<u8>], fresh: &BTreeMap<Vec<u8>, Cand>) {
-        for k in unknown {
-            if !fresh.contains_key(*k) {
-                self.ineligible.insert((*k).clone());
-            }
-        }
-    }
-
     /// Ends a hop: its best-valued memories, up to `max` in all, get their graph values
     /// (`fresh` holds the new candidates' rows) and are the next hop's level. `false`: it
     /// reached none, so the walk ends.
@@ -1123,7 +1119,7 @@ impl Walk {
         mut fresh: BTreeMap<Vec<u8>, Cand>,
         cands: &mut Vec<Cand>,
         stats: &mut RecallStats,
-    ) -> bool {
+    ) -> Result<bool> {
         if let Some(b) = self.budget.as_mut() {
             *b = b.saturating_sub(hop.read);
         }
@@ -1141,7 +1137,11 @@ impl Walk {
             let i = match self.at.get(n) {
                 Some(&i) => i,
                 None => {
-                    let c = fresh.remove(n).expect("an eligible row was read");
+                    let c = fresh.remove(n).ok_or_else(|| {
+                        Error::InvalidArgument(
+                            "a recall hop reached a memory it didn't read".into(),
+                        )
+                    })?;
                     self.at.insert(n.clone(), cands.len());
                     cands.push(c);
                     cands.len() - 1
@@ -1152,10 +1152,10 @@ impl Walk {
         }
         self.graphed += l.len();
         if l.is_empty() {
-            return false;
+            return Ok(false);
         }
         self.level = l;
-        true
+        Ok(true)
     }
 }
 
@@ -1493,10 +1493,12 @@ impl<'a> Recall<'a> {
             RecallPool::new(cands, &ivf_counts, &fell_back).rank(self.fusion, self.weights);
         // 2. The graph expansion, seeded by the fused order without it.
         if let Some(x) = self.expand {
-            let seeds = ranking.seeds();
-            self.expand_graph_async(&plan, &mut ranking, seeds, x, &rows)
-                .await?;
-            ranking.refuse();
+            let mut walk = ranking.walk(x, self.byte_budget);
+            while let Some(hop) = walk.next_hop() {
+                let part = self.hop_part_async(&plan, &hop, &rows).await?;
+                walk.settle([part])?;
+            }
+            ranking = walk.finish();
         }
         // 3. The hits, with the bodies read with their candidates.
         Ok(ranking.finish(
@@ -1587,52 +1589,37 @@ impl<'a> Recall<'a> {
         Ok((out, fell_back))
     }
 
-    /// [`expand_graph`](Self::expand_graph)'s async twin: the same budget arithmetic
-    /// ([`Hop`]), hop by hop, link by link.
-    async fn expand_graph_async(
+    /// [`hop_part`](Self::hop_part)'s async twin: the same budget arithmetic ([`Hop`]),
+    /// link by link.
+    async fn hop_part_async(
         &self,
         plan: &Plan<'_>,
-        ranking: &mut RecallRanking,
-        seeds: Vec<(Vec<u8>, f64)>,
-        x: Expand,
+        req: &RecallHop,
         rows: &Yields,
-    ) -> Result<()> {
+    ) -> Result<RecallHopPart> {
         let s = plan.s;
-        let (cands, stats) = (&mut ranking.cands, &mut ranking.stats);
-        let mut walk = Walk::new(cands, seeds, x, self.byte_budget);
-        for _ in 0..x.hops {
-            if walk.full() {
-                break;
-            }
-            let mut hop = Hop::default();
-            for (q, vq) in &walk.level {
-                for fam in [LINKS, BACKLINKS] {
-                    let left = hop.left(walk.budget);
-                    let (edges, cut) = self.rows.edges_async(s, q, fam, left).await?;
-                    if cut {
-                        walk.cut(stats);
-                        return Ok(());
-                    }
-                    hop.add(*vq, edges, &walk.visited, &walk.ineligible);
+        let mut hop = Hop::default();
+        for (q, vq) in &req.level {
+            for fam in [LINKS, BACKLINKS] {
+                let left = hop.left(req.left);
+                let (edges, cut) = self.rows.edges_async(s, q, fam, left).await?;
+                if cut {
+                    return Ok(RecallHopPart::cut());
                 }
-            }
-            let unknown = walk.unknown(&hop);
-            let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
-            if !unknown.is_empty() {
-                let set = KeySet::from_unsorted(unknown.iter().copied());
-                self.rows
-                    .read_each_async(s, &set, rows, |key, row| {
-                        self.admit(&mut fresh, key, row, plan)
-                    })
-                    .await?;
-                walk.filtered_out(&unknown, &fresh);
-            }
-            if !walk.settle(hop, fresh, cands, stats) {
-                break;
+                hop.add(*vq, edges, &req.visited, &req.ineligible);
             }
         }
-        stats.expanded = walk.graphed;
-        Ok(())
+        let unknown = req.unknown(&hop);
+        let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+        if !unknown.is_empty() {
+            let set = KeySet::from_unsorted(unknown.iter());
+            self.rows
+                .read_each_async(s, &set, rows, |key, row| {
+                    self.admit(&mut fresh, key, row, plan)
+                })
+                .await?;
+        }
+        Ok(RecallHopPart::new(hop, &unknown, fresh))
     }
 }
 

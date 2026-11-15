@@ -8,10 +8,10 @@
 //! The byte forms are versioned: a version this build doesn't know is refused, never guessed
 //! at.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Body, Cand, Fusion, GRAPH_SEEDS, RecallHit, RecallStats, Signal, Signals, Weights};
-use super::{fuse, hit_size};
+use super::{Body, Cand, Expand, Fusion, GRAPH_SEEDS, Hop, RecallHit, RecallStats, Signal};
+use super::{Signals, Walk, Weights, fuse, hit_size};
 use crate::error::{Error, Result};
 use crate::layout::MemoryId;
 use crate::store::Kind;
@@ -41,7 +41,7 @@ impl RecallPool {
     pub(crate) fn new(
         cands: Vec<Cand>,
         ivf_counts: &BTreeMap<&str, u64>,
-        fell_back: &std::collections::BTreeSet<&str>,
+        fell_back: &BTreeSet<&str>,
     ) -> Self {
         RecallPool {
             cands,
@@ -64,7 +64,7 @@ impl RecallPool {
     /// `InvalidArgument`: its namespace was gathered twice.
     pub fn merge(parts: impl IntoIterator<Item = RecallPool>) -> Result<RecallPool> {
         let mut out = RecallPool::default();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for p in parts {
             for c in &p.cands {
                 if !seen.insert(c.key.clone()) {
@@ -103,17 +103,7 @@ impl RecallPool {
         let n = r.u32()?;
         let mut cands = Vec::new();
         for _ in 0..n {
-            let key = r.bytes()?.to_vec();
-            let id = MemoryId::from_row(&key).ok_or_else(|| r.bad())?;
-            let vals = r.vals()?;
-            cands.push(Cand {
-                key,
-                id,
-                vals,
-                ranks: [None; 6],
-                score: 0.0,
-                body: None,
-            });
+            cands.push(r.cand()?);
         }
         r.end()?;
         Ok(RecallPool {
@@ -193,6 +183,18 @@ impl RecallRanking {
         fuse(&mut self.cands, &self.weights, self.fusion);
     }
 
+    /// A graph expansion of the ranking, as [`Expand`] says, within `byte_budget` (the
+    /// recall's): seeded by its best 10, hop by hop ([`RecallWalk`]).
+    pub fn walk(self, x: Expand, byte_budget: Option<u64>) -> RecallWalk {
+        let walk = Walk::new(&self.cands, self.seeds(), x, byte_budget);
+        RecallWalk {
+            walk,
+            ranking: self,
+            hops_left: x.hops,
+            done: false,
+        }
+    }
+
     /// The hits: the candidates in fused order, each with its body (read with it in one
     /// store, or from `bodies`), at most `k`, within `byte_budget` as
     /// [`Recall::byte_budget`](super::Recall::byte_budget) says, with their signals if
@@ -247,6 +249,334 @@ impl RecallRanking {
             out.push(hit);
         }
         (out, stats)
+    }
+}
+
+/// A graph expansion under way ([`RecallRanking::walk`], D311 §3): its bounds
+/// ([`Expand::max`] and the byte budget) are over every hop's part together, so a walk over
+/// several stores settles as one store's.
+///
+/// Each hop: [`next_hop`](Self::next_hop) says what to walk from, each store holding some
+/// of it runs its part ([`Recall::hop`](super::Recall::hop), on [`RecallHop::split`]'s
+/// share), and [`settle`](Self::settle) takes every part. Links stay within a namespace,
+/// and a store holds its namespaces whole, so a part needs no other store's.
+pub struct RecallWalk {
+    walk: Walk,
+    ranking: RecallRanking,
+    hops_left: u32,
+    done: bool,
+}
+
+impl std::fmt::Debug for RecallWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecallWalk")
+            .field("hops_left", &self.hops_left)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecallWalk {
+    /// The next hop to take, or `None` once the walk is over: its hops are taken, it's
+    /// full, a hop reached nothing, or the budget cut it.
+    pub fn next_hop(&self) -> Option<RecallHop> {
+        if self.done || self.hops_left == 0 || self.walk.full() {
+            return None;
+        }
+        Some(RecallHop {
+            level: self.walk.level.clone(),
+            visited: self.walk.visited.clone(),
+            known: self.walk.at.keys().cloned().collect(),
+            ineligible: self.walk.ineligible.clone(),
+            left: self.walk.budget,
+        })
+    }
+
+    /// Ends the hop [`next_hop`](Self::next_hop) gave, with every store's part of it.
+    /// A part that came back cut, or parts that together read past the budget left, cut
+    /// the walk, as one store's hop reading them all would.
+    pub fn settle(&mut self, parts: impl IntoIterator<Item = RecallHopPart>) -> Result<()> {
+        let mut hop = Hop::default();
+        let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+        let mut cut = false;
+        for p in parts {
+            cut |= p.cut;
+            hop.read += p.read;
+            for (k, v) in p.reached {
+                let e = hop.reached.entry(k).or_insert(v);
+                if v > *e {
+                    *e = v;
+                }
+            }
+            for c in p.fresh {
+                fresh.insert(c.key.clone(), c);
+            }
+            self.walk.ineligible.extend(p.ineligible);
+        }
+        self.hops_left = self.hops_left.saturating_sub(1);
+        if cut || self.walk.budget.is_some_and(|b| hop.read > b) {
+            self.walk.cut(&mut self.ranking.stats);
+            self.done = true;
+            return Ok(());
+        }
+        let r = &mut self.ranking;
+        if !self.walk.settle(hop, fresh, &mut r.cands, &mut r.stats)? {
+            self.done = true;
+        }
+        Ok(())
+    }
+
+    /// The ranking with the walk's graph values, fused again.
+    pub fn finish(mut self) -> RecallRanking {
+        self.ranking.stats.expanded = self.walk.graphed;
+        self.ranking.refuse();
+        self.ranking
+    }
+}
+
+/// What one hop of a graph expansion walks from ([`RecallWalk::next_hop`]): its memories
+/// with their values, what the walk already knows of their namespaces, and the byte budget
+/// left.
+#[derive(Clone)]
+pub struct RecallHop {
+    pub(crate) level: Vec<(Vec<u8>, f64)>,
+    pub(crate) visited: BTreeSet<Vec<u8>>,
+    /// The walk's candidates: a row it reaches among them isn't read again.
+    known: BTreeSet<Vec<u8>>,
+    pub(crate) ineligible: BTreeSet<Vec<u8>>,
+    pub(crate) left: Option<u64>,
+}
+
+impl std::fmt::Debug for RecallHop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecallHop")
+            .field("level", &self.level.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A row key's namespace (a memory row's, as every key in a walk is).
+fn namespace_of(key: &[u8]) -> Option<String> {
+    MemoryId::from_row(key).map(|id| id.namespace().to_owned())
+}
+
+impl RecallHop {
+    /// The namespaces of the memories it walks from.
+    pub fn namespaces(&self) -> BTreeSet<String> {
+        self.level
+            .iter()
+            .filter_map(|(k, _)| namespace_of(k))
+            .collect()
+    }
+
+    /// The hop's share for each store, by `by` (a namespace's store): each share walks
+    /// from that store's memories, and knows only its namespaces' rows.
+    pub fn split<K: Ord>(&self, by: impl Fn(&str) -> K) -> BTreeMap<K, RecallHop> {
+        let blank = || RecallHop {
+            level: Vec::new(),
+            visited: BTreeSet::new(),
+            known: BTreeSet::new(),
+            ineligible: BTreeSet::new(),
+            left: self.left,
+        };
+        // Each namespace's share, then each store's.
+        let mut by_ns: BTreeMap<String, RecallHop> = BTreeMap::new();
+        for (k, v) in &self.level {
+            if let Some(ns) = namespace_of(k) {
+                by_ns
+                    .entry(ns)
+                    .or_insert_with(blank)
+                    .level
+                    .push((k.clone(), *v));
+            }
+        }
+        let mut place = |k: &Vec<u8>, pick: fn(&mut RecallHop) -> &mut BTreeSet<Vec<u8>>| {
+            if let Some(h) = namespace_of(k).and_then(|ns| by_ns.get_mut(&ns)) {
+                pick(h).insert(k.clone());
+            }
+        };
+        for k in &self.visited {
+            place(k, |h| &mut h.visited);
+        }
+        for k in &self.known {
+            place(k, |h| &mut h.known);
+        }
+        for k in &self.ineligible {
+            place(k, |h| &mut h.ineligible);
+        }
+        let mut out: BTreeMap<K, RecallHop> = BTreeMap::new();
+        for (ns, h) in by_ns {
+            let e = out.entry(by(&ns)).or_insert_with(blank);
+            e.level.extend(h.level);
+            e.visited.extend(h.visited);
+            e.known.extend(h.known);
+            e.ineligible.extend(h.ineligible);
+        }
+        // Each share's level stays best first, as the walk's is.
+        for h in out.values_mut() {
+            h.level
+                .sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        }
+        out
+    }
+
+    /// What `hop` reached that isn't a candidate yet: its rows are read through the
+    /// recall's filters.
+    pub(crate) fn unknown(&self, hop: &Hop) -> Vec<Vec<u8>> {
+        hop.reached
+            .keys()
+            .filter(|k| !self.known.contains(*k))
+            .cloned()
+            .collect()
+    }
+
+    /// The byte form.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match self.left {
+            Some(b) => {
+                w.out.push(1);
+                w.u64(b);
+            }
+            None => w.out.push(0),
+        }
+        w.u32(self.level.len() as u32);
+        for (k, v) in &self.level {
+            w.bytes(k);
+            w.f64(*v);
+        }
+        for set in [&self.visited, &self.known, &self.ineligible] {
+            w.keys(set.iter());
+        }
+        w.out
+    }
+
+    /// The hop a byte form names. A version this build doesn't know, or anything
+    /// malformed, is `InvalidArgument`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<RecallHop> {
+        let mut r = Reader::new(bytes, "recall hop")?;
+        let left = match r.u8()? {
+            0 => None,
+            1 => Some(r.u64()?),
+            _ => return Err(r.bad()),
+        };
+        let n = r.u32()?;
+        let mut level = Vec::new();
+        for _ in 0..n {
+            let k = r.key()?;
+            level.push((k, r.f64()?));
+        }
+        let visited = r.keys()?;
+        let known = r.keys()?;
+        let ineligible = r.keys()?;
+        r.end()?;
+        Ok(RecallHop {
+            level,
+            visited,
+            known,
+            ineligible,
+            left,
+        })
+    }
+}
+
+/// One store's part of a hop ([`Recall::hop`](super::Recall::hop)), for
+/// [`RecallWalk::settle`].
+pub struct RecallHopPart {
+    reached: BTreeMap<Vec<u8>, f64>,
+    read: u64,
+    cut: bool,
+    fresh: Vec<Cand>,
+    ineligible: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for RecallHopPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecallHopPart")
+            .field("reached", &self.reached.len())
+            .field("cut", &self.cut)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecallHopPart {
+    /// A part whose reads passed the budget left.
+    pub(crate) fn cut() -> Self {
+        RecallHopPart {
+            reached: BTreeMap::new(),
+            read: 0,
+            cut: true,
+            fresh: Vec::new(),
+            ineligible: Vec::new(),
+        }
+    }
+
+    /// A whole part: what `hop` reached, and of the rows it read (`unknown`), the ones
+    /// that passed the filters (`fresh`); the rest are ineligible.
+    pub(crate) fn new(hop: Hop, unknown: &[Vec<u8>], fresh: BTreeMap<Vec<u8>, Cand>) -> Self {
+        let ineligible = unknown
+            .iter()
+            .filter(|k| !fresh.contains_key(*k))
+            .cloned()
+            .collect();
+        RecallHopPart {
+            reached: hop.reached,
+            read: hop.read,
+            cut: false,
+            fresh: fresh.into_values().collect(),
+            ineligible,
+        }
+    }
+
+    /// The byte form: the new candidates' ids and signal values, without their bodies.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.out.push(u8::from(self.cut));
+        w.u64(self.read);
+        w.u32(self.reached.len() as u32);
+        for (k, v) in &self.reached {
+            w.bytes(k);
+            w.f64(*v);
+        }
+        w.u32(self.fresh.len() as u32);
+        for c in &self.fresh {
+            w.bytes(&c.key);
+            w.vals(&c.vals);
+        }
+        w.keys(self.ineligible.iter());
+        w.out
+    }
+
+    /// The part a byte form names. A version this build doesn't know, or anything
+    /// malformed, is `InvalidArgument`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<RecallHopPart> {
+        let mut r = Reader::new(bytes, "recall hop part")?;
+        let cut = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(r.bad()),
+        };
+        let read = r.u64()?;
+        let n = r.u32()?;
+        let mut reached = BTreeMap::new();
+        for _ in 0..n {
+            let k = r.key()?;
+            reached.insert(k, r.f64()?);
+        }
+        let n = r.u32()?;
+        let mut fresh = Vec::new();
+        for _ in 0..n {
+            fresh.push(r.cand()?);
+        }
+        let ineligible = r.keys()?.into_iter().collect();
+        r.end()?;
+        Ok(RecallHopPart {
+            reached,
+            read,
+            cut,
+            fresh,
+            ineligible,
+        })
     }
 }
 
@@ -358,8 +688,10 @@ impl RecallBodies {
                     let d = r.u32()? as usize;
                     let raw = r.take(d.checked_mul(4).ok_or_else(|| r.bad())?)?;
                     Some(
-                        raw.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes(c.try_into().expect("4")))
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| f32::from_le_bytes(*c))
                             .collect(),
                     )
                 }
@@ -399,9 +731,21 @@ impl Writer {
         self.out.extend_from_slice(&v.to_le_bytes());
     }
 
+    fn u64(&mut self, v: u64) {
+        self.out.extend_from_slice(&v.to_le_bytes());
+    }
+
     fn bytes(&mut self, b: &[u8]) {
         self.u32(b.len() as u32);
         self.out.extend_from_slice(b);
+    }
+
+    /// A count, then each key.
+    fn keys<'k>(&mut self, keys: impl ExactSizeIterator<Item = &'k Vec<u8>>) {
+        self.u32(keys.len() as u32);
+        for k in keys {
+            self.bytes(k);
+        }
     }
 
     /// Six optional values: a presence mask, then each present one.
@@ -460,9 +804,47 @@ impl<'b> Reader<'b> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into().expect("8")))
     }
 
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8")))
+    }
+
     fn bytes(&mut self) -> Result<&'b [u8]> {
         let n = self.u32()? as usize;
         self.take(n)
+    }
+
+    /// A memory row's key.
+    fn key(&mut self) -> Result<Vec<u8>> {
+        let k = self.bytes()?;
+        if MemoryId::from_row(k).is_none() {
+            return Err(self.bad());
+        }
+        Ok(k.to_vec())
+    }
+
+    /// A count, then each memory row's key.
+    fn keys(&mut self) -> Result<BTreeSet<Vec<u8>>> {
+        let n = self.u32()?;
+        let mut out = BTreeSet::new();
+        for _ in 0..n {
+            out.insert(self.key()?);
+        }
+        Ok(out)
+    }
+
+    /// A candidate without its body: its key and signal values.
+    fn cand(&mut self) -> Result<Cand> {
+        let key = self.bytes()?.to_vec();
+        let id = MemoryId::from_row(&key).ok_or_else(|| self.bad())?;
+        let vals = self.vals()?;
+        Ok(Cand {
+            key,
+            id,
+            vals,
+            ranks: [None; 6],
+            score: 0.0,
+            body: None,
+        })
     }
 
     fn vals(&mut self) -> Result<[Option<f64>; 6]> {
