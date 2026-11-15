@@ -505,21 +505,52 @@ fn identity_fields(id: Option<&super::backup::CopyIdentity>) -> proto::BackupChu
     }
 }
 
-/// A download's offset past its copy's end.
-/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::backup::CHUNK) chunks with
-/// `send`, the last carrying the total, the SHA-256 and the identity: a download's copy, or a
-/// closed partition's file (D317 ticket 6). Stops early, `Ok`, once the client went away.
-async fn send_kept<F, Fut>(
+/// A download's chunks on their way to its client: what the task of a backup's download and
+/// of a closed partition's file sends through and ends with.
+struct Chunks {
+    tx: mpsc::Sender<Result<proto::BackupChunk, ApiError>>,
+    /// `--stream-idle-ms`: the longest one send waits.
+    idle: Duration,
+    /// What a client that took no chunk for `idle` is told: how it resumes.
+    stalled: &'static str,
+}
+
+impl Chunks {
+    /// Sends `chunk` within the idle limit; `false` once the client went away (it resumes).
+    async fn send(&self, chunk: proto::BackupChunk) -> Result<bool, ApiError> {
+        match tokio::time::timeout(self.idle, self.tx.send(Ok(chunk))).await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(_)) => Ok(false),
+            Err(_) => Err(ApiError::deadline(self.stalled)),
+        }
+    }
+
+    /// The download's end: counted with its `outcome`, and its error sent. Within the idle
+    /// limit, as a chunk: a heartbeat may still sit in the channel, and a dropped error would
+    /// end the stream as if it were whole (cli692's R1 on #1628).
+    async fn end(&self, outcome: Result<(), ApiError>, metrics: &Metrics, started: Instant) {
+        metrics.count(
+            DOWNLOAD,
+            outcome.as_ref().err().map(|e| e.code.as_str()),
+            started.elapsed(),
+        );
+        if let Err(e) = outcome {
+            let _ = tokio::time::timeout(self.idle, self.tx.send(Err(e))).await;
+        }
+    }
+}
+
+/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::backup::CHUNK) chunks
+/// through `chunks`, the last carrying the total, the SHA-256 and the identity: a download's
+/// copy, or a closed partition's file (D317 ticket 6). Stops early, `Ok`, once the client
+/// went away.
+async fn send_kept(
     kept: &super::backup::Kept,
     start: u64,
     id: &str,
     pool: &Arc<Semaphore>,
-    send: F,
-) -> Result<(), ApiError>
-where
-    F: Fn(proto::BackupChunk) -> Fut,
-    Fut: Future<Output = Result<bool, ApiError>>,
-{
+    chunks: &Chunks,
+) -> Result<(), ApiError> {
     let mut at = start;
     loop {
         let path = kept.path.clone();
@@ -550,13 +581,14 @@ where
             feed_token: kept.feed_token.clone().into(),
             ..identity_fields(last.then_some(kept.identity.as_ref()).flatten())
         };
-        if !send(chunk).await? || last {
+        if !chunks.send(chunk).await? || last {
             return Ok(());
         }
         at = next;
     }
 }
 
+/// A download's offset past its copy's end.
 pub(crate) fn past_the_copy(offset: u64, total: u64) -> ApiError {
     ApiError::invalid(format!(
         "offset {offset} is past the backup's {total} bytes"
@@ -1285,6 +1317,8 @@ impl Partition {
             Some(id) => pigeonhole_otel::Config::new().attribute(PARTITION_ATTRIBUTE, id),
             None => pigeonhole_otel::Config::new(),
         };
+        // The node's one `Backups` keeps the first placement it's given (a `OnceLock`): a
+        // cluster node's partitions all pass the node's, so the later calls change nothing.
         if let Some(p) = &config.placement {
             config.backups.place(p);
         }
@@ -2673,31 +2707,18 @@ impl Service {
             return Err(past_the_copy(r.offset, kept.total));
         }
         let (tx, rx) = mpsc::channel(1);
-        let (backups, pool, idle) = (
-            Arc::clone(&part.backups),
-            Arc::clone(&self.blocking),
-            self.limits.stream_idle,
-        );
+        let chunks = Chunks {
+            tx,
+            idle: self.limits.stream_idle,
+            stalled: "the client took no backup chunk for --stream-idle-ms; resume with \
+                      backup_id and the offset it reached",
+        };
+        let (backups, pool) = (Arc::clone(&part.backups), Arc::clone(&self.blocking));
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         let (task_id, start, mut task_copy) = (id.clone(), r.offset, copy.clone());
         let want = r.partition;
         tokio::spawn(async move {
-            // Sends `chunk` within the idle limit; `false` once the client went away (it
-            // resumes with the id).
-            let send = |chunk: proto::BackupChunk| {
-                let tx = tx.clone();
-                async move {
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => Ok(true),
-                        Ok(Err(_)) => Ok(false),
-                        Err(_) => Err(ApiError::deadline(
-                            "the client took no backup chunk for --stream-idle-ms; resume \
-                             with backup_id and the offset it reached",
-                        )),
-                    }
-                }
-            };
             let outcome: Result<(), ApiError> = async {
                 // The copy, with heartbeats while it's written (#1611).
                 let kept = loop {
@@ -2716,7 +2737,7 @@ impl Service {
                         feed_token: feed_token.into(),
                         ..Default::default()
                     };
-                    if !send(beat).await? {
+                    if !chunks.send(beat).await? {
                         return Ok(());
                     }
                     tokio::select! {
@@ -2742,19 +2763,10 @@ impl Service {
                         "backup {task_id} is of partition {of:?}, not {want:?}"
                     )));
                 }
-                send_kept(&kept, start, &task_id, &pool, send).await
+                send_kept(&kept, start, &task_id, &pool, &chunks).await
             }
             .await;
-            metrics.count(
-                DOWNLOAD,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            // Within the idle limit, as a chunk: a heartbeat may still sit in the channel, and
-            // a dropped error would end the stream as if it were whole (cli692's R1 on #1628).
-            if let Err(e) = outcome {
-                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
-            }
+            chunks.end(outcome, &metrics, started).await;
             backups.release(&task_id);
             drop(slot);
         });
@@ -2797,33 +2809,19 @@ impl Service {
         }
         let slot = self.stream_slot()?;
         let (tx, rx) = mpsc::channel(1);
-        let (pool, idle) = (Arc::clone(&self.blocking), self.limits.stream_idle);
+        let chunks = Chunks {
+            tx,
+            idle: self.limits.stream_idle,
+            stalled: "the client took no chunk for --stream-idle-ms; resume from the offset \
+                      it reached",
+        };
+        let pool = Arc::clone(&self.blocking);
         let metrics = Arc::clone(&self.metrics);
         let started = Instant::now();
         let (start, task_kept) = (r.offset, kept.clone());
         tokio::spawn(async move {
-            let send = |chunk: proto::BackupChunk| {
-                let tx = tx.clone();
-                async move {
-                    match tokio::time::timeout(idle, tx.send(Ok(chunk))).await {
-                        Ok(Ok(())) => Ok(true),
-                        Ok(Err(_)) => Ok(false),
-                        Err(_) => Err(ApiError::deadline(
-                            "the client took no chunk for --stream-idle-ms; resume from the \
-                             offset it reached",
-                        )),
-                    }
-                }
-            };
-            let outcome = send_kept(&task_kept, start, "", &pool, send).await;
-            metrics.count(
-                DOWNLOAD,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            if let Err(e) = outcome {
-                let _ = tokio::time::timeout(idle, tx.send(Err(e))).await;
-            }
+            let outcome = send_kept(&task_kept, start, "", &pool, &chunks).await;
+            chunks.end(outcome, &metrics, started).await;
             drop(slot);
         });
         Ok(super::backup::Download {
