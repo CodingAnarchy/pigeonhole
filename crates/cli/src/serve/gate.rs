@@ -32,17 +32,41 @@ use super::errors::ApiError;
 
 /// A node's lease clock (D326): nanoseconds on a clock that counts time the machine was
 /// suspended ([`pigeonhole_io::sys::boot_clock_ns`]), shared by the node's gates and its
-/// grants. Tests move one node's clock on with a seam of their own, so nodes in the same
-/// process don't share a skew.
-#[derive(Debug, Default)]
+/// grants; and whether the node's last lease round reached a majority, which decides what a
+/// partition without a lease does with its feeds (feed1248's F2). Tests move one node's
+/// clock on with a seam of their own, so nodes in the same process don't share a skew.
+#[derive(Debug)]
 pub(crate) struct LeaseClock {
     /// Added to the clock (tests): a suspend, or a pause between a write's admission and
     /// its commit.
     #[cfg(test)]
     skew: AtomicU64,
+    /// The node's last lease round reached a majority of its map's nodes (true until one
+    /// didn't).
+    majority: std::sync::atomic::AtomicBool,
+}
+
+impl Default for LeaseClock {
+    fn default() -> Self {
+        Self {
+            #[cfg(test)]
+            skew: AtomicU64::new(0),
+            majority: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
 }
 
 impl LeaseClock {
+    /// Records whether the node's last lease round reached a majority.
+    pub(crate) fn set_majority(&self, reached: bool) {
+        self.majority.store(reached, Ordering::SeqCst);
+    }
+
+    /// Whether the node's last lease round reached a majority.
+    pub(crate) fn majority(&self) -> bool {
+        self.majority.load(Ordering::SeqCst)
+    }
+
     /// Now, in nanoseconds since an arbitrary start.
     #[inline]
     pub(crate) fn now(&self) -> u64 {
@@ -73,6 +97,20 @@ pub(crate) enum Fence {
     Unconfirmed,
     /// Its lease ran out: its renewals stopped reaching a majority (D326).
     Lapsed,
+}
+
+/// What a partition's feed components do now (feed1248's F2, D326 PR 2).
+#[derive(Debug)]
+pub(crate) enum Delivery {
+    /// It holds a lease: they deliver.
+    Serve,
+    /// It has held none since it opened here, and the node's last round reached a majority
+    /// (the peers answered, granting or withholding with time left: a move's new node before
+    /// its lease, or one waiting out an old owner's grants). They wait.
+    Wait,
+    /// Its lease lapsed, or the node's last round didn't reach a majority (a node cut off,
+    /// restarted or not): they end, and new subscribes are refused, with this.
+    End(ApiError),
 }
 
 /// No operator's fence.
@@ -180,6 +218,18 @@ impl WriteGate {
         !self.leased()
     }
 
+    /// What its feed components do now ([`Delivery`]): one clock read and two loads.
+    #[inline]
+    pub(crate) fn delivery(&self) -> Delivery {
+        if self.leased() {
+            Delivery::Serve
+        } else if self.leased_once() || !self.clock.majority() {
+            Delivery::End(unleased(&self.partition, self.leased_once()))
+        } else {
+            Delivery::Wait
+        }
+    }
+
     /// Whether it held a lease since it opened here.
     fn leased_once(&self) -> bool {
         self.leased_once.load(Ordering::SeqCst)
@@ -209,6 +259,10 @@ impl WriteGate {
 
     /// The map no longer names this node for the partition at its file's epoch: its lease
     /// ends now (audit120's S1). It reads as never held, since no renewal can bring it back.
+    /// That matters for the feeds (feed1248 on #1912): the install ends the leases before it
+    /// ends the moved partition's components with `WrongPartition`, and a component polled
+    /// in between must see `Wait` (and take that end next), not `End`'s
+    /// `PartitionUnavailable`, which would skip S-C5's reopen at the new owner.
     pub(crate) fn lapse(&self) {
         self.lease_end.store(0, Ordering::SeqCst);
         self.leased_once.store(false, Ordering::SeqCst);

@@ -5438,6 +5438,29 @@ pub struct LeaseWithheld {
     #[prost(uint64, tag = "3")]
     pub remaining_ms: u64,
 }
+/// D326: a node gives up partitions it closed.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReleaseRequest {
+    /// Refused (`InvalidArgument`) if it isn't this node's cluster.
+    #[prost(string, tag = "1")]
+    pub cluster_id: ::prost::alloc::string::String,
+    /// The releasing node.
+    #[prost(string, tag = "2")]
+    pub node_id: ::prost::alloc::string::String,
+    /// The releasing node's round, numbered with its lease rounds: a lease request older
+    /// than it is then ignored.
+    #[prost(uint64, tag = "3")]
+    pub round: u64,
+    /// The partitions given up, at their epochs.
+    #[prost(message, repeated, tag = "4")]
+    pub parts: ::prost::alloc::vec::Vec<LeasePart>,
+    /// The releasing node's start id, as `LeaseRequest.start`: a release of another start
+    /// than the grant's is ignored.
+    #[prost(uint64, tag = "5")]
+    pub start: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReleaseResponse {}
 /// A partition's state on its node (D317 ticket 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -5940,6 +5963,35 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Lease"));
             self.inner.unary(req, path, codec).await
         }
+        /// Node to node (D326): the asking node closed the partitions it names, so this node drops
+        /// them from its grant to it at once, rather than when the grant runs out: a planned
+        /// move's new node then needn't wait. Applied only to a grant of the same start of the
+        /// asking node, at a round no older than the grant's, so a delayed release can never end
+        /// a grant that's live. Cluster scope, gRPC only.
+        pub async fn release(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReleaseRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReleaseResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Release",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Release"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -6081,6 +6133,15 @@ pub mod cluster_server {
             &self,
             request: tonic::Request<super::LeaseRequest>,
         ) -> std::result::Result<tonic::Response<super::LeaseResponse>, tonic::Status>;
+        /// Node to node (D326): the asking node closed the partitions it names, so this node drops
+        /// them from its grant to it at once, rather than when the grant runs out: a planned
+        /// move's new node then needn't wait. Applied only to a grant of the same start of the
+        /// asking node, at a round no older than the grant's, so a delayed release can never end
+        /// a grant that's live. Cluster scope, gRPC only.
+        async fn release(
+            &self,
+            request: tonic::Request<super::ReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReleaseResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ClusterServer<T> {
@@ -6709,6 +6770,49 @@ pub mod cluster_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LeaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/Release" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReleaseSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::ReleaseRequest>
+                    for ReleaseSvc<T> {
+                        type Response = super::ReleaseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReleaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::release(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReleaseSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

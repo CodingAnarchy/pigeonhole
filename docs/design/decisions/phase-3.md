@@ -4872,7 +4872,8 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 
 **What it costs.**
 - One clock read and two atomic loads per write and per read on a cluster partition; nothing on a single node.
-- A cut-off owner stops within L. A relocate's new owner waits for the old owner's grants to run out (up to L). Until D326 PR 2's release, a planned move's new owner waits for them too.
+- A cut-off owner stops within L. A relocate's new owner waits for the old owner's grants to run out (up to L). A planned move's doesn't: the old owner releases its grants when it closes the partition (`Cluster.Release`, D326 PR 2), and a release from an earlier start of the node, or an older round, is ignored, so it never ends a live grant.
+- **Feeds (D326 PR 2, feed1248's F1–F5).** A subscribe isn't a read for the gate. A partition's feed components deliver only under its lease: without one since it opened, they wait while the node's last round reached a majority; once the lease lapses or a round misses a majority, they end with `PartitionUnavailable` (a quiet one at the lease's end), and new subscribes there are refused. The check is in each component's events, one clock read per event, so a single node pays nothing.
 - A whole cluster restarting serves about L later than before.
 - **Two nodes:** a majority is both, so with one down the other stops serving within L (the owner accepted this). Run three nodes, or a single node.
 
