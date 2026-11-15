@@ -720,7 +720,8 @@ impl Hub {
         self.ring().failed = true;
         self.stats.hub_failures.fetch_add(1, Ordering::Relaxed);
         // Wake every client: each moves to its own stream once it has taken the ring's rest.
-        self.head.send_modify(|_| {});
+        // The head's current value, so the watch says where the ring is (perf2's nit on #1938).
+        self.notify();
     }
 }
 
