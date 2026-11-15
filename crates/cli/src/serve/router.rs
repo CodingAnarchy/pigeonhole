@@ -528,8 +528,14 @@ impl Router {
     /// large as the largest it awaits in place. Awaited in place, those made every call's
     /// future, a single node's included, over twice the size of [`Service::call`]'s, and a
     /// change to a fan-out changed what a single node's `Get` cost. A boxed one costs its
-    /// path one allocation, beside calls to several nodes. What is still awaited in place is
-    /// counted by the serve callgrind shapes (`serveshapes.rs`): they show a growth of it.
+    /// path one allocation, beside calls to several nodes.
+    ///
+    /// **The rest stay in place:** [`Service::call`], which every single-node call takes,
+    /// and the cluster's scan fan-out, subscription, backup and admin calls, whose futures
+    /// are each smaller than `Service::call`'s, so they don't size this one. A test below
+    /// keeps this future within a margin of `Service::call`'s; one of them that outgrows it
+    /// is boxed as the others are. The serve callgrind shapes (`serveshapes.rs`) count what
+    /// a growth of `Service::call` itself costs.
     async fn dispatch_by(
         &self,
         op: ServiceOp,
@@ -1156,4 +1162,40 @@ pub(crate) fn not_open(partition: &str) -> ApiError {
 /// The answer of [`route`] to a call no caller brings it: one answered before it's routed.
 fn unrouted() -> ApiError {
     ApiError::internal("this call isn't routed to one partition")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The size of the future `f` returns, without calling it.
+    fn future_size<A, F: Future>(_f: impl FnOnce(A) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn dispatch_by_awaits_nothing_in_place_larger_than_a_service_call() {
+        // #1902: a future is as large as the largest it awaits in place, and every call's
+        // future holds `dispatch_by`'s. A cluster-only future awaited in place there, larger
+        // than `Service::call`'s, makes a single node's `Get` pay for it. The margin is what
+        // `dispatch_by` keeps beside its awaitee: the op twice, and its other arguments.
+        type Args<'a> = (
+            &'a Router,
+            ServiceOp,
+            &'a Caller,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+        );
+        let dispatch = future_size(|(r, op, caller, prepaid): Args<'_>| {
+            r.dispatch_by(op, caller, prepaid, None)
+        });
+        let call =
+            future_size(|(r, op, caller, prepaid): Args<'_>| r.service.call(op, caller, prepaid));
+        let margin = 2 * std::mem::size_of::<ServiceOp>() + 512;
+        assert!(
+            dispatch <= call + margin,
+            "dispatch_by's future is {dispatch} bytes, Service::call's {call}, and the margin \
+             {margin}: box the future dispatch_by awaits in place that outgrew Service::call's \
+             (Box::pin, as the fan-outs are), or every call pays for its size (#1902)"
+        );
+    }
 }
