@@ -552,7 +552,8 @@ mod read_tests {
     /// cursor reads the padded record in order, at its own start past the pad; a cursor
     /// opened at the record before's end or at the padded record's start reads it; and a
     /// pad whose record isn't written yet (a live tail seen between the pad's page and the
-    /// record's) stops at the last record's end, then resumes to the record once it is.
+    /// record's) stops at the last record's end, then resumes to the record once it is; and a
+    /// cursor moved by `skip_to` to the pre-pad end steps over the pad to it (#1827).
     #[test]
     fn a_cursor_steps_over_a_pad_and_resumes_on_either_side_of_it() {
         // The padded record's bytes, framed from the stream's end (the first segment is
@@ -627,6 +628,18 @@ mod read_tests {
             for at in [tail, Lsn::new(tail.epoch(), rec_start as u32)] {
                 let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, at).unwrap();
                 assert_eq!(drain(&mut c), [3], "{unit} from {at:?}");
+            }
+            // (d) A cursor moved with `skip_to` to the record before's end (#1827's skip index
+            // jumps to a chunk's end, before the next record's pad) steps over the pad to it.
+            let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+            assert!(c.skip_to(tail).unwrap(), "{unit}");
+            match c.step().unwrap() {
+                Step::Record {
+                    start,
+                    record: WalRecord::Batch { seqno: 3, .. },
+                    ..
+                } => assert_eq!(start, Lsn::new(tail.epoch(), rec_start as u32), "{unit}"),
+                other => panic!("{unit}: {other:?}"),
             }
         }
     }
