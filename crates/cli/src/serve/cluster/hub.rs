@@ -1513,6 +1513,7 @@ mod tests {
             client_events: crate::serve::feed::CLIENT_EVENTS,
             client_bytes: crate::serve::feed::CLIENT_BYTES,
             solo_after: crate::serve::feed::SOLO_AFTER,
+            coalesce: crate::serve::feed::Coalesce::default(),
         };
         let (sink, events, end) = Sink::new(&limits);
         let metrics = Arc::new(Metrics::default());
@@ -1603,6 +1604,7 @@ mod tests {
                 client_events: crate::serve::feed::CLIENT_EVENTS,
                 client_bytes: crate::serve::feed::CLIENT_BYTES,
                 solo_after: crate::serve::feed::SOLO_AFTER,
+                coalesce: crate::serve::feed::Coalesce::default(),
             };
             let (sink, _events, _end) = Sink::new(&limits);
             let metrics = Arc::new(Metrics::default());

@@ -1122,6 +1122,7 @@ fn feed_limits(limits: &Limits) -> super::feed::FeedLimits {
         client_events: limits.feed_client_events,
         client_bytes: limits.feed_client_bytes,
         solo_after: super::feed::SOLO_AFTER,
+        coalesce: limits.feed_coalesce,
     }
 }
 

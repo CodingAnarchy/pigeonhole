@@ -317,6 +317,12 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 
   Raise it on a feed-heavy server with CPUs to spare, whose subscribers matter more than its writes' latency. The feed dump (below) shows hubs' engine feeds falling behind the database.
 
+  **Waiting to batch (#1901).** A hub that keeps up reads its feed once per commit, so under steady writes each hub thread can stay busy waking. `--feed-hub-coalesce-ticks N` makes a hub that just read a small batch (a few commits) wait N timer ticks (1 ms each) before reading again, so the commits arriving meanwhile are read together.
+  - **The cost:** up to N to N+1 ms more lag, and only under steady writes. A commit after a quiet gap is read at once.
+  - **Clients:** `--feed-client-coalesce-ticks N` does the same for each subscriber's stream.
+  - **Default:** 0, never waiting, for both.
+  - **Batched notifies:** whatever these are set to, a hub tells its streams about new commits once per batch it reads, not once per commit.
+
   **At saturation, writes come first.** When the feed side can't deliver every commit, the writes still get the rate they ask for, and feed streams fall behind and catch up. `pigeonhole_serve_feed_fell_behind_total` and the streams' lag show it.
   - On the AX102 at 16 table sets × 16 streams and 55K puts/s, about 14M events/s didn't fit in 3 feed threads and 1 hub thread. More hub threads delivered less.
   - Size the feed side for headroom. #1737 tracks scaling it.

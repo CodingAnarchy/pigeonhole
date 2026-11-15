@@ -92,6 +92,7 @@ pub(super) fn limits() -> Limits {
         feed_quiet: Duration::from_secs(10),
         feed_client_events: super::feed::CLIENT_EVENTS,
         feed_client_bytes: super::feed::CLIENT_BYTES,
+        feed_coalesce: super::feed::Coalesce::default(),
         request_timeout: Duration::from_secs(5),
         stream_idle: Duration::from_secs(5),
         hold_after_part_page: false,

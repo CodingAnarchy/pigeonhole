@@ -167,6 +167,17 @@ pub(crate) struct ServeArgs {
     /// runs on the feed threads beside it instead (#1689).
     #[arg(long, value_name = "N")]
     pub feed_hub_threads: Option<usize>,
+    /// After reading a small batch (a few commits), a subscription's hub waits this many
+    /// timer ticks (1 ms each) before reading its change feed again, so the commits arriving
+    /// meanwhile are read together: fewer wakes per commit for a few milliseconds more lag
+    /// under steady writes. A commit after a quiet gap is never held back. 0 (the default)
+    /// never waits (#1901).
+    #[arg(long, value_name = "TICKS", default_value_t = 0)]
+    pub feed_hub_coalesce_ticks: u32,
+    /// As `--feed-hub-coalesce-ticks`, for each subscriber's stream after it delivered a small
+    /// batch. 0 (the default) never waits (#1901).
+    #[arg(long, value_name = "TICKS", default_value_t = 0)]
+    pub feed_client_coalesce_ticks: u32,
     /// Whether the server's threads get a CPU mask off the shards' CPUs (Linux, where the
     /// engine pinned its shards): the network workers on the free cores and the shards' SMT
     /// siblings, the feed, hub, blocking and background threads on the free cores only.
@@ -349,6 +360,8 @@ pub(crate) struct Limits {
     pub bulk_load_bytes: usize,
     /// How long a quiet feed stream waits before a progress event (ICR 0112: about 10 s).
     pub feed_quiet: Duration,
+    /// `--feed-hub-coalesce-ticks` and `--feed-client-coalesce-ticks` (#1901).
+    pub feed_coalesce: super::feed::Coalesce,
     /// A feed client's buffer: events and their encoded bytes (not flags; tests shrink them).
     pub feed_client_events: usize,
     pub feed_client_bytes: usize,
@@ -385,6 +398,10 @@ impl ServeArgs {
             feed_ring_bytes: self.feed_ring_bytes.max(1 << 16),
             bulk_load_bytes: self.bulk_load_bytes,
             feed_quiet: Duration::from_secs(10),
+            feed_coalesce: super::feed::Coalesce {
+                hub: Duration::from_millis(u64::from(self.feed_hub_coalesce_ticks)),
+                client: Duration::from_millis(u64::from(self.feed_client_coalesce_ticks)),
+            },
             feed_client_events: super::feed::CLIENT_EVENTS,
             feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),

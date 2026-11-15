@@ -67,7 +67,30 @@ pub(crate) struct FeedLimits {
     /// How long a hub on the hub runtime must have had at most one client before it moves
     /// back to the feed runtime ([`SOLO_AFTER`]; #1689).
     pub solo_after: Duration,
+    /// How long a caught-up hub, and a caught-up client, wait after a small batch before
+    /// looking again (#1901): `--feed-hub-coalesce-ticks`, `--feed-client-coalesce-ticks`.
+    pub coalesce: Coalesce,
 }
+
+/// After a small batch (at most [`SMALL_BATCH`] commits), how long a hub waits before it polls
+/// its feed again, and a client before it looks at its ring's head again, so that the commits
+/// arriving meanwhile are read together (#1901: at s20p1 two hub threads each ran about a
+/// core, waking once per commit). The wait comes after work, never before it: a commit after
+/// a quiet gap longer than the wait is read at once. Zero, the default, never waits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Coalesce {
+    pub hub: Duration,
+    pub client: Duration,
+}
+
+/// A batch of at most this many commits is a small one: the hub or client is caught up, and
+/// may wait ([`Coalesce`]). A bigger batch means it's behind, and it looks again at once.
+const SMALL_BATCH: u32 = 4;
+
+/// A hub tells its clients about its pushes at most this many pushes apart, so a hub that's
+/// behind (its feed never empty) still reaches them at a steady cadence (perf2 on #1901's
+/// design note); otherwise once its feed has nothing more, after the batch.
+const NOTIFY_EVERY: u32 = 64;
 
 /// How long a hub must have had at most one client before its task moves back to the feed
 /// runtime (#1689): a client that joins and leaves doesn't bounce it on every join.
@@ -542,6 +565,9 @@ pub(crate) struct HubOf<K: RingKind> {
     sharers: Arc<AtomicU64>,
     /// Its clients' trackers, for the dump; a gone client's is pruned there.
     clients: Mutex<Vec<Weak<Tracker>>>,
+    /// Times it told its clients its head moved (an inspection count for tests, #1901).
+    #[cfg(test)]
+    notifies: AtomicU64,
 }
 
 pub(crate) type Hub = HubOf<Single>;
@@ -569,6 +595,8 @@ impl<K: RingKind> HubOf<K> {
             live,
             sharers,
             clients: Mutex::default(),
+            #[cfg(test)]
+            notifies: AtomicU64::new(0),
         }
     }
 
@@ -659,9 +687,14 @@ impl Hub {
         r.passed = position.max(seqno);
         r.passed_token = token;
         r.push(Arc::new(entry), limit);
-        let head = r.head();
-        drop(r);
+    }
+
+    /// Tells the clients the ring's head moved: once per batch of pushes ([`drive`], #1901).
+    fn notify(&self) {
+        let head = self.ring().head();
         self.head.send_replace(head);
+        #[cfg(test)]
+        self.notifies.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The hub's feed found nothing at `position`: the ring holds everything up to it.
@@ -742,6 +775,14 @@ struct Driver {
     place: Place,
     /// When the task first saw its hub alone on the hub runtime, and the joins then.
     alone: Option<(Instant, u64)>,
+    /// `Coalesce::hub`.
+    coalesce: Duration,
+    /// Pushes since the clients were last told ([`NOTIFY_EVERY`]).
+    unnotified: u32,
+    /// Commits read since the feed last had nothing.
+    batch: u32,
+    /// After a small batch, the feed isn't polled again before this ([`Coalesce`]).
+    quiet_until: Option<Instant>,
     /// Set once the task has tried its hub with its first item (`Feeds::after_hub_spawn`'s
     /// hold seam, #1926).
     #[cfg(test)]
@@ -814,8 +855,16 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             // A mask a partition's open or close published (D317 ticket 6): a busy hub
             // may not park for the whole load (perf287's P1 on #1755).
             super::placement::refresh();
+            // After a small batch (#1901): the commits arriving meanwhile are read together.
+            if let Some(until) = d.quiet_until.take()
+                && Instant::now() < until
+            {
+                tokio::time::sleep_until(until.into()).await;
+            }
             // A poll that finds nothing records how far the feed got, so the ring's `passed`
             // follows other tables' writes (the engine wakes the hub on each frontier move).
+            // It also ends a batch: the clients are told of its pushes, and after a small one
+            // the next poll waits (`Coalesce::hub`).
             let item = std::future::poll_fn(|cx| {
                 let polled = Pin::new(&mut d.stream).poll_next(cx);
                 if polled.is_pending()
@@ -823,6 +872,14 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                 {
                     let at = d.stream.position().seqno();
                     hub.note_passed(at, || token_of(&d.stream));
+                    if d.unnotified > 0 {
+                        hub.notify();
+                        d.unnotified = 0;
+                    }
+                    if d.batch > 0 && d.batch <= SMALL_BATCH && !d.coalesce.is_zero() {
+                        d.quiet_until = Some(Instant::now() + d.coalesce);
+                    }
+                    d.batch = 0;
                 }
                 polled
             })
@@ -839,11 +896,22 @@ fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                 Some(Ok(commit)) => {
                     let at = d.stream.position().seqno();
                     hub.push(commit, token_of(&d.stream), at, d.ring_bytes);
+                    d.batch = d.batch.saturating_add(1);
+                    d.unnotified += 1;
+                    if d.unnotified >= NOTIFY_EVERY {
+                        hub.notify();
+                        d.unnotified = 0;
+                    }
                     if let Some(to) = d.moves(&hub)
                         && let Some((feed, hubs)) = d.runtimes.clone()
                     {
                         d.place = to;
                         d.alone = None;
+                        // Its clients hear of every push before the task moves.
+                        if d.unnotified > 0 {
+                            hub.notify();
+                            d.unnotified = 0;
+                        }
                         let rt = if to == Place::Feed { feed } else { hubs };
                         // Under the task's lock and holding `hub`: the hub can't drop (and
                         // abort the old handle) before the new task's handle is in place. A
@@ -1279,6 +1347,10 @@ impl Feeds {
             solo_after: self.limits.solo_after,
             place: Place::Feed,
             alone: None,
+            coalesce: self.limits.coalesce.hub,
+            unnotified: 0,
+            batch: 0,
+            quiet_until: None,
             #[cfg(test)]
             started: Some(Arc::clone(&started)),
         };
@@ -1584,6 +1656,8 @@ impl Client {
         let mut head = hub.head.subscribe();
         // Reused across wakes: one allocation per client, not one per commit.
         let mut batch: Vec<Arc<Entry>> = Vec::with_capacity(64);
+        // After a small batch, the head isn't looked at again before this (`Coalesce`, #1901).
+        let mut quiet_until: Option<Instant> = None;
         loop {
             // Per delivery batch, as the hub does per read (perf287's P1 on #1755).
             super::placement::refresh();
@@ -1612,6 +1686,16 @@ impl Client {
                 )?;
                 return Ok(Source::Own(Box::new(FeedStream::new(feed)), slot));
             }
+            if batch.is_empty()
+                && let Some(until) = quiet_until.take()
+                && Instant::now() < until
+            {
+                tokio::select! {
+                    () = self.sink.closed() => return Err(gone()),
+                    () = tokio::time::sleep_until(until.into()) => {}
+                }
+                continue;
+            }
             if batch.is_empty() {
                 let quiet =
                     tokio::time::sleep_until((pos.last_event + self.feeds.limits.quiet).into());
@@ -1639,9 +1723,14 @@ impl Client {
                 }
                 continue;
             }
+            let n = batch.len() as u32;
             for e in batch.drain(..) {
                 at += 1;
                 self.cover_entry(&e, pos).await?;
+            }
+            let client = self.feeds.limits.coalesce.client;
+            if n <= SMALL_BATCH && !client.is_zero() {
+                quiet_until = Some(Instant::now() + client);
             }
         }
     }
@@ -2509,6 +2598,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
+                coalesce: Coalesce::default(),
             },
             &FeedShared::new(1),
         );
@@ -2625,6 +2715,7 @@ mod tests {
             client_events: CLIENT_EVENTS,
             client_bytes: CLIENT_BYTES,
             solo_after,
+            coalesce: Coalesce::default(),
         }
     }
 
@@ -2793,6 +2884,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1901 (A): a hub tells its clients once per batch it reads, not once per commit, and
+    /// at least every [`NOTIFY_EVERY`] pushes, so a hub whose feed never runs dry still
+    /// reaches them (perf2 on the design note). 200 commits are ready before its first poll.
+    #[test]
+    fn a_hub_tells_its_clients_once_per_batch_and_at_least_every_64_pushes() {
+        let (_, db, dir) = commits("hubnotify", 0);
+        let t = db.table("t").unwrap().open().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = Arc::new(Hub::new(
+            Ring::new(SingleRing::default()),
+            rt.spawn(async {}).abort_handle(),
+            false,
+            Arc::default(),
+            Arc::new(AtomicU64::new(1)),
+            Arc::default(),
+        ));
+        let snapshot = db.snapshot().unwrap();
+        let stream = open(std::slice::from_ref(&t), true, &Start::Snapshot(snapshot)).unwrap();
+        let put = |row: &str| {
+            t.mutate(row.as_bytes())
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+        };
+        for i in 0..200 {
+            put(&format!("r{i:03}"));
+        }
+        let d = Driver {
+            stream: FeedStream::new(stream),
+            hub: Arc::downgrade(&hub),
+            ring_bytes: 16 << 20,
+            runtimes: None,
+            solo_after: Duration::ZERO,
+            place: Place::Feed,
+            alone: None,
+            coalesce: Duration::ZERO,
+            unnotified: 0,
+            batch: 0,
+            quiet_until: None,
+            started: None,
+        };
+        let task = rt.spawn(drive(d));
+        let head_at = |n: u64| {
+            rt.block_on(async {
+                for _ in 0..400 {
+                    if hub.ring().head() >= n {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                panic!("the hub's head never reached {n}");
+            });
+        };
+        head_at(200);
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert_eq!(
+            hub.notifies.load(Ordering::Relaxed),
+            4,
+            "at 64, 128 and 192 pushes, then once the feed had nothing more"
+        );
+        put("r200");
+        head_at(201);
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert_eq!(
+            hub.notifies.load(Ordering::Relaxed),
+            5,
+            "one commit, one notify"
+        );
+        task.abort();
+        drop((hub, t, rt));
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1901 (B): a caught-up hub waits `Coalesce::hub` after a small batch, never before one.
+    /// After a quiet gap a lone commit is delivered at once; two commits made during the wait
+    /// after it are read together when it ends, one batch and one notify.
+    #[test]
+    fn a_caught_up_hub_waits_after_a_small_batch_but_never_before_one() {
+        let (_, db, dir) = commits("hubcoalesce", 0);
+        let (requests, delivery, hubs) = server_runtimes(1);
+        let t = db.table("t").unwrap().open().unwrap();
+        let mut limits = limits_solo_after(Duration::from_secs(60));
+        limits.coalesce.hub = Duration::from_millis(300);
+        let feeds = Feeds::new(db.clone(), limits, &FeedShared::new(1));
+        feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
+        let slots = Arc::new(Semaphore::new(8));
+        requests.block_on(async {
+            let put = |row: &[u8]| t.mutate(row).put("f", b"q", b"v").commit().unwrap().seqno;
+            let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
+            let mut a = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
+            let hub = feeds
+                .hubs
+                .lock()
+                .unwrap()
+                .values()
+                .find_map(Weak::upgrade)
+                .unwrap();
+            // A quiet gap longer than the wait: the next commit is read at once.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let t0 = Instant::now();
+            let s1 = put(b"r1");
+            assert_eq!(seqnos(&mut a, Duration::from_millis(100)).await, [s1]);
+            let first = t0.elapsed();
+            assert!(
+                first < Duration::from_millis(280),
+                "a lone commit waited: {first:?} (its 100 ms quiet included)"
+            );
+            // The hub is in its 300 ms wait after that batch of one: both are read after it.
+            let notified = hub.notifies.load(Ordering::Relaxed);
+            let s2 = put(b"r2");
+            let s3 = put(b"r3");
+            assert_eq!(seqnos(&mut a, Duration::from_millis(600)).await, [s2, s3]);
+            assert_eq!(
+                hub.notifies.load(Ordering::Relaxed) - notified,
+                1,
+                "two commits during the wait, one batch"
+            );
+            drop((a, hub));
+        });
+        drop(t);
+        drop(requests);
+        drop(delivery);
+        drop(hubs);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_single_nodes_hub_placement_is_mains() {
         // #1798, g102: on a node with no cluster merges, `Driver::moves` decides as main's
@@ -2830,6 +3052,10 @@ mod tests {
             solo_after: Duration::ZERO,
             place: Place::Feed,
             alone: None,
+            coalesce: Duration::ZERO,
+            unnotified: 0,
+            batch: 0,
+            quiet_until: None,
             started: None,
         };
         // One step, checked against main's rule; `alone_due`: main's answer alone on the hub
@@ -3069,6 +3295,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
+                coalesce: Coalesce::default(),
             },
             &FeedShared::new(1),
         );
@@ -3153,6 +3380,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: 4096,
                 solo_after: SOLO_AFTER,
+                coalesce: Coalesce::default(),
             },
             &FeedShared::new(1),
         );
@@ -3247,6 +3475,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: 4096,
                 solo_after: SOLO_AFTER,
+                coalesce: Coalesce::default(),
             },
             &FeedShared::new(1),
         );
@@ -3347,6 +3576,7 @@ mod tests {
                 client_events: CLIENT_EVENTS,
                 client_bytes: CLIENT_BYTES,
                 solo_after: SOLO_AFTER,
+                coalesce: Coalesce::default(),
             },
             &FeedShared::new(1),
         );
