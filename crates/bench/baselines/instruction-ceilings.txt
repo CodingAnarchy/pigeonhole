@@ -421,6 +421,11 @@ text-two-terms-k100 52001738 0.3
 text-fuzzy 59386475 0.3
 text-phrase 126670191 0.3
 text-phrase-slop2 131159719 0.3
+# #1924 (#1930): text-two-terms and text-fuzzy restricted to an id prefix no document has.
+# From the instructions run 43697716916 on d00fcafd8 (#1930's code on main 6297da828), head
+# counts times 1.003. New shapes; no existing line changed (coordinator 2026-11-15).
+text-two-terms-prefix-none 131202 0.3
+text-fuzzy-prefix-none 4460813 0.3
 # #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
 # a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
 # identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
@@ -438,8 +443,14 @@ commit-if-returning-async 29264 0.3
 # +14 a commit (+0.2%) on x86 only, from codegen in the feed reader's poll (a scratch A/B by
 # function; the arm VM measured -7). A reader that falls behind now drains in time linear in
 # its backlog. feed-drain-all (6172) stays under its ceiling.
-feed-drain 6176 0.3
-feed-drain-all 6177 0.3
+# Raised by D195 for #1935 (#1901 stage 1: a resumed feed cursor re-reads only the tail past where
+# it stopped, not its whole 32 KiB frame; the coordinator's standing approval, 2026-11-15): CI's
+# head counts on 0f4dedbb3 (main e3c5cd1df, run 43728628039) times 1.003.
+# feed-drain 6158 -> 6177 (+0.31%), feed-drain-all 6173 -> 6192 (+0.31%): +19 a commit, the
+# decoder's fresh-bytes bound and the cursor's fresh end, after a cut from +34 (one compare per
+# fragment on a fresh frame). The re-read was 47.5% of each hub thread (g111).
+feed-drain 6196 0.3
+feed-drain-all 6211 0.3
 replicate-apply 6764 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459

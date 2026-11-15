@@ -178,7 +178,7 @@ jobs:
             examples: textshapes
             hotrow: '-'
             shapes: >-
-              textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2
+              textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2,text-two-terms-prefix-none,text-fuzzy-prefix-none
           - name: feed and replication instructions per commit (callgrind)
             # The change feed's drain and a replica's apply (#1828,
             # crates/bench/examples/feedshapes.rs): commits written in setup, drained or

@@ -314,7 +314,8 @@ impl FeedCursor {
         // cursor stopped, so its first load reads only a window past that: to the next 4 KiB
         // page, at least 512 bytes on.
         if have && self.fresh_end >= frame {
-            if std::mem::take(&mut self.tail_window) {
+            if self.tail_window {
+                self.tail_window = false;
                 let window = (self.fresh_end + TAIL_MIN).next_multiple_of(TAIL_PAGE);
                 return self.read_tail(slot, window.min(frame + FRAME));
             }
@@ -482,7 +483,8 @@ impl FeedCursor {
                 self.load(slot, frame)?;
                 let at = (frame - self.chunk_start) as usize;
                 let bytes = &self.chunk[at..at + FRAME_SIZE];
-                let fresh = (self.fresh_end.saturating_sub(frame) as usize).min(FRAME_SIZE);
+                // `load` left the frame fresh at least to its start.
+                let fresh = (self.fresh_end - frame) as usize;
                 let cur = self.cur.as_mut().expect("checked above");
                 let decoded = match cur.dec.decode_within(bytes, fresh)? {
                     Within::Decoded(d) => d,
