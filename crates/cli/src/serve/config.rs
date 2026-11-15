@@ -221,7 +221,8 @@ pub(crate) struct ServeArgs {
     /// Turn the change feed on, keeping up to this many bytes of history: `Feed.Subscribe`
     /// and replicas (`Replication.Follow`) read it. Without it, a database whose feed is on
     /// keeps it (the open inherits it). A replica that falls further behind than this
-    /// bootstraps again.
+    /// bootstraps again. On a cluster node, the node's total, split across its partitions by
+    /// their shards (#1786).
     #[arg(long, value_name = "BYTES")]
     pub change_feed: Option<u64>,
     /// Don't size each shard's write-ahead log at start-up. By default `serve` gives every

@@ -112,6 +112,12 @@ pub struct EngineOptions {
     /// open that recorded "fed: none", or no sidecar, means off as before. Independently, an
     /// unset `shards` (0) takes the last session's stream count when there is one.
     pub feed_inherit: bool,
+    /// With `feed` set: raise its retention to the sidecar's last session's when that kept
+    /// more, so this open drops none of the history the last one kept. Off by default. A
+    /// cluster node sets it on a partition it opens while serving, which may arrive with a
+    /// moved partition's history under a smaller share of the node's `--change-feed` (#1786,
+    /// simp724's R1); a restart, which re-splits the budget, leaves it off.
+    pub feed_keep_last: bool,
     /// Bytes a shard's WAL stream may hold past its oldest record that is not yet in SSTs
     /// before the shard flushes the memtables that record (and the ones after it) wrote,
     /// however small they are (#137). Without it one write to a slot that is never written
@@ -303,6 +309,7 @@ impl EngineOptions {
             wal: WalOptions::default(),
             feed: None,
             feed_inherit: false,
+            feed_keep_last: false,
             wal_pin_bytes: 0,
             wal_preallocate: false,
             tablet_split_bytes: 256 << 20,
