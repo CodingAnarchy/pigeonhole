@@ -710,7 +710,7 @@ fn a_split_memory_write_names_what_applied_and_says_when_a_part_may_have() {
                 locals,
                 listener,
                 "",
-                limits.clone(),
+                limits,
                 false,
                 placement,
                 None,
