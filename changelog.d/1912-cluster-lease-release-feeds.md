@@ -1,0 +1,3 @@
+### Changed
+- **A cluster partition's change feed delivers only while its node holds the partition's lease** (D326). A node cut off from the majority, or whose lease ran out, ends the partition's streams with `PartitionUnavailable` within the lease and refuses new subscribes. With `allow_partial`, that's a `partition_state` event and a retry; without, resume from your token. A node waiting for a lease it hasn't had yet (a move's new node) keeps subscriptions open and delivers once it has one, nothing skipped.
+- **`phdb cluster move` no longer waits for the old node's lease to run out:** the old node releases it when it closes the partition (`Cluster.Release`).
