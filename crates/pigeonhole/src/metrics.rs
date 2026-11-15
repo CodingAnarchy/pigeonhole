@@ -439,6 +439,8 @@ pub(crate) fn internal(
         ("wal_unpin_flushes", m.unpin.1),
         ("wal_inline_syncs", m.wal_inline_syncs),
         ("wal_rollover_blocks", m.wal_rollover_blocks),
+        ("wal_pads", m.wal_pads.0),
+        ("wal_pad_bytes", m.wal_pads.1),
         ("file_growths_ahead", m.file_growths_ahead.0),
         ("file_growth_ahead_nanos", m.file_growths_ahead.1),
         ("default_ts_lead_micros", m.default_ts_lead_micros.0),

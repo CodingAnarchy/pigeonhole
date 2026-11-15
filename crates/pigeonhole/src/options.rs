@@ -46,6 +46,7 @@ pub struct Options {
     compaction_cpu_set: Option<Vec<usize>>,
     pin_threads: bool,
     wal_preallocate: bool,
+    wal_pad_unit: u32,
     memtable_budget: u64,
     block_cache: Option<usize>,
     row_cache: usize,
@@ -282,6 +283,7 @@ impl Default for Options {
             compaction_cpu_set: None,
             pin_threads: true,
             wal_preallocate: false,
+            wal_pad_unit: 0,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
@@ -508,6 +510,40 @@ impl Options {
     /// ```
     pub fn wal_preallocate(mut self, yes: bool) -> Self {
         self.wal_preallocate = yes;
+        self
+    }
+
+    /// Starts a commit group on a fresh `bytes`-aligned span of its WAL stream while that
+    /// stream's previous sync is still in flight (D327, ICR 0137; 0, the default, never does).
+    ///
+    /// At [`Durability::GroupSync`](crate::Durability::GroupSync) a group's write ends
+    /// partway into a page, and the group's sync then holds that page while it writes it to
+    /// disk. The next group's write starts in the same page, so it waits for the device.
+    /// Under a heavy flush or compaction that wait reaches milliseconds, on every shard at
+    /// once (#1621). With this set, the next group skips to the next `bytes` boundary behind
+    /// padding, so its write never touches the page the sync holds. Nothing else changes:
+    /// a commit is visible and durable when it was without it.
+    ///
+    /// **What it costs:** WAL bytes. At most one pad per sync, of under `bytes` plus 12, so
+    /// the log grows most with small groups and frequent syncs. `Buffered` and `None` commits
+    /// alone never pad: they don't sync. The padding takes no seqno and is never delivered by
+    /// the change feed.
+    ///
+    /// **It changes the file's format:** the first open with it set flags the database (its
+    /// `incompat` feature bit 1, for good), so a build before 1.3 refuses to open it.
+    ///
+    /// `bytes` is a power of two from 32 to 32,768 (a page, 4,096, is the usual choice);
+    /// anything else fails the open with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument).
+    /// A reader process has no log, so this does nothing there.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().wal_pad_unit(4096);
+    /// # let _ = options;
+    /// ```
+    pub fn wal_pad_unit(mut self, bytes: u32) -> Self {
+        self.wal_pad_unit = bytes;
         self
     }
 
@@ -1898,6 +1934,7 @@ impl Options {
         };
         o.pin_threads = self.pin_threads;
         o.wal_preallocate = self.wal_preallocate;
+        o.wal.pad_unit = self.wal_pad_unit;
         o.shard_threads = budget.drivers;
         // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,
         // 2026-10-28), never with a fixed count; application-owned shards run on the

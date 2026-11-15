@@ -360,22 +360,34 @@ impl FrameEncoder {
         n
     }
 
+    /// Bytes that a [`pad`](Self::pad) to `unit` and then encoding a record of `len` bytes
+    /// would append together (for segment-full checks, D327).
+    pub fn padded_len(&self, unit: usize, len: usize) -> usize {
+        let pad = self.pad_len(unit);
+        pad + encoded_len_from(self.pos + pad as u64, len)
+    }
+
     /// Bytes that encoding a record of `len` bytes would append (for segment-full checks).
     pub fn encoded_len(&self, len: usize) -> usize {
-        let mut pos = self.pos;
-        let mut rest = len;
-        loop {
-            let room = frame_room(pos);
-            if room < MIN_FRAGMENT_ROOM {
-                pos += room as u64;
-                continue;
-            }
-            let n = rest.min(room - FRAGMENT_HEADER_LEN);
-            pos += (FRAGMENT_HEADER_LEN + n) as u64;
-            rest -= n;
-            if rest == 0 {
-                return (pos - self.pos) as usize;
-            }
+        encoded_len_from(self.pos, len)
+    }
+}
+
+/// Bytes that encoding a record of `len` bytes from segment offset `from` would append.
+fn encoded_len_from(from: u64, len: usize) -> usize {
+    let mut pos = from;
+    let mut rest = len;
+    loop {
+        let room = frame_room(pos);
+        if room < MIN_FRAGMENT_ROOM {
+            pos += room as u64;
+            continue;
+        }
+        let n = rest.min(room - FRAGMENT_HEADER_LEN);
+        pos += (FRAGMENT_HEADER_LEN + n) as u64;
+        rest -= n;
+        if rest == 0 {
+            return (pos - from) as usize;
         }
     }
 }
@@ -464,7 +476,7 @@ impl FrameDecoder {
             let end = at + FRAGMENT_HEADER_LEN + len;
             let ty = h[10];
             let sequenced = match ty {
-                // A pad (D327) sits only between records, never inside one.
+                // A pad (D327, `PAD_FRAGMENT`, 5) sits only between records, never inside one.
                 1 | 2 | 5 => self.partial_start.is_none(),
                 3 | 4 => self.partial_start.is_some(),
                 _ => false,
@@ -478,6 +490,7 @@ impl FrameDecoder {
             // A fragment of this segment's epoch whose CRC passes is real data, not a torn
             // tail: a type this build does not know means a newer build wrote it (#496).
             // Zeroed and recycled frames fail the epoch or the CRC and stay a stop.
+            // Known types: Full, First, Middle, Last (1..=4) and `PAD_FRAGMENT` (5).
             if intact && !(1..=5).contains(&ty) {
                 return Err(Error::UnsupportedFeature {
                     what: "wal fragment type",

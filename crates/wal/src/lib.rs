@@ -188,6 +188,13 @@ pub struct WalOptions {
     /// The change-feed session id written into every segment header this stream writes
     /// (FORMAT §10.2, bytes 76..84; D310), 0 for none.
     pub feed_session: u64,
+    /// D327: while a sync of the stream is in flight, the next group starts at a multiple of
+    /// this many bytes of the segment, behind a pad fragment (FORMAT §10.2 type 5), so its
+    /// write never touches the page that sync is writing back (#1708). A power of two from
+    /// 32 bytes to a frame (32 KiB); 0, the default, never pads. The database must carry
+    /// `incompat` bit 1 ([`INCOMPAT_WAL_PAD`](pigeonhole_format::wal::INCOMPAT_WAL_PAD))
+    /// before a stream with this set writes: builds without D327 refuse pads.
+    pub pad_unit: u32,
 }
 
 impl Default for WalOptions {
@@ -197,6 +204,7 @@ impl Default for WalOptions {
             spare_segments: 2,
             retain_segments: 0,
             feed_session: 0,
+            pad_unit: 0,
         }
     }
 }

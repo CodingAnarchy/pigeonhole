@@ -779,3 +779,97 @@ fn a_new_streams_creation_is_durable_once_its_file_and_directory_syncs_finish() 
         Some(true)
     );
 }
+
+/// D327 (#1708): a group's first record pads to the unit while a sync the stream submitted
+/// is in flight, once per sync (the records after it are aligned), and not once that sync
+/// completed; the pads' bytes are counted; everything replays in order, at its own end.
+#[test]
+fn a_group_starts_on_a_fresh_unit_while_a_sync_is_in_flight() {
+    let sim = pigeonhole_io::sim::SimVfs::new(327);
+    sim.set_deferred_io(true);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let mut o = opts(16, 1);
+    o.pad_unit = 4096;
+    let mut w = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    sim.complete_all_io();
+    let t1 = w
+        .append(&batch(1, 100).record(), Durability::GroupSync)
+        .unwrap();
+    // No sync submitted yet: no pad.
+    assert_eq!(w.counters().pads(), 0);
+    let sync1 = w.submit_sync().unwrap();
+    assert!(!sync1.is_ready(), "deferred: the sync is in flight");
+    // The next group pads, once: its second record follows directly.
+    let t2 = w
+        .append(&batch(2, 100).record(), Durability::GroupSync)
+        .unwrap();
+    let t3 = w
+        .append(&batch(3, 100).record(), Durability::GroupSync)
+        .unwrap();
+    assert_eq!(w.counters().pads(), 1);
+    let gap = 4096 - u64::from(t1.end.offset()) % 4096;
+    assert!(gap >= 12, "a gap with room for a pad's header");
+    assert_eq!(w.counters().pad_bytes(), gap);
+    w.write().unwrap();
+    // A second sync in flight: the group after it pads again.
+    let sync2 = w.submit_sync().unwrap();
+    let _t4 = w
+        .append(&batch(4, 100).record(), Durability::GroupSync)
+        .unwrap();
+    assert_eq!(w.counters().pads(), 2);
+    w.write().unwrap();
+    // Every sync completed: no pad.
+    sim.complete_all_io();
+    sync1.wait().unwrap();
+    sync2.wait().unwrap();
+    let pad_bytes = w.counters().pad_bytes();
+    let _t5 = w
+        .append(&batch(5, 100).record(), Durability::GroupSync)
+        .unwrap();
+    assert_eq!(w.counters().pads(), 2, "nothing in flight");
+    w.sync().unwrap();
+    drop(w);
+    let (got, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(got.seqnos(), [1, 2, 3, 4, 5]);
+    assert_eq!(got.records[1].0, t2.end);
+    assert_eq!(got.records[2].0, t3.end);
+    assert_eq!(got.end, got.records[4].0, "the log ends at its last record");
+    assert!(pad_bytes > gap);
+}
+
+/// D327: a stream whose groups never sync (`Buffered`) never pads, even with a unit set:
+/// only a sync this stream submitted can hold its tail page.
+#[test]
+fn a_stream_that_never_syncs_never_pads() {
+    let sim = pigeonhole_io::sim::SimVfs::new(328);
+    sim.set_deferred_io(true);
+    let vfs: pigeonhole_io::VfsRef = sim.clone();
+    let mut o = opts(4, 1);
+    o.pad_unit = 4096;
+    let mut w = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    sim.complete_all_io();
+    for seqno in 1..=200 {
+        w.append(&batch(seqno, 500).record(), Durability::Buffered)
+            .unwrap();
+        w.write().unwrap();
+    }
+    assert_eq!(w.counters().pads(), 0);
+    sim.complete_all_io();
+}
+
+/// D327: a pad unit that isn't a power of two from 32 bytes to a frame is refused.
+#[test]
+fn a_bad_pad_unit_is_refused() {
+    for unit in [16, 100, 4095, 65_536] {
+        let vfs = sim(329);
+        let mut o = opts(4, 1);
+        o.pad_unit = unit;
+        assert!(
+            matches!(
+                WalStream::create(&vfs, db(), STREAM, DB_ID, o),
+                Err(Error::InvalidArgument { .. })
+            ),
+            "{unit}"
+        );
+    }
+}

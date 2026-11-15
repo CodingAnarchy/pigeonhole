@@ -188,6 +188,10 @@ pub struct Metrics {
     /// while that segment's header still waited for the previous segment's sync (#19).
     /// Expected to stay near 0.
     pub wal_rollover_blocks: u64,
+    /// Groups that started on a fresh unit behind a WAL pad fragment because their stream's
+    /// sync was in flight, and the bytes those pads took (D327, `wal.pad_unit`). 0 with the
+    /// option off.
+    pub wal_pads: (u64, u64),
     /// File growths and the nanoseconds they held the page allocator across a `fallocate`
     /// and a `sync_all` (#28, #182).
     pub file_growths: (u64, u64),
@@ -947,6 +951,13 @@ impl Engine {
                 "memtable_budget must be at least 128 KiB".to_owned(),
             ));
         }
+        // D327: checked before the open can set the file's sticky pad bit.
+        let unit = options.wal.pad_unit;
+        if unit != 0 && (!unit.is_power_of_two() || !(32..=32 * 1024).contains(&unit)) {
+            return Err(Error::InvalidArgument(format!(
+                "the WAL pad unit must be a power of two from 32 bytes to 32 KiB, not {unit}"
+            )));
+        }
         let vfs = Arc::clone(&options.vfs);
         let registry = Arc::new(options.merge_operators.clone());
 
@@ -1089,6 +1100,19 @@ impl Engine {
             && !no_writes
         {
             pager.set_grow_ahead(block, from)?;
+        }
+        // D327: a writable open that pads its WAL flags the file before any stream writes,
+        // in both superblock pages, so a build without D327 refuses it rather than meeting
+        // a pad mid-replay. Sticky: retained feed segments keep pads past a checkpoint.
+        if !no_writes && options.wal.pad_unit != 0 {
+            let features = pager.features();
+            let bit = pigeonhole_format::wal::INCOMPAT_WAL_PAD;
+            if features.incompat & bit == 0 {
+                pager.set_features(pigeonhole_format::superblock::Features {
+                    incompat: features.incompat | bit,
+                    ..features
+                })?;
+            }
         }
         let read_only = no_writes;
         // The change feed (D310): the session's sidecar entry, written and synced before any
@@ -3908,6 +3932,8 @@ impl Engine {
             m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
             m.wal_inline_syncs += s.wal.get().map_or(0, |c| c.inline_rollover_syncs());
             m.wal_rollover_blocks += s.wal.get().map_or(0, |c| c.rollover_blocks());
+            m.wal_pads.0 += s.wal.get().map_or(0, |c| c.pads());
+            m.wal_pads.1 += s.wal.get().map_or(0, |c| c.pad_bytes());
             let x = &mut m.cross_shard;
             x.rounds += s.cross.rounds.load(Ordering::Relaxed);
             x.refused_rounds += s.cross.refused_rounds.load(Ordering::Relaxed);

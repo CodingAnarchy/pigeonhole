@@ -1252,3 +1252,143 @@ fn a_rollover_waits_for_the_previous_rollovers_header_sync_and_loses_nothing() {
     let (r, _) = replay(&vfs, Lsn::default()).unwrap();
     assert_eq!(r.seqnos(), (1..=seqno).collect::<Vec<_>>());
 }
+
+/// [`note`] for [`padded_workload`]: a sync left in flight that a crash failed poisons the
+/// stream, and the workload learns it later as a poisoned stream, not `Crashed`. The
+/// workload injects nothing but the crash, so that is the crash too; the dry run, which
+/// doesn't crash, checks that every commit was acknowledged.
+fn note_padded(trace: &mut Trace, e: Error) {
+    // A sync queued behind the one the crash failed reports the stream poisoned (an I/O
+    // error of its own kind), as does a call after it.
+    let poisoned = matches!(&e, Error::Poisoned)
+        || matches!(&e, Error::Io(io) if io.to_string().contains("poisoned by a failed sync"));
+    if !poisoned {
+        note(trace, e);
+    }
+}
+
+/// D327: group commits whose syncs are left in flight (the next group appends before the last
+/// sync completes, as a shard's driver does), with `opts.pad_unit` set so groups pad. A group
+/// is acknowledged when its sync completes. Returns the trace and the pads the stream wrote.
+fn padded_workload(sim: &std::sync::Arc<SimVfs>, opts: WalOptions, seed: u64) -> (Trace, u64) {
+    sim.set_deferred_io(true);
+    let vfs: VfsRef = sim.clone();
+    let mut rng = Rng(seed);
+    let mut trace = Trace::default();
+    let mut wal = match WalStream::create(&vfs, db(), STREAM, DB_ID, opts) {
+        Ok(w) => w,
+        Err(e) => {
+            note_padded(&mut trace, e);
+            return (trace, 0);
+        }
+    };
+    let mut pending: Vec<(pigeonhole_io::Completion<Lsn>, Vec<CommitTicket>)> = Vec::new();
+    let mut seqno = 0;
+    'groups: for _ in 0..GROUPS * 3 {
+        // The groups whose sync completed are acknowledged.
+        let mut i = 0;
+        while i < pending.len() {
+            if !pending[i].0.is_ready() {
+                i += 1;
+                continue;
+            }
+            let (c, group) = pending.remove(i);
+            match c.wait() {
+                Ok(_) => trace.acked.extend(group),
+                Err(e) => {
+                    note_padded(&mut trace, e.into());
+                    break 'groups;
+                }
+            }
+        }
+        let mut group = Vec::new();
+        for _ in 0..1 + rng.below(4) {
+            seqno += 1;
+            let rec = batch(seqno, rng.below(3_000) as usize);
+            drive(sim, || !wal.blocked());
+            match wal.append(&rec.record(), Durability::GroupSync) {
+                Ok(t) => {
+                    group.push(t);
+                    trace.appended.push((t, rec));
+                }
+                Err(e) => {
+                    note_padded(&mut trace, e);
+                    break 'groups;
+                }
+            }
+        }
+        match wal.submit_sync() {
+            Ok(c) => pending.push((c, group)),
+            Err(e) => {
+                note_padded(&mut trace, e);
+                break;
+            }
+        }
+        // Leave a seeded number of operations in flight, often the sync just submitted.
+        for _ in 0..rng.below(3) {
+            sim.complete_io();
+        }
+        if rng.below(3) == 0
+            && let Some(cp) = trace.acked.last().map(|t| t.end)
+            && cp > trace.checkpoint
+            && cp <= wal.durable()
+        {
+            if let Err(e) = wal.checkpoint(cp) {
+                note_padded(&mut trace, e);
+                break;
+            }
+            trace.checkpoint = cp;
+        }
+    }
+    sim.complete_all_io();
+    for (c, group) in pending {
+        if c.is_ready() && c.wait().is_ok() {
+            trace.acked.extend(group);
+        }
+    }
+    let pads = wal.counters().pads();
+    (trace, pads)
+}
+
+#[test]
+fn padded_groups_survive_power_loss_at_every_operation() {
+    // D327 (#1708): with pads before groups whose predecessor's sync was in flight, a crash at
+    // every operation, with unsynced writes torn and reordered, replays an in-order prefix
+    // that holds every acknowledged commit and ends at its last record, never at a pad: a
+    // torn pad, or a pad whose record was lost, is not data. Recovery reopens and appends.
+    let mut opts = opts(16, 1);
+    opts.pad_unit = 4096;
+    let mut cases = 0;
+    for seed in 0..4u64 {
+        let dry = SimVfs::new(seed);
+        let (trace, pads) = padded_workload(&dry, opts, seed);
+        assert_eq!(trace.unexpected, None, "seed {seed}");
+        assert_eq!(
+            trace.acked.len(),
+            trace.appended.len(),
+            "seed {seed}: all acknowledged"
+        );
+        assert!(pads > 0, "seed {seed}: no group padded");
+        let total = dry.mutating_ops();
+        for n in 1..=total {
+            for (torn, reorder) in [(false, false), (true, true)] {
+                let mut plan = FaultPlan::none();
+                plan.torn_writes = torn;
+                plan.reorder_unsynced = reorder;
+                plan.crash_after_ops = Some(n);
+                let sim = SimVfs::with_faults(seed, plan);
+                let (trace, _) = padded_workload(&sim, opts, seed);
+                let ctx = format!("seed {seed} crash after op {n} torn={torn} reorder={reorder}");
+                assert_eq!(trace.unexpected, None, "{ctx}");
+                let vfs: VfsRef = sim.clone();
+                if sim.mutating_ops() < n || !vfs.exists(&path()).unwrap() {
+                    continue;
+                }
+                sim.set_faults(FaultPlan::none());
+                check(&vfs, &trace, durable_levels, &ctx);
+                cases += 1;
+            }
+        }
+    }
+    eprintln!("{cases} padded crash cases");
+}

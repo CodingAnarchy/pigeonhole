@@ -43,6 +43,12 @@ pub(crate) fn check_options(opts: &WalOptions) -> Result<()> {
             what: "wal segment size",
         });
     }
+    let unit = opts.pad_unit;
+    if unit != 0 && (!unit.is_power_of_two() || !(32..=FRAME as u32).contains(&unit)) {
+        return Err(Error::InvalidArgument {
+            what: "wal pad unit",
+        });
+    }
     Ok(())
 }
 
@@ -396,6 +402,8 @@ pub struct WalCounters {
     rollover_blocks: AtomicU64,
     rollover_waits: AtomicU64,
     retained_taken: AtomicU64,
+    pads: AtomicU64,
+    pad_bytes: AtomicU64,
 }
 
 impl WalCounters {
@@ -428,6 +436,17 @@ impl WalCounters {
     /// rather than the writer waiting. Expected to stay 0 while spares keep up.
     pub fn retained_taken(&self) -> u64 {
         self.retained_taken.load(Ordering::Relaxed)
+    }
+
+    /// Groups that started on a fresh alignment unit behind a pad fragment, because a sync
+    /// of the stream was in flight (D327, [`WalOptions::pad_unit`](crate::WalOptions::pad_unit)).
+    pub fn pads(&self) -> u64 {
+        self.pads.load(Ordering::Relaxed)
+    }
+
+    /// The bytes those pads took, headers included: the log the padding cost (D327).
+    pub fn pad_bytes(&self) -> u64 {
+        self.pad_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -1398,6 +1417,11 @@ pub struct WalStream {
     /// Epoch of the current segment.
     epoch: u32,
     enc: FrameEncoder,
+    /// D327: the alignment unit a group starts on while a sync is in flight; 0 never pads.
+    pad_unit: usize,
+    /// The target of the latest sync submitted through [`Wal::submit_sync`]: one is in flight
+    /// while the durable mark is below it (D327).
+    sync_target: Lsn,
     /// Segment offset past the last byte handed to the kernel; `buf` starts here.
     written_off: u64,
     /// Appended, not yet written bytes of the current segment.
@@ -1616,6 +1640,8 @@ impl WalStream {
             slot: 0,
             epoch: 0,
             enc: FrameEncoder::new(0, FRAME),
+            pad_unit: opts.pad_unit as usize,
+            sync_target: Lsn::default(),
             written_off: 0,
             buf: Vec::new(),
             held: None,
@@ -2113,6 +2139,28 @@ impl WalStream {
     /// Frames a record of `len` bytes, given as `parts`, into the buffer, rolling over first
     /// if it does not fit.
     fn append_parts(&mut self, parts: &[&[u8]], len: usize) -> Result<Lsn> {
+        // D327: a group's first record, while a sync of the stream is in flight, starts on a
+        // fresh unit behind a pad, so the group's write never touches the page that sync is
+        // writing back. One pad per sync at most: the records after it are aligned already.
+        let pad = self.pad_unit != 0 && self.buf.is_empty() && self.durable() < self.sync_target;
+        if pad {
+            let need = self.enc.padded_len(self.pad_unit, len) as u64;
+            if self.append_pos() + need <= self.segment_size {
+                let n = self.enc.pad(self.pad_unit, &mut self.buf);
+                if n > 0 {
+                    self.shared.counters.pads.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .counters
+                        .pad_bytes
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                }
+                let end = self.enc.encode_parts(parts, &mut self.buf);
+                return Ok(Lsn::new(self.epoch, end as u32));
+            }
+            // Pad and record don't fit: roll over without the pad (a new segment's first
+            // record starts a frame, aligned already). A pad is never the last thing in a
+            // segment.
+        }
         let need = self.enc.encoded_len(len) as u64;
         if self.append_pos() + need > self.segment_size {
             self.rollover()?;
@@ -2170,6 +2218,7 @@ impl Wal for WalStream {
     fn submit_sync(&mut self) -> Result<Completion<Lsn>> {
         let _fg = crate::foreground::Foreground::enter();
         let lsn = self.write()?;
+        self.sync_target = self.sync_target.max(lsn);
         let Some(held) = &self.held else {
             let shared = Arc::clone(&self.shared);
             return Ok(self.shared.submit_durable_sync(&self.file).map(move |r| {

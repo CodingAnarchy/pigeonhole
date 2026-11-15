@@ -785,6 +785,15 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     // `PIGEONHOLE_DIRECT=1`: SST and blob extents through a direct handle (#403), which the
     // simulator holds to aligned I/O.
     o.direct_io = std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1");
+    // `PIGEONHOLE_WAL_PAD=N`: a group starts on an N-byte unit behind a pad fragment while a
+    // sync of its stream is in flight (D327, #1708), so the suites run over padded logs. Syncs
+    // stay in flight only with deferred I/O, so pair it with `PIGEONHOLE_DEFERRED_IO=1`.
+    if let Some(unit) = std::env::var("PIGEONHOLE_WAL_PAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        o.wal.pad_unit = unit;
+    }
     o.create_if_missing = true;
     o.shards = shards;
     o.pin_threads = false;
