@@ -1,0 +1,2 @@
+### Fixed
+- Change feeds: a durable feed resumed from a token after a power loss could expire ("records the feed read were lost") although nothing it had read or delivered was lost. This needed a rare coincidence (the last synced WAL record ending within 12 bytes of a 32 KiB frame's end while a durable subscriber held the next, unsynced record). A token's resume position now never points past where recovery cuts the log (#1937).

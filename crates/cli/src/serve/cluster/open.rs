@@ -165,6 +165,41 @@ pub(crate) static HOLD_OPEN: std::sync::Mutex<
     Vec<(std::path::PathBuf, std::sync::mpsc::Receiver<()>)>,
 > = std::sync::Mutex::new(Vec::new());
 
+/// An inspection seam (tests): how many passes of `open_missing` have finished in each
+/// cluster directory. A test that opens a partition itself waits out the pass its map install
+/// started, which would otherwise open the same partition just before or after it (#1928).
+#[cfg(test)]
+static MISSING_PASSES: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The passes of `open_missing` finished in cluster directory `dir` ([`MISSING_PASSES`]).
+#[cfg(test)]
+pub(crate) fn missing_passes(dir: &std::path::Path) -> u64 {
+    MISSING_PASSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(d, _)| d == dir)
+        .map_or(0, |(_, n)| *n)
+}
+
+/// Counts a pass of `open_missing` in its directory as it ends, however it ends.
+#[cfg(test)]
+struct MissingPass<'a>(&'a std::path::Path);
+
+#[cfg(test)]
+impl Drop for MissingPass<'_> {
+    fn drop(&mut self) {
+        let mut passes = MISSING_PASSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match passes.iter_mut().find(|(d, _)| d == self.0) {
+            Some((_, n)) => *n += 1,
+            None => passes.push((self.0.to_path_buf(), 1)),
+        }
+    }
+}
+
 /// A hold seam (tests): `open_missing` in each listed cluster directory waits after its next
 /// partition opened, before it confirms it, until the sender sends or is dropped. The wait
 /// is on a blocking thread: on a runtime worker it stopped every task queued behind it on
@@ -689,6 +724,8 @@ impl Node {
     /// unfenced once the node's map confirms it (a relocation's new owner serves at once). A
     /// partition that fails to open is reported and left to the next map, or the operator.
     pub(crate) async fn open_missing(self: &Arc<Self>) {
+        #[cfg(test)]
+        let _pass = MissingPass(&self.dir);
         if self.server.get().is_none() {
             return;
         }
