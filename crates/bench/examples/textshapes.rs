@@ -42,7 +42,11 @@
 //!   characters and none for `w0` to `w9`, so the shape would mix costs by the drawn word's
 //!   length. A fixed edit count keeps every query the same kind of work (perf287 on #1575);
 //! - `text-phrase`, `text-phrase-slop2`: a two-word phrase taken from a document, one word
-//!   among the 20 most common and one not, at slop 0 and 2.
+//!   among the 20 most common and one not, at slop 0 and 2;
+//! - `text-two-terms-prefix-none`, `text-fuzzy-prefix-none`: `text-two-terms` and
+//!   `text-fuzzy` restricted to an id prefix no document has (`~`, past every `d…` id): a
+//!   search for an empty tenant, which costs its statistics reads and fuzzy walk and nothing
+//!   per posting row (#1924).
 //!
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`. The measured
 //! work is one `#[inline(never)]` `shape_search` under a `Measured` guard, on a fresh thread,
@@ -332,7 +336,25 @@ fn phrases(corpus: &[Vec<usize>], rng: &mut Rng) -> Vec<(String, String)> {
 }
 
 /// The shape's queries and `k`, seeded: the same on every run.
-fn queries(shape: &str, dir: &Path) -> (Vec<Query>, usize) {
+/// The id prefix of the `-prefix-none` shapes: no document's id starts with it (ids are
+/// `d` and eight digits, and `~` sorts after them).
+const PREFIX_NONE: &[u8] = b"~";
+
+/// A shape's queries, its `k`, and the id prefix its searches are restricted to.
+fn queries(shape: &str, dir: &Path) -> (Vec<Query>, usize, Option<&'static [u8]>) {
+    if let Some(base) = shape.strip_suffix("-prefix-none") {
+        assert!(
+            matches!(base, "text-two-terms" | "text-fuzzy"),
+            "unknown shape {shape}"
+        );
+        let (q, k) = base_queries(base, dir);
+        return (q, k, Some(PREFIX_NONE));
+    }
+    let (q, k) = base_queries(shape, dir);
+    (q, k, None)
+}
+
+fn base_queries(shape: &str, dir: &Path) -> (Vec<Query>, usize) {
     let z = Zipf::new();
     let mut rng = Rng(QUERY_SEED);
     let terms = |n: usize, rng: &mut Rng| -> Vec<Query> {
@@ -390,18 +412,33 @@ fn queries(shape: &str, dir: &Path) -> (Vec<Query>, usize) {
         }
         other => panic!(
             "unknown shape {other}: text-term-rare, text-term-hub, text-two-terms, \
-             text-five-terms, text-two-terms-k100, text-fuzzy, text-phrase or text-phrase-slop2"
+             text-five-terms, text-two-terms-k100, text-fuzzy, text-phrase, text-phrase-slop2, \
+             text-two-terms-prefix-none or text-fuzzy-prefix-none"
         ),
+    }
+}
+
+/// A search for `q`'s top `k`, restricted to ids starting with `prefix` when there is one.
+fn search<'i>(
+    index: &'i Index,
+    q: &Query,
+    k: usize,
+    prefix: Option<&[u8]>,
+) -> pigeonhole_text::Search<'i> {
+    let s = index.search(q.clone(), k);
+    match prefix {
+        Some(p) => s.id_prefix(p),
+        None => s,
     }
 }
 
 /// The measured work: every query once. Returns the searches run.
 #[inline(never)]
-fn shape_search(index: &Index, queries: &[Query], k: usize) -> usize {
+fn shape_search(index: &Index, queries: &[Query], k: usize, prefix: Option<&[u8]>) -> usize {
     let _measured = Measured::start();
     let mut hits = 0usize;
     for q in queries {
-        hits += index.search(q.clone(), k).run().unwrap().len();
+        hits += search(index, q, k, prefix).run().unwrap().len();
     }
     std::hint::black_box(hits);
     queries.len()
@@ -430,7 +467,7 @@ fn main() {
         build(&dir);
     }
     // The queries are built before the index is opened, as the measured iterations' inputs.
-    let (queries, k) = queries(&shape, &dir);
+    let (queries, k, prefix) = queries(&shape, &dir);
     // Read-only (#1348): the open writes nothing, so every shape reads the same bytes in
     // place, and nothing runs in the background.
     let (db, driver) = driver::Driver::open(
@@ -440,7 +477,7 @@ fn main() {
     let index = Index::open(&db, "docs_text").unwrap();
     // Warm: every query once, so the block cache holds what the measured passes read.
     for q in &queries {
-        index.search(q.clone(), k).run().unwrap();
+        search(&index, q, k, prefix).run().unwrap();
     }
     driver.wait_idle();
     // `SHAPE_SETUP_ONLY=1`: the setup alone (the script checks it counts nothing).
@@ -451,7 +488,7 @@ fn main() {
     };
     let mut units = 0;
     for _ in 0..iters {
-        units += driver::on_fresh_thread(|| shape_search(&index, &queries, k));
+        units += driver::on_fresh_thread(|| shape_search(&index, &queries, k, prefix));
     }
     eprintln!("units {units}");
     drop(index);

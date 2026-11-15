@@ -546,6 +546,104 @@ mod read_tests {
         }
     }
 
+    /// D327 (feed1248's S1 on #1925): a cursor over a hand-written pad. Records appended
+    /// through a stream, then `[pad, record]` written straight into the segment past them,
+    /// as the writer will frame them (nothing writes a pad before D327's writer PR). The
+    /// cursor reads the padded record in order, at its own start past the pad; a cursor
+    /// opened at the record before's end or at the padded record's start reads it; and a
+    /// pad whose record isn't written yet (a live tail seen between the pad's page and the
+    /// record's) stops at the last record's end, then resumes to the record once it is; and a
+    /// cursor moved by `skip_to` to the pre-pad end steps over the pad to it (#1827).
+    #[test]
+    fn a_cursor_steps_over_a_pad_and_resumes_on_either_side_of_it() {
+        // The padded record's bytes, framed from the stream's end (the first segment is
+        // slot 0, at the file's start).
+        let record = |seqno: u64| {
+            let mut b = BatchBuilder::new();
+            b.push(
+                TableId(1),
+                FamilyId(2),
+                Kind::Put,
+                b"row",
+                b"q",
+                Some(seqno),
+                b"v",
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            WalRecord::Batch {
+                seqno,
+                commit_ts: seqno,
+                batch: b.batch(),
+            }
+            .encode(&mut out);
+            out
+        };
+        for unit in [4096usize, FRAME as usize] {
+            let vfs: VfsRef = SimVfs::new(10);
+            let mut wal = stream(&vfs, 64);
+            append(&mut wal, 1, 8);
+            append(&mut wal, 2, 8);
+            let tail = wal.written();
+            drop(wal);
+            let mut enc = FrameEncoder::new(tail.epoch(), u64::from(tail.offset()));
+            let mut pad = Vec::new();
+            let pad_len = enc.pad(unit, &mut pad);
+            assert!(pad_len > 0);
+            let mut rec = Vec::new();
+            let rec_end = enc.encode(&record(3), &mut rec);
+            let rec_start = u64::from(tail.offset()) + pad_len as u64;
+            assert_eq!(rec_start % unit as u64, 0, "{unit}");
+            let file = vfs
+                .open(
+                    &stream_path(db(), StreamId(0)),
+                    OpenOptions::read_write_create(),
+                )
+                .unwrap();
+            // (c) The pad alone: the live tail stops at the last record's end.
+            file.write_at(&pad, u64::from(tail.offset())).unwrap();
+            let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+            assert_eq!(drain(&mut c), [1, 2], "{unit}");
+            assert_eq!(c.position(), tail, "stopped before the pad");
+            // Then the record: the same cursor resumes over the pad to it.
+            file.write_at(&rec, rec_start).unwrap();
+            match c.step().unwrap() {
+                Step::Record {
+                    start,
+                    end,
+                    record: WalRecord::Batch { seqno: 3, .. },
+                    ..
+                } => {
+                    assert_eq!(start, Lsn::new(tail.epoch(), rec_start as u32), "{unit}");
+                    assert_eq!(end, Lsn::new(tail.epoch(), rec_end as u32));
+                }
+                other => panic!("{unit}: {other:?}"),
+            }
+            assert!(drain(&mut c).is_empty());
+            // (a) A fresh cursor reads all three in order.
+            let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+            assert_eq!(drain(&mut c), [1, 2, 3], "{unit}");
+            // (b) Opened at the record before's end (before the pad) or at the padded
+            // record's start (past it), a cursor reads it.
+            for at in [tail, Lsn::new(tail.epoch(), rec_start as u32)] {
+                let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, at).unwrap();
+                assert_eq!(drain(&mut c), [3], "{unit} from {at:?}");
+            }
+            // (d) A cursor moved with `skip_to` to the record before's end (#1827's skip index
+            // jumps to a chunk's end, before the next record's pad) steps over the pad to it.
+            let mut c = FeedCursor::open(&vfs, db(), StreamId(0), DB_ID, Lsn::default()).unwrap();
+            assert!(c.skip_to(tail).unwrap(), "{unit}");
+            match c.step().unwrap() {
+                Step::Record {
+                    start,
+                    record: WalRecord::Batch { seqno: 3, .. },
+                    ..
+                } => assert_eq!(start, Lsn::new(tail.epoch(), rec_start as u32), "{unit}"),
+                other => panic!("{unit}: {other:?}"),
+            }
+        }
+    }
+
     /// D310 PR 5b (the subscriber cost on the AX102): a stop reads the segment headers once,
     /// not on resuming and again at the stop, and a resume reads one frame, not a 1 MiB
     /// chunk. Without the writer's marks (a reader process) every stop reads the headers.

@@ -1581,10 +1581,12 @@ pub(crate) fn routes(
     let idle = shared.as_ref().map(|s| s.limits.stream_idle);
     // A cluster subscription's parts last as long as it does: outside the limit below, each
     // holding a `--max-streams` place instead (D317 ticket 7).
-    let streams = shared.as_ref().map(|shared| feed::ForwardSubscribeGrpc {
-        node: Arc::clone(&node),
-        shared: Arc::clone(shared),
-        max_request_bytes,
+    let streams = shared.as_ref().map(|shared| {
+        crate::serve::grpc::EventsGrpc(feed::ForwardSubscribeGrpc {
+            node: Arc::clone(&node),
+            shared: Arc::clone(shared),
+            max_request_bytes,
+        })
     });
     // A forward carries a call the entry node took within its `--max-request-bytes`, inside
     // an envelope (audit120's S-C2).

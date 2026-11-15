@@ -390,10 +390,10 @@ fn an_unknown_incompat_bit_refuses_the_file_before_its_families_are_read() {
     let vfs = SimVfs::new(8);
     let r = Rig::open(&vfs, 128);
     r.db.close().unwrap();
-    edit_superblocks(&vfs, |sb| sb.features.incompat |= 1 << 1);
+    edit_superblocks(&vfs, |sb| sb.features.incompat |= 1 << 2);
     match Engine::open(Path::new(DB), options(&vfs, 128)) {
         Err(Error::UnsupportedFeature(what)) => {
-            assert!(what.contains("incompatible feature bits 2"), "{what}")
+            assert!(what.contains("incompatible feature bits 4"), "{what}")
         }
         Ok(_) => panic!("opened a file with an unknown incompat bit"),
         Err(e) => panic!("{e:?}"),
