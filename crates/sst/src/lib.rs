@@ -561,6 +561,12 @@ pub struct ReadOptions {
     /// separator marks the end of a row (the writer's row-end separators, ICR 0039), the
     /// cursor ends instead of reading the next block, which holds only later rows.
     pub one_row: bool,
+    /// A filtered jump (a seek to the filter's hint, a row skip) that leaves the row it
+    /// jumped from stops there, valid but not admitted ([`SstIter::take_stopped`]), instead of
+    /// jumping on row by row through the rest of the file (#1924, #1931). Implied by
+    /// [`ReadOptions::one_row`]; set alone by a read of several rows whose caller moves the
+    /// cursor forward row by row (a multi-get), without `one_row`'s end at a row-end block.
+    pub stop_jumps: bool,
 }
 
 impl Default for ReadOptions {
@@ -573,6 +579,7 @@ impl Default for ReadOptions {
             readahead_merge: false,
             cache_only: false,
             one_row: false,
+            stop_jumps: false,
         }
     }
 }

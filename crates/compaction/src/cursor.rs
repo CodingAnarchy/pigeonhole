@@ -451,6 +451,9 @@ pub struct FilteredCursor<C> {
     /// row ends the settle there, valid but not admitted, where the read ends, instead of
     /// jumping on row by row. Beside the other flags, so the cursor is no larger.
     one_row: bool,
+    /// Such a jump stop left the cursor on an entry it didn't admit, since
+    /// [`FilteredCursor::take_stopped`] last asked (#1931). Set only where a jump stops.
+    stopped: bool,
 }
 
 impl<C: Cursor> FilteredCursor<C> {
@@ -465,6 +468,7 @@ impl<C: Cursor> FilteredCursor<C> {
             parked: false,
             verdict: Verdict::Admit,
             one_row: false,
+            stopped: false,
         }
     }
 
@@ -473,6 +477,33 @@ impl<C: Cursor> FilteredCursor<C> {
     pub fn one_row(mut self, one_row: bool) -> Self {
         self.one_row = one_row;
         self
+    }
+
+    /// Whether a jump stop has left the cursor on an entry it didn't admit since this was last
+    /// asked, clearing it (#1931). A caller that moves on to a key the cursor already stands
+    /// at or past settles it there first ([`FilteredCursor::resettle`]).
+    #[inline]
+    pub fn take_stopped(&mut self) -> bool {
+        // Cleared only when set: the common answer is a load.
+        if !self.stopped {
+            return false;
+        }
+        self.stopped = false;
+        true
+    }
+
+    /// Settles the cursor from where it stands (#1931). In lazy mode it parks on the entry if
+    /// that isn't admitted, for a merge to settle under its bound; otherwise the filter's
+    /// jumps run from it (and may stop again, past its row).
+    pub fn resettle(&mut self) -> Result<(), C::Error> {
+        if self.all {
+            return Ok(());
+        }
+        if self.lazy {
+            self.land();
+            return Ok(());
+        }
+        self.settle_filtered()
     }
 
     /// Whether a jump of a one-row read just left the row it started in: past the row of
@@ -579,6 +610,7 @@ impl<C: Cursor> FilteredCursor<C> {
             };
             // A one-row read's jump past its row ends it there (#1924), as in `SstIter`.
             if self.jumped_out(seek) {
+                self.stopped = true;
                 break;
             }
         }
@@ -630,6 +662,7 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
             // A one-row read's jump past its row ends it there, settled (#1924): alone in
             // the merge (`bound` `None`) it would otherwise jump on through its later rows.
             if verdict != Verdict::Next && self.jumped_out(verdict == Verdict::Seek) {
+                self.stopped = true;
                 break;
             }
             verdict = self.filter.check(self.inner.key(), &mut self.hint);

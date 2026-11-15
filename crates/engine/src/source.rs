@@ -177,6 +177,25 @@ impl Source {
         }
     }
 
+    /// Whether a jump stop (`ReadOptions::stop_jumps`, a one-row memtable cursor) left the
+    /// source on a key its filter didn't admit since this was last asked, clearing it (#1931).
+    #[inline]
+    pub(crate) fn take_stopped(&mut self) -> bool {
+        match self {
+            Source::Mem(it) => it.take_stopped(),
+            Source::Sst(s) => s.iter.take_stopped(),
+        }
+    }
+
+    /// Settles a source from where it stands: one a jump stop left on a key its filter
+    /// didn't admit, which a multi-get's next key already lies at or before (#1931).
+    pub(crate) fn resettle(&mut self) -> Result<()> {
+        match self {
+            Source::Mem(it) => Ok(it.resettle()?),
+            Source::Sst(s) => s.resettle(),
+        }
+    }
+
     /// The uncached blocks an SST source's next steps read, up to `max`, appended to `out`
     /// ([`SstSource::upcoming`]; nothing for other sources).
     pub(crate) fn upcoming(&self, max: usize, out: &mut Vec<pigeonhole_sst::Fetch>) {
@@ -479,6 +498,16 @@ impl Level {
 }
 
 impl SstSource {
+    /// Settles the open SST's cursor from where it stands ([`SstIter::resettle`]); run out,
+    /// a level moves on to its next SST.
+    fn resettle(&mut self) -> Result<()> {
+        self.iter.resettle()?;
+        if self.level.is_some() && !self.iter.valid() {
+            self.next_file()?;
+        }
+        Ok(())
+    }
+
     /// Switches cache-only reads on or off for the open SST and the ones the level opens
     /// next (an async scan positions cache-only, then steps reading normally; ICR 0014).
     pub(crate) fn set_cache_only(&mut self, on: bool) {
