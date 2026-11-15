@@ -6353,6 +6353,153 @@ impl<'de> serde::Deserialize<'de> for ForgetResponse {
         deserializer.deserialize_struct("pigeonhole.v1.ForgetResponse", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for ForwardMemoryWatchRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.map_version != 0 {
+            len += 1;
+        }
+        if self.caller.is_some() {
+            len += 1;
+        }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
+        if self.request.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForwardMemoryWatchRequest", len)?;
+        if self.map_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("map_version", ToString::to_string(&self.map_version).as_str())?;
+        }
+        if let Some(v) = self.caller.as_ref() {
+            struct_ser.serialize_field("caller", v)?;
+        }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
+        }
+        if let Some(v) = self.request.as_ref() {
+            struct_ser.serialize_field("request", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for ForwardMemoryWatchRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "map_version",
+            "mapVersion",
+            "caller",
+            "partition",
+            "request",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            MapVersion,
+            Caller,
+            Partition,
+            Request,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "mapVersion" | "map_version" => Ok(GeneratedField::MapVersion),
+                            "caller" => Ok(GeneratedField::Caller),
+                            "partition" => Ok(GeneratedField::Partition),
+                            "request" => Ok(GeneratedField::Request),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = ForwardMemoryWatchRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.ForwardMemoryWatchRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ForwardMemoryWatchRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut map_version__ = None;
+                let mut caller__ = None;
+                let mut partition__ = None;
+                let mut request__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::MapVersion => {
+                            if map_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("mapVersion"));
+                            }
+                            map_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Caller => {
+                            if caller__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("caller"));
+                            }
+                            caller__ = map_.next_value()?;
+                        }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Request => {
+                            if request__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("request"));
+                            }
+                            request__ = map_.next_value()?;
+                        }
+                    }
+                }
+                Ok(ForwardMemoryWatchRequest {
+                    map_version: map_version__.unwrap_or_default(),
+                    caller: caller__,
+                    partition: partition__.unwrap_or_default(),
+                    request: request__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.ForwardMemoryWatchRequest", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for ForwardRequest {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -6459,6 +6606,12 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::Forget(v) => {
                     struct_ser.serialize_field("forget", v)?;
                 }
+                forward_request::Op::RecallPool(v) => {
+                    struct_ser.serialize_field("recall_pool", v)?;
+                }
+                forward_request::Op::RecallBodies(v) => {
+                    struct_ser.serialize_field("recall_bodies", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6512,6 +6665,10 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "supersede",
             "link",
             "forget",
+            "recall_pool",
+            "recallPool",
+            "recall_bodies",
+            "recallBodies",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6543,6 +6700,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             Supersede,
             Link,
             Forget,
+            RecallPool,
+            RecallBodies,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6591,6 +6750,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "supersede" => Ok(GeneratedField::Supersede),
                             "link" => Ok(GeneratedField::Link),
                             "forget" => Ok(GeneratedField::Forget),
+                            "recallPool" | "recall_pool" => Ok(GeneratedField::RecallPool),
+                            "recallBodies" | "recall_bodies" => Ok(GeneratedField::RecallBodies),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6804,6 +6965,20 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::Forget)
 ;
                         }
+                        GeneratedField::RecallPool => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("recallPool"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::RecallPool)
+;
+                        }
+                        GeneratedField::RecallBodies => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("recallBodies"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::RecallBodies)
+;
+                        }
                     }
                 }
                 Ok(ForwardRequest {
@@ -6879,6 +7054,12 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::Forget(v) => {
                     struct_ser.serialize_field("forget", v)?;
                 }
+                forward_response::Reply::RecallPool(v) => {
+                    struct_ser.serialize_field("recall_pool", v)?;
+                }
+                forward_response::Reply::RecallBodies(v) => {
+                    struct_ser.serialize_field("recall_bodies", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6913,6 +7094,10 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "mark_used",
             "markUsed",
             "forget",
+            "recall_pool",
+            "recallPool",
+            "recall_bodies",
+            "recallBodies",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6933,6 +7118,8 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             Recall,
             MarkUsed,
             Forget,
+            RecallPool,
+            RecallBodies,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6970,6 +7157,8 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "recall" => Ok(GeneratedField::Recall),
                             "markUsed" | "mark_used" => Ok(GeneratedField::MarkUsed),
                             "forget" => Ok(GeneratedField::Forget),
+                            "recallPool" | "recall_pool" => Ok(GeneratedField::RecallPool),
+                            "recallBodies" | "recall_bodies" => Ok(GeneratedField::RecallBodies),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7102,6 +7291,20 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("forget"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Forget)
+;
+                        }
+                        GeneratedField::RecallPool => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("recallPool"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::RecallPool)
+;
+                        }
+                        GeneratedField::RecallBodies => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("recallBodies"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::RecallBodies)
 ;
                         }
                     }
@@ -17215,6 +17418,441 @@ impl<'de> serde::Deserialize<'de> for Rebalance {
             }
         }
         deserializer.deserialize_any(GeneratedVisitor)
+    }
+}
+impl serde::Serialize for RecallBodiesRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.request.is_some() {
+            len += 1;
+        }
+        if !self.ids.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RecallBodiesRequest", len)?;
+        if let Some(v) = self.request.as_ref() {
+            struct_ser.serialize_field("request", v)?;
+        }
+        if !self.ids.is_empty() {
+            struct_ser.serialize_field("ids", &self.ids.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for RecallBodiesRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "request",
+            "ids",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Request,
+            Ids,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "request" => Ok(GeneratedField::Request),
+                            "ids" => Ok(GeneratedField::Ids),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = RecallBodiesRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.RecallBodiesRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<RecallBodiesRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut request__ = None;
+                let mut ids__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Request => {
+                            if request__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("request"));
+                            }
+                            request__ = map_.next_value()?;
+                        }
+                        GeneratedField::Ids => {
+                            if ids__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("ids"));
+                            }
+                            ids__ = 
+                                Some(map_.next_value::<Vec<::pbjson::private::BytesDeserialize<_>>>()?
+                                    .into_iter().map(|x| x.0).collect())
+                            ;
+                        }
+                    }
+                }
+                Ok(RecallBodiesRequest {
+                    request: request__,
+                    ids: ids__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.RecallBodiesRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for RecallBodiesResponse {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.bodies.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RecallBodiesResponse", len)?;
+        if !self.bodies.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("bodies", pbjson::private::base64::encode(&self.bodies).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for RecallBodiesResponse {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "bodies",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Bodies,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "bodies" => Ok(GeneratedField::Bodies),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = RecallBodiesResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.RecallBodiesResponse")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<RecallBodiesResponse, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut bodies__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Bodies => {
+                            if bodies__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("bodies"));
+                            }
+                            bodies__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(RecallBodiesResponse {
+                    bodies: bodies__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.RecallBodiesResponse", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for RecallPoolRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.request.is_some() {
+            len += 1;
+        }
+        if self.now_us != 0 {
+            len += 1;
+        }
+        if !self.hop.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RecallPoolRequest", len)?;
+        if let Some(v) = self.request.as_ref() {
+            struct_ser.serialize_field("request", v)?;
+        }
+        if self.now_us != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("now_us", ToString::to_string(&self.now_us).as_str())?;
+        }
+        if !self.hop.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("hop", pbjson::private::base64::encode(&self.hop).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for RecallPoolRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "request",
+            "now_us",
+            "nowUs",
+            "hop",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Request,
+            NowUs,
+            Hop,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "request" => Ok(GeneratedField::Request),
+                            "nowUs" | "now_us" => Ok(GeneratedField::NowUs),
+                            "hop" => Ok(GeneratedField::Hop),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = RecallPoolRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.RecallPoolRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<RecallPoolRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut request__ = None;
+                let mut now_us__ = None;
+                let mut hop__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Request => {
+                            if request__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("request"));
+                            }
+                            request__ = map_.next_value()?;
+                        }
+                        GeneratedField::NowUs => {
+                            if now_us__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nowUs"));
+                            }
+                            now_us__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Hop => {
+                            if hop__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("hop"));
+                            }
+                            hop__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(RecallPoolRequest {
+                    request: request__,
+                    now_us: now_us__.unwrap_or_default(),
+                    hop: hop__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.RecallPoolRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for RecallPoolResponse {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.pool.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RecallPoolResponse", len)?;
+        if !self.pool.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("pool", pbjson::private::base64::encode(&self.pool).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for RecallPoolResponse {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "pool",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Pool,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "pool" => Ok(GeneratedField::Pool),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = RecallPoolResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.RecallPoolResponse")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<RecallPoolResponse, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut pool__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Pool => {
+                            if pool__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("pool"));
+                            }
+                            pool__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(RecallPoolResponse {
+                    pool: pool__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.RecallPoolResponse", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for RecallRequest {

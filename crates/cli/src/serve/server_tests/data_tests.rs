@@ -690,27 +690,37 @@ fn a_scan_over_http_is_ndjson_or_server_sent_events() {
     assert_eq!(err["code"], "TableNotFound", "{status} {err}");
 }
 
+/// A scan holds its `--max-scans` slot until the server's stream has taken its last page. The
+/// held scan waits after its first page (the hold seam), since a connection would otherwise
+/// drain its pages, and the scan give its slot back, before the second scan asks (#1947).
 #[test]
 fn scans_past_the_scan_limit_are_refused_until_one_ends() {
+    const TABLE: &str = "scan-limit";
     let mut l = limits();
     l.max_scans = 1;
     let s = Server::start("", l);
     let mut c = s.grpc();
-    seed_rows(&s, &mut c);
+    let create = json!({"name": TABLE, "families": [{"name": "f"}]});
+    assert_eq!(s.rpc("Schema/CreateTable", &create, None).0, 200);
+    seed_rows_in(&s, &mut c, TABLE);
+    let scan = |page_bytes| proto::ScanRequest {
+        table: TABLE.into(),
+        ..scan_request(page_bytes, 0, Vec::new())
+    };
+    let (release, hold) = tokio::sync::oneshot::channel();
+    super::super::service::HOLD_AFTER_PAGE
+        .lock()
+        .unwrap()
+        .push((TABLE.into(), hold));
     let mut held = s.block_on(async {
-        let mut stream = c
-            .scan(scan_request(1000, 0, Vec::new()))
-            .await
-            .unwrap()
-            .into_inner();
+        let mut stream = c.scan(scan(1000)).await.unwrap().into_inner();
         stream.message().await.unwrap().unwrap();
         stream
     });
-    let refused = s
-        .block_on(c.scan(scan_request(1000, 0, Vec::new())))
-        .unwrap_err();
+    let refused = s.block_on(c.scan(scan(1000))).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
     assert!(refused.message().contains("scan limit"), "{refused:?}");
+    drop(release);
     // The held scan's stream stays readable to its end; once it ends, its slot is free.
     let rest = s.block_on(async {
         let mut n = 0;
@@ -723,7 +733,7 @@ fn scans_past_the_scan_limit_are_refused_until_one_ends() {
     drop(held);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match s.block_on(c.scan(scan_request(100_000, 0, Vec::new()))) {
+        match s.block_on(c.scan(scan(100_000))) {
             Ok(r) => {
                 let mut stream = r.into_inner();
                 s.block_on(async { while stream.message().await.unwrap().is_some() {} });

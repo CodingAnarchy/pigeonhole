@@ -461,6 +461,8 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::Supersede(r) => Op::Supersede(r),
         ServiceOp::Link(r) => Op::Link(r),
         ServiceOp::Forget(r) => Op::Forget(r),
+        ServiceOp::RecallPool(r) => Op::RecallPool(r),
+        ServiceOp::RecallBodies(r) => Op::RecallBodies(r),
         other => {
             return Err(ApiError::internal(format!(
                 "{} isn't a call that's forwarded",
@@ -499,6 +501,8 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::Supersede(r) => ServiceOp::Supersede(r),
             Op::Link(r) => ServiceOp::Link(r),
             Op::Forget(r) => ServiceOp::Forget(r),
+            Op::RecallPool(r) => ServiceOp::RecallPool(r),
+            Op::RecallBodies(r) => ServiceOp::RecallBodies(r),
         },
     )
 }
@@ -527,6 +531,8 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Recall(r) => Reply::Recall(r),
         ServiceReply::MarkUsed(r) => Reply::MarkUsed(r),
         ServiceReply::Forget(r) => Reply::Forget(r),
+        ServiceReply::RecallPool(r) => Reply::RecallPool(r),
+        ServiceReply::RecallBodies(r) => Reply::RecallBodies(r),
         _ => {
             return Err(ApiError::internal(
                 "a forwarded call answered an unexpected reply",
@@ -560,6 +566,8 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Recall(r) => ServiceReply::Recall(r),
             Reply::MarkUsed(r) => ServiceReply::MarkUsed(r),
             Reply::Forget(r) => ServiceReply::Forget(r),
+            Reply::RecallPool(r) => ServiceReply::RecallPool(r),
+            Reply::RecallBodies(r) => ServiceReply::RecallBodies(r),
         },
     )
 }

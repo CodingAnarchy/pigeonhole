@@ -43,7 +43,7 @@ use tokio::sync::Semaphore;
 
 /// The cluster side of a fan-out, owned, so a scan's task can outlive its request.
 #[derive(Clone)]
-struct Reach {
+pub(super) struct Reach {
     node: Arc<super::Node>,
     /// The partitions served here, each with its service (D317 ticket 8a).
     parts: crate::serve::router::Parts,
@@ -56,7 +56,19 @@ struct Reach {
 }
 
 impl Reach {
-    fn of(router: &Router, cluster: &Cluster) -> Self {
+    /// [`of`](Self::of), with a request's `deadline`.
+    pub(super) fn until(
+        router: &Router,
+        cluster: &Cluster,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..Self::of(router, cluster)
+        }
+    }
+
+    pub(super) fn of(router: &Router, cluster: &Cluster) -> Self {
         Self {
             node: Arc::clone(&cluster.node),
             parts: Arc::clone(&cluster.parts),
@@ -68,7 +80,7 @@ impl Reach {
 
     /// How long the next forward or pull may take: what's left of the deadline, or the
     /// timeout.
-    fn within(&self) -> Result<std::time::Duration, ApiError> {
+    pub(super) fn within(&self) -> Result<std::time::Duration, ApiError> {
         match self.deadline {
             None => Ok(self.timeout),
             Some(d) => d
@@ -79,7 +91,7 @@ impl Reach {
     }
 
     /// The routes now, or `PartitionUnavailable` before a map.
-    fn routes(&self) -> Result<Arc<Routes>, ApiError> {
+    pub(super) fn routes(&self) -> Result<Arc<Routes>, ApiError> {
         self.node
             .routes()
             .as_ref()
@@ -96,7 +108,7 @@ impl Reach {
     /// forwarded to the partition's node, and once more with the newer map after that node
     /// answers `WrongPartition`. Its reply, and whether it was forwarded. The request's
     /// holding covers the part (#1715): it takes no charge of its own.
-    async fn part(
+    pub(super) async fn part(
         &self,
         partition: &str,
         caller: &Caller,
@@ -618,7 +630,7 @@ impl Router {
 }
 
 /// A boxed future of a fan-out's.
-type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(super) type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Runs `futs`, at most `n` at once (`--fanout-forwards`), handing each result to `each`
 /// with its index as it arrives, so a merge holds only what it keeps (simp724's S1 on
@@ -629,7 +641,7 @@ type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the queued reads wait for a running one to finish. Shares go back once the queue is
 /// empty and fewer reads are running. So the reads never wait for budget while the request
 /// holds some (cli692 on #1715's plan).
-async fn bounded<'a, T, S>(
+pub(super) async fn bounded<'a, T, S>(
     futs: Vec<Boxed<'a, T>>,
     n: usize,
     mut spare: impl FnMut() -> Option<S>,

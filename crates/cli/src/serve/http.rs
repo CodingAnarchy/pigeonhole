@@ -488,6 +488,10 @@ async fn call(
             ApiError::unsupported("Replication is gRPC only").into_response()
         }
         Ok(ServiceReply::Charged(..)) => ApiError::internal("a charge on a charge").into_response(),
+        // A spanning recall's steps are node to node only: `decode` has no route to them.
+        Ok(ServiceReply::RecallPool(_) | ServiceReply::RecallBodies(_)) => {
+            ApiError::internal("a recall's step on the HTTP API").into_response()
+        }
         Err(e) => e.into_response(),
     };
     match charge {
