@@ -540,6 +540,12 @@ impl BulkLoads {
                         };
                         drop(input);
                         drop(index);
+                        // A load that finished past its partition's lease is unknown, as a
+                        // write is (D326, audit120's S-a).
+                        let r = match (r, &held) {
+                            (Ok(()), Some(h)) => h.committed(),
+                            (r, _) => r,
+                        };
                         // Its last write is done: a fence's drain may finish.
                         drop(held);
                         for g in [

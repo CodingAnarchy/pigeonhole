@@ -286,6 +286,17 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_push_timeout_ms: u64,
+    /// How long a partition's lease runs, in milliseconds (D326). A partition serves on its
+    /// node only while a majority of the map's nodes grant it one; a node cut off from the
+    /// majority stops serving within it. At least 3 times `--cluster-push-timeout-ms`.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 10_000,
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub cluster_lease_ms: u64,
     /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
     /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
@@ -509,6 +520,7 @@ mod tests {
             ["--cluster-token-file", "t"],
             ["--cluster-ca", "ca.pem"],
             ["--cluster-push-timeout-ms", "7"],
+            ["--cluster-lease-ms", "21"],
         ] {
             if flag[0] != "--node-id" {
                 assert!(

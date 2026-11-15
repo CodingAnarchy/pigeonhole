@@ -431,6 +431,31 @@ impl ServiceOp {
         }
     }
 
+    /// Whether the call reads a cluster partition's data, so it needs the partition's lease
+    /// when it takes its snapshot (D326): the data reads, a transaction's or snapshot's
+    /// start, and a transaction's reads. Not a feed's subscribe (feed1248's F1: its
+    /// delivery is gated instead), nor the calls that read no rows (the schema, metrics,
+    /// maintenance), nor a transaction's `Commit`: one with writes is gated as a write where
+    /// it's answered, and a read-only one reads nothing past its transaction's reads.
+    pub(crate) fn reads_partition(&self) -> bool {
+        matches!(
+            self,
+            Self::Get(_)
+                | Self::MultiGet(_)
+                | Self::ReadRow(_)
+                | Self::Scan(_)
+                | Self::Begin(_)
+                | Self::TxnGet(_)
+                | Self::TxnGetRow(_)
+                | Self::OpenSnapshot(_)
+                | Self::Traverse(_)
+                | Self::Nearest(_)
+                | Self::VectorSearch(_)
+                | Self::TextSearch(_)
+                | Self::Recall(_)
+        )
+    }
+
     /// Whether the call writes or changes the schema: a replica refuses it (#1436). Derived
     /// from the scope, so a new write RPC is covered without being listed here (cli692's F2
     /// on #1583): every write-scope RPC writes, and `DropTable` is the one admin-scope
@@ -1672,14 +1697,32 @@ impl Service {
         // worker that hasn't parked since.
         super::placement::refresh();
         let budget = self.admit(&op.admit(), caller, prepaid).await?;
-        // A fenced partition's writes (D317 ticket 6), once admitted, so a fence's drain
-        // never waits behind a write's wait for the budget. Held until the call answers;
-        // a write that runs on past its request extends it.
-        let held = match &self.gate {
-            Some(gate) if op.writes() => Some(gate.enter()?),
-            _ => None,
+        // A cluster partition's gate (D317 ticket 6, D326), once admitted, so a fence's
+        // drain never waits behind a write's wait for the budget. A write is held until the
+        // call answers (a write that runs on past its request extends it); a read needs the
+        // partition's lease. Each is checked again once it's done: a write whose commit
+        // returned past the lease's end is `OutcomeUnknown`, and a read whose snapshot may
+        // have been taken past it is refused (audit120's S3).
+        let (held, read) = match &self.gate {
+            Some(gate) if op.writes() => (Some(gate.enter()?), None),
+            Some(gate) if op.reads_partition() => {
+                gate.serving()?;
+                (None, Some(gate))
+            }
+            _ => (None, None),
         };
-        let reply = self.answer(op, caller, budget).await;
+        let mut reply = self.answer(op, caller, budget).await;
+        if reply.is_ok() {
+            if let Some(h) = &held
+                && let Err(e) = h.committed()
+            {
+                reply = Err(e);
+            } else if let Some(gate) = read
+                && let Err(e) = gate.serving()
+            {
+                reply = Err(e);
+            }
+        }
         drop(held);
         match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
             // A transaction's Commit with writes: the engine's gate (R6) refused it.
@@ -2252,6 +2295,20 @@ impl Service {
     ) -> Result<ServiceReply, ApiError> {
         // The caller's scope, as admission checks it; the budget is the fanning-out node's.
         self.check(&op.admit(), caller)?;
+        // Its partition's lease, before the read and again after it took its snapshot
+        // (D326, audit120's S3).
+        if let Some(gate) = &self.gate {
+            gate.serving()?;
+        }
+        let reply = self.fanout_read(op, caller).await?;
+        if let Some(gate) = &self.gate {
+            gate.serving()?;
+        }
+        Ok(reply)
+    }
+
+    /// [`fanout_part`](Self::fanout_part)'s read.
+    async fn fanout_read(&self, op: ServiceOp, caller: &Caller) -> Result<ServiceReply, ApiError> {
         match op {
             ServiceOp::MultiGet(r) => self
                 .multi_get(r, caller)
@@ -3523,6 +3580,7 @@ impl Service {
     pub(crate) async fn scan_opener(&self, table: &str) -> Result<ScanOpener, ApiError> {
         Ok(ScanOpener {
             table: self.table(table).await?,
+            gate: self.gate.clone(),
             db: self.part()?.db.clone(),
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
@@ -3990,6 +4048,12 @@ impl Service {
                     "the commit's task failed: {e}"
                 ))),
             };
+            // A commit that returned past the partition's lease is unknown (D326), and a
+            // retry of it finds the same.
+            let outcome = match (outcome, &held) {
+                (Ok(c), Some(h)) => h.committed().map(|()| c),
+                (o, _) => o,
+            };
             ticket.finish(outcome.clone());
             drop(budget);
             drop(held);
@@ -4237,6 +4301,8 @@ fn between_reads(table: &str) {
 /// A table's scan, ready to start: see [`Service::scan_opener`].
 pub(crate) struct ScanOpener {
     table: Table,
+    /// A cluster partition's gate: each page needs its lease (D326).
+    gate: Option<Arc<super::gate::WriteGate>>,
     /// The partition's database, for a page's snapshot when the request pins none.
     db: pigeonhole::Pigeonhole,
     pool: Arc<Semaphore>,
@@ -4268,6 +4334,7 @@ impl ScanOpener {
         let (end_tx, end_rx) = oneshot::channel();
         let task = ScanTask {
             table: self.table.clone(),
+            gate: self.gate.clone(),
             db: self.db.clone(),
             r,
             after,
@@ -4308,6 +4375,7 @@ impl ScanOpener {
 /// A scan's reading side, run as its own task.
 struct ScanTask {
     table: Table,
+    gate: Option<Arc<super::gate::WriteGate>>,
     db: pigeonhole::Pigeonhole,
     r: proto::ScanRequest,
     after: Option<ScanPosition>,
@@ -4337,6 +4405,7 @@ impl ScanTask {
     async fn run(self) -> Result<(), ApiError> {
         let Self {
             table,
+            gate,
             db,
             r,
             mut after,
@@ -4362,6 +4431,12 @@ impl ScanTask {
             let limit = remaining.map(|n| n.saturating_add(u64::from(last_row.is_some())));
             if let Some(p) = &pinned {
                 p.check()?;
+            }
+            // A cluster partition's lease, for each page (D326, audit120's M2): before it
+            // takes the page's snapshot, and again once the page is read, before it's sent
+            // (S3). A page is a read at a snapshot of its own unless the request pins one.
+            if let Some(g) = &gate {
+                g.serving()?;
             }
             let pinned_at = pinned.as_ref().map(|p| p.snapshot().clone());
             let (table, db, req, pos) = (table.clone(), db.clone(), Arc::clone(&r), after.take());
@@ -4409,6 +4484,9 @@ impl ScanTask {
             })
             .await?;
             drop(thread);
+            if let Some(g) = &gate {
+                g.serving()?;
+            }
             let continued = matches!(
                 (&last_row, rows.first()),
                 (Some(p), Some(first)) if first.key[..] == p[..]

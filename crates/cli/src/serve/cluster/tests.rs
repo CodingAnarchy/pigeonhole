@@ -58,6 +58,13 @@ pub(super) fn test_dir() -> PathBuf {
     dir
 }
 
+/// The lease the test nodes grant (D326): three of their push timeouts, the least a node
+/// takes, so a test waits out a lease in moments.
+pub(super) const TEST_LEASE: Duration = Duration::from_millis(1500);
+
+/// An hour, in nanoseconds on a lease clock: a test node's lease that won't run out.
+pub(super) const HOUR_NS: u64 = 3_600_000_000_000;
+
 /// A node over `dir` (its persisted map loaded, as `run` loads it), without tokens or TLS.
 pub(super) fn node(dir: &Path, id: &str) -> Arc<Node> {
     node_with(dir, id, "")
@@ -81,6 +88,7 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             scheme: "http",
             ca: None,
             push_timeout: Duration::from_millis(500),
+            lease: TEST_LEASE,
         },
         state,
     )
@@ -1145,6 +1153,11 @@ fn data_node_placed(
 ) {
     use crate::serve::{Shared, router::Router, service::Metrics, service::Service};
     let node = node_with(dir, id, tokens);
+    // A fresh node stands for one that has served for a while: past its start grace, so it
+    // grants leases at once (D326). A restarted one grants none for its grace.
+    if !restart {
+        node.grants.clock().advance(super::lease::grace(TEST_LEASE));
+    }
     // `DIR/fenced.json`, as `run` loads it before any partition opens (D317 ticket 6).
     node.load_fences().unwrap();
     let metrics = Arc::new(Metrics::default());
@@ -1169,11 +1182,11 @@ fn data_node_placed(
         let memory = memories
             .as_ref()
             .map_or_else(|| crate::serve::placement::Memory::defaults(1), |m| m[i]);
-        // Fenced as `run` opens it (D317 ticket 6). A restarted node waits for its peers'
-        // maps to unfence it; a fresh one stands for a node already serving.
+        // Without a lease as `run` opens it (D326). A restarted node waits for its peers'
+        // grants; a fresh one stands for a node already serving, with a lease for the test.
         let gate = node.open_gate(p, 1);
         if !restart {
-            gate.unfence();
+            gate.renew(node.grants.clock().now() + HOUR_NS);
         }
         parts.push((
             p.to_owned(),
@@ -1917,6 +1930,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-token-file",
         "cluster-ca",
         "cluster-push-timeout-ms",
+        "cluster-lease-ms",
         "tls-key",
         "tls-cert",
     ];

@@ -1289,16 +1289,26 @@ impl ScanJob {
         loop {
             let routes = self.reach.routes()?;
             match self.reach.place(&routes, partition)? {
-                Place::Here(_) => {
+                Place::Here(service) => {
                     let here = self.here.get(partition).ok_or_else(|| {
                         ApiError::internal("no local scan for the local partition")
                     })?;
+                    // Its partition's lease, before it reads and once it has taken its
+                    // snapshot (D326, audit120's S3).
+                    let gate = service.gate();
+                    if let Some(g) = gate {
+                        g.serving()?;
+                    }
                     let pinned = self
                         .pinned
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
-                    return here.open(r, None, pinned, None).map(PartPages::Here);
+                    let pages = here.open(r, None, pinned, None)?;
+                    if let Some(g) = gate {
+                        g.serving()?;
+                    }
+                    return Ok(PartPages::Here(pages));
                 }
                 Place::There(Target {
                     address,
