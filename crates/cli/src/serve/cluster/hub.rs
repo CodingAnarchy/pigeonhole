@@ -447,9 +447,6 @@ fn open_hub(
     let hubs = &node.feed_hubs;
     let hub = Arc::new(ClusterHub::new(
         RingOf::new(ClusterRing::new(partitions)),
-        tokio::runtime::Handle::current()
-            .spawn(async {})
-            .abort_handle(),
         false,
         Arc::clone(&hubs.stats),
         Arc::clone(&hubs.live),
@@ -1455,7 +1452,6 @@ mod tests {
             let hub = |parts: &[String]| {
                 Arc::new(ClusterHub::new(
                     RingOf::new(ClusterRing::new(parts.to_vec())),
-                    tokio::spawn(async {}).abort_handle(),
                     false,
                     Arc::default(),
                     Arc::clone(&hubs.live),
@@ -1585,7 +1581,6 @@ mod tests {
             let hub = |hubs: &Hubs| {
                 Arc::new(ClusterHub::new(
                     RingOf::new(ClusterRing::new(parts.clone())),
-                    tokio::spawn(async {}).abort_handle(),
                     false,
                     Arc::default(),
                     Arc::clone(&hubs.live),
