@@ -36,7 +36,7 @@ use pigeonhole_format::superblock::{
     ExtentRef, FIRST_DATA_PAGE, SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock,
 };
 use pigeonhole_format::wal::{
-    Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FragmentType, FrameDecoder, FrameEncoder,
+    Decoded, FRAGMENT_HEADER_LEN, FRAME_SIZE, FrameDecoder, FrameEncoder, PAD_FRAGMENT,
     SegmentHeader, WalRecord,
 };
 use pigeonhole_format::{BlobFileId, Cursor, Lsn, PAGE_SIZE, StreamId};
@@ -1318,7 +1318,7 @@ fn fragment_ok(mut frame: &[u8], epoch: u32) -> bool {
                 pigeonhole_format::checksum::crc32c(&h[4..]),
                 &frame[FRAGMENT_HEADER_LEN..end],
             ) == u32::from_le_bytes(h[..4].try_into().expect("4 bytes"));
-        if intact && ty == FragmentType::Pad as u8 {
+        if intact && ty == PAD_FRAGMENT {
             frame = &frame[end..];
             continue;
         }

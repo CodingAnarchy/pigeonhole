@@ -60,14 +60,17 @@ pub enum FragmentType {
     Middle = 3,
     /// The last piece.
     Last = 4,
-    /// Padding (D327, FORMAT §10.2): zeros the decoder steps over, written only directly
-    /// before a record's first fragment, in the same write, so a stream's next group starts
-    /// on a fresh page while a sync holds the page before it (#1708). Its payload is zeros,
-    /// covered by the CRC like any fragment's. Needs [`INCOMPAT_WAL_PAD`].
-    Pad = 5,
 }
 
-/// Superblock `incompat` bit 1 (D327): the database's WAL may hold [`FragmentType::Pad`]
+/// Fragment type 5, padding (D327, FORMAT §10.2): zeros the decoder steps over, written only
+/// directly before a record's first fragment, in the same write, so a stream's next group
+/// starts on a fresh page while a sync holds the page before it (#1708). Its payload is
+/// zeros, covered by the CRC like any fragment's. Needs [`INCOMPAT_WAL_PAD`]. A constant
+/// rather than a [`FragmentType`] variant: that enum is exhaustive, and a pad is never part
+/// of a record.
+pub const PAD_FRAGMENT: u8 = 5;
+
+/// Superblock `incompat` bit 1 (D327): the database's WAL may hold [`PAD_FRAGMENT`]
 /// fragments, which a build without D327 would refuse mid-replay. Set in both superblock
 /// pages before the first segment that may hold one is written, and never cleared: retained
 /// feed segments (D310) can keep pads long after a checkpoint.
@@ -332,7 +335,7 @@ impl FrameEncoder {
         }
     }
 
-    /// Appends a [`FragmentType::Pad`] fragment (D327) so the next record starts at a multiple
+    /// Appends a [`PAD_FRAGMENT`] (D327) so the next record starts at a multiple
     /// of `unit` bytes of the segment, and returns the bytes appended (0 when it already
     /// would). `unit` is a power of two from 32 bytes to a frame, so a pad never crosses a
     /// frame. Call it only directly before encoding a record into the same buffer: a pad is
@@ -347,7 +350,7 @@ impl FrameEncoder {
         let mut header = [0u8; FRAGMENT_HEADER_LEN];
         header[4..8].copy_from_slice(&self.epoch.to_le_bytes());
         header[8..10].copy_from_slice(&(payload as u16).to_le_bytes());
-        header[10] = FragmentType::Pad as u8;
+        header[10] = PAD_FRAGMENT;
         let at = out.len();
         out.extend_from_slice(&header);
         out.resize(at + n, 0);
@@ -492,7 +495,7 @@ impl FrameDecoder {
             self.pos += (FRAGMENT_HEADER_LEN + len) as u64;
             // A pad is stepped over: the stop offset stays the end of the last record, so a
             // pad whose record was torn off is not counted as data.
-            if ty == FragmentType::Pad as u8 {
+            if ty == PAD_FRAGMENT {
                 continue;
             }
             if ty == FragmentType::First as u8 || ty == FragmentType::Full as u8 {
