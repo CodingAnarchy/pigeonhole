@@ -4947,10 +4947,10 @@ pub mod vectors_server {
 pub struct PartitionRequest {
     #[prost(string, tag = "1")]
     pub partition: ::prost::alloc::string::String,
-    /// `Unfence` only: lift the fence without the peers' confirmation (D317 rule 3: a majority
-    /// of the map's nodes holding the newest map, which names this node for the partition at
-    /// its file's epoch). For a node whose peers can't answer; it risks two writers if a newer
-    /// map moved the partition.
+    /// `Unfence` only: lift the operator's fence without asking the peers whether their newest
+    /// map still names this node for the partition. It never makes the partition serve
+    /// without a lease (D326): that still takes a majority of the map's nodes granting it. For
+    /// a node whose peers can't answer its unfence, once they can grant again.
     #[prost(bool, tag = "2")]
     pub force: bool,
 }
@@ -5142,6 +5142,11 @@ pub struct NodeStatus {
     /// of one version, and an operator must set a newer one.
     #[prost(string, repeated, tag = "5")]
     pub divergent: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// D326: the time left on this node's start grace, in which it grants no lease, its own
+    /// included (it may have granted one just before it stopped, and grants live only in
+    /// memory). 0 once it's over.
+    #[prost(uint64, tag = "6")]
+    pub grace_remaining_ms: u64,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5182,11 +5187,15 @@ pub struct LocalPartition {
     /// else AWAITING_PEER_MAP.
     #[prost(enumeration = "FenceReason", tag = "12")]
     pub fence_reason: i32,
-    /// The peers have yet to confirm it since it opened here (D317 rule 3), whatever
-    /// `fence_reason` says: an operator-fenced partition may be waiting for them too, and an
-    /// unfence without --force asks them first (#1829, ICR 0117 amendment).
+    /// It holds no live lease here (D326): a majority of the map's nodes have yet to grant it
+    /// since it opened, or its lease lapsed. Whatever `fence_reason` says: an operator-fenced
+    /// partition may be waiting for its lease too (#1829, ICR 0117 amendment).
     #[prost(bool, tag = "13")]
     pub awaiting_peers: bool,
+    /// D326: the time left on the partition's lease here, in milliseconds; 0 when it holds none
+    /// (`awaiting_peers` is then true). A partition serves only while it holds one.
+    #[prost(uint64, tag = "14")]
+    pub lease_remaining_ms: u64,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -5358,6 +5367,77 @@ pub struct ForwardSubscribeRequest {
     #[prost(uint64, tag = "5")]
     pub skip_through: u64,
 }
+/// D326: a node's lease round asks each node of its map, itself included, for a grant.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LeaseRequest {
+    /// Refused (`InvalidArgument`) if it isn't this node's cluster.
+    #[prost(string, tag = "1")]
+    pub cluster_id: ::prost::alloc::string::String,
+    /// The asking node.
+    #[prost(string, tag = "2")]
+    pub node_id: ::prost::alloc::string::String,
+    /// The asking node's map version: this node grants only at the same version.
+    #[prost(uint64, tag = "3")]
+    pub map_version: u64,
+    /// The asking node's round, rising: a request older than the last one this node took
+    /// from it is ignored.
+    #[prost(uint64, tag = "4")]
+    pub round: u64,
+    /// What it asks for: each partition it serves that its map names it for, at the file's
+    /// epoch. A grant replaces the asking node's previous one, so what it no longer asks for
+    /// is no longer granted.
+    #[prost(message, repeated, tag = "5")]
+    pub parts: ::prost::alloc::vec::Vec<LeasePart>,
+    /// The asking node's `--cluster-lease-ms`. Refused (`FailedPrecondition`, naming both) if
+    /// it isn't this node's: a holder with a longer lease than its grantors' would serve past
+    /// their grants (audit120's M1).
+    #[prost(uint64, tag = "6")]
+    pub lease_ms: u64,
+    /// A random id the asking node picks when it starts. A request with another id than the
+    /// one this node's grant to it carries is a new start of that node: its rounds start
+    /// again, so the round order doesn't apply, and the request replaces the grant (a node
+    /// that starts holds no lease).
+    #[prost(uint64, tag = "7")]
+    pub start: u64,
+}
+/// A partition at an epoch.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LeasePart {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LeaseResponse {
+    /// This node's map is newer than the request's: nothing is granted, and the asking node
+    /// takes the newer map. 0 otherwise.
+    #[prost(uint64, tag = "1")]
+    pub newer_map_version: u64,
+    /// Granted until `--cluster-lease-ms` after this node received the request, on its clock:
+    /// the parts asked that this node's map, at the request's version, gives the asking node.
+    #[prost(message, repeated, tag = "2")]
+    pub granted: ::prost::alloc::vec::Vec<LeasePart>,
+    /// Withheld: another node's grant of the partition is still live here.
+    #[prost(message, repeated, tag = "3")]
+    pub withheld: ::prost::alloc::vec::Vec<LeaseWithheld>,
+    /// This node is in its start grace and grants nothing until it ends: the time left. 0
+    /// otherwise.
+    #[prost(uint64, tag = "4")]
+    pub grace_remaining_ms: u64,
+}
+/// A partition this node won't grant yet, and why.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LeaseWithheld {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The node whose grant of it is live here.
+    #[prost(string, tag = "2")]
+    pub holder: ::prost::alloc::string::String,
+    /// The time left on that grant, in milliseconds.
+    #[prost(uint64, tag = "3")]
+    pub remaining_ms: u64,
+}
 /// A partition's state on its node (D317 ticket 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -5408,9 +5488,12 @@ pub enum FenceReason {
     /// node's `fenced.json` across a restart, lifted by `phdb cluster unfence`, or by a stamp
     /// that installs another copy of the partition (a move or relocation onto that node).
     Operator = 1,
-    /// Fenced since the node started, until a peer's map at least as new as the node's names
-    /// it for the partition at the file's epoch (or `phdb cluster unfence`).
+    /// The node hasn't held the partition's lease since it opened here (D326): a majority of
+    /// the map's nodes have yet to grant it, so it serves neither reads nor writes.
     AwaitingPeerMap = 2,
+    /// The partition's lease ran out on this node (D326): its renewals stopped reaching a
+    /// majority of the map's nodes, so it stopped serving until a renewal does.
+    LeaseLapsed = 3,
 }
 impl FenceReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -5422,6 +5505,7 @@ impl FenceReason {
             Self::Unspecified => "FENCE_REASON_UNSPECIFIED",
             Self::Operator => "FENCE_REASON_OPERATOR",
             Self::AwaitingPeerMap => "FENCE_REASON_AWAITING_PEER_MAP",
+            Self::LeaseLapsed => "FENCE_REASON_LEASE_LAPSED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -5430,6 +5514,7 @@ impl FenceReason {
             "FENCE_REASON_UNSPECIFIED" => Some(Self::Unspecified),
             "FENCE_REASON_OPERATOR" => Some(Self::Operator),
             "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
+            "FENCE_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
             _ => None,
         }
     }
@@ -5828,6 +5913,33 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Stamp"));
             self.inner.unary(req, path, codec).await
         }
+        /// Node to node (D326): a lease round's request for this node's grant of the partitions it
+        /// names, for `--cluster-lease-ms` on this node's clock from its receipt. This node grants
+        /// only at its own map version, only what that map gives the asking node at the epochs
+        /// asked, and withholds a partition while its grant of it to another node is live, or
+        /// everything during its start grace. A refusal isn't an error: the reply says what was
+        /// granted and why the rest wasn't. Cluster scope, gRPC only.
+        pub async fn lease(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::LeaseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/Lease",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Lease"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -5959,6 +6071,16 @@ pub mod cluster_server {
             &self,
             request: tonic::Request<super::StampRequest>,
         ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
+        /// Node to node (D326): a lease round's request for this node's grant of the partitions it
+        /// names, for `--cluster-lease-ms` on this node's clock from its receipt. This node grants
+        /// only at its own map version, only what that map gives the asking node at the epochs
+        /// asked, and withholds a partition while its grant of it to another node is live, or
+        /// everything during its start grace. A refusal isn't an error: the reply says what was
+        /// granted and why the rest wasn't. Cluster scope, gRPC only.
+        async fn lease(
+            &self,
+            request: tonic::Request<super::LeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::LeaseResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ClusterServer<T> {
@@ -6559,6 +6681,49 @@ pub mod cluster_server {
                     };
                     Box::pin(fut)
                 }
+                "/pigeonhole.v1.Cluster/Lease" => {
+                    #[allow(non_camel_case_types)]
+                    struct LeaseSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::LeaseRequest>
+                    for LeaseSvc<T> {
+                        type Response = super::LeaseResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LeaseRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::lease(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LeaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 _ => {
                     Box::pin(async move {
                         let mut response = http::Response::new(
@@ -6696,10 +6861,14 @@ pub struct PartitionInfo {
     /// Why a fenced partition is fenced.
     #[prost(enumeration = "FenceReason", tag = "6")]
     pub fence_reason: i32,
-    /// As `Cluster.Status`'s `LocalPartition.awaiting_peers`: a majority of the map's nodes
-    /// have yet to confirm it since it opened here, whatever `fence_reason` says (#1829).
+    /// As `Cluster.Status`'s `LocalPartition.awaiting_peers`: it holds no live lease here
+    /// (D326), whatever `fence_reason` says (#1829).
     #[prost(bool, tag = "7")]
     pub awaiting_peers: bool,
+    /// As `Cluster.Status`'s `LocalPartition.lease_remaining_ms` (D326): the time left on the
+    /// partition's lease here; 0 when it holds none.
+    #[prost(uint64, tag = "8")]
+    pub lease_remaining_ms: u64,
 }
 /// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
 /// acts on every partition the map gives the node that's open (the ones `Info` lists), trying
