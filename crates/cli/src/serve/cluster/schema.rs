@@ -313,9 +313,53 @@ pub(crate) fn reconcile_parts(
                 map.map_version
             );
         }
+        memory(shared, service, partition, map);
         outcomes.push((partition.clone(), outcome));
     }
     Some(outcomes)
+}
+
+/// Partition `partition`'s memory store, when `map` places the store there (#1915) and the
+/// node was started with `--memory`: its slot is set the first time, and its store opened
+/// again at every reconcile after (a reconcile that changed the partition's tables cleared
+/// it), so the store's background loops keep running. A map can't move a placed store, so
+/// a slot once set stays the partition's.
+fn memory(
+    shared: &crate::serve::Shared,
+    service: &crate::serve::service::Service,
+    partition: &str,
+    map: &ClusterMap,
+) {
+    let Some(recipe) = shared
+        .router
+        .cluster
+        .as_ref()
+        .and_then(|c| c.memory.as_ref())
+    else {
+        return;
+    };
+    let placed = map
+        .memory
+        .as_ref()
+        .is_some_and(|m| m.store == recipe.name && m.partitions.iter().any(|p| p == partition));
+    if !placed {
+        return;
+    }
+    if let Some(slot) = service.memory_slot() {
+        if slot.cached().is_none() {
+            recipe.reopen(slot, partition);
+        }
+        return;
+    }
+    let (Ok(part), Some(gate)) = (service.part(), service.gate()) else {
+        return;
+    };
+    let loops = crate::serve::memslot::Loops {
+        gate: Arc::clone(gate),
+        placement: service.placement_of().cloned(),
+        partition: partition.to_owned(),
+    };
+    service.set_memory(recipe.open(&part.db, loops));
 }
 
 impl Node {

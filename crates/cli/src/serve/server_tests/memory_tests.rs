@@ -17,6 +17,7 @@ pub(super) fn memory_server_with(tokens: &str, l: Limits) -> Server {
             Arc::new(|_| Ok(pigeonhole_memory::StoreOptions::new())),
             (1 << 20, 8 << 20),
             true,
+            None,
         )
         .unwrap();
         svc.memory_opt(Some(slot), 0)
@@ -407,7 +408,7 @@ fn embedding_memory_server(url: &str) -> Server {
         let (slot, _) = crate::serve::memslot::MemSlot::start(
             &svc.part().unwrap().db,
             "m",
-            Some(crate::memcore::Embedder::Remote(endpoint)),
+            Some(Arc::new(crate::memcore::Embedder::Remote(endpoint))),
             None,
             Arc::new(|_| {
                 let model =
@@ -417,6 +418,7 @@ fn embedding_memory_server(url: &str) -> Server {
             }),
             (1 << 20, 8 << 20),
             true,
+            None,
         )
         .unwrap();
         svc.memory_opt(Some(slot), 0)
@@ -524,6 +526,7 @@ fn memory_replica(p: &Server) -> Server {
             no_model(),
             (1 << 20, 8 << 20),
             false,
+            None,
         )
         .unwrap();
         assert!(!created, "a replica never creates the store");
@@ -667,6 +670,7 @@ fn a_replica_recalls_a_store_made_after_its_start_from_the_write_s_seqno() {
             no_model(),
             (1 << 20, 8 << 20),
             true,
+            None,
         );
         svc.memory_opt(Some(slot), 0)
     });
@@ -862,6 +866,7 @@ fn a_promoted_replica_s_memory_store_runs_its_ivf_rebalancer() {
                 Arc::new(move |_| Ok(options())),
                 (1 << 20, 8 << 20),
                 false,
+                None,
             )
             .unwrap();
             svc.memory_opt(Some(slot), 0)

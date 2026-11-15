@@ -30,6 +30,7 @@ mod convert;
 mod errors;
 mod feed;
 mod gate;
+mod gated;
 mod grpc;
 mod handles;
 mod http;
@@ -180,10 +181,7 @@ fn replica(args: &ServeArgs) -> Result<Option<Arc<replica::Replica>>, Failure> {
 /// the start. A replica (`writer` false) never creates it: it opens it now only if its copy
 /// already has it (so a pin mismatch fails the start too, cli692's D3), and otherwise when a
 /// call first needs it. The `--memory-*` creation options are then used only if it's
-/// promoted without the store.
-///
-/// `--embed-local`'s threads run where the network side's do (`placement`), off the shards'
-/// CPUs, at most as many as those CPUs (cli692's A2 on #1591).
+/// promoted without the store. Its embedder and options: [`memory_recipe`].
 fn memory(
     args: &ServeArgs,
     db: &pigeonhole::Pigeonhole,
@@ -191,6 +189,44 @@ fn memory(
     placement: &Arc<placement::Placement>,
     stderr: &mut dyn std::io::Write,
 ) -> Result<Option<memslot::MemSlot>, Failure> {
+    let Some(recipe) = memory_recipe(args, placement)? else {
+        return Ok(None);
+    };
+    let (m, name) = (&recipe.args, recipe.name.as_str());
+    let (slot, created) = memslot::MemSlot::start(
+        db,
+        name,
+        recipe.embedder.clone(),
+        m.memory_model.as_deref(),
+        Arc::clone(&recipe.create),
+        recipe.budget,
+        writer,
+        None,
+    )?;
+    // An existing store against `--memory-dim` and `--memory-normalization`, as `phdb mcp`
+    // checks it: another value fails the start (#1405). A replica that opens the store later
+    // checks only its pin, as before.
+    if let Some(memslot::Entry::Core(core)) = slot.cached() {
+        crate::memcore::check_reopened(m, name, &core)?;
+    }
+    if created {
+        let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
+    }
+    Ok(Some(slot))
+}
+
+/// What `--memory` opens a store with (D313 ticket 8a), or `None` without it: the embedder
+/// `--embed-url` gives under `--embed-timeout-ms` (or `--embed-local`), the `--memory-*`
+/// creation options, and a recall's byte budget (1 MiB when it sets none, 8 MiB at most, as
+/// pages are). A single node opens its one store with it; a cluster node, each partition's
+/// that the map places the store on (#1915).
+///
+/// `--embed-local`'s threads run where the network side's do (`placement`), off the shards'
+/// CPUs, at most as many as those CPUs (cli692's A2 on #1591).
+pub(crate) fn memory_recipe(
+    args: &ServeArgs,
+    placement: &Arc<placement::Placement>,
+) -> Result<Option<memslot::Recipe>, Failure> {
     use crate::memcore::{Embedder, LocalPlace};
     let m = &args.memory;
     let Some(name) = &m.memory else {
@@ -205,28 +241,13 @@ fn memory(
             on_thread_start: Some(Arc::new(move || enter.enter())),
         },
     )?;
-    let create = crate::memcore::create_options(m, name);
-    let name = args.memory.memory.as_deref().unwrap_or_default();
-    // A recall's byte budget: 1 MiB when it sets none, 8 MiB at most, as pages are.
-    let (slot, created) = memslot::MemSlot::start(
-        db,
-        name,
-        embedder,
-        args.memory.memory_model.as_deref(),
-        create,
-        (1 << 20, 8 << 20),
-        writer,
-    )?;
-    // An existing store against `--memory-dim` and `--memory-normalization`, as `phdb mcp`
-    // checks it: another value fails the start (#1405). A replica that opens the store later
-    // checks only its pin, as before.
-    if let Some(memslot::Entry::Core(core)) = slot.cached() {
-        crate::memcore::check_reopened(m, name, &core)?;
-    }
-    if created {
-        let _ = writeln!(stderr, "phdb serve: memory store {name}: created");
-    }
-    Ok(Some(slot))
+    Ok(Some(memslot::Recipe {
+        name: name.clone(),
+        embedder: embedder.map(Arc::new),
+        create: crate::memcore::create_options(m, name),
+        budget: (1 << 20, 8 << 20),
+        args: m.clone(),
+    }))
 }
 
 /// The startup line's tail when the request runtime's workers also run on the shards' SMT

@@ -52,6 +52,14 @@ use super::{ServeArgs, config, tls};
 use crate::ExitStatus;
 use crate::exit::Failure;
 
+/// The map fields this build keeps when it decodes and stores a map (`NodeStatus.map_features`,
+/// ICR 0138 and 0139). A map's writer adds such a field only once every node reports it: a
+/// node that drops it would store a different map at the same version, and read as divergent.
+pub(crate) const MAP_FEATURES: &[&str] = &[MEMORY_FEATURE];
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
+pub(crate) const MEMORY_FEATURE: &str = "memory";
+
 /// The map file in a node's directory.
 pub(crate) const MAP_FILE: &str = "cluster-map.json";
 /// The lock file that keeps a directory to one server (or one `init-partition`).
@@ -535,6 +543,11 @@ impl Node {
             if let Some(why) = map::moves_with_node_change(&current, &map) {
                 return Err(ApiError::failed_precondition(why));
             }
+            // A memory store goes into the map only once every node keeps it (#1915).
+            if current.memory.is_none() && map.memory.is_some() {
+                self.every_node_keeps(&map, MEMORY_FEATURE, "a memory store")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -547,6 +560,11 @@ impl Node {
                 current.nodes.clone()
             };
         } else {
+            // The node's first map: its nodes keep a memory store too, or none goes in.
+            if map.memory.is_some() {
+                self.every_node_keeps(&map, MEMORY_FEATURE, "a memory store")
+                    .await?;
+            }
             map.previous_nodes.clear();
         }
         let changes_nodes = !map.previous_nodes.is_empty();
@@ -693,6 +711,47 @@ impl Node {
         // Its partitions, confirmed by a majority's maps (D317 rule 3, #1760): asked again,
         // backing off, until they are (cli692's S3).
         self.confirm_until_done().await;
+    }
+
+    /// `FailedPrecondition` unless every node `map` lists keeps its field `feature`
+    /// ([`MAP_FEATURES`]), asked through `Status`: a node that would drop the field stores
+    /// another map at the same version, reads as divergent and blocks confirms (#1899's
+    /// rule), so `what` is added only once the whole cluster runs a build that keeps it. A
+    /// node that doesn't answer counts as one that doesn't: the refusal names it, and a
+    /// forced map skips this as it skips the majority.
+    async fn every_node_keeps(
+        &self,
+        map: &ClusterMap,
+        feature: &str,
+        what: &str,
+    ) -> Result<(), ApiError> {
+        let mut lacking = Vec::new();
+        for n in map.nodes.iter().filter(|n| n.id != self.id) {
+            let answer = async {
+                let mut client = self.client(&n.address).await?;
+                let req = self.request(proto::StatusRequest {})?;
+                client
+                    .status(req)
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|s| s.message().to_owned())
+            };
+            match tokio::time::timeout(self.peers.push_timeout, answer).await {
+                Ok(Ok(st)) if st.map_features.iter().any(|f| f == feature) => {}
+                Ok(Ok(_)) => lacking.push(format!("{} (an older build)", n.id)),
+                Ok(Err(e)) => lacking.push(format!("{} (no answer: {e})", n.id)),
+                Err(_) => lacking.push(format!("{} (no answer in time)", n.id)),
+            }
+        }
+        if lacking.is_empty() {
+            Ok(())
+        } else {
+            Err(ApiError::failed_precondition(format!(
+                "the map can't add {what} until every node runs a build that keeps it in its \
+                 map, or that node would read as divergent: {}. Finish the upgrade first",
+                lacking.join(", ")
+            )))
+        }
     }
 
     /// Peer `address`'s map.
@@ -900,6 +959,7 @@ impl Node {
             cluster_id,
             partitions,
             divergent,
+            map_features: MAP_FEATURES.iter().map(|&f| f.to_owned()).collect(),
         }
     }
 
@@ -1428,11 +1488,6 @@ pub(crate) fn run(
             "#1436's promotion path in D317 §6",
         ),
         (
-            args.memory.memory.is_some(),
-            "--memory",
-            "a later D317 ticket",
-        ),
-        (
             args.create,
             "--create",
             "D317's ticket 2 (partitions are created by phdb cluster init-partition)",
@@ -1598,7 +1653,21 @@ pub(crate) fn run(
         placement.blocking_threads,
         Arc::clone(&metrics),
     )
-    .placement(&placement);
+    .placement(&placement)
+    .memory_opt(None, args.memory_calls.unwrap_or(0));
+    // `--memory` (#1915): each partition the map places the store on opens its own, with
+    // this node's embedder and options, when a reconcile finds it placed. The map may place
+    // it later; it can't place another store.
+    let recipe = super::memory_recipe(args, &placement)?;
+    if let (Some(r), Ok(map)) = (&recipe, node.get_map())
+        && let Some(m) = &map.memory
+        && m.store != r.name
+    {
+        return Err(Failure::usage(&format!(
+            "--memory {}: the cluster map places memory store {:?}, not this one",
+            r.name, m.store
+        )));
+    }
     let backups = super::backup::Backups::new(args.backup_dir.as_deref(), args.max_backups)
         .map_err(|e| Failure::usage(&e))?;
     let parts: Vec<(String, super::service::Service)> = opened
@@ -1646,7 +1715,8 @@ pub(crate) fn run(
     };
     let shared = Arc::new(super::Shared {
         router: super::router::Router::cluster(service, Arc::clone(&node), parts)
-            .max_uploads(args.max_uploads),
+            .max_uploads(args.max_uploads)
+            .memory_recipe(recipe),
         // The data calls' tokens: the same file the node's own calls read.
         tokens: super::tokens(args)?,
         limits,

@@ -7,6 +7,7 @@ package pigeonhole.v1;
 import "pigeonhole/v1/common.proto";
 import "pigeonhole/v1/data.proto";
 import "pigeonhole/v1/feed.proto";
+import "pigeonhole/v1/memory.proto";
 import "pigeonhole/v1/schema.proto";
 import "pigeonhole/v1/transactions.proto";
 import "pigeonhole/v1/vector.proto";
@@ -147,6 +148,9 @@ message ClusterMap {
   // `nodes` hold the map. Derived where the map is set (a forced map clears it), carried by
   // the changes after it, and cleared by the first one once both majorities hold it.
   repeated Node previous_nodes = 6;
+  // The agent memory store's placement (#1915, ICR 0139), if the cluster serves one: each
+  // partition named holds a whole store for the namespaces in its range.
+  MemoryPlacement memory = 8;
 }
 
 message Node {
@@ -190,6 +194,20 @@ message TablePlacement {
   // again under its name gets a new one, which tells a node that missed both to drop the
   // old table and create the new.
   uint64 created = 6;
+}
+
+// Where an agent memory store's namespaces are (#1915, ICR 0139). A store keeps its data in
+// three tables (`mem_{store}`, `mem_{store}_text`, `mem_{store}_ivf`), whose index rows cover
+// every namespace in a file, so a partition holds a whole store of its own for the
+// namespaces in its range, made with the node's `--memory-*` options. Fixed once written.
+message MemoryPlacement {
+  // The store's name, as `phdb serve --memory` names it.
+  string store = 1;
+  // Sorted, distinct namespaces, none containing `\0` (so no namespace's rows straddle
+  // one); none: one range. Namespace `ns` is in range i when `splits[i-1] <= ns < splits[i]`.
+  repeated SplitKey splits = 2;
+  // `splits.len() + 1` partition ids, one per range, as `TablePlacement.partitions`.
+  repeated string partitions = 3;
 }
 
 // A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
@@ -251,6 +269,10 @@ message NodeStatus {
   // Peers seen with this node's `map_version` but a different map: the cluster has two maps
   // of one version, and an operator must set a newer one.
   repeated string divergent = 5;
+  // The map fields this node's build keeps (ICR 0138, 0139): `indexes`, `memory`. A map's
+  // writer adds such a field only once every node reports it, since a node that drops a
+  // field from its copy reads as holding a different map (divergent). Empty from older nodes.
+  repeated string map_features = 7;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -326,6 +348,15 @@ message ForwardRequest {
     // diverge (D317 ticket 5). Another node answers `WrongPartition`.
     CreateTableRequest create_table = 19;
     DropTableRequest drop_table = 20;
+    // Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
+    // that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
+    // or ids are in several partitions never comes here whole.
+    RememberRequest remember = 34;
+    RecallRequest recall = 35;
+    MarkUsedRequest mark_used = 36;
+    SupersedeRequest supersede = 37;
+    LinkRequest link = 38;
+    ForgetRequest forget = 39;
   }
 }
 
@@ -373,6 +404,12 @@ message ForwardResponse {
     NearestResponse nearest = 11;
     // `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
     TableResponse table = 12;
+    // The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
+    // answer `empty`.
+    RememberResponse remember = 19;
+    RecallResponse recall = 20;
+    MarkUsedResponse mark_used = 21;
+    ForgetResponse forget = 22;
   }
 }
 

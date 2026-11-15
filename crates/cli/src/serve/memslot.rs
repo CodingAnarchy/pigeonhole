@@ -62,6 +62,92 @@ impl Drop for Opening<'_> {
     }
 }
 
+/// Where a cluster partition's store runs its background loops (#1915).
+#[derive(Clone)]
+pub(crate) struct Loops {
+    /// The partition's write gate: each slice enters it.
+    pub(crate) gate: Arc<super::gate::WriteGate>,
+    /// The node's CPU placement, which the loops' threads enter.
+    pub(crate) placement: Option<Arc<super::placement::Placement>>,
+    /// The partition, for the threads' log lines.
+    pub(crate) partition: String,
+}
+
+/// What a cluster node opens each of its partitions' stores with (#1915): `--memory`'s
+/// name, the node's one embedder, and the `--memory-*` options a missing store is created
+/// with. Every partition's store is checked against the same pin.
+pub(crate) struct Recipe {
+    pub(crate) name: String,
+    pub(crate) embedder: Option<Arc<Embedder>>,
+    pub(crate) create: Arc<Create>,
+    pub(crate) budget: (u64, u64),
+    /// `--memory-*`, which an existing store is checked against as at a single node's start
+    /// (`--memory-dim`, `--memory-normalization`, #1405).
+    pub(crate) args: crate::args::MemoryArgs,
+}
+
+impl std::fmt::Debug for Recipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recipe")
+            .field("name", &self.name)
+            .field("embeds", &self.embedder.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Recipe {
+    /// A partition's slot, as its writer with `loops`, and its store opened now (created if
+    /// missing), so its background loops run before any call. A failure of the node's own
+    /// configuration (a pin mismatch) is kept and answered by the partition's memory calls;
+    /// any other is logged, and the next call opens again.
+    pub(crate) fn open(&self, db: &Pigeonhole, loops: Loops) -> MemSlot {
+        let partition = loops.partition.clone();
+        let slot = MemSlot::new(
+            db,
+            &self.name,
+            self.embedder.clone(),
+            self.args.memory_model.as_deref(),
+            Arc::clone(&self.create),
+            self.budget,
+            true,
+            Some(loops),
+        );
+        let created = !slot.exists();
+        if self.reopen(&slot, &partition) && created {
+            eprintln!(
+                "phdb serve: memory store {} on partition {partition}: created",
+                self.name
+            );
+        }
+        slot
+    }
+
+    /// Opens `slot`'s store now if it isn't open (a reconcile cleared it), and checks it
+    /// against `--memory-*`: a mismatch is kept as the slot's failure, which its calls
+    /// answer. Whether the store is open.
+    pub(crate) fn reopen(&self, slot: &MemSlot, partition: &str) -> bool {
+        let failed = match slot.cached().map_or_else(|| slot.get(), Ok) {
+            Ok(Entry::Core(core)) => {
+                match crate::memcore::check_reopened(&self.args, &self.name, &core) {
+                    Ok(()) => return true,
+                    Err(f) => {
+                        let e = ApiError::failed_precondition(f.message().to_owned());
+                        slot.fail(e.clone());
+                        e
+                    }
+                }
+            }
+            Ok(Entry::Missing) => return false,
+            Ok(Entry::Failed(e)) | Err(e) => e,
+        };
+        eprintln!(
+            "phdb serve: memory store {} on partition {partition}: {}",
+            self.name, failed.message
+        );
+        false
+    }
+}
+
 /// The memory store `--memory` names, as the service holds it.
 pub(crate) struct MemSlot {
     db: Pigeonhole,
@@ -73,6 +159,10 @@ pub(crate) struct MemSlot {
     budget: (u64, u64),
     state: Mutex<State>,
     opened: Condvar,
+    /// On a cluster partition (#1915): the partition's write gate, which the store's
+    /// forgetter and IVF rebalancer run under, on threads of the server's
+    /// ([`super::gated`]), rather than the crate's own threads, which would write past it.
+    loops: Option<Loops>,
     /// How many times the database was swapped under the slot: a watch of the store ends
     /// when it changes.
     swaps: tokio::sync::watch::Sender<u64>,
@@ -86,20 +176,23 @@ pub(crate) struct MemSlot {
 
 impl MemSlot {
     /// A slot for the store `name`, opening as the writer or (`writer` false) as a replica.
-    /// Nothing is opened yet.
+    /// Nothing is opened yet. With `loops` (a cluster partition's), the store's background
+    /// loops run under its gate.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         db: &Pigeonhole,
         name: &str,
-        embedder: Option<Embedder>,
+        embedder: Option<Arc<Embedder>>,
         expected: Option<&str>,
         create: Arc<Create>,
         budget: (u64, u64),
         writer: bool,
+        loops: Option<Loops>,
     ) -> Self {
         Self {
             db: db.clone(),
             name: name.to_owned(),
-            embedder: embedder.map(Arc::new),
+            embedder,
             expected: expected.map(str::to_owned),
             create,
             budget,
@@ -110,6 +203,7 @@ impl MemSlot {
                 entry: None,
             }),
             opened: Condvar::new(),
+            loops,
             swaps: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
             after_open: Mutex::new(None),
@@ -134,24 +228,39 @@ impl MemSlot {
     /// [`new`](Self::new), opened now as a server starts it: a writer opens the store,
     /// creating it if missing; a replica opens it only if its copy has it (so a pin mismatch
     /// fails the start, cli692's D3 on #1618), and otherwise when a call first needs it.
-    /// Returns the slot and whether the store was created.
+    /// Returns the slot and whether the store was created. With `loops` (a cluster
+    /// partition's), the store's background loops run under its gate.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         db: &Pigeonhole,
         name: &str,
-        embedder: Option<Embedder>,
+        embedder: Option<Arc<Embedder>>,
         expected: Option<&str>,
         create: Arc<Create>,
         budget: (u64, u64),
         writer: bool,
+        loops: Option<Loops>,
     ) -> Result<(Self, bool), Failure> {
-        let slot = Self::new(db, name, embedder, expected, create, budget, writer);
+        let slot = Self::new(db, name, embedder, expected, create, budget, writer, loops);
         let exists = slot.exists();
         if !(writer || exists) {
             return Ok((slot, false));
         }
         let create = writer.then_some(&*slot.create);
-        match MemCore::open_in(db, name, slot.embedder.clone(), expected, create, budget) {
-            Ok(Some(core)) => slot.state().entry = Some(Entry::Core(Arc::new(core))),
+        let own = writer && slot.loops.is_some();
+        match MemCore::open_in(
+            db,
+            name,
+            slot.embedder.clone(),
+            expected,
+            create,
+            budget,
+            own,
+        ) {
+            Ok(Some(core)) => {
+                slot.run_loops(&core);
+                slot.state().entry = Some(Entry::Core(Arc::new(core)));
+            }
             Ok(None) => {}
             Err(OpenError::Pin(f) | OpenError::Create(f)) => return Err(f),
             Err(OpenError::Store(e)) => {
@@ -162,6 +271,47 @@ impl MemSlot {
             }
         }
         Ok((slot, writer && !exists))
+    }
+
+    /// Starts the store's forgetter and IVF rebalancer under the partition's gate, when the
+    /// slot has [`Loops`] and `core` was opened owning them. Each thread ends once the store
+    /// it works on closes: the slot dropping its entry (a clear, or the partition's close)
+    /// drops the last handle.
+    fn run_loops(&self, core: &MemCore) {
+        let Some(l) = &self.loops else { return };
+        let (forgetter, rebalancer) = core.take_loops();
+        let what = |job: &str| format!("memory store {} on {}: {job}", self.name, l.partition);
+        let spawned = [
+            forgetter.map(|f| {
+                super::gated::spawn(
+                    f,
+                    "phdb-serve-forget",
+                    what("forgetting"),
+                    Some(Arc::clone(&l.gate)),
+                    l.placement.clone(),
+                )
+            }),
+            rebalancer.map(|r| {
+                super::gated::spawn(
+                    r,
+                    "phdb-serve-rebalance",
+                    what("rebalancing"),
+                    Some(Arc::clone(&l.gate)),
+                    l.placement.clone(),
+                )
+            }),
+        ];
+        // Not joined: each ends with the store. One that couldn't start leaves its work for
+        // the next open.
+        for e in spawned.into_iter().flatten().filter_map(Result::err) {
+            eprintln!("phdb serve: {}: no background thread: {e}", what("loops"));
+        }
+    }
+
+    /// Keeps `e` as what the slot answers until the next clear: a store that opened but
+    /// doesn't match the server's configuration. Its handles go, and its loops with them.
+    pub(crate) fn fail(&self, e: ApiError) {
+        self.state().entry = Some(Entry::Failed(e));
     }
 
     /// Whether the database has the store now.
@@ -241,8 +391,12 @@ impl MemSlot {
             self.expected.as_deref(),
             create,
             self.budget,
+            writer && self.loops.is_some(),
         ) {
-            Ok(Some(core)) => Ok(Entry::Core(Arc::new(core))),
+            Ok(Some(core)) => {
+                self.run_loops(&core);
+                Ok(Entry::Core(Arc::new(core)))
+            }
             Ok(None) => Ok(Entry::Missing),
             // The server's configuration: a retry won't change it (D4).
             Err(OpenError::Pin(f) | OpenError::Create(f)) => Ok(Entry::Failed(
@@ -334,12 +488,14 @@ mod tests {
             no_model(),
             (1 << 20, 8 << 20),
             false,
+            None,
         )
     }
 
     /// Creates the store `m` (no model) as a primary's writes would.
     fn create_store(db: &Pigeonhole) {
-        let core = MemCore::open_in(db, "m", None, None, Some(&*no_model()), (1, 1)).unwrap();
+        let core =
+            MemCore::open_in(db, "m", None, None, Some(&*no_model()), (1, 1), false).unwrap();
         assert!(core.is_some());
     }
 

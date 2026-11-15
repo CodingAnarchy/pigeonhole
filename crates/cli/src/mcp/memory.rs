@@ -126,6 +126,7 @@ impl Memory {
                     args.memory_model.as_deref(),
                     writable.then_some(&*create),
                     budget,
+                    false,
                 )
                 .map_err(open)?
                 .ok_or_else(|| {

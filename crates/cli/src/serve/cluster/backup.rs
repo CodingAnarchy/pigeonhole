@@ -441,6 +441,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: version,
             previous_nodes: Vec::new(),
+            memory: None,
             nodes: vec![Node {
                 id: "n1".into(),
                 address: "a:1".into(),
