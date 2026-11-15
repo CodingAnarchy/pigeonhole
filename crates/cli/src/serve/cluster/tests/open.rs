@@ -351,6 +351,7 @@ fn opened_off_the_others_cores_alone() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        memory: None,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
