@@ -703,10 +703,12 @@ impl SstIter {
         r
     }
 
-    /// Advances to the first admitted entry at or after the current one, or to the first
-    /// entry a jump lands on at or past the filter's stop (#1924): there the read ends, and
-    /// without the stop a row whose qualifiers the filter passes over would send the cursor
-    /// seeking row by row through the rest of the file.
+    /// Advances to the first admitted entry at or after the current one. A one-row read
+    /// ([`ReadOptions::one_row`]) stops instead at the first entry a jump lands on past its
+    /// row (#1924), valid but not admitted, where its caller ends the read: a row with no
+    /// qualifier the filter keeps would otherwise send the cursor seeking (or skipping) row
+    /// by row through the rest of the file. Tested only after a jump, never on `Admit` or
+    /// `Next`. Forward reads only, as every filtered read is.
     fn settle(&mut self) -> Result<()> {
         if self.filter_all {
             return Ok(());
@@ -716,16 +718,18 @@ impl SstIter {
                 Verdict::Admit => return Ok(()),
                 Verdict::SkipRow => {
                     self.skip_row_raw()?;
-                    if self.past_stop() {
+                    // A row skip leaves the row: a one-row read is done.
+                    if self.options.one_row {
                         return Ok(());
                     }
                 }
                 Verdict::Seek => {
                     let hint = std::mem::take(&mut self.hint);
                     let r = self.seek_forward(&hint);
+                    let left = self.options.one_row && r.is_ok() && self.left_row(&hint);
                     self.hint = hint;
                     r?;
-                    if self.past_stop() {
+                    if left {
                         return Ok(());
                     }
                 }
@@ -735,12 +739,15 @@ impl SstIter {
         Ok(())
     }
 
-    /// Whether the cursor stands at or past the filter's stop, after a jump.
+    /// Whether the cursor stands past the row of `hint` (a row prefix and a qualifier
+    /// bound), after a seek to it. A key that starts with the whole hint is still in the row
+    /// (a prefix filter's usual landing), without finding the row's end.
     #[inline]
-    fn past_stop(&self) -> bool {
-        self.data
-            .as_ref()
-            .is_some_and(|d| d.valid() && self.filter.past_stop(d.key()))
+    fn left_row(&self, hint: &[u8]) -> bool {
+        let Some(data) = self.data.as_ref().filter(|d| d.valid()) else {
+            return false;
+        };
+        !data.key().starts_with(hint) && left_row_of(data.key(), hint)
     }
 
     /// Runs a move and settles; on error the cursor becomes invalid.
@@ -751,6 +758,12 @@ impl SstIter {
         }
         r
     }
+}
+
+/// Whether `key` is past the row `hint` starts with ([`SstIter::left_row`]'s slow case).
+#[cold]
+fn left_row_of(key: &[u8], hint: &[u8]) -> bool {
+    row_prefix_len(hint).is_ok_and(|n| !key.starts_with(&hint[..n]))
 }
 
 impl Cursor for SstIter {

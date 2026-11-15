@@ -1,5 +1,5 @@
-//! #1924: a read whose qualifier filter keeps nothing in its row ends at the row. Without the
-//! filter's stop, each SST source's seek to the filter's hint landed on the next row, which
+//! #1924: a read whose qualifier filter keeps nothing in its row ends at the row. Before, each
+//! SST source's seek to the filter's hint (or row skip) landed on the next row, which
 //! sent it seeking again, row by row through the rest of its file (and a lone memtable
 //! source through its rows): a text search for an id prefix with no documents cost more than
 //! one without the prefix. Covered for a row read and for a one-row scan (the text crate's
@@ -150,7 +150,7 @@ fn a_read_whose_filter_keeps_nothing_in_its_row_ends_at_the_row() {
             ],
             "scan {scan}"
         );
-        // At most the blocks around its row, whatever follows it (2 here). Without the stop,
+        // At most the blocks around its row, whatever follows it (2 here). Without the fix,
         // a row early in its SST read on through it: 15 to 17 uncached block reads.
         assert!(most <= 4, "scan {scan}: a read made {most} block reads");
     }

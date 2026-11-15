@@ -212,9 +212,14 @@ pub(crate) type Merged = MergingCursor<Source>;
 /// The MVCC resolver over them.
 pub(crate) type Resolver = CellResolver<Merged>;
 
-/// Memtable sources of `set`, newest first.
-pub(crate) fn mem_sources(set: &MemSet, filter: &ScanFilter, out: &mut Vec<Source>) {
-    mem_sources_from(&set.readers, filter, out);
+/// Memtable sources of `set`, newest first. `one_row`: the read stays within one row, so a
+/// filtered source's jump past it ends there (#1924).
+pub(crate) fn mem_sources(set: &MemSet, filter: &ScanFilter, one_row: bool, out: &mut Vec<Source>) {
+    for r in &set.readers {
+        out.push(Source::Mem(
+            FilteredCursor::lazy(r.iter(), filter.clone()).one_row(one_row),
+        ));
+    }
 }
 
 /// Memtable sources over `readers`, in their order. Filtered ones are lazy (D288): a scan's or
@@ -300,9 +305,13 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     end: Option<&[u8]>,
     priority: Priority,
     short: bool,
+    one_row: bool,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, true, short, CACHE_ONLY);
+    let mut opts = read_options(priority, true, short, CACHE_ONLY);
+    // A scan of one row (`RowRead::cells`, the text crate's posting reads) ends at its row
+    // as a row read does: a filtered cursor's jump past it stops there (#1924).
+    opts.one_row = one_row;
     let reader = |sst: &OpenSst| {
         if CACHE_ONLY {
             sst.reader_cache_only(set, priority)
@@ -832,11 +841,12 @@ impl View {
         out: &mut Vec<Source>,
     ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
-        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, false, out)
+        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, false, false, out)
     }
 
     /// [`View::scan_sources_into`] from a [`View::locate`] the caller already made, its SST
-    /// cursors' readahead starting later if the scan is `short` ([`scan_is_short`]).
+    /// cursors' readahead starting later if the scan is `short` ([`scan_is_short`]). A scan of
+    /// one row (`one_row`) ends at its row as a row read does (#1924).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_sources_located<const CACHE_ONLY: bool>(
         &self,
@@ -845,14 +855,15 @@ impl View {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         short: bool,
+        one_row: bool,
         out: &mut Vec<Source>,
     ) -> Result<()> {
         if let Some(set) = l.mems {
-            mem_sources(set, filter, out);
+            mem_sources(set, filter, one_row, out);
         }
         if let Some(fam) = l.ssts {
             sst_sources_range::<CACHE_ONLY>(
-                fam, &self.ssts, filter, start, end, l.priority, short, out,
+                fam, &self.ssts, filter, start, end, l.priority, short, one_row, out,
             )?;
         }
         Ok(())
@@ -881,7 +892,7 @@ impl View {
         let mut markers = false;
         if let Some(set) = l.mems {
             markers = set.readers.iter().any(MemtableReader::may_have_markers);
-            mem_sources(set, &all, out);
+            mem_sources(set, &all, false, out);
         }
         if let Some(fam) = l.ssts
             && !fam.is_empty()
@@ -906,7 +917,7 @@ impl View {
     ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
         if let Some(set) = l.mems {
-            mem_sources(set, filter, out);
+            mem_sources(set, filter, true, out);
         }
         if let Some(fam) = l.ssts
             && !fam.is_empty()
@@ -1220,6 +1231,7 @@ mod level_tests {
                 end.as_deref(),
                 Priority::Normal,
                 true,
+                false,
                 &mut out,
             )
             .unwrap();
