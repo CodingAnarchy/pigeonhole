@@ -495,7 +495,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - backups and restore;
   - several partitions per node.
 - **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
-  - the IVF and full-text indexes (building them as well as searching them) aren't served by a cluster node (#1722), nor is `/mcp`; agent memory is, for calls within one partition, and `Memory.Watch` and calls across partitions aren't yet (#1915). [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
+  - the IVF and full-text indexes (building them as well as searching them) aren't served by a cluster node (#1722), nor is `/mcp`; agent memory is, across partitions too, but `Memory.Watch` isn't yet (#1915). [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
   - no read replicas: a cluster node refuses `--replica-of` and `Admin.Promote`, so a partition has one copy, and losing its node means a restore or [the lost-node recipe](#a-lost-node) (#1851).
@@ -584,7 +584,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Refused with `Unsupported`** on a cluster node in this release:
   - every IVF and full-text index call, not only the searches: `Vectors.CreateIndex`, `Insert`, `Delete`, `BulkLoad`, `Search` and `Verify`, and `Text.CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild` and `Verify` (#1722, 1.3.0). For vectors, `Vectors.Nearest` works and fans out across the partitions;
   - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
-  - `Memory.Watch`, a `Memory` call whose namespaces or ids are on more than one partition (make one call per partition; [Agent memory on a cluster](#agent-memory-on-a-cluster)), and `/mcp` (#1915).
+  - `Memory.Watch` ([Agent memory on a cluster](#agent-memory-on-a-cluster)) and `/mcp` (#1915).
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
@@ -598,7 +598,14 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Start every node with `--memory notes`** and the same memory flags. Each partition the map places the store on opens it, created with the `--memory-*` options if missing, and checked against the node's model pin, `--memory-dim` and `--memory-normalization`. A partition whose store doesn't match answers its memory calls with `FailedPrecondition`, and `phdb cluster status` lists why among its reconcile errors; the node's other partitions serve. So does a partition the map places the store on whose node was started without `--memory`, naming the flag. A node started with `--memory` while the map places no store opens one when a map places it. A map that places another store refuses the start.
 - **Use one embedder backend on every node** (all `--embed-url` with the same endpoint and model, or all `--embed-local` with the same model). The model pin checks the model's name, dimension and normalisation, not the numbers each backend computes.
 - **Routing:** any node takes a memory call and forwards it to the partition holding its namespace. `Remember` goes by its namespace, `Link` and `Supersede` by their first memory's, and `MarkUsed`, `Forget` and `Recall` by every id's or namespace's. The owner checks the token's scope and `ns=` namespaces again.
-- **Not yet (#1915):** a call whose namespaces or ids are on more than one partition, and `Memory.Watch`, answer `Unsupported`. Make one call per partition meanwhile. `/mcp` isn't served on a cluster node.
+- **A recall across partitions** (its namespaces on more than one) runs in steps from the node you called:
+  - each partition returns its candidates, which that node ranks together;
+  - a graph expansion (`expand_hops`) then walks one hop at a time;
+  - the partitions holding the best hits return them.
+
+  It returns what one store holding every namespace would, except for the keyword signal: each partition's BM25 statistics are its own. That holds only while nothing writes to those namespaces, since each step reads each partition at a snapshot of its own. It costs two round trips, plus one per hop of expansion. It names at most 64 namespaces, and any partition that can't be reached fails it (`PartitionUnavailable`). The node you called checks the byte budget against its own `--memory-*` limits and embeds the text once for every partition, so it needs `--memory` with the same memory flags as the others: without it, a recall across partitions answers `Unsupported`, while a recall whose namespaces are on one partition is forwarded and served there.
+- **`MarkUsed` and `Forget` across partitions** are split, one call per partition, sent together, and their counts summed. If a part fails, the error names the partitions that applied, with their counts. If a part may have applied, the error is `OutcomeUnknown`. Retrying the whole call is safe either way: `Forget` skips what's gone, and `MarkUsed`'s counts are advisory.
+- **Not yet (#1915):** `Memory.Watch` answers `Unsupported` on a cluster node, and `/mcp` isn't served on one.
 - **In the background:** each partition's forget policy and IVF rebalancing run on the node serving it, under the partition's fence: a fenced partition runs neither.
 
 ### Schema through the cluster
@@ -758,7 +765,7 @@ A node writes a partition only while its newest map names it for the partition a
     - **The map on a majority:** the map is set; a node that missed it takes it from a peer. Check the nodes that don't answer, and run the move again to go on waiting.
     - **Serving:** the map already gives P to `ID`, so check that node.
 
-    The copy has no limit, since it takes as long as the files do. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
+    The copy has no limit on its length, since it takes as long as the files do. It does stop if the old node sends nothing of a file for 60 s: run the move again, and it resumes from the bytes `ID` holds. Without `--timeout`, a wait goes on as long as it takes, and says every 10 s what it's waiting for.
   - **Run it again** to resume a move that stopped. A move that's finished answers that the map already gives P to `ID`.
     - A rerun before the map changed copies and checks the files again, whatever an earlier run left on `ID`: a copy still staged there is picked up from what arrived, and one already installed is sent whole and installed over the earlier one, which moves aside (`<file>.replaced-<time>`). So if you unfenced P on the old node between two runs, the second run moves the writes it took since.
   - **The old node's files stay** unless you pass `--drop-source`. With it, they move aside (`drop-partition`, below) once the copy has checked out and `ID` serves P. A rerun that finds the map already changed drops nothing; its report gives the `drop-partition` command.
@@ -820,7 +827,7 @@ A node writes a partition only while its newest map names it for the partition a
   - Each node needs `--backup-dir`, and the token admin scope, as for `Admin.Backup`.
   - `--durable` copies only what each writer holds durable.
   - `--parallel N` (4) copies that many partitions at once.
-  - A broken download resumes.
+  - A broken download resumes from the bytes written, on a new connection. A node that sends nothing for 60 s, with its connection up, counts as a break. Three breaks in a row with no new bytes fail the backup with the first one's reason; a break after progress starts the count again, so a long copy over a poor link still finishes. A copy that is gone from the node when the download resumes starts again from nothing, within the same three tries.
 - **Not one point in time.** Each copy is a consistent snapshot of its own partition, and the set is not one point in time across partitions. A commit on one partition can be in the backup while an earlier one on another isn't. A table created during the backup can have rows in one partition's copy and none in another's.
 - **Checked against the map.** The backup checks each copy's cluster, partition and epoch against the map. A copy that differs fails it, naming both, for example `the copy is partition "p2" of cluster "c1" at epoch 2, but the map says partition "p2" of cluster "c1" at epoch 1`. That means the map changed during the backup, or the node holds another file. Run it again once the map is settled.
 - **A map that moves meanwhile:** a partition added, moved or relocated during the backup fails it: `the map changed during the backup`. Tables created or dropped meanwhile don't, but a table dropped and created again under its name does (`table users was dropped and created again`): some copies may hold the old table and others the new. `map.json` is the map at the end, which places them as the copies hold them.

@@ -6255,7 +6255,7 @@ pub struct ForwardRequest {
     pub fanout_part: bool,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 35, 36, 37, 38, 39"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 35, 36, 37, 38, 39, 40, 41"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -6324,7 +6324,72 @@ pub mod forward_request {
         Link(super::LinkRequest),
         #[prost(message, tag = "39")]
         Forget(super::ForgetRequest),
+        /// A recall's steps on one partition, when its namespaces are on several (#1915, ICR
+        /// 0139): the pool, or a hop of its graph expansion, and the hits' bodies.
+        #[prost(message, tag = "40")]
+        RecallPool(super::RecallPoolRequest),
+        #[prost(message, tag = "41")]
+        RecallBodies(super::RecallBodiesRequest),
     }
+}
+/// One partition's step of a recall whose namespaces are on several partitions (#1915,
+/// ICR 0139): its pool of candidates, or with `hop` its part of one hop of the graph
+/// expansion. The sending node merges the partitions' answers and ranks them as one store
+/// would.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecallPoolRequest {
+    /// The client's recall, its namespaces narrowed to this partition's, and its embedding the
+    /// one the sending node made from its text (the query is embedded once).
+    #[prost(message, optional, tag = "1")]
+    pub request: ::core::option::Option<RecallRequest>,
+    /// The recall's one clock, in µs since the Unix epoch, so recency compares across
+    /// partitions.
+    #[prost(uint64, tag = "2")]
+    pub now_us: u64,
+    /// A hop of the graph expansion (`pigeonhole_memory::RecallHop`'s versioned bytes); empty
+    /// for the pool. A version this node doesn't read is `FailedPrecondition`.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub hop: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecallPoolResponse {
+    /// The pool (`RecallPool`'s versioned bytes), or with `hop` the hop's part
+    /// (`RecallHopPart`'s).
+    #[prost(bytes = "bytes", tag = "1")]
+    pub pool: ::prost::bytes::Bytes,
+}
+/// The bodies of a recall's best hits on one partition (#1915, ICR 0139).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecallBodiesRequest {
+    /// The client's recall, its namespaces narrowed to this partition's.
+    #[prost(message, optional, tag = "1")]
+    pub request: ::core::option::Option<RecallRequest>,
+    /// The memories, in rank order: each in one of `request`'s namespaces.
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RecallBodiesResponse {
+    /// `RecallBodies`' versioned bytes.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub bodies: ::prost::bytes::Bytes,
+}
+/// One partition's part of a `Memory.Watch` (#1915, ICR 0139).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ForwardMemoryWatchRequest {
+    /// The sending node's map version, as for `Forward`.
+    #[prost(uint64, tag = "1")]
+    pub map_version: u64,
+    /// Who the watch is for, checked again here.
+    #[prost(message, optional, tag = "2")]
+    pub caller: ::core::option::Option<ForwardedCaller>,
+    /// The partition whose part this is: every namespace in `request` must be placed on it.
+    #[prost(string, tag = "3")]
+    pub partition: ::prost::alloc::string::String,
+    /// A single node's watch: its namespaces narrowed to this partition's, and `resume` this
+    /// partition's own token.
+    #[prost(message, optional, tag = "4")]
+    pub request: ::core::option::Option<MemoryWatchRequest>,
 }
 /// One partition's part of a fanned-out scan (D317 ticket 4).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6364,7 +6429,7 @@ pub struct ForwardedCaller {
 pub struct ForwardResponse {
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 22"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 22, 23, 24"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -6410,6 +6475,10 @@ pub mod forward_response {
         MarkUsed(super::MarkUsedResponse),
         #[prost(message, tag = "22")]
         Forget(super::ForgetResponse),
+        #[prost(message, tag = "23")]
+        RecallPool(super::RecallPoolResponse),
+        #[prost(message, tag = "24")]
+        RecallBodies(super::RecallBodiesResponse),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6875,6 +6944,36 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardSubscribe"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Node to node (#1915, ICR 0139): one partition's part of a `Memory.Watch` whose
+        /// namespaces are on several partitions, which the sending node merges with the others.
+        /// Served as `ForwardSubscribe` is: only if this node's map gives it the partition, on
+        /// connections of their own, and with the stream ending `PartitionUnavailable` when the
+        /// partition's lease lapses or it closes. The events are a single node's. Cluster scope,
+        /// gRPC only.
+        pub async fn forward_memory_watch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ForwardMemoryWatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::MemoryEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/ForwardMemoryWatch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardMemoryWatch"));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
@@ -7145,6 +7244,25 @@ pub mod cluster_server {
             request: tonic::Request<super::ForwardSubscribeRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::ForwardSubscribeStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ForwardMemoryWatch method.
+        type ForwardMemoryWatchStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::MemoryEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Node to node (#1915, ICR 0139): one partition's part of a `Memory.Watch` whose
+        /// namespaces are on several partitions, which the sending node merges with the others.
+        /// Served as `ForwardSubscribe` is: only if this node's map gives it the partition, on
+        /// connections of their own, and with the stream ending `PartitionUnavailable` when the
+        /// partition's lease lapses or it closes. The events are a single node's. Cluster scope,
+        /// gRPC only.
+        async fn forward_memory_watch(
+            &self,
+            request: tonic::Request<super::ForwardMemoryWatchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ForwardMemoryWatchStream>,
             tonic::Status,
         >;
         /// D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
@@ -7577,6 +7695,53 @@ pub mod cluster_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ForwardSubscribeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/ForwardMemoryWatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForwardMemoryWatchSvc<T: Cluster>(pub Arc<T>);
+                    impl<
+                        T: Cluster,
+                    > tonic::server::ServerStreamingService<
+                        super::ForwardMemoryWatchRequest,
+                    > for ForwardMemoryWatchSvc<T> {
+                        type Response = super::MemoryEvent;
+                        type ResponseStream = T::ForwardMemoryWatchStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ForwardMemoryWatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::forward_memory_watch(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForwardMemoryWatchSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -419,6 +419,17 @@ pub(crate) struct MemCore {
     max_budget: u64,
 }
 
+/// A recall's byte budget: `asked`, or `default` for none, at most `max` (the server's).
+pub(crate) fn recall_budget(asked: u64, default: u64, max: u64) -> Result<u64> {
+    match asked {
+        0 => Ok(default),
+        b if b > max => Err(MemError::invalid(format!(
+            "byte_budget is at most {max} on this server"
+        ))),
+        b => Ok(b),
+    }
+}
+
 impl MemCore {
     /// Opens the store `name`, creating it with `create` if it doesn't exist. An existing
     /// store must be pinned to `expected` (the embedder's model, or the one the caller
@@ -639,6 +650,11 @@ impl MemCore {
             return Ok(Some(v));
         }
         let Some(v) = given else { return Ok(None) };
+        self.given_embedding(v).map(Some)
+    }
+
+    /// An embedding made elsewhere, checked against the store's model.
+    fn given_embedding(&self, v: Vec<f32>) -> Result<Vec<f32>> {
         let Some(m) = self.model() else {
             return Err(MemError::invalid(
                 "this store has no embedding model: send text only",
@@ -652,7 +668,7 @@ impl MemCore {
                 m.dim()
             )));
         }
-        Ok(Some(v))
+        Ok(v)
     }
 
     /// Remembers a memory in its namespace, and with `supersedes`, marks the old one
@@ -746,6 +762,58 @@ impl MemCore {
         scope: Scope<'_>,
         a: RecallArgs,
     ) -> Result<(Vec<RecallHit>, RecallStats)> {
+        self.recall_of(scope, a, false)?
+            .run_with_stats()
+            .map_err(|e| MemError::store_error("recall", &e))
+    }
+
+    /// One partition's step of a recall whose namespaces are on several (#1915): its pool's
+    /// bytes, or with `hop` its part of that hop, at the recall's clock `now_us`. The same
+    /// checks as [`recall`](Self::recall); the namespaces are this partition's.
+    #[cfg(feature = "serve")]
+    pub(crate) fn recall_pool(
+        &self,
+        scope: Scope<'_>,
+        a: RecallArgs,
+        now_us: u64,
+        hop: Option<&pigeonhole_memory::RecallHop>,
+    ) -> Result<Vec<u8>> {
+        let r = self.recall_of(scope, a, true)?.now_us(now_us);
+        match hop {
+            None => r.gather().map(|p| p.to_bytes()),
+            Some(h) => r.hop(h).map(|p| p.to_bytes()),
+        }
+        .map_err(|e| MemError::store_error("recall", &e))
+    }
+
+    /// The bodies of a recall's best hits on this partition (#1915): `ids`, each in one of
+    /// the recall's namespaces.
+    #[cfg(feature = "serve")]
+    pub(crate) fn recall_bodies(
+        &self,
+        scope: Scope<'_>,
+        a: RecallArgs,
+        ids: &[MemoryId],
+    ) -> Result<Vec<u8>> {
+        self.recall_of(scope, a, true)?
+            .bodies(ids)
+            .map(|b| b.to_bytes())
+            .map_err(|e| MemError::store_error("recall", &e))
+    }
+
+    /// The recall `a` asks for, checked: namespaces (the caller's), `k`, the byte budget
+    /// (this server's default and largest), the query's embedding (made from its text when
+    /// none is given and there's an embedder).
+    ///
+    /// `step`: a spanning recall's step (#1915), whose embedding the entry node made from
+    /// the text once, for every partition: kept (its dimensions checked against the store's
+    /// model) rather than refused as a client's would be with an embedder here.
+    fn recall_of(
+        &self,
+        scope: Scope<'_>,
+        a: RecallArgs,
+        step: bool,
+    ) -> Result<pigeonhole_memory::Recall<'_>> {
         if a.namespaces.is_empty() {
             return Err(MemError::invalid("a recall names its namespaces"));
         }
@@ -753,20 +821,13 @@ impl MemCore {
         if a.k == 0 || a.k > MAX_K {
             return Err(MemError::invalid(format!("k is 1 to {MAX_K}")));
         }
-        let budget = match a.byte_budget {
-            0 => self.default_budget,
-            b if b > self.max_budget => {
-                return Err(MemError::invalid(format!(
-                    "byte_budget is at most {} on this server",
-                    self.max_budget
-                )));
+        let budget = recall_budget(a.byte_budget, self.default_budget, self.max_budget)?;
+        let embedding = match a.embedding {
+            Some(v) if step => Some(self.given_embedding(v)?),
+            given if self.model().is_some() || self.embedder.is_some() => {
+                self.embedding(given, a.text.as_deref(), EmbedKind::Query)?
             }
-            b => b,
-        };
-        let embedding = if self.model().is_some() || self.embedder.is_some() {
-            self.embedding(a.embedding, a.text.as_deref(), EmbedKind::Query)?
-        } else {
-            self.embedding(a.embedding, None, EmbedKind::Query)?
+            given => self.embedding(given, None, EmbedKind::Query)?,
         };
         if a.text.is_none() && embedding.is_none() {
             return Err(MemError::invalid("a recall needs text or an embedding"));
@@ -795,8 +856,7 @@ impl MemCore {
         if let Some(s) = a.session {
             r = r.session(s);
         }
-        r.run_with_stats()
-            .map_err(|e| MemError::store_error("recall", &e))
+        Ok(r)
     }
 
     /// Marks memories used: their ids' namespaces must be the caller's.

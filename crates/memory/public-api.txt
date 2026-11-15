@@ -248,13 +248,16 @@ impl core::fmt::Debug for pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_memory::Recall<'a>
 impl<'a> pigeonhole_memory::Recall<'a>
+pub fn pigeonhole_memory::Recall<'a>::bodies(self, &[pigeonhole_memory::MemoryId]) -> pigeonhole_memory::Result<pigeonhole_memory::RecallBodies>
 pub fn pigeonhole_memory::Recall<'a>::byte_budget(self, u64) -> Self
 pub fn pigeonhole_memory::Recall<'a>::candidates(self, usize) -> Self
 pub fn pigeonhole_memory::Recall<'a>::embedding(self, impl core::convert::Into<alloc::vec::Vec<f32>>) -> Self
 pub fn pigeonhole_memory::Recall<'a>::exact(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::expand(self, pigeonhole_memory::Expand) -> Self
 pub fn pigeonhole_memory::Recall<'a>::fusion(self, pigeonhole_memory::Fusion) -> Self
+pub fn pigeonhole_memory::Recall<'a>::gather(self) -> pigeonhole_memory::Result<pigeonhole_memory::RecallPool>
 pub fn pigeonhole_memory::Recall<'a>::half_life(self, core::time::Duration) -> Self
+pub fn pigeonhole_memory::Recall<'a>::hop(self, &pigeonhole_memory::RecallHop) -> pigeonhole_memory::Result<pigeonhole_memory::RecallHopPart>
 pub fn pigeonhole_memory::Recall<'a>::include_superseded(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::k(self, usize) -> Self
 pub fn pigeonhole_memory::Recall<'a>::now_us(self, u64) -> Self
@@ -272,6 +275,15 @@ pub async fn pigeonhole_memory::Recall<'a>::run_async(self) -> pigeonhole_memory
 pub async fn pigeonhole_memory::Recall<'a>::run_with_stats_async(self) -> pigeonhole_memory::Result<(alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)>
 impl core::fmt::Debug for pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::Recall<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_memory::RecallBodies
+impl pigeonhole_memory::RecallBodies
+pub fn pigeonhole_memory::RecallBodies::from_bytes(&[u8]) -> pigeonhole_memory::Result<pigeonhole_memory::RecallBodies>
+pub fn pigeonhole_memory::RecallBodies::is_empty(&self) -> bool
+pub fn pigeonhole_memory::RecallBodies::len(&self) -> usize
+pub fn pigeonhole_memory::RecallBodies::merge(impl core::iter::traits::collect::IntoIterator<Item = pigeonhole_memory::RecallBodies>) -> pigeonhole_memory::RecallBodies
+pub fn pigeonhole_memory::RecallBodies::to_bytes(&self) -> alloc::vec::Vec<u8>
+impl core::fmt::Debug for pigeonhole_memory::RecallBodies
+pub fn pigeonhole_memory::RecallBodies::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::RecallHit
 pub pigeonhole_memory::RecallHit::created_us: u64
 pub pigeonhole_memory::RecallHit::embedding: core::option::Option<alloc::vec::Vec<f32>>
@@ -282,6 +294,37 @@ pub pigeonhole_memory::RecallHit::score: f64
 pub pigeonhole_memory::RecallHit::signals: core::option::Option<pigeonhole_memory::Signals>
 pub pigeonhole_memory::RecallHit::superseded_by: core::option::Option<pigeonhole_memory::MemoryId>
 pub pigeonhole_memory::RecallHit::text: alloc::string::String
+pub struct pigeonhole_memory::RecallHop
+impl pigeonhole_memory::RecallHop
+pub fn pigeonhole_memory::RecallHop::from_bytes(&[u8]) -> pigeonhole_memory::Result<pigeonhole_memory::RecallHop>
+pub fn pigeonhole_memory::RecallHop::namespaces(&self) -> alloc::collections::btree::set::BTreeSet<alloc::string::String>
+pub fn pigeonhole_memory::RecallHop::split<K: core::cmp::Ord>(&self, impl core::ops::function::Fn(&str) -> K) -> alloc::collections::btree::map::BTreeMap<K, pigeonhole_memory::RecallHop>
+pub fn pigeonhole_memory::RecallHop::to_bytes(&self) -> alloc::vec::Vec<u8>
+impl core::fmt::Debug for pigeonhole_memory::RecallHop
+pub fn pigeonhole_memory::RecallHop::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_memory::RecallHopPart
+impl pigeonhole_memory::RecallHopPart
+pub fn pigeonhole_memory::RecallHopPart::from_bytes(&[u8]) -> pigeonhole_memory::Result<pigeonhole_memory::RecallHopPart>
+pub fn pigeonhole_memory::RecallHopPart::to_bytes(&self) -> alloc::vec::Vec<u8>
+impl core::fmt::Debug for pigeonhole_memory::RecallHopPart
+pub fn pigeonhole_memory::RecallHopPart::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_memory::RecallPool
+impl pigeonhole_memory::RecallPool
+pub fn pigeonhole_memory::RecallPool::from_bytes(&[u8]) -> pigeonhole_memory::Result<pigeonhole_memory::RecallPool>
+pub fn pigeonhole_memory::RecallPool::is_empty(&self) -> bool
+pub fn pigeonhole_memory::RecallPool::len(&self) -> usize
+pub fn pigeonhole_memory::RecallPool::merge(impl core::iter::traits::collect::IntoIterator<Item = pigeonhole_memory::RecallPool>) -> pigeonhole_memory::Result<pigeonhole_memory::RecallPool>
+pub fn pigeonhole_memory::RecallPool::rank(self, pigeonhole_memory::Fusion, pigeonhole_memory::Weights) -> pigeonhole_memory::RecallRanking
+pub fn pigeonhole_memory::RecallPool::to_bytes(&self) -> alloc::vec::Vec<u8>
+impl core::fmt::Debug for pigeonhole_memory::RecallPool
+pub fn pigeonhole_memory::RecallPool::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_memory::RecallRanking
+impl pigeonhole_memory::RecallRanking
+pub fn pigeonhole_memory::RecallRanking::finish(self, pigeonhole_memory::RecallBodies, usize, core::option::Option<u64>, bool) -> (alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)
+pub fn pigeonhole_memory::RecallRanking::top(&self, usize) -> alloc::vec::Vec<pigeonhole_memory::MemoryId>
+pub fn pigeonhole_memory::RecallRanking::walk(self, pigeonhole_memory::Expand, core::option::Option<u64>) -> pigeonhole_memory::RecallWalk
+impl core::fmt::Debug for pigeonhole_memory::RecallRanking
+pub fn pigeonhole_memory::RecallRanking::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::RecallStats
 pub pigeonhole_memory::RecallStats::candidates: usize
 pub pigeonhole_memory::RecallStats::expanded: usize
@@ -289,6 +332,13 @@ pub pigeonhole_memory::RecallStats::expansion_truncated: bool
 pub pigeonhole_memory::RecallStats::ivf_fallbacks: usize
 pub pigeonhole_memory::RecallStats::ivf_namespaces: usize
 pub pigeonhole_memory::RecallStats::truncated: bool
+pub struct pigeonhole_memory::RecallWalk
+impl pigeonhole_memory::RecallWalk
+pub fn pigeonhole_memory::RecallWalk::finish(self) -> pigeonhole_memory::RecallRanking
+pub fn pigeonhole_memory::RecallWalk::next_hop(&self) -> core::option::Option<pigeonhole_memory::RecallHop>
+pub fn pigeonhole_memory::RecallWalk::settle(&mut self, impl core::iter::traits::collect::IntoIterator<Item = pigeonhole_memory::RecallHopPart>) -> pigeonhole_memory::Result<()>
+impl core::fmt::Debug for pigeonhole_memory::RecallWalk
+pub fn pigeonhole_memory::RecallWalk::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::Signal
 pub pigeonhole_memory::Signal::rank: u32
 pub pigeonhole_memory::Signal::value: f64

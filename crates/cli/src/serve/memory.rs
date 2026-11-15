@@ -118,7 +118,7 @@ fn embedding(v: Option<&proto::Vector>) -> Result<Option<Vec<f32>>, ApiError> {
 }
 
 /// `f32`s as a proto vector.
-fn vector_out(v: &[f32]) -> proto::Vector {
+pub(crate) fn vector_out(v: &[f32]) -> proto::Vector {
     proto::Vector {
         element: proto::Element::F32 as i32,
         dim: v.len() as u32,

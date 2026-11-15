@@ -24,6 +24,7 @@ mod charge_tests;
 mod cluster_tests;
 mod connection_tests;
 mod data_tests;
+mod download_tests;
 mod feed_tests;
 mod http1_tests;
 mod mcp_tests;
