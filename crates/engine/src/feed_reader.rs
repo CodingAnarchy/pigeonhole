@@ -683,6 +683,7 @@ pub struct FeedReader {
     /// Polls that read the streams (an inspection count for tests).
     stream_reads: u64,
     /// Records the stream cursors stepped (an inspection count for tests, #1827).
+    #[cfg(feature = "test-hooks")]
     record_steps: u64,
     /// #1827: whether the streams' skip indexes are built. Set once a pass is capped (D320)
     /// and cleared, with the indexes, once a pass reads to the end passing nothing over: a
@@ -1252,6 +1253,7 @@ impl FeedReader {
             frontier: 0,
             read_through: None,
             stream_reads: 0,
+            #[cfg(feature = "test-hooks")]
             record_steps: 0,
             indexing: false,
             chunk_skips: 0,
@@ -2076,7 +2078,8 @@ impl FeedReader {
     /// or past the cutoff, lowering the cutoff below each. A held share counts at its id + 1
     /// (its round's apply seqno is above its id), and goes with every share of its round; a
     /// decided round goes with its shares.
-    fn trim(&mut self) {
+    fn trim(&mut self) -> bool {
+        let mut evicted = false;
         loop {
             let c = self.ahead.cutoff;
             let top_ready = self.ready.last_key_value().map(|(&k, _)| k);
@@ -2091,8 +2094,12 @@ impl FeedReader {
                 .map(|(&(id, _), _)| id.saturating_add(1));
             let over = self.ahead.bytes > self.ahead.budget;
             if !over && top_ready.is_none_or(|k| k <= c) && top_held.is_none_or(|k| k <= c) {
-                return;
+                return evicted;
             }
+            // The cutoff falls only here: the streams' skip indexes are built from now on
+            // (#1827), and a reader that never gets here pays nothing for them per record.
+            self.indexing = true;
+            evicted = true;
             match (top_ready, top_held) {
                 (Some(k), None) => self.evict_ready(k),
                 (Some(k), Some(h)) if k >= h => self.evict_ready(k),
@@ -2104,7 +2111,7 @@ impl FeedReader {
                     self.evict_round(id);
                     self.ahead.lower_cutoff(id);
                 }
-                (None, None) => return,
+                (None, None) => return evicted,
             }
         }
     }
@@ -2214,6 +2221,19 @@ impl FeedReader {
 
     /// Reads stream `s` to its readable end. Returns `false` once the feed expired.
     fn read_stream(&mut self, s: usize) -> Result<bool> {
+        if self.indexing {
+            self.read_stream_as::<true>(s)
+        } else {
+            self.read_stream_as::<false>(s)
+        }
+    }
+
+    /// [`read_stream`](Self::read_stream), with the skip indexes built and used (#1827) or,
+    /// for a reader that has never been capped since the indexes were last dropped, not:
+    /// that instance is main's loop, with nothing of the index in it per record (callgrind's
+    /// feed-drain). An eviction that turns indexing on mid-stream hands the rest of the
+    /// stream to the indexing instance, so the index has no hole.
+    fn read_stream_as<const INDEXING: bool>(&mut self, s: usize) -> Result<bool> {
         let chunk_bytes = (self.ahead.base / 16).clamp(256, 1 << 20);
         loop {
             let before = self.streams[s].cursor.position();
@@ -2221,8 +2241,10 @@ impl FeedReader {
             // would pass over (keys past the cutoff, which is at least `delivered`): jumped
             // whole, as passing each over would leave it (the hint at its start, its session
             // raised), without stepping its records. Not while a token's delivered records
-            // must still be reached: they're at or below `delivered`.
-            if self.streams[s].must_reach.is_none()
+            // must still be reached: they're at or below `delivered`. A reader that isn't
+            // indexing has no chunks, and pays only the flag's test (callgrind's feed-drain).
+            if INDEXING
+                && self.streams[s].must_reach.is_none()
                 && let Some(c) = self.streams[s].index.at(before)
                 && c.min_key > self.ahead.cutoff
             {
@@ -2240,10 +2262,10 @@ impl FeedReader {
                 }
                 continue;
             }
-            let Some((start, end, session, key, item)) = self.read_one(s)? else {
+            let Some((start, end, session, key, item)) = self.read_one::<INDEXING>(s)? else {
                 return Ok(self.expired.is_none());
             };
-            if self.indexing {
+            if INDEXING {
                 self.streams[s]
                     .index
                     .note(before, start, end, key, session, chunk_bytes);
@@ -2365,15 +2387,16 @@ impl FeedReader {
                     }
                 }
             }
-            self.trim();
-            self.indexing |= self.ahead.capped();
+            if self.trim() && !INDEXING {
+                return self.read_stream_as::<true>(s);
+            }
         }
     }
 
     /// Stream `s`'s next record as an owned item, its mutations filtered to the feed's
     /// tables and prefix; `None` at the readable end, or once its segment is gone (which
     /// expires the feed).
-    fn read_one(&mut self, s: usize) -> Result<Option<ReadRecord>> {
+    fn read_one<const INDEXING: bool>(&mut self, s: usize) -> Result<Option<ReadRecord>> {
         let (tables, prefix) = (&self.tables, &self.prefix);
         // D320: a record past the read-ahead's cutoff is passed over before its mutations
         // are filtered or copied. One at or below `delivered` takes its usual path.
@@ -2387,7 +2410,10 @@ impl FeedReader {
                 session,
                 record,
             } => {
-                self.record_steps += 1;
+                #[cfg(feature = "test-hooks")]
+                {
+                    self.record_steps += 1;
+                }
                 (start, end, session, record)
             }
             Step::End => return Ok(None),
@@ -2404,8 +2430,10 @@ impl FeedReader {
                 return Ok(None);
             }
         };
-        // The lowest key it can matter at (`Chunk::min_key`, #1827).
+        // The lowest key it can matter at (`Chunk::min_key`, #1827), needed only while the
+        // skip indexes are built.
         let key = match &record {
+            _ if !INDEXING => 0,
             WalRecord::Batch { seqno, .. } => *seqno,
             WalRecord::Prepare { seqno, .. } | WalRecord::Decision { seqno, .. } => {
                 seqno.saturating_add(1)
