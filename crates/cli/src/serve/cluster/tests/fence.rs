@@ -687,6 +687,7 @@ impl Served {
                 false,
                 crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
                 None,
+                None,
             );
             stops.push(stop);
             dbs.extend(db);

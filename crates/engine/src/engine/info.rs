@@ -52,6 +52,9 @@ pub struct FeedStorage {
     /// Blob bytes kept only for the history's horizon: files no SST points into any more
     /// (dead data) that a retained WAL record may still name.
     pub held_blob_bytes: u64,
+    /// The retention the feed's last session requested before this open, if there was one:
+    /// a lower `retention_bytes` now means this open kept less history (#1786).
+    pub previous_retention_bytes: Option<u64>,
 }
 
 /// One table of [`DbInfo`].
@@ -225,6 +228,7 @@ impl Engine {
                 retention_bytes: f.retention_in_effect(),
                 retained_wal_bytes: f.retained_bytes(),
                 held_blob_bytes: f.held_bytes(),
+                previous_retention_bytes: f.previous_retention_bytes,
             }),
             tables,
         })

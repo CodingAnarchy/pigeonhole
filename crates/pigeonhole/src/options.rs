@@ -81,6 +81,8 @@ pub struct Options {
     change_feed: Option<FeedRetention>,
     /// `change_feed_off()`: no feed, and nothing inherited.
     feed_off: bool,
+    /// `change_feed_keep_last` (#1786): not part of the stable API.
+    feed_keep_last: bool,
     feed_tables: Option<Vec<String>>,
 }
 
@@ -316,6 +318,7 @@ impl Default for Options {
             auto_recover: Recovery::Off,
             change_feed: None,
             feed_off: false,
+            feed_keep_last: false,
             feed_tables: None,
         }
     }
@@ -881,6 +884,16 @@ impl Options {
     /// counter's base, so its next reads stop there (D291; default 128, 0 turns it off). For
     /// tests and benchmarks.
     #[cfg(feature = "__unstable-hooks")]
+    /// With [`change_feed`](Self::change_feed): keep at least the retention the feed's last
+    /// session kept, if that was more, so the open drops none of its history. `phdb serve`
+    /// sets it on a cluster partition it opens while serving (#1786): a moved partition keeps
+    /// its history until the node restarts. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn change_feed_keep_last(mut self, keep: bool) -> Self {
+        self.feed_keep_last = keep;
+        self
+    }
+
     #[doc(hidden)]
     pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
         self.counter_checkpoint_steps = Some(steps);
@@ -1953,6 +1966,7 @@ impl Options {
         };
         // Unset (neither `change_feed` nor `change_feed_off`): inherit the last session's.
         o.feed_inherit = self.change_feed.is_none() && !self.feed_off;
+        o.feed_keep_last = self.feed_keep_last;
         o.tablet_changes = self.tablet_changes;
         o.balance_pack = self.tablet_packing;
         if let Some(window) = self.commit_spin {

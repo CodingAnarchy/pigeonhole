@@ -1031,12 +1031,16 @@ impl Engine {
         // What the change feed's last session recorded (D310's amendment): an unset shard
         // count takes its stream count, and an open that doesn't mention the feed its
         // settings, so neither ends the feed's history by accident.
-        let last_session =
-            if options.shards == 0 || (options.feed.is_none() && options.feed_inherit) {
-                crate::feed::last_session(&vfs, path, db_id)?
-            } else {
-                None
-            };
+        // With the feed set, it's read too: its retention is reported beside this session's
+        // (`FeedStorage::previous_retention_bytes`), and `feed_keep_last` keeps it (#1786).
+        let last_session = if options.shards == 0
+            || (options.feed.is_none() && options.feed_inherit)
+            || options.feed.is_some()
+        {
+            crate::feed::last_session(&vfs, path, db_id)?
+        } else {
+            None
+        };
         let shards = match (options.shards, &last_session) {
             (0, Some(last)) if last.streams > 0 => last.streams as usize,
             // The application's default, else one per physical core (ICR 0132).
@@ -1106,10 +1110,25 @@ impl Engine {
                 options.feed = Some(inherited);
             }
         }
+        if options.feed_keep_last
+            && let Some(f) = options.feed.as_mut()
+            && let Some(last) = &last_session
+        {
+            f.retention_bytes = f.retention_bytes.max(last.retention_bytes);
+        }
         let feed = if no_writes {
             None
         } else {
-            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_root)?
+            crate::feed::open_session(
+                &vfs,
+                path,
+                db_id,
+                &catalog,
+                &options,
+                shards,
+                opened_root,
+                last_session.as_ref().map(|l| l.retention_bytes),
+            )?
         };
         if let Some(f) = &feed {
             let weak = Arc::downgrade(f);

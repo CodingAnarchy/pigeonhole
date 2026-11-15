@@ -365,6 +365,7 @@ fn opened_off_the_others_cores_alone() {
         false,
         placement,
         None,
+        None,
     );
     map.map_version = 2;
     map.partitions.extend([part("p3"), part("p4")]);
@@ -683,6 +684,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         false,
         crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
         Some(BUDGET),
+        None,
     );
     let shared = node.server.get().unwrap().shared.upgrade().unwrap();
     let memory_of = |id: &str| {
@@ -800,6 +802,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
             restart,
             crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
             Some(BUDGET),
+            None,
         )
     };
     let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
@@ -1261,6 +1264,93 @@ fn another_map_lands_before_the_confirm(rt: &tokio::runtime::Runtime) {
         .await;
     });
     drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// #1786, simp724's R1: a partition opened while the node serves takes its share of the
+/// node's `--change-feed`, but keeps at least the history its feed's last session kept, so a
+/// partition moved here with its history (`move`, `relocate --copy`) keeps it until the node
+/// restarts. Here p3 arrives with 16 MiB of history, and its share of the node's 4 MiB over
+/// two 1-shard partitions is 2 MiB.
+#[test]
+fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = test_dir();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let part = |id: &str| Partition {
+        id: id.into(),
+        node: "a".into(),
+        epoch: 1,
+        memory_bytes: 0,
+        history_epoch: 0,
+    };
+    let mut map = ClusterMap {
+        cluster_id: "c1".into(),
+        map_version: 1,
+        nodes: vec![MapNode {
+            id: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+        }],
+        partitions: vec![part("p1")],
+        tables: vec![TablePlacement {
+            name: "users".into(),
+            group: String::new(),
+            families: Vec::new(),
+            splits: Vec::new(),
+            partitions: vec!["p1".into()],
+            created: 0,
+        }],
+        previous_nodes: Vec::new(),
+    };
+    super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
+    let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
+    // p3's file, with a 16 MiB feed (1 MiB segments), as a move leaves it here.
+    test_partition_with(&dir, "p3", pigeonhole::Options::default().shards(1))
+        .close()
+        .unwrap();
+    let (stop, dbs, node) = data_node_placed(
+        &rt,
+        &dir,
+        "a",
+        vec![("p1", Some(p1))],
+        listener,
+        "",
+        crate::serve::server_tests::limits(),
+        false,
+        crate::serve::placement::Placement::routes_only(Some(2), Some(2)),
+        None,
+        Some(4 << 20),
+    );
+    let shared = node.server.get().unwrap().shared.upgrade().unwrap();
+    map.map_version = 2;
+    map.partitions.push(part("p3"));
+    rt.block_on(async {
+        client(port)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: 1,
+                map: Some(map),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        node.open_part("p3").await.unwrap();
+    });
+    let p3 = shared.router.partition("p3").unwrap();
+    assert_eq!(p3.db.feed_previous_retention().unwrap(), Some(16 << 20));
+    assert_eq!(
+        p3.db.info().unwrap().feed.unwrap().retention_bytes,
+        16 << 20,
+        "its 16 MiB kept, not its 2 MiB share"
+    );
+    drop(p3);
+    drop(shared);
+    drop(node);
+    let _ = stop.send(());
     for db in dbs {
         let _ = db.close();
     }
