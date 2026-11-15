@@ -5,7 +5,10 @@
 //!
 //! Each slice of work enters the gate first and holds it only for that slice, so a fence's
 //! wait for its writes to drain waits for one slice at most (simp724's (b) on #1915). A
-//! fenced gate skips the slice and waits. The loop ends once its index or store closes.
+//! fenced gate (the operator's fence, or no live lease, D326) skips the slice and waits. A
+//! slice whose commits returned past the lease's end is logged, as a client's write would
+//! answer `OutcomeUnknown`: its work is in this node's file, kept only if the node gets the
+//! lease back. The loop ends once its index or store closes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +67,10 @@ pub(crate) fn run(mut l: impl Slices, what: &str, gate: Option<&Arc<super::gate:
             Some(Ok(h)) => Some(h),
             None => None,
         };
-        let worked = l.run_once(SLICE);
+        let mut worked = l.run_once(SLICE);
+        if let Some(Err(e)) = held.as_ref().map(super::gate::Held::committed) {
+            worked = Err(e.message);
+        }
         drop(held);
         match worked {
             Ok(true) => {}
@@ -122,11 +128,14 @@ mod tests {
     }
 
     /// #1915 (M2): a fenced partition's background loop (a memory store's forgetter, an
-    /// index's rebalancer) runs no slice; once unfenced, it does, and each slice is counted
-    /// on the gate, so a fence waits for one slice at most.
+    /// index's rebalancer) runs no slice, whether the operator fenced it or it holds no
+    /// lease (D326); once it may write, it does, and each slice is counted on the gate, so
+    /// a fence waits for one slice at most.
     #[test]
     fn a_fenced_partitions_loop_runs_no_slice() {
-        let gate = crate::serve::gate::WriteGate::opened("p1", true);
+        use crate::serve::gate::{LeaseClock, WriteGate};
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", true, Arc::clone(&clock));
         let slices = Arc::new(AtomicUsize::new(0));
         let l = || Counting {
             slices: Arc::clone(&slices),
@@ -134,7 +143,11 @@ mod tests {
         };
         run(l(), "test", Some(&gate));
         assert_eq!(slices.load(Ordering::Relaxed), 0);
+        // The operator's unfence alone: still no lease.
         gate.unfence();
+        run(l(), "test", Some(&gate));
+        assert_eq!(slices.load(Ordering::Relaxed), 0);
+        gate.renew(clock.now() + 60_000_000_000);
         run(l(), "test", Some(&gate));
         assert_eq!(slices.load(Ordering::Relaxed), 3);
         assert_eq!(gate.inflight(), 0, "each slice's hold ended with it");
