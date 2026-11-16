@@ -29,7 +29,22 @@ pub(crate) struct Cluster {
     /// `--memory` on a cluster node (#1915): what each partition the map places the memory
     /// store on opens its store with, once the map does.
     pub(crate) memory: Option<Arc<super::memslot::Recipe>>,
+    /// This node's replica copies of partitions other nodes own (D328), by partition id:
+    /// apart from `parts`, so nothing that serves or maintains an owner's partition sees
+    /// one.
+    pub(crate) replicas: Replicas,
 }
+
+/// A cluster node's replica copy of a partition (D328): a read-only service over its
+/// engine, and the follower that applies the owner's feed to it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicaCopy {
+    pub(crate) service: Arc<Service>,
+    pub(crate) follower: Arc<super::replica::Replica>,
+}
+
+/// [`Cluster::replicas`]: swapped whole as a copy opens or closes.
+pub(crate) type Replicas = Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, ReplicaCopy>>>;
 
 /// A cluster node's partitions open here, each served by its own [`Service`] sharing the
 /// node's (D317 ticket 8a), by id. Shared with a cluster subscription's task, which opens a
@@ -168,6 +183,7 @@ impl Router {
                 forwarder,
                 uploads,
                 memory: None,
+                replicas: Arc::default(),
             }),
         }
     }
@@ -301,6 +317,14 @@ impl Router {
         self.parts().first()?.memory.get().cloned()
     }
 
+    /// A cluster node's replica copies open now (D328); none on a single node.
+    pub(crate) fn replica_copies(&self) -> Vec<ReplicaCopy> {
+        self.cluster
+            .as_ref()
+            .map(|c| c.replicas.load().values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Partition `id` on a cluster node: `WrongPartition` when the map gives it to another
     /// node, ticket 2's `not_open` when the map gives it here but it isn't open, `NotFound`
     /// when the map has no such partition.
@@ -349,7 +373,15 @@ impl Router {
             .chain(open.values().map(|s| &s.sessions))
             .map(|s| &**s)
             .collect();
-        self.service.metrics_text(&parts, &sessions)
+        let mut text = self.service.metrics_text(&parts, &sessions);
+        // Each replica copy's follower, labelled by its partition (D328).
+        let copies = cluster.replicas.load();
+        let followers: Vec<(&str, &super::replica::Replica)> = copies
+            .iter()
+            .map(|(id, c)| (id.as_str(), &*c.follower))
+            .collect();
+        super::replica::Replica::render_copies(&followers, &mut text);
+        text
     }
 
     /// A cluster node's `Admin.Info`, `Flush` or `Compact` (ICR 0117, #1852), answered here
@@ -459,6 +491,26 @@ impl Router {
             }
             partitions.push(p);
         }
+        // Each replica copy here (D328), with its follower's state; its `state` is unset, as
+        // it serves no routed call in this release.
+        let copies = cluster.replicas.load_full();
+        for (id, copy) in copies.iter() {
+            let mut p = super::proto::PartitionInfo {
+                id: id.clone(),
+                replica: copy.follower.info(),
+                ..Default::default()
+            };
+            if let Some(part) = PartRef::of(&copy.service) {
+                let db = part.db.clone();
+                let info = self.service.blocking(move || Ok(db.info()?)).await?;
+                p.path = part.db.path().display().to_string();
+                p.file_bytes = info.file_bytes;
+                p.tables = part.0.user_tables();
+                file_bytes += info.file_bytes;
+                free_bytes = free_bytes.or(info.free_bytes);
+            }
+            partitions.push(p);
+        }
         Ok(super::proto::InfoResponse {
             path: cluster.node.dir().display().to_string(),
             file_bytes,
@@ -527,6 +579,49 @@ impl Router {
             }
             _ => Err(ApiError::internal("not a backup")),
         }
+    }
+
+    /// `Replication.Follow` on a cluster node (D328): a replica copy's follower, at the node
+    /// its map says owns the partition. The token is opaque, so it's tried on each partition
+    /// this node owns and has open, and the one whose database it names serves it (another
+    /// database's token is refused by the engine, `InvalidArgument`). None: `WrongPartition`
+    /// with this node's map version, so the follower re-reads the map (Q5: never forwarded,
+    /// as a long stream through two hops would be).
+    async fn follow_owned(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+    ) -> Result<ServiceReply, ApiError> {
+        let ServiceOp::Follow(r) = op else {
+            return Err(ApiError::internal("not a Follow"));
+        };
+        let routes = cluster.node.routes();
+        let Some(routes) = routes.as_ref() else {
+            return Err(ApiError::partition_unavailable(
+                "this node has no cluster map yet",
+            ));
+        };
+        let me = cluster.node.id();
+        let parts = cluster.parts.load_full();
+        for (id, service) in parts.iter() {
+            if routes.owner(id).is_none_or(|o| o.node != me) {
+                continue;
+            }
+            match service
+                .call(ServiceOp::Follow(r.clone()), caller, None)
+                .await
+            {
+                Err(e) if e.code == "InvalidArgument" && e.message.contains("another database") => {
+                }
+                answer => return answer,
+            }
+        }
+        Err(ApiError::wrong_partition(
+            routes.map_version(),
+            "no partition this node owns is the database this token names: follow the \
+             partition's owner in a newer map",
+        ))
     }
 
     /// Answers `op` for `caller`, wherever its partition lives.
@@ -628,6 +723,11 @@ impl Router {
                 // would widen every call's future (#1902).
                 ServiceOp::MemoryWatch(_) => {
                     return Box::pin(self.memory_watch(cluster, op, caller, prepaid)).await;
+                }
+                // A replica copy's follower, here at P's owner (D328): never forwarded. Boxed,
+                // as it awaits a partition's whole `Service::call` (#1902).
+                ServiceOp::Follow(_) => {
+                    return Box::pin(self.follow_owned(cluster, op, caller)).await;
                 }
                 // Served where the partition is, never forwarded (D317 ticket 8b).
                 ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {

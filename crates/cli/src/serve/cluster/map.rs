@@ -96,6 +96,29 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
         if partitions.insert(p.id.as_str(), p).is_some() {
             return Err(format!("partition {:?} is listed twice", p.id));
         }
+        // D328: its replicas are other nodes of the map, each once. A map that drops a node
+        // must drop it from every partition's replicas too.
+        let mut replicas = HashSet::new();
+        for r in &p.replicas {
+            if !nodes.contains(r.as_str()) {
+                return Err(format!(
+                    "partition {:?} has a replica on node {:?}, which the map doesn't list                      (a map that drops a node drops its replicas too)",
+                    p.id, r
+                ));
+            }
+            if *r == p.node {
+                return Err(format!(
+                    "partition {:?}'s owner, node {:?}, is listed as its replica too",
+                    p.id, r
+                ));
+            }
+            if !replicas.insert(r.as_str()) {
+                return Err(format!(
+                    "partition {:?} lists node {:?} as its replica twice",
+                    p.id, r
+                ));
+            }
+        }
     }
     let mut tables = HashSet::new();
     // A co-location group's single partition, and the table that set it.
@@ -535,6 +558,7 @@ mod tests {
             node: node.into(),
             epoch: 1,
             memory_bytes: 0,
+            replicas: Vec::new(),
         };
         let table =
             |name: &str, group: &str, splits: Vec<SplitKey>, parts: &[&str]| TablePlacement {
@@ -791,6 +815,7 @@ mod tests {
             node: "c".into(),
             epoch: 1,
             memory_bytes: 0,
+            replicas: Vec::new(),
         });
         ok.partitions[0].node = "c".into();
         ok.partitions[0].epoch = 2;
@@ -894,6 +919,7 @@ mod tests {
             epoch: 5,
             memory_bytes: 0,
             history_epoch: 0,
+            replicas: Vec::new(),
         });
         assert_eq!(
             history(&with_history(&old, &moved, &[]).unwrap(), "p4"),

@@ -162,6 +162,7 @@ impl Host for Gate<'_> {
             // The request's bytes are the POST's, reserved before its body was read.
             size: 0,
             memory: what.starts_with("memory_"),
+            peer: false,
         };
         // The checks only: the request's bytes are its POST's, already reserved (ai1249's S1).
         if let Err(e) = service.check(&admit, self.caller) {
@@ -452,6 +453,7 @@ async fn poll_wait(
         writes: false,
         size: 0,
         memory: false,
+        peer: false,
     };
     shared.router.service.check(&admit, caller).ok()?;
     let p = session.tools.feed_poll_args(args).ok()?;

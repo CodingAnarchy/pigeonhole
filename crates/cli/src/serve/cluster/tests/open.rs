@@ -651,6 +651,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         epoch: 1,
         memory_bytes: 0,
         history_epoch: 0,
+        replicas: Vec::new(),
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -779,6 +780,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         epoch: 1,
         memory_bytes: 0,
         history_epoch: 0,
+        replicas: Vec::new(),
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -1297,6 +1299,7 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
         epoch: 1,
         memory_bytes: 0,
         history_epoch: 0,
+        replicas: Vec::new(),
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
