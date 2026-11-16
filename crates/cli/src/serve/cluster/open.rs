@@ -134,11 +134,7 @@ struct Opening<'a> {
 
 impl<'a> Opening<'a> {
     fn mark(node: &'a Node, id: &str) -> Self {
-        node.fences
-            .opening
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.to_owned());
+        node.fences.set_opening(id, true);
         Self {
             node,
             id: id.to_owned(),
@@ -148,12 +144,7 @@ impl<'a> Opening<'a> {
 
 impl Drop for Opening<'_> {
     fn drop(&mut self) {
-        self.node
-            .fences
-            .opening
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
+        self.node.fences.set_opening(&self.id, false);
     }
 }
 
@@ -661,8 +652,8 @@ impl Node {
                 opened.pinning.shards_unpinned(),
             )));
         }
-        // Reopened: its files change from here, so the hashes a close kept go (feed1248).
-        self.fences.closed().remove(id);
+        // Reopened: its files change from here, so the hashes a close kept go (feed1248),
+        // in the step that makes it served.
         let gate = self.open_gate(id, epoch);
         let config = crate::serve::service::PartitionConfig {
             backups: Arc::clone(&server.backups),
@@ -740,7 +731,11 @@ impl Node {
             .collect();
         for id in mine {
             // Open, or closed by the operator: a close holds until `unfence`.
-            if self.part_state(&id).is_some() || self.fences.closed().contains_key(&id) {
+            // One read, so a reopen between two can't make it look like neither.
+            if matches!(
+                self.fences.now(&id, |_| ()),
+                super::fence::Now::Served(_) | super::fence::Now::Closed
+            ) {
                 continue;
             }
             match self.open_part(&id).await {
