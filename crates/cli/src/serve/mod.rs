@@ -534,6 +534,8 @@ pub(crate) fn single<'a>(
     if let Some(r) = &replica {
         service = service.replica(Arc::clone(r));
     }
+    // A text index rebuild a fence or a shutdown stopped carries on (#1756).
+    service.resume_text_rebuilds();
     let shared = Arc::new(Shared {
         router: router::Router::single(service),
         tokens,

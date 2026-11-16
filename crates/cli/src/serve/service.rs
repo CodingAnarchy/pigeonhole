@@ -1216,7 +1216,7 @@ pub(crate) struct Service {
     /// `--max-concurrent` slot, as a scan does.
     streams: Arc<Semaphore>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
-    text_rebuilds: Arc<Semaphore>,
+    text_rebuilds: Arc<super::texts::RebuildSlot>,
     /// Memory calls at once: a sub-limit of the blocking pool, so a slow embedding endpoint
     /// can't take every blocking thread (ai1249's M6 on D313 §7).
     memory_calls: Arc<Semaphore>,
@@ -1423,6 +1423,7 @@ impl Partition {
         if let Some(p) = &config.placement {
             config.backups.place(p);
         }
+        let text_placement = config.placement.clone();
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: config.pinning,
@@ -1434,7 +1435,11 @@ impl Partition {
                 gate.cloned(),
             )),
             bulk: super::bulk::BulkLoads::new(config.placement),
-            texts: Arc::new(super::texts::Texts::new(db.clone())),
+            texts: Arc::new(super::texts::Texts::new(
+                db.clone(),
+                gate.cloned(),
+                text_placement,
+            )),
             memory: std::sync::OnceLock::new(),
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
@@ -1555,6 +1560,19 @@ impl Service {
         }
     }
 
+    /// Resumes the partition's stopped text index rebuilds once it takes writes (#1756): at
+    /// its open (an owner's: the callers that open one call it, after the service is whole,
+    /// never `for_partition`, which a replica copy is built with too), and after a promote.
+    /// Not on a replica, whose writes are refused.
+    pub(crate) fn resume_text_rebuilds(&self) {
+        if self.replica.as_ref().is_some_and(|r| r.refuses_writes()) {
+            return;
+        }
+        if let Some(part) = &self.part {
+            part.texts.resume_soon(&self.text_rebuilds);
+        }
+    }
+
     /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
     /// threads run on `placement`'s CPUs, as [`PartitionConfig::placement`] says.
     pub(crate) fn routing_only(
@@ -1594,7 +1612,7 @@ impl Service {
             ),
             session_caps,
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
-            text_rebuilds: Arc::new(Semaphore::new(1)),
+            text_rebuilds: Arc::new(super::texts::RebuildSlot::new()),
             memory_calls: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
@@ -2080,6 +2098,8 @@ impl Service {
                 // afresh (cli692's F3 on #1583).
                 self.part()?.indexes.forget();
                 self.part()?.indexes.pause_rebalancing(false);
+                // And a text index rebuild stopped on the primary, then copied, resumes here.
+                self.resume_text_rebuilds();
                 // The memory store opens as the writer now, at once, created if missing
                 // (cli692's D3 on #1618). Its failure doesn't fail the promote (the database
                 // is what's promoted): it's the replica's last error, and memory calls answer
@@ -2175,9 +2195,13 @@ impl Service {
                     .map(ServiceReply::TextSearch)
                     .map_err(ApiError::for_read)
             }
+            // Boxed: its slot wait and the rebuild's state would otherwise widen the future
+            // every call moves (serve-mutate's ceiling on #1975).
             ServiceOp::TextRebuild(r) => {
                 drop(budget);
-                self.text_rebuild(r).await.map(ServiceReply::TextRebuild)
+                Box::pin(self.text_rebuild(r))
+                    .await
+                    .map(ServiceReply::TextRebuild)
             }
             ServiceOp::TextVerify(r) => {
                 drop(budget);
@@ -3609,34 +3633,65 @@ impl Service {
     /// `Text.Rebuild`: rewrites the index from its source column. One at a time, on a
     /// thread of its own off the shards' cores, never the blocking pool (perf287's D1: a
     /// rebuild reads the whole source). A write: it finishes if the client goes away.
+    ///
+    /// It starts from the first row, whatever a stopped rebuild left (ai1249 on #1756), and
+    /// runs a document at a time under the partition's gate: a fence stops it at the next
+    /// document, answering `Fenced` with what it did, and it resumes on its own once the
+    /// partition takes writes again. A resume holding the node's rebuild slot gives it up at
+    /// its next document for this call.
     async fn text_rebuild(
         &self,
         r: proto::TextIndexRequest,
     ) -> Result<proto::TextRebuildResponse, ApiError> {
         let index = self.text_index(&r.index).await?;
-        let Ok(slot) = Arc::clone(&self.text_rebuilds).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is already rebuilding a text index",
-            ));
-        };
-        let placement = self.part()?.bulk.placement.clone();
+        let slot = self
+            .text_rebuilds
+            .client(self.limits.request_timeout)
+            .await?;
+        let part = self.part()?;
+        let placement = part.bulk.placement.clone();
+        let texts = Arc::clone(&part.texts);
         let (tx, rx) = oneshot::channel();
-        // One library call that rewrites the whole index: a fence waits for it to end
-        // (within its deadline), since it can't stop part way.
+        // The first document runs under the request's admission; each later one enters the
+        // gate itself (`Steps`), so a fence's drain waits for one document.
         let held = self.gate.as_ref().map(super::gate::WriteGate::extend);
-        self.part()?.texts.spawn_rebuild(move || {
+        let steps_texts = Arc::clone(&texts);
+        texts.spawn_rebuild(move || {
             if let Some(p) = placement {
                 p.enter();
             }
-            let r = index.rebuild();
+            let mut steps = super::texts::Steps::new(steps_texts, held, None);
+            let r = index.rebuild_with(|_| steps.step());
+            let stop = steps.finish();
             drop(index);
-            drop(held);
             drop(slot);
-            let _ = tx.send(r);
+            let _ = tx.send((r, stop));
         })?;
-        let stats = rx
+        let (done, stop) = rx
             .await
-            .map_err(|_| ApiError::internal("the rebuild's thread ended early"))??;
+            .map_err(|_| ApiError::internal("the rebuild's thread ended early"))?;
+        let stats = done?;
+        if stats.stopped {
+            let did = format!(
+                "the rebuild of text index {:?} stopped after {} documents ({} changed), which \
+                 stand",
+                r.index, stats.documents, stats.changed
+            );
+            return Err(match stop {
+                Some(super::texts::Stop::Fenced(e)) => {
+                    texts.resume_soon(&self.text_rebuilds);
+                    let why = e.message.trim_end_matches("; nothing was written");
+                    ApiError::fenced(format!(
+                        "{did}: {why}. It resumes on its own once the partition takes writes \
+                         again"
+                    ))
+                }
+                _ => ApiError::from_code(
+                    pigeonhole::ErrorCode::Closed,
+                    &format!("{did}: the server is shutting down. It resumes when it serves again"),
+                ),
+            });
+        }
         Ok(proto::TextRebuildResponse {
             documents: stats.documents,
             changed: stats.changed,

@@ -451,6 +451,61 @@ struct Held {
     claimed: Vec<BlobFileId>,
 }
 
+/// Wakers by reader key, with a flag that lets a wake with none registered cost one load.
+///
+/// The waiter and the waker each store, then load, across two atomics: the waiter stores
+/// the flag ([`register`](Self::register)) and then loads what it waits for; the waker
+/// stores that and then loads the flag ([`wake_all`](Self::wake_all)). Each has a SeqCst
+/// fence between its store and its load, so one of them sees the other.
+#[derive(Debug, Default)]
+struct WakerList {
+    wakers: Mutex<FastMap<u64, std::task::Waker>>,
+    /// Whether `wakers` may be non-empty.
+    any: std::sync::atomic::AtomicBool,
+}
+
+impl WakerList {
+    /// Registers `waker` under `key`, replacing its last one. The caller re-checks what it
+    /// waits for afterwards.
+    fn register(&self, key: u64, waker: &std::task::Waker) {
+        let mut w = self.wakers.lock().unwrap_or_else(PoisonError::into_inner);
+        w.insert(key, waker.clone());
+        self.any.store(true, Ordering::SeqCst);
+        drop(w);
+        // Pairs with the fence in `wake_all`: the caller's re-check can't be ordered before
+        // the flag's store.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// Forgets `key`'s waker.
+    fn forget(&self, key: u64) {
+        let mut w = self.wakers.lock().unwrap_or_else(PoisonError::into_inner);
+        if w.remove(&key).is_some() && w.is_empty() {
+            self.any.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Wakes every waker, after the caller stored what they wait for. Out of line: its
+    /// callers are on the shard's settle, which pays the fence and one load when none waits.
+    #[inline(never)]
+    fn wake_all(&self) {
+        // The caller's store before the flag's load: store then load on different atomics
+        // needs a SeqCst fence on each side (`register`).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !self.any.load(Ordering::SeqCst) {
+            return;
+        }
+        let woken: Vec<std::task::Waker> = {
+            let mut w = self.wakers.lock().unwrap_or_else(PoisonError::into_inner);
+            self.any.store(false, Ordering::SeqCst);
+            w.drain().map(|(_, waker)| waker).collect()
+        };
+        for waker in woken {
+            waker.wake();
+        }
+    }
+}
+
 /// The change feed's writer-side state, in `Shared::feed` while the feed is on.
 #[derive(Debug)]
 pub(crate) struct Feed {
@@ -509,18 +564,14 @@ pub(crate) struct Feed {
     /// Async feed readers waiting for one of the feed's own holds (WRITTEN/SYNCED) to let
     /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
     /// waits on the visible or durable watermark, but a hold releasing moves the frontier
-    /// without a publish there, so the shard wakes these when it releases one.
-    hold_waiters: Mutex<FastMap<u64, std::task::Waker>>,
-    /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
-    /// release with no async feed waiting costs one load.
-    has_hold_waiters: std::sync::atomic::AtomicBool,
+    /// without a publish there, so the shard wakes these when it releases one. A release
+    /// with no async feed waiting costs the list's one load.
+    hold_waiters: WakerList,
     /// Feeds of every table waiting for a catalog change, which moves no seqno, by reader
     /// key (the idle-catalog fix after #1515): woken by `manifest::release_catalog` and on
     /// close, never by the shards' settles, so an idle feed of every table costs the shards
     /// nothing (simp724's P1 on #1539).
-    catalog_waiters: Mutex<FastMap<u64, std::task::Waker>>,
-    /// Whether `catalog_waiters` may be non-empty.
-    has_catalog_waiters: std::sync::atomic::AtomicBool,
+    catalog_waiters: WakerList,
     /// Catalog changes of this session whose Root entry is written (`catalog_roots`).
     catalog_roots: AtomicU64,
     /// A hold seam (`Engine::delay_root_observer`, #1504): nanoseconds each root commit's
@@ -632,10 +683,8 @@ impl Feed {
             appends_stopped: std::sync::atomic::AtomicBool::new(false),
             shm: OnceLock::new(),
             catalog_hold_frozen: std::sync::atomic::AtomicBool::new(false),
-            hold_waiters: Mutex::default(),
-            has_hold_waiters: std::sync::atomic::AtomicBool::new(false),
-            catalog_waiters: Mutex::default(),
-            has_catalog_waiters: std::sync::atomic::AtomicBool::new(false),
+            hold_waiters: WakerList::default(),
+            catalog_waiters: WakerList::default(),
             catalog_roots: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             root_observer_delay_nanos: AtomicU64::new(0),
@@ -787,92 +836,42 @@ impl Feed {
     /// Registers `waker` (reader `key`, replacing its last one) to be woken when a hold lets
     /// go. The caller loads the frontier again afterwards: a release that published before
     /// this registration is seen there; one after it finds the waker.
+    ///
+    /// The list's fence pairs with the one in `wake_hold_waiters`: the caller's re-check of
+    /// the frontier (an Acquire load of WRITTEN/SYNCED) can't be ordered before the flag's
+    /// store, so either it sees the shard's release or the shard sees the flag.
     pub(crate) fn wait_for_hold(&self, key: u64, waker: &std::task::Waker) {
-        let mut w = self
-            .hold_waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        w.insert(key, waker.clone());
-        self.has_hold_waiters.store(true, Ordering::SeqCst);
-        drop(w);
-        // Pairs with the fence in `wake_hold_waiters`: the caller's re-check of the frontier
-        // (an Acquire load of WRITTEN/SYNCED) can't be ordered before this store, so either
-        // it sees the shard's release or the shard sees this flag.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        self.hold_waiters.register(key, waker);
     }
 
     /// Registers `waker` (reader `key`, a feed of every table) to be woken when a catalog
     /// change's hold is released, as [`wait_for_hold`](Self::wait_for_hold) for the shards'
     /// holds: the caller re-checks [`catalog_roots`](Self::catalog_roots) afterwards.
     pub(crate) fn wait_for_catalog(&self, key: u64, waker: &std::task::Waker) {
-        let mut w = self
-            .catalog_waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        w.insert(key, waker.clone());
-        self.has_catalog_waiters.store(true, Ordering::SeqCst);
-        drop(w);
-        // Pairs with the fence in `wake_catalog_waiters`.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        self.catalog_waiters.register(key, waker);
     }
 
     /// Forgets reader `key`'s wakers, on both lists (the reader is dropped, or delivered).
     pub(crate) fn forget_hold_waiter(&self, key: u64) {
-        for (list, flag) in [
-            (&self.hold_waiters, &self.has_hold_waiters),
-            (&self.catalog_waiters, &self.has_catalog_waiters),
-        ] {
-            let mut w = list.lock().unwrap_or_else(PoisonError::into_inner);
-            if w.remove(&key).is_some() && w.is_empty() {
-                flag.store(false, Ordering::SeqCst);
-            }
-        }
+        self.hold_waiters.forget(key);
+        self.catalog_waiters.forget(key);
     }
 
     /// After a catalog change's hold is released (`release_catalog`, its Root entry and
     /// `catalog_roots` stored first): wakes every feed of every table waiting for one, as
     /// [`wake_hold_waiters`](Self::wake_hold_waiters) does for the shards' holds.
-    #[inline(never)]
+    #[inline]
     pub(crate) fn wake_catalog_waiters(&self) {
-        std::sync::atomic::fence(Ordering::SeqCst);
-        if !self.has_catalog_waiters.load(Ordering::SeqCst) {
-            return;
-        }
-        let woken: Vec<std::task::Waker> = {
-            let mut w = self
-                .catalog_waiters
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.has_catalog_waiters.store(false, Ordering::SeqCst);
-            w.drain().map(|(_, waker)| waker).collect()
-        };
-        for waker in woken {
-            waker.wake();
-        }
+        self.catalog_waiters.wake_all();
     }
 
     /// After a shard let one of its holds go (its WRITTEN or SYNCED store published first):
-    /// wakes every async reader waiting on a hold. One load when none waits; out of line, so
-    /// the shard's settle stays small (perf287's codegen lesson on #1297).
-    #[inline(never)]
+    /// wakes every async reader waiting on a hold. One load when none waits; the list's
+    /// wake is out of line, so the shard's settle stays small (perf287's codegen lesson on
+    /// #1297).
+    #[inline]
     pub(crate) fn wake_hold_waiters(&self) {
-        // The release's WRITTEN/SYNCED store (Release) before the flag's load: store then
-        // load on different atomics needs a SeqCst fence on each side (`wait_for_hold`).
-        std::sync::atomic::fence(Ordering::SeqCst);
-        if !self.has_hold_waiters.load(Ordering::SeqCst) {
-            return;
-        }
-        let woken: Vec<std::task::Waker> = {
-            let mut w = self
-                .hold_waiters
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.has_hold_waiters.store(false, Ordering::SeqCst);
-            w.drain().map(|(_, waker)| waker).collect()
-        };
-        for waker in woken {
-            waker.wake();
-        }
+        self.hold_waiters.wake_all();
     }
 
     /// Stream `stream`'s marks, once its stream is open.

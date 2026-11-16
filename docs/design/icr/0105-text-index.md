@@ -43,7 +43,8 @@
 - **`Hit`** (`#[non_exhaustive]`): `id: Vec<u8>`, `score: f64`.
 - **`SearchStats`** (`#[non_exhaustive]`): `stale`.
 - **`IndexStats`** (`#[non_exhaustive]`): `documents`, `terms`, `postings`, `counter_drift`, `forward_mismatch`, `source_mismatch`, `invalid_utf8`, and `is_consistent()`.
-- **`RebuildStats`** (`#[non_exhaustive]`): `documents`, `changed`, `invalid_utf8`.
+- **`RebuildStats`** (`#[non_exhaustive]`): `documents`, `changed`, `invalid_utf8`, and `stopped` (#1756).
+- **Amendment (#1756): a rebuild that can stop.** `rebuild_with(step)` calls `step` after each document's transaction, and a `Break` stops it with `stopped` set. A cursor in `G`'s `meta` family (`rebuild-after`) records how far it got: written empty at the start, once a page, and in the transaction of any document that writes anyway, so an index already right costs one commit a page. `resume_rebuild_with(step)` continues after it, `rebuild_pending()` reads it (one point read), and `Index::pending_rebuilds(db)` lists the indexes with one. `rebuild` and `rebuild_with` start from the top and replace it; `repair` drops it and never reads it, since its walk starts from an emptied table (ai1249's review). A resume misses a write around the index to a row before the cursor, as one rebuild that had passed the row would: `rebuild` or `repair` after such writes.
 - **`Query`** (`Clone + Default + PartialEq`):
   - **Building:** `new()`, `parse(&str) -> Result<Query>`, `term`, `phrase`, `phrase_with_slop(words, u16)`, `text`, `fuzzy(term, Fuzziness)`, and `clauses() -> &[Clause]`.
   - **From strings:** `From<&str>`, `From<String>` and `From<&String>` parse the string, and a parse error comes back when the search runs.
