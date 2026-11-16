@@ -102,7 +102,7 @@ jobs:
   valgrind-debs:
     name: valgrind .debs
     # The measuring jobs' image (below), so the .debs it saves are the ones they install.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -141,8 +141,8 @@ jobs:
     # valgrind. Identical code on Rust 1.100 counts get-sst 16615 on ubuntu-24.04 (valgrind
     # 3.22) and 16737 on ubuntu-26.04 (valgrind 3.26), and commit-one 8621 against 8479, so a
     # run would pass or fail the ceilings by which image it got. Moving to another image is a
-    # re-baseline of every ceiling in the same PR (#1795).
-    runs-on: ubuntu-24.04
+    # re-baseline of every ceiling in the same PR: ubuntu-24.04 -> ubuntu-26.04 in #1795.
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     # Jobs in parallel (#1575): the read and write shapes; the text-search shapes, which
     # alone took about 20 minutes a side under valgrind and pushed one job to its 60-minute
@@ -205,7 +205,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      # A pinned toolchain, never `stable`, for the same reason as the image: a new rustc moves
+      # the counts (1.100 did, #1796), so a stable release would fail or pass the ceilings on
+      # its own. Bumping it is a re-baseline of every ceiling in the same PR, as for the image
+      # (#1795).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           # (#1961) PR runs restore main's caches without saving their own.
