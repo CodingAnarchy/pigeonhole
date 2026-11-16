@@ -38,6 +38,7 @@ mod http;
 mod indexes;
 mod lease;
 mod listener;
+mod lite;
 mod mcp;
 mod mcp_backend;
 mod memory;

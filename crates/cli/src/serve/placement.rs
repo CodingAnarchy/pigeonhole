@@ -15,7 +15,10 @@
 //! - **The server's own heavy threads** (bulk loads, index builds and rebalancers,
 //!   `Replication.Follow`, embedding) and the request runtime's blocking pool (scans,
 //!   `read_row`, `/mcp` and the other sync client calls) stay on the free cores only:
-//!   [`Placement::enter`].
+//!   [`Placement::enter`]. The exception is the light pool (`phdb-serve-lite`, #1880):
+//!   `read_row` pages within the default budget, at most as many at once as there are
+//!   network workers, run on the network workers' CPUs, siblings included
+//!   ([`Placement::enter_lite`]).
 //! - **A thread inherits its creator's mask.** A `std::thread` spawned from a request
 //!   worker starts on the shards' siblings too, so a heavy one calls
 //!   [`Placement::enter`] first, as the backups, bulk loads, index builds, text rebuilds and
@@ -806,18 +809,29 @@ impl Placement {
 
     /// Called on each request runtime thread as it starts. Tokio runs it on the runtime's
     /// blocking-pool threads as well as its workers, and the pool runs heavy client calls
-    /// (`Service::blocking`'s scans, `read_row`, `multi_get`, text and vector calls, `/mcp`,
-    /// and the replica's and cluster's sync calls): so the free cores, as
+    /// (`Service::blocking`'s scans, large `read_row` pages, `multi_get`, text and vector
+    /// calls, `/mcp`, and the replica's and cluster's sync calls): so the free cores, as
     /// [`Placement::enter`], off the shards' siblings (#1244, ai1249's S1 on #1738). A
     /// worker widens itself to `network` as it first unparks ([`Placement::unpark_network`]).
+    /// The only sync calls on the siblings are the light pool's ([`Placement::enter_lite`]).
     pub(crate) fn enter_network(&self) {
         self.enter();
+    }
+
+    /// Called on each light pool thread as it starts (`phdb-serve-lite`, #1880): the
+    /// network workers' CPUs, the free cores and the shards' siblings. The pool runs only
+    /// calls whose work is small and bounded (`read_row` pages within the default budget),
+    /// at most as many at once as there are network workers, on threads outside any Tokio
+    /// runtime, so nothing heavy can start from them (simp724's C1 and C2 on #1880).
+    pub(crate) fn enter_lite(&self) {
+        self.enter_as(Role::Network);
     }
 
     /// Called each time a request runtime worker unparks: the first time on a thread, it
     /// masks the thread to `network`, the free cores and the shards' siblings. Only workers
     /// unpark (Tokio's blocking pool never calls it), so the blocking pool stays on the free
-    /// cores. After the first, it's a thread-local read.
+    /// cores; the light pool's threads, which aren't Tokio's, widen as they start
+    /// ([`Placement::enter_lite`]). After the first, it's a thread-local read.
     ///
     /// Nothing may call `tokio::task::block_in_place` (nothing in the workspace or its
     /// dependencies does, ai1249 on #1738): a worker that gives up its core there goes back
