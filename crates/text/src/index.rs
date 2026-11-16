@@ -369,6 +369,39 @@ impl Index {
         Ok(index)
     }
 
+    /// The text indexes in `db` whose source column is in the table `table` (#1916): the
+    /// indexes dropping that table would leave behind, unable to write, rebuild or find
+    /// their documents. Sorted. A table without the index's families is skipped without a
+    /// read; one with them is read for its source, whatever its tokeniser.
+    pub fn over_table(db: &Pigeonhole, table: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for name in db.tables() {
+            if name == table {
+                continue;
+            }
+            // A table dropped since the listing has nothing to leave behind.
+            let rows = match db.table(&name).and_then(|t| t.open()) {
+                Ok(t) => Rows::W(t),
+                Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if [POST, DF, TERMS, META, STATS]
+                .iter()
+                .any(|f| rows.family_info(f).is_none())
+            {
+                continue;
+            }
+            let found = rows
+                .get(GLOBAL, META, SOURCE)?
+                .and_then(|c| Source::decode(c.value()));
+            if found.is_some_and(|s| s.table == table) {
+                out.push(name);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Opens the index `name`, with the built-in tokeniser. Everything else is read back
     /// from the index. `Mismatch` if it was created with a custom tokeniser, or with the
     /// built-in one at another version (a dependency bump that changed its word boundaries:
