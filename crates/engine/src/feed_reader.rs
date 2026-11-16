@@ -342,6 +342,11 @@ enum Item {
     SkippedRound {
         id: Seqno,
     },
+    /// An external transaction's abort (D329, type 6): its held shares go, and nothing is
+    /// delivered at its own seqno.
+    Abort {
+        id: Seqno,
+    },
     Other,
 }
 
@@ -2405,6 +2410,11 @@ impl FeedReader {
                         },
                     );
                 }
+                Item::Abort { id } => {
+                    // Its shares are never delivered; the abort's own seqno holds nothing, so
+                    // the frontier passes it as any seqno with no event (ICR 0140's E1).
+                    self.remove_held(id);
+                }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
                     // build writes feed marks); any other type is newer than this build.
@@ -2463,15 +2473,16 @@ impl FeedReader {
         let key = match &record {
             _ if !INDEXING => 0,
             WalRecord::Batch { seqno, .. } => *seqno,
-            WalRecord::Prepare { seqno, .. } | WalRecord::Decision { seqno, .. } => {
-                seqno.saturating_add(1)
-            }
+            WalRecord::Prepare { seqno, .. }
+            | WalRecord::Decision { seqno, .. }
+            | WalRecord::ExternalPrepare { seqno, .. }
+            | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
             // Its round's apply seqno is above its id.
-            WalRecord::Prepare { seqno, .. }
+            WalRecord::Prepare { seqno, .. } | WalRecord::ExternalPrepare { seqno, .. }
                 if seqno >= cutoff || skipped_rounds.contains(&seqno) =>
             {
                 Item::Skipped
@@ -2494,6 +2505,16 @@ impl FeedReader {
                 id: seqno,
                 changes: filter(batch)?,
             },
+            // D329: an external share is held as a D263 one is, delivered at its Decision's
+            // apply seqno, or dropped by its abort.
+            WalRecord::ExternalPrepare { seqno, share, .. } => match share.batch() {
+                Some(batch) => Item::Prepare {
+                    id: seqno,
+                    changes: filter(batch)?,
+                },
+                None => Item::Other,
+            },
+            WalRecord::ExternalAbort { seqno, .. } => Item::Abort { id: seqno },
             WalRecord::Decision {
                 seqno,
                 apply_seqno,
@@ -2998,10 +3019,14 @@ impl FeedReader {
                     }) if of == session => match record {
                         WalRecord::Batch { seqno, .. }
                         | WalRecord::Prepare { seqno, .. }
-                        | WalRecord::Commit { seqno, .. } => seqno,
+                        | WalRecord::Commit { seqno, .. }
+                        | WalRecord::ExternalPrepare { seqno, .. } => seqno,
                         WalRecord::Decision {
                             seqno, apply_seqno, ..
                         } => seqno.min(apply_seqno),
+                        WalRecord::ExternalAbort {
+                            seqno, abort_seqno, ..
+                        } => seqno.min(abort_seqno),
                         // A kind this build can't key: the session can't be started in.
                         _ => continue 'sessions,
                     },
