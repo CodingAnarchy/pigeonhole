@@ -1655,6 +1655,15 @@ pub(crate) enum ShardMsg {
     /// Boxed, so a queued message is sized for a single-shard commit.
     Coordinate(Box<CoordinateReq>),
     Prepare(PrepareReq),
+    /// `Engine::decide` of an externally prepared transaction (D329), to its coordinator:
+    /// commit or abort the commit with id `id`. `reply` answers the commit's outcome; seqno
+    /// 0 (never a commit's) when it isn't awaiting a decision here (decided already, or
+    /// unknown), which the engine reports as not in doubt.
+    ExternalDecide {
+        id: Seqno,
+        commit: bool,
+        reply: Notifier<Result<Settled>>,
+    },
     Prepared {
         seqno: Seqno,
         from: ShardId,
@@ -9769,6 +9778,82 @@ impl ShardState {
         self.commit_round(seqno, ctx);
     }
 
+    /// `Engine::decide` (D329): the external commit `id`, awaiting its decision here, is
+    /// committed (its DECISION logged as any cross-shard commit's, and `reply` answers once
+    /// applied) or aborted (`abort_external`). Its registry entry goes now: a later decide of
+    /// the same xid answers `NotFound`, which the engine reports as "not in doubt".
+    fn on_external_decide(
+        &mut self,
+        id: Seqno,
+        commit: bool,
+        reply: Notifier<Result<Settled>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let Some(c) = self.coord.get_mut(&id).filter(|c| c.awaiting) else {
+            reply.notify(Ok(CommitInfo {
+                seqno: 0,
+                durability: Durability::None,
+            }
+            .into()));
+            return;
+        };
+        c.awaiting = false;
+        if let Some(ext) = &c.external {
+            self.shared
+                .external
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&ext.xid[..]);
+        }
+        let c = self.coord.get_mut(&id).expect("present");
+        c.reply = Some(reply);
+        if commit {
+            self.commit_round(id, ctx);
+        } else {
+            self.abort_external(id, ctx);
+        }
+    }
+
+    /// Aborts the external commit `id` (D329): its External Abort record (type 6) is logged
+    /// on this stream at a seqno of its own (ICR 0140's E1), then its participants drop their
+    /// shares (`Decide { commit: false }`), and the decide's reply answers.
+    fn abort_external(&mut self, id: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
+        // TODO(D329 PR 1, step 5): the type-6 member. Until it lands, an abort is the
+        // in-memory abort of a round that failed, which a reopen would see in doubt again.
+        let c = self.coord.get_mut(&id).expect("present");
+        c.decided = true;
+        // Not a failure the caller hears: the abort is its own decision. The `Coord` goes once
+        // every participant answered (`on_applied`), with no reply left to send and no retry.
+        c.failed = Some(Error::Conflict);
+        let info = CommitInfo {
+            seqno: id,
+            durability: c.durability,
+        };
+        if let Some(reply) = c.reply.take() {
+            reply.notify(Ok(info.into()));
+        }
+        let priority = c.priority;
+        let shards = c.shards.clone();
+        self.mark_aborted(id);
+        for p in shards {
+            self.send(
+                p,
+                ShardMsg::Decide {
+                    seqno: id,
+                    commit: false,
+                    apply_seqno: 0,
+                    commit_ts: 0,
+                    coordinator: self.id,
+                    priority,
+                    last: true,
+                    participants: None,
+                    completion: None,
+                },
+                ctx,
+            );
+        }
+    }
+
     /// Commits a cross-shard commit every participant prepared (`seqno` is its id): the
     /// decision's seqno and timestamp, then its DECISION record, whose settle sends the
     /// `Decide`s (D263, D278).
@@ -11976,6 +12061,9 @@ impl ShardState {
             }
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
             ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
+            ShardMsg::ExternalDecide { id, commit, reply } => {
+                self.on_external_decide(id, commit, reply, ctx);
+            }
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
             ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),

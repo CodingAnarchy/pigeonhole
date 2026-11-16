@@ -2279,6 +2279,21 @@ impl Engine {
         self.inner.commit_blocking(batch, durability)
     }
 
+    /// Decides the externally prepared transaction `xid` (D329, ICR 0140; [`Txn::prepare`]):
+    /// `commit` applies its shares and answers the commit's seqno, an abort drops them and
+    /// answers its id; `None` when `xid` isn't in doubt here (decided already, or never
+    /// prepared). Idempotent.
+    pub fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<CommitInfo>> {
+        self.inner.shared.refuse_blocking_on_driver("decide")?;
+        self.inner.decide(xid, commit)
+    }
+
+    /// The externally prepared transactions in doubt here (D329): each xid, with how long
+    /// ago it was prepared, in nanoseconds.
+    pub fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
+        self.inner.in_doubt()
+    }
+
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
     /// after this commit (D314): its value as a read at the commit's seqno sees it, with a TTL judged at
     /// the commit's timestamp, in the order the batch first wrote each cell. `batch`
@@ -5504,6 +5519,50 @@ impl Inner {
         }));
         self.shared.submitter(target).submit(msg)?;
         crate::write::wait_blocking(&self.shared, &mut waiter, false)
+    }
+
+    /// Decides the externally prepared transaction `xid` (D329, ICR 0140): `commit` applies
+    /// its shares (`Some` with the commit's seqno once applied), and otherwise they are
+    /// dropped (`Some` with its id). `None` when `xid` isn't in doubt here: decided already,
+    /// or never prepared. Idempotent.
+    pub(crate) fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<CommitInfo>> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        let Some(entry) = self
+            .shared
+            .external
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(xid)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let (tx, mut waiter) = crate::write::commit_completion();
+        self.shared
+            .submitter(entry.coordinator)
+            .submit(ShardMsg::ExternalDecide {
+                id: entry.id,
+                commit,
+                reply: tx,
+            })?;
+        let info = crate::write::wait_blocking(&self.shared, &mut waiter, false)?;
+        Ok((info.seqno != 0).then_some(info))
+    }
+
+    /// The externally prepared transactions in doubt here (D329): each one's xid, and how
+    /// long ago (the engine's monotonic clock) it was prepared, in nanoseconds.
+    pub(crate) fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
+        let now = self.shared.vfs.monotonic_nanos();
+        self.shared
+            .external
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(xid, e)| (xid.clone(), now.saturating_sub(e.prepared_at)))
+            .collect()
     }
 
     /// Sets `incompat` bit 2 in both superblock pages before the first external PREPARE
