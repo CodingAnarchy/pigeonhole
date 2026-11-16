@@ -4920,6 +4920,7 @@ mod close;
 mod feed;
 mod fence;
 mod idle;
+mod mcp;
 mod memory;
 mod metrics;
 mod moving;

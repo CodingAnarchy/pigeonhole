@@ -47,6 +47,7 @@ async fn remember(port: u16, ns: &str, text: &str) -> Result<Vec<u8>, tonic::Sta
                 text: text.into(),
                 ..Default::default()
             }),
+            ..Default::default()
         })
         .await
         .map(|r| r.into_inner().id.to_vec())
@@ -396,6 +397,20 @@ fn three_nodes(
     [pigeonhole::Pigeonhole; 2],
     [u16; 3],
 ) {
+    let (stops, dbs, ports, _) = three_nodes_with(rt, "");
+    (stops, dbs, ports)
+}
+
+/// [`three_nodes`] with `tokens` on each node: also their directories, a's, b's and c's.
+fn three_nodes_with(
+    rt: &tokio::runtime::Runtime,
+    tokens: &str,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    [pigeonhole::Pigeonhole; 2],
+    [u16; 3],
+    Vec<PathBuf>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -422,7 +437,7 @@ fn three_nodes(
             id,
             locals,
             listener,
-            "",
+            tokens,
             crate::serve::server_tests::limits(),
             false,
             placement,
@@ -434,7 +449,7 @@ fn three_nodes(
         dbs.extend(d);
     }
     let [p1, p2]: [pigeonhole::Pigeonhole; 2] = dbs.try_into().ok().unwrap();
-    (stops, [p1, p2], ports)
+    (stops, [p1, p2], ports, dirs)
 }
 
 /// The words the memories are made of.
@@ -1029,4 +1044,333 @@ fn a_move_ends_a_watch_and_its_token_from_before_resumes_after() {
             "nothing more"
         );
     });
+}
+
+// ---- The memory tools on `/mcp` (#1915 PR 3b, ICR 0139) ----
+
+mod on_mcp {
+    use serde_json::{Value as Json, json};
+
+    use super::*;
+    use crate::serve::server_tests::mcp_tests::{call_at, mcp_at, request, session_at};
+
+    fn url(port: u16) -> String {
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// `tool` on a new session through the node at `port`, as `token`: its answer, and
+    /// whether it's an error.
+    fn tool(port: u16, token: Option<&str>, name: &str, args: Json) -> (Json, bool) {
+        let id = session_at(&url(port), token);
+        call_at(&url(port), token, &id, name, args)
+    }
+
+    fn ok(port: u16, name: &str, args: Json) -> Json {
+        let (out, err) = tool(port, None, name, args);
+        assert!(!err, "{name} through {port}: {out}");
+        out
+    }
+
+    fn code(out: &Json) -> &str {
+        out["error"]["code"].as_str().unwrap_or("")
+    }
+
+    fn texts(out: &Json) -> Vec<String> {
+        let mut t: Vec<String> = out["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["text"].as_str().unwrap().to_owned())
+            .collect();
+        t.sort();
+        t
+    }
+
+    fn names(port: u16) -> Vec<String> {
+        let id = session_at(&url(port), None);
+        mcp_at(
+            &url(port),
+            None,
+            Some(&id),
+            Some("2025-06-18"),
+            &request("tools/list", json!({})),
+        )
+        .reply()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Every memory tool through either data node reaches both partitions' stores, and
+    /// answers what `phdb mcp` answers: a recall equal to the gRPC one, a supersede's
+    /// `superseded_by`, the `missing` ids of a split mark-used and forget, and a recall cut
+    /// by its budget `truncated`.
+    #[test]
+    fn the_memory_tools_reach_every_partition_through_either_data_node() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_stops, [p1, p2], [a, b, c]) = three_nodes(&rt);
+        let mut ids = std::collections::BTreeMap::new();
+        for (port, ns, text) in [
+            (a, "alice", "alice ate lunch"),
+            (b, "bob", "bob ate lunch"),
+            (a, "zed", "zed skipped lunch"),
+        ] {
+            let out = ok(
+                port,
+                "memory_remember",
+                json!({"namespace": ns, "text": text}),
+            );
+            assert_eq!(out["outcome"], "new", "{out}");
+            ids.insert(ns, out["id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(namespaces_in(&p1), ["alice", "bob"]);
+        assert_eq!(namespaces_in(&p2), ["zed"]);
+        let all = ["alice", "bob", "zed"];
+        let rpc = {
+            let mut t = rt.block_on(recall(c, &all, "lunch")).unwrap();
+            t.sort();
+            t
+        };
+        assert_eq!(rpc.len(), 3, "{rpc:?}");
+        for port in [a, b] {
+            let out = ok(
+                port,
+                "memory_recall",
+                json!({"namespaces": all, "text": "lunch"}),
+            );
+            assert_eq!(texts(&out), rpc, "through {port}");
+            assert_eq!(out["truncated"], false, "{out}");
+        }
+        // A correction on p2, through a: the old memory superseded, as a recall that keeps
+        // superseded memories shows.
+        let fix = ok(
+            a,
+            "memory_remember",
+            json!({"namespace": "zed", "text": "zed ate lunch after all",
+                   "supersedes": ids["zed"]}),
+        );
+        assert_eq!(fix["superseded"], true, "{fix}");
+        let kept = ok(
+            b,
+            "memory_recall",
+            json!({"namespace": "zed", "text": "lunch", "include_superseded": true}),
+        );
+        let old = kept["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == ids["zed"].as_str())
+            .unwrap_or_else(|| panic!("{kept}"));
+        assert_eq!(old["superseded_by"], fix["id"], "{kept}");
+        // A memory forgotten, then named again beside live ones on both partitions: missing.
+        let gone = ok(
+            a,
+            "memory_remember",
+            json!({"namespace": "zed", "text": "gone soon"}),
+        );
+        let gone = gone["id"].as_str().unwrap().to_owned();
+        ok(b, "memory_forget", json!({"ids": [gone]}));
+        let marked = ok(
+            a,
+            "memory_mark_used",
+            json!({"ids": [ids["alice"], gone, ids["bob"]]}),
+        );
+        assert_eq!(marked["marked"], 2, "{marked}");
+        assert_eq!(marked["missing"], json!([gone]), "{marked}");
+        let forgot = ok(b, "memory_forget", json!({"ids": [ids["alice"], gone]}));
+        assert_eq!(forgot["deleted"], 1, "{forgot}");
+        assert_eq!(forgot["missing"], json!([gone]), "{forgot}");
+        // A budget smaller than the hits: cut, and said so.
+        let long = "lunch ".repeat(80);
+        ok(
+            a,
+            "memory_remember",
+            json!({"namespace": "bob", "text": long}),
+        );
+        ok(
+            a,
+            "memory_remember",
+            json!({"namespace": "zed", "text": long.clone() + "again"}),
+        );
+        let cut = ok(
+            b,
+            "memory_recall",
+            json!({"namespaces": all, "text": "lunch", "max_bytes": 256}),
+        );
+        assert_eq!(cut["truncated"], true, "{cut}");
+    }
+
+    /// The `memory_tool_fields` gate (#1915 PR 3b, the coordinator's call): a node that
+    /// answers without the feature refuses a `/mcp` memory call reaching its partition, and
+    /// a gRPC `Remember` with `supersedes`, naming the node; a plain gRPC recall isn't
+    /// gated, and a call on the entry node's own partition needs no peer. A node that
+    /// doesn't answer is unavailable.
+    #[test]
+    fn a_memory_tool_is_refused_while_a_node_it_reaches_runs_an_older_build() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_stops, _dbs, [a, b, c], dirs) = three_nodes_with(&rt, "");
+        let zed = ok(
+            b,
+            "memory_remember",
+            json!({"namespace": "zed", "text": "zed lunch"}),
+        );
+        ok(
+            a,
+            "memory_remember",
+            json!({"namespace": "alice", "text": "alice lunch"}),
+        );
+        // b (p2: zed) acts as a build before the feature.
+        super::super::super::OLD_MEMORY
+            .lock()
+            .unwrap()
+            .push(dirs[1].clone());
+        let (e, err) = tool(
+            a,
+            None,
+            "memory_recall",
+            json!({"namespaces": ["alice", "zed"], "text": "lunch"}),
+        );
+        assert!(err, "{e}");
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(e.to_string().contains("b (an older build)"), "{e}");
+        for (name, args) in [
+            ("memory_mark_used", json!({"ids": [zed["id"]]})),
+            ("memory_forget", json!({"ids": [zed["id"]]})),
+            (
+                "memory_remember",
+                json!({"namespace": "zed", "text": "zed lunch, really", "supersedes": zed["id"]}),
+            ),
+        ] {
+            let (e, err) = tool(a, None, name, args);
+            assert!(err && code(&e) == "FailedPrecondition", "{name}: {e}");
+        }
+        // Without supersedes, a remember relies on no new field.
+        ok(
+            a,
+            "memory_remember",
+            json!({"namespace": "zed", "text": "zed again"}),
+        );
+        // Only a's own partition: no peer to ask.
+        ok(
+            a,
+            "memory_recall",
+            json!({"namespace": "alice", "text": "lunch"}),
+        );
+        rt.block_on(async {
+            // A plain gRPC recall isn't gated (its new fields may be empty mid-upgrade)...
+            assert_eq!(
+                recall(c, &["alice", "zed"], "lunch").await.unwrap().len(),
+                3
+            );
+            // ...but a remember with supersedes is, for every caller.
+            let e = memory(c)
+                .await
+                .remember(RememberRequest {
+                    namespace: "zed".into(),
+                    memory: Some(NewMemory {
+                        text: "zed, corrected".into(),
+                        ..Default::default()
+                    }),
+                    supersedes: zed["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<pigeonhole_memory::MemoryId>()
+                        .unwrap()
+                        .to_bytes()
+                        .into(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(super::code(&e), "FailedPrecondition", "{e:?}");
+        });
+        super::super::super::OLD_MEMORY
+            .lock()
+            .unwrap()
+            .retain(|d| *d != dirs[1]);
+    }
+
+    /// A node that doesn't answer the feature check is unavailable, not an older build:
+    /// `PartitionUnavailable`, as for any call to it.
+    #[test]
+    fn a_memory_tool_reaching_a_node_that_doesnt_answer_is_unavailable() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_stops, _dbs, [a, b, _c], dirs) = three_nodes_with(&rt, "");
+        let entry = (dirs[1].clone(), format!("127.0.0.1:{b}"));
+        super::super::super::CUT_OFF
+            .lock()
+            .unwrap()
+            .push(entry.clone());
+        let (e, err) = tool(
+            a,
+            None,
+            "memory_recall",
+            json!({"namespaces": ["alice", "zed"], "text": "lunch"}),
+        );
+        super::super::super::CUT_OFF
+            .lock()
+            .unwrap()
+            .retain(|x| *x != entry);
+        assert!(err, "{e}");
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.to_string().contains("p2"), "{e}");
+    }
+
+    /// S5: the memory tools are listed on a node with `--memory` only: its flags (the
+    /// embedder, the budgets) are what a recall across partitions runs with.
+    #[test]
+    fn a_node_without_memory_lists_no_memory_tools() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let with = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let kept = one_node(&rt, listener, None, Some(recipe()));
+            (port, kept)
+        };
+        assert!(names(with.0).contains(&"memory_recall".to_owned()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _without = one_node(&rt, listener, None, None);
+        let list = names(port);
+        assert!(list.contains(&"read_row".to_owned()), "{list:?}");
+        assert!(!list.iter().any(|n| n.starts_with("memory_")), "{list:?}");
+    }
+
+    /// A namespace-scoped token on a cluster: only the memory tools, within its
+    /// namespaces, wherever they're placed; one outside them is refused whole.
+    #[test]
+    fn a_namespace_scoped_token_gets_its_namespaces_on_every_partition() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tokens = format!("admin all\nwrite ns=alice,zed scoped\ncluster {NODE_TOKEN}\n");
+        let (_stops, _dbs, [a, b, _c], _) = three_nodes_with(&rt, &tokens);
+        let t = Some("scoped");
+        for (ns, port) in [("alice", a), ("zed", a), ("zed", b)] {
+            let (out, err) = tool(
+                port,
+                t,
+                "memory_remember",
+                json!({"namespace": ns, "text": format!("{ns} lunch via {port}")}),
+            );
+            assert!(!err, "{ns} through {port}: {out}");
+        }
+        let (out, err) = tool(
+            b,
+            t,
+            "memory_recall",
+            json!({"namespaces": ["alice", "zed"], "text": "lunch"}),
+        );
+        assert!(!err, "{out}");
+        assert_eq!(out["hits"].as_array().unwrap().len(), 3, "{out}");
+        let (e, err) = tool(
+            a,
+            t,
+            "memory_recall",
+            json!({"namespaces": ["alice", "bob"], "text": "lunch"}),
+        );
+        assert!(err, "{e}");
+        assert_eq!(code(&e), "PermissionDenied", "{e}");
+        let (e, err) = tool(a, t, "read_row", json!({"table": "users", "row": "r"}));
+        assert!(err, "{e}");
+    }
 }

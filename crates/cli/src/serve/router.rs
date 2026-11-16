@@ -288,6 +288,12 @@ impl Router {
     /// Every database this server serves: a single node's one, or a cluster node's
     /// partitions open now (D317 ticket 8a). For what's done to each alike: feeds started,
     /// the dump, bulk loads stopped, indexes closed, health.
+    /// The memory store's slot of this node's first partition, if the node serves one
+    /// (`--memory`): its name, model and limits are the node's, the same on every partition.
+    pub(crate) fn memory_slot(&self) -> Option<Arc<super::memslot::MemSlot>> {
+        self.parts().first()?.memory.get().cloned()
+    }
+
     pub(crate) fn parts(&self) -> Vec<PartRef> {
         match &self.cluster {
             None => PartRef::of(&self.service).into_iter().collect(),
@@ -676,6 +682,14 @@ impl Router {
                 .filter(|d| !d.is_zero())
                 .ok_or_else(ApiError::deadline_exceeded)
         };
+        // `supersedes` changes what's written: the owner applies it, or the call is refused
+        // (#1915 PR 3b). Here, in the forward (boxed), not in `dispatch_by`, whose future
+        // every call holds; an owner that is this node has the feature.
+        if let ServiceOp::Remember(r) = &op
+            && !r.supersedes.is_empty()
+        {
+            self.memory_fields(&op).await?;
+        }
         let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
         let writes = forward_writes(&op);
         let req = ForwardRequest {

@@ -33,6 +33,9 @@ use crate::mcp::backend::{
     NearestArgs, Neighbour, Query, RowWrite, Selection, TraverseArgs, TraverseOut, WriteOp,
     vector_from,
 };
+use crate::mcp::memory::{Forgotten, Hit, Marked, Recalled, Store as MemStore, Stored};
+use crate::memcore::{RecallArgs, Remember};
+use pigeonhole_memory::{EmbeddingModel, LinkType, MemoryId};
 
 /// A result's pages are this size at most: the tools cut their results by their own budget
 /// (`--mcp-max-result-bytes`), so the op's own cap is the server's largest.
@@ -45,6 +48,7 @@ pub(super) fn failure(e: ApiError) -> Failure {
 
 /// The tools' database surface on a server: service ops through the router, as the session's
 /// caller, within the current message's deadline.
+#[derive(Clone)]
 pub(super) struct ServeBackend {
     /// Weak: the session table, inside the service, holds the session that holds this.
     pub(super) shared: Weak<Shared>,
@@ -102,7 +106,21 @@ impl ServeBackend {
         }
         let rt = tokio::runtime::Handle::current();
         let reply = rt
-            .block_on(shared.router.dispatch_by(op, &self.caller, None, deadline))
+            .block_on(async {
+                // The memory tools read the fields `memory_tool_fields` names, so on a cluster
+                // every owner the call reaches must have them (#1915 PR 3b): a `Remember` with
+                // `supersedes` is gated by the router for every caller; these only here.
+                if matches!(
+                    op,
+                    ServiceOp::Recall(_) | ServiceOp::MarkUsed(_) | ServiceOp::Forget(_)
+                ) {
+                    shared.router.memory_fields(&op).await?;
+                }
+                shared
+                    .router
+                    .dispatch_by(op, &self.caller, None, deadline)
+                    .await
+            })
             .map_err(failure)?;
         Ok(match reply {
             ServiceReply::Charged(r, charge) => Reply {
@@ -823,5 +841,201 @@ fn commit_of(c: proto::FeedCommit) -> CommitOut {
                 ts: ch.timestamp,
             })
             .collect(),
+    }
+}
+
+/// The memory tools' store on a server (#1915 PR 3b): each operation a `Memory` op through
+/// the router, as the session's token (so within its namespaces, M4), within the message's
+/// deadline. The op takes its own memory place (M6), as the RPC does: the message holds only
+/// its `/mcp` place while it waits, so `/mcp` messages can't hold every memory place while
+/// their ops wait for one.
+pub(super) struct ServeMemory {
+    pub(super) backend: ServeBackend,
+    /// The node's store slot, for its pinned model.
+    pub(super) slot: Arc<super::memslot::MemSlot>,
+}
+
+impl ServeMemory {
+    fn model_of(&self, entry: super::memslot::Entry) -> Result<Option<EmbeddingModel>, Failure> {
+        use super::memslot::Entry;
+        match entry {
+            Entry::Core(core) => Ok(core.model().cloned()),
+            Entry::Missing => Err(failure(ApiError::unavailable(format!(
+                "memory store {} isn't on this replica yet: the primary hasn't created it, or \
+                 the replica hasn't applied that yet",
+                self.slot.name()
+            )))),
+            Entry::Failed(e) => Err(failure(e)),
+        }
+    }
+}
+
+fn memory_id(raw: &[u8]) -> Result<MemoryId, Failure> {
+    super::memory::id(raw).map_err(failure)
+}
+
+fn memory_ids(raw: Vec<prost::bytes::Bytes>) -> Result<Vec<MemoryId>, Failure> {
+    raw.iter().map(|b| memory_id(b)).collect()
+}
+
+fn id_bytes(ids: &[MemoryId]) -> Vec<prost::bytes::Bytes> {
+    ids.iter().map(|id| id.to_bytes().into()).collect()
+}
+
+impl MemStore for ServeMemory {
+    fn model(&self) -> Option<EmbeddingModel> {
+        match self.slot.cached()? {
+            super::memslot::Entry::Core(core) => core.model().cloned(),
+            _ => None,
+        }
+    }
+
+    fn call_model(&self) -> Result<Option<EmbeddingModel>, Failure> {
+        // The node's own store, opened if need be, on this `/mcp` thread (never a pool
+        // permit's): every partition's store is pinned by the same flags.
+        self.model_of(self.slot.get().map_err(failure)?)
+    }
+
+    fn remember(&self, r: Remember, supersedes: Option<MemoryId>) -> Result<Stored, Failure> {
+        let op = ServiceOp::Remember(proto::RememberRequest {
+            namespace: r.namespace,
+            memory: Some(proto::NewMemory {
+                text: r.text,
+                embedding: r.embedding.as_deref().map(super::memory::vector_out),
+                kind: r.kind.map_or(0, super::memory::kind_out),
+                importance: r.importance,
+                source: r.source.unwrap_or_default(),
+                session: r.session.unwrap_or_default(),
+                pinned: r.pinned,
+                links: r
+                    .links
+                    .into_iter()
+                    .map(|(to, ty, weight)| proto::MemoryLink {
+                        to: to.to_bytes().into(),
+                        link_type: Some(super::memory::link_type_out(ty)),
+                        weight,
+                    })
+                    .collect(),
+            }),
+            supersedes: supersedes
+                .map(|id| id.to_bytes().into())
+                .unwrap_or_default(),
+        });
+        let ServiceReply::Remember(done) = self.backend.call(op)?.reply else {
+            return Err(unexpected("Memory.Remember"));
+        };
+        let outcome = match proto::RememberOutcome::try_from(done.outcome) {
+            Ok(proto::RememberOutcome::New) => "new",
+            Ok(proto::RememberOutcome::Merged) => "merged",
+            Ok(proto::RememberOutcome::Similar) => "similar",
+            _ => "other",
+        };
+        Ok(Stored {
+            id: memory_id(&done.id)?,
+            outcome,
+            supersede_error: done
+                .supersede_error
+                .map(|e| Failure::served(&e.code, e.code_num, &e.message)),
+        })
+    }
+
+    fn recall(&self, a: RecallArgs) -> Result<Recalled, Failure> {
+        let op = ServiceOp::Recall(proto::RecallRequest {
+            namespaces: a.namespaces,
+            text: a.text.unwrap_or_default(),
+            embedding: a.embedding.as_deref().map(super::memory::vector_out),
+            k: u32::try_from(a.k).unwrap_or(u32::MAX),
+            byte_budget: a.byte_budget,
+            expand_hops: a.expand_hops,
+            exact: a.exact,
+            include_superseded: a.include_superseded,
+            session: a.session.unwrap_or_default(),
+            with_embeddings: a.with_embeddings,
+            with_signals: a.with_signals,
+        });
+        let ServiceReply::Recall(r) = self.backend.call(op)?.reply else {
+            return Err(unexpected("Memory.Recall"));
+        };
+        let hits = r
+            .hits
+            .into_iter()
+            .map(|h| {
+                Ok(Hit {
+                    id: memory_id(&h.id)?,
+                    kind: super::memory::kind_in(h.kind)
+                        .map_err(failure)?
+                        .unwrap_or_default(),
+                    text: h.text,
+                    importance: h.importance,
+                    created_us: h.created,
+                    score: h.score,
+                    superseded_by: if h.superseded_by.is_empty() {
+                        None
+                    } else {
+                        Some(memory_id(&h.superseded_by)?)
+                    },
+                })
+            })
+            .collect::<Result<_, Failure>>()?;
+        Ok(Recalled {
+            hits,
+            truncated: r.truncated,
+        })
+    }
+
+    fn mark_used(&self, ids: &[MemoryId]) -> Result<Marked, Failure> {
+        let op = ServiceOp::MarkUsed(proto::MarkUsedRequest { ids: id_bytes(ids) });
+        let ServiceReply::MarkUsed(m) = self.backend.call(op)?.reply else {
+            return Err(unexpected("Memory.MarkUsed"));
+        };
+        Ok(Marked {
+            marked: m.marked,
+            missing: memory_ids(m.missing)?,
+        })
+    }
+
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<(), Failure> {
+        let op = ServiceOp::Supersede(proto::SupersedeRequest {
+            old: old.to_bytes().into(),
+            new: new.to_bytes().into(),
+        });
+        match self.backend.call(op)?.reply {
+            ServiceReply::Empty(_) => Ok(()),
+            _ => Err(unexpected("Memory.Supersede")),
+        }
+    }
+
+    fn link(
+        &self,
+        from: &MemoryId,
+        to: &MemoryId,
+        ty: LinkType,
+        weight: f32,
+    ) -> Result<(), Failure> {
+        let op = ServiceOp::Link(proto::LinkRequest {
+            from: from.to_bytes().into(),
+            to: to.to_bytes().into(),
+            link_type: Some(super::memory::link_type_out(ty)),
+            weight,
+        });
+        match self.backend.call(op)?.reply {
+            ServiceReply::Empty(_) => Ok(()),
+            _ => Err(unexpected("Memory.Link")),
+        }
+    }
+
+    fn forget(&self, ids: &[MemoryId]) -> Result<Forgotten, Failure> {
+        // A failure part-way is the call's error, as `Memory.Forget` answers it: on a cluster,
+        // `OutcomeUnknown` naming the partitions whose outcome isn't known (#1939's rule),
+        // never a partial list that reads as "the rest weren't forgotten".
+        let op = ServiceOp::Forget(proto::ForgetRequest { ids: id_bytes(ids) });
+        let ServiceReply::Forget(f) = self.backend.call(op)?.reply else {
+            return Err(unexpected("Memory.Forget"));
+        };
+        Ok(Forgotten {
+            deleted: f.forgotten,
+            missing: memory_ids(f.missing)?,
+            failed: None,
+        })
     }
 }

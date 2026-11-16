@@ -60,8 +60,12 @@ use crate::exit::Failure;
 /// ICR 0138 and 0139). A map's writer adds such a field only once every node reports it: a
 /// node that drops it would store a different map at the same version, and read as divergent.
 /// Request features its peers may rely on are listed here too (#1915 PR 3, ICR 0139's PR 3
-/// section): [`NEAREST_QUALIFIERS_FEATURE`].
-pub(crate) const MAP_FEATURES: &[&str] = &[MEMORY_FEATURE, NEAREST_QUALIFIERS_FEATURE];
+/// section): [`NEAREST_QUALIFIERS_FEATURE`] and [`MEMORY_TOOL_FIELDS_FEATURE`].
+pub(crate) const MAP_FEATURES: &[&str] = &[
+    MEMORY_FEATURE,
+    NEAREST_QUALIFIERS_FEATURE,
+    MEMORY_TOOL_FIELDS_FEATURE,
+];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
 pub(crate) const MEMORY_FEATURE: &str = "memory";
@@ -69,6 +73,13 @@ pub(crate) const MEMORY_FEATURE: &str = "memory";
 /// [`MAP_FEATURES`]' name for a build that applies `NearestRequest.qualifiers` (#1915 PR 3):
 /// a node without it would rank every qualifier.
 pub(crate) const NEAREST_QUALIFIERS_FEATURE: &str = "nearest_qualifiers";
+
+/// [`MAP_FEATURES`]' name for a build that serves the memory calls' fields for `/mcp`'s
+/// memory tools (#1915 PR 3b): `RememberRequest.supersedes`, `RememberResponse.
+/// supersede_error`, `RecallResponse.truncated`, `MemoryHit.superseded_by` and the
+/// `missing` ids of `MarkUsed` and `Forget`. A node without it would ignore `supersedes`
+/// and leave the rest empty.
+pub(crate) const MEMORY_TOOL_FIELDS_FEATURE: &str = "memory_tool_fields";
 
 /// How long a peer's answered features ([`Node::owners_keep`]) are taken as its own: a
 /// node's build changes only when it restarts.
@@ -152,6 +163,11 @@ pub(crate) static CUT_OFF: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new()
 /// `status` false, a peer that changed build within the entry node's features cache).
 #[cfg(test)]
 pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before `memory_tool_fields` (#1915 PR 3b),
+/// by cluster directory: their `Status` leaves the feature out.
+#[cfg(test)]
+pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// How [`OLD_NEAREST`] has a node act.
 #[cfg(test)]
@@ -1237,6 +1253,16 @@ impl Node {
                 .filter(|&&f| {
                     #[cfg(test)]
                     if f == NEAREST_QUALIFIERS_FEATURE && old_nearest(&self.dir, OldNearest::Status)
+                    {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    if f == MEMORY_TOOL_FIELDS_FEATURE
+                        && OLD_MEMORY
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .any(|d| self.dir.starts_with(d))
                     {
                         return false;
                     }

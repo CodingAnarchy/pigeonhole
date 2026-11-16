@@ -27,7 +27,7 @@ mod data_tests;
 mod download_tests;
 mod feed_tests;
 mod http1_tests;
-mod mcp_tests;
+pub(crate) mod mcp_tests;
 mod memory_tests;
 mod replica_tests;
 mod session_tests;
