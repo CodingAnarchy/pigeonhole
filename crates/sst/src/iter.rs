@@ -94,6 +94,10 @@ pub struct SstIter {
     /// and the size of its next readahead batch: readahead ramps up (#712).
     stepped: u32,
     window: u32,
+    /// A jump stop ([`ReadOptions::stop_jumps`]) left the cursor on a key it didn't admit,
+    /// since [`SstIter::take_stopped`] last asked. Set only where a jump stops; a stale `true`
+    /// costs its caller one settle.
+    stopped: bool,
 }
 
 /// Where a cursor's readahead ramp stands ([`SstIter::readahead_ramp`]), to carry it to the
@@ -293,6 +297,10 @@ fn loaded(slot: &mut Option<BlockIter<BlockHandle>>) -> Result<&mut BlockIter<Bl
 impl SstIter {
     #[inline]
     pub(crate) fn new(reader: Arc<SstReader>, filter: ScanFilter, options: ReadOptions) -> Self {
+        debug_assert!(
+            !options.one_row || options.stop_jumps,
+            "a one-row read stops its jumps: set stop_jumps with one_row"
+        );
         Self {
             reader,
             filter_all: filter.is_all(),
@@ -306,7 +314,27 @@ impl SstIter {
             ahead: None,
             stepped: 0,
             window: 0,
+            stopped: false,
         }
+    }
+
+    /// Whether a jump stop ([`ReadOptions::stop_jumps`]) has left the cursor on a key it
+    /// didn't admit since this was last asked, clearing it. A caller that moves on to a key
+    /// the cursor already stands at or past settles it there first ([`SstIter::resettle`]).
+    #[inline]
+    pub fn take_stopped(&mut self) -> bool {
+        // Cleared only when set: the common answer is a load.
+        if !self.stopped {
+            return false;
+        }
+        self.stopped = false;
+        true
+    }
+
+    /// Settles the cursor from where it stands: the entry it is on, if admitted, else the
+    /// filter's jumps from it (which may stop again, past its row).
+    pub fn resettle(&mut self) -> Result<()> {
+        self.run(|_| Ok(()))
     }
 
     /// Switches cache-only reads on or off ([`ReadOptions::cache_only`]): an async scan
@@ -703,9 +731,10 @@ impl SstIter {
         r
     }
 
-    /// Advances to the first admitted entry at or after the current one. A one-row read
-    /// ([`ReadOptions::one_row`]) stops instead at the first entry a jump lands on past its
-    /// row (#1924), valid but not admitted, where its caller ends the read: a row with no
+    /// Advances to the first admitted entry at or after the current one. A read that stops
+    /// its jumps ([`ReadOptions::stop_jumps`], which a one-row read implies) stops instead at
+    /// the first entry a jump lands on past the row it jumped from (#1924, #1931), valid but
+    /// not admitted and marked `stopped`, where its caller ends the row: a row with no
     /// qualifier the filter keeps would otherwise send the cursor seeking (or skipping) row
     /// by row through the rest of the file. Tested only after a jump, never on `Admit` or
     /// `Next`. Forward reads only, as every filtered read is.
@@ -719,17 +748,19 @@ impl SstIter {
                 Verdict::SkipRow => {
                     self.skip_row_raw()?;
                     // A row skip leaves the row: a one-row read is done.
-                    if self.options.one_row {
+                    if self.options.stop_jumps {
+                        self.stopped = true;
                         return Ok(());
                     }
                 }
                 Verdict::Seek => {
                     let hint = std::mem::take(&mut self.hint);
                     let r = self.seek_forward(&hint);
-                    let left = self.options.one_row && r.is_ok() && self.left_row(&hint);
+                    let left = self.options.stop_jumps && r.is_ok() && self.left_row(&hint);
                     self.hint = hint;
                     r?;
                     if left {
+                        self.stopped = true;
                         return Ok(());
                     }
                 }

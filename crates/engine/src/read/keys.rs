@@ -233,6 +233,10 @@ enum Slot {
 struct FamilyRead {
     lane: Lane,
     filter: ScanFilter,
+    /// The filter keeps less than every cell (`!filter.is_all()`), so a source can stop on a
+    /// key it didn't admit (#1931). Computed once per family read: an unfiltered multi-get
+    /// never asks its sources.
+    filtered: bool,
     opts: pigeonhole_compaction::ResolveOptions,
     priority: pigeonhole_cache::Priority,
     mems: Vec<Option<Source>>,
@@ -461,7 +465,8 @@ impl KeyCursor {
             let mut mems = Vec::new();
             if let Some(set) = located.mems {
                 let mut out = Vec::new();
-                mem_sources(set, &filter, false, &mut out);
+                // One row per key: a jump that leaves the key's row stops there (#1931).
+                mem_sources(set, &filter, true, &mut out);
                 mems.extend(out.into_iter().map(Some));
             }
             let (mut ssts, mut levels) = (Vec::new(), Vec::new());
@@ -491,6 +496,7 @@ impl KeyCursor {
                     pending: false,
                     done: true,
                 },
+                filtered: !filter.is_all(),
                 filter,
                 opts,
                 priority: located.priority,
@@ -1024,6 +1030,7 @@ impl FamilyRead {
         let FamilyRead {
             lane,
             filter,
+            filtered,
             opts,
             priority,
             mems,
@@ -1041,19 +1048,24 @@ impl FamilyRead {
             }
         }
         let reseek = std::mem::take(reseek);
+        let filtered = *filtered;
         lane.pending = false;
         lane.pinned = None;
         for (i, m) in mems.iter_mut().enumerate() {
             let mut src = m.take().expect("a memtable source is in its slot");
-            let moved = move_to(&mut src, prefix, reseek);
+            let moved = move_to(&mut src, prefix, reseek, filtered);
             sources.push(src);
             in_merge.push(Slot::Mem(i));
             moved?;
         }
         // A point read's options without `one_row`: a cursor that stopped at its row's end
-        // could not move forward to the next key, and would seek from the top.
+        // could not move forward to the next key, and would seek from the top. Its jump stop
+        // stays (#1931): a key whose row holds nothing the filter keeps ends at the row
+        // instead of jumping on through the rest of the file, and `move_to` settles a cursor
+        // stopped at or past the next key.
         let mut read_opts = read_options(*priority, false, false, cache_only);
         read_opts.one_row = false;
+        read_opts.stop_jumps = true;
         let set = Arc::clone(&lane.ssts);
         each_sst(fam.as_deref(), levels, ssts, prefix, |i, slot| {
             let reader = slot.reader(&set, *priority, cache_only)?;
@@ -1070,7 +1082,7 @@ impl FamilyRead {
             };
             // Kept in the merge even if the move fails: an SST cursor whose move failed is
             // invalid, and seeks next time.
-            let moved = move_to(&mut src, prefix, fresh);
+            let moved = move_to(&mut src, prefix, fresh, filtered);
             sources.push(src);
             in_merge.push(Slot::Sst(i));
             moved
@@ -1132,12 +1144,32 @@ impl FamilyRead {
 /// Moves `src` to the first entry at or past `target` (a row prefix): a full seek if it is
 /// `fresh` or has run past its end, a forward one from where it is if it is behind, nothing
 /// if it is already there (keys come in increasing order).
-fn move_to(src: &mut Source, target: &[u8], fresh: bool) -> Result<()> {
+///
+/// Already there after a jump stop (only a `filtered` read's sources stop), it stands on a
+/// key its filter didn't admit, which the merge would take as admitted: it settles from
+/// there first (#1931). Under `cache_only` that settle can miss the cache after the flag is
+/// cleared; the miss fails the positioning, [`FamilyRead::unwind`] sets `reseek`, and the
+/// retry seeks every source afresh, which settles it anyway. The retry's probe fetches only
+/// the seek's first blocks; a later miss is fetched by the same `WouldBlock` loop.
+///
+/// Inlined into the key loop, as it was before the re-settle (#1954's callgrind: an out-of-line
+/// `move_to` cost multi-get-dense 0.3%); the re-settle itself is out of line.
+#[inline]
+fn move_to(src: &mut Source, target: &[u8], fresh: bool, filtered: bool) -> Result<()> {
     if fresh || !src.valid() {
         src.seek(target)
     } else if src.key() < target {
         src.seek_forward(target)
+    } else if filtered && src.take_stopped() {
+        resettle(src)
     } else {
         Ok(())
     }
+}
+
+/// [`move_to`]'s rare case: a source a jump stop left on a key its filter didn't admit.
+#[cold]
+#[inline(never)]
+fn resettle(src: &mut Source) -> Result<()> {
+    src.resettle()
 }

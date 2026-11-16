@@ -858,6 +858,7 @@ fn a_one_row_reads_filtered_jumps_stop_at_its_row() {
             f.qualifiers = pigeonhole_format::scan::QualifierFilter::Prefix(keep.to_vec());
             let mut o = o;
             o.one_row = one_row;
+            o.stop_jumps = one_row;
             pigeonhole_sst::counting_file_reads(|| {
                 let mut it = r.iter(f, o);
                 it.seek(&prefix).unwrap();
@@ -924,6 +925,7 @@ fn a_one_row_read_never_reads_the_block_after_its_row() {
         let read = |one_row: bool, skip: bool| {
             let mut o = o;
             o.one_row = one_row;
+            o.stop_jumps = one_row;
             pigeonhole_sst::counting_file_reads(|| {
                 let mut it = r.iter(ScanFilter::all(), o);
                 it.seek(&prefix).unwrap();
