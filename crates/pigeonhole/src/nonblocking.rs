@@ -66,7 +66,9 @@ use std::task::{Context, Poll};
 use crate::Durability;
 
 use crate::cell::RowBuf;
-use crate::write::{Submitted, SubmittedCheck, TicketState};
+use crate::write::{
+    Submitted, SubmittedCheck, SubmittedCheckReturning, SubmittedReturning, TicketState,
+};
 use crate::{
     Cell, CommitInfo, CommitTicket, Condition, Error, Pigeonhole, Result, Row, RowMutation,
     Transaction, WriteBatch,
@@ -80,26 +82,82 @@ use pigeonhole_engine::ScanCursor;
 #[derive(Debug)]
 #[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
 pub struct CommitFuture {
-    state: State,
+    state: Resolving<Submitted, CommitInfo>,
 }
 
+/// A submitted commit of one kind: what it waits on, and the public result it makes of the
+/// engine's.
+trait Resolve {
+    type Out;
+
+    /// Polls the engine's pending commit, and maps its outcome once it has one.
+    fn poll_outcome(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Out>>;
+}
+
+macro_rules! resolves {
+    ($($submitted:ty => $out:ty,)*) => {$(
+        impl Resolve for $submitted {
+            type Out = $out;
+
+            fn poll_outcome(&mut self, cx: &mut Context<'_>) -> Poll<Result<$out>> {
+                match Pin::new(&mut self.pending).poll(cx) {
+                    Poll::Ready(r) => Poll::Ready(self.outcome(r)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    )*};
+}
+
+resolves! {
+    Submitted => CommitInfo,
+    SubmittedReturning => crate::Returned,
+    SubmittedCheck => Option<CommitInfo>,
+    SubmittedCheckReturning => crate::Checked,
+}
+
+/// The state of every commit future: `S` submitted, resolving to a `T`.
 #[derive(Debug)]
-enum State {
+enum Resolving<S, T> {
     /// Submitted (or waiting for room, D210: the engine's pending commit submits once
     /// admitted), not resolved.
-    Pending(Submitted),
+    Pending(S),
     /// Resolved without waiting (refused before submission, or a ticket already done);
     /// `None` once taken.
-    Ready(Option<Result<CommitInfo>>),
+    Ready(Option<Result<T>>),
+}
+
+impl<S: Resolve<Out = T>, T> Resolving<S, T> {
+    fn new(submitted: Result<S>) -> Self {
+        match submitted {
+            Ok(s) => Self::Pending(s),
+            Err(e) => Self::Ready(Some(Err(e))),
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<T>> {
+        match self {
+            Self::Pending(s) => match s.poll_outcome(cx) {
+                Poll::Ready(out) => {
+                    *self = Self::Ready(None);
+                    Poll::Ready(out)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            Self::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
+                Err(Error::new(
+                    crate::ErrorCode::InvalidArgument,
+                    "commit future polled after it resolved",
+                ))
+            })),
+        }
+    }
 }
 
 impl CommitFuture {
     fn new(submitted: Result<Submitted>) -> Self {
         Self {
-            state: match submitted {
-                Ok(s) => State::Pending(s),
-                Err(e) => State::Ready(Some(Err(e))),
-            },
+            state: Resolving::new(submitted),
         }
     }
 }
@@ -108,22 +166,7 @@ impl Future for CommitFuture {
     type Output = Result<CommitInfo>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.state {
-            State::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
-                Poll::Ready(r) => {
-                    let out = s.outcome(r);
-                    self.state = State::Ready(None);
-                    Poll::Ready(out)
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            State::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
-                Err(Error::new(
-                    crate::ErrorCode::InvalidArgument,
-                    "commit future polled after it resolved",
-                ))
-            })),
-        }
+        self.state.poll(cx)
     }
 }
 
@@ -134,8 +177,8 @@ impl IntoFuture for CommitTicket {
     fn into_future(self) -> CommitFuture {
         CommitFuture {
             state: match self.into_state() {
-                TicketState::Pending(s) => State::Pending(s),
-                TicketState::Done(r) => State::Ready(Some(r)),
+                TicketState::Pending(s) => Resolving::Pending(s),
+                TicketState::Done(r) => Resolving::Ready(Some(r)),
             },
         }
     }
@@ -160,10 +203,7 @@ impl RowMutation<'_> {
     /// gap in a sequence, never a repeat).
     pub fn commit_returning_async(self) -> ReturningFuture {
         ReturningFuture {
-            state: match self.submit_returning_async() {
-                Ok(s) => ReturningState::Pending(s),
-                Err(e) => ReturningState::Ready(Some(Err(e))),
-            },
+            state: Resolving::new(self.submit_returning_async()),
         }
     }
 }
@@ -172,37 +212,14 @@ impl RowMutation<'_> {
 #[derive(Debug)]
 #[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
 pub struct ReturningFuture {
-    state: ReturningState,
-}
-
-#[derive(Debug)]
-enum ReturningState {
-    /// Submitted (or waiting for room, D210), not resolved.
-    Pending(crate::write::SubmittedReturning),
-    /// Refused before submission; `None` once taken.
-    Ready(Option<Result<crate::Returned>>),
+    state: Resolving<SubmittedReturning, crate::Returned>,
 }
 
 impl Future for ReturningFuture {
     type Output = Result<crate::Returned>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.state {
-            ReturningState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
-                Poll::Ready(r) => {
-                    let out = s.outcome(r);
-                    self.state = ReturningState::Ready(None);
-                    Poll::Ready(out)
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            ReturningState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
-                Err(Error::new(
-                    crate::ErrorCode::InvalidArgument,
-                    "commit future polled after it resolved",
-                ))
-            })),
-        }
+        self.state.poll(cx)
     }
 }
 
@@ -215,10 +232,7 @@ impl RowMutation<'_> {
     /// [module docs](self)).
     pub fn commit_if_async(self, condition: &Condition) -> CheckFuture {
         CheckFuture {
-            state: match self.submit_if_async(condition) {
-                Ok(s) => CheckState::Pending(s),
-                Err(e) => CheckState::Ready(Some(Err(e))),
-            },
+            state: Resolving::new(self.submit_if_async(condition)),
         }
     }
 
@@ -228,10 +242,7 @@ impl RowMutation<'_> {
     /// writes nothing.**
     pub fn commit_if_returning_async(self, condition: &Condition) -> CheckReturningFuture {
         CheckReturningFuture {
-            state: match self.submit_if_returning_async(condition) {
-                Ok(s) => CheckReturningState::Pending(s),
-                Err(e) => CheckReturningState::Ready(Some(Err(e))),
-            },
+            state: Resolving::new(self.submit_if_returning_async(condition)),
         }
     }
 }
@@ -315,37 +326,14 @@ impl Future for TransactionCommitFuture {
 #[derive(Debug)]
 #[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
 pub struct CheckFuture {
-    state: CheckState,
-}
-
-#[derive(Debug)]
-enum CheckState {
-    /// Submitted (or waiting for room, D210), not resolved.
-    Pending(SubmittedCheck),
-    /// Refused before submission; `None` once taken.
-    Ready(Option<Result<Option<CommitInfo>>>),
+    state: Resolving<SubmittedCheck, Option<CommitInfo>>,
 }
 
 impl Future for CheckFuture {
     type Output = Result<Option<CommitInfo>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.state {
-            CheckState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
-                Poll::Ready(r) => {
-                    let out = s.outcome(r);
-                    self.state = CheckState::Ready(None);
-                    Poll::Ready(out)
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            CheckState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
-                Err(Error::new(
-                    crate::ErrorCode::InvalidArgument,
-                    "commit future polled after it resolved",
-                ))
-            })),
-        }
+        self.state.poll(cx)
     }
 }
 
@@ -354,37 +342,14 @@ impl Future for CheckFuture {
 #[derive(Debug)]
 #[must_use = "a future does nothing unless polled; dropped once submitted, it does not roll back"]
 pub struct CheckReturningFuture {
-    state: CheckReturningState,
-}
-
-#[derive(Debug)]
-enum CheckReturningState {
-    /// Submitted (or waiting for room, D210), not resolved.
-    Pending(crate::write::SubmittedCheckReturning),
-    /// Refused before submission; `None` once taken.
-    Ready(Option<Result<crate::Checked>>),
+    state: Resolving<SubmittedCheckReturning, crate::Checked>,
 }
 
 impl Future for CheckReturningFuture {
     type Output = Result<crate::Checked>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.state {
-            CheckReturningState::Pending(s) => match Pin::new(&mut s.pending).poll(cx) {
-                Poll::Ready(r) => {
-                    let out = s.outcome(r);
-                    self.state = CheckReturningState::Ready(None);
-                    Poll::Ready(out)
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            CheckReturningState::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
-                Err(Error::new(
-                    crate::ErrorCode::InvalidArgument,
-                    "commit future polled after it resolved",
-                ))
-            })),
-        }
+        self.state.poll(cx)
     }
 }
 
