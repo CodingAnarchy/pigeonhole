@@ -10314,6 +10314,24 @@ impl serde::Serialize for LocalPartition {
         if self.lease_remaining_ms != 0 {
             len += 1;
         }
+        if self.role != 0 {
+            len += 1;
+        }
+        if !self.replica_of.is_empty() {
+            len += 1;
+        }
+        if self.replica_applied_seqno != 0 {
+            len += 1;
+        }
+        if self.replica_primary_seqno != 0 {
+            len += 1;
+        }
+        if self.replica_lag_ms != 0 {
+            len += 1;
+        }
+        if self.replica_state != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -10367,6 +10385,34 @@ impl serde::Serialize for LocalPartition {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("lease_remaining_ms", ToString::to_string(&self.lease_remaining_ms).as_str())?;
         }
+        if self.role != 0 {
+            let v = PartitionRole::try_from(self.role)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.role)))?;
+            struct_ser.serialize_field("role", &v)?;
+        }
+        if !self.replica_of.is_empty() {
+            struct_ser.serialize_field("replica_of", &self.replica_of)?;
+        }
+        if self.replica_applied_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("replica_applied_seqno", ToString::to_string(&self.replica_applied_seqno).as_str())?;
+        }
+        if self.replica_primary_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("replica_primary_seqno", ToString::to_string(&self.replica_primary_seqno).as_str())?;
+        }
+        if self.replica_lag_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("replica_lag_ms", ToString::to_string(&self.replica_lag_ms).as_str())?;
+        }
+        if self.replica_state != 0 {
+            let v = ReplicaState::try_from(self.replica_state)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replica_state)))?;
+            struct_ser.serialize_field("replica_state", &v)?;
+        }
         struct_ser.end()
     }
 }
@@ -10398,6 +10444,17 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "awaitingPeers",
             "lease_remaining_ms",
             "leaseRemainingMs",
+            "role",
+            "replica_of",
+            "replicaOf",
+            "replica_applied_seqno",
+            "replicaAppliedSeqno",
+            "replica_primary_seqno",
+            "replicaPrimarySeqno",
+            "replica_lag_ms",
+            "replicaLagMs",
+            "replica_state",
+            "replicaState",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -10416,6 +10473,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             FenceReason,
             AwaitingPeers,
             LeaseRemainingMs,
+            Role,
+            ReplicaOf,
+            ReplicaAppliedSeqno,
+            ReplicaPrimarySeqno,
+            ReplicaLagMs,
+            ReplicaState,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10451,6 +10514,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "fenceReason" | "fence_reason" => Ok(GeneratedField::FenceReason),
                             "awaitingPeers" | "awaiting_peers" => Ok(GeneratedField::AwaitingPeers),
                             "leaseRemainingMs" | "lease_remaining_ms" => Ok(GeneratedField::LeaseRemainingMs),
+                            "role" => Ok(GeneratedField::Role),
+                            "replicaOf" | "replica_of" => Ok(GeneratedField::ReplicaOf),
+                            "replicaAppliedSeqno" | "replica_applied_seqno" => Ok(GeneratedField::ReplicaAppliedSeqno),
+                            "replicaPrimarySeqno" | "replica_primary_seqno" => Ok(GeneratedField::ReplicaPrimarySeqno),
+                            "replicaLagMs" | "replica_lag_ms" => Ok(GeneratedField::ReplicaLagMs),
+                            "replicaState" | "replica_state" => Ok(GeneratedField::ReplicaState),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -10484,6 +10553,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut fence_reason__ = None;
                 let mut awaiting_peers__ = None;
                 let mut lease_remaining_ms__ = None;
+                let mut role__ = None;
+                let mut replica_of__ = None;
+                let mut replica_applied_seqno__ = None;
+                let mut replica_primary_seqno__ = None;
+                let mut replica_lag_ms__ = None;
+                let mut replica_state__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -10576,6 +10651,48 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Role => {
+                            if role__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("role"));
+                            }
+                            role__ = Some(map_.next_value::<PartitionRole>()? as i32);
+                        }
+                        GeneratedField::ReplicaOf => {
+                            if replica_of__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaOf"));
+                            }
+                            replica_of__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ReplicaAppliedSeqno => {
+                            if replica_applied_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaAppliedSeqno"));
+                            }
+                            replica_applied_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::ReplicaPrimarySeqno => {
+                            if replica_primary_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaPrimarySeqno"));
+                            }
+                            replica_primary_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::ReplicaLagMs => {
+                            if replica_lag_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaLagMs"));
+                            }
+                            replica_lag_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::ReplicaState => {
+                            if replica_state__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaState"));
+                            }
+                            replica_state__ = Some(map_.next_value::<ReplicaState>()? as i32);
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -10593,6 +10710,12 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     fence_reason: fence_reason__.unwrap_or_default(),
                     awaiting_peers: awaiting_peers__.unwrap_or_default(),
                     lease_remaining_ms: lease_remaining_ms__.unwrap_or_default(),
+                    role: role__.unwrap_or_default(),
+                    replica_of: replica_of__.unwrap_or_default(),
+                    replica_applied_seqno: replica_applied_seqno__.unwrap_or_default(),
+                    replica_primary_seqno: replica_primary_seqno__.unwrap_or_default(),
+                    replica_lag_ms: replica_lag_ms__.unwrap_or_default(),
+                    replica_state: replica_state__.unwrap_or_default(),
                 })
             }
         }
@@ -14643,6 +14766,9 @@ impl serde::Serialize for Partition {
         if self.history_epoch != 0 {
             len += 1;
         }
+        if !self.replicas.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.Partition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -14665,6 +14791,9 @@ impl serde::Serialize for Partition {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("history_epoch", ToString::to_string(&self.history_epoch).as_str())?;
         }
+        if !self.replicas.is_empty() {
+            struct_ser.serialize_field("replicas", &self.replicas)?;
+        }
         struct_ser.end()
     }
 }
@@ -14682,6 +14811,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
             "memoryBytes",
             "history_epoch",
             "historyEpoch",
+            "replicas",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -14691,6 +14821,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
             Epoch,
             MemoryBytes,
             HistoryEpoch,
+            Replicas,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -14717,6 +14848,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                             "epoch" => Ok(GeneratedField::Epoch),
                             "memoryBytes" | "memory_bytes" => Ok(GeneratedField::MemoryBytes),
                             "historyEpoch" | "history_epoch" => Ok(GeneratedField::HistoryEpoch),
+                            "replicas" => Ok(GeneratedField::Replicas),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14741,6 +14873,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                 let mut epoch__ = None;
                 let mut memory_bytes__ = None;
                 let mut history_epoch__ = None;
+                let mut replicas__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -14779,6 +14912,12 @@ impl<'de> serde::Deserialize<'de> for Partition {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Replicas => {
+                            if replicas__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicas"));
+                            }
+                            replicas__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(Partition {
@@ -14787,6 +14926,7 @@ impl<'de> serde::Deserialize<'de> for Partition {
                     epoch: epoch__.unwrap_or_default(),
                     memory_bytes: memory_bytes__.unwrap_or_default(),
                     history_epoch: history_epoch__.unwrap_or_default(),
+                    replicas: replicas__.unwrap_or_default(),
                 })
             }
         }
@@ -14958,6 +15098,9 @@ impl serde::Serialize for PartitionInfo {
         if self.lease_remaining_ms != 0 {
             len += 1;
         }
+        if self.replica.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.PartitionInfo", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -14991,6 +15134,9 @@ impl serde::Serialize for PartitionInfo {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("lease_remaining_ms", ToString::to_string(&self.lease_remaining_ms).as_str())?;
         }
+        if let Some(v) = self.replica.as_ref() {
+            struct_ser.serialize_field("replica", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -15013,6 +15159,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
             "awaitingPeers",
             "lease_remaining_ms",
             "leaseRemainingMs",
+            "replica",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15025,6 +15172,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
             FenceReason,
             AwaitingPeers,
             LeaseRemainingMs,
+            Replica,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -15054,6 +15202,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                             "fenceReason" | "fence_reason" => Ok(GeneratedField::FenceReason),
                             "awaitingPeers" | "awaiting_peers" => Ok(GeneratedField::AwaitingPeers),
                             "leaseRemainingMs" | "lease_remaining_ms" => Ok(GeneratedField::LeaseRemainingMs),
+                            "replica" => Ok(GeneratedField::Replica),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -15081,6 +15230,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                 let mut fence_reason__ = None;
                 let mut awaiting_peers__ = None;
                 let mut lease_remaining_ms__ = None;
+                let mut replica__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -15135,6 +15285,12 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Replica => {
+                            if replica__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replica"));
+                            }
+                            replica__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(PartitionInfo {
@@ -15146,6 +15302,7 @@ impl<'de> serde::Deserialize<'de> for PartitionInfo {
                     fence_reason: fence_reason__.unwrap_or_default(),
                     awaiting_peers: awaiting_peers__.unwrap_or_default(),
                     lease_remaining_ms: lease_remaining_ms__.unwrap_or_default(),
+                    replica: replica__,
                 })
             }
         }
@@ -15258,6 +15415,80 @@ impl<'de> serde::Deserialize<'de> for PartitionRequest {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.PartitionRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PartitionRole {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Unspecified => "PARTITION_ROLE_UNSPECIFIED",
+            Self::Owner => "PARTITION_ROLE_OWNER",
+            Self::Replica => "PARTITION_ROLE_REPLICA",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionRole {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "PARTITION_ROLE_UNSPECIFIED",
+            "PARTITION_ROLE_OWNER",
+            "PARTITION_ROLE_REPLICA",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = PartitionRole;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "PARTITION_ROLE_UNSPECIFIED" => Ok(PartitionRole::Unspecified),
+                    "PARTITION_ROLE_OWNER" => Ok(PartitionRole::Owner),
+                    "PARTITION_ROLE_REPLICA" => Ok(PartitionRole::Replica),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
     }
 }
 impl serde::Serialize for PartitionSeqno {
@@ -19367,6 +19598,89 @@ impl<'de> serde::Deserialize<'de> for ReplicaInfo {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.ReplicaInfo", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for ReplicaState {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Unspecified => "REPLICA_STATE_UNSPECIFIED",
+            Self::Bootstrapping => "REPLICA_STATE_BOOTSTRAPPING",
+            Self::Following => "REPLICA_STATE_FOLLOWING",
+            Self::Behind => "REPLICA_STATE_BEHIND",
+            Self::Stopped => "REPLICA_STATE_STOPPED",
+            Self::OwnerFeedOff => "REPLICA_STATE_OWNER_FEED_OFF",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for ReplicaState {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "REPLICA_STATE_UNSPECIFIED",
+            "REPLICA_STATE_BOOTSTRAPPING",
+            "REPLICA_STATE_FOLLOWING",
+            "REPLICA_STATE_BEHIND",
+            "REPLICA_STATE_STOPPED",
+            "REPLICA_STATE_OWNER_FEED_OFF",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = ReplicaState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "REPLICA_STATE_UNSPECIFIED" => Ok(ReplicaState::Unspecified),
+                    "REPLICA_STATE_BOOTSTRAPPING" => Ok(ReplicaState::Bootstrapping),
+                    "REPLICA_STATE_FOLLOWING" => Ok(ReplicaState::Following),
+                    "REPLICA_STATE_BEHIND" => Ok(ReplicaState::Behind),
+                    "REPLICA_STATE_STOPPED" => Ok(ReplicaState::Stopped),
+                    "REPLICA_STATE_OWNER_FEED_OFF" => Ok(ReplicaState::OwnerFeedOff),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
     }
 }
 impl serde::Serialize for ReplicationBatch {

@@ -154,6 +154,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
                 node: (*node).into(),
                 epoch: 1,
                 memory_bytes: 0,
+                replicas: Vec::new(),
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -1259,6 +1260,7 @@ fn data_node_served(
             engine_memory,
             change_feed,
             reserved: None,
+            replica_run: 256,
         },
     );
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
@@ -4146,6 +4148,7 @@ fn split_nodes(
                 node: format!("n{i}"),
                 epoch: 1,
                 memory_bytes: 0,
+                replicas: Vec::new(),
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -4925,6 +4928,7 @@ mod memory;
 mod metrics;
 mod moving;
 mod open;
+mod replicas;
 mod restore;
 mod several;
 mod stamp;

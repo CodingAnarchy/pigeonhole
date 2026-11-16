@@ -6100,6 +6100,12 @@ pub struct Partition {
     /// before ticket 6, when no epoch had moved.
     #[prost(uint64, tag = "5")]
     pub history_epoch: u64,
+    /// The nodes holding a read replica of P (D328, #1851), in order of preference: each a
+    /// `Node.id`, none P's `node`, none twice. A replica copy follows P's owner's change feed
+    /// (which must be on) and serves reads that allow a bounded staleness; it never takes a
+    /// write or P's lease. A change to this alone is no move: P's epoch stays. (6 is unused.)
+    #[prost(string, repeated, tag = "7")]
+    pub replicas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -6289,6 +6295,26 @@ pub struct LocalPartition {
     /// (`awaiting_peers` is then true). A partition serves only while it holds one.
     #[prost(uint64, tag = "14")]
     pub lease_remaining_ms: u64,
+    /// D328: whether this node holds P as its owner or as one of `Partition.replicas`.
+    #[prost(enumeration = "PartitionRole", tag = "15")]
+    pub role: i32,
+    /// For a replica copy (D328): the node it follows, P's owner in this node's map.
+    #[prost(string, tag = "16")]
+    pub replica_of: ::prost::alloc::string::String,
+    /// For a replica copy: the owner's seqno of P it applied through.
+    #[prost(uint64, tag = "17")]
+    pub replica_applied_seqno: u64,
+    /// For a replica copy: the owner's durable frontier of P, as its last message said.
+    #[prost(uint64, tag = "18")]
+    pub replica_primary_seqno: u64,
+    /// For a replica copy: milliseconds since it last heard it was caught up, on its own
+    /// clock (the owner sends a caught-up message at least once a second while idle). It
+    /// grows from the moment the owner's stream stops.
+    #[prost(uint64, tag = "19")]
+    pub replica_lag_ms: u64,
+    /// For a replica copy: where its follower is.
+    #[prost(enumeration = "ReplicaState", tag = "20")]
+    pub replica_state: i32,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -6725,6 +6751,84 @@ impl FenceReason {
             "FENCE_REASON_OPERATOR" => Some(Self::Operator),
             "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
             "FENCE_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
+            _ => None,
+        }
+    }
+}
+/// D328: how a node holds a partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PartitionRole {
+    Unspecified = 0,
+    /// The map's `Partition.node`: it takes writes and holds P's lease.
+    Owner = 1,
+    /// One of `Partition.replicas`: a read-only copy following the owner.
+    Replica = 2,
+}
+impl PartitionRole {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PARTITION_ROLE_UNSPECIFIED",
+            Self::Owner => "PARTITION_ROLE_OWNER",
+            Self::Replica => "PARTITION_ROLE_REPLICA",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PARTITION_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "PARTITION_ROLE_OWNER" => Some(Self::Owner),
+            "PARTITION_ROLE_REPLICA" => Some(Self::Replica),
+            _ => None,
+        }
+    }
+}
+/// D328: a replica copy's follower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReplicaState {
+    Unspecified = 0,
+    /// Downloading and installing a copy of P from its owner (the first, or again after its
+    /// position expired: the old copy serves meanwhile).
+    Bootstrapping = 1,
+    /// Following the owner's feed.
+    Following = 2,
+    /// Not following, after an error (`LocalPartition.error` says which): it retries.
+    Behind = 3,
+    /// Not following: the copy is closing, or the node is stopping.
+    Stopped = 4,
+    /// The owner's change feed for P is off, so there is nothing to follow: start the owner's
+    /// node with `--change-feed`. It asks again every 30 s.
+    OwnerFeedOff = 5,
+}
+impl ReplicaState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REPLICA_STATE_UNSPECIFIED",
+            Self::Bootstrapping => "REPLICA_STATE_BOOTSTRAPPING",
+            Self::Following => "REPLICA_STATE_FOLLOWING",
+            Self::Behind => "REPLICA_STATE_BEHIND",
+            Self::Stopped => "REPLICA_STATE_STOPPED",
+            Self::OwnerFeedOff => "REPLICA_STATE_OWNER_FEED_OFF",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REPLICA_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "REPLICA_STATE_BOOTSTRAPPING" => Some(Self::Bootstrapping),
+            "REPLICA_STATE_FOLLOWING" => Some(Self::Following),
+            "REPLICA_STATE_BEHIND" => Some(Self::Behind),
+            "REPLICA_STATE_STOPPED" => Some(Self::Stopped),
+            "REPLICA_STATE_OWNER_FEED_OFF" => Some(Self::OwnerFeedOff),
             _ => None,
         }
     }
@@ -8256,6 +8360,10 @@ pub struct PartitionInfo {
     /// partition's lease here; 0 when it holds none.
     #[prost(uint64, tag = "8")]
     pub lease_remaining_ms: u64,
+    /// Set for a replica copy of P on this node (D328): its follower, as a single node's
+    /// replica reports in `InfoResponse` (`primary` is the owner node's address).
+    #[prost(message, optional, tag = "9")]
+    pub replica: ::core::option::Option<ReplicaInfo>,
 }
 /// `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty
 /// acts on every partition the map gives the node that's open (the ones `Info` lists), trying

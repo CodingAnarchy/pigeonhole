@@ -4938,3 +4938,36 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
   - **Who holds the lock:** the in-flight `fdatasync`'s writeback walk locks each dirty folio it reaches while it builds and submits the bio. It reaches every dirty page of the file, including those dirtied after the sync was submitted, not only the page holding the sync's target. So a pad moves a group to fresh pages that the same walk then locks, and the Problem paragraph's premise (only the tail page is at risk) does not hold.
   - **Why the hold lasts milliseconds** (inferred): submit_bio blocks in the block layer's wbt throttle with the folio still locked. g116 counted about 22M `rq_qos_wait` calls on the io_uring sync workers, and 2.53 s of the WAL thread's 2.69 s of fsync time in wbt.
 - **What #1708 tries next:** a g69-session A/B with wbt on and off on the WAL device (g118). If the stalls go, the remedy is a host-tuning note, not a format or code change. If not, the remaining levers are WAL I/O designs (direct or uncached writes, range-limited writeback before the sync), each its own decision.
+
+<a id="d328"></a>
+## D328 — Read replicas of a cluster partition: the map lists them, each follows its partition's owner under the owner's lease (cli692, design; owner, 2026-11-14; reviewed by simp724; cli, #1851, ICR 0117) · D317, D326
+
+**Problem (#1851).** A single node can have a read replica (`phdb serve --replica-of`, #1436), but a cluster partition can't. There's no copy that follows the partition's owner, serves bounded-staleness reads, and is ready to become its owner (#1484's failover).
+
+**Decision (the owner chose (B), 2026-11-14): replicas are recorded in the map.**
+- **The map:** `Partition.replicas` lists the nodes holding a read replica of P, in order of preference. Each must be a node of the map, none P's owner, none twice; a map that removes a node must drop it from every `replicas` list. A change to `replicas` alone is an ordinary change: not a move, no new epoch, nothing confirmed. It's set through `set-map` only (Q6). A map's writer adds the first replicas only once every node reports the `replicas` map feature.
+- **A replica copy:** a node opens `DIR/P.phdb` as a replica of P when its map lists it in `P.replicas`, while it serves and at start, and closes it (the file stays) when a map drops it. The copy is opened with its feed off and counts in the node's budgets. Copies stay outside the lease machinery (S3): never asked for, confirmed or lapsed, and never fenced. Every local write on a copy is refused; only its follower applies.
+- **Following:** `replica.rs`'s loop, given P's owner from the node's map rather than a URL.
+  - It bootstraps from the owner's `BackupDownload { partition: P, replica }`, a durable snapshot with the feed token it follows from, then calls `Replication.Follow`. Between nodes both are taken with the cluster token: cluster scope may make them.
+  - The owner serves Follow for the open partition it owns whose database the token names (the token is opaque, so it tries each); none gives `WrongPartition` (Q5).
+  - **M1:** the owner serves Follow only under P's lease (D326): a deposed owner's stream ends within L, so it can't feed a replica.
+  - **S1:** a partition with replicas needs its owner's change feed on. An owner without one answers the bootstrap and Follow with `FailedPrecondition` naming `--change-feed`, and the copy reports `OWNER_FEED_OFF`.
+  - On a break the follower reads the map again and dials P's owner now. A copy move (`move`, `relocate --copy`) keeps P's history, so the token resumes on the new owner. When the map says P's history began after the copy's bootstrap (`history_epoch` > the epoch in the copy's identity row, `e_b`: a relocate without copy, a restore, a promotion), the follower bootstraps again from the new owner instead, since the owner can't tell which partition another database's token was for.
+- **Freshness** is measured on the replica: the time since its owner last said it was caught up (a batch with `caught_up`, sent at least once a second while idle). A stopped stream ages it at once.
+- **Status and Info:** `LocalPartition.role` (owner or replica); for a copy, the owner it follows, the applied and primary seqnos, `lag_ms` and `replica_state` (bootstrapping, following, behind, stopped, owner feed off). `Admin.Info` lists each copy with its `ReplicaInfo`, and `/metrics` carries each copy's replica gauges labelled by partition.
+- **Reads (PR 2):** opt in per request with a max-lag bound (`x-pigeonhole-read-replica-max-lag-ms`), checked by the replica on its own clock, falling back to the next replica, then the owner. Read-your-writes per partition with `x-pigeonhole-min-primary-seqno`. A routed scan checks the bound before each page (S2). The response says who served it and at what seqno (Q7). Off by default, no server-wide default (Q9).
+- **Promotion (PR 3):** `phdb cluster promote P --to ID` closes ID's copy and stamps and maps it as relocate does. `--old-unreachable` reports the loss of acknowledged writes, with no extra flag (Q8).
+
+**Amendments while building PR 1 (2026-11-15, agreed with simp724).**
+- **The copy's identity epoch isn't kept current.** The design had the follower record the owner's epoch in its copy's identity row on each reconnect, but the engine refuses local writes on a replica database (R6). The copy keeps the owner's epoch from its bootstrap snapshot, `e_b`. Promote (PR 3) accepts the copy when `history_epoch <= e_b <=` the map's epoch, stamps from `e_b`, and checks that the copy's feed position belongs to that history. The same comparison makes the follower bootstrap again after a new history (above).
+- **S4 is a refusal until PR 3.** A `move`, `relocate` or `restore --partition` to a node in `P.replicas` is refused, by the CLI and on the node by `Stamp` while a replica copy of P is open there (an upload only stages; only the stamp installs into `P.phdb`). The steps: set a map without that node in P's replicas, `drop-partition` P on it, run the command again. PR 3 does the drop and close itself, before the stamp, as promote does.
+
+**What it costs.**
+- A copy is a whole engine on its node: memory, shards and compaction counted as a partition's.
+- The owner reads its feed once more per replica, and keeps feed history for a replica's outage (a replica behind its partition's share of `--change-feed` bootstraps again).
+- Nothing on a request's path in PR 1: no routed call reaches a copy until PR 2.
+
+**Rejected.**
+- *(A), replicas as separate single-node replicas of each partition* (`--replica-of` per partition): nothing records them, so routing and #1484 couldn't find them.
+- *Replicas holding P's lease, or counting in its grants:* a replica serves only bounded-stale reads, which its own freshness covers, and a lease would make a replica a second owner.
+- *Forwarding Follow between nodes:* a long stream would cross two hops; the replica dials P's owner itself.
