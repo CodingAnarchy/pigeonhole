@@ -3329,9 +3329,12 @@ mod tests {
                 let _ = wait.recv();
             });
             parked.recv().unwrap();
+            // Buffered: the hub reads the same commits either way, and 3000 group-syncs took
+            // about a minute on Windows CI (#1961).
             for i in 0..BACKLOG {
                 t.mutate(format!("r{i}").as_bytes())
                     .put("f", b"q", b"v")
+                    .durability(pigeonhole::Durability::Buffered)
                     .commit()
                     .unwrap();
             }
