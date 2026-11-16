@@ -205,7 +205,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      # A pinned toolchain, never `stable`, for the same reason as the image: a new rustc moves
+      # the counts (1.100 did, #1796), so a stable release would fail or pass the ceilings on
+      # its own. Bumping it is a re-baseline of every ceiling in the same PR, as for the image
+      # (#1795).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           # (#1961) PR runs restore main's caches without saving their own.
