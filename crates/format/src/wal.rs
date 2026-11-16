@@ -76,6 +76,13 @@ pub const PAD_FRAGMENT: u8 = 5;
 /// feed segments (D310) can keep pads long after a checkpoint.
 pub const INCOMPAT_WAL_PAD: u64 = 1 << 1;
 
+/// `incompat` bit 2 (D329): the WAL may hold [`WalRecord::ExternalPrepare`] and
+/// [`WalRecord::ExternalAbort`] records, which a build without D329 would refuse mid-replay
+/// or mid-feed. Set in both superblock pages before the first external PREPARE is appended,
+/// and never cleared: as with [`INCOMPAT_WAL_PAD`], retained feed segments (D310) can keep
+/// such records long after a checkpoint, for a feed resumed from before them.
+pub const INCOMPAT_EXTERNAL_PREPARE: u64 = 1 << 2;
+
 /// The header in frame 0 of every segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -571,6 +578,11 @@ pub enum RecordType {
     /// The coordinator's decision, naming the seqno and timestamp the commit applies at
     /// (D263).
     Decision = 4,
+    /// A participant's share of a transaction prepared for an external coordinator, with its
+    /// xid, every participant stream and its read set (D329, `incompat` bit 2).
+    ExternalPrepare = 5,
+    /// An externally prepared transaction aborted, at a seqno of its own (D329).
+    ExternalAbort = 6,
 }
 
 /// A decoded WAL record, borrowing its batch bytes. Non-exhaustive: a later format may add
@@ -619,6 +631,194 @@ pub enum WalRecord<'a> {
         /// Participant streams.
         participants: StreamList<'a>,
     },
+    /// A share of a transaction prepared for an external coordinator (D329): like
+    /// [`WalRecord::Prepare`], but in doubt until a [`WalRecord::Decision`] (commit) or a
+    /// [`WalRecord::ExternalAbort`] on the `coordinator` stream decides it, across a crash
+    /// and a reopen. Its read set is logged, so a reopen holds the rows it read again.
+    ExternalPrepare {
+        /// The commit's id, reserved by the coordinator.
+        seqno: Seqno,
+        /// The stream that holds the decision.
+        coordinator: StreamId,
+        /// The xid, the participants and the read set, then this participant's mutations.
+        share: ExternalShare<'a>,
+    },
+    /// An externally prepared transaction aborted (D329): its PREPAREs are dropped. Written
+    /// on the coordinator's stream, at a seqno of its own (`abort_seqno`), so a feed's
+    /// frontier passes it and an idle reader looks again.
+    ExternalAbort {
+        /// The commit's id (the PREPAREs' seqno field).
+        seqno: Seqno,
+        /// The seqno the abort was reserved at: nothing applies there.
+        abort_seqno: Seqno,
+        /// The xid and the participants (no read set, no mutations).
+        share: ExternalShare<'a>,
+    },
+}
+
+/// An external share's encoded fields (D329, FORMAT §10.3): `xid` (varint-length bytes),
+/// `participants` (a [`StreamList`], length-prefixed by a `u32 LE`), the read set (`count
+/// u32 LE`, then each read as table `u32 LE`, family `u32 LE`, row as varint-length bytes,
+/// and a qualifier flag `u8`, 0 for a whole family or 1 followed by varint-length bytes),
+/// then, in an [`WalRecord::ExternalPrepare`], the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalShare<'a> {
+    /// The whole encoded body, for [`WalRecord::split`].
+    body: &'a [u8],
+    xid: &'a [u8],
+    participants: StreamList<'a>,
+    reads: &'a [u8],
+    read_count: u32,
+    batch: Option<BatchRef<'a>>,
+}
+
+/// A read in an [`ExternalShare`]'s read set: a cell (`qualifier` set) or a whole family
+/// of a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalRead<'a> {
+    /// The table.
+    pub table: TableId,
+    /// The family.
+    pub family: FamilyId,
+    /// The row.
+    pub row: &'a [u8],
+    /// The cell's qualifier, or `None` for the whole family.
+    pub qualifier: Option<&'a [u8]>,
+}
+
+impl<'a> ExternalShare<'a> {
+    /// The transaction's external id.
+    pub fn xid(&self) -> &'a [u8] {
+        self.xid
+    }
+
+    /// Every participant stream of the transaction, the coordinator's included.
+    pub fn participants(&self) -> StreamList<'a> {
+        self.participants
+    }
+
+    /// The batch: `Some` in an [`WalRecord::ExternalPrepare`], `None` in an abort.
+    pub fn batch(&self) -> Option<BatchRef<'a>> {
+        self.batch
+    }
+
+    /// The reads this participant validated, in order.
+    pub fn reads(&self) -> impl Iterator<Item = crate::Result<ExternalRead<'a>>> + 'a {
+        let mut r = Reader::new(self.reads, "wal external read set");
+        (0..self.read_count).map(move |_| {
+            let table = TableId(r.u32()?);
+            let family = FamilyId(r.u32()?);
+            let row = r.bytes()?;
+            let qualifier = match r.u8()? {
+                0 => None,
+                1 => Some(r.bytes()?),
+                _ => {
+                    return Err(Error::Corrupt {
+                        what: "wal external read qualifier flag",
+                    });
+                }
+            };
+            Ok(ExternalRead {
+                table,
+                family,
+                row,
+                qualifier,
+            })
+        })
+    }
+
+    /// Encodes a share's fields into `out`: `xid`, `participants`, `reads`, then `batch`'s
+    /// bytes if it has one. The result is a record body for [`ExternalShare::decode`].
+    pub fn encode<'r>(
+        xid: &[u8],
+        participants: &[StreamId],
+        reads: impl ExactSizeIterator<Item = ExternalRead<'r>>,
+        batch: Option<BatchRef<'_>>,
+        out: &mut Vec<u8>,
+    ) -> crate::Result<()> {
+        if xid.is_empty() || xid.len() > MAX_KEY_PART {
+            return Err(Error::InvalidArgument {
+                what: "an external xid is 1 to MAX_KEY_PART bytes",
+            });
+        }
+        crate::varint::put_bytes(out, xid);
+        let mut list = Vec::with_capacity(2 + 4 * participants.len());
+        StreamList::encode(participants, &mut list)?;
+        out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+        out.extend_from_slice(&list);
+        let count = u32::try_from(reads.len()).map_err(|_| Error::InvalidArgument {
+            what: "an external share's read set is at most u32::MAX reads",
+        })?;
+        out.extend_from_slice(&count.to_le_bytes());
+        for read in reads {
+            out.extend_from_slice(&read.table.0.to_le_bytes());
+            out.extend_from_slice(&read.family.0.to_le_bytes());
+            crate::varint::put_bytes(out, read.row);
+            match read.qualifier {
+                None => out.push(0),
+                Some(q) => {
+                    out.push(1);
+                    crate::varint::put_bytes(out, q);
+                }
+            }
+        }
+        if let Some(b) = batch {
+            out.extend_from_slice(b.as_bytes());
+        }
+        Ok(())
+    }
+
+    /// Decodes a share's fields from a record body; `with_batch` for an
+    /// [`WalRecord::ExternalPrepare`], whose batch is the rest. Never panics.
+    pub fn decode(bytes: &'a [u8], with_batch: bool) -> crate::Result<Self> {
+        let mut r = Reader::new(bytes, "wal external share");
+        let xid = r.bytes()?;
+        let list_len = r.u32()? as usize;
+        let participants = StreamList::new(r.take(list_len)?)?;
+        let read_count = r.u32()?;
+        let start = r.pos();
+        // Walk the reads once to find where they end (and check them).
+        for _ in 0..read_count {
+            r.u32()?;
+            r.u32()?;
+            r.bytes()?;
+            match r.u8()? {
+                0 => {}
+                1 => {
+                    r.bytes()?;
+                }
+                _ => {
+                    return Err(Error::Corrupt {
+                        what: "wal external read qualifier flag",
+                    });
+                }
+            }
+        }
+        let reads = &bytes[start..r.pos()];
+        let batch = if with_batch {
+            Some(BatchRef::new(r.rest())?)
+        } else if r.remaining() != 0 {
+            return Err(Error::Corrupt {
+                what: "wal external abort length",
+            });
+        } else {
+            None
+        };
+        Ok(Self {
+            body: bytes,
+            xid,
+            participants,
+            reads,
+            read_count,
+            batch,
+        })
+    }
+
+    /// The encoded body this share was decoded from, re-encoded unchanged by
+    /// [`WalRecord::split`].
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.body
+    }
 }
 
 /// The longest record head [`WalRecord::split`] writes: a DECISION's type, id, seqno and
@@ -681,6 +881,26 @@ impl WalRecord<'_> {
                 head[17..25].copy_from_slice(&commit_ts.to_le_bytes());
                 (25, participants.bytes)
             }
+            WalRecord::ExternalPrepare {
+                seqno,
+                coordinator,
+                share,
+            } => {
+                head[0] = RecordType::ExternalPrepare as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                head[9..13].copy_from_slice(&coordinator.0.to_le_bytes());
+                (13, share.as_bytes())
+            }
+            WalRecord::ExternalAbort {
+                seqno,
+                abort_seqno,
+                share,
+            } => {
+                head[0] = RecordType::ExternalAbort as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                head[9..17].copy_from_slice(&abort_seqno.to_le_bytes());
+                (17, share.as_bytes())
+            }
         };
         (&head[..len], body)
     }
@@ -721,6 +941,16 @@ impl WalRecord<'_> {
                 apply_seqno: r.u64()?,
                 commit_ts: r.u64()?,
                 participants: StreamList::new(r.rest())?,
+            }),
+            5 => Ok(WalRecord::ExternalPrepare {
+                seqno: r.u64()?,
+                coordinator: StreamId(r.u32()?),
+                share: ExternalShare::decode(r.rest(), true)?,
+            }),
+            6 => Ok(WalRecord::ExternalAbort {
+                seqno: r.u64()?,
+                abort_seqno: r.u64()?,
+                share: ExternalShare::decode(r.rest(), false)?,
             }),
             t => Err(Error::UnsupportedFeature {
                 what: "wal record type",
