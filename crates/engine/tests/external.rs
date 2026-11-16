@@ -204,3 +204,31 @@ fn a_reopen_with_another_shard_count_is_refused_while_shares_are_in_doubt() {
         .close()
         .unwrap();
 }
+
+#[test]
+fn past_the_in_doubt_limits_a_prepare_is_busy() {
+    let vfs = SimVfs::new(25);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    db.set_in_doubt_limits(2, 0);
+    for (i, xid) in [&b"l1"[..], b"l2"].into_iter().enumerate() {
+        let row = format!("r{i}");
+        txn(&db, &t, row.as_bytes(), &[row.as_bytes()], b"v")
+            .prepare(xid, Durability::GroupSync)
+            .unwrap();
+    }
+    assert!(matches!(
+        txn(&db, &t, b"r9", &[b"r9"], b"v").prepare(b"l3", Durability::GroupSync),
+        Err(Error::Busy)
+    ));
+    // One decided frees its place.
+    db.decide(b"l1", false).unwrap();
+    txn(&db, &t, b"r9", &[b"r9"], b"v")
+        .prepare(b"l3", Durability::GroupSync)
+        .unwrap();
+    db.decide(b"l2", true).unwrap();
+    db.decide(b"l3", true).unwrap();
+    db.close().unwrap();
+}

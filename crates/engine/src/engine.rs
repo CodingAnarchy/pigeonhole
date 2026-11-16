@@ -1729,6 +1729,7 @@ impl Engine {
                                 id: *seqno,
                                 coordinator: ShardId(coordinator.0 as u16),
                                 prepared_at: now,
+                                bytes: bytes.len() as u64,
                             },
                         );
                 }
@@ -2415,6 +2416,12 @@ impl Engine {
     /// ago it was prepared, in nanoseconds.
     pub fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
         self.inner.in_doubt()
+    }
+
+    /// The in-doubt limits (D329): past `max_shares` transactions in doubt, or `max_bytes`
+    /// of their batches, a new [`Txn::prepare`] answers `Busy`. 0: no limit.
+    pub fn set_in_doubt_limits(&self, max_shares: usize, max_bytes: u64) {
+        self.inner.set_in_doubt_limits(max_shares, max_bytes);
     }
 
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
@@ -5586,16 +5593,30 @@ impl Inner {
                 "an external xid is 1 byte to 64 KiB".to_owned(),
             ));
         }
-        if self
-            .shared
-            .external
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(xid)
         {
-            return Err(Error::InvalidArgument(
-                "this xid is prepared here already: decide it first".to_owned(),
-            ));
+            let registry = self
+                .shared
+                .external
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if registry.contains_key(xid) {
+                return Err(Error::InvalidArgument(
+                    "this xid is prepared here already: decide it first".to_owned(),
+                ));
+            }
+            // The in-doubt limits (D329): past either, no new share, so a home that stopped
+            // deciding can't grow the WAL its shares pin without bound.
+            let (max_shares, max_bytes) = *self
+                .shared
+                .external_limits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let bytes: u64 = registry.values().map(|e| e.bytes).sum();
+            if (max_shares > 0 && registry.len() >= max_shares)
+                || (max_bytes > 0 && bytes >= max_bytes)
+            {
+                return Err(Error::Busy);
+            }
         }
         let view = self.shared.view.load();
         let (builder, mut shards) = self.route(batch, &view)?;
@@ -5673,6 +5694,16 @@ impl Inner {
             })?;
         let info = crate::write::wait_blocking(&self.shared, &mut waiter, false)?;
         Ok((info.seqno != 0).then_some(info))
+    }
+
+    /// Sets the in-doubt limits (D329, ICR 0140): past `max_shares` transactions in doubt,
+    /// or `max_bytes` of their batches, a new prepare answers `Busy`. 0: no limit.
+    pub(crate) fn set_in_doubt_limits(&self, max_shares: usize, max_bytes: u64) {
+        *self
+            .shared
+            .external_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (max_shares, max_bytes);
     }
 
     /// The externally prepared transactions in doubt here (D329): each one's xid, and how
@@ -7461,6 +7492,7 @@ impl Shared {
             keep_locks: AtomicBool::new(false),
             external_flagged: AtomicBool::new(false),
             external: Mutex::new(std::collections::BTreeMap::new()),
+            external_limits: Mutex::new((0, 0)),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,

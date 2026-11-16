@@ -540,6 +540,9 @@ pub(crate) struct Shared {
     /// always finds it), removed by the coordinator once decided, read by `Engine::decide`
     /// and `Engine::in_doubt`.
     pub external: Mutex<BTreeMap<Vec<u8>, ExternalEntry>>,
+    /// `Engine::set_in_doubt_limits` (D329): the most shares in doubt, and the most bytes of
+    /// their batches, past which `prepare_external` refuses (`Busy`); 0 for no limit.
+    pub external_limits: Mutex<(usize, u64)>,
     /// What became of the closed instance's memtable arenas (`release_memory`, D265):
     /// `ARENAS_PENDING` until the discard ran (`ARENAS_DISCARDED`) or the OS refused it
     /// (`ARENAS_REFUSED`: the pages stay until the last mapping goes).
@@ -1559,6 +1562,8 @@ pub(crate) struct ExternalEntry {
     pub coordinator: ShardId,
     /// When it was prepared (the engine's monotonic clock), for `in_doubt`.
     pub prepared_at: u64,
+    /// Its batches' bytes across its shards, for the limits.
+    pub bytes: u64,
 }
 
 /// A transaction prepared for an external coordinator (D329, ICR 0140).
@@ -9950,6 +9955,11 @@ impl ShardState {
                         id: seqno,
                         coordinator: self.id,
                         prepared_at: ctx.now_nanos(),
+                        bytes: c
+                            .parts
+                            .iter()
+                            .map(|(_, b)| b.batch().as_bytes().len() as u64)
+                            .sum(),
                     },
                 );
             let info = CommitInfo {

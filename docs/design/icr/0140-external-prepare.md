@@ -46,7 +46,8 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 - **Close and moves:**
   - A close doesn't wait for external shares; they stay in the WAL.
   - `nothing_in_flight` ignores them.
-  - Packing (D217) skips tablets an external share touches.
+  - A tablet change (packing, D217) touching an in-doubt share is given up with `Busy` and retried later. A layout change (shard count) or spill at open with shares in doubt is refused with `Unsupported`.
+  - A PREPARE overlapping an in-doubt share fails at once with `Conflict` (a single write with `Busy`), rather than waiting on a decision that may take hours.
 - **Visibility:** an undecided share holds neither the visible watermark nor the feed's WRITTEN/SYNCED. Its id is reserved, never held, and its apply seqno is reserved at the decision.
 - **The abort's seqno (E1),** and its four conditions:
   1. The record is in the WAL before the seqno can be visible.
@@ -55,10 +56,17 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
   4. Recovery counts it and never reapplies it.
 
 ## The feed reader (E3)
-- A held type 5 is kept as its position only, not its batch, and read again when its Decision arrives.
-- It sits outside the read-ahead budget and `top_held`, so it never triggers an eviction or a cutoff.
+- A held type 5 is held as a D263 share is, with its filtered changes, and delivered at its Decision's apply seqno.
+- It sits outside the read-ahead budget (it counts 0 bytes) and `top_held`, so it never triggers an eviction or a cutoff, however long it waits.
 - The idle shortcut treats it as settled, since an abort's own seqno moves the frontier.
 - Type 6 drops the hold.
+- **Memory:** what a subscriber holds for shares in doubt is bounded only by the writer's in-doubt limits: up to `--txn-max-in-doubt-wal-bytes` (filtered to its tables) per subscriber, so N subscribers hold up to N× that. The guide says so next to the flag. perf2 accepted this for PR 1.
+- **Follow-up, #1993 (Post-1.0):** hold the position only and read the record again at its Decision, so a held share costs a few bytes whatever its batch.
+
+## Limits
+- `Engine::set_in_doubt_limits(max_shares, max_bytes)`: past either, a new prepare answers `Busy`, so a home that stops deciding can't pin unbounded WAL. The engine's default is no limit; `phdb serve` sets it from `--txn-max-in-doubt-wal-bytes` (D329 PR 2).
+- **Serve default:** 16 MiB of batches in doubt per partition, so 64 feed subscribers hold at most 1 GiB in the worst case (perf2's condition 2). Raising it is a deliberate operator choice.
+- Not supported in PR 1, and refused with `InvalidArgument`: values large enough to be stored apart (the share's batch must be whole in its record), and prepares with no writes.
 
 ## Callers
 `phdb serve` (D329 PR 2) only. Single-partition commits are unchanged. The only new branch on a commit path is `external.is_some()` in `on_prepared`.
