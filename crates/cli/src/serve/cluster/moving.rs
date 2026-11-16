@@ -817,6 +817,15 @@ pub(super) async fn copy_file(
                 stall.as_secs()
             )));
         }
+        // NEW took every byte and never answered (#1983).
+        Err(Stopped::Unanswered(bound)) => {
+            return Err(Failure::usage(&format!(
+                "node {:?} took {what} and gave no answer for {} s: run the move again to \
+                 resume",
+                new.id,
+                bound.as_secs()
+            )));
+        }
         Err(Stopped::Upload(s)) => return Err(new.failed(&format!("upload {what}"), &s)),
     };
     if !reply.complete {
