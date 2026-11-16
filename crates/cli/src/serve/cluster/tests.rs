@@ -4038,7 +4038,15 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             .await
             .unwrap()
             .into_inner();
-        assert!(made.unreconciled.is_empty(), "{made:?}");
+        // A push that took longer than the push timeout (the map's fsync and the table's
+        // create on c, on a slow runner) lists its partition as unreconciled, which the
+        // guide allows: only `orders`' partitions on another node than the writer, a, may be
+        // listed. Its node catches up by a pull, so the files are checked once it has (#1771).
+        assert!(
+            made.unreconciled.iter().all(|p| p == "p3"),
+            "only c's p3 can miss the push: {made:?}"
+        );
+        settled().await;
         assert!(has(&dbs[0], "orders") && has(&dbs[2], "orders") && !has(&dbs[1], "orders"));
         for &port in &ports {
             let mut s = schema(port).await;
