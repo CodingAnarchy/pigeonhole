@@ -87,7 +87,13 @@ fn a_prepared_transaction_waits_for_its_decision_then_commits_or_aborts() {
     txn(&db, &t, b"row00", &rows, b"two")
         .prepare(b"x2", Durability::GroupSync)
         .unwrap();
-    assert!(db.decide(b"x2", false).unwrap().is_some());
+    // The abort takes a seqno of its own but is no write: no commit is counted (perf2's E1,
+    // condition 3 on ICR 0140), and nothing reaches a memtable (the reads below).
+    let commits = |db: &Engine| db.metrics().commits.iter().sum::<u64>();
+    let before = commits(&db);
+    let a = db.decide(b"x2", false).unwrap().expect("in doubt");
+    assert!(a.seqno > c.seqno, "the abort's own seqno");
+    assert_eq!(commits(&db), before, "an abort counts no commit");
     assert!(
         rows.iter()
             .all(|r| get_bytes(&db, &t, r).as_deref() == Some(&b"one"[..]))
