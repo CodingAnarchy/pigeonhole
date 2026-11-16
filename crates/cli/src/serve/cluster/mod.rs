@@ -550,7 +550,7 @@ impl Node {
         // A lease the map no longer names this node for ends now (audit120's S1), still
         // under the state lock, so a round reads the new map only once it has (audit120's
         // M3): its request no longer asks for the partition, and frees its grants. The
-        // state lock, then the served one, as `apply_leases` takes them.
+        // state lock, then the fences' `local` one, as `apply_leases` takes them.
         if let Some((m, _)) = &st.map {
             self.fences.lapse_unnamed(m, &self.id);
         }
@@ -1235,15 +1235,17 @@ impl Node {
         }
         // Each open partition's state, and a closed one's files (D317 ticket 6).
         for lp in &mut partitions {
-            if let Some((state, reason)) = self.part_state(&lp.id) {
+            // One read (simp724's S1 on #1964): a reopen or a close between two would show
+            // the partition as neither.
+            let id = lp.id.clone();
+            if let fence::Now::Served(gate) = self.fences.now(&id, |closed| closed.describe(lp)) {
+                let (state, reason) = fence::gate_state(&gate);
                 lp.set_state(state);
                 lp.set_fence_reason(reason);
                 // Both reasons at once (#1829): an operator-fenced partition may still await
                 // its lease.
-                lp.awaiting_peers = self.awaiting_peers(&lp.id);
-                lp.lease_remaining_ms = millis(self.lease_remaining(&lp.id));
-            } else if let Some(closed) = self.fences.closed().get(&lp.id) {
-                closed.describe(lp);
+                lp.awaiting_peers = self.awaiting_peers(&id);
+                lp.lease_remaining_ms = millis(self.lease_remaining(&id));
             }
         }
         NodeStatus {

@@ -74,19 +74,47 @@ struct Served {
     epoch: u64,
 }
 
+/// What a partition is on this node at one moment, read under one lock ([`Fences::now`]).
+/// Served and closed win over an open that is running beside them.
+pub(super) enum Now {
+    /// Served here, behind this gate.
+    Served(Arc<WriteGate>),
+    Closed,
+    /// Being opened, and neither served nor closed yet.
+    Opening,
+    Nothing,
+}
+
+/// What a partition is on this node: served or closed, and whether an open of it is running.
+/// An entry that is none of them is removed.
+#[derive(Debug, Default)]
+struct Local {
+    /// Being opened while the node serves ([`Node::open_part`]): `Status` shows it opening
+    /// and doesn't read its files (#1770). Set from the open's start to its end, so beside
+    /// a closed partition's entry while it reopens, and a served one's while it reconciles.
+    opening: bool,
+    is: Is,
+}
+
+#[derive(Debug, Default)]
+enum Is {
+    #[default]
+    Neither,
+    Served(Served),
+    /// Closed here ([`Node::close`]), with its files once hashed.
+    Closed(super::close::Closed),
+}
+
 /// A node's fences.
 #[derive(Debug, Default)]
 pub(crate) struct Fences {
-    served: Mutex<BTreeMap<String, Served>>,
+    /// Each partition served, closed or being opened here, under one lock, so a partition
+    /// that changes from one to another is never seen as neither (#1830).
+    local: Mutex<BTreeMap<String, Local>>,
     /// The operator's fences as `fenced.json` has them, partitions not open here included.
     operator: Mutex<BTreeSet<String>>,
     /// One fence, unfence or close at a time, so the file follows the flags in order.
     pub(super) changing: tokio::sync::Mutex<()>,
-    /// Partitions closed here ([`Node::close`]), with their files once hashed.
-    pub(super) closed: Mutex<BTreeMap<String, super::close::Closed>>,
-    /// Partitions being opened while the node serves ([`Node::open_part`]): `Status` shows
-    /// them opening and doesn't read their files (#1770).
-    pub(super) opening: Mutex<BTreeSet<String>>,
     /// [`Node::confirm_soon`]'s rounds: one running, and whether another is owed.
     rounds: Mutex<Rounds>,
     /// [`Node::renew_leases`]'s loop is running.
@@ -182,9 +210,34 @@ impl Round {
     }
 }
 
+/// A served partition's state behind `gate`, and why it's fenced when it is.
+pub(super) fn gate_state(gate: &WriteGate) -> (LocalPartitionState, FenceReason) {
+    match gate.fenced() {
+        Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
+        Some(Fence::Unconfirmed) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
+        Some(Fence::Lapsed) => (LocalPartitionState::Fenced, FenceReason::LeaseLapsed),
+        None => (LocalPartitionState::Serving, FenceReason::Unspecified),
+    }
+}
+
 impl Fences {
-    fn served(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Served>> {
-        self.served.lock().unwrap_or_else(PoisonError::into_inner)
+    fn local(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Local>> {
+        self.local.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many partitions have an entry (tests): one that is nothing here has none.
+    #[cfg(test)]
+    pub(super) fn entries(&self) -> usize {
+        self.local().len()
+    }
+
+    /// Runs `f` on each partition served here, in id order, under the lock.
+    fn for_served(&self, mut f: impl FnMut(&str, &Served)) {
+        for (id, l) in self.local().iter() {
+            if let Is::Served(s) = &l.is {
+                f(id, s);
+            }
+        }
     }
 
     fn rounds(&self) -> std::sync::MutexGuard<'_, Rounds> {
@@ -195,29 +248,86 @@ impl Fences {
         self.operator.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(super) fn closed(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<String, super::close::Closed>> {
-        self.closed.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Whether partition `id` is being opened here.
     pub(super) fn is_opening(&self, id: &str) -> bool {
-        self.opening
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(id)
+        self.local().get(id).is_some_and(|l| l.opening)
     }
 
-    /// Partition `id` no longer served here: its gate goes with it.
-    pub(super) fn forget(&self, id: &str) {
-        self.served().remove(id);
+    /// Marks partition `id` as being opened here, or no longer.
+    pub(super) fn set_opening(&self, id: &str, opening: bool) {
+        let mut local = self.local();
+        let l = local.entry(id.to_owned()).or_default();
+        l.opening = opening;
+        if !l.opening && matches!(l.is, Is::Neither) {
+            local.remove(id);
+        }
+    }
+
+    /// Partition `id` is served here from now, behind `gate`, at its file's `epoch`. A
+    /// closed partition reopened stops being closed in the same step: its files change.
+    fn serve(&self, id: &str, gate: Arc<WriteGate>, epoch: u64) {
+        self.local().entry(id.to_owned()).or_default().is = Is::Served(Served { gate, epoch });
     }
 
     pub(super) fn gate(&self, id: &str) -> Option<(Arc<WriteGate>, u64)> {
-        self.served()
-            .get(id)
-            .map(|s| (Arc::clone(&s.gate), s.epoch))
+        match &self.local().get(id)?.is {
+            Is::Served(s) => Some((Arc::clone(&s.gate), s.epoch)),
+            _ => None,
+        }
+    }
+
+    /// What partition `id` is here, in one read, so a close or a reopen is seen before or
+    /// after and never between. `closed` runs on a closed partition's entry, under the lock,
+    /// so it can't take it again.
+    pub(super) fn now(&self, id: &str, closed: impl FnOnce(&super::close::Closed)) -> Now {
+        let local = self.local();
+        match local.get(id) {
+            Some(Local {
+                is: Is::Served(s), ..
+            }) => Now::Served(Arc::clone(&s.gate)),
+            Some(Local {
+                is: Is::Closed(c), ..
+            }) => {
+                closed(c);
+                Now::Closed
+            }
+            Some(Local { opening: true, .. }) => Now::Opening,
+            _ => Now::Nothing,
+        }
+    }
+
+    /// Partition `id` is closed here from now, as `closed`, and no longer served: its gate
+    /// goes in the same step, so it is never seen as neither.
+    pub(super) fn close(&self, id: &str, closed: super::close::Closed) {
+        self.local().entry(id.to_owned()).or_default().is = Is::Closed(closed);
+    }
+
+    /// What `f` makes of partition `id`'s close, `None` if it isn't closed here. `f` runs
+    /// under the lock, so it can't take it again.
+    pub(super) fn closed<R>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut super::close::Closed) -> R,
+    ) -> Option<R> {
+        match &mut self.local().get_mut(id)?.is {
+            Is::Closed(c) => Some(f(c)),
+            _ => None,
+        }
+    }
+
+    /// Partition `id` is no longer closed here (stamped over, or its files dropped).
+    /// Nothing for one that isn't closed.
+    pub(super) fn forget_closed(&self, id: &str) {
+        let mut local = self.local();
+        let Some(l) = local.get_mut(id) else {
+            return;
+        };
+        if matches!(l.is, Is::Closed(_)) {
+            l.is = Is::Neither;
+            if !l.opening {
+                local.remove(id);
+            }
+        }
     }
 
     /// Partitions a peer's map can still confirm: without a live lease (operator-fenced or
@@ -226,25 +336,29 @@ impl Fences {
     /// rounds don't hurry for it (audit120's S1 on #1897: a move's old node, restarted with
     /// its copy fenced, would otherwise ask its peers for ever).
     pub(crate) fn confirmable(&self, map: &ClusterMap, node: &str) -> Vec<String> {
-        self.served()
-            .iter()
-            .filter(|(id, s)| s.gate.awaiting_peers() && names(map, node, id, s.epoch))
-            .map(|(id, _)| id.clone())
-            .collect()
+        let mut out = Vec::new();
+        self.for_served(|id, s| {
+            if s.gate.awaiting_peers() && names(map, node, id, s.epoch) {
+                out.push(id.to_owned());
+            }
+        });
+        out
     }
 
     /// What a lease round asks for (D326): every partition served here that `map` names
     /// this node (`node`) for at its file's epoch, operator-fenced or not (an operator's
     /// fence stops writes, not reads).
     pub(crate) fn askable(&self, map: &ClusterMap, node: &str) -> Vec<LeasePart> {
-        self.served()
-            .iter()
-            .filter(|(id, s)| names(map, node, id, s.epoch))
-            .map(|(id, s)| LeasePart {
-                partition: id.clone(),
-                epoch: s.epoch,
-            })
-            .collect()
+        let mut out = Vec::new();
+        self.for_served(|id, s| {
+            if names(map, node, id, s.epoch) {
+                out.push(LeasePart {
+                    partition: id.to_owned(),
+                    epoch: s.epoch,
+                });
+            }
+        });
+        out
     }
 
     /// Ends the lease of every partition served here that `map` doesn't name this node
@@ -252,7 +366,7 @@ impl Fences {
     /// an install publishes the map, so a round that read the map before it either set its
     /// lease first (and this clears it) or saw the new map (and set none).
     pub(crate) fn lapse_unnamed(&self, map: &ClusterMap, node: &str) {
-        for (id, s) in self.served().iter() {
+        self.for_served(|id, s| {
             if !names(map, node, id, s.epoch) && !s.gate.awaiting_peers() {
                 s.gate.lapse();
                 eprintln!(
@@ -261,7 +375,7 @@ impl Fences {
                     map.map_version, s.epoch
                 );
             }
-        }
+        });
     }
 }
 
@@ -286,13 +400,7 @@ impl Node {
     pub(crate) fn open_gate(&self, id: &str, epoch: u64) -> Arc<WriteGate> {
         let operator = self.fences.operator().contains(id);
         let gate = WriteGate::opened(id, operator, Arc::clone(self.grants.clock()));
-        self.fences.served().insert(
-            id.to_owned(),
-            Served {
-                gate: Arc::clone(&gate),
-                epoch,
-            },
-        );
+        self.fences.serve(id, Arc::clone(&gate), epoch);
         gate
     }
 
@@ -300,26 +408,18 @@ impl Node {
     /// when it isn't open here.
     pub(crate) fn part_state(&self, id: &str) -> Option<(LocalPartitionState, FenceReason)> {
         let (gate, _) = self.fences.gate(id)?;
-        Some(match gate.fenced() {
-            Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
-            Some(Fence::Unconfirmed) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
-            Some(Fence::Lapsed) => (LocalPartitionState::Fenced, FenceReason::LeaseLapsed),
-            None => (LocalPartitionState::Serving, FenceReason::Unspecified),
-        })
+        Some(gate_state(&gate))
     }
 
     /// Partition `id`'s state as `Status` reports it, for `Admin.Info` (#1852): open
     /// ([`part_state`](Self::part_state)), else closed, else being opened. Unspecified for one
     /// the node hasn't opened (no file, or a failed open).
     pub(crate) fn local_state(&self, id: &str) -> (LocalPartitionState, FenceReason) {
-        if let Some(state) = self.part_state(id) {
-            state
-        } else if self.fences.closed().contains_key(id) {
-            (LocalPartitionState::Closed, FenceReason::Unspecified)
-        } else if self.fences.is_opening(id) {
-            (LocalPartitionState::Opening, FenceReason::Unspecified)
-        } else {
-            (LocalPartitionState::Unspecified, FenceReason::Unspecified)
+        match self.fences.now(id, |_| ()) {
+            Now::Served(gate) => gate_state(&gate),
+            Now::Closed => (LocalPartitionState::Closed, FenceReason::Unspecified),
+            Now::Opening => (LocalPartitionState::Opening, FenceReason::Unspecified),
+            Now::Nothing => (LocalPartitionState::Unspecified, FenceReason::Unspecified),
         }
     }
 
@@ -378,7 +478,7 @@ impl Node {
         // The checks first, at the epoch of the open partition or of the closed one's file:
         // a refused unfence leaves a closed partition closed, its hashes kept (simp724's N1
         // on #1826).
-        let closed = self.fences.closed().get(id).map(|c| c.epoch);
+        let closed = self.fences.closed(id, |c| c.epoch);
         let (epoch, unconfirmed) = match closed {
             Some(epoch) => (epoch, false),
             None => {
@@ -767,8 +867,7 @@ impl Node {
         if st.version() != round.map.map_version {
             return;
         }
-        let served = self.fences.served();
-        for (id, s) in served.iter() {
+        self.fences.for_served(|id, s| {
             if !round.leased(&self.id, id, s.epoch) {
                 // A renewal that failed while the lease still runs: said each round until it
                 // runs out, so the log shows why a partition stopped serving.
@@ -780,10 +879,10 @@ impl Node {
                         s.gate.lease_remaining().as_millis()
                     );
                 }
-                continue;
+                return;
             }
             if !s.gate.renew(end) {
-                continue;
+                return;
             }
             if s.gate.operator_fenced() {
                 eprintln!(
@@ -802,7 +901,7 @@ impl Node {
                     round.map.map_version
                 );
             }
-        }
+        });
     }
 
     /// Pushes `map` to the peer at `address` (a round's catch-up of a peer that's behind).

@@ -331,6 +331,24 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 
   Raise it on a feed-heavy server with CPUs to spare, whose subscribers matter more than its writes' latency. The feed dump (below) shows hubs' engine feeds falling behind the database.
 
+  **Waiting to batch (#1901).** A hub that keeps up reads its feed once per commit, so under steady writes each hub thread can stay busy waking. `--feed-hub-coalesce-ticks N` makes a hub that just read a small batch (a few commits) wait N timer ticks (1 ms each) before reading again, so the commits arriving meanwhile are read together.
+  - **The cost:** up to N to N+1 ms more lag, and only under steady writes. A commit after a quiet gap is read at once.
+  - **Clients:** `--feed-client-coalesce-ticks N` does the same for each subscriber's stream.
+  - **Default:** 1 tick for hubs on Linux, 0 on Windows, macOS and other systems; 0 for clients everywhere. On the reference machine, a Linux server (16 table sets × 16 streams, 2 hub threads, g114 on #1938):
+    - At 20K puts/s, the hub threads went from 1.92 cores to 0.69, the feed threads from 2.7 to 1.0, and CPU per delivered event fell 42%. Feed lag p99 rose from 1.4 ms to about 3.5 ms.
+    - At 2K puts/s, CPU per delivered event fell 39%, and lag p99 rose from 0.6 ms to 2.2–2.8 ms.
+    - **For the lowest lag,** set `--feed-hub-coalesce-ticks 0`. At 20K puts/s, its lag p99 was 0.7 ms, at about 3% more CPU per event than before #1901.
+  - **A tick lasts longer outside Linux.** The wait is a tokio timer, and how long a 1-tick wait really lasts depends on the OS timer under it. It also depends on whether anything else wakes the hub threads meanwhile, as other busy hubs do:
+
+    | OS | hub threads otherwise idle: p50 (p99) | hub threads busy: p50 |
+    |---|--:|--:|
+    | Linux | 2.1 ms (2.1 ms) | 2.0 ms |
+    | Windows | 13.6 ms (16 ms) | 2.0 ms |
+    | macOS | 3–10 ms (up to 30 ms) | 2.0 ms |
+
+    Measured with tokio 1.54.1 on GitHub's runners and an Apple-silicon Mac (#1938). Windows' timer ticks every 15.6 ms, and macOS coalesces timer wakes. A server with few hubs would pay about 14–16 ms of lag per wait on Windows, and 3–10 ms (up to 30 ms) on macOS, so the default doesn't wait there. **On Windows or macOS,** a server with many busy hubs can opt in with `--feed-hub-coalesce-ticks 1`.
+  - **Batched notifies:** whatever these are set to, a hub tells its streams about new commits once per batch it reads, not once per commit.
+
   **At saturation, writes come first.** When the feed side can't deliver every commit, the writes still get the rate they ask for, and feed streams fall behind and catch up. `pigeonhole_serve_feed_fell_behind_total` and the streams' lag show it.
   - On the AX102 at 16 table sets × 16 streams and 55K puts/s, about 14M events/s didn't fit in 3 feed threads and 1 hub thread. More hub threads delivered less.
   - Size the feed side for headroom. #1737 tracks scaling it.

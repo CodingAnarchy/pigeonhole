@@ -137,9 +137,7 @@ impl Node {
         // it: held through an `if let`'s body, the second lock never returned.
         let failed = self
             .fences
-            .closed()
-            .get(id)
-            .map(|closed| matches!(closed.files, Hashing::Failed(_)));
+            .closed(id, |closed| matches!(closed.files, Hashing::Failed(_)));
         if let Some(failed) = failed {
             if failed {
                 self.hash_soon(id);
@@ -197,9 +195,8 @@ impl Node {
         let mut parts = (*cluster.parts.load_full()).clone();
         let service = parts.remove(id).ok_or_else(|| super::fence::not_here(id))?;
         cluster.parts.store(Arc::new(parts.clone()));
-        self.fences.forget(id);
-        self.fences.closed().insert(
-            id.to_owned(),
+        self.fences.close(
+            id,
             Closed {
                 epoch,
                 files: Hashing::Running,
@@ -245,14 +242,14 @@ impl Node {
         // record stops saying it's still closing, so Status shows its error rather than
         // waiting on it for ever (cli692's nit on #1769).
         let joined = closed.as_ref().err().map(ToString::to_string);
-        if let Some(c) = self.fences.closed().get_mut(id) {
+        self.fences.closed(id, |c| {
             c.db_open = false;
             match (&closed, &joined) {
                 (_, Some(e)) => c.error = Some(format!("the close's task failed: {e}")),
                 (Ok(Err(e)), None) => c.error = Some(e.to_string()),
                 _ => {}
             }
-        }
+        });
         let closed = closed?;
         if let Err(e) = closed {
             eprintln!("phdb serve: partition {id} closed, and its close reported: {e}");
@@ -287,16 +284,14 @@ impl Node {
         id: &str,
         name: &str,
     ) -> Result<(PathBuf, PartitionFile), ApiError> {
-        let closed = self.fences.closed();
-        let file = closed
-            .get(id)
+        let file = self
+            .fences
+            .closed(id, |closed| closed.file(id, name).cloned())
             .ok_or_else(|| {
                 ApiError::failed_precondition(format!(
                     "partition {id:?} isn't closed on this node: fence and close it first"
                 ))
-            })?
-            .file(id, name)?
-            .clone();
+            })??;
         let mut path = self.dir.join(format!("{id}.phdb")).into_os_string();
         path.push(&file.name);
         Ok((PathBuf::from(path), file))
@@ -308,7 +303,7 @@ impl Node {
         let Some(node) = self.me.upgrade() else {
             return;
         };
-        let Some(generation) = self.fences.closed().get_mut(id).map(|c| {
+        let Some(generation) = self.fences.closed(id, |c| {
             c.files = Hashing::Running;
             c.generation
         }) else {
@@ -326,11 +321,11 @@ impl Node {
             };
             // Still this close: a reopen meanwhile dropped it, and a later close of the same
             // partition has its own hash (cli692's S2).
-            if let Some(c) = node.fences.closed().get_mut(&id)
-                && c.generation == generation
-            {
-                c.files = files;
-            }
+            node.fences.closed(&id, |c| {
+                if c.generation == generation {
+                    c.files = files;
+                }
+            });
         });
     }
 }
@@ -413,7 +408,7 @@ impl Node {
         let dir = self.dir.clone();
         let part = id.to_owned();
         let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await??;
-        self.fences.closed().remove(id);
+        self.fences.forget_closed(id);
         eprintln!(
             "phdb serve: partition {id}'s files moved to {}: delete it once checked",
             lp.file
@@ -496,6 +491,55 @@ mod tests {
             error: None,
             db_open: false,
         }
+    }
+
+    #[test]
+    fn a_partition_is_one_thing_at_a_time_here_and_gone_when_it_is_nothing() {
+        use crate::serve::proto::LocalPartitionState::{
+            Closed as IsClosed, Fenced, Opening, Unspecified,
+        };
+        let dir = pigeonhole::doc_support::temp_dir();
+        let n = super::super::tests::node(&dir, "a");
+        let state = || n.local_state("p1").0;
+        let closed = |epoch| Closed {
+            epoch,
+            ..closed(Hashing::Running)
+        };
+        assert_eq!(state(), Unspecified);
+        // An open: marked, served (with no lease yet), and the mark lifted.
+        n.fences.set_opening("p1", true);
+        assert_eq!(state(), Opening);
+        let _gate = n.open_gate("p1", 1);
+        assert_eq!(state(), Fenced);
+        assert!(n.fences.is_opening("p1"), "until the open ends");
+        n.fences.set_opening("p1", false);
+        assert_eq!(state(), Fenced);
+        // A served partition isn't closed, and forgetting a close leaves it served.
+        assert!(n.fences.closed("p1", |_| ()).is_none());
+        n.fences.forget_closed("p1");
+        assert!(n.fences.gate("p1").is_some());
+        // A close: closed and no longer served, in one step.
+        n.fences.close("p1", closed(1));
+        assert_eq!(state(), IsClosed);
+        assert!(n.fences.gate("p1").is_none());
+        assert_eq!(n.fences.closed("p1", |c| c.epoch), Some(1));
+        // A reopen that fails leaves it closed; one that succeeds makes it served.
+        n.fences.set_opening("p1", true);
+        assert_eq!(state(), IsClosed);
+        n.fences.set_opening("p1", false);
+        assert_eq!(state(), IsClosed);
+        let _gate = n.open_gate("p1", 2);
+        assert!(n.fences.closed("p1", |_| ()).is_none());
+        assert_eq!(n.fences.gate("p1").map(|(_, epoch)| epoch), Some(2));
+        // Closed again, then its close forgotten (stamped over, or dropped): nothing.
+        n.fences.close("p1", closed(2));
+        n.fences.forget_closed("p1");
+        assert_eq!(state(), Unspecified);
+        assert!(n.fences.entries() == 0);
+        // A mark alone goes with the open that set it.
+        n.fences.set_opening("p2", true);
+        n.fences.set_opening("p2", false);
+        assert!(n.fences.entries() == 0);
     }
 
     #[test]
