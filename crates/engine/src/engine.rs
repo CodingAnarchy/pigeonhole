@@ -5427,6 +5427,101 @@ impl Inner {
         self.submission(routed)
     }
 
+    /// Prepares `batch` (validated by `validate`) as transaction `xid` of an external
+    /// coordinator (D329, ICR 0140): every share is logged as an external PREPARE and holds
+    /// its rows, and the commit's decision waits for [`Engine::decide`], across a close and a
+    /// reopen. It always takes the cross-shard path, even for one shard. Off the commit
+    /// paths: nothing on them changes.
+    pub(crate) fn prepare_external(
+        &self,
+        batch: WriteBatch,
+        durability: Durability,
+        validate: Option<Arc<Validate>>,
+        xid: &[u8],
+    ) -> Result<CommitInfo> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        if xid.is_empty() || xid.len() > pigeonhole_format::key::MAX_KEY_PART {
+            return Err(Error::InvalidArgument(
+                "an external xid is 1 byte to 64 KiB".to_owned(),
+            ));
+        }
+        if self
+            .shared
+            .external
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(xid)
+        {
+            return Err(Error::InvalidArgument(
+                "this xid is prepared here already: decide it first".to_owned(),
+            ));
+        }
+        let view = self.shared.view.load();
+        let (builder, mut shards) = self.route(batch, &view)?;
+        let (builder, large) = self.separate_large(builder)?;
+        if large.is_some() {
+            // A large value's blob file is kept only by its commit's success; an in-doubt
+            // share would need it kept across a reopen too (not in ICR 0140's first part).
+            return Err(Error::InvalidArgument(
+                "a prepared transaction can't hold a value over the inline limit".to_owned(),
+            ));
+        }
+        if let Some(reads) = validate.as_ref().map(|v| &v.reads) {
+            for r in reads {
+                if let Some((_, shard)) = view.tablets().route(r.table, &r.row)
+                    && !shards.contains(&shard)
+                {
+                    shards.push(shard);
+                }
+            }
+        }
+        if shards.is_empty() || builder.is_empty() {
+            return Err(Error::InvalidArgument(
+                "an external prepare needs writes (a read-only prepare is ICR 0140's later part)"
+                    .to_owned(),
+            ));
+        }
+        self.flag_external()?;
+        let parts = split_by_shard(&view, &builder, &shards)?;
+        let target = shards[0];
+        let (tx, mut waiter) = crate::write::commit_completion();
+        let msg = ShardMsg::Coordinate(Box::new(CoordinateReq {
+            external: Some(Arc::new(crate::shard::ExternalReq { xid: xid.into() })),
+            parts,
+            durability,
+            reply: tx,
+            submitted_at: self.shared.vfs.monotonic_nanos(),
+            validate,
+            map_version: view.tablets.version(),
+            epoch: 0,
+            first_seqno: 0,
+            prev_shards: Vec::new(),
+            attempts: 0,
+            wait: None,
+        }));
+        self.shared.submitter(target).submit(msg)?;
+        crate::write::wait_blocking(&self.shared, &mut waiter, false)
+    }
+
+    /// Sets `incompat` bit 2 in both superblock pages before the first external PREPARE
+    /// (D329): once per database, under the manifest writer's lock.
+    fn flag_external(&self) -> Result<()> {
+        if self.shared.external_flagged.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut writer = self
+            .shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE)?;
+        self.shared.external_flagged.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Routes `batch` and sends its request to its shard (a cross-shard commit's
     /// coordinator). With `admit` (an async commit's admission and bytes), it first charges
     /// that shard (D236), so the commit is routed once; without room it builds the request
@@ -7182,6 +7277,8 @@ impl Shared {
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
+            external_flagged: AtomicBool::new(false),
+            external: Mutex::new(std::collections::BTreeMap::new()),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,

@@ -530,6 +530,16 @@ pub(crate) struct Shared {
     /// `Engine::close_for_reopen` ran: the final close leaves `locks` in place for the reopen
     /// (D265) instead of releasing them, and removes neither the WAL files nor the region.
     pub keep_locks: AtomicBool,
+    /// `incompat` bit 2 is set in both superblock pages (D329): an external PREPARE may be
+    /// logged. Set once, under the manifest writer's lock, after `flag_incompat` returned;
+    /// read (Acquire) by `Engine::prepare_external` to skip the lock.
+    pub external_flagged: AtomicBool,
+    /// Externally prepared transactions in doubt (D329, ICR 0140), by xid: each one's id and
+    /// coordinator shard. A leaf lock: inserted by the coordinator once every share is
+    /// prepared (before it answers the caller, so a `decide` after `prepare` returned
+    /// always finds it), removed by the coordinator once decided, read by `Engine::decide`
+    /// and `Engine::in_doubt`.
+    pub external: Mutex<BTreeMap<Vec<u8>, ExternalEntry>>,
     /// What became of the closed instance's memtable arenas (`release_memory`, D265):
     /// `ARENAS_PENDING` until the discard ran (`ARENAS_DISCARDED`) or the OS refused it
     /// (`ARENAS_REFUSED`: the pages stay until the last mapping goes).
@@ -1529,6 +1539,17 @@ pub(crate) struct PrepareReq {
     /// The client's submit time, as the coordinator keeps it across retries: the participant
     /// counts the round's time in flight from it at the decision (D262).
     pub submitted_at: u64,
+}
+
+/// [`Shared::external`]'s entry for an xid in doubt.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExternalEntry {
+    /// The commit's id.
+    pub id: Seqno,
+    /// The shard that holds its decision.
+    pub coordinator: ShardId,
+    /// When it was prepared (the engine's monotonic clock), for `in_doubt`.
+    pub prepared_at: u64,
 }
 
 /// A transaction prepared for an external coordinator (D329, ICR 0140).
@@ -9722,8 +9743,20 @@ impl ShardState {
         }
         // An external transaction (D329): every share is prepared and logged, so the caller
         // hears so, and the decision waits for `Engine::decide` (`on_external_decide`).
-        if c.external.is_some() {
+        if let Some(ext) = &c.external {
             c.awaiting = true;
+            self.shared
+                .external
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    ext.xid.to_vec(),
+                    ExternalEntry {
+                        id: seqno,
+                        coordinator: self.id,
+                        prepared_at: ctx.now_nanos(),
+                    },
+                );
             let info = CommitInfo {
                 seqno,
                 durability: c.durability,

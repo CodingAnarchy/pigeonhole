@@ -417,6 +417,27 @@ impl ManifestWriter {
         })
     }
 
+    /// Sets `incompat` `bits` in both superblock pages if the file lacks any of them: D329's
+    /// bit 2, before the first external PREPARE is logged (ICR 0140). Sticky: nothing clears
+    /// it. Blocking (four syncs), once per database.
+    pub(crate) fn flag_incompat(&mut self, bits: u64) -> Result<()> {
+        if self.poisoned {
+            return Err(Self::poisoned_error());
+        }
+        let features = self.pager.features();
+        if bits & !features.incompat == 0 {
+            return Ok(());
+        }
+        let flagged = Features {
+            incompat: features.incompat | bits,
+            ..features
+        };
+        self.pager.set_features(flagged).map_err(|e| {
+            self.poisoned = true;
+            e.into()
+        })
+    }
+
     /// Clears `ro_compat` bit 0 when the file carries it but has no replica state table (#1436,
     /// ICR 0125): a promoted replica's last step, and the open-time repair when a crash came
     /// between its state table's drop and this. Under the writer's exclusion, as
