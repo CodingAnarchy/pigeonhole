@@ -92,6 +92,10 @@ const QUERIES: &[&str] = &[
     "\"the memory\"",
     "\"memory the\"~2",
     "\"the store\" agent~",
+    // A repeated word: one stream of positions for both of its terms (#1586).
+    "\"the the\"",
+    "\"the memory the\"~2",
+    "\"memory the memory\"",
 ];
 
 #[test]

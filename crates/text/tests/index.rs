@@ -77,6 +77,23 @@ fn searches_equal_a_brute_force_bm25_through_puts_overwrites_and_deletes() {
                 &bm.scores(&[], std::slice::from_ref(&phrase)),
                 &ctx(&format!("phrase {phrase:?}")),
             );
+            // Phrases that repeat a word (#1586): its terms read one stream of positions in
+            // the join, as the lead or beside it.
+            for repeated in [
+                vec!["the", "the"],
+                vec![phrase[0], phrase[1], phrase[0]],
+                vec![phrase[1], phrase[0], phrase[0]],
+            ] {
+                let got = index
+                    .search(Query::new().phrase(repeated.clone()), 1000)
+                    .run()
+                    .unwrap();
+                same_scores(
+                    &got,
+                    &bm.scores(&[], std::slice::from_ref(&repeated)),
+                    &ctx(&format!("phrase {repeated:?}")),
+                );
+            }
             let syntax = format!("{} \"{}\"", terms[0], phrase.join(" "));
             let got = index.search(syntax.as_str(), 1000).run().unwrap();
             same_scores(

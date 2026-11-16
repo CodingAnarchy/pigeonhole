@@ -49,7 +49,7 @@ use crate::layout::*;
 /// real index switches to advancing a little late, never early. A modestly wrong value
 /// costs a constant factor (ski-rental's bound assumes the price is right; one off by a
 /// factor `f` costs up to about `f` times more, perf287 on #1377).
-const LOOKUP_IN_STEPS: u64 = 14;
+pub(crate) const LOOKUP_IN_STEPS: u64 = 14;
 
 /// [`LOOKUP_IN_STEPS`] as a step budget's charge for a point read (#1560).
 #[cfg(feature = "async")]
