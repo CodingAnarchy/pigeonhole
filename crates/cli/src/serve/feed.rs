@@ -1569,6 +1569,9 @@ pub(crate) struct Sink {
     taken: Arc<TakeClock>,
     client_bytes: usize,
     stream_idle: Duration,
+    /// Where the stream starts, sent once it's known ([`Sink::started`], read by
+    /// [`FeedEvents::start`]).
+    start: Mutex<Option<oneshot::Sender<Bytes>>>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -1587,6 +1590,12 @@ impl Client {
 
     async fn run(&self, begin: Begin) -> Result<(), ApiError> {
         let mut pos;
+        // Where it starts ([`FeedEvents::start`]): the ring's position it joins at, known
+        // now. An own stream's, once its first read has taken the start (`read_own`): a
+        // refused resume reports that read's error instead.
+        if let Begin::Ring { token, .. } = &begin {
+            self.sink.started(token);
+        }
         let mut source = match begin {
             Begin::Own(feed, start) => {
                 // Opened at subscribe so a bad start fails the call. Waiting for a catch-up
@@ -1760,8 +1769,13 @@ impl Client {
         // that on the first read, and a ring that happens to cover the token's seqno would
         // otherwise take the client on without it (#1805's Windows run: a stale copy's token
         // went on). Nothing ready yet: it may rejoin at once.
+        let before = pos.token.clone();
         let first =
             std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *stream).poll_next(cx))).await;
+        if !matches!(first, Poll::Ready(Some(Err(_)))) {
+            // The start is taken: where it is ([`FeedEvents::start`]), before any commit.
+            self.sink.started(&before);
+        }
         match first {
             Poll::Ready(Some(Ok(commit))) => {
                 let token = token_of(&stream);
@@ -1929,22 +1943,46 @@ impl Sink {
         let client_bytes = limits.client_bytes.clamp(1, Semaphore::MAX_PERMITS);
         let taken = Arc::new(TakeClock::new());
         let (end_tx, end_rx) = oneshot::channel();
+        let (start_tx, start_rx) = oneshot::channel();
         let sink = Sink {
             tx,
             budget: Arc::new(Semaphore::new(client_bytes)),
             taken: Arc::clone(&taken),
             client_bytes,
             stream_idle: limits.stream_idle,
+            start: Mutex::new(Some(start_tx)),
         };
         let events = FeedEvents(
             EventSource::Sink {
                 events: rx,
                 taken,
                 end: Some(end_rx),
+                start: Some(start_rx),
             },
             None,
         );
         (sink, events, end_tx)
+    }
+
+    /// The stream starts at `token`: for [`FeedEvents::start`], once (later calls do
+    /// nothing).
+    pub(crate) fn started(&self, token: &Bytes) {
+        if let Some(tx) = self
+            .start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = tx.send(token.clone());
+        }
+    }
+
+    /// Whether [`Sink::started`] is still to be told.
+    pub(crate) fn starting(&self) -> bool {
+        self.start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     /// Whether events wait in the connection's buffer, untaken.
@@ -2101,6 +2139,8 @@ enum EventSource {
         /// Each take's time, for a send waiting for room.
         taken: Arc<TakeClock>,
         end: Option<oneshot::Receiver<ApiError>>,
+        /// Where the stream starts, once its task knows ([`FeedEvents::start`]).
+        start: Option<oneshot::Receiver<Bytes>>,
     },
 }
 
@@ -2208,6 +2248,34 @@ impl Out {
 }
 
 impl FeedEvents {
+    /// Where the stream starts: a token that resumes after everything it will deliver comes
+    /// before (#1915 PR 3: `/mcp`'s `feed_poll` returns it when no commit arrives, as the
+    /// library's `Feed::token()` at open does). A single node's is its start's; a cluster
+    /// subscription's, once every partition's part has placed it. Waits until then; asked
+    /// again, the same token. The stream's error if it ends first.
+    pub(crate) async fn start(&mut self) -> Result<Vec<u8>, ApiError> {
+        let EventSource::Sink { start, end, .. } = &mut self.0;
+        let Some(rx) = start.as_mut() else {
+            return Err(ApiError::internal("a stream's start asked for twice"));
+        };
+        match rx.await {
+            Ok(token) => {
+                *start = None;
+                Ok(token.to_vec())
+            }
+            Err(_) => {
+                // The stream's task ended first: its error, which it sends as it ends.
+                *start = None;
+                Err(match end.take() {
+                    Some(e) => e.await.unwrap_or_else(|_| {
+                        ApiError::unavailable("the subscription ended before it started")
+                    }),
+                    None => ApiError::unavailable("the subscription ended before it started"),
+                })
+            }
+        }
+    }
+
     /// These events, delivered only while cluster partition `gate`'s lease holds (D326 PR
     /// 2): they wait while it has had none since it opened and the node reaches a majority,
     /// and end with `PartitionUnavailable` once it lapses or the node doesn't (feed1248's
@@ -2264,7 +2332,9 @@ impl FeedEvents {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
         let (events, taken, end) = match &mut self.0 {
-            EventSource::Sink { events, taken, end } => (events, taken, end),
+            EventSource::Sink {
+                events, taken, end, ..
+            } => (events, taken, end),
         };
         match events.poll_recv(cx) {
             // Taken: its bytes go back to the client's buffer.

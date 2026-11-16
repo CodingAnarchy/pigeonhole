@@ -3469,6 +3469,343 @@ fn fanned_out_nearest_and_traversals_at_seeds_that_failed() {
     nearest_traverse_model(1794386011110329000);
 }
 
+/// Three nodes holding the users table's vectors at qualifiers "", "x" and "y" (each row's
+/// three through different nodes), and one database holding them all. `old` has those nodes
+/// act as a build before `nearest_qualifiers` ([`super::OLD_NEAREST`]), from the start.
+struct QualifierVectors {
+    rt: tokio::runtime::Runtime,
+    _stops: Vec<tokio::sync::oneshot::Sender<()>>,
+    ports: Vec<u16>,
+    dirs: [PathBuf; 3],
+    _oracle_dir: PathBuf,
+    t: pigeonhole::Table,
+}
+
+impl QualifierVectors {
+    const QUERY: [f32; 4] = [2.0, 1.0, 0.0, 0.5];
+
+    fn start(old: &[(usize, super::OldNearest)]) -> Self {
+        use super::proto::{
+            MutateRequest, Put, RowKey, RowWrites, Value, Vector, Write, value, write,
+        };
+        let dirs = [test_dir(), test_dir(), test_dir()];
+        super::OLD_NEAREST
+            .lock()
+            .unwrap()
+            .extend(old.iter().map(|&(n, how)| (dirs[n].clone(), how)));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (stops, ports, _dbs) = three_nodes_in(&rt, &dirs);
+        let oracle_dir = test_dir();
+        let oracle = pigeonhole::Pigeonhole::open(
+            oracle_dir.join("oracle.phdb"),
+            pigeonhole::Options::default().create_if_missing(true),
+        )
+        .unwrap();
+        let t = users(&oracle);
+        let rows: Vec<Vec<u8>> = ["a", "c", "g", "h", "m", "q", "s", "z"]
+            .iter()
+            .flat_map(|p| (0..2).map(move |i| format!("{p}{i}").into_bytes()))
+            .collect();
+        let qualifiers: [&[u8]; 3] = [b"", b"x", b"y"];
+        rt.block_on(async {
+            for (i, row) in rows.iter().enumerate() {
+                for (j, q) in qualifiers.iter().enumerate() {
+                    let v = [(i % 5) as f32, j as f32, (i % 2) as f32, 0.5];
+                    let put = Write {
+                        op: Some(write::Op::Put(Put {
+                            family: "emb".into(),
+                            qualifier: q.to_vec().into(),
+                            timestamp: None,
+                            value: Some(Value {
+                                kind: Some(value::Kind::Vector(Vector {
+                                    element: super::proto::Element::F32 as i32,
+                                    dim: 4,
+                                    data: f32_bytes(&v).into(),
+                                })),
+                            }),
+                        })),
+                    };
+                    data(ports[(i + j) % 3])
+                        .await
+                        .mutate(MutateRequest {
+                            writes: Some(RowWrites {
+                                row: Some(RowKey {
+                                    table: "users".into(),
+                                    row: row.clone().into(),
+                                }),
+                                writes: vec![put],
+                            }),
+                            durability: 0,
+                        })
+                        .await
+                        .unwrap();
+                    t.mutate(row).put_vector_f32("emb", q, &v).commit().unwrap();
+                }
+            }
+        });
+        Self {
+            rt,
+            _stops: stops,
+            ports,
+            dirs,
+            _oracle_dir: oracle_dir,
+            t,
+        }
+    }
+
+    /// Cuts node `i` off from its peers both ways, or joins it again (`CUT_OFF`).
+    fn cut(&self, i: usize, off: bool) {
+        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
+        let mut cut = super::CUT_OFF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cut.retain(|e| *e != entry);
+        if off {
+            cut.push(entry);
+        }
+    }
+
+    /// The oracle's ranking of [`Self::QUERY`]'s `k` nearest under `select`.
+    fn want(
+        &self,
+        k: usize,
+        select: impl FnOnce(pigeonhole::Scan<'_>) -> pigeonhole::Scan<'_>,
+    ) -> Ranked {
+        select(self.t.scan_prefix(b"").family("emb"))
+            .nearest_f32(&Self::QUERY, k)
+            .run_within(1 << 20)
+            .unwrap()
+            .into_neighbours()
+            .into_iter()
+            .map(|n| (n.row, n.qualifier, n.distance))
+            .collect()
+    }
+
+    /// Node `n`'s answer to [`Self::QUERY`]'s `k` nearest under `qualifiers`.
+    fn nearest(
+        &self,
+        n: usize,
+        k: u32,
+        qualifiers: Option<super::proto::QualifierSelection>,
+    ) -> Result<Ranked, tonic::Status> {
+        self.nearest_partial(n, k, qualifiers, false)
+            .map(|(found, _)| found)
+    }
+
+    /// [`Self::nearest`] with `allow_partial`, and the partitions it names as missing.
+    fn nearest_partial(
+        &self,
+        n: usize,
+        k: u32,
+        qualifiers: Option<super::proto::QualifierSelection>,
+        allow_partial: bool,
+    ) -> Result<(Ranked, Vec<String>), tonic::Status> {
+        use super::proto::{NearestRequest, Vector};
+        self.rt.block_on(async {
+            let channel = tonic::transport::Endpoint::from_shared(format!(
+                "http://127.0.0.1:{}",
+                self.ports[n]
+            ))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+            let got = super::proto::vectors_client::VectorsClient::new(channel)
+                .nearest(NearestRequest {
+                    table: "users".into(),
+                    family: "emb".into(),
+                    query: Some(Vector {
+                        element: super::proto::Element::F32 as i32,
+                        dim: 4,
+                        data: f32_bytes(&Self::QUERY).into(),
+                    }),
+                    k,
+                    qualifiers,
+                    allow_partial,
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            Ok((
+                got.neighbours
+                    .iter()
+                    .map(|n| (n.row.to_vec(), n.qualifier.to_vec(), n.distance))
+                    .collect(),
+                got.missing.iter().map(|m| m.partition.clone()).collect(),
+            ))
+        })
+    }
+}
+
+impl Drop for QualifierVectors {
+    fn drop(&mut self) {
+        super::OLD_NEAREST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(d, _)| !self.dirs.contains(d));
+    }
+}
+
+/// A nearest search's neighbours: row, qualifier, distance.
+type Ranked = Vec<(Vec<u8>, Vec<u8>, f64)>;
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn qualifier_bound(key: &[u8], inclusive: bool) -> super::proto::Bound {
+    super::proto::Bound {
+        key: key.to_vec().into(),
+        inclusive,
+    }
+}
+
+/// `NearestRequest.qualifiers` (#1915 PR 3) on a cluster: every partition's part applies the
+/// selection, so the merged ranking is one database's under it, through any node: a prefix,
+/// inclusive bounds, an exclusive end, and none.
+#[test]
+fn a_fanned_out_nearest_ranks_only_the_qualifiers_it_selects() {
+    use super::proto::QualifierSelection;
+    use std::ops::Bound as B;
+    let c = QualifierVectors::start(&[]);
+    let cases: Vec<(&str, Option<QualifierSelection>, Ranked)> = vec![
+        ("none", None, c.want(12, |s| s)),
+        (
+            "prefix x",
+            Some(QualifierSelection {
+                prefix: b"x".to_vec().into(),
+                ..Default::default()
+            }),
+            c.want(12, |s| s.qualifier_prefix(b"x")),
+        ),
+        (
+            "x to y",
+            Some(QualifierSelection {
+                start: Some(qualifier_bound(b"x", true)),
+                end: Some(qualifier_bound(b"y", true)),
+                ..Default::default()
+            }),
+            c.want(12, |s| {
+                s.qualifier_bounds(B::Included(&b"x"[..]), B::Included(&b"y"[..]))
+            }),
+        ),
+        (
+            "before x",
+            Some(QualifierSelection {
+                end: Some(qualifier_bound(b"x", false)),
+                ..Default::default()
+            }),
+            c.want(12, |s| {
+                s.qualifier_bounds(B::Unbounded, B::Excluded(&b"x"[..]))
+            }),
+        ),
+    ];
+    for (name, qualifiers, want) in cases {
+        assert!(!want.is_empty(), "{name}");
+        for n in 0..3 {
+            let got = c
+                .nearest(n, 12, qualifiers.clone())
+                .unwrap_or_else(|e| panic!("{name} via node {n}: {e}"));
+            assert_eq!(got, want, "{name} via node {n}");
+        }
+    }
+}
+
+/// A node that reports a build before `nearest_qualifiers` (#1915 PR 3): a nearest search
+/// with `qualifiers` whose parts it holds is refused with `FailedPrecondition` naming it,
+/// through every node, rather than answered with fewer than `k`. One without `qualifiers`
+/// still answers.
+#[test]
+fn a_nearest_with_qualifiers_is_refused_while_a_node_runs_an_older_build() {
+    use super::proto::QualifierSelection;
+    let c = QualifierVectors::start(&[(1, super::OldNearest::Status)]);
+    let x = QualifierSelection {
+        prefix: b"x".to_vec().into(),
+        ..Default::default()
+    };
+    for n in [0, 2] {
+        let e = c.nearest(n, 12, Some(x.clone())).unwrap_err();
+        assert_eq!(
+            e.code(),
+            tonic::Code::FailedPrecondition,
+            "via node {n}: {e:?}"
+        );
+        assert!(
+            e.message().contains("b (an older build)"),
+            "via node {n}: {}",
+            e.message()
+        );
+        assert_eq!(
+            c.nearest(n, 12, None).unwrap(),
+            c.want(12, |s| s),
+            "via node {n}"
+        );
+    }
+}
+
+/// A node that doesn't answer the features check is unavailable, not an older build (the
+/// coordinator's call on #1915 PR 3): with `allow_partial` its partition is skipped and named
+/// in `missing`, the rest answered exactly; without, `PartitionUnavailable`.
+/// Its no-answer is cached, so the next search doesn't ask again: rejoined within the cache,
+/// its partition is still skipped.
+#[test]
+fn a_nearest_with_qualifiers_skips_a_node_that_doesnt_answer() {
+    use super::proto::QualifierSelection;
+    let c = QualifierVectors::start(&[]);
+    let x = QualifierSelection {
+        prefix: b"x".to_vec().into(),
+        ..Default::default()
+    };
+    c.cut(1, true);
+    for n in [0, 2] {
+        let e = c.nearest(n, 12, Some(x.clone())).unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "via node {n}: {e:?}");
+        let (found, missing) = c.nearest_partial(n, 100, Some(x.clone()), true).unwrap();
+        assert_eq!(missing, ["p2"], "via node {n}");
+        assert!(
+            !found.is_empty() && found.iter().all(|(_, q, _)| q == b"x"),
+            "via node {n}: {found:?}"
+        );
+        // The oracle's, without p2's rows ([g, m) in `three_way`).
+        let want: Vec<_> = c
+            .want(100, |s| s.qualifier_prefix(b"x"))
+            .into_iter()
+            .filter(|(row, _, _)| !(&b"g"[..]..&b"m"[..]).contains(&row.as_slice()))
+            .collect();
+        assert_eq!(found, want, "via node {n}");
+    }
+    // Rejoined: node 0's no-answer is still cached, so its search still skips p2.
+    c.cut(1, false);
+    let (_, missing) = c.nearest_partial(0, 100, Some(x.clone()), true).unwrap();
+    assert_eq!(missing, ["p2"]);
+}
+
+/// A node whose parts ignore `qualifiers` though it reported the feature (a build changed
+/// within the entry node's features cache): the entry node applies the selection to every
+/// part's answer again, so no neighbour at another qualifier comes back, and with `k` past
+/// every vector the answer is the oracle's.
+#[test]
+fn an_entry_node_filters_a_parts_neighbours_by_the_selection_again() {
+    use super::proto::QualifierSelection;
+    let c = QualifierVectors::start(&[(1, super::OldNearest::Parts)]);
+    let x = QualifierSelection {
+        prefix: b"x".to_vec().into(),
+        ..Default::default()
+    };
+    for n in 0..3 {
+        let some = c.nearest(n, 5, Some(x.clone())).unwrap();
+        assert!(
+            !some.is_empty() && some.iter().all(|(_, q, _)| q == b"x"),
+            "via node {n}: {some:?}"
+        );
+        assert_eq!(
+            c.nearest(n, 100, Some(x.clone())).unwrap(),
+            c.want(100, |s| s.qualifier_prefix(b"x")),
+            "via node {n}"
+        );
+    }
+}
+
 /// D317 §12's model test, ticket 4b, against one database holding every row: nearest
 /// searches over every source kind (vectors repeat, so distances tie and the order's row
 /// and qualifier tie-breaks decide), cut by budgets; traversals whose edges cross the
@@ -4038,7 +4375,15 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             .await
             .unwrap()
             .into_inner();
-        assert!(made.unreconciled.is_empty(), "{made:?}");
+        // A push that took longer than the push timeout (the map's fsync and the table's
+        // create on c, on a slow runner) lists its partition as unreconciled, which the
+        // guide allows: only `orders`' partitions on another node than the writer, a, may be
+        // listed. Its node catches up by a pull, so the files are checked once it has (#1771).
+        assert!(
+            made.unreconciled.iter().all(|p| p == "p3"),
+            "only c's p3 can miss the push: {made:?}"
+        );
+        settled().await;
         assert!(has(&dbs[0], "orders") && has(&dbs[2], "orders") && !has(&dbs[1], "orders"));
         for &port in &ports {
             let mut s = schema(port).await;

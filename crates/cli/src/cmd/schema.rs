@@ -138,23 +138,228 @@ pub(crate) fn vector_spec_from_json(v: &Value) -> Result<VectorSpec, String> {
 /// The family [`family_json`] describes: its name and a [`Family`] with those options.
 /// Missing fields take `Family`'s defaults.
 pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
+    let def = family_def_from_json(v)?;
+    let family = def.family();
+    Ok((def.name, family))
+}
+
+/// A family's kind, as a [`FamilyDef`] holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FamilyKind {
+    /// An ordinary family (perhaps naming a merge operator).
+    Plain,
+    /// An aggregate family; `Aggregation::Sum` is a counter family.
+    Aggregate(Aggregation),
+    /// A vector family (D303).
+    Vector(VectorSpec),
+}
+
+/// A family's options, independent of where they come from (#1915 PR 3): parsed from
+/// [`family_json`]'s shape (`create_table`, `load`), read from a database's
+/// [`FamilyInfo`], or from a server's family spec. An option left `None` takes
+/// [`Family`]'s default.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FamilyDef {
+    pub(crate) name: String,
+    pub(crate) kind: FamilyKind,
+    pub(crate) max_versions: Option<u32>,
+    pub(crate) ttl: Option<Duration>,
+    pub(crate) bloom_bits: Option<u8>,
+    pub(crate) blob_threshold: Option<u32>,
+    pub(crate) compression: Option<Compression>,
+    pub(crate) block_size: Option<u32>,
+    pub(crate) merge_operator: Option<String>,
+    pub(crate) cache_priority: Option<Priority>,
+    pub(crate) compaction: Option<Compaction>,
+}
+
+impl FamilyDef {
+    /// A family with every option at its default.
+    pub(crate) fn new(name: String, kind: FamilyKind) -> Self {
+        Self {
+            name,
+            kind,
+            max_versions: None,
+            ttl: None,
+            bloom_bits: None,
+            blob_threshold: None,
+            compression: None,
+            block_size: None,
+            merge_operator: None,
+            cache_priority: None,
+            compaction: None,
+        }
+    }
+
+    /// A database's family, every option set.
+    pub(crate) fn from_info(f: &FamilyInfo) -> Self {
+        let kind = match (&f.aggregation, &f.vector) {
+            (Some(a), _) => FamilyKind::Aggregate(a.clone()),
+            (None, Some(v)) => FamilyKind::Vector(*v),
+            (None, None) => FamilyKind::Plain,
+        };
+        Self {
+            name: f.name.clone(),
+            kind,
+            max_versions: Some(f.max_versions),
+            ttl: f.ttl,
+            bloom_bits: Some(f.bloom_bits),
+            blob_threshold: Some(f.blob_threshold),
+            compression: Some(f.compression),
+            block_size: Some(f.block_size),
+            merge_operator: f.merge_operator.clone(),
+            cache_priority: Some(f.cache_priority),
+            compaction: Some(f.compaction),
+        }
+    }
+
+    /// The aggregation of an aggregate family.
+    pub(crate) fn aggregation(&self) -> Option<&Aggregation> {
+        match &self.kind {
+            FamilyKind::Aggregate(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The spec of a vector family.
+    pub(crate) fn vector(&self) -> Option<&VectorSpec> {
+        match &self.kind {
+            FamilyKind::Vector(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The builder that defines this family.
+    pub(crate) fn family(&self) -> Family {
+        let mut f = match &self.kind {
+            FamilyKind::Plain => Family::default(),
+            FamilyKind::Aggregate(Aggregation::Sum) => Family::counter(),
+            FamilyKind::Aggregate(a) => Family::aggregate(a.clone()),
+            FamilyKind::Vector(v) => Family::vector(*v),
+        };
+        if let Some(n) = self.max_versions {
+            f = f.max_versions(n);
+        }
+        if let Some(t) = self.ttl {
+            f = f.ttl(t);
+        }
+        if let Some(n) = self.bloom_bits {
+            f = f.bloom_bits(n);
+        }
+        if let Some(n) = self.blob_threshold {
+            f = f.blob_threshold(n);
+        }
+        if let Some(c) = self.compression {
+            f = f.compression(c);
+        }
+        if let Some(n) = self.block_size {
+            f = f.block_size(n);
+        }
+        if let Some(op) = &self.merge_operator {
+            f = f.merge_operator(op);
+        }
+        if let Some(p) = self.cache_priority {
+            f = f.cache_priority(p);
+        }
+        if let Some(c) = self.compaction {
+            f = f.compaction(c);
+        }
+        f
+    }
+
+    /// [`family_json`]'s shape, for a family whose options are all set (a database's or a
+    /// server's): equal to `family_json` of the same family.
+    pub(crate) fn json(&self) -> Map<String, Value> {
+        let (compression, zstd_level) = match self.compression {
+            None => (None, None),
+            Some(Compression::None) => (Some("none"), None),
+            Some(Compression::Zstd(level)) => (Some("zstd"), Some(level)),
+            Some(Compression::Lz4) => (Some("lz4"), None),
+            Some(_) => (Some("unknown"), None),
+        };
+        let v = json!({
+            "name": self.name,
+            "counter": matches!(self.kind, FamilyKind::Aggregate(Aggregation::Sum)),
+            "aggregation": self.aggregation().map(aggregation_name),
+            "aggregation_params": match self.aggregation() {
+                Some(Aggregation::Histogram(h)) => json!({ "bounds": h.bounds() }),
+                Some(Aggregation::Bloom(b)) => json!({ "bits": b.bits(), "hashes": b.hashes() }),
+                Some(Aggregation::Quantiles(q)) => json!({
+                    "mantissa_bits": q.get_mantissa_bits(),
+                    "max_buckets": q.get_max_buckets(),
+                }),
+                _ => Value::Null,
+            },
+            "vector": self.vector().map(vector_spec_json),
+            "max_versions": self.max_versions,
+            "ttl_micros": self.ttl.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX)),
+            "bloom_bits": self.bloom_bits,
+            "blob_threshold": self.blob_threshold,
+            "compression": compression,
+            "zstd_level": zstd_level,
+            "block_size": self.block_size,
+            "merge_operator": self.merge_operator,
+            "cache_priority": self.cache_priority.map(|p| match p {
+                Priority::Low => "low",
+                Priority::Normal => "normal",
+                Priority::High => "high",
+                _ => "unknown",
+            }),
+            "compaction": self.compaction.map(|c| match c {
+                Compaction::Leveled => "leveled",
+                Compaction::Tiered => "tiered",
+                Compaction::FifoByTime => "fifo-by-time",
+                _ => "unknown",
+            }),
+        });
+        match v {
+            Value::Object(m) => m,
+            _ => unreachable!("json! of an object literal"),
+        }
+    }
+}
+
+/// An aggregation's name in JSON.
+fn aggregation_name(a: &Aggregation) -> &'static str {
+    match a {
+        Aggregation::Sum => "sum",
+        Aggregation::Min => "min",
+        Aggregation::Max => "max",
+        Aggregation::Hll => "hll",
+        Aggregation::BitOr => "bit_or",
+        Aggregation::BitAnd => "bit_and",
+        Aggregation::BitXor => "bit_xor",
+        Aggregation::MinF64 => "min_f64",
+        Aggregation::MaxF64 => "max_f64",
+        Aggregation::SumF64 => "sum_f64",
+        Aggregation::MeanVar => "mean_var",
+        Aggregation::Histogram(_) => "histogram",
+        Aggregation::Quantiles(_) => "quantiles",
+        Aggregation::Bloom(_) => "bloom",
+        Aggregation::Set => "set",
+        _ => "unknown",
+    }
+}
+
+/// The family [`family_json`] describes, as a [`FamilyDef`]: missing fields are `None`.
+pub(crate) fn family_def_from_json(v: &Value) -> Result<FamilyDef, String> {
     let name = v["name"]
         .as_str()
         .ok_or("a family without a name")?
         .to_owned();
     // `aggregation` (D294) names the kind; files dumped before it say `counter` only.
-    let mut f = match (v["aggregation"].as_str(), v["counter"].as_bool()) {
-        (Some("sum"), _) | (None, Some(true)) => Family::counter(),
-        (Some("min"), _) => Family::aggregate(Aggregation::Min),
-        (Some("max"), _) => Family::aggregate(Aggregation::Max),
-        (Some("hll"), _) => Family::aggregate(Aggregation::Hll),
-        (Some("bit_or"), _) => Family::aggregate(Aggregation::BitOr),
-        (Some("bit_and"), _) => Family::aggregate(Aggregation::BitAnd),
-        (Some("bit_xor"), _) => Family::aggregate(Aggregation::BitXor),
-        (Some("min_f64"), _) => Family::aggregate(Aggregation::MinF64),
-        (Some("max_f64"), _) => Family::aggregate(Aggregation::MaxF64),
-        (Some("sum_f64"), _) => Family::aggregate(Aggregation::SumF64),
-        (Some("mean_var"), _) => Family::aggregate(Aggregation::MeanVar),
+    let kind = match (v["aggregation"].as_str(), v["counter"].as_bool()) {
+        (Some("sum"), _) | (None, Some(true)) => FamilyKind::Aggregate(Aggregation::Sum),
+        (Some("min"), _) => FamilyKind::Aggregate(Aggregation::Min),
+        (Some("max"), _) => FamilyKind::Aggregate(Aggregation::Max),
+        (Some("hll"), _) => FamilyKind::Aggregate(Aggregation::Hll),
+        (Some("bit_or"), _) => FamilyKind::Aggregate(Aggregation::BitOr),
+        (Some("bit_and"), _) => FamilyKind::Aggregate(Aggregation::BitAnd),
+        (Some("bit_xor"), _) => FamilyKind::Aggregate(Aggregation::BitXor),
+        (Some("min_f64"), _) => FamilyKind::Aggregate(Aggregation::MinF64),
+        (Some("max_f64"), _) => FamilyKind::Aggregate(Aggregation::MaxF64),
+        (Some("sum_f64"), _) => FamilyKind::Aggregate(Aggregation::SumF64),
+        (Some("mean_var"), _) => FamilyKind::Aggregate(Aggregation::MeanVar),
         (Some("histogram"), _) => {
             let bounds: Vec<f64> = v["aggregation_params"]["bounds"]
                 .as_array()
@@ -166,7 +371,7 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
                 })
                 .collect::<Result<_, _>>()?;
             let params = HistogramParams::new(bounds).map_err(|e| format!("family {name}: {e}"))?;
-            Family::aggregate(Aggregation::Histogram(params))
+            FamilyKind::Aggregate(Aggregation::Histogram(params))
         }
         (Some("quantiles"), _) => {
             let p = &v["aggregation_params"];
@@ -181,7 +386,7 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
                     u16::try_from(n).map_err(|_| format!("family {name}: bad max_buckets"))?,
                 );
             }
-            Family::aggregate(Aggregation::Quantiles(q))
+            FamilyKind::Aggregate(Aggregation::Quantiles(q))
         }
         (Some("bloom"), _) => {
             let p = &v["aggregation_params"];
@@ -194,15 +399,15 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
             };
             let params =
                 BloomParams::new(bits, hashes).map_err(|e| format!("family {name}: {e}"))?;
-            Family::aggregate(Aggregation::Bloom(params))
+            FamilyKind::Aggregate(Aggregation::Bloom(params))
         }
-        (Some("set"), _) => Family::aggregate(Aggregation::Set),
+        (Some("set"), _) => FamilyKind::Aggregate(Aggregation::Set),
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => match v.get("vector").filter(|s| !s.is_null()) {
-            Some(spec) => Family::vector(
+            Some(spec) => FamilyKind::Vector(
                 vector_spec_from_json(spec).map_err(|m| format!("family {name}: {m}"))?,
             ),
-            None => Family::default(),
+            None => FamilyKind::Plain,
         },
     };
     if v.get("vector").is_some_and(|s| !s.is_null())
@@ -212,53 +417,55 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
             "family {name}: a vector family can't also be an aggregate"
         ));
     }
+    let mut f = FamilyDef::new(name, kind);
+    let name = &f.name.clone();
     let num = |key: &str| v[key].as_u64();
     let bad = |key: &str| format!("family {name}: bad {key}");
     if let Some(n) = num("max_versions") {
-        f = f.max_versions(u32::try_from(n).map_err(|_| bad("max_versions"))?);
+        f.max_versions = Some(u32::try_from(n).map_err(|_| bad("max_versions"))?);
     }
     if let Some(n) = num("ttl_micros") {
-        f = f.ttl(Duration::from_micros(n));
+        f.ttl = Some(Duration::from_micros(n));
     }
     if let Some(n) = num("bloom_bits") {
-        f = f.bloom_bits(u8::try_from(n).map_err(|_| bad("bloom_bits"))?);
+        f.bloom_bits = Some(u8::try_from(n).map_err(|_| bad("bloom_bits"))?);
     }
     if let Some(n) = num("blob_threshold") {
-        f = f.blob_threshold(u32::try_from(n).map_err(|_| bad("blob_threshold"))?);
+        f.blob_threshold = Some(u32::try_from(n).map_err(|_| bad("blob_threshold"))?);
     }
-    f = match v["compression"].as_str() {
-        None => f,
-        Some("lz4") => f.compression(Compression::Lz4),
-        Some("none") => f.compression(Compression::None),
+    f.compression = match v["compression"].as_str() {
+        None => None,
+        Some("lz4") => Some(Compression::Lz4),
+        Some("none") => Some(Compression::None),
         Some("zstd") => {
             let level = v["zstd_level"].as_i64().unwrap_or(3);
-            f.compression(Compression::Zstd(
+            Some(Compression::Zstd(
                 i8::try_from(level).map_err(|_| bad("zstd_level"))?,
             ))
         }
         Some(_) => return Err(bad("compression")),
     };
     if let Some(n) = num("block_size") {
-        f = f.block_size(u32::try_from(n).map_err(|_| bad("block_size"))?);
+        f.block_size = Some(u32::try_from(n).map_err(|_| bad("block_size"))?);
     }
     if let Some(op) = v["merge_operator"].as_str() {
-        f = f.merge_operator(op);
+        f.merge_operator = Some(op.to_owned());
     }
-    f = match v["cache_priority"].as_str() {
-        None => f,
-        Some("low") => f.cache_priority(Priority::Low),
-        Some("normal") => f.cache_priority(Priority::Normal),
-        Some("high") => f.cache_priority(Priority::High),
+    f.cache_priority = match v["cache_priority"].as_str() {
+        None => None,
+        Some("low") => Some(Priority::Low),
+        Some("normal") => Some(Priority::Normal),
+        Some("high") => Some(Priority::High),
         Some(_) => return Err(bad("cache_priority")),
     };
-    f = match v["compaction"].as_str() {
-        None => f,
-        Some("leveled") => f.compaction(Compaction::Leveled),
-        Some("tiered") => f.compaction(Compaction::Tiered),
-        Some("fifo-by-time") => f.compaction(Compaction::FifoByTime),
+    f.compaction = match v["compaction"].as_str() {
+        None => None,
+        Some("leveled") => Some(Compaction::Leveled),
+        Some("tiered") => Some(Compaction::Tiered),
+        Some("fifo-by-time") => Some(Compaction::FifoByTime),
         Some(_) => return Err(bad("compaction")),
     };
-    Ok((name, f))
+    Ok(f)
 }
 
 /// Bytes as JSON: a string when they are valid UTF-8 (JSON escapes control characters, so

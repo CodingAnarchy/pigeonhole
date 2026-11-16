@@ -879,6 +879,49 @@ impl Router {
                 },
             ));
         }
+        // A node built before `qualifiers` would rank every qualifier: refused rather than
+        // answered short (the coordinator's call on #1915 PR 3). The entry node's filter
+        // below covers a peer that changed build within the features' cache. A node that
+        // doesn't answer the check is unavailable: its parts are skipped and named with
+        // `allow_partial`, else `PartitionUnavailable`, as a read of them would be.
+        let mut down_parts = Vec::new();
+        if r.qualifiers.is_some() {
+            let owners = parts.iter().filter_map(|(p, _)| {
+                routes
+                    .owner(&p.partition)
+                    .map(|o| (o.node.clone(), o.address.clone()))
+            });
+            let down = cluster
+                .node
+                .owners_keep(
+                    owners,
+                    super::NEAREST_QUALIFIERS_FEATURE,
+                    "a nearest search with `qualifiers`",
+                )
+                .await?;
+            if !down.is_empty() {
+                let owned_by_down = |p: &PartRange| {
+                    routes
+                        .owner(&p.partition)
+                        .is_some_and(|o| down.contains(&o.node))
+                };
+                if let Some((p, _)) = parts.iter().find(|(p, _)| owned_by_down(p))
+                    && !r.allow_partial
+                {
+                    return Err(ApiError::partition_unavailable(format!(
+                        "partition {} isn't reachable: its node didn't answer",
+                        p.partition
+                    )));
+                }
+                parts.retain(|(p, _)| {
+                    let skip = owned_by_down(p);
+                    if skip {
+                        down_parts.push(missing(&r.table, p));
+                    }
+                    !skip
+                });
+            }
+        }
         type Answer = Result<NearestResponse, ApiError>;
         let reads: Vec<Pin<Box<dyn Future<Output = Answer> + Send + '_>>> = parts
             .iter()
@@ -894,7 +937,7 @@ impl Router {
         let budget = page_bytes(r.page_bytes);
         let mut kept: Vec<proto::Neighbour> = Vec::new();
         let mut some_cut = false;
-        let mut missed = Vec::new();
+        let mut missed = down_parts;
         // The request's holding (#1715), taken before any read: the result's bound (one
         // budget, the merge keeping at most it and one neighbour) and one read's answer
         // (another). Further concurrent reads run only on spare budget (`bounded`), so no
@@ -911,7 +954,15 @@ impl Router {
             |i, answer| match answer {
                 Ok(a) => {
                     some_cut |= a.cut_by_budget;
-                    kept = merge_nearest(std::mem::take(&mut kept), a.neighbours, k, budget);
+                    let mut found = a.neighbours;
+                    // A part from a node built before `qualifiers` (#1915 PR 3) ranked every
+                    // qualifier: the selection again here, which a part that applied it
+                    // passes whole (simp724's mixed-version point).
+                    if let Some(q) = &r.qualifiers {
+                        found
+                            .retain(|n| crate::serve::convert::qualifier_selected(q, &n.qualifier));
+                    }
+                    kept = merge_nearest(std::mem::take(&mut kept), found, k, budget);
                     Ok(())
                 }
                 Err(e) if r.allow_partial && skippable(&e) => {
