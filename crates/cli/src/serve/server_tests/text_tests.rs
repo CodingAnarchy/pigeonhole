@@ -1,5 +1,28 @@
 use super::*;
 
+/// `texts::STEP_DELAY_MS` is process-wide: a test that slows rebuilds holds this from setting
+/// it until it resets it, so another test's reset can't speed its rebuild past its fence or
+/// close (#1995).
+static STEP_DELAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Rebuilds wait 5 ms after each document until this is dropped.
+struct SlowSteps(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+fn slow_steps() -> SlowSteps {
+    let held = STEP_DELAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    SlowSteps(held)
+}
+
+impl Drop for SlowSteps {
+    // Before the lock is released: the field drops after this.
+    fn drop(&mut self) {
+        crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    }
+}
+
 // ---- Text (D313 ticket 7c, D309, ICR 0105) ----
 
 fn text_hits(r: &Json) -> Vec<String> {
@@ -417,7 +440,7 @@ fn a_fence_stops_a_text_rebuild_at_its_next_document_and_it_resumes_once_unfence
     let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
     gate.renew(u64::MAX);
     let part = gated_part(&s, &gate);
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let slow = slow_steps();
     // The fence lands mid-rebuild (400 documents at 5 ms each).
     let fenced_at = {
         let gate = Arc::clone(&gate);
@@ -436,7 +459,7 @@ fn a_fence_stops_a_text_rebuild_at_its_next_document_and_it_resumes_once_unfence
         .unwrap_err();
     let answered = std::time::Instant::now();
     let fenced_at = fenced_at.join().unwrap();
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    drop(slow);
     // Within a document or two of the fence, not the whole rebuild (or the fence's drain).
     assert!(
         answered.saturating_duration_since(fenced_at) < Duration::from_secs(1),
@@ -470,7 +493,7 @@ fn a_close_stops_a_text_rebuild_and_the_next_open_resumes_it() {
     let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
     gate.renew(u64::MAX);
     let part = gated_part(&s, &gate);
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let slow = slow_steps();
     let texts = Arc::clone(&part.part().unwrap().texts);
     let closer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
@@ -486,7 +509,7 @@ fn a_close_stops_a_text_rebuild_and_the_next_open_resumes_it() {
         ))
         .unwrap_err();
     let took = closer.join().unwrap();
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    drop(slow);
     // The close no longer waits for the whole rebuild.
     assert!(took < Duration::from_secs(1), "the close took {took:?}");
     // A cluster partition's close answers `PartitionUnavailable` (D317 ticket 6), carrying
@@ -568,7 +591,7 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
     let db = s.shared.router.service.part().unwrap().db.clone();
     indexed(&db, 400);
     stopped(&db, "tx");
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let slow = slow_steps();
     let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
     gate.renew(u64::MAX);
     let part = gated_part(&s, &gate);
@@ -580,7 +603,7 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
         &Caller::anonymous(),
         None,
     ));
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    drop(slow);
     let Ok(service::ServiceReply::TextRebuild(r)) = r else {
         panic!("{r:?}");
     };
