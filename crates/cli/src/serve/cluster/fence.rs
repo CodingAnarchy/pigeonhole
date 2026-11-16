@@ -302,11 +302,6 @@ impl Fences {
         self.local().entry(id.to_owned()).or_default().is = Is::Closed(closed);
     }
 
-    /// Whether partition `id` is closed here.
-    pub(super) fn is_closed(&self, id: &str) -> bool {
-        self.closed(id, |_| ()).is_some()
-    }
-
     /// What `f` makes of partition `id`'s close, `None` if it isn't closed here. `f` runs
     /// under the lock, so it can't take it again.
     pub(super) fn closed<R>(

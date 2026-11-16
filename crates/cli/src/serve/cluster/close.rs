@@ -515,7 +515,7 @@ mod tests {
         n.fences.set_opening("p1", false);
         assert_eq!(state(), Fenced);
         // A served partition isn't closed, and forgetting a close leaves it served.
-        assert!(!n.fences.is_closed("p1"));
+        assert!(n.fences.closed("p1", |_| ()).is_none());
         n.fences.forget_closed("p1");
         assert!(n.fences.gate("p1").is_some());
         // A close: closed and no longer served, in one step.
@@ -529,7 +529,7 @@ mod tests {
         n.fences.set_opening("p1", false);
         assert_eq!(state(), IsClosed);
         let _gate = n.open_gate("p1", 2);
-        assert!(!n.fences.is_closed("p1"));
+        assert!(n.fences.closed("p1", |_| ()).is_none());
         assert_eq!(n.fences.gate("p1").map(|(_, epoch)| epoch), Some(2));
         // Closed again, then its close forgotten (stamped over, or dropped): nothing.
         n.fences.close("p1", closed(2));
