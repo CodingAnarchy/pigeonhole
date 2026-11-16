@@ -472,7 +472,14 @@ replicate-apply 6764 0.3
 # 43625456463, 43625461046 and 43628573840 (ubuntu-24.04). The highest count of each shape times
 # 1.003. Spread across these runs: serve-get 68310-68323, serve-read-row 657557-657570,
 # serve-mutate 63474-63924, and serve-scan 8015241-8015247.
-serve-get 68528 0.3
+#
+# Raised by D195 (standing approval of up to ~0.5% a shape; coordinator 2026-11-16):
+# serve-get 68528 -> 68708 (+0.26%) and serve-mutate 64116 -> 64275 (+0.25%). Main's own
+# counts, the base column of 14 PR runs on ubuntu-24.04 between 2026-11-16T04:48Z and 17:52Z
+# (43806328852 ... 43922912077), drifted up to serve-get 68470-68502 and serve-mutate
+# 63675-64082, 27-47 under the old ceilings, so test-only PRs went red on noise (#1977). The
+# highest main count times 1.003. serve-mutate's spread (0.64%) is #1900's.
+serve-get 68708 0.3
 serve-read-row 659543 0.3
-serve-mutate 64116 0.3
+serve-mutate 64275 0.3
 serve-scan 8039293 0.3
