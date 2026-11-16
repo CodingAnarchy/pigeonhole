@@ -745,6 +745,39 @@ fn a_map_older_than_the_newest_reconciled_isnt_reconciled() {
 }
 
 #[test]
+fn a_reconcile_outcome_goes_once_the_map_places_the_partition_elsewhere() {
+    // #1830 (W4): a node kept the last reconcile outcome of every partition it ever held.
+    // `Status` reads one only for a partition its map places on the node, so an outcome for
+    // one the map gives another node is dropped at that map's reconcile, and kept until
+    // then (a closed partition the map still places here shows its outcome as before).
+    let t = Served::start();
+    let a = &t.nodes[0];
+    let base = a.get_map().unwrap();
+    let map = |v: u64, node: &str| {
+        let mut m = ClusterMap {
+            map_version: v,
+            ..base.clone()
+        };
+        for p in m.partitions.iter_mut().filter(|p| p.id == "p1") {
+            p.node = node.into();
+        }
+        m
+    };
+    let reconciled = || a.reconciled.lock().unwrap().get("p1").map(|(v, _)| *v);
+    let installing = a.installing.lock().unwrap();
+    a.reconcile_locked(&installing, &map(3, "a"), None);
+    assert_eq!(reconciled(), Some(3));
+    a.reconcile_locked(&installing, &map(4, "c"), None);
+    assert_eq!(reconciled(), None, "the map gives p1 to c");
+    // A stale map is passed over whole: it brings nothing back.
+    a.reconcile_locked(&installing, &map(3, "a"), None);
+    assert_eq!(reconciled(), None);
+    a.reconcile_locked(&installing, &map(5, "a"), None);
+    assert_eq!(reconciled(), Some(5), "placed here again");
+    drop(installing);
+}
+
+#[test]
 fn an_unfence_lifts_the_gate_only_under_the_install_lock() {
     // #1848: the unfence reconciles the partition to the node's map and lifts its gate under
     // `installing`, so a map install (and its schema reconcile) can't land between the two

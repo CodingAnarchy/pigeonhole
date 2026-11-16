@@ -438,15 +438,21 @@ impl Node {
             .shared
             .upgrade()
             .and_then(|shared| reconcile_parts(&shared, map, unfencing));
-        if let Some(outcomes) = outcomes {
-            let mut reconciled = self
-                .reconciled
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (partition, outcome) in outcomes {
-                reconciled.insert(partition, (map.map_version, outcome));
-            }
+        let mut reconciled = self
+            .reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (partition, outcome) in outcomes.into_iter().flatten() {
+            reconciled.insert(partition, (map.map_version, outcome));
         }
+        // A partition the map no longer places here has no outcome to show: `Status` reads
+        // one only for a partition its map gives this node, so this changes no answer, and
+        // the entries stop at the node's own partitions (#1830).
+        reconciled.retain(|id, _| {
+            map.partitions
+                .iter()
+                .any(|p| p.id == *id && p.node == self.id)
+        });
     }
 }
 
