@@ -1016,6 +1016,16 @@ impl BatchBuilder {
         Self::default()
     }
 
+    /// A builder holding a copy of `batch`'s mutations, as it was logged: a share replay
+    /// reinstalls from its record (D329's in-doubt shares).
+    pub fn from_batch(batch: BatchRef<'_>) -> Self {
+        Self {
+            buf: batch.as_bytes().to_vec(),
+            count: batch.len() as u32,
+            logged: false,
+        }
+    }
+
     /// An empty batch with room for about `bytes` of encoded mutations before it grows
     /// (one allocation, where [`BatchBuilder::new`] allocates its header and grows on the
     /// first push, #320).

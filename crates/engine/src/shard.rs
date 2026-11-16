@@ -1096,14 +1096,23 @@ impl Shared {
         // With the change feed on, a clean close keeps the WAL files and their checkpoints
         // (at their ends): the next open adopts the retained segments as history and replays
         // nothing (D310 §2.1).
-        let keep_wal = self.feed.is_some();
+        // External shares in doubt (D329): their PREPAREs stay in the WAL, which no
+        // checkpoint passed, so the files stay and the close isn't marked clean (a clean mark
+        // would let a reader's last-one-out remove them); the next open replays and
+        // reinstalls them.
+        let in_doubt = !self
+            .external
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
+        let keep_wal = self.feed.is_some() || in_doubt;
         if clean.is_ok() && last && !keep_wal {
             // The WAL files go away with this close: the streams the next open creates
             // start over at epoch 1, so their checkpoints must not point into the old
             // files (recovery would skip everything below them).
             clean = self.forget_checkpoints();
         }
-        if clean.is_ok() {
+        if clean.is_ok() && !in_doubt {
             // Under the exclusion (see `try_final_close`): no commit is in flight, and the
             // queue is drained first, so nothing commits after the clean mark and clears it.
             manifest::drain_sync(self);
@@ -4297,10 +4306,16 @@ impl ShardState {
                     slots: slots.into_iter().collect(),
                 },
             }),
-            ReplayedKind::Prepare { slots, applied } => {
+            ReplayedKind::Prepare {
+                slots,
+                applied,
+                in_doubt,
+            } => {
                 if let Some((at, holders)) = applied {
                     self.share_seqnos.insert(seqno, (at, holders, true));
-                } else {
+                } else if !in_doubt {
+                    // An external share in doubt (D329) stays undecided, so needed until its
+                    // decision; anything else undecided was aborted.
                     self.aborted.insert(seqno);
                 }
                 self.push_logged(Logged {
@@ -4328,6 +4343,85 @@ impl ShardState {
                 self.log_cross_record(seqno);
             }
         }
+    }
+
+    /// Reinstalls an external share a reopen found in doubt (D329, ICR 0140), before the
+    /// shard admits anything: its PREPARE (`seqno`, coordinated by `coordinator`, over
+    /// `participants`) holds the rows it writes and the rows it `read` again, as at its
+    /// admission, and waits for its decision. Its record was logged by `log_replayed` as
+    /// undecided, so the checkpoint keeps it.
+    pub(crate) fn reinstall_external_share(
+        &mut self,
+        seqno: Seqno,
+        batch: BatchBuilder,
+        read: &[(TableId, Vec<u8>)],
+        participants: Vec<ShardId>,
+        xid: Arc<[u8]>,
+    ) {
+        let reads: Vec<u64> = read.iter().map(|(t, row)| hash_row(*t, row)).collect();
+        let bytes = Arc::new(batch);
+        self.track_share_rows(bytes.batch(), true);
+        self.track_share_reads(&reads, true);
+        self.prepared.insert(
+            seqno,
+            PreparedShare {
+                external: Some(Arc::new(ExternalReq { xid })),
+                bytes,
+                commit_ts: self.last_stamp + 1,
+                reserved: 0,
+                tracked: true,
+                reads,
+                participants,
+                priority: (0, seqno),
+                submitted_at: 0,
+                settled: true,
+                parked: None,
+                feed_end: None,
+            },
+        );
+    }
+
+    /// Reinstalls the coordinator's side of an external commit a reopen found in doubt
+    /// (D329): every share prepared, awaiting `Engine::decide`, which then commits it as
+    /// any cross-shard commit (`commit_round`) or aborts it (`abort_external`).
+    pub(crate) fn reinstall_external_coord(
+        &mut self,
+        seqno: Seqno,
+        participants: Vec<ShardId>,
+        xid: Arc<[u8]>,
+    ) {
+        self.coord.insert(
+            seqno,
+            Coord {
+                external: Some(Arc::new(ExternalReq { xid })),
+                awaiting: true,
+                participants: participants.len(),
+                // D329 prepares at GroupSync at least; its decision is logged so too.
+                durability: Durability::GroupSync,
+                reply: None,
+                submitted_at: 0,
+                prepared: participants.len(),
+                applied: 0,
+                failed: None,
+                decided: true,
+                committing: false,
+                not_applied: false,
+                shards: participants,
+                parts: Vec::new(),
+                validate: None,
+                map_version: 0,
+                refused: None,
+                commit_ts: 0,
+                apply_seqno: 0,
+                completion: None,
+                epoch: 0,
+                priority: (0, seqno),
+                gives_up: false,
+                attempt: 1,
+                decide_sent: false,
+                decision_settled: false,
+            },
+        );
     }
 
     /// Takes every memtable (open-time flush when the shard count changed, decision D20).
@@ -5119,11 +5213,27 @@ impl ShardState {
     /// its reservation), no group whose sync is in flight, and no retired memtable a reader
     /// process still pins. On a frozen clock a stall wait refuses its waiters then (issues
     /// #70 and #116): in-process snapshots, which only they can drop, hold the rest.
+    /// Whether the checkpoint stops at an external share in doubt (D329): the log's front is
+    /// its PREPARE, which only its decision makes unneeded. A close then ends with the log
+    /// as it is; everything after the front is flushed, so a replay skips it.
+    fn log_held_by_in_doubt(&self) -> bool {
+        self.log.front().is_some_and(|f| {
+            matches!(f.kind, LoggedKind::Prepare { .. })
+                && self
+                    .prepared
+                    .get(&f.seqno)
+                    .is_some_and(|p| p.external.is_some())
+        })
+    }
+
     fn nothing_in_flight(&self) -> bool {
         !self.flush_running
             && self.flush_queue.is_empty()
             && !self.freeze_deferred
-            && self.prepared.is_empty()
+            && self
+                .prepared
+                .values()
+                .all(|p| p.external.is_some() && p.settled)
             && self.unresolved.is_empty()
             && self.retired.is_empty()
     }
@@ -7538,6 +7648,18 @@ impl ShardState {
                 && !matches!(m.kind, MemberKind::CommitRecord { .. })
                 && self.overlaps_undecided(&m)
             {
+                // D329: over an external share in doubt, whose decision may take as long as
+                // its caller does, nothing waits or retries: a PREPARE fails `Conflict` and a
+                // single `Busy`, at once, both retry-safe.
+                if self.overlaps_external(&m) {
+                    m.failed = Some(if matches!(m.kind, MemberKind::Single) {
+                        Error::Busy
+                    } else {
+                        Error::Conflict
+                    });
+                    self.settle(m, Ok(()), ctx);
+                    continue;
+                }
                 if matches!(m.kind, MemberKind::Single) {
                     share_waits += usize::from(self.wait_for_shares(m, true, ctx));
                     continue;
@@ -9166,6 +9288,43 @@ impl ShardState {
     /// share writes or reads here, or (a PREPARE or a conditional single) reads one an
     /// undecided share writes. The share's seqno is reserved only at its decision, so such a
     /// write admitted now would land below it while ordered after it.
+    /// Whether `m` overlaps an external share in doubt (D329), as `overlaps_undecided`
+    /// judges overlaps: a write to a row it read, or a read of (or predicate on) a row it
+    /// writes. Called only once an overlap was found, so it may walk the shares.
+    #[cold]
+    #[inline(never)]
+    fn overlaps_external(&self, m: &Member) -> bool {
+        let writes: Vec<u64> = m
+            .bytes
+            .batch()
+            .map(|b| {
+                b.iter()
+                    .flatten()
+                    .map(|mu| hash_row(mu.table, mu.row))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut reads: Vec<u64> = m
+            .validate
+            .as_ref()
+            .map(|v| v.reads.iter().map(|r| hash_row(r.table, &r.row)).collect())
+            .unwrap_or_default();
+        if let Some((table, row, _)) = m.predicate.as_deref() {
+            reads.push(hash_row(*table, row));
+        }
+        self.prepared
+            .values()
+            .filter(|p| p.external.is_some() && p.tracked)
+            .any(|p| {
+                writes.iter().any(|w| p.reads.contains(w))
+                    || p.bytes
+                        .batch()
+                        .iter()
+                        .flatten()
+                        .any(|mu| reads.contains(&hash_row(mu.table, mu.row)))
+            })
+    }
+
     fn overlaps_undecided(&self, m: &Member) -> bool {
         if self.pending_rows.is_empty() && self.pending_reads.is_empty() {
             return false;
@@ -11763,9 +11922,16 @@ impl ShardState {
             // round still waiting ends `Closed` through the closing retry path.
             self.doomed.clear();
         }
+        // External shares in doubt, and their coordinators awaiting `decide` (D329), don't
+        // hold the close: their records stay in the WAL and the next open reinstalls them.
+        let coord_live = self.coord.values().any(|c| !c.awaiting);
+        let shares_live = self
+            .prepared
+            .values()
+            .any(|p| p.external.is_none() || !p.settled);
         if !self.unresolved.is_empty()
-            || (!self.coord.is_empty() && !died)
-            || (!self.prepared.is_empty() && !died)
+            || (coord_live && !died)
+            || (shares_live && !died)
             || !self.pending.is_empty()
             || self.op.is_some()
             || !self.parked.is_empty()
@@ -11910,7 +12076,9 @@ impl ShardState {
                 // Waiting for our own edit.
                 return;
             }
-            if (!self.log.is_empty() || self.checkpoint_dirty) && !self.shared.close.failed() {
+            if ((!self.log.is_empty() && !self.log_held_by_in_doubt()) || self.checkpoint_dirty)
+                && !self.shared.close.failed()
+            {
                 // Waiting for the other shards' flushes and checkpoints (`FlushedThrough`
                 // arrives as a message). Once the close is unclean, a shard that gave up
                 // flushing never raises its flushed-through seqno: stop waiting (the WAL
@@ -12554,6 +12722,8 @@ pub(crate) enum ReplayedKind {
         /// The seqno it was applied at, if its commit was decided (D263), and the shards
         /// the replay applied the commit's shares to (D266).
         applied: Option<(Seqno, Holders)>,
+        /// An external share undecided at the crash (D329): kept, not aborted.
+        in_doubt: bool,
     },
     Commit {
         /// The shards the replay applied the commit's shares to (D266).

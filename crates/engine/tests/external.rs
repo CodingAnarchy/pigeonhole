@@ -124,3 +124,83 @@ fn a_prepare_that_read_a_row_since_written_conflicts() {
     assert!(db.in_doubt().is_empty());
     db.close().unwrap();
 }
+
+#[test]
+fn a_share_in_doubt_survives_a_close_and_a_reopen_and_is_decided_after() {
+    let vfs = SimVfs::new(23);
+    let rows: Vec<Vec<u8>> = (0..16).map(|i| format!("row{i:02}").into_bytes()).collect();
+    let rows: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &t, b"row00", &rows, b"kept")
+            .prepare(b"c1", Durability::GroupSync)
+            .unwrap();
+        // Reading a row c1 writes is refused at once while c1 is in doubt (D329).
+        assert!(matches!(
+            txn(&db, &t, b"row00", &[b"other"], b"no").prepare(b"r1", Durability::GroupSync),
+            Err(Error::Conflict)
+        ));
+        txn(&db, &t, b"other", &[b"other"], b"dropped")
+            .prepare(b"a1", Durability::GroupSync)
+            .unwrap();
+        // The close doesn't wait for the decisions: they're the caller's.
+        db.close().unwrap();
+    }
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    let mut doubt: Vec<Vec<u8>> = db.in_doubt().into_iter().map(|(x, _)| x).collect();
+    doubt.sort();
+    assert_eq!(doubt, [b"a1".to_vec(), b"c1".to_vec()]);
+    assert!(rows.iter().all(|r| get_bytes(&db, &t, r).is_none()));
+    // The holds are back: a PREPARE over the same rows is refused while they're in doubt.
+    assert!(
+        txn(&db, &t, b"row01", &rows[..1], b"overlap")
+            .prepare(b"o1", Durability::GroupSync)
+            .is_err()
+    );
+    db.decide(b"c1", true).unwrap().expect("in doubt");
+    db.decide(b"a1", false).unwrap().expect("in doubt");
+    assert!(
+        rows.iter()
+            .all(|r| get_bytes(&db, &t, r).as_deref() == Some(&b"kept"[..]))
+    );
+    assert_eq!(get_bytes(&db, &t, b"other"), None);
+    assert!(db.in_doubt().is_empty());
+    db.close().unwrap();
+    // Decided before the close: a reopen finds nothing in doubt, and the commit stands.
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    assert!(db.in_doubt().is_empty());
+    assert_eq!(get_bytes(&db, &t, b"row05").as_deref(), Some(&b"kept"[..]));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_reopen_with_another_shard_count_is_refused_while_shares_are_in_doubt() {
+    let vfs = SimVfs::new(24);
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &t, b"a", &[b"a", b"z"], b"v")
+            .prepare(b"x", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+    }
+    assert!(matches!(
+        Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 3)),
+        Err(Error::Unsupported(_))
+    ));
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    db.decide(b"x", false).unwrap().expect("in doubt");
+    db.close().unwrap();
+    // Decided: any shard count opens.
+    Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 3))
+        .unwrap()
+        .close()
+        .unwrap();
+}

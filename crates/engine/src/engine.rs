@@ -711,6 +711,14 @@ type Slots = Vec<(TabletId, FamilyId)>;
 
 /// A replayed record of one stream, kept until every stream is read and the cross-shard
 /// decisions are resolved.
+/// An external PREPARE's fields at replay (D329): what reinstalling it needs beside its batch.
+struct ExternalStash {
+    xid: Arc<[u8]>,
+    participants: Vec<StreamId>,
+    /// The rows it read on its shard, for its read holds.
+    read: Vec<(TableId, Vec<u8>)>,
+}
+
 struct ReplayedRecord {
     end: Lsn,
     seqno: Seqno,
@@ -1372,6 +1380,11 @@ impl Engine {
         let mut max_seqno = 0;
         let mut recoveries: Vec<(StreamId, Recovery)> = Vec::new();
         let mut stashed: Vec<(StreamId, Seqno, u64, StreamId, Vec<u8>)> = Vec::new();
+        // D329: each external PREPARE's xid, participant streams and logged reads, by
+        // `(stream, id)` (its batch is in `stashed`), and each external abort's
+        // `(coordinator stream, id)`.
+        let mut external: HashMap<(StreamId, Seqno), ExternalStash> = HashMap::new();
+        let mut external_aborts: HashSet<(StreamId, Seqno)> = HashSet::new();
         // `(coordinator stream, seqno) -> participant streams` of every COMMIT decision.
         // With the seqno and timestamp a DECISION applies the commit at (D263);
         // `None` for a 0.3.0 COMMIT, whose PREPAREs apply at their own.
@@ -1461,6 +1474,45 @@ impl Engine {
                             kind: ReplayedRecordKind::Commit,
                         });
                     }
+                    WalRecord::ExternalPrepare {
+                        seqno,
+                        coordinator,
+                        share,
+                    } => {
+                        let Some(batch) = share.batch() else {
+                            return Err(Error::Corruption(
+                                "an external PREPARE without its batch".into(),
+                            ));
+                        };
+                        let mut read = Vec::new();
+                        for r in share.reads() {
+                            let r = r?;
+                            read.push((r.table, r.row.to_vec()));
+                        }
+                        stashed.push((stream, seqno, 0, coordinator, batch.as_bytes().to_vec()));
+                        external.insert(
+                            (stream, seqno),
+                            ExternalStash {
+                                xid: share.xid().into(),
+                                participants: share.participants().iter().collect(),
+                                read,
+                            },
+                        );
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Prepare { coordinator },
+                        });
+                    }
+                    WalRecord::ExternalAbort { seqno, .. } => {
+                        external_aborts.insert((stream, seqno));
+                        // An abort's record: its id is aborted (`log_replayed`, no apply).
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Commit,
+                        });
+                    }
                     // `WalRecord::decode` returns no other type in this build.
                     _ => return Err(Error::Corruption("wal record type".into())),
                 }
@@ -1509,6 +1561,25 @@ impl Engine {
             }
             applied_slots.insert((*stream, *seqno), (apply_seqno, per_shard));
         }
+        // D329: an external PREPARE with no decision and no abort, whose every participant's
+        // PREPARE is here, is in doubt: kept, held again, and decided by the caller. One
+        // with a participant's record missing (a torn tail below its durability) is dropped
+        // as aborted, as a D263 PREPARE is.
+        let in_doubt: Vec<(StreamId, Seqno, StreamId)> = stashed
+            .iter()
+            .filter(|(stream, seqno, _, coordinator, _)| {
+                external.get(&(*stream, *seqno)).is_some_and(|e| {
+                    !complete(*coordinator, *seqno)
+                        && !external_aborts.contains(&(*coordinator, *seqno))
+                        && e.participants
+                            .iter()
+                            .all(|p| prepared.contains(&(*p, *seqno)))
+                })
+            })
+            .map(|(stream, seqno, _, coordinator, _)| (*stream, *seqno, *coordinator))
+            .collect();
+        let in_doubt_ids: HashSet<(StreamId, Seqno)> =
+            in_doubt.iter().map(|(s, id, _)| (*s, *id)).collect();
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
         // The allocator starts above every recovered seqno, and shm mirrors it (D271); its
         // timestamp is seeded once replay has raised the floors (below).
@@ -1543,6 +1614,15 @@ impl Engine {
             }
             on.into_iter().collect()
         };
+        // D329: an in-doubt share's records must stay in their streams, which a changed layout
+        // or a spilled replay checkpoints past (`flush_recovered`). Refused rather than
+        // losing it: open with the shard count it was written with, and decide it.
+        if !no_writes && !same_layout && !in_doubt.is_empty() {
+            return Err(Error::Unsupported(
+                "this database has externally prepared transactions in doubt: open it with \
+                 the shard count and memory it was written with, and decide them first",
+            ));
+        }
         if no_writes {
             // A read-only open (ICR 0059) keeps what it replayed in its memtables, whatever
             // the layout (replay routes each record to the shard owning its rows), and
@@ -1583,6 +1663,7 @@ impl Engine {
                                 slots,
                                 applied: applied
                                     .map(|(s, _)| (*s, holders_of(coordinator, r.seqno))),
+                                in_doubt: in_doubt_ids.contains(&(stream, r.seqno)),
                             }
                         }
                         ReplayedRecordKind::Commit => ReplayedKind::Commit {
@@ -1609,6 +1690,48 @@ impl Engine {
                 note_feed_marks(&shared, i, &wal);
                 states[i].set_wal(Box::new(wal));
                 have_wal[i] = true;
+            }
+            // D329: each in-doubt share is held again on its shard, and its coordinator
+            // awaits `decide`, before any shard admits a write.
+            let now = shared.vfs.monotonic_nanos();
+            for (stream, seqno, coordinator) in &in_doubt {
+                let (Some(e), Some((.., bytes))) = (
+                    external.get(&(*stream, *seqno)),
+                    stashed
+                        .iter()
+                        .find(|(s, id, ..)| s == stream && id == seqno),
+                ) else {
+                    continue;
+                };
+                let participants: Vec<ShardId> =
+                    e.participants.iter().map(|p| ShardId(p.0 as u16)).collect();
+                let batch = BatchBuilder::from_batch(pigeonhole_format::wal::BatchRef::new(bytes)?);
+                states[stream.0 as usize].reinstall_external_share(
+                    *seqno,
+                    batch,
+                    &e.read,
+                    participants.clone(),
+                    Arc::clone(&e.xid),
+                );
+                if stream == coordinator {
+                    states[stream.0 as usize].reinstall_external_coord(
+                        *seqno,
+                        participants,
+                        Arc::clone(&e.xid),
+                    );
+                    shared
+                        .external
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(
+                            e.xid.to_vec(),
+                            crate::shard::ExternalEntry {
+                                id: *seqno,
+                                coordinator: ShardId(coordinator.0 as u16),
+                                prepared_at: now,
+                            },
+                        );
+                }
             }
         } else {
             flush_recovered(
