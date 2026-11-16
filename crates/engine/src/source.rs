@@ -19,7 +19,7 @@ use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{FamilyId, TabletId};
 use pigeonhole_memtable::{ArenaSlice, MemIter, MemtableReader};
 use pigeonhole_runtime::ShardId;
-use pigeonhole_sst::{ReadOptions, SstIter};
+use pigeonhole_sst::{ReadOptions, ScanStop, SstIter};
 use smallvec::SmallVec;
 
 use crate::snapshot::{FamilySsts, MemSet, OpenSst, SstSet, View};
@@ -378,7 +378,7 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
         && !filter.is_all()
         && out.len() > first
     {
-        let stop: Arc<[u8]> = Arc::from(end);
+        let stop: ScanStop = Arc::new(Box::from(end));
         for source in &mut out[first..] {
             if let Source::Sst(s) = source {
                 s.set_stop(&stop);
@@ -489,7 +489,7 @@ struct Level {
     filter: ScanFilter,
     opts: ReadOptions,
     /// Where the scan ends, for each SST the level opens ([`SstIter::set_stop`]).
-    stop: Option<Arc<[u8]>>,
+    stop: Option<ScanStop>,
     /// Index in `files` of the open SST.
     at: usize,
     /// A seek has positioned the cursor: before one, the open SST's cursor is invalid
@@ -515,7 +515,10 @@ impl Level {
         };
         self.at = i;
         let mut iter = reader.iter(self.filter.clone(), self.opts);
-        iter.set_stop(self.stop.clone());
+        // Only a filtered bounded scan has one: the rest skip the clone and the store.
+        if let Some(stop) = &self.stop {
+            iter.set_stop(Some(Arc::clone(stop)));
+        }
         Ok(iter)
     }
 }
@@ -533,7 +536,7 @@ impl SstSource {
 
     /// Ends the scan's filtered jumps at `stop` ([`SstIter::set_stop`]), for the open SST and
     /// the ones the level opens next.
-    fn set_stop(&mut self, stop: &Arc<[u8]>) {
+    fn set_stop(&mut self, stop: &ScanStop) {
         self.iter.set_stop(Some(Arc::clone(stop)));
         if let Some(level) = &mut self.level {
             level.stop = Some(Arc::clone(stop));

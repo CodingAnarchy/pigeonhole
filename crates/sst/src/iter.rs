@@ -99,9 +99,14 @@ pub struct SstIter {
     /// costs its caller one settle.
     stopped: bool,
     /// Where a multi-row read ends ([`SstIter::set_stop`]): a jump that lands at or past it
-    /// stops there (#1931). One per read, shared by its sources.
-    stop: Option<Arc<[u8]>>,
+    /// stops there (#1931). One per read, shared by its sources. A thin pointer (a boxed
+    /// slice behind the `Arc`): every cursor carries the field, most with `None`, and each
+    /// byte it adds is copied with the cursor wherever it moves.
+    stop: Option<ScanStop>,
 }
+
+/// A multi-row read's end, shared by its cursors ([`SstIter::set_stop`]).
+pub type ScanStop = Arc<Box<[u8]>>;
 
 /// Where a cursor's readahead ramp stands ([`SstIter::readahead_ramp`]), to carry it to the
 /// cursor of the next SST a level scan reads on into.
@@ -326,7 +331,7 @@ impl SstIter {
     /// bounded scan's end, as its resolver stops at): a jump that lands there stops, valid
     /// but not admitted, instead of jumping on row by row through rows past the read's end
     /// (#1931). Tested only after a jump. A one-row read needs none: its rows end it.
-    pub fn set_stop(&mut self, stop: Option<Arc<[u8]>>) {
+    pub fn set_stop(&mut self, stop: Option<ScanStop>) {
         self.stop = stop;
     }
 
