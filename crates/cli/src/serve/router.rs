@@ -1194,6 +1194,11 @@ impl Router {
         ))
     }
 
+    /// Whether this is a cluster node's router.
+    pub(crate) fn is_cluster(&self) -> bool {
+        self.cluster.is_some()
+    }
+
     /// [`dispatch_after_primary`](Self::dispatch_after_primary), and on a cluster node a read
     /// sent with `x-pigeonhole-read-replica-max-lag-ms` (`max_lag`, as parsed) that a
     /// replica may serve (D328): with what served it, for the response's headers. Every

@@ -438,26 +438,37 @@ async fn call(
             .map(|v| v.as_bytes()),
     );
     // A read a replica may serve on a cluster node (D328).
-    let max_lag = super::replica::read_replica_max_lag(
-        headers
-            .get(super::replica::READ_REPLICA_MAX_LAG_MS)
-            .map(|v| v.as_bytes()),
-    );
+    let max_lag = if shared.router.is_cluster() {
+        super::replica::read_replica_max_lag(
+            headers
+                .get(super::replica::READ_REPLICA_MAX_LAG_MS)
+                .map(|v| v.as_bytes()),
+        )
+    } else {
+        Ok(None)
+    };
     let deadline = ReadDeadline::new(arrived, shared.limits.request_timeout, None);
-    let reply = shared
-        .router
-        .dispatch_read(
+    let (reply, served) = match max_lag {
+        Ok(None) => (
+            shared
+                .router
+                .dispatch_after_primary(op, &caller, Some(budget), min_primary_seqno, deadline)
+                .await,
+            None,
+        ),
+        max_lag => match Box::pin(shared.router.dispatch_read(
             op,
             &caller,
             Some(budget),
             min_primary_seqno,
             max_lag,
             deadline,
-        )
-        .await;
-    let (reply, served) = match reply {
-        Ok((reply, served)) => (Ok(reply), served),
-        Err(e) => (Err(e), None),
+        ))
+        .await
+        {
+            Ok((reply, served)) => (Ok(reply), served),
+            Err(e) => (Err(e), None),
+        },
     };
     shared.count(rpc, started, &reply);
     // A read's charge (#1567): fitted to the rendered body, then held until it's written.

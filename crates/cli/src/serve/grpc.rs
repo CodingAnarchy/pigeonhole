@@ -464,11 +464,17 @@ async fn call_served<T>(
             .get(super::replica::MIN_PRIMARY_SEQNO)
             .map(|v| v.as_bytes()),
     );
-    let max_lag = super::replica::read_replica_max_lag(
-        req.metadata()
-            .get(super::replica::READ_REPLICA_MAX_LAG_MS)
-            .map(|v| v.as_bytes()),
-    );
+    // Only a cluster node reads the replica header (D328): a single node's calls keep
+    // their cost (the serve callgrind shapes, D193).
+    let max_lag = if shared.router.is_cluster() {
+        super::replica::read_replica_max_lag(
+            req.metadata()
+                .get(super::replica::READ_REPLICA_MAX_LAG_MS)
+                .map(|v| v.as_bytes()),
+        )
+    } else {
+        Ok(None)
+    };
     // The request's one deadline, from its arrival (#1577).
     let arrived = req.extensions().get::<Arrived>().map_or(started, |a| a.0);
     let deadline = ReadDeadline::new(
@@ -478,13 +484,29 @@ async fn call_served<T>(
     );
     let op = op(req.into_inner());
     let rpc = op.index();
-    let reply = shared
-        .router
-        .dispatch_read(op, &caller, prepaid, min_primary_seqno, max_lag, deadline)
-        .await;
-    let (reply, served) = match reply {
-        Ok((reply, served)) => (Ok(reply), served),
-        Err(e) => (Err(e), None),
+    // A call without the header goes as it always did; one with it, boxed, so its future
+    // doesn't widen every call's.
+    let (reply, served) = match max_lag {
+        Ok(None) => (
+            shared
+                .router
+                .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+                .await,
+            None,
+        ),
+        max_lag => match Box::pin(shared.router.dispatch_read(
+            op,
+            &caller,
+            prepaid,
+            min_primary_seqno,
+            max_lag,
+            deadline,
+        ))
+        .await
+        {
+            Ok((reply, served)) => (Ok(reply), served),
+            Err(e) => (Err(e), None),
+        },
     };
     shared.count(rpc, started, &reply);
     Ok((reply?, served))
