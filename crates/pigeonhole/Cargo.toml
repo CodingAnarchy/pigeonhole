@@ -33,6 +33,10 @@ __engine-hooks = ["__unstable-hooks", "pigeonhole-engine/test-hooks"]
 # primary's feed gives, and the calls a replica applies them with. Not part of the API and
 # outside the semver promise, until the replica's surface is designed for it.
 __unstable-replication = []
+# Transactions prepared for an external coordinator (D329, ICR 0140): `Transaction::prepare`,
+# `Pigeonhole::decide` and `Pigeonhole::in_doubt`, for `phdb serve`'s spanning transactions.
+# Not part of the API and outside the semver promise.
+__unstable-txn-prepare = []
 
 [dependencies]
 pigeonhole-engine = { workspace = true }

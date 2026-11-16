@@ -1,0 +1,45 @@
+//! D329 (ICR 0140), the hidden `__unstable-txn-prepare` API: a transaction prepared for an
+//! external coordinator is in doubt across a close and a reopen, and decided by the caller.
+#![cfg(feature = "__unstable-txn-prepare")]
+
+use pigeonhole::{Durability, Family, Options, Pigeonhole};
+
+#[test]
+fn a_prepared_transaction_is_decided_after_a_reopen() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("p.phdb");
+    {
+        let db = Pigeonhole::open(&path, Options::default().shards(2)).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let mut txn = db.transaction().unwrap();
+        for row in [&b"a"[..], b"m", b"z"] {
+            txn.put(&t, row, "f", b"q", b"v");
+        }
+        let p = txn.prepare(b"home:h1-01", Durability::GroupSync).unwrap();
+        assert!(p.seqno > 0);
+        assert!(
+            t.get(b"a", "f", b"q").unwrap().is_none(),
+            "in doubt: not visible"
+        );
+        drop(t);
+        db.close().unwrap();
+    }
+    let db = Pigeonhole::open(&path, Options::default().shards(2)).unwrap();
+    let doubt: Vec<Vec<u8>> = db.in_doubt().into_iter().map(|(x, _)| x).collect();
+    assert_eq!(doubt, [b"home:h1-01".to_vec()]);
+    assert!(db.decide(b"home:h1-01", true).unwrap().is_some());
+    assert_eq!(
+        db.decide(b"home:h1-01", true).unwrap(),
+        None,
+        "decided already"
+    );
+    let t = db.table("t").unwrap().open().unwrap();
+    assert_eq!(t.get(b"m", "f", b"q").unwrap().unwrap().value(), b"v");
+    drop(t);
+    db.close().unwrap();
+}
