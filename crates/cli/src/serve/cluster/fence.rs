@@ -74,6 +74,17 @@ struct Served {
     epoch: u64,
 }
 
+/// What a partition is on this node at one moment, read under one lock ([`Fences::now`]).
+/// Served and closed win over an open that is running beside them.
+pub(super) enum Now {
+    /// Served here, behind this gate.
+    Served(Arc<WriteGate>),
+    Closed,
+    /// Being opened, and neither served nor closed yet.
+    Opening,
+    Nothing,
+}
+
 /// What a partition is on this node: served or closed, and whether an open of it is running.
 /// An entry that is none of them is removed.
 #[derive(Debug, Default)]
@@ -199,6 +210,16 @@ impl Round {
     }
 }
 
+/// A served partition's state behind `gate`, and why it's fenced when it is.
+pub(super) fn gate_state(gate: &WriteGate) -> (LocalPartitionState, FenceReason) {
+    match gate.fenced() {
+        Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
+        Some(Fence::Unconfirmed) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
+        Some(Fence::Lapsed) => (LocalPartitionState::Fenced, FenceReason::LeaseLapsed),
+        None => (LocalPartitionState::Serving, FenceReason::Unspecified),
+    }
+}
+
 impl Fences {
     fn local(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Local>> {
         self.local.lock().unwrap_or_else(PoisonError::into_inner)
@@ -252,6 +273,26 @@ impl Fences {
         match &self.local().get(id)?.is {
             Is::Served(s) => Some((Arc::clone(&s.gate), s.epoch)),
             _ => None,
+        }
+    }
+
+    /// What partition `id` is here, in one read, so a close or a reopen is seen before or
+    /// after and never between. `closed` runs on a closed partition's entry, under the lock,
+    /// so it can't take it again.
+    pub(super) fn now(&self, id: &str, closed: impl FnOnce(&super::close::Closed)) -> Now {
+        let local = self.local();
+        match local.get(id) {
+            Some(Local {
+                is: Is::Served(s), ..
+            }) => Now::Served(Arc::clone(&s.gate)),
+            Some(Local {
+                is: Is::Closed(c), ..
+            }) => {
+                closed(c);
+                Now::Closed
+            }
+            Some(Local { opening: true, .. }) => Now::Opening,
+            _ => Now::Nothing,
         }
     }
 
@@ -372,26 +413,18 @@ impl Node {
     /// when it isn't open here.
     pub(crate) fn part_state(&self, id: &str) -> Option<(LocalPartitionState, FenceReason)> {
         let (gate, _) = self.fences.gate(id)?;
-        Some(match gate.fenced() {
-            Some(Fence::Operator) => (LocalPartitionState::Fenced, FenceReason::Operator),
-            Some(Fence::Unconfirmed) => (LocalPartitionState::Fenced, FenceReason::AwaitingPeerMap),
-            Some(Fence::Lapsed) => (LocalPartitionState::Fenced, FenceReason::LeaseLapsed),
-            None => (LocalPartitionState::Serving, FenceReason::Unspecified),
-        })
+        Some(gate_state(&gate))
     }
 
     /// Partition `id`'s state as `Status` reports it, for `Admin.Info` (#1852): open
     /// ([`part_state`](Self::part_state)), else closed, else being opened. Unspecified for one
     /// the node hasn't opened (no file, or a failed open).
     pub(crate) fn local_state(&self, id: &str) -> (LocalPartitionState, FenceReason) {
-        if let Some(state) = self.part_state(id) {
-            state
-        } else if self.fences.is_closed(id) {
-            (LocalPartitionState::Closed, FenceReason::Unspecified)
-        } else if self.fences.is_opening(id) {
-            (LocalPartitionState::Opening, FenceReason::Unspecified)
-        } else {
-            (LocalPartitionState::Unspecified, FenceReason::Unspecified)
+        match self.fences.now(id, |_| ()) {
+            Now::Served(gate) => gate_state(&gate),
+            Now::Closed => (LocalPartitionState::Closed, FenceReason::Unspecified),
+            Now::Opening => (LocalPartitionState::Opening, FenceReason::Unspecified),
+            Now::Nothing => (LocalPartitionState::Unspecified, FenceReason::Unspecified),
         }
     }
 

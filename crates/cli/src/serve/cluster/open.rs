@@ -731,7 +731,11 @@ impl Node {
             .collect();
         for id in mine {
             // Open, or closed by the operator: a close holds until `unfence`.
-            if self.part_state(&id).is_some() || self.fences.is_closed(&id) {
+            // One read, so a reopen between two can't make it look like neither.
+            if matches!(
+                self.fences.now(&id, |_| ()),
+                super::fence::Now::Served(_) | super::fence::Now::Closed
+            ) {
                 continue;
             }
             match self.open_part(&id).await {
