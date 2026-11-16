@@ -273,8 +273,20 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
                 continue;
             }
             o.created.push((*name).to_owned());
-        } else if i.created > 0 {
-            o.adopted.push((*name).to_owned());
+        } else {
+            // An index's create isn't one step, so an unrecorded table of its name may be
+            // half made (a crash before `record`, audit120's S2): adopted only if it opens
+            // as the kind the map places, else left unrecorded with an error for `Status`.
+            if let Err(e) = open_index(db, i) {
+                o.errors.push(format!(
+                    "index {name:?}: an unrecorded table of its name doesn't open as the \
+                     index: {e}"
+                ));
+                continue;
+            }
+            if i.created > 0 {
+                o.adopted.push((*name).to_owned());
+            }
         }
         if let Err(e) = record(db, name, i.created) {
             o.errors.push(e);
@@ -330,6 +342,20 @@ fn create_index(db: &Pigeonhole, i: &IndexPlacement) -> Result<(), String> {
                 .map(drop)
                 .map_err(|e| e.to_string())
         }
+        None => Err("its placement has no create request".into()),
+    }
+}
+
+/// Opens index `i` as the kind its placement says, to check a table of its name is it.
+fn open_index(db: &Pigeonhole, i: &IndexPlacement) -> Result<(), String> {
+    use crate::serve::proto::index_placement::Kind;
+    match &i.kind {
+        Some(Kind::Vector(_)) => pigeonhole_vector::Index::open(db, &i.name)
+            .map(drop)
+            .map_err(|e| e.to_string()),
+        Some(Kind::Text(_)) => pigeonhole_text::Index::open(db, &i.name)
+            .map(drop)
+            .map_err(|e| e.to_string()),
         None => Err("its placement has no create request".into()),
     }
 }
@@ -782,6 +808,15 @@ impl Router {
             crate::serve::convert::family_in(f)?;
         }
         let (map, missed) = Self::change_map(node, |map| {
+            // An index's name (audit120's S4): `TableExists`, as a single node answers, where
+            // the map's own rule would say `InvalidArgument`. Even with `if_missing`: the
+            // index's table isn't the map's to give families.
+            if map.indexes.iter().any(|i| i.name == r.name) {
+                return Err(ApiError::from_code(
+                    ErrorCode::TableExists,
+                    &format!("{:?} is an index's table", r.name),
+                ));
+            }
             let mut new = map.clone();
             match new.tables.iter_mut().find(|t| t.name == r.name) {
                 Some(t) => {
@@ -912,6 +947,11 @@ impl Router {
             )));
         }
         // The options parse as each partition will parse them, before the map takes them.
+        // A text index's source family, checked against the followed table's in the map.
+        let source_family = match &r {
+            IndexRequest::Text(t) => Some(t.source_family.clone()),
+            IndexRequest::Vector(_) => None,
+        };
         let (kind, follows, splits, partitions) = match r {
             IndexRequest::Vector(r) => {
                 crate::serve::indexes::create_args(&r)?;
@@ -962,13 +1002,24 @@ impl Router {
                     &format!("table {name:?} exists, and an index is a table of its own"),
                 ));
             }
-            if !follows.is_empty() && !map.tables.iter().any(|t| t.name == follows) {
+            let followed = map.tables.iter().find(|t| t.name == follows);
+            if !follows.is_empty() && followed.is_none() {
                 return Err(ApiError::from_code(
                     ErrorCode::TableNotFound,
                     &format!(
                         "index {name:?} follows table {follows:?}, which isn't in the cluster map"
                     ),
                 ));
+            }
+            // Every partition would refuse to make it, for ever, with the placement fixed
+            // (audit120's M3). A placement set by hand with no families can't be checked.
+            if let (Some(family), Some(t)) = (&source_family, followed)
+                && !t.families.is_empty()
+                && !t.families.iter().any(|f| f.name == *family)
+            {
+                return Err(ApiError::invalid(format!(
+                    "text index {name:?}: table {follows:?} has no family {family:?}"
+                )));
             }
             let mut new = map.clone();
             new.indexes.push(IndexPlacement {
@@ -1171,6 +1222,54 @@ mod tests {
             "{o:?}"
         );
         assert_eq!(records(&db).unwrap().get("users"), Some(&0));
+        db.close().unwrap();
+    }
+
+    /// audit120's S2 on #1994: an unrecorded table of an index's name is adopted only if it
+    /// opens as that index. One that doesn't (a crash between the index's create steps, or
+    /// a plain table) stays unrecorded, with an error.
+    #[test]
+    fn an_unrecorded_index_table_is_adopted_only_if_it_opens_as_the_index() {
+        use crate::serve::proto::{
+            CreateVectorIndexRequest, Element, IndexPlacement, Metric, VectorSpec,
+            index_placement::Kind,
+        };
+        let db = db();
+        let request = |name: &str| CreateVectorIndexRequest {
+            name: name.into(),
+            spec: Some(VectorSpec {
+                dim: 2,
+                element: Element::F32 as i32,
+                metric: Metric::L2 as i32,
+            }),
+            ..Default::default()
+        };
+        // `half` is a table and no index; `whole` is an index made outside the map.
+        db.table("half")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let (spec, options) = crate::serve::indexes::create_args(&request("whole")).unwrap();
+        pigeonhole_vector::Index::create(&db, "whole", spec, options).unwrap();
+        let mut m = map(2, &[]);
+        for (name, created) in [("half", 2), ("whole", 2)] {
+            m.indexes.push(IndexPlacement {
+                name: name.into(),
+                kind: Some(Kind::Vector(request(name))),
+                partitions: vec!["p1".into()],
+                created,
+                ..Default::default()
+            });
+        }
+        let o = reconcile(&db, "p1", &m);
+        assert_eq!(o.adopted, vec!["whole".to_owned()], "{o:?}");
+        assert!(
+            o.errors.len() == 1 && o.errors[0].contains("\"half\""),
+            "{o:?}"
+        );
+        let r = records(&db).unwrap();
+        assert_eq!((r.get("whole"), r.get("half")), (Some(&2), None));
         db.close().unwrap();
     }
 }

@@ -219,8 +219,9 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             m.cluster_id
         )));
     }
-    // An edited map changes where the partitions go, never the tables: another table, or
-    // another `created`, would drop data.
+    // An edited map changes where the partitions go, never the tables or the indexes
+    // (#1722): another table or index, or another `created`, would drop data or make an
+    // index again empty.
     if r.map.is_some() {
         let ours = r.dir.join("map.json");
         let backed_up = map::parse_json(
@@ -232,6 +233,13 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             return Err(Failure::usage(&format!(
                 "{}'s tables aren't the backup's: --map may change the nodes and where the \
                  partitions go, not the tables",
+                map_path.display()
+            )));
+        }
+        if backed_up.indexes != m.indexes {
+            return Err(Failure::usage(&format!(
+                "{}'s indexes aren't the backup's: --map may change the nodes and where the \
+                 partitions go, not the indexes",
                 map_path.display()
             )));
         }
@@ -604,18 +612,17 @@ fn record_part(dir: &Path, p: &PartProgress, unwritable: &mut Option<String>) {
 /// open-ended), as bytes.
 type Range = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-/// The ranges `m` gives `partition` in each table that has one there, by table: its
-/// `created`, and the ranges as the splits bound them.
-fn ranges_of(m: &ClusterMap, partition: &str) -> BTreeMap<String, (u64, Vec<Range>)> {
-    let mut out = BTreeMap::new();
-    for t in &m.tables {
-        let keys: Vec<Vec<u8>> = t
-            .splits
+/// The ranges `m` gives `partition` in each table and index that has one there, by name
+/// (names are unique across both): whether it's a table or an index, its `created`, and the
+/// ranges as the splits bound them. An index that follows a table has that table's ranges
+/// (#1722).
+fn ranges_of(m: &ClusterMap, partition: &str) -> BTreeMap<String, (&'static str, u64, Vec<Range>)> {
+    let on = |splits: &[proto::SplitKey], partitions: &[String]| -> Vec<Range> {
+        let keys: Vec<Vec<u8>> = splits
             .iter()
             .map(|k| map::split_key_bytes(k).unwrap_or_default())
             .collect();
-        let ranges: Vec<Range> = t
-            .partitions
+        partitions
             .iter()
             .enumerate()
             .filter(|(_, q)| *q == partition)
@@ -625,53 +632,93 @@ fn ranges_of(m: &ClusterMap, partition: &str) -> BTreeMap<String, (u64, Vec<Rang
                     keys.get(i).cloned(),
                 )
             })
-            .collect();
+            .collect()
+    };
+    let mut out = BTreeMap::new();
+    for t in &m.tables {
+        let ranges = on(&t.splits, &t.partitions);
         if !ranges.is_empty() {
-            out.insert(t.name.clone(), (t.created, ranges));
+            out.insert(t.name.clone(), ("table", t.created, ranges));
+        }
+    }
+    for i in &m.indexes {
+        let ranges = if i.follows.is_empty() {
+            on(&i.splits, &i.partitions)
+        } else {
+            m.tables
+                .iter()
+                .find(|t| t.name == i.follows)
+                .map(|t| on(&t.splits, &t.partitions))
+                .unwrap_or_default()
+        };
+        if !ranges.is_empty() {
+            out.insert(i.name.clone(), ("index", i.created, ranges));
         }
     }
     out
 }
 
 /// What the live map's schema does to the backup's copy of `partition` once it opens
-/// (D317 ticket 5's reconcile), or why it can't be restored alone: a table both maps have
-/// (the same `created`) must give it the same ranges, since no reconcile moves rows
-/// between partitions (cli692's design Q1). Tables created on it since come back empty,
-/// and tables dropped since go. Their names, in that order.
+/// (D317 ticket 5's reconcile), or why it can't be restored alone: a table or index both
+/// maps have (the same `created`) must give it the same ranges, since no reconcile moves
+/// rows between partitions (cli692's design Q1). Tables and indexes created on it since
+/// come back empty (a text index then fills from its source rows, #1722), and those
+/// dropped since go. Their names, in that order.
 fn schema_against(
     backup: &ClusterMap,
     live: &ClusterMap,
     partition: &str,
 ) -> Result<(Vec<String>, Vec<String>), Failure> {
     let (in_backup, in_live) = (ranges_of(backup, partition), ranges_of(live, partition));
-    let same = |name: &str, created: u64| {
-        backup
-            .tables
-            .iter()
-            .any(|t| t.name == name && t.created == created)
-    };
     let mut empty = Vec::new();
-    for (name, (created, ranges)) in &in_live {
-        if !same(name, *created) {
+    for (name, (kind, created, ranges)) in &in_live {
+        let before = in_backup
+            .get(name)
+            .filter(|(k, c, _)| k == kind && c == created);
+        let Some((_, _, before)) = before else {
+            // Not on this partition in the backup, or another incarnation: the reconcile
+            // makes it, empty. One the backup had on other partitions only can't have
+            // moved here, since that would change a range it has here.
+            if (*kind == "table"
+                && backup
+                    .tables
+                    .iter()
+                    .any(|t| t.name == *name && t.created == *created))
+                || (*kind == "index"
+                    && backup
+                        .indexes
+                        .iter()
+                        .any(|i| i.name == *name && i.created == *created))
+            {
+                return Err(moved_range(partition, kind, name));
+            }
             empty.push(name.clone());
             continue;
-        }
-        let before = in_backup.get(name).map(|(_, r)| r);
-        if before != Some(ranges) {
-            return Err(Failure::usage(&format!(
-                "partition {partition}'s key range of table {name:?} changed since the backup \
-                 (its splits or partitions): the copy holds the backup's range, and no \
-                 reconcile moves rows between partitions. Restore the whole cluster, or put \
-                 the table's splits back first"
-            )));
+        };
+        if before != ranges {
+            return Err(moved_range(partition, kind, name));
         }
     }
     let dropped = in_backup
         .iter()
-        .filter(|(name, (created, _))| !in_live.get(*name).is_some_and(|(c, _)| c == created))
+        .filter(|(name, (kind, created, _))| {
+            !in_live
+                .get(*name)
+                .is_some_and(|(k, c, _)| k == kind && c == created)
+        })
         .map(|(name, _)| name.clone())
         .collect();
     Ok((empty, dropped))
+}
+
+/// [`schema_against`]'s refusal: `name`'s range on `partition` changed since the backup.
+fn moved_range(partition: &str, kind: &str, name: &str) -> Failure {
+    Failure::usage(&format!(
+        "partition {partition}'s key range of {kind} {name:?} changed since the backup \
+         (its splits or partitions): the copy holds the backup's range, and no reconcile \
+         moves rows between partitions. Restore the whole cluster, or put the {kind}'s \
+         splits back first"
+    ))
 }
 
 /// `phdb cluster restore DIR --partition P [--to ID]` (#1832): P's copy put back into the
@@ -1257,6 +1304,74 @@ mod tests {
                 vec!["again".to_owned(), "old".to_owned()]
             )
         );
+    }
+
+    fn index(
+        name: &str,
+        created: u64,
+        follows: &str,
+        splits: &[&str],
+        parts: &[&str],
+    ) -> proto::IndexPlacement {
+        let t = table(name, created, splits, parts);
+        proto::IndexPlacement {
+            name: t.name,
+            follows: follows.into(),
+            splits: t.splits,
+            partitions: t.partitions,
+            created,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn indexes_count_as_tables_do_when_a_partition_restores_alone() {
+        // #1722 (audit120's M2): an index following `users` has its ranges; one of its own
+        // ranges has those. Created since (or again) comes back empty, dropped since goes,
+        // and one whose range on p3 moved refuses the restore.
+        let backup = ClusterMap {
+            indexes: vec![
+                index("uv", 4, "users", &[], &[]),
+                index("own", 5, "", &["k"], &["p1", "p3"]),
+                index("gone", 6, "", &[], &["p3"]),
+            ],
+            ..with(vec![table("users", 1, &["m"], &["p1", "p3"])])
+        };
+        let live = ClusterMap {
+            indexes: vec![
+                index("uv", 7, "users", &[], &[]),
+                index("own", 5, "", &["k"], &["p1", "p3"]),
+                index("ut", 8, "users", &[], &[]),
+            ],
+            ..with(vec![table("users", 1, &["m"], &["p1", "p3"])])
+        };
+        assert_eq!(
+            schema_against(&backup, &live, "p3").unwrap(),
+            (
+                vec!["ut".to_owned(), "uv".to_owned()],
+                vec!["gone".to_owned(), "uv".to_owned()]
+            )
+        );
+        let moved = ClusterMap {
+            indexes: vec![index("own", 5, "", &["j"], &["p1", "p3"])],
+            ..with(vec![table("users", 1, &["m"], &["p1", "p3"])])
+        };
+        let e = schema_against(&backup, &moved, "p3").unwrap_err();
+        assert!(
+            e.message().contains("key range of index \"own\""),
+            "{}",
+            e.message()
+        );
+        // An index on p1 only in the backup, now on p3 too: its rows aren't in p3's copy.
+        let spread = ClusterMap {
+            indexes: vec![index("own", 5, "", &[], &["p3"])],
+            ..with(vec![table("users", 1, &["m"], &["p1", "p3"])])
+        };
+        let only_p1 = ClusterMap {
+            indexes: vec![index("own", 5, "", &[], &["p1"])],
+            ..with(vec![table("users", 1, &["m"], &["p1", "p3"])])
+        };
+        assert!(schema_against(&only_p1, &spread, "p3").is_err());
     }
 
     #[test]

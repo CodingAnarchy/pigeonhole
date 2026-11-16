@@ -674,15 +674,9 @@ impl Router {
         }
         if let Some(cluster) = &self.cluster {
             // The schema is the map's (ticket 5).
-            if matches!(
-                op,
-                ServiceOp::ListTables(_)
-                    | ServiceOp::DescribeTable(_)
-                    | ServiceOp::CreateTable(_)
-                    | ServiceOp::DropTable(_)
-                    | ServiceOp::CreateIndex(_)
-                    | ServiceOp::TextCreateIndex(_)
-            ) {
+            if map_schema_change(&op)
+                || matches!(op, ServiceOp::ListTables(_) | ServiceOp::DescribeTable(_))
+            {
                 let deadline = deadline.map_or_else(
                     || tokio::time::Instant::now() + self.service.request_timeout(),
                     tokio::time::Instant::from_std,
@@ -1256,12 +1250,25 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
             "Text.Search isn't supported on a cluster yet",
         )),
+        // So do the calls over a whole index (#1722's next PRs).
+        ServiceOp::VectorVerify(_) => Err(ApiError::unsupported(
+            "Vectors.Verify isn't supported on a cluster yet",
+        )),
+        ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
+            "Vectors.BulkLoad isn't supported on a cluster yet",
+        )),
+        ServiceOp::TextRebuild(_) => Err(ApiError::unsupported(
+            "Text.Rebuild isn't supported on a cluster yet",
+        )),
+        ServiceOp::TextVerify(_) => Err(ApiError::unsupported(
+            "Text.Verify isn't supported on a cluster yet",
+        )),
         // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
-        // read that fans out, a schema call (the map's), a subscription and a backup.
+        // schema change (the map writer's), a schema read, a read that fans out, a
+        // subscription and a backup.
+        op if map_schema_change(op) => Err(unrouted()),
         ServiceOp::Traverse(_)
         | ServiceOp::ListTables(_)
-        | ServiceOp::CreateTable(_)
-        | ServiceOp::DropTable(_)
         | ServiceOp::DescribeTable(_)
         | ServiceOp::Subscribe(_)
         | ServiceOp::Backup(_)

@@ -6,9 +6,9 @@
 use super::*;
 use crate::serve::proto::{
     CreateTableRequest, CreateTextIndexRequest, CreateVectorIndexRequest, DropTableRequest,
-    Element, FamilySpec, Metric, TablePlacementRequest, TextPutRequest, Vector,
-    VectorInsertRequest, VectorSearchRequest, VectorSpec, schema_client::SchemaClient,
-    text_client::TextClient, vectors_client::VectorsClient,
+    Element, FamilySpec, Metric, TablePlacementRequest, TextIndexRequest, TextPutRequest, Vector,
+    VectorInsertRequest, VectorSearchRequest, VectorSpec, VectorVerifyRequest,
+    schema_client::SchemaClient, text_client::TextClient, vectors_client::VectorsClient,
 };
 
 /// Three nodes: a serves p1, b serves p2, c only routes; `users` split at "m" over p1 and
@@ -177,6 +177,26 @@ fn an_index_created_through_any_node_holds_each_partitions_range() {
             .create_index(v)
             .await
             .unwrap();
+        // A table of an index's name: TableExists, as on a single node (audit120's S4).
+        let e = SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "uv".into(),
+                if_missing: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "TableExists", "{e}");
+        // A text index over a family the table hasn't: refused at the writer, before the
+        // map fixes a placement no partition can make (audit120's M3).
+        let mut nofam = text_index("un");
+        nofam.source_family = "g".into();
+        let e = TextClient::new(channel(c).await)
+            .create_index(nofam)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        assert!(e.message().contains("no family \"g\""), "{e}");
         eventually("both partitions create both indexes", async || {
             ["uv", "ut"]
                 .iter()
@@ -250,15 +270,34 @@ fn an_index_created_through_any_node_holds_each_partitions_range() {
         .await;
         assert_eq!((docs(&p1), docs(&p2)), (1, 1));
 
-        // Searches across partitions come with PR 1b and PR 2.
-        let e = VectorsClient::new(channel(a).await)
-            .search(VectorSearchRequest {
-                index: "uv".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(code(&e), "Unsupported", "{e}");
+        // Searches, verifies and rebuilds across partitions come with PR 1b and PR 2.
+        let not_yet = |e: tonic::Status| {
+            assert_eq!(code(&e), "Unsupported", "{e}");
+            assert!(
+                e.message().contains("isn't supported on a cluster yet"),
+                "{e}"
+            );
+        };
+        let mut vectors = VectorsClient::new(channel(a).await);
+        not_yet(
+            vectors
+                .search(VectorSearchRequest {
+                    index: "uv".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err(),
+        );
+        not_yet(
+            vectors
+                .verify(VectorVerifyRequest { index: "uv".into() })
+                .await
+                .unwrap_err(),
+        );
+        let mut text = TextClient::new(channel(a).await);
+        let ut = || TextIndexRequest { index: "ut".into() };
+        not_yet(text.rebuild(ut()).await.unwrap_err());
+        not_yet(text.verify(ut()).await.unwrap_err());
 
         // The followed table stays while its indexes do (#1916's rule).
         let mut schema = SchemaClient::new(channel(b).await);

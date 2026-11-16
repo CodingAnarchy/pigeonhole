@@ -57,6 +57,15 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - **Not in the table routes:** an index's own table isn't routed by its ids. Data calls on it stay as before.
 - **Still `Unsupported` until the later PRs:** `Vectors.Search` (use `Vectors.Nearest`), `Verify` and `BulkLoad`, and `Text.Search`, `Rebuild` and `Verify`. The search refusals are split by kind.
 
+**Backups, restores and the rest (the reviews, audit120 and simp724 on #1994):**
+- **A backup** is refused, as for a table, when an index is dropped and created again or placed differently while it runs (`backup::moved`): copies either side would hold two incarnations, and a restore would make the older one's partitions again, empty.
+- **`restore --map`** must keep the backup's indexes exactly, as it keeps its tables.
+- **A partition restored alone:** indexes count as tables do. One created since comes back empty (a text one refills), one dropped since goes, and one whose range on the partition moved refuses the restore. An index that follows a table has that table's ranges.
+- **The writer** refuses a text index whose `source_family` the followed table's placement doesn't list (`InvalidArgument`; a placement with no families can't be checked). It answers `Schema.CreateTable` of an index's name with `TableExists`, as a single node does.
+- **Reconcile** adopts an unrecorded table of an index's name only if it opens as that index. An index's create takes several steps, so a crash before the record can leave a half-made one, which then stays unrecorded with an error in `Status`.
+- **Index creates answer `Empty`,** with no `unreconciled` list: a write right after can answer `TableNotFound` from a partition that hasn't taken the map yet, and the guide says to retry. `ListTables` and `DescribeTable` show the map's tables only, and `GetMap` lists the indexes.
+- **Calls not yet served** (`Vectors.Verify`, `BulkLoad`; `Text.Rebuild`, `Verify`) answer `Unsupported` "isn't supported on a cluster yet", as the searches do.
+
 **Tests:**
 - **Through three nodes:**
   - an index of each kind created through any node is made on every partition of the table it follows;
