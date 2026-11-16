@@ -504,7 +504,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - backups and restore;
   - several partitions per node.
 - **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
-  - the IVF and full-text indexes (building them as well as searching them) aren't served by a cluster node (#1722), nor is `/mcp`; agent memory is, for calls within one partition, and `Memory.Watch` and calls across partitions aren't yet (#1915). [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
+  - the IVF and full-text indexes (building them as well as searching them) aren't served by a cluster node (#1722), nor is `/mcp`; agent memory is, across partitions too (`/mcp` is #1915's next step). [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
   - no read replicas: a cluster node refuses `--replica-of` and `Admin.Promote`, so a partition has one copy, and losing its node means a restore or [the lost-node recipe](#a-lost-node) (#1851).
@@ -593,7 +593,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Refused with `Unsupported`** on a cluster node in this release:
   - every IVF and full-text index call, not only the searches: `Vectors.CreateIndex`, `Insert`, `Delete`, `BulkLoad`, `Search` and `Verify`, and `Text.CreateIndex`, `Put`, `Delete`, `Search`, `Rebuild` and `Verify` (#1722, 1.3.0). For vectors, `Vectors.Nearest` works and fans out across the partitions;
   - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
-  - `Memory.Watch`, a `Memory` call whose namespaces or ids are on more than one partition (make one call per partition; [Agent memory on a cluster](#agent-memory-on-a-cluster)), and `/mcp` (#1915).
+  - `/mcp` (#1915).
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
 - **Errors a cluster adds:**
   - `PartitionUnavailable` (503): the row's node can't be reached and nothing was sent to it. Safe to retry, writes included.
@@ -607,7 +607,20 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Start every node with `--memory notes`** and the same memory flags. Each partition the map places the store on opens it, created with the `--memory-*` options if missing, and checked against the node's model pin, `--memory-dim` and `--memory-normalization`. A partition whose store doesn't match answers its memory calls with `FailedPrecondition`, and `phdb cluster status` lists why among its reconcile errors; the node's other partitions serve. So does a partition the map places the store on whose node was started without `--memory`, naming the flag. A node started with `--memory` while the map places no store opens one when a map places it. A map that places another store refuses the start.
 - **Use one embedder backend on every node** (all `--embed-url` with the same endpoint and model, or all `--embed-local` with the same model). The model pin checks the model's name, dimension and normalisation, not the numbers each backend computes.
 - **Routing:** any node takes a memory call and forwards it to the partition holding its namespace. `Remember` goes by its namespace, `Link` and `Supersede` by their first memory's, and `MarkUsed`, `Forget` and `Recall` by every id's or namespace's. The owner checks the token's scope and `ns=` namespaces again.
-- **Not yet (#1915):** a call whose namespaces or ids are on more than one partition, and `Memory.Watch`, answer `Unsupported`. Make one call per partition meanwhile. `/mcp` isn't served on a cluster node.
+- **A recall across partitions** (its namespaces on more than one) runs in steps from the node you called:
+  - each partition returns its candidates, which that node ranks together;
+  - a graph expansion (`expand_hops`) then walks one hop at a time;
+  - the partitions holding the best hits return them.
+
+  It returns what one store holding every namespace would, except for the keyword signal: each partition's BM25 statistics are its own. That holds only while nothing writes to those namespaces, since each step reads each partition at a snapshot of its own. It costs two round trips, plus one per hop of expansion. It names at most 64 namespaces, and any partition that can't be reached fails it (`PartitionUnavailable`). The node you called checks the byte budget against its own `--memory-*` limits and embeds the text once for every partition, so it needs `--memory` with the same memory flags as the others: without it, a recall across partitions answers `Unsupported`, while a recall whose namespaces are on one partition is forwarded and served there.
+- **`MarkUsed` and `Forget` across partitions** are split, one call per partition, sent together, and their counts summed. If a part fails, the error names the partitions that applied, with their counts. If a part may have applied, the error is `OutcomeUnknown`. Retrying the whole call is safe either way: `Forget` skips what's gone, and `MarkUsed`'s counts are advisory.
+- **`Memory.Watch` across partitions** watches each partition holding its namespaces (every partition for a watch of every namespace) and merges their events on the node you called, which needs no `--memory` for it.
+  - **Order:** each partition's events come in its commit order, so each namespace's do; there's no order across partitions. A commit's memories come together, never with another partition's between them.
+  - **Tokens:** every event carries a token for the whole watch, which resumes it through any node, as on a single node: resume once that event's commit is handled. A token resumes only the watch it came from (the same namespaces), on the same cluster; a single node's token, or another watch's, answers `InvalidArgument`.
+  - **Leases:** each partition's events are delivered only while its node holds the partition's lease, as a cluster subscription's are ([When a partition's node is down](#when-a-partitions-node-is-down)). A partition with no lease yet holds the watch back, and if it gets none within the request timeout, the watch doesn't start (`PartitionUnavailable`, naming it); one whose lease lapses, or that closes or moves, ends it (`PartitionUnavailable`, or `WrongPartition` for a move), as does any partition that can't be reached. Watch again from the last token.
+  - **`--max-streams`:** a watch holds one place on the node you called, and one on each partition's node, as a cluster subscription does.
+  - **Scope:** a token limited to some namespaces (`ns=`) names its namespaces, as on a single node; the node you called and each partition's node both check them.
+- **Not yet (#1915):** `/mcp` isn't served on a cluster node.
 - **In the background:** each partition's forget policy and IVF rebalancing run on the node serving it, under the partition's fence: a fenced partition runs neither.
 
 ### Schema through the cluster

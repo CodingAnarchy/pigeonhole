@@ -22,7 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use super::forward;
 use super::position::{Kind, Position};
@@ -36,13 +36,14 @@ use crate::serve::proto::{
 };
 use crate::serve::router::{Cluster, Place, Router, Target};
 use crate::serve::service::{
-    PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, page_bytes, room,
+    PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, continues, page_bytes,
+    queue_page, room,
 };
 use tokio::sync::Semaphore;
 
 /// The cluster side of a fan-out, owned, so a scan's task can outlive its request.
 #[derive(Clone)]
-struct Reach {
+pub(super) struct Reach {
     node: Arc<super::Node>,
     /// The partitions served here, each with its service (D317 ticket 8a).
     parts: crate::serve::router::Parts,
@@ -55,7 +56,19 @@ struct Reach {
 }
 
 impl Reach {
-    fn of(router: &Router, cluster: &Cluster) -> Self {
+    /// [`of`](Self::of), with a request's `deadline`.
+    pub(super) fn until(
+        router: &Router,
+        cluster: &Cluster,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..Self::of(router, cluster)
+        }
+    }
+
+    pub(super) fn of(router: &Router, cluster: &Cluster) -> Self {
         Self {
             node: Arc::clone(&cluster.node),
             parts: Arc::clone(&cluster.parts),
@@ -67,7 +80,7 @@ impl Reach {
 
     /// How long the next forward or pull may take: what's left of the deadline, or the
     /// timeout.
-    fn within(&self) -> Result<std::time::Duration, ApiError> {
+    pub(super) fn within(&self) -> Result<std::time::Duration, ApiError> {
         match self.deadline {
             None => Ok(self.timeout),
             Some(d) => d
@@ -78,7 +91,7 @@ impl Reach {
     }
 
     /// The routes now, or `PartitionUnavailable` before a map.
-    fn routes(&self) -> Result<Arc<Routes>, ApiError> {
+    pub(super) fn routes(&self) -> Result<Arc<Routes>, ApiError> {
         self.node
             .routes()
             .as_ref()
@@ -95,7 +108,7 @@ impl Reach {
     /// forwarded to the partition's node, and once more with the newer map after that node
     /// answers `WrongPartition`. Its reply, and whether it was forwarded. The request's
     /// holding covers the part (#1715): it takes no charge of its own.
-    async fn part(
+    pub(super) async fn part(
         &self,
         partition: &str,
         caller: &Caller,
@@ -557,8 +570,6 @@ impl Router {
         }
         let slot = self.service.scan_slot()?;
         drop(request);
-        let (tx, rx) = mpsc::channel(1);
-        let (end_tx, end_rx) = oneshot::channel();
         let job = ScanJob {
             reach,
             here,
@@ -571,23 +582,11 @@ impl Router {
             inflight: Arc::clone(self.service.inflight()),
         };
         let metrics = Arc::clone(&self.service.metrics);
-        let started = std::time::Instant::now();
-        tokio::spawn(async move {
-            let outcome = match tokio::spawn(job.run(tx)).await {
-                Ok(outcome) => outcome.map_err(ApiError::for_read),
-                Err(e) => Err(ApiError::internal(format!("the scan failed: {e}"))),
-            };
-            metrics.count(
-                crate::serve::service::SCAN,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            drop(slot);
-            if let Err(e) = outcome {
-                let _ = end_tx.send(e);
-            }
-        });
-        Ok(ServiceReply::Scan(ScanPages::new(rx, end_rx)))
+        Ok(ServiceReply::Scan(ScanPages::spawn(
+            |pages| job.run(pages),
+            Some(slot),
+            Some(metrics),
+        )))
     }
 
     /// A partition's part of a scan another node fans out (D317 ticket 4a): served only if
@@ -631,7 +630,7 @@ impl Router {
 }
 
 /// A boxed future of a fan-out's.
-type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(super) type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Runs `futs`, at most `n` at once (`--fanout-forwards`), handing each result to `each`
 /// with its index as it arrives, so a merge holds only what it keeps (simp724's S1 on
@@ -642,7 +641,7 @@ type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the queued reads wait for a running one to finish. Shares go back once the queue is
 /// empty and fewer reads are running. So the reads never wait for budget while the request
 /// holds some (cli692 on #1715's plan).
-async fn bounded<'a, T, S>(
+pub(super) async fn bounded<'a, T, S>(
     futs: Vec<Boxed<'a, T>>,
     n: usize,
     mut spare: impl FnMut() -> Option<S>,
@@ -1367,18 +1366,7 @@ impl ScanJob {
                 let Some(space) = room(&pages, &mut queued, limits.stream_idle).await? else {
                     return Ok(());
                 };
-                let paid = match paid {
-                    Some(paid) => paid,
-                    None => {
-                        let share = usize::try_from(page.bytes)
-                            .unwrap_or(usize::MAX)
-                            .min(limits.max_request_bytes);
-                        budget_within(&self.inflight, share, limits.request_timeout).await?
-                    }
-                };
-                let slot: PageSlot = Arc::new(std::sync::Mutex::new(Some((page, paid))));
-                space.send(Arc::clone(&slot));
-                queued = Some(slot);
+                queued = Some(queue_page(space, page, paid, &self.inflight, &limits).await?);
                 sent_any = true;
             }};
         }
@@ -1430,10 +1418,7 @@ impl ScanJob {
                 if self.limits.hold_after_part_page {
                     hold_after_part_page(&self.inflight).await;
                 }
-                let continued = matches!(
-                    (&last_row, page.rows.first()),
-                    (Some(p), Some(first)) if first.key[..] == p[..]
-                );
+                let continued = continues(last_row.as_deref(), &page.rows);
                 if let Some(n) = remaining.as_mut() {
                     let new_rows = page.rows.len() as u64 - u64::from(continued);
                     *n = n.saturating_sub(new_rows);

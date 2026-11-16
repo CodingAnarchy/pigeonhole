@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::serve::proto::{
-    ForgetRequest, MemoryPlacement, NewMemory, RecallRequest, RememberRequest,
-    memory_client::MemoryClient,
+    ForgetRequest, LinkRequest, LinkType, MarkUsedRequest, MemoryPlacement, NewMemory,
+    RecallRequest, RememberRequest, link_type, memory_client::MemoryClient,
 };
 
 /// `--memory notes`, no embedder or model: memories are recalled by keyword.
@@ -138,10 +138,16 @@ fn a_memory_call_goes_to_the_partition_that_holds_its_namespace_through_any_node
             let hits = recall(port, &["zed"], "lunch").await.unwrap();
             assert_eq!(hits, ["zed skipped lunch"], "through {port}");
         }
-        // A recall across both partitions isn't served whole yet: a call per partition.
-        let e = recall(c, &["alice", "zed"], "lunch").await.unwrap_err();
-        assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("more than one partition"), "{e}");
+        // A recall across both partitions is served whole, through any node (PR 2).
+        for port in [a, b, c] {
+            let mut hits = recall(port, &["alice", "zed"], "lunch").await.unwrap();
+            hits.sort();
+            assert_eq!(
+                hits,
+                ["alice ate lunch at noon", "zed skipped lunch"],
+                "through {port}"
+            );
+        }
         // An id carries its namespace: a forget through b goes to a's p1.
         let forgot = memory(b)
             .await
@@ -378,5 +384,649 @@ fn a_node_without_memory_holding_a_placed_partition_names_the_missing_flag() {
         assert!(e.message().contains("--memory"), "{e}");
         let e = recall(port, &["alice"], "x").await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
+    });
+}
+
+/// Three nodes as in the first test (a: p1, b: p2, c: routes only), the store's split at
+/// "m", started with `--memory notes`: the stops, and each data node's partition database.
+fn three_nodes(
+    rt: &tokio::runtime::Runtime,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    [pigeonhole::Pigeonhole; 2],
+    [u16; 3],
+) {
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    map.memory = Some(placement());
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+    }
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((dir, (id, local)), listener) in dirs
+        .iter()
+        .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+        .zip(listeners)
+    {
+        let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+        let locals = local.map(|p| (p, None)).into_iter().collect();
+        let (stop, d, _) = data_node_served(
+            rt,
+            dir,
+            id,
+            locals,
+            listener,
+            "",
+            crate::serve::server_tests::limits(),
+            false,
+            placement,
+            None,
+            None,
+            Some(recipe()),
+        );
+        stops.push(stop);
+        dbs.extend(d);
+    }
+    let [p1, p2]: [pigeonhole::Pigeonhole; 2] = dbs.try_into().ok().unwrap();
+    (stops, [p1, p2], ports)
+}
+
+/// The words the memories are made of.
+const WORDS: &[&str] = &[
+    "lunch", "deploy", "postgres", "meeting", "tuesday", "index", "budget", "agent",
+];
+
+#[test]
+fn a_recall_across_partitions_is_the_steps_over_the_partitions_stores() {
+    // The cluster's recall against `pigeonhole_memory`'s steps run here over the two
+    // partitions' own stores: equal hits and scores, through every node, with and without
+    // a graph expansion and a byte budget. (Its fusion is RRF, which ranks recency, so the
+    // server's clock and this one's give the same order.) The steps themselves equal one
+    // store's recall: `pigeonhole-memory`'s `recall_steps` test.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, [p1, p2], [a, b, c]) = three_nodes(&rt);
+    let namespaces = ["alice", "bob", "yan", "zed"];
+    rt.block_on(async {
+        let mut x = 0x1915u64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut ids: std::collections::BTreeMap<&str, Vec<Vec<u8>>> = Default::default();
+        for i in 0..60 {
+            let ns = namespaces[i % 4];
+            let words: Vec<&str> = (0..2 + next(3))
+                .map(|_| WORDS[next(WORDS.len() as u64) as usize])
+                .collect();
+            let text = format!("{} {ns}{i}", words.join(" "));
+            ids.entry(ns)
+                .or_default()
+                .push(remember(c, ns, &text).await.unwrap());
+        }
+        // Links within each namespace, a hub in each.
+        for list in ids.values() {
+            for (j, to) in list.iter().enumerate().skip(1) {
+                let from = if j % 2 == 0 { &list[0] } else { &list[j - 1] };
+                memory(c)
+                    .await
+                    .link(LinkRequest {
+                        from: from.clone().into(),
+                        to: to.clone().into(),
+                        link_type: Some(LinkType {
+                            kind: Some(link_type::Kind::Custom(16)),
+                        }),
+                        weight: (1 + next(1000)) as f32 / 1000.0,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let open = |db: &pigeonhole::Pigeonhole| {
+            pigeonhole_memory::Store::open_with(
+                db,
+                "notes",
+                pigeonhole_memory::OpenOptions::new()
+                    .without_embeddings()
+                    .own_forgetter()
+                    .own_rebalancer(),
+            )
+            .unwrap()
+        };
+        let stores = [(open(&p1), ["alice", "bob"]), (open(&p2), ["yan", "zed"])];
+        // The cases where the byte budget cut the walk: it changed the hits.
+        let mut budget_cut = 0;
+        for (k, hops, budget) in [
+            (10, 0, 0),
+            (3, 0, 0),
+            (25, 1, 0),
+            (25, 2, 0),
+            (40, 3, 0),
+            (10, 1, 700),
+            (40, 2, 3000),
+            (12, 1, 1000),
+            (25, 2, 1500),
+            (30, 3, 2500),
+        ] {
+            let text = "lunch deploy postgres";
+            let want = in_steps(&stores, text, k, hops, budget, true);
+            assert!(!want.is_empty());
+            if budget > 0 && hops > 0 && want != in_steps(&stores, text, k, hops, budget, false) {
+                budget_cut += 1;
+            }
+            for port in [a, b, c] {
+                let got: Vec<(Vec<u8>, f64)> = memory(port)
+                    .await
+                    .recall(RecallRequest {
+                        namespaces: namespaces.iter().map(|n| (*n).to_owned()).collect(),
+                        text: text.into(),
+                        k: k as u32,
+                        byte_budget: budget,
+                        expand_hops: hops,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .hits
+                    .into_iter()
+                    .map(|h| (h.id.to_vec(), h.score))
+                    .collect();
+                assert_eq!(
+                    got, want,
+                    "k {k}, hops {hops}, budget {budget}, through {port}"
+                );
+            }
+        }
+        assert!(budget_cut > 0, "no case's budget cut its walk");
+        // At most 64 namespaces across partitions (a recall on one keeps a single node's
+        // rules).
+        let many: Vec<String> = (0..65)
+            .map(|i| format!("{}{i:02}", if i % 2 == 0 { "a" } else { "n" }))
+            .collect();
+        let e = memory(c)
+            .await
+            .recall(RecallRequest {
+                namespaces: many,
+                text: "lunch".into(),
+                k: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        assert!(e.message().contains("at most 64"), "{e}");
+    });
+}
+
+/// `pigeonhole_memory`'s steps over `stores` (each with its namespaces), as the entry node
+/// runs them: `(id, score)` of each hit. `walk_budget` false: the walk has no byte budget
+/// (to tell the cases where it cuts).
+fn in_steps(
+    stores: &[(pigeonhole_memory::Store, [&str; 2])],
+    text: &str,
+    k: usize,
+    hops: u32,
+    budget: u64,
+    walk_budget: bool,
+) -> Vec<(Vec<u8>, f64)> {
+    use pigeonhole_memory::{Expand, Fusion, RecallBodies, RecallPool, Weights};
+    let budget = if budget == 0 {
+        recipe().budget.0
+    } else {
+        budget
+    };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    let mk = |i: usize| {
+        let (s, ns) = &stores[i];
+        s.recall(ns).text(text).k(k).byte_budget(budget).now_us(at)
+    };
+    let pools = (0..stores.len()).map(|i| mk(i).gather().unwrap());
+    let mut ranking = RecallPool::merge(pools)
+        .unwrap()
+        .rank(Fusion::default(), Weights::default());
+    let store_of = |ns: &str| stores.iter().position(|(_, n)| n.contains(&ns)).unwrap();
+    if hops > 0 {
+        let mut walk = ranking.walk(Expand::hops(hops), walk_budget.then_some(budget));
+        while let Some(hop) = walk.next_hop() {
+            let parts = hop
+                .split(store_of)
+                .into_iter()
+                .map(|(i, share)| mk(i).hop(&share).unwrap())
+                .collect::<Vec<_>>();
+            walk.settle(parts).unwrap();
+        }
+        ranking = walk.finish();
+    }
+    let top = ranking.top(k + 4);
+    let bodies = (0..stores.len()).map(|i| {
+        let ids: Vec<_> = top
+            .iter()
+            .filter(|id| store_of(id.namespace()) == i)
+            .cloned()
+            .collect();
+        mk(i).bodies(&ids).unwrap()
+    });
+    ranking
+        .finish(RecallBodies::merge(bodies), k, Some(budget), false)
+        .0
+        .into_iter()
+        .map(|h| (h.id.to_bytes(), h.score))
+        .collect()
+}
+
+#[test]
+fn mark_used_and_forget_across_partitions_split_and_sum() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, [p1, p2], [a, _b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut ids = Vec::new();
+        for (ns, t) in [
+            ("alice", "alice ate lunch"),
+            ("bob", "bob ate lunch"),
+            ("zed", "zed skipped lunch"),
+        ] {
+            ids.push(remember(c, ns, t).await.unwrap());
+        }
+        let marked = memory(a)
+            .await
+            .mark_used(MarkUsedRequest {
+                ids: ids.iter().map(|i| i.clone().into()).collect(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(marked.marked, 3);
+        // Forgotten across both, through the routing node; again, nothing's left.
+        for want in [3, 0] {
+            let forgot = memory(c)
+                .await
+                .forget(ForgetRequest {
+                    ids: ids.iter().map(|i| i.clone().into()).collect(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(forgot.forgotten, want);
+        }
+        assert!(
+            recall(c, &["alice", "bob", "zed"], "lunch")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    });
+    assert_eq!(namespaces_in(&p1), Vec::<String>::new());
+    assert_eq!(namespaces_in(&p2), Vec::<String>::new());
+}
+
+#[test]
+fn a_split_memory_write_names_what_applied_and_says_when_a_part_may_have() {
+    // a serves p1 and c routes; p2's node b is a closed port (nothing sent: the part
+    // failed), then a listener that takes connections and never answers (sent, no answer:
+    // the part may have applied). Either way the call names the partition that applied.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for silent in [false, true] {
+        let listeners: Vec<std::net::TcpListener> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+        let mut map = the_map(1, &ports);
+        map.partitions.retain(|p| p.id != "p3");
+        map.memory = Some(placement());
+        let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+        for dir in &dirs {
+            super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        }
+        let mut it = listeners.into_iter();
+        let (la, lb, lc) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+        // b: closed, or silent (its accepted sockets held open, unread).
+        let _held = if silent {
+            Some(std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for s in lb.incoming() {
+                    held.push(s);
+                }
+            }))
+        } else {
+            drop(lb);
+            None
+        };
+        let mut limits = crate::serve::server_tests::limits();
+        limits.request_timeout = std::time::Duration::from_millis(800);
+        let start = |dir: &Path, id: &str, local: Option<&str>, listener| {
+            let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
+            let locals = local.map(|p| (p, None)).into_iter().collect();
+            data_node_served(
+                &rt,
+                dir,
+                id,
+                locals,
+                listener,
+                "",
+                limits,
+                false,
+                placement,
+                None,
+                None,
+                Some(recipe()),
+            )
+        };
+        let (_stop_a, _, _) = start(&dirs[0], "a", Some("p1"), la);
+        let (_stop_c, _, _) = start(&dirs[2], "c", None, lc);
+        rt.block_on(async {
+            let alice = remember(ports[2], "alice", "alice ate lunch")
+                .await
+                .unwrap();
+            // A memory id in zed's namespace (on p2): its part goes to b whether or not
+            // such a memory exists.
+            let zed = pigeonhole_memory::MemoryId::from_bytes(
+                &[&3u16.to_le_bytes()[..], b"zed", &[7u8; 16]].concat(),
+            )
+            .unwrap()
+            .to_bytes();
+            let e = memory(ports[2])
+                .await
+                .forget(ForgetRequest {
+                    ids: vec![alice.into(), zed.into()],
+                })
+                .await
+                .unwrap_err();
+            let want = if silent {
+                "OutcomeUnknown"
+            } else {
+                "PartitionUnavailable"
+            };
+            assert_eq!(code(&e), want, "silent {silent}: {e}");
+            assert!(e.message().contains("p2"), "silent {silent}: {e}");
+            assert!(
+                e.message().contains("applied on: p1 (1)"),
+                "silent {silent}: {e}"
+            );
+            assert_eq!(
+                e.message().contains("may or may not have applied"),
+                silent,
+                "{e}"
+            );
+            // p1's part applied.
+            assert!(
+                recall(ports[0], &["alice"], "lunch")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+}
+
+/// A watch of `namespaces` through the node at `port`, from `resume` (empty: now).
+async fn watch(
+    port: u16,
+    namespaces: &[&str],
+    resume: Vec<u8>,
+) -> Result<tonic::Streaming<crate::serve::proto::MemoryEvent>, tonic::Status> {
+    memory(port)
+        .await
+        .watch(crate::serve::proto::MemoryWatchRequest {
+            namespaces: namespaces.iter().map(|n| (*n).to_owned()).collect(),
+            resume: resume.into(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// The next `n` memories a watch delivers, each with its token; progress passed over.
+async fn memories(
+    events: &mut tonic::Streaming<crate::serve::proto::MemoryEvent>,
+    n: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let e = tokio::time::timeout(Duration::from_secs(10), events.message())
+            .await
+            .expect("an event in time")
+            .unwrap()
+            .expect("the watch goes on");
+        if let Some(crate::serve::proto::memory_event::Event::Memory(m)) = e.event {
+            out.push((m.text, e.token.to_vec()));
+        }
+    }
+    out
+}
+
+/// #1915 PR 2b: a watch over namespaces on both partitions, through a node holding neither
+/// (both components forwarded) and through one holding p1 (one here, one forwarded),
+/// delivers every new memory once. A resume from any event's token delivers exactly the
+/// events after it, on either node.
+#[test]
+fn a_watch_across_partitions_delivers_each_memory_once_and_resumes_from_any_token() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [a, _b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut via_c = watch(c, &["alice", "zed"], Vec::new()).await.unwrap();
+        let mut via_a = watch(a, &["zed", "alice"], Vec::new()).await.unwrap();
+        let texts = [
+            "alice one",
+            "zed one",
+            "alice two",
+            "zed two",
+            "alice three",
+        ];
+        for t in texts {
+            let ns = t.split(' ').next().unwrap();
+            remember(c, ns, t).await.unwrap();
+        }
+        // Not in the watch: never delivered.
+        remember(c, "bob", "bob one").await.unwrap();
+        let mut resumed_all = Vec::new();
+        for events in [&mut via_c, &mut via_a] {
+            let got = memories(events, texts.len()).await;
+            let mut seen: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+            // Each partition's in order.
+            for ns in ["alice", "zed"] {
+                let mine: Vec<&str> = seen.iter().copied().filter(|t| t.starts_with(ns)).collect();
+                let want: Vec<&str> = texts
+                    .iter()
+                    .copied()
+                    .filter(|t| t.starts_with(ns))
+                    .collect();
+                assert_eq!(mine, want);
+            }
+            seen.sort_unstable();
+            let mut want = texts.to_vec();
+            want.sort_unstable();
+            assert_eq!(seen, want);
+            // From each event's token, through either node: the events after it.
+            for (i, (_, token)) in got.iter().enumerate() {
+                for port in [a, c] {
+                    let mut resumed = watch(port, &["alice", "zed"], token.clone()).await.unwrap();
+                    let rest = memories(&mut resumed, got.len() - i - 1).await;
+                    let mut rest: Vec<&str> = rest.iter().map(|(t, _)| t.as_str()).collect();
+                    let mut after: Vec<&str> =
+                        got[i + 1..].iter().map(|(t, _)| t.as_str()).collect();
+                    rest.sort_unstable();
+                    after.sort_unstable();
+                    assert_eq!(rest, after, "from event {i} through {port}");
+                    // Kept from the first token only: each watch holds a `--max-streams`
+                    // place on every node it reaches, and the test nodes have 16.
+                    if i == 0 {
+                        resumed_all.push(resumed);
+                    }
+                }
+            }
+        }
+        // And nothing more: each resumed watch's next memory is the next one written.
+        remember(c, "zed", "zed later").await.unwrap();
+        for (i, resumed) in resumed_all
+            .iter_mut()
+            .chain([&mut via_c, &mut via_a])
+            .enumerate()
+        {
+            let next = memories(resumed, 1).await;
+            assert_eq!(next[0].0, "zed later", "watch {i}");
+        }
+    });
+}
+
+/// #1915 PR 2b: a watch resumes only from its own token: not a single node's, not one of a
+/// watch over other namespaces. A watch of every namespace covers both partitions.
+#[test]
+fn a_cluster_watch_refuses_another_watchs_token_and_watches_every_namespace() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [_a, b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut alice = watch(c, &["alice"], Vec::new()).await.unwrap();
+        let mut all = watch(b, &[], Vec::new()).await.unwrap();
+        remember(c, "alice", "alice one").await.unwrap();
+        remember(c, "zed", "zed one").await.unwrap();
+        let (_, token) = memories(&mut alice, 1).await.remove(0);
+        let mut both: Vec<String> = memories(&mut all, 2)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        both.sort();
+        assert_eq!(both, ["alice one", "zed one"]);
+        for (namespaces, resume, says) in [
+            (vec!["alice", "bob"], token.clone(), "another watch's"),
+            (vec![], token.clone(), "another watch's"),
+            (
+                vec!["alice"],
+                vec![1, 2, 3],
+                "isn't a cluster memory watch's token",
+            ),
+        ] {
+            let e = watch(c, &namespaces, resume).await.unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{}", e.message());
+            assert!(e.message().contains(says), "{}", e.message());
+        }
+    });
+}
+
+/// The next event of a watch that should end: its error.
+async fn ended(events: &mut tonic::Streaming<crate::serve::proto::MemoryEvent>) -> tonic::Status {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), events.message())
+            .await
+            .expect("the end in time")
+        {
+            Ok(Some(e)) => assert!(
+                !matches!(
+                    e.event,
+                    Some(crate::serve::proto::memory_event::Event::Memory(_))
+                ),
+                "no memory: {e:?}"
+            ),
+            Ok(None) => panic!("the watch ended without an error"),
+            Err(status) => return status,
+        }
+    }
+}
+
+async fn admin(port: u16, op: &str, p: &str) {
+    let request = crate::serve::proto::PartitionRequest {
+        partition: p.into(),
+        ..Default::default()
+    };
+    let mut c = client(port).await;
+    match op {
+        "fence" => c.fence(request).await.map(drop),
+        "close" => c.close(request).await.map(drop),
+        _ => c.unfence(request).await.map(drop),
+    }
+    .unwrap();
+}
+
+/// #1915 PR 2b (S2 of the design): a partition's close ends a watch over it with
+/// `PartitionUnavailable`, and once it reopens, a resume from the last token delivers what
+/// came after, once.
+#[test]
+fn a_close_ends_a_watch_and_its_token_resumes_after_the_reopen() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [a, b, c]) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut w = watch(c, &["alice", "zed"], Vec::new()).await.unwrap();
+        remember(c, "alice", "alice one").await.unwrap();
+        let (_, token) = memories(&mut w, 1).await.remove(0);
+        admin(a, "fence", "p1").await;
+        admin(a, "close", "p1").await;
+        let e = ended(&mut w).await;
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{}", e.message());
+        assert!(e.message().contains("closed"), "{}", e.message());
+        // Closed, p1 refuses a watch over it; p2 alone still watches.
+        assert!(watch(c, &["alice"], Vec::new()).await.is_err());
+        let mut zed = watch(b, &["zed"], Vec::new()).await.unwrap();
+        remember(c, "zed", "zed one").await.unwrap();
+        assert_eq!(memories(&mut zed, 1).await[0].0, "zed one");
+        admin(a, "unfence", "p1").await;
+        remember(c, "alice", "alice two").await.unwrap();
+        let mut resumed = watch(b, &["alice", "zed"], token).await.unwrap();
+        let mut got: Vec<String> = memories(&mut resumed, 2)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        got.sort();
+        assert_eq!(got, ["alice two", "zed one"]);
+        remember(c, "zed", "zed two").await.unwrap();
+        assert_eq!(
+            memories(&mut resumed, 1).await[0].0,
+            "zed two",
+            "nothing more"
+        );
+    });
+}
+
+/// #1915 PR 2b (simp724's S1): `phdb cluster move` takes p1 from a to c. A watch with a
+/// component on a ends (the move closes p1 there before the map moves it, so with
+/// `PartitionUnavailable`; a map that moves an open partition ends it with
+/// `WrongPartition`, `serve::memory`'s M1 test), and its token from before the move
+/// resumes after it, through another node, with no gap and no repeat: the token's epoch
+/// and map version hold across the move.
+#[test]
+fn a_move_ends_a_watch_and_its_token_from_before_resumes_after() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, _dbs, [a, b, c]) = three_nodes(&rt);
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{b}"),
+        token_file: None,
+        ca: None,
+    };
+    rt.block_on(async {
+        let mut w = watch(b, &["alice", "zed"], Vec::new()).await.unwrap();
+        remember(c, "alice", "alice one").await.unwrap();
+        let (_, token) = memories(&mut w, 1).await.remove(0);
+        remember(c, "alice", "alice two").await.unwrap();
+        assert_eq!(memories(&mut w, 1).await[0].0, "alice two");
+        let r = within(super::super::moving::run(&args, "p1", "c", true, None))
+            .await
+            .unwrap();
+        assert_eq!(r.document["verified"], true, "{:?}", r.document);
+        let e = ended(&mut w).await;
+        assert!(e.message().contains("\"p1\""), "{}", e.message());
+        remember(a, "alice", "alice three").await.unwrap();
+        let mut resumed = watch(b, &["alice", "zed"], token).await.unwrap();
+        let got: Vec<String> = memories(&mut resumed, 2)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(got, ["alice two", "alice three"], "no gap and no repeat");
+        remember(c, "zed", "zed one").await.unwrap();
+        assert_eq!(
+            memories(&mut resumed, 1).await[0].0,
+            "zed one",
+            "nothing more"
+        );
     });
 }

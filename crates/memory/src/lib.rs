@@ -45,7 +45,10 @@ pub use layout::{MemoryId, normalize};
 /// The text index's Unicode normalisation ([`StoreOptions::normalization`]), re-exported from
 /// `pigeonhole-text`.
 pub use pigeonhole_text::Normalization;
-pub use recall::{Expand, Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
+pub use recall::{
+    Expand, Fusion, Recall, RecallBodies, RecallHit, RecallHop, RecallHopPart, RecallPool,
+    RecallRanking, RecallStats, RecallWalk, Signal, Signals, Weights,
+};
 pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, PreparedMemory, ReadStore,
     Remembered, Source, Store, StoreOptions, StoreStats, StoredMemory,

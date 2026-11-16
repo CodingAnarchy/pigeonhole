@@ -576,3 +576,51 @@ fn table_names_are_the_tables_a_store_creates() {
     assert_eq!(made, named);
     drop(store);
 }
+
+#[test]
+fn a_namespace_s_ivf_candidates_dont_depend_on_the_other_namespaces_recalled() {
+    // `big` is IVF-sized and wholly in session s1; `small` has 4 of 200 in s1, so a
+    // recall in s1 doubles `small`'s n to its end. `big`'s n doubles on its own (#1915),
+    // so its candidates are the ones it has recalled alone: a cluster partition holding
+    // `big` gathers exactly these.
+    let (_dir, db) = open();
+    let store = create(&db, small());
+    let mut rng = Rng(0x1915);
+    for i in 0..400 {
+        let m = Memory::new(format!("big memory {i}"))
+            .embedding(emb(&mut rng))
+            .session("s1");
+        store.remember("big", m).unwrap();
+    }
+    for i in 0..200 {
+        let m = Memory::new(format!("small memory {i}"))
+            .embedding(emb(&mut rng))
+            .session(if i % 50 == 0 { "s1" } else { "s2" });
+        store.remember("small", m).unwrap();
+    }
+    let s = db.snapshot().unwrap();
+    for i in 0..20 {
+        let q = emb(&mut rng);
+        let big = |namespaces: &[&str]| -> (BTreeSet<MemoryId>, usize) {
+            let (hits, stats) = store
+                .recall(namespaces)
+                .embedding(q.clone())
+                .weights(vector_only())
+                .candidates(4)
+                .session("s1")
+                .k(10_000)
+                .snapshot(&s)
+                .run_with_stats()
+                .unwrap();
+            let ids = hits
+                .into_iter()
+                .filter(|h| h.id.namespace() == "big")
+                .map(|h| h.id)
+                .collect();
+            (ids, stats.ivf_namespaces)
+        };
+        let (with, alone) = (big(&["big", "small"]), big(&["big"]));
+        assert_eq!(with.0, alone.0, "query {i}");
+        assert_eq!((with.1, alone.1), (1, 1), "query {i}");
+    }
+}
