@@ -41,6 +41,10 @@ message NearestRequest {
   // in the reply's `missing`, rather than fail with `PartitionUnavailable`. The result is
   // then the exact top `k` of what was reached. A single node ignores it.
   bool allow_partial = 9;
+  // Only the vectors whose qualifiers this selects (ICR 0139's amendment, #1915 PR 3): a
+  // prefix, bounds, or both, applied as a read's `Selection` applies its own. Absent: every
+  // qualifier of the family.
+  QualifierSelection qualifiers = 10;
 }
 
 message KeyList {

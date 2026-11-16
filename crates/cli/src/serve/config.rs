@@ -317,6 +317,12 @@ pub(crate) struct ServeArgs {
     /// then gets a retryable error.
     #[arg(long, value_name = "N", default_value_t = 8)]
     pub mcp_session_requests: usize,
+    /// `/mcp` messages the server runs at once, across every session. One past it waits for
+    /// a place until the request times out. Each runs on a blocking thread outside
+    /// `--blocking-threads`, whose permits its tools' calls take (ICR 0139's PR 3 section):
+    /// the server keeps this many blocking threads more.
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    pub mcp_blocking: usize,
     /// The bytes one `/mcp` session may keep for its cursors (a cut traversal's result).
     /// A larger result isn't kept: its cursor runs the traversal again.
     #[arg(long, value_name = "BYTES", default_value_t = 8 << 20)]
@@ -365,6 +371,8 @@ pub(crate) struct Limits {
     pub mcp: crate::mcp::Limits,
     /// Requests one `/mcp` session may have running at once.
     pub mcp_session_requests: usize,
+    /// `/mcp` messages running at once, across sessions (`--mcp-blocking`).
+    pub mcp_blocking: usize,
 }
 
 impl ServeArgs {
@@ -410,6 +418,7 @@ impl ServeArgs {
                 cache_bytes: self.mcp_session_cache_bytes,
             },
             mcp_session_requests: self.mcp_session_requests.max(1),
+            mcp_blocking: self.mcp_blocking.max(1),
         }
     }
 }

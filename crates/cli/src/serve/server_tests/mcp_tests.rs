@@ -397,12 +397,19 @@ fn a_session_past_its_request_limit_gets_a_retryable_refusal() {
 
 #[test]
 fn waiting_feed_polls_hold_no_blocking_pool_thread() {
-    // The audit's F7: a `feed_poll` with `wait_ms` waited up to 30 s on the blocking-pool
-    // thread its message ran on, so a few polls could hold the whole pool. Now the wait runs
-    // on the runtime first. With a pool of one, four waiting polls leave it free: another
-    // session's read answers at once, and a commit wakes every poll.
+    // The audit's F7, and simp724's M2 on #1915 PR 3: a `feed_poll` with `wait_ms` waits
+    // on the runtime before its message takes a `/mcp` place, so waiting polls hold neither
+    // a place nor a pool thread. With one pool thread and two `/mcp` places, four waiting
+    // polls leave both free: another session's read answers at once, and a commit wakes
+    // every poll.
     blocking_threads(1);
-    let s = Server::start("", limits());
+    let s = Server::start(
+        "",
+        Limits {
+            mcp_blocking: 2,
+            ..limits()
+        },
+    );
     let reader = session(&s, None);
     let polls: Vec<_> = (0..4)
         .map(|_| {
@@ -463,6 +470,171 @@ fn waiting_feed_polls_hold_no_blocking_pool_thread() {
     }
 }
 
+/// The nested-pool deadlock #1915 PR 3's `/mcp` places rule out: as many messages as
+/// `--blocking-threads` (2), each held in flight until all are, then each one's op opening an
+/// uncached table on the pool. Had the messages held the pool's permits, as before the
+/// `/mcp` places, every op would wait for one forever (the requests' 20 s timeout fails the
+/// test); with the places, every read answers. The uncached table open, which takes a pool
+/// permit, is what makes the test bite: were opens ever to leave the pool, it would pass
+/// without the places too, so a change that moves them must give the op another pool wait.
+#[test]
+fn mcp_messages_as_many_as_the_pool_still_reach_it() {
+    blocking_threads(2);
+    let s = Server::start(
+        "",
+        Limits {
+            mcp_blocking: 2,
+            ..limits()
+        },
+    );
+    // Made on the database, not through the service: its table cache doesn't hold them, so
+    // each read's op opens its table on the pool.
+    let db = &s.shared.router.service.part().unwrap().db;
+    for name in ["a", "b"] {
+        db.table(name)
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+    }
+    let ids: Vec<String> = (0..2).map(|_| session(&s, None)).collect();
+    let path = s
+        .shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .path()
+        .to_path_buf();
+    super::super::mcp_backend::HOLD
+        .lock()
+        .unwrap()
+        .push((path.clone(), Arc::new(std::sync::Barrier::new(2))));
+    let url = s.url.clone();
+    let readers: Vec<_> = ids
+        .into_iter()
+        .zip(["a", "b"])
+        .map(|(id, table)| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                let resp = agent()
+                    .post(format!("{url}/mcp"))
+                    .header("content-type", "application/json")
+                    .header("mcp-session-id", id.as_str())
+                    .send(
+                        request(
+                            "tools/call",
+                            json!({"name": "read_row", "arguments": {"table": table, "row": "r"}}),
+                        )
+                        .to_string(),
+                    );
+                resp.map(|mut r| (r.status().as_u16(), r.body_mut().read_to_string().unwrap()))
+            })
+        })
+        .collect();
+    let answers: Vec<_> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+    super::super::mcp_backend::HOLD
+        .lock()
+        .unwrap()
+        .retain(|(p, _)| *p != path);
+    for a in answers {
+        let (status, body) = a.unwrap_or_else(|e| panic!("a held read never answered: {e:?}"));
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("\"isError\":false"), "{body}");
+    }
+}
+
+/// simp724 on #1915 PR 3: a `feed_poll` that doesn't wait returns every commit made before
+/// it (the subscription takes its start before the poll reads), and a quiet one answers at
+/// once with a token that resumes after them.
+#[test]
+fn a_poll_without_a_wait_returns_the_commits_made_before_it() {
+    let s = Server::start("", limits());
+    let id = session(&s, None);
+    let (first, err) = call(&s, None, &id, "feed_poll", json!({"tables": ["t"]}));
+    assert!(!err, "{first}");
+    let token = first["token"].clone();
+    for i in 0..5 {
+        let (status, e) = s.post(
+            "Mutate",
+            &super::put(&format!("r{i}"), "f", "q", json!({"bytes": b64(b"v")})),
+            None,
+        );
+        assert_eq!(status, 200, "{e}");
+    }
+    let (got, err) = call(
+        &s,
+        None,
+        &id,
+        "feed_poll",
+        json!({"tables": ["t"], "token": token}),
+    );
+    assert!(!err, "{got}");
+    assert_eq!(got["commits"].as_array().unwrap().len(), 5, "{got}");
+    let started = std::time::Instant::now();
+    let (quiet, err) = call(
+        &s,
+        None,
+        &id,
+        "feed_poll",
+        json!({"tables": ["t"], "token": got["token"]}),
+    );
+    assert!(!err, "{quiet}");
+    assert_eq!(quiet["commits"], json!([]), "{quiet}");
+    assert_eq!(quiet["token"], got["token"], "{quiet}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a quiet poll took {:?}",
+        started.elapsed()
+    );
+}
+
+/// simp724 on #1915 PR 3a: a tool makes no call past its message's deadline (one node's ops
+/// don't read it), so a message holds its `/mcp` place for its deadline and one op at most.
+/// A call held past a 1 s request timeout answers `DeadlineExceeded`, and the one place is
+/// free again for the next message.
+#[test]
+fn a_tool_call_past_its_messages_deadline_answers_deadline_exceeded() {
+    let s = Server::start(
+        "",
+        Limits {
+            mcp_blocking: 1,
+            request_timeout: Duration::from_secs(1),
+            ..limits()
+        },
+    );
+    let id = session(&s, None);
+    let path = s
+        .shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .path()
+        .to_path_buf();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    super::super::mcp_backend::HOLD
+        .lock()
+        .unwrap()
+        .push((path.clone(), Arc::clone(&barrier)));
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        barrier.wait();
+    });
+    let (out, err) = call(&s, None, &id, "read_row", json!({"table": "t", "row": "r"}));
+    releaser.join().unwrap();
+    super::super::mcp_backend::HOLD
+        .lock()
+        .unwrap()
+        .retain(|(p, _)| *p != path);
+    assert!(err, "{out}");
+    assert_eq!(out["error"]["code"], "DeadlineExceeded", "{out}");
+    let (out, err) = call(&s, None, &id, "read_row", json!({"table": "t", "row": "r"}));
+    assert!(!err, "{out}");
+}
+
 #[test]
 fn an_initialize_without_an_answer_leaves_no_session() {
     let s = Server::start("", limits());
@@ -487,9 +659,9 @@ fn an_initialize_without_an_answer_leaves_no_session() {
 
 #[test]
 fn a_tool_opens_and_creates_tables_on_the_requests_own_pool_thread() {
-    // ai1249's B1 on #1666: a `/mcp` request holds a blocking-pool thread for its message,
-    // so a table it opens or creates must not wait for a second one. With a pool of one,
-    // that would wait forever.
+    // ai1249's B1 on #1666, as #1915 PR 3 has it: a `/mcp` message runs under a `/mcp` place,
+    // not a pool permit, so the ops its tools make (a table opened or created on the pool)
+    // take the pool's one thread. Were the message to hold it, they would wait forever.
     blocking_threads(1);
     let s = Server::start("", limits());
     let id = session(&s, None);
@@ -512,8 +684,8 @@ fn a_tool_opens_and_creates_tables_on_the_requests_own_pool_thread() {
 
 #[test]
 fn sessions_opening_tables_at_once_never_wait_on_each_other() {
-    // As many first reads of uncached tables at once as the pool has threads (2): each
-    // request holds one thread, and opens its table on it.
+    // Three first reads of uncached tables at once: each message holds a `/mcp` place, and
+    // its read's op opens the table on the pool.
     let s = Server::start("", limits());
     for name in ["a", "b", "c", "d"] {
         let (status, e) = s.rpc(

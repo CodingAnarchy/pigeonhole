@@ -34,7 +34,7 @@ pub(crate) mod token;
 mod transfer;
 pub(crate) mod upload;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -59,10 +59,37 @@ use crate::exit::Failure;
 /// The map fields this build keeps when it decodes and stores a map (`NodeStatus.map_features`,
 /// ICR 0138 and 0139). A map's writer adds such a field only once every node reports it: a
 /// node that drops it would store a different map at the same version, and read as divergent.
-pub(crate) const MAP_FEATURES: &[&str] = &[MEMORY_FEATURE];
+/// Request features its peers may rely on are listed here too (#1915 PR 3, ICR 0139's PR 3
+/// section): [`NEAREST_QUALIFIERS_FEATURE`].
+pub(crate) const MAP_FEATURES: &[&str] = &[MEMORY_FEATURE, NEAREST_QUALIFIERS_FEATURE];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
 pub(crate) const MEMORY_FEATURE: &str = "memory";
+
+/// [`MAP_FEATURES`]' name for a build that applies `NearestRequest.qualifiers` (#1915 PR 3):
+/// a node without it would rank every qualifier.
+pub(crate) const NEAREST_QUALIFIERS_FEATURE: &str = "nearest_qualifiers";
+
+/// How long a peer's answered features ([`Node::owners_keep`]) are taken as its own: a
+/// node's build changes only when it restarts.
+const PEER_FEATURES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a peer that didn't answer the features check is taken as unavailable without
+/// asking again: so searches while it's down don't each wait a push timeout for it, yet one
+/// back up serves again soon.
+const PEER_DOWN_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A peer's features as it last answered `Status`, and when (`None`: it didn't answer).
+type PeerFeatures = (std::time::Instant, Option<Vec<String>>);
+
+/// What a peer said about a feature ([`Node::features_of`]).
+pub(crate) enum PeerFeature {
+    Has,
+    /// It answered without it: an older build.
+    Lacks,
+    /// It didn't answer (in time): why.
+    NoAnswer(String),
+}
 
 /// The map file in a node's directory.
 pub(crate) const MAP_FILE: &str = "cluster-map.json";
@@ -118,6 +145,33 @@ fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
 /// owner). One entry per node, so tests running at once don't cut each other's.
 #[cfg(test)]
 pub(crate) static CUT_OFF: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before `nearest_qualifiers` (#1915 PR 3),
+/// by cluster directory. `status`: its `Status` leaves the feature out. `parts`: its
+/// partitions' nearest searches rank every qualifier, as such a build's would (with
+/// `status` false, a peer that changed build within the entry node's features cache).
+#[cfg(test)]
+pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Vec::new());
+
+/// How [`OLD_NEAREST`] has a node act.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OldNearest {
+    /// `Status` leaves `nearest_qualifiers` out.
+    Status,
+    /// The node's partitions ignore `NearestRequest.qualifiers`.
+    Parts,
+}
+
+/// Whether [`OLD_NEAREST`] has the node or partition at `path` act as `how`.
+#[cfg(test)]
+pub(crate) fn old_nearest(path: &Path, how: OldNearest) -> bool {
+    OLD_NEAREST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|(d, h)| *h == how && path.starts_with(d))
+}
 
 #[cfg(test)]
 fn cut_off(dir: &Path, address: &str) -> bool {
@@ -207,6 +261,10 @@ pub(crate) struct Node {
     /// never reconciled after it, so a stale one can't drop a table a newer one created
     /// (audit120's F6).
     reconciled_newest: std::sync::atomic::AtomicU64,
+    /// Peers' features as they last answered `Status` (`map_features`), by node id, with
+    /// when (`None`: it didn't answer): asked again after [`PEER_FEATURES_TTL`], or
+    /// [`PEER_DOWN_TTL`] for no answer ([`Node::owners_keep`]).
+    peer_features: Mutex<HashMap<String, PeerFeatures>>,
     /// Whether this node has taken its peers' newer maps since it started (cleared by
     /// [`run`] for a node that restarts with a map, set by [`Node::sync_on_start`]). The
     /// map's writer changes the map only once it has (D317 amendment 1): a writer back from
@@ -323,6 +381,7 @@ impl Node {
             pulling: tokio::sync::Mutex::new(()),
             reconciled: Mutex::new(std::collections::BTreeMap::new()),
             reconciled_newest: std::sync::atomic::AtomicU64::new(0),
+            peer_features: Mutex::new(HashMap::new()),
             synced: std::sync::atomic::AtomicBool::new(true),
             schema_changes: tokio::sync::Mutex::new(()),
             fences: fence::Fences::default(),
@@ -819,9 +878,83 @@ impl Node {
     ) -> Result<(), ApiError> {
         // Every node at once, as a confirm round asks them (simp724's n2 on #1920): k nodes
         // that don't answer cost one push timeout, not k.
+        let peers = map
+            .nodes
+            .iter()
+            .filter(|n| n.id != self.id)
+            .map(|n| (n.id.clone(), n.address.clone()));
+        let lacking = self.lacking(peers, feature).await;
+        if lacking.is_empty() {
+            Ok(())
+        } else {
+            Err(ApiError::failed_precondition(format!(
+                "the map can't add {what} until every node runs a build that keeps it in its \
+                 map, or that node would read as divergent: {}. Finish the upgrade first",
+                lacking.join(", ")
+            )))
+        }
+    }
+
+    /// The peers of `peers` (id, address) that don't report `feature` in `Status`, each
+    /// named with why: an older build, or no answer (in time). Every peer asked at once, as
+    /// a confirm round asks them (simp724's n2 on #1920).
+    async fn lacking(
+        self: &Arc<Self>,
+        peers: impl Iterator<Item = (String, String)>,
+        feature: &str,
+    ) -> Vec<String> {
+        let mut lacking: Vec<String> = self
+            .features_of(peers, feature, false)
+            .await
+            .into_iter()
+            .filter_map(|(id, f)| match f {
+                PeerFeature::Has => None,
+                PeerFeature::Lacks => Some(format!("{id} (an older build)")),
+                PeerFeature::NoAnswer(why) => Some(format!("{id} ({why})")),
+            })
+            .collect();
+        lacking.sort();
+        lacking
+    }
+
+    /// What each peer of `peers` (id, address) says about `feature` in `Status`, asked all
+    /// at once. With `cached`, an answer from the last [`PEER_FEATURES_TTL`] stands, and a
+    /// no-answer from the last [`PEER_DOWN_TTL`].
+    pub(crate) async fn features_of(
+        self: &Arc<Self>,
+        peers: impl Iterator<Item = (String, String)>,
+        feature: &str,
+        cached: bool,
+    ) -> Vec<(String, PeerFeature)> {
+        let verdict = |fs: &Option<Vec<String>>| match fs {
+            Some(fs) if fs.iter().any(|f| f == feature) => PeerFeature::Has,
+            Some(_) => PeerFeature::Lacks,
+            None => PeerFeature::NoAnswer("no answer lately".into()),
+        };
         let mut asks = tokio::task::JoinSet::new();
-        for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let (node, id, address) = (Arc::clone(self), n.id.clone(), n.address.clone());
+        let mut out = Vec::new();
+        for (id, address) in peers {
+            if cached {
+                let known = self
+                    .peer_features
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&id)
+                    .filter(|(at, fs)| {
+                        let ttl = if fs.is_some() {
+                            PEER_FEATURES_TTL
+                        } else {
+                            PEER_DOWN_TTL
+                        };
+                        at.elapsed() < ttl
+                    })
+                    .map(|(_, fs)| verdict(fs));
+                if let Some(v) = known {
+                    out.push((id, v));
+                    continue;
+                }
+            }
+            let node = Arc::clone(self);
             let feature = feature.to_owned();
             asks.spawn(async move {
                 let answer = async {
@@ -833,22 +966,60 @@ impl Node {
                         .map(tonic::Response::into_inner)
                         .map_err(|s| s.message().to_owned())
                 };
-                match tokio::time::timeout(node.peers.push_timeout, answer).await {
-                    Ok(Ok(st)) if st.map_features.contains(&feature) => None,
-                    Ok(Ok(_)) => Some(format!("{id} (an older build)")),
-                    Ok(Err(e)) => Some(format!("{id} (no answer: {e})")),
-                    Err(_) => Some(format!("{id} (no answer in time)")),
-                }
+                let (seen, v) = match tokio::time::timeout(node.peers.push_timeout, answer).await {
+                    Ok(Ok(st)) => {
+                        let v = if st.map_features.contains(&feature) {
+                            PeerFeature::Has
+                        } else {
+                            PeerFeature::Lacks
+                        };
+                        (Some(st.map_features), v)
+                    }
+                    Ok(Err(e)) => (None, PeerFeature::NoAnswer(format!("no answer: {e}"))),
+                    Err(_) => (None, PeerFeature::NoAnswer("no answer in time".into())),
+                };
+                node.peer_features
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id.clone(), (std::time::Instant::now(), seen));
+                (id, v)
             });
         }
-        let mut lacking: Vec<String> = asks.join_all().await.into_iter().flatten().collect();
+        out.extend(asks.join_all().await);
+        out
+    }
+
+    /// Whether every node among `owners` (other than this one) applies request feature
+    /// `feature`, which `what` needs (#1915 PR 3): `FailedPrecondition` naming each that
+    /// answers without it (a build before it would answer its part without it), else the
+    /// nodes that didn't answer, which the caller treats as unavailable (the coordinator's
+    /// call). Answers are cached per peer ([`Node::features_of`]), so a node that's down
+    /// doesn't cost each request a push timeout.
+    pub(crate) async fn owners_keep(
+        self: &Arc<Self>,
+        owners: impl Iterator<Item = (String, String)>,
+        feature: &str,
+        what: &str,
+    ) -> Result<Vec<String>, ApiError> {
+        let mut seen = std::collections::BTreeMap::new();
+        for (id, address) in owners.filter(|(id, _)| *id != self.id) {
+            seen.entry(id).or_insert(address);
+        }
+        let (mut lacking, mut down) = (Vec::new(), Vec::new());
+        for (id, f) in self.features_of(seen.into_iter(), feature, true).await {
+            match f {
+                PeerFeature::Has => {}
+                PeerFeature::Lacks => lacking.push(format!("{id} (an older build)")),
+                PeerFeature::NoAnswer(_) => down.push(id),
+            }
+        }
         lacking.sort();
         if lacking.is_empty() {
-            Ok(())
+            Ok(down)
         } else {
             Err(ApiError::failed_precondition(format!(
-                "the map can't add {what} until every node runs a build that keeps it in its \
-                 map, or that node would read as divergent: {}. Finish the upgrade first",
+                "{what} needs every node that holds a part of it to run a build that supports \
+                 it, and these don't: {}. Finish the upgrade first, or ask without it",
                 lacking.join(", ")
             )))
         }
@@ -1061,7 +1232,19 @@ impl Node {
             partitions,
             divergent,
             grace_remaining_ms: millis(self.grants.grace_remaining()),
-            map_features: MAP_FEATURES.iter().map(|&f| f.to_owned()).collect(),
+            map_features: MAP_FEATURES
+                .iter()
+                .filter(|&&f| {
+                    #[cfg(test)]
+                    if f == NEAREST_QUALIFIERS_FEATURE && old_nearest(&self.dir, OldNearest::Status)
+                    {
+                        return false;
+                    }
+                    let _ = f;
+                    true
+                })
+                .map(|&f| f.to_owned())
+                .collect(),
         }
     }
 
