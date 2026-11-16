@@ -428,6 +428,9 @@ impl DataGrpc {
         op: impl FnOnce(T) -> ServiceOp,
         pick: impl FnOnce(ServiceReply) -> Option<R>,
     ) -> Result<Response<R>, Status> {
+        if !self.0.router.is_cluster() {
+            return respond(self.call(req, op).await?, pick);
+        }
         let (reply, served) = call_served(&self.0, req, op).await?;
         let mut resp = respond(reply, pick)?;
         if let Some(served) = served {
@@ -447,10 +450,41 @@ async fn call<T>(
     req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<ServiceReply, Status> {
-    call_served(shared, req, op).await.map(|(reply, _)| reply)
+    // A cluster node's calls may carry the replica header (D328): boxed, so a single node's
+    // calls keep the future and the cost they had.
+    if shared.router.is_cluster() {
+        return Box::pin(call_served(shared, req, op))
+            .await
+            .map(|(reply, _)| reply);
+    }
+    let caller = shared.caller(auth_header(&req))?;
+    let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
+    let started = Instant::now();
+    let min_primary_seqno = super::replica::min_primary_seqno(
+        req.metadata()
+            .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    );
+    // The request's one deadline, from its arrival (#1577).
+    let arrived = req.extensions().get::<Arrived>().map_or(started, |a| a.0);
+    let deadline = ReadDeadline::new(
+        arrived,
+        shared.limits.request_timeout,
+        grpc_timeout(req.metadata().as_ref()),
+    );
+    let op = op(req.into_inner());
+    let rpc = op.index();
+    let reply = shared
+        .router
+        .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+        .await;
+    shared.count(rpc, started, &reply);
+    Ok(reply?)
 }
 
-/// [`call`], with what served a read a replica could have (D328), for its headers.
+/// [`call`] on a cluster node, with what served a read a replica could have (D328), for its
+/// headers. A single node's calls take [`call`] itself, unchanged, so their cost stays as
+/// it was (the serve callgrind shapes, D193).
 async fn call_served<T>(
     shared: &Shared,
     req: Request<T>,
