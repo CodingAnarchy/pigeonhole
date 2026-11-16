@@ -307,6 +307,7 @@ fn a_partition_that_fails_to_open_fails_the_node_and_closes_the_others() {
         &dir,
         Some("c1"),
         &mine,
+        false,
         super::super::Budget {
             shares: &shares,
             reserved: None,
@@ -350,6 +351,7 @@ fn a_partition_stamped_past_the_maps_epoch_is_left_unopened_and_the_node_starts(
             &dir,
             Some("c1"),
             mine,
+            false,
             super::super::Budget {
                 shares: &shares,
                 reserved: None,
@@ -411,6 +413,7 @@ fn a_partitions_share_of_the_budget_keeps_its_feeds_shard_count() {
         &dir,
         Some("c1"),
         &mine,
+        false,
         super::super::Budget {
             shares: &[share],
             reserved: None,
@@ -571,6 +574,7 @@ fn shards_pin_together_alone() {
         &dir,
         Some("c1"),
         &mine,
+        false,
         super::super::Budget {
             shares: &shares,
             reserved: Some(&reserved),
