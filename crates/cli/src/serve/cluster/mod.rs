@@ -2225,6 +2225,9 @@ pub(crate) fn run(
                 engine_memory: Some(o.memory),
             };
             let part = service.for_partition(o.db.clone(), &o.id, gate, config);
+            // A text index rebuild a fence or a shutdown stopped carries on once the
+            // partition takes writes (#1756).
+            part.resume_text_rebuilds();
             (o.id.clone(), part)
         })
         .collect();

@@ -3,7 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
+use std::ops::{Bound, ControlFlow};
 use std::sync::Arc;
 
 use pigeonhole::{
@@ -219,6 +219,26 @@ pub struct RebuildStats {
     pub changed: u64,
     /// Source cells that aren't valid UTF-8 (skipped).
     pub invalid_utf8: u64,
+    /// Whether the step of [`Index::rebuild_with`] or [`Index::resume_rebuild_with`] stopped
+    /// the walk before its end (#1756). The index is consistent, and a later
+    /// [`Index::resume_rebuild_with`] carries on.
+    pub stopped: bool,
+}
+
+/// Which walk [`Index::rebuild_inner`] makes.
+enum Walk {
+    /// A rebuild, which keeps a cursor; from the row after `from`, if it resumes (#1756).
+    Rebuild { from: Option<Vec<u8>> },
+    /// A repair's, from an emptied table: no cursor, read or written.
+    Repair,
+}
+
+/// How a page of a rebuild ended.
+enum Paged {
+    /// Its step stopped the walk.
+    Stopped,
+    /// Every document done; whether the last one's transaction wrote the cursor.
+    Done { cursor_at_last: bool },
 }
 
 /// A transaction body's failure: the database's error (retried as `transact` retries), or
@@ -365,7 +385,7 @@ impl Index {
                 builtin,
             }),
         };
-        index.rebuild_inner(false)?;
+        index.rebuild_inner(Walk::Rebuild { from: None }, |_| ControlFlow::Continue(()))?;
         Ok(index)
     }
 
@@ -594,8 +614,92 @@ impl Index {
     /// length) trust `F{doc}` as the record of what was indexed, so after a write around the
     /// index's own rows (not just the source column), use `repair`, which starts from an
     /// emptied table. It fails with `Busy` while a repair runs.
+    ///
+    /// It starts from the first source row, and drops the cursor a stopped
+    /// [`rebuild_with`](Self::rebuild_with) left: it covers every source row as of the call.
     pub fn rebuild(&self) -> Result<RebuildStats> {
-        self.rebuild_inner(false)
+        self.rebuild_with(|_| ControlFlow::Continue(()))
+    }
+
+    /// [`rebuild`](Self::rebuild), calling `step` after each document's transaction with the
+    /// counts so far (#1756). A `Break` stops the walk there: the index is consistent (each
+    /// document is its own transaction), the result has `stopped` set, and
+    /// [`resume_rebuild_with`](Self::resume_rebuild_with) carries on from the cursor the walk
+    /// keeps in the index. The cursor is written once a page, and in the transaction of any
+    /// document that writes anyway, so a document already right still writes nothing, and a
+    /// resume redoes at most one page of documents. A walk costs two commits more: the empty
+    /// cursor at its start, and the cursor's removal at its end.
+    ///
+    /// Like `rebuild`, it starts from the first source row, replacing any earlier cursor with
+    /// an empty one ("from the top") in its first commit: a stop or a crash before its first
+    /// page's cursor still leaves it pending.
+    pub fn rebuild_with(
+        &self,
+        step: impl FnMut(&RebuildStats) -> ControlFlow<()>,
+    ) -> Result<RebuildStats> {
+        self.w()
+            .table
+            .mutate(GLOBAL)
+            .put(META, REBUILD_AFTER, b"")
+            .commit()?;
+        self.rebuild_inner(Walk::Rebuild { from: None }, step)
+    }
+
+    /// Carries on a rebuild that [`rebuild_with`](Self::rebuild_with)'s step stopped, after
+    /// the last row its cursor names (#1756); nothing if none is pending. It ends as that
+    /// rebuild would have: documents before the cursor were reconciled when it visited them,
+    /// and writes through the index have kept them so since. A write around the index to a
+    /// row before the cursor is missed, as it would be by one rebuild that had passed that
+    /// row: call [`rebuild`](Self::rebuild) (which starts over) or [`repair`](Self::repair)
+    /// after such writes, never this.
+    pub fn resume_rebuild_with(
+        &self,
+        step: impl FnMut(&RebuildStats) -> ControlFlow<()>,
+    ) -> Result<RebuildStats> {
+        let Some(from) = self.rebuild_cursor()? else {
+            return Ok(RebuildStats::default());
+        };
+        // An empty cursor: stopped before its first page's, so from the top.
+        let from = (!from.is_empty()).then_some(from);
+        self.rebuild_inner(Walk::Rebuild { from }, step)
+    }
+
+    /// The text indexes in `db` with a stopped rebuild pending (#1756): for a server to
+    /// resume them. A point read per table with the index's families; a table dropped since
+    /// the catalog was listed is passed over.
+    pub fn pending_rebuilds(db: &Pigeonhole) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for name in db.tables() {
+            let t = match db.table(&name).and_then(|b| b.open()) {
+                Ok(t) => t,
+                Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let families = t.families();
+            if [POST, DF, TERMS, META, STATS]
+                .iter()
+                .any(|f| !families.contains(f))
+            {
+                continue;
+            }
+            if t.get(GLOBAL, META, REBUILD_AFTER)?.is_some() {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether a stopped rebuild is pending (a cursor is kept): one point read.
+    pub fn rebuild_pending(&self) -> Result<bool> {
+        Ok(self.rebuild_cursor()?.is_some())
+    }
+
+    fn rebuild_cursor(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .w()
+            .table
+            .get(GLOBAL, META, REBUILD_AFTER)?
+            .map(|c| c.value().to_vec()))
     }
 
     /// Rebuilds the index from an emptied table (D309 §3, M2): drops every index row, then
@@ -606,7 +710,12 @@ impl Index {
         let w = self.w();
         let t = &w.table;
         // The flag first: every write in flight read it, so they conflict and retry into Busy.
-        t.mutate(GLOBAL).put(META, REPAIR, b"").commit()?;
+        // A stopped rebuild's cursor goes with it: the repair walks the whole source, and a
+        // resume after it would skip rows of the emptied index (ai1249 on #1756).
+        t.mutate(GLOBAL)
+            .put(META, REPAIR, b"")
+            .delete_column(META, REBUILD_AFTER)
+            .commit()?;
         for prefix in [POST_PREFIX, FWD_PREFIX, STATS_ROW] {
             // The keys first, under a snapshot and an iterator dropped before anything below
             // commits (#1514): held across this thread's own commits, they would pin the
@@ -628,18 +737,26 @@ impl Index {
                 batch.commit()?;
             }
         }
-        let stats = self.rebuild_inner(true)?;
+        let stats = self.rebuild_inner(Walk::Repair, |_| ControlFlow::Continue(()))?;
         t.mutate(GLOBAL).delete_column(META, REPAIR).commit()?;
         Ok(stats)
     }
 
-    fn rebuild_inner(&self, repairing: bool) -> Result<RebuildStats> {
-        use std::ops::Bound;
+    /// The walk over the source: a rebuild's, which keeps a cursor (from `from`, if it
+    /// resumes), or a repair's, which keeps none (`rebuild_inner`).
+    fn rebuild_inner(
+        &self,
+        walk: Walk,
+        mut step: impl FnMut(&RebuildStats) -> ControlFlow<()>,
+    ) -> Result<RebuildStats> {
         let inn = &*self.inner;
         let w = self.w();
         let mut stats = RebuildStats::default();
         let q = inn.source.qualifier.as_slice();
-        let mut after: Option<Vec<u8>> = None;
+        let (repairing, mut after) = match walk {
+            Walk::Repair => (true, None),
+            Walk::Rebuild { from } => (false, from),
+        };
         loop {
             // A page of documents, under a snapshot and an iterator dropped before the page's
             // transactions commit (#1514): held across them, they would pin the memtables a
@@ -663,28 +780,57 @@ impl Index {
                 }
                 page
             };
-            let Some(last) = page.last() else {
-                return Ok(stats);
+            let Some(last) = page.last().cloned() else {
+                return self.rebuilt(repairing, stats);
             };
-            after = Some(last.clone());
             let full = page.len() as u64 == REBUILD_PAGE;
-            self.rebuild_page(&page, repairing, &mut stats)?;
+            let cursor_at_last = match self.rebuild_page(&page, repairing, &mut stats, &mut step)? {
+                Paged::Stopped => {
+                    stats.stopped = true;
+                    return Ok(stats);
+                }
+                Paged::Done { cursor_at_last } => cursor_at_last,
+            };
             if !full {
-                return Ok(stats);
+                return self.rebuilt(repairing, stats);
             }
+            // The page's cursor, unless its last document's transaction wrote it: a resume
+            // redoes at most the next page (ai1249's Q2 on #1756).
+            if !repairing && !cursor_at_last {
+                w.table
+                    .mutate(GLOBAL)
+                    .put(META, REBUILD_AFTER, &last)
+                    .commit()?;
+            }
+            after = Some(last);
         }
     }
 
-    /// Re-indexes each of `docs`, one transaction each (`rebuild_inner`'s page).
+    /// A walk that reached the source's end: a rebuild's cursor goes.
+    fn rebuilt(&self, repairing: bool, stats: RebuildStats) -> Result<RebuildStats> {
+        if !repairing && self.rebuild_pending()? {
+            self.w()
+                .table
+                .mutate(GLOBAL)
+                .delete_column(META, REBUILD_AFTER)
+                .commit()?;
+        }
+        Ok(stats)
+    }
+
+    /// Re-indexes each of `docs`, one transaction each (`rebuild_inner`'s page), calling
+    /// `step` after each. A rebuild's document that writes anyway also writes the cursor.
     fn rebuild_page(
         &self,
         docs: &[Vec<u8>],
         repairing: bool,
         stats: &mut RebuildStats,
-    ) -> Result<()> {
+        step: &mut impl FnMut(&RebuildStats) -> ControlFlow<()>,
+    ) -> Result<Paged> {
         let inn = &*self.inner;
         let w = self.w();
         let q = inn.source.qualifier.as_slice();
+        let mut cursor_at_last = false;
         for doc in docs {
             stats.documents += 1;
             let ((changed, bad), _) = w.db.transact(&RetryPolicy::default(), |tx| {
@@ -702,12 +848,19 @@ impl Index {
                 let old = self.read_forward(tx, doc)?;
                 let new = self.analyse(&text)?;
                 let changed = self.apply(tx, doc, &old, &new, Mode::Rebuild)?;
+                if changed && !repairing {
+                    tx.put(&w.table, GLOBAL, META, REBUILD_AFTER, doc);
+                }
                 Ok::<_, Tx>((changed, false))
             })?;
             stats.changed += u64::from(changed);
             stats.invalid_utf8 += u64::from(bad);
+            cursor_at_last = changed && !repairing;
+            if step(stats).is_break() {
+                return Ok(Paged::Stopped);
+            }
         }
-        Ok(())
+        Ok(Paged::Done { cursor_at_last })
     }
 
     fn check_not_repairing(&self, txn: &mut Transaction) -> Result<()> {
