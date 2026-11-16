@@ -1815,7 +1815,7 @@ enum MemberKind {
 /// 2, since Linux file systems fold concurrent `fdatasync`s of one file into one journal
 /// commit, so a second one in flight keeps the device busy; on the AX102 it came within 2% of
 /// unlimited at 16 clients (p99 191 against 188 µs), and 1 lost 6% (p99 248 µs).
-const GROUP_SYNC_DEPTH: u32 = if cfg!(target_os = "macos") { 1 } else { 2 };
+const GROUP_SYNC_DEPTH: u32 = 1; // scratch g125 (#1621): depth 1 on Linux too
 
 /// The group syncs a shard keeps in flight per stream: 2, or 1 on macOS (D207, D221).
 pub fn group_sync_depth() -> u32 {
