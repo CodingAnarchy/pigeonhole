@@ -25,6 +25,54 @@ pub(crate) struct Texts {
     rebuild: Mutex<Option<JoinHandle<()>>>,
     /// Set by `close` under `rebuild`'s lock: no rebuild starts after it.
     closed: AtomicBool,
+    /// The source tables of `Text.CreateIndex` calls in flight, once per call (#1916). Added
+    /// to under the partition's `schema` lock, so a `DropTable` holding it sees every create
+    /// that could still write an index's source after the drop's check.
+    creating: Mutex<Vec<String>>,
+}
+
+/// A hold seam (tests): a `Text.CreateIndex` of an index named here meets the test at the
+/// first barrier, then waits at the second before it creates anything (#1916).
+#[cfg(test)]
+pub(crate) static HOLD_CREATE: Mutex<Vec<HeldCreate>> = Mutex::new(Vec::new());
+
+/// An entry of [`HOLD_CREATE`]: the index's name, the barrier it meets the test at, and the
+/// one it waits at.
+#[cfg(test)]
+pub(crate) type HeldCreate = (String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+
+#[cfg(test)]
+fn hold_create(name: &str) {
+    let held = HOLD_CREATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(n, _, _)| n == name)
+        .map(|(_, a, b)| (Arc::clone(a), Arc::clone(b)));
+    if let Some((reached, release)) = held {
+        reached.wait();
+        release.wait();
+    }
+}
+
+/// A `Text.CreateIndex` in flight over a source table ([`Texts::creating`]); dropping it
+/// removes the entry.
+pub(crate) struct Creating {
+    texts: Arc<Texts>,
+    source: String,
+}
+
+impl Drop for Creating {
+    fn drop(&mut self) {
+        let mut creating = self
+            .texts
+            .creating
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(i) = creating.iter().position(|s| *s == self.source) {
+            creating.swap_remove(i);
+        }
+    }
 }
 
 impl Texts {
@@ -34,7 +82,30 @@ impl Texts {
             open: Mutex::new(super::handles::Handles::default()),
             rebuild: Mutex::new(None),
             closed: AtomicBool::new(false),
+            creating: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Notes a `Text.CreateIndex` over `source` until the guard drops. Call it holding the
+    /// partition's `schema` lock (#1916).
+    pub(crate) fn creating(self: &Arc<Self>, source: &str) -> Creating {
+        self.creating
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(source.to_owned());
+        Creating {
+            texts: Arc::clone(self),
+            source: source.to_owned(),
+        }
+    }
+
+    /// Whether a `Text.CreateIndex` over `source` is in flight ([`Texts::creating`]).
+    pub(crate) fn creating_over(&self, source: &str) -> bool {
+        self.creating
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|s| s == source)
     }
 
     /// Runs `rebuild` on a thread of its own (`phdb-serve-text-rebuild`), which `close`
@@ -117,6 +188,8 @@ impl Texts {
         if if_missing && self.cached(name).is_some() {
             return Ok(());
         }
+        #[cfg(test)]
+        hold_create(name);
         let generation = self.handles().generation();
         let index = match Index::create(&self.db, name, source, options) {
             Ok(i) => i,

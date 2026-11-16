@@ -2673,7 +2673,33 @@ impl Service {
         let place = pool_place(&self.blocking).await?;
         let _schema = self.part()?.schema.lock().await;
         let db = self.part()?.db.clone();
-        let dropped = held(place, move || Ok(db.drop_table(&name)?)).await;
+        let texts = Arc::clone(&self.part()?.texts);
+        let dropped = held(place, move || {
+            // A text index reading the table would be left behind, unable to write, rebuild
+            // or find its documents, and a new table of the name would become its source
+            // (#1916, the coordinator's option (a)). Checked under `schema`, which a text
+            // index's create takes too, so none appears between the check and the drop.
+            if texts.creating_over(&name) {
+                return Err(ApiError::failed_precondition(format!(
+                    "a text index over table {name:?} is being created: once it's built, drop \
+                     the index before the table"
+                )));
+            }
+            let over = pigeonhole_text::Index::over_table(&db, &name)?;
+            if !over.is_empty() {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} is the source of the text index{} {}: drop {} first",
+                    if over.len() == 1 { "" } else { "es" },
+                    over.iter()
+                        .map(|i| format!("{i:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if over.len() == 1 { "it" } else { "them" },
+                )));
+            }
+            Ok(db.drop_table(&name)?)
+        })
+        .await;
         // Whatever the outcome, the next use resolves every name again: the table's handle,
         // and a vector or text index's if it was one, with its rebalancer (#1588). Every
         // cached handle goes, not only the name's: drops are rare, and an open of the name
@@ -3495,8 +3521,21 @@ impl Service {
         let table = self.table(&r.source_table).await?;
         let source = pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
         let texts = Arc::clone(&self.part()?.texts);
-        self.blocking(move || texts.create(&r.name, source, options, r.if_missing))
-            .await?;
+        // Noted under `schema`, where a drop of the source checks for its indexes (#1916),
+        // and held until the index (its source stored first) is built: a drop then refuses
+        // it, and one that checked first has dropped the source, which the create can't
+        // open. The build itself runs without `schema`, which it could hold for minutes.
+        // The pool place first (its lock order).
+        let place = pool_place(&self.blocking).await?;
+        let creating = {
+            let _schema = self.part()?.schema.lock().await;
+            texts.creating(&r.source_table)
+        };
+        held(place, move || {
+            let _creating = creating;
+            texts.create(&r.name, source, options, r.if_missing)
+        })
+        .await?;
         Ok(proto::Empty {})
     }
 

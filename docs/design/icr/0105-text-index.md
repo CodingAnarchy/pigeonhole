@@ -151,6 +151,11 @@ No API change.
 - **No generic `Query::clause(Clause)`:** it would let callers build clauses the docs don't describe (ai1249). `FuzzyText`'s builder waits until a front end needs it.
 - **Test:** the builder and the parsed `"..."~N` form give the same clauses and the same hits and scores, for stop words, slop, reversed order, a phrase of only stop words or of nothing, and escaped quotes.
 
+## Amendment: `Index::over_table` (#1916)
+- **`Index::over_table(db: &Pigeonhole, table: &str) -> Result<Vec<String>>`** is additive: the names of the text indexes whose source column is in `table`, sorted. A table without the index's families is skipped without a read. One with them is read for its stored source, whatever its tokeniser, so an index made with a custom tokeniser counts.
+- **Why:** dropping a source table left its indexes unable to write, rebuild or find their documents, and a new table of that name became their source. The coordinator chose to refuse the drop (option (a)). `phdb serve`'s `Schema.DropTable` asks this first and answers `FailedPrecondition`, naming them, and refuses too while a `Text.CreateIndex` over the table is building. The library's `Pigeonhole::drop_table` doesn't know about text indexes, so the guide says to drop the index first.
+- **Test:** two indexes over a table, one with a custom tokeniser, and one over another table: `over_table` names exactly the first table's, and nothing for an index's own table or a missing one.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 
