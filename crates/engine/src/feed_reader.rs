@@ -329,6 +329,8 @@ enum Item {
     Prepare {
         id: Seqno,
         changes: Raws,
+        /// An external share (D329): see [`Held::external`].
+        external: bool,
     },
     Decision {
         id: Seqno,
@@ -392,6 +394,11 @@ struct Held {
     changes: Raws,
     /// Read in a segment outside the feed's history (the mark rule): delivering it expires.
     outside: bool,
+    /// An external share (D329), which may be held as long as its caller takes to decide:
+    /// outside the read-ahead budget and never what trimming evicts, so a long hold can't
+    /// lower the cutoff and stall delivery (perf2's E3 on ICR 0140). Bounded instead by the
+    /// writer's in-doubt limits.
+    external: bool,
 }
 
 /// One stream's reading state.
@@ -1091,6 +1098,9 @@ fn pending_bytes(p: &Pending) -> u64 {
 
 /// The read-ahead bytes a held share counts for, as for [`pending_bytes`].
 fn held_bytes(h: &Held) -> u64 {
+    if h.external {
+        return 0;
+    }
     HELD_ENTRY + h.changes.memory()
 }
 
@@ -2107,7 +2117,8 @@ impl FeedReader {
         let top_held = self
             .held
             .range((self.delivered, 0)..)
-            .next_back()
+            .rev()
+            .find(|(_, h)| !h.external)
             .map(|(&(id, _), _)| id.saturating_add(1));
         (top_ready, top_held)
     }
@@ -2360,13 +2371,18 @@ impl FeedReader {
                     self.evict_round(id);
                     continue;
                 }
-                Item::Prepare { id, changes } => {
+                Item::Prepare {
+                    id,
+                    changes,
+                    external,
+                } => {
                     let h = Held {
                         stream: s,
                         start,
                         end,
                         changes,
                         outside: !inside,
+                        external,
                     };
                     self.starts.add(s, start);
                     self.ahead.bytes += held_bytes(&h);
@@ -2504,6 +2520,7 @@ impl FeedReader {
             WalRecord::Prepare { seqno, batch, .. } => Item::Prepare {
                 id: seqno,
                 changes: filter(batch)?,
+                external: false,
             },
             // D329: an external share is held as a D263 one is, delivered at its Decision's
             // apply seqno, or dropped by its abort.
@@ -2511,6 +2528,7 @@ impl FeedReader {
                 Some(batch) => Item::Prepare {
                     id: seqno,
                     changes: filter(batch)?,
+                    external: true,
                 },
                 None => Item::Other,
             },
@@ -3761,6 +3779,7 @@ mod tests {
             end: Lsn::new(epoch, 128),
             changes: Raws::default(),
             outside: false,
+            external: false,
         }
     }
 
