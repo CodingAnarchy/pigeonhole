@@ -67,10 +67,14 @@ pub fn pigeonhole_text::Index::open_reader(&pigeonhole::db::PigeonholeReader, &s
 pub fn pigeonhole_text::Index::open_reader_with_tokenizer(&pigeonhole::db::PigeonholeReader, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
 pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::Index::pending_rebuilds(&pigeonhole::db::Pigeonhole) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
 pub fn pigeonhole_text::Index::put_in(&self, &mut pigeonhole::write::Transaction, &[u8], &str) -> pigeonhole_text::Result<()>
 pub fn pigeonhole_text::Index::rebuild(&self) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
+pub fn pigeonhole_text::Index::rebuild_pending(&self) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::rebuild_with(&self, impl core::ops::function::FnMut(&pigeonhole_text::RebuildStats) -> core::ops::control_flow::ControlFlow<()>) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
 pub fn pigeonhole_text::Index::repair(&self) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
+pub fn pigeonhole_text::Index::resume_rebuild_with(&self, impl core::ops::function::FnMut(&pigeonhole_text::RebuildStats) -> core::ops::control_flow::ControlFlow<()>) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
 pub fn pigeonhole_text::Index::search(&self, impl core::convert::Into<pigeonhole_text::Query>, usize) -> pigeonhole_text::Search<'_>
 pub fn pigeonhole_text::Index::source(&self) -> &pigeonhole_text::Source
 pub fn pigeonhole_text::Index::verify(&self) -> pigeonhole_text::Result<pigeonhole_text::IndexStats>
@@ -138,6 +142,7 @@ pub fn pigeonhole_text::ReadIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> 
 pub pigeonhole_text::RebuildStats::changed: u64
 pub pigeonhole_text::RebuildStats::documents: u64
 pub pigeonhole_text::RebuildStats::invalid_utf8: u64
+pub pigeonhole_text::RebuildStats::stopped: bool
 pub struct pigeonhole_text::Search<'a>
 impl<'a> pigeonhole_text::Search<'a>
 pub fn pigeonhole_text::Search<'a>::highlight(self, bool) -> Self
