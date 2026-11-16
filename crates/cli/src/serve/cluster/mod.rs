@@ -1377,8 +1377,6 @@ impl Node {
             .map_err(|e| format!("connecting to {address}: {e}"))
     }
 
-    /// Partition `id`'s owner in this node's map and its address, for a replica copy's
-    /// follower (D328): an error when the map has no such partition, or names this node.
     /// The epoch partition `id`'s current history began at, as this node's map has it
     /// (`Partition.history_epoch`): `None` without a map or the partition.
     pub(crate) fn history_epoch(&self, id: &str) -> Option<u64> {
@@ -1389,6 +1387,8 @@ impl Node {
             .map(|p| p.history_epoch)
     }
 
+    /// Partition `id`'s owner in this node's map and its address, for a replica copy's
+    /// follower (D328): an error when the map has no such partition, or names this node.
     pub(crate) fn owner_of(&self, id: &str) -> Result<(String, String), String> {
         let map = self.get_map().map_err(|e| e.message)?;
         let p =

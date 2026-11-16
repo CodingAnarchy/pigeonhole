@@ -531,3 +531,68 @@ fn a_replica_copy_of_a_partition_whose_owner_has_no_feed_says_so() {
         let _ = db.close();
     }
 }
+
+/// The owner tries a replica's opaque token against each partition it owns (simp724's S2 on
+/// #1974): with p2 and p3 both on b, a's replica of p3 is tried against p2 first (in id
+/// order), whose "the token is another database's" moves on to p3. So this follows only
+/// while `follow_owned`'s match still finds the engine's wording, and pins it.
+#[test]
+fn a_replica_copy_follows_an_owner_holding_several_partitions() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut map = three_way(&[ports[0], ports[1], ports[2]]);
+    for p in map.partitions.iter_mut().filter(|p| p.id == "p3") {
+        p.node = "b".into();
+    }
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, id), dir) in listeners.into_iter().zip(["a", "b", "c"]).zip(&dirs) {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let locals: Vec<(&str, Option<pigeonhole::Pigeonhole>)> = match id {
+            "a" => vec![("p1", None)],
+            "b" => vec![("p2", None), ("p3", None)],
+            _ => Vec::new(),
+        };
+        let (stop, db) = data_node_many(
+            &rt,
+            dir,
+            id,
+            locals,
+            l,
+            "",
+            crate::serve::server_tests::limits(),
+            false,
+        );
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    rt.block_on(async {
+        table_on_p3(ports[0]).await;
+        let first = put_in(ports[2], "r", "k1").await;
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's replica of p3 to follow b past a write", async || {
+            copy_of(ports[0], "p3").await.is_some_and(|lp| {
+                lp.replica_state() == ReplicaState::Following
+                    && lp.replica_of == "b"
+                    && lp.replica_applied_seqno >= first
+            })
+        })
+        .await;
+    });
+    assert_eq!(
+        bootstraps_in(&dirs[0]),
+        1,
+        "one bootstrap, then it followed"
+    );
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}

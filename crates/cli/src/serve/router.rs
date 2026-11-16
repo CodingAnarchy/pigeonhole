@@ -658,6 +658,20 @@ impl Router {
         prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
         deadline: Option<std::time::Instant>,
     ) -> Result<ServiceReply, ApiError> {
+        // A cluster token's replica calls (`Admit::peer`, D328) are one cluster node's of
+        // another. A single node has no peers: there, a cluster token would read the whole
+        // database through them, so it keeps its scope's reach, which is none (simp724's S1
+        // on #1974). Only a cluster-scope caller pays for the check.
+        if self.cluster.is_none() && caller.scope == super::auth::Scope::Cluster {
+            let admit = op.admit();
+            if admit.peer {
+                return Err(ApiError::permission_denied(&format!(
+                    "call {} on a single node: a cluster token makes it only of a cluster \
+                     node, for a replica copy",
+                    admit.what
+                )));
+            }
+        }
         if let Some(cluster) = &self.cluster {
             // The schema is the map's (ticket 5).
             if matches!(

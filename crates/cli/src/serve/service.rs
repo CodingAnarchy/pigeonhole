@@ -535,8 +535,9 @@ pub(crate) struct Admit {
     /// limited to namespaces may make (audit120's F5).
     pub memory: bool,
     /// A call one cluster node makes of another for a replica copy (D328): `Follow`, and a
-    /// replica's bootstrap download of a partition. The node's cluster token may make it
-    /// as well as an admin token.
+    /// replica's bootstrap download of a partition. On a cluster node, the node's cluster
+    /// token may make it as well as an admin token; a single node's router refuses a cluster
+    /// token's (simp724's S1 on #1974).
     pub peer: bool,
 }
 

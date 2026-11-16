@@ -102,7 +102,8 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
         for r in &p.replicas {
             if !nodes.contains(r.as_str()) {
                 return Err(format!(
-                    "partition {:?} has a replica on node {:?}, which the map doesn't list                      (a map that drops a node drops its replicas too)",
+                    "partition {:?} has a replica on node {:?}, which the map doesn't list \
+                     (a map that drops a node drops its replicas too)",
                     p.id, r
                 ));
             }
