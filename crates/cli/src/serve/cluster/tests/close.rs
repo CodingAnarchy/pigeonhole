@@ -378,3 +378,97 @@ fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
         let _ = db.close();
     }
 }
+
+/// A file's mode changed until dropped, so a test that fails leaves no unreadable file.
+#[cfg(unix)]
+struct Mode {
+    file: std::path::PathBuf,
+    was: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Mode {
+    fn set(file: &std::path::Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let was = std::fs::metadata(file).unwrap().permissions();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self {
+            file: file.to_owned(),
+            was,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.file, self.was.clone());
+    }
+}
+
+/// Closing a closed partition whose hash failed takes the hash again, and returns.
+#[cfg(unix)]
+#[test]
+fn a_close_again_after_a_failed_hash_hashes_again() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: [u16; 3] = std::array::from_fn(|i| listeners[i].local_addr().unwrap().port());
+    let mut map = the_map(1, &ports);
+    map.partitions.retain(|p| p.id != "p3");
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let mut stops = Vec::new();
+    let mut dbs = Vec::new();
+    for ((l, dir), (id, local)) in
+        listeners
+            .into_iter()
+            .zip(&dirs)
+            .zip([("a", Some("p1")), ("b", Some("p2")), ("c", None)])
+    {
+        super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
+        let (stop, db) = data_node_tokens(&rt, dir, id, local, l, "");
+        stops.push(stop);
+        dbs.extend(db);
+    }
+    let [a, _, c] = ports;
+    let file = dirs[0].join("p1.phdb");
+    rt.block_on(async {
+        put(c, "alice", "1").await;
+        client(a)
+            .await
+            .fence(PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Unreadable once closed: the open database keeps its descriptor, the hash can't
+        // open the file.
+        let unreadable = Mode::set(&file, 0o000);
+        if std::fs::File::open(&file).is_ok() {
+            // Root reads a file whatever its mode (a container's default user), so the
+            // hash can't be made to fail this way.
+            eprintln!("skipped: this user can open a file of mode 000");
+            return;
+        }
+        close(a, "p1").await.unwrap();
+        eventually("p1's hash to fail", async || {
+            !local(a, "p1").await.error.is_empty()
+        })
+        .await;
+        drop(unreadable);
+        tokio::time::timeout(std::time::Duration::from_secs(10), close(a, "p1"))
+            .await
+            .expect("the close again returns")
+            .unwrap();
+        eventually("p1's files to be hashed", async || {
+            !local(a, "p1").await.files.is_empty()
+        })
+        .await;
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
