@@ -1434,6 +1434,9 @@ pub(crate) struct Retried {
 /// A cross-shard commit request, sent to the coordinator (the shard owning the first row).
 #[derive(Debug)]
 pub(crate) struct CoordinateReq {
+    /// A transaction prepared for an external coordinator (D329, ICR 0140): its decision
+    /// waits for `Engine::decide`, across a reopen. `None` for every other commit.
+    pub external: Option<Arc<ExternalReq>>,
     pub parts: Vec<(ShardId, Arc<BatchBuilder>)>,
     pub durability: Durability,
     pub reply: Notifier<Result<Settled>>,
@@ -1509,6 +1512,8 @@ impl RetryWait {
 /// A participant's share of a cross-shard commit.
 #[derive(Debug)]
 pub(crate) struct PrepareReq {
+    /// [`CoordinateReq::external`]: the share is logged as an external PREPARE (type 5).
+    pub external: Option<Arc<ExternalReq>>,
     /// Version of the tablet map the share was routed with.
     pub map_version: u64,
     pub seqno: Seqno,
@@ -1524,6 +1529,13 @@ pub(crate) struct PrepareReq {
     /// The client's submit time, as the coordinator keeps it across retries: the participant
     /// counts the round's time in flight from it at the decision (D262).
     pub submitted_at: u64,
+}
+
+/// A transaction prepared for an external coordinator (D329, ICR 0140).
+#[derive(Debug)]
+pub(crate) struct ExternalReq {
+    /// The caller's transaction id.
+    pub xid: Arc<[u8]>,
 }
 
 /// Why a participant could not prepare.
@@ -1799,6 +1811,10 @@ enum MemberKind {
     Single,
     Prepare {
         coordinator: ShardId,
+        /// An external PREPARE's encoded share (D329: xid, participants, reads, then the
+        /// batch, FORMAT §10.3), its record's body; `None` for a D263 PREPARE. Boxed, so the
+        /// variant (and every member) keeps its size.
+        external: Option<Box<Vec<u8>>>,
     },
     /// `apply_seqno`: the seqno reserved at the decision, which the commit applies at
     /// (D263); the member's own `seqno` is the commit's id.
@@ -1930,11 +1946,22 @@ impl Member {
                 commit_ts: self.commit_ts,
                 batch: self.bytes.batch()?,
             },
-            MemberKind::Prepare { coordinator } => WalRecord::Prepare {
+            MemberKind::Prepare {
+                coordinator,
+                external: None,
+            } => WalRecord::Prepare {
                 seqno: self.seqno,
                 commit_ts: self.commit_ts,
                 coordinator: StreamId(u32::from(coordinator.0)),
                 batch: self.bytes.batch()?,
+            },
+            MemberKind::Prepare {
+                coordinator,
+                external: Some(share),
+            } => WalRecord::ExternalPrepare {
+                seqno: self.seqno,
+                coordinator: StreamId(u32::from(coordinator.0)),
+                share: pigeonhole_format::wal::ExternalShare::decode(share, true)?,
             },
             MemberKind::CommitRecord { apply_seqno, .. } => WalRecord::Decision {
                 seqno: self.seqno,
@@ -2005,6 +2032,12 @@ struct Group {
 /// A cross-shard commit this shard coordinates.
 #[derive(Debug)]
 struct Coord {
+    /// [`CoordinateReq::external`] (D329): once every participant prepared, the decision
+    /// waits for `Engine::decide` instead of being taken here (`awaiting`).
+    external: Option<Arc<ExternalReq>>,
+    /// External and fully prepared: the caller was answered, and the `Coord` waits for its
+    /// decide.
+    awaiting: bool,
     participants: usize,
     durability: Durability,
     reply: Option<Notifier<Result<Settled>>>,
@@ -7620,7 +7653,7 @@ impl ShardState {
                         // keeps the durable watermark below the memtables a freeze needs
                         // durable (D227), so waiting could deadlock (#655).
                         need_room = true;
-                        if let MemberKind::Prepare { coordinator } = m.kind {
+                        if let MemberKind::Prepare { coordinator, .. } = m.kind {
                             self.refuse_for_room(m, coordinator, ctx);
                             continue;
                         }
@@ -7872,7 +7905,7 @@ impl ShardState {
         // settled (`ParkedDecide`).
         if !need_group_sync && last_sync.is_none() {
             for m in &mut group.members {
-                if let MemberKind::Prepare { coordinator } = m.kind
+                if let MemberKind::Prepare { coordinator, .. } = m.kind
                     && m.durability == Durability::Buffered
                     && m.ticket.is_some()
                     && m.failed.is_none()
@@ -9178,7 +9211,7 @@ impl ShardState {
                 };
                 m.reply.resolve_returning(result, batch);
             }
-            MemberKind::Prepare { coordinator } => {
+            MemberKind::Prepare { coordinator, .. } => {
                 if let Err(e) = &result {
                     trace!("shard {} prepare {} failed: {e}", self.id.0, m.seqno);
                 }
@@ -9372,6 +9405,8 @@ impl ShardState {
         self.coord.insert(
             seqno,
             Coord {
+                external: req.external.clone(),
+                awaiting: false,
                 participants: req.parts.len(),
                 durability: req.durability,
                 reply: Some(req.reply),
@@ -9410,6 +9445,7 @@ impl ShardState {
         }
         for (shard, bytes) in req.parts {
             let msg = ShardMsg::Prepare(PrepareReq {
+                external: req.external.clone(),
                 map_version: req.map_version,
                 seqno,
                 coordinator: self.id,
@@ -9500,6 +9536,7 @@ impl ShardState {
         self.pending.push(Member {
             kind: MemberKind::Prepare {
                 coordinator: req.coordinator,
+                external: None,
             },
             durability: req.durability,
             seqno: req.seqno,
@@ -10188,6 +10225,7 @@ impl ShardState {
                 return;
             }
             let req = CoordinateReq {
+                external: c.external.clone(),
                 parts: std::mem::take(&mut c.parts),
                 durability: c.durability,
                 reply,

@@ -526,7 +526,7 @@ impl ShardState {
         wait: OverlapWait,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        let MemberKind::Prepare { coordinator } = m.kind else {
+        let MemberKind::Prepare { coordinator, .. } = m.kind else {
             return;
         };
         let rows = Self::member_row_hashes(&m);
@@ -1032,7 +1032,7 @@ impl ShardState {
         error: PrepareError,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        let MemberKind::Prepare { coordinator } = m.kind else {
+        let MemberKind::Prepare { coordinator, .. } = m.kind else {
             return;
         };
         if let Some(share) = self.prepared.remove(&m.seqno) {
@@ -1125,6 +1125,7 @@ impl ShardState {
                 };
                 let retried = req.retry.map(|r| *r).unwrap_or_default();
                 let creq = CoordinateReq {
+                    external: None,
                     parts,
                     durability: req.durability,
                     reply,

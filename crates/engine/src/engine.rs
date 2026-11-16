@@ -5540,6 +5540,7 @@ impl Inner {
         let parts = split_by_shard(&view, &builder, &shards)?;
         let target = shards[0];
         let msg = ShardMsg::Coordinate(Box::new(CoordinateReq {
+            external: None,
             parts,
             durability,
             reply: tx,
