@@ -33,11 +33,21 @@ jobs:
           HEAD_REF: refs/heads/${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
+          # A long-lived head branch keeps its caches: other runs restore them (a PR from
+          # main or a release branch, e.g. a forward-port; cli692's S1 on #1968).
+          case "$HEAD_REF" in
+            refs/heads/main | refs/heads/release/*) HEAD_REF="" ;;
+          esac
+          export HEAD_REF
           ids=$(gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
-            --jq ".actions_caches[] | select(.ref == env.MERGE_REF or .ref == env.HEAD_REF) | .id")
+            --jq ".actions_caches[] | select(.ref == env.MERGE_REF or (env.HEAD_REF != \"\" and .ref == env.HEAD_REF)) | .id")
           n=0
           for id in $ids; do
-            gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null
-            n=$((n + 1))
+            # Evicted, or deleted by another run, since the list: not a failure (N1).
+            if gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null; then
+              n=$((n + 1))
+            else
+              echo "cache $id: already gone"
+            fi
           done
-          echo "deleted $n caches for $MERGE_REF and $HEAD_REF"
+          echo "deleted $n caches for $MERGE_REF${HEAD_REF:+ and $HEAD_REF}"
