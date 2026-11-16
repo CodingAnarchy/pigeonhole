@@ -482,6 +482,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: version,
             previous_nodes: Vec::new(),
+            indexes: Vec::new(),
             memory: None,
             nodes: vec![Node {
                 id: "n1".into(),

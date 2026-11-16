@@ -61,6 +61,10 @@ pub(crate) struct Routes {
     owners: HashMap<String, Owner>,
     /// The memory store's name and its namespaces' placement (#1915), if the map has one.
     memory: Option<(String, Placement)>,
+    /// Each index's ids' placement (#1722): its followed table's, or its own. Apart from
+    /// `tables`: an index's own table holds rows that aren't keyed by its ids, so a data
+    /// call on that table never routes by them.
+    indexes: HashMap<String, Placement>,
 }
 
 impl Routes {
@@ -86,7 +90,7 @@ impl Routes {
                 (p.id.clone(), owner)
             })
             .collect();
-        let tables = map
+        let tables: HashMap<String, Placement> = map
             .tables
             .iter()
             .map(|t| {
@@ -113,13 +117,43 @@ impl Routes {
             };
             (m.store.clone(), placement)
         });
+        let indexes = map
+            .indexes
+            .iter()
+            .map(|i| {
+                let placement = match tables.get(i.follows.as_str()) {
+                    Some(t) if !i.follows.is_empty() => Placement {
+                        splits: t.splits.clone(),
+                        partitions: t.partitions.clone(),
+                    },
+                    _ => Placement {
+                        splits: i
+                            .splits
+                            .iter()
+                            .filter_map(|k| split_key_bytes(k).ok())
+                            .collect(),
+                        partitions: i.partitions.clone(),
+                    },
+                };
+                (i.name.clone(), placement)
+            })
+            .collect();
         Self {
             cluster_id: map.cluster_id.clone(),
             map_version: map.map_version,
             tables,
             owners,
             memory,
+            indexes,
         }
+    }
+
+    /// The partition holding id `id` of index `index` (#1722); `None` for an index the map
+    /// doesn't place.
+    pub(crate) fn index_partition(&self, index: &str, id: &[u8]) -> Option<&str> {
+        let p = self.indexes.get(index)?;
+        let i = p.splits.partition_point(|s| s.as_slice() <= id);
+        p.partitions.get(i).map(String::as_str)
     }
 
     /// The memory store the map places, if any (#1915).
@@ -313,6 +347,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 7,
             previous_nodes: Vec::new(),
+            indexes: Vec::new(),
             memory: None,
             nodes: vec![
                 Node {
@@ -344,6 +379,36 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// #1722: an index's id routes by its followed table's ranges, or by its own; a data call
+    /// on the index's own table never does (it isn't in `tables`).
+    #[test]
+    fn an_index_id_routes_by_the_table_it_follows_or_its_own_ranges() {
+        use crate::serve::proto::IndexPlacement;
+        let mut m = map();
+        m.indexes = vec![
+            IndexPlacement {
+                name: "users_vec".into(),
+                follows: "users".into(),
+                ..Default::default()
+            },
+            IndexPlacement {
+                name: "own".into(),
+                splits: vec![text("k")],
+                partitions: vec!["p3".into(), "p1".into()],
+                ..Default::default()
+            },
+        ];
+        let r = Routes::new(&m);
+        for (id, want) in [(&b"a"[..], "p1"), (b"g", "p2"), (b"m\xff", "p3")] {
+            assert_eq!(r.index_partition("users_vec", id), Some(want));
+            assert_eq!(r.partition("users", id), Some(want));
+        }
+        assert_eq!(r.index_partition("own", b"j"), Some("p3"));
+        assert_eq!(r.index_partition("own", b"k"), Some("p1"));
+        assert_eq!(r.index_partition("nope", b"a"), None);
+        assert_eq!(r.partition("users_vec", b"a"), None);
     }
 
     #[test]

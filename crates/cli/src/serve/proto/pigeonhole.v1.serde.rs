@@ -2957,6 +2957,9 @@ impl serde::Serialize for ClusterMap {
         if !self.previous_nodes.is_empty() {
             len += 1;
         }
+        if !self.indexes.is_empty() {
+            len += 1;
+        }
         if self.memory.is_some() {
             len += 1;
         }
@@ -2981,6 +2984,9 @@ impl serde::Serialize for ClusterMap {
         if !self.previous_nodes.is_empty() {
             struct_ser.serialize_field("previous_nodes", &self.previous_nodes)?;
         }
+        if !self.indexes.is_empty() {
+            struct_ser.serialize_field("indexes", &self.indexes)?;
+        }
         if let Some(v) = self.memory.as_ref() {
             struct_ser.serialize_field("memory", v)?;
         }
@@ -3003,6 +3009,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             "tables",
             "previous_nodes",
             "previousNodes",
+            "indexes",
             "memory",
         ];
 
@@ -3014,6 +3021,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             Partitions,
             Tables,
             PreviousNodes,
+            Indexes,
             Memory,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
@@ -3042,6 +3050,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             "partitions" => Ok(GeneratedField::Partitions),
                             "tables" => Ok(GeneratedField::Tables),
                             "previousNodes" | "previous_nodes" => Ok(GeneratedField::PreviousNodes),
+                            "indexes" => Ok(GeneratedField::Indexes),
                             "memory" => Ok(GeneratedField::Memory),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
@@ -3068,6 +3077,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                 let mut partitions__ = None;
                 let mut tables__ = None;
                 let mut previous_nodes__ = None;
+                let mut indexes__ = None;
                 let mut memory__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -3109,6 +3119,12 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             }
                             previous_nodes__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Indexes => {
+                            if indexes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("indexes"));
+                            }
+                            indexes__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::Memory => {
                             if memory__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("memory"));
@@ -3124,6 +3140,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                     partitions: partitions__.unwrap_or_default(),
                     tables: tables__.unwrap_or_default(),
                     previous_nodes: previous_nodes__.unwrap_or_default(),
+                    indexes: indexes__.unwrap_or_default(),
                     memory: memory__,
                 })
             }
@@ -4217,6 +4234,12 @@ impl serde::Serialize for CreateVectorIndexRequest {
         if self.if_missing {
             len += 1;
         }
+        if !self.follows.is_empty() {
+            len += 1;
+        }
+        if self.placement.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.CreateVectorIndexRequest", len)?;
         if !self.name.is_empty() {
             struct_ser.serialize_field("name", &self.name)?;
@@ -4241,6 +4264,12 @@ impl serde::Serialize for CreateVectorIndexRequest {
         if self.if_missing {
             struct_ser.serialize_field("if_missing", &self.if_missing)?;
         }
+        if !self.follows.is_empty() {
+            struct_ser.serialize_field("follows", &self.follows)?;
+        }
+        if let Some(v) = self.placement.as_ref() {
+            struct_ser.serialize_field("placement", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -4261,6 +4290,8 @@ impl<'de> serde::Deserialize<'de> for CreateVectorIndexRequest {
             "rebalance",
             "if_missing",
             "ifMissing",
+            "follows",
+            "placement",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -4272,6 +4303,8 @@ impl<'de> serde::Deserialize<'de> for CreateVectorIndexRequest {
             ReassignNeighbours,
             Rebalance,
             IfMissing,
+            Follows,
+            Placement,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -4300,6 +4333,8 @@ impl<'de> serde::Deserialize<'de> for CreateVectorIndexRequest {
                             "reassignNeighbours" | "reassign_neighbours" => Ok(GeneratedField::ReassignNeighbours),
                             "rebalance" => Ok(GeneratedField::Rebalance),
                             "ifMissing" | "if_missing" => Ok(GeneratedField::IfMissing),
+                            "follows" => Ok(GeneratedField::Follows),
+                            "placement" => Ok(GeneratedField::Placement),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -4326,6 +4361,8 @@ impl<'de> serde::Deserialize<'de> for CreateVectorIndexRequest {
                 let mut reassign_neighbours__ = None;
                 let mut rebalance__ = None;
                 let mut if_missing__ = None;
+                let mut follows__ = None;
+                let mut placement__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Name => {
@@ -4376,6 +4413,18 @@ impl<'de> serde::Deserialize<'de> for CreateVectorIndexRequest {
                             }
                             if_missing__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Follows => {
+                            if follows__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("follows"));
+                            }
+                            follows__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Placement => {
+                            if placement__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("placement"));
+                            }
+                            placement__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(CreateVectorIndexRequest {
@@ -4386,6 +4435,8 @@ impl<'de> serde::Deserialize<'de> for CreateVectorIndexRequest {
                     reassign_neighbours: reassign_neighbours__,
                     rebalance: rebalance__.unwrap_or_default(),
                     if_missing: if_missing__.unwrap_or_default(),
+                    follows: follows__.unwrap_or_default(),
+                    placement: placement__,
                 })
             }
         }
@@ -6608,6 +6659,24 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::DropTable(v) => {
                     struct_ser.serialize_field("drop_table", v)?;
                 }
+                forward_request::Op::CreateVectorIndex(v) => {
+                    struct_ser.serialize_field("create_vector_index", v)?;
+                }
+                forward_request::Op::VectorInsert(v) => {
+                    struct_ser.serialize_field("vector_insert", v)?;
+                }
+                forward_request::Op::VectorDelete(v) => {
+                    struct_ser.serialize_field("vector_delete", v)?;
+                }
+                forward_request::Op::CreateTextIndex(v) => {
+                    struct_ser.serialize_field("create_text_index", v)?;
+                }
+                forward_request::Op::TextPut(v) => {
+                    struct_ser.serialize_field("text_put", v)?;
+                }
+                forward_request::Op::TextDelete(v) => {
+                    struct_ser.serialize_field("text_delete", v)?;
+                }
                 forward_request::Op::Remember(v) => {
                     struct_ser.serialize_field("remember", v)?;
                 }
@@ -6678,6 +6747,18 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "createTable",
             "drop_table",
             "dropTable",
+            "create_vector_index",
+            "createVectorIndex",
+            "vector_insert",
+            "vectorInsert",
+            "vector_delete",
+            "vectorDelete",
+            "create_text_index",
+            "createTextIndex",
+            "text_put",
+            "textPut",
+            "text_delete",
+            "textDelete",
             "remember",
             "recall",
             "mark_used",
@@ -6714,6 +6795,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             Nearest,
             CreateTable,
             DropTable,
+            CreateVectorIndex,
+            VectorInsert,
+            VectorDelete,
+            CreateTextIndex,
+            TextPut,
+            TextDelete,
             Remember,
             Recall,
             MarkUsed,
@@ -6764,6 +6851,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "nearest" => Ok(GeneratedField::Nearest),
                             "createTable" | "create_table" => Ok(GeneratedField::CreateTable),
                             "dropTable" | "drop_table" => Ok(GeneratedField::DropTable),
+                            "createVectorIndex" | "create_vector_index" => Ok(GeneratedField::CreateVectorIndex),
+                            "vectorInsert" | "vector_insert" => Ok(GeneratedField::VectorInsert),
+                            "vectorDelete" | "vector_delete" => Ok(GeneratedField::VectorDelete),
+                            "createTextIndex" | "create_text_index" => Ok(GeneratedField::CreateTextIndex),
+                            "textPut" | "text_put" => Ok(GeneratedField::TextPut),
+                            "textDelete" | "text_delete" => Ok(GeneratedField::TextDelete),
                             "remember" => Ok(GeneratedField::Remember),
                             "recall" => Ok(GeneratedField::Recall),
                             "markUsed" | "mark_used" => Ok(GeneratedField::MarkUsed),
@@ -6941,6 +7034,48 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                                 return Err(serde::de::Error::duplicate_field("dropTable"));
                             }
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::DropTable)
+;
+                        }
+                        GeneratedField::CreateVectorIndex => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createVectorIndex"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::CreateVectorIndex)
+;
+                        }
+                        GeneratedField::VectorInsert => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vectorInsert"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::VectorInsert)
+;
+                        }
+                        GeneratedField::VectorDelete => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vectorDelete"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::VectorDelete)
+;
+                        }
+                        GeneratedField::CreateTextIndex => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createTextIndex"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::CreateTextIndex)
+;
+                        }
+                        GeneratedField::TextPut => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textPut"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextPut)
+;
+                        }
+                        GeneratedField::TextDelete => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textDelete"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextDelete)
 ;
                         }
                         GeneratedField::Remember => {
@@ -8806,6 +8941,204 @@ impl<'de> serde::Deserialize<'de> for Incr {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.Incr", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for IndexPlacement {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.name.is_empty() {
+            len += 1;
+        }
+        if !self.follows.is_empty() {
+            len += 1;
+        }
+        if !self.splits.is_empty() {
+            len += 1;
+        }
+        if !self.partitions.is_empty() {
+            len += 1;
+        }
+        if self.created != 0 {
+            len += 1;
+        }
+        if self.kind.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.IndexPlacement", len)?;
+        if !self.name.is_empty() {
+            struct_ser.serialize_field("name", &self.name)?;
+        }
+        if !self.follows.is_empty() {
+            struct_ser.serialize_field("follows", &self.follows)?;
+        }
+        if !self.splits.is_empty() {
+            struct_ser.serialize_field("splits", &self.splits)?;
+        }
+        if !self.partitions.is_empty() {
+            struct_ser.serialize_field("partitions", &self.partitions)?;
+        }
+        if self.created != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("created", ToString::to_string(&self.created).as_str())?;
+        }
+        if let Some(v) = self.kind.as_ref() {
+            match v {
+                index_placement::Kind::Vector(v) => {
+                    struct_ser.serialize_field("vector", v)?;
+                }
+                index_placement::Kind::Text(v) => {
+                    struct_ser.serialize_field("text", v)?;
+                }
+            }
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for IndexPlacement {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "name",
+            "follows",
+            "splits",
+            "partitions",
+            "created",
+            "vector",
+            "text",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Name,
+            Follows,
+            Splits,
+            Partitions,
+            Created,
+            Vector,
+            Text,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "name" => Ok(GeneratedField::Name),
+                            "follows" => Ok(GeneratedField::Follows),
+                            "splits" => Ok(GeneratedField::Splits),
+                            "partitions" => Ok(GeneratedField::Partitions),
+                            "created" => Ok(GeneratedField::Created),
+                            "vector" => Ok(GeneratedField::Vector),
+                            "text" => Ok(GeneratedField::Text),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = IndexPlacement;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.IndexPlacement")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<IndexPlacement, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut name__ = None;
+                let mut follows__ = None;
+                let mut splits__ = None;
+                let mut partitions__ = None;
+                let mut created__ = None;
+                let mut kind__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Name => {
+                            if name__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("name"));
+                            }
+                            name__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Follows => {
+                            if follows__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("follows"));
+                            }
+                            follows__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Splits => {
+                            if splits__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("splits"));
+                            }
+                            splits__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Partitions => {
+                            if partitions__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partitions"));
+                            }
+                            partitions__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Created => {
+                            if created__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("created"));
+                            }
+                            created__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Vector => {
+                            if kind__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vector"));
+                            }
+                            kind__ = map_.next_value::<::std::option::Option<_>>()?.map(index_placement::Kind::Vector)
+;
+                        }
+                        GeneratedField::Text => {
+                            if kind__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("text"));
+                            }
+                            kind__ = map_.next_value::<::std::option::Option<_>>()?.map(index_placement::Kind::Text)
+;
+                        }
+                    }
+                }
+                Ok(IndexPlacement {
+                    name: name__.unwrap_or_default(),
+                    follows: follows__.unwrap_or_default(),
+                    splits: splits__.unwrap_or_default(),
+                    partitions: partitions__.unwrap_or_default(),
+                    created: created__.unwrap_or_default(),
+                    kind: kind__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.IndexPlacement", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for InfoResponse {

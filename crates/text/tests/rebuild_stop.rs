@@ -209,3 +209,40 @@ fn rebuilding_an_index_already_right_commits_only_the_page_cursors() {
     assert!(!index.rebuild_pending().unwrap());
     db.close().unwrap();
 }
+
+/// #1722: `create_unfilled` over a source column with rows makes an empty index with a
+/// rebuild from the top pending. A put through it meanwhile is indexed at once, a stopped
+/// resume carries on, and the resumed rebuild ends as `create` would have, the cursor gone.
+#[test]
+fn an_unfilled_index_is_filled_by_resuming_its_pending_rebuild() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let docs = docs(&db);
+    let mut model = bypassed(&docs, 1722);
+    let index =
+        Index::create_unfilled(&db, "docs_text", source(&docs), IndexOptions::new()).unwrap();
+    assert!(index.rebuild_pending().unwrap());
+    assert_eq!(index.verify().unwrap().documents, 0);
+    // A write through the index is there before the fill.
+    index.put(b"new", "memory agent store").unwrap();
+    model.insert(b"new".to_vec(), "memory agent store".into());
+    assert_eq!(index.verify().unwrap().documents, 1);
+    // A resume stopped part way, then resumed to the end.
+    let r = index
+        .resume_rebuild_with(|s| {
+            if s.documents >= 300 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+    assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
+    let r = index
+        .resume_rebuild_with(|_| ControlFlow::Continue(()))
+        .unwrap();
+    assert!(!r.stopped, "{r:?}");
+    assert!(!index.rebuild_pending().unwrap());
+    matches(&index, &model, "filled");
+    db.close().unwrap();
+}

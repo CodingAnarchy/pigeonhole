@@ -27,7 +27,8 @@ use crate::serve::auth::Caller;
 use crate::serve::errors::ApiError;
 use crate::serve::proto::ForwardRequest;
 use crate::serve::proto::{
-    self, ClusterMap, FamilySpec, SetMapRequest, SplitKey, TablePlacement, split_key,
+    self, ClusterMap, FamilySpec, IndexPlacement, SetMapRequest, SplitKey, TablePlacement,
+    split_key,
 };
 use crate::serve::router::Cluster;
 use crate::serve::router::Router;
@@ -147,15 +148,24 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
         .filter(|t| t.partitions.iter().any(|p| p == partition))
         .map(|t| (t.name.as_str(), t))
         .collect();
-    // What the map dropped: a recorded table it no longer places here, or places as another
-    // incarnation. The table first, then its record.
+    // The indexes placed here (#1722): by the table each follows, or by their own ranges.
+    let indexes: BTreeMap<&str, &IndexPlacement> = map
+        .indexes
+        .iter()
+        .filter(|i| index_on(map, i, partition))
+        .map(|i| (i.name.as_str(), i))
+        .collect();
+    // What the map dropped: a recorded table (or index) it no longer places here, or places
+    // as another incarnation. The table first, then its record.
+    let created_here = |name: &str| {
+        placed
+            .get(name)
+            .map(|t| t.created)
+            .or_else(|| indexes.get(name).map(|i| i.created))
+    };
     let gone: Vec<String> = recorded
         .iter()
-        .filter(|(name, created)| {
-            placed
-                .get(name.as_str())
-                .is_none_or(|t| t.created != **created)
-        })
+        .filter(|(name, created)| created_here(name).is_none_or(|c| c != **created))
         .map(|(name, _)| name.clone())
         .collect();
     for name in gone {
@@ -250,13 +260,78 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
             }
         }
     }
+    // Indexes after tables: a text index reads its source table, created above.
+    let have: BTreeSet<String> = db.tables().into_iter().collect();
+    for (name, i) in &indexes {
+        if recorded.contains_key(*name) {
+            continue;
+        }
+        let exists = have.contains(*name);
+        if !exists {
+            if let Err(e) = create_index(db, i) {
+                o.errors.push(format!("create index {name:?}: {e}"));
+                continue;
+            }
+            o.created.push((*name).to_owned());
+        } else if i.created > 0 {
+            o.adopted.push((*name).to_owned());
+        }
+        if let Err(e) = record(db, name, i.created) {
+            o.errors.push(e);
+        }
+    }
     let after: BTreeSet<String> = db.tables().into_iter().collect();
     o.unmapped = after
         .into_iter()
         .filter(|n| !n.starts_with(super::map::RESERVED_PREFIX))
-        .filter(|n| !placed.contains_key(n.as_str()) && !recorded.contains_key(n))
+        .filter(|n| {
+            !placed.contains_key(n.as_str())
+                && !indexes.contains_key(n.as_str())
+                && !recorded.contains_key(n)
+        })
         .collect();
     o
+}
+
+/// Whether `map` places index `i` on `partition` (#1722): by the table it follows, or by
+/// its own ranges.
+fn index_on(map: &ClusterMap, i: &IndexPlacement, partition: &str) -> bool {
+    if i.follows.is_empty() {
+        return i.partitions.iter().any(|p| p == partition);
+    }
+    map.tables
+        .iter()
+        .find(|t| t.name == i.follows)
+        .is_some_and(|t| t.partitions.iter().any(|p| p == partition))
+}
+
+/// Creates index `i` in this partition's file, with the options its create sent (#1722): a
+/// vector index empty; a text index unfilled, with a rebuild pending that the partition's
+/// background resume runs a document at a time under its gate (#1756), not this reconcile
+/// on the installing thread.
+fn create_index(db: &Pigeonhole, i: &IndexPlacement) -> Result<(), String> {
+    use crate::serve::proto::index_placement::Kind;
+    match &i.kind {
+        Some(Kind::Vector(r)) => {
+            let (spec, options) = crate::serve::indexes::create_args(r).map_err(|e| e.message)?;
+            pigeonhole_vector::Index::create(db, &i.name, spec, options)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }
+        Some(Kind::Text(r)) => {
+            let options = crate::serve::texts::options(r).map_err(|e| e.message)?;
+            let table = db
+                .table(&r.source_table)
+                .and_then(|t| t.open())
+                .map_err(|e| e.to_string())?;
+            let source =
+                pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
+            pigeonhole_text::Index::create_unfilled(db, &i.name, source, options)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }
+        None => Err("its placement has no create request".into()),
+    }
 }
 
 /// Reconciles each partition `shared` has open to `map` (D317 ticket 5), through that
@@ -298,6 +373,11 @@ pub(crate) fn reconcile_parts(
         if !outcome.created.is_empty() || !outcome.dropped.is_empty() || !outcome.altered.is_empty()
         {
             service.tables_changed();
+        }
+        // A text index created here is unfilled (#1722): the partition's background resume
+        // fills it.
+        if !outcome.created.is_empty() {
+            service.resume_text_rebuilds();
         }
         for name in &outcome.adopted {
             eprintln!(
@@ -476,6 +556,12 @@ fn split_keys(splits: &[prost::bytes::Bytes]) -> Vec<SplitKey> {
         .collect()
 }
 
+/// An index create's request (#1722), of either kind.
+enum IndexRequest {
+    Vector(proto::CreateVectorIndexRequest),
+    Text(proto::CreateTextIndexRequest),
+}
+
 impl Router {
     /// `Schema.*` on a cluster node (D317 ticket 5), after the caller's scope is checked as a
     /// single node checks it.
@@ -514,9 +600,10 @@ impl Router {
                     unreconciled: Vec::new(),
                 }))
             }
-            op @ (ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) => {
-                self.at_writer(cluster, op, caller, deadline).await
-            }
+            op @ (ServiceOp::CreateTable(_)
+            | ServiceOp::DropTable(_)
+            | ServiceOp::CreateIndex(_)
+            | ServiceOp::TextCreateIndex(_)) => self.at_writer(cluster, op, caller, deadline).await,
             _ => Err(ApiError::internal("cluster_schema takes a schema call")),
         }
     }
@@ -619,6 +706,14 @@ impl Router {
             }
             ServiceOp::DropTable(r) => {
                 self.cluster_drop(node, r.name).await?;
+                Ok(ServiceReply::Empty(proto::Empty {}))
+            }
+            ServiceOp::CreateIndex(r) => {
+                Self::cluster_create_index(node, IndexRequest::Vector(r)).await?;
+                Ok(ServiceReply::Empty(proto::Empty {}))
+            }
+            ServiceOp::TextCreateIndex(r) => {
+                Self::cluster_create_index(node, IndexRequest::Text(r)).await?;
                 Ok(ServiceReply::Empty(proto::Empty {}))
             }
             _ => Err(ApiError::internal("write_schema takes a schema change")),
@@ -762,14 +857,130 @@ impl Router {
 
     async fn cluster_drop(&self, node: &Arc<Node>, name: String) -> Result<(), ApiError> {
         Self::change_map(node, |map| {
+            let mut new = map.clone();
+            // An index is a table of its own (#1722): dropping it drops its placement.
+            if map.indexes.iter().any(|i| i.name == name) {
+                new.indexes.retain(|i| i.name != name);
+                return Ok(Some(new));
+            }
             if !map.tables.iter().any(|t| t.name == name) {
                 return Err(ApiError::from_code(
                     ErrorCode::TableNotFound,
                     &format!("no table {name:?} in the cluster map"),
                 ));
             }
-            let mut new = map.clone();
+            // A table an index follows stays while the index does (#1916's rule, #1722).
+            let over: Vec<String> = map
+                .indexes
+                .iter()
+                .filter(|i| i.follows == name)
+                .map(|i| format!("{:?}", i.name))
+                .collect();
+            if !over.is_empty() {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} is followed by the index{} {}: drop {} first",
+                    if over.len() == 1 { "" } else { "es" },
+                    over.join(", "),
+                    if over.len() == 1 { "it" } else { "them" },
+                )));
+            }
             new.tables.retain(|t| t.name != name);
+            Ok(Some(new))
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// `Vectors.CreateIndex` or `Text.CreateIndex` on a cluster (#1722, ICR 0138), at the
+    /// map's writer: an index placement, which every node owning one of its partitions then
+    /// creates. A vector index follows a placed table or has ranges of its own; a text index
+    /// follows its source table. `if_missing` answers an index the map places as it is, as a
+    /// single node's opens one without comparing its options.
+    async fn cluster_create_index(node: &Arc<Node>, r: IndexRequest) -> Result<(), ApiError> {
+        use crate::serve::proto::index_placement::Kind;
+        let (name, if_missing) = match &r {
+            IndexRequest::Vector(r) => (r.name.clone(), r.if_missing),
+            IndexRequest::Text(r) => (r.name.clone(), r.if_missing),
+        };
+        if name.is_empty() {
+            return Err(ApiError::invalid("an index needs a name"));
+        }
+        if name.starts_with(super::map::RESERVED_PREFIX) {
+            return Err(ApiError::invalid(format!(
+                "index {name:?}: the {} prefix is reserved",
+                super::map::RESERVED_PREFIX
+            )));
+        }
+        // The options parse as each partition will parse them, before the map takes them.
+        let (kind, follows, splits, partitions) = match r {
+            IndexRequest::Vector(r) => {
+                crate::serve::indexes::create_args(&r)?;
+                let (follows, splits, partitions) = match (&r.placement, r.follows.is_empty()) {
+                    (None, false) => (r.follows.clone(), Vec::new(), Vec::new()),
+                    (Some(p), true) => {
+                        if !p.group.is_empty() {
+                            return Err(ApiError::invalid(format!(
+                                "index {name:?}: an index takes no co-location group (follow \
+                                 a table instead)"
+                            )));
+                        }
+                        (String::new(), split_keys(&p.splits), p.partitions.clone())
+                    }
+                    (None, true) => {
+                        return Err(ApiError::invalid(format!(
+                            "index {name:?}: a create on a cluster needs follows (a placed \
+                             table whose ranges it shares) or a placement of its own"
+                        )));
+                    }
+                    (Some(_), false) => {
+                        return Err(ApiError::invalid(format!(
+                            "index {name:?}: give follows or a placement, not both"
+                        )));
+                    }
+                };
+                (Kind::Vector(r), follows, splits, partitions)
+            }
+            IndexRequest::Text(r) => {
+                crate::serve::texts::options(&r)?;
+                let follows = r.source_table.clone();
+                (Kind::Text(r), follows, Vec::new(), Vec::new())
+            }
+        };
+        Self::change_map(node, |map| {
+            if map.indexes.iter().any(|i| i.name == name) {
+                if if_missing {
+                    return Ok(None);
+                }
+                return Err(ApiError::from_code(
+                    ErrorCode::TableExists,
+                    &format!("index {name:?} exists"),
+                ));
+            }
+            if map.tables.iter().any(|t| t.name == name) {
+                return Err(ApiError::from_code(
+                    ErrorCode::TableExists,
+                    &format!("table {name:?} exists, and an index is a table of its own"),
+                ));
+            }
+            if !follows.is_empty() && !map.tables.iter().any(|t| t.name == follows) {
+                return Err(ApiError::from_code(
+                    ErrorCode::TableNotFound,
+                    &format!(
+                        "index {name:?} follows table {follows:?}, which isn't in the cluster map"
+                    ),
+                ));
+            }
+            let mut new = map.clone();
+            new.indexes.push(IndexPlacement {
+                name: name.clone(),
+                kind: Some(kind.clone()),
+                follows: follows.clone(),
+                splits: splits.clone(),
+                partitions: partitions.clone(),
+                created: map.map_version + 1,
+            });
+            // The rest of the rules (unique names, ranges, partitions) are the map's own.
+            super::map::validate(&new, false).map_err(ApiError::invalid)?;
             Ok(Some(new))
         })
         .await
