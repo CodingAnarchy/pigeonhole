@@ -1,6 +1,6 @@
 //! One-shot completions that wake either a blocked thread or an async task.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -8,7 +8,11 @@ use std::sync::PoisonError;
 use std::task::{Context, Poll, Waker};
 
 #[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(loom)]
 use loom::sync::{Arc, Condvar, Mutex, MutexGuard};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -28,6 +32,32 @@ pub trait Settle: Send + Sync {
 struct Slot<T> {
     state: Mutex<SlotState<T>>,
     cv: Condvar,
+    /// The completion's two holders, the notifier and the waiter, each release the slot once
+    /// (`AcqRel`), after their last use of it. The one that releases last returns it to
+    /// its owner (#1795): no side's last use can race the slot's reuse, whichever side
+    /// finishes first.
+    holders: AtomicU8,
+    /// Where the slot goes back to once both holders released it: the [`SlotCache`] it was
+    /// made from, through its shared half. `None` for [`completion`]'s slots.
+    owner: Option<Arc<Returns<T>>>,
+}
+
+/// A [`SlotCache`]'s shared half: slots released last on a thread other than the cache's
+/// own come back here, and the owner takes them when its own list runs out (#1795). A leaf
+/// lock: never held with the slot lock, and nothing that can run user code (a value, a
+/// waker or a hook) is dropped while it is held.
+struct Returns<T> {
+    inner: Mutex<ReturnsInner<T>>,
+    /// Set and cleared under `inner`, read without it: a stale `false` costs only a fresh
+    /// slot.
+    pending: AtomicBool,
+}
+
+struct ReturnsInner<T> {
+    slots: Vec<Arc<Slot<T>>>,
+    /// The owner's cache was dropped (its thread exited): a slot released afterwards is
+    /// freed, not kept, so a slot and its owner never keep each other alive.
+    gone: bool,
 }
 
 struct SlotState<T> {
@@ -99,10 +129,10 @@ impl<T> Slot<T> {
 /// assert_eq!(waiter.wait(), None);
 /// ```
 pub fn completion<T: Send>() -> (Notifier<T>, Waiter<T>) {
-    pair(new_slot())
+    pair(new_slot(None))
 }
 
-fn new_slot<T>() -> Arc<Slot<T>> {
+fn new_slot<T>(owner: Option<Arc<Returns<T>>>) -> Arc<Slot<T>> {
     Arc::new(Slot {
         state: Mutex::new(SlotState {
             value: None,
@@ -114,16 +144,70 @@ fn new_slot<T>() -> Arc<Slot<T>> {
             blocked: false,
         }),
         cv: Condvar::new(),
+        holders: AtomicU8::new(2),
+        owner,
     })
 }
 
+/// A completion on `slot`, which nothing else holds (fresh, or both holders of its last
+/// completion released it).
 fn pair<T>(slot: Arc<Slot<T>>) -> (Notifier<T>, Waiter<T>) {
+    // Ordered before the other side's use by however the notifier reaches it.
+    slot.holders.store(2, Ordering::Relaxed);
     (
         Notifier {
             slot: Some(Arc::clone(&slot)),
         },
-        Waiter { slot },
+        Waiter {
+            slot,
+            released: AtomicBool::new(false),
+        },
     )
+}
+
+impl<T> Slot<T> {
+    /// Releases one holder's claim, after its last use of the slot. Whether it was the
+    /// last: then the caller is the slot's only user, and returns it.
+    fn release(&self) -> bool {
+        self.holders.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+
+    /// Clears a finished completion's state for the slot's next use. The caller is the
+    /// slot's only user and holds no other lock: what comes out (a value nobody took, a
+    /// waker, a hook) is returned to be dropped after, as its drop may run arbitrary code.
+    fn reset(&self) -> Leftovers<T> {
+        let mut s = self.lock();
+        // The resolution took it, or `on_settled` ran it at once: never left behind.
+        debug_assert!(s.settle.is_none());
+        s.done = false;
+        s.resolving = false;
+        s.blocked = false;
+        (s.value.take(), s.waker.take(), s.hook.take())
+    }
+}
+
+/// What [`Slot::reset`] took out, dropped by its caller once it holds no lock or borrow.
+type Leftovers<T> = (Option<T>, Option<Waker>, Option<Hook<T>>);
+
+/// Returns a slot both holders released to its owner's shared half, from any thread: reset
+/// first, then kept if the owner is there and has room, else freed. Nothing is dropped
+/// under the `Returns` lock (simp724's M3).
+fn return_to_owner<T>(slot: Arc<Slot<T>>) {
+    let Some(owner) = slot.owner.clone() else {
+        return;
+    };
+    drop(slot.reset());
+    let refused = {
+        let mut r = owner.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if r.gone || r.slots.len() >= SlotCache::<T>::CAP {
+            Some(slot)
+        } else {
+            r.slots.push(slot);
+            owner.pending.store(true, Ordering::Relaxed);
+            None
+        }
+    };
+    drop(refused);
 }
 
 /// Up to [`SlotCache::CAP`] finished completions' slots, kept by one thread for its next
@@ -147,17 +231,76 @@ fn pair<T>(slot: Arc<Slot<T>>) -> (Notifier<T>, Waiter<T>) {
 /// ```
 pub struct SlotCache<T> {
     slots: RefCell<Vec<Arc<Slot<T>>>>,
+    /// The shared half, made on first use: where this cache's slots come back when the
+    /// last to release one isn't this thread's waiter (#1795).
+    returns: OnceCell<Arc<Returns<T>>>,
 }
 
 impl<T> SlotCache<T> {
-    /// Slots a cache keeps at most: a thread that holds many completions at once does not
-    /// keep them all afterwards.
+    /// Slots a cache keeps at most in each of its two lists (its own, and the one other
+    /// threads return slots to), so up to twice this in all: a thread that holds many
+    /// completions at once does not keep them all afterwards.
     pub const CAP: usize = 8;
 
     /// An empty cache.
     pub const fn new() -> Self {
         Self {
             slots: RefCell::new(Vec::new()),
+            returns: OnceCell::new(),
+        }
+    }
+
+    fn returns(&self) -> &Arc<Returns<T>> {
+        self.returns.get_or_init(|| {
+            Arc::new(Returns {
+                inner: Mutex::new(ReturnsInner {
+                    slots: Vec::new(),
+                    gone: false,
+                }),
+                pending: AtomicBool::new(false),
+            })
+        })
+    }
+
+    /// Whether `slot` came from this cache.
+    fn owns(&self, slot: &Slot<T>) -> bool {
+        match (self.returns.get(), &slot.owner) {
+            (Some(mine), Some(its)) => Arc::ptr_eq(mine, its),
+            _ => false,
+        }
+    }
+
+    /// A slot to reuse: this thread's own list first, then what other threads returned.
+    fn take(&self) -> Option<Arc<Slot<T>>> {
+        let mut slots = self.slots.try_borrow_mut().ok()?;
+        if let Some(slot) = slots.pop() {
+            return Some(slot);
+        }
+        let returns = self.returns.get()?;
+        if !returns.pending.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut r = returns.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        returns.pending.store(false, Ordering::Relaxed);
+        // Moves only `Arc`s: nothing is dropped under the lock. Both lists cap at `CAP`, and
+        // this one is empty, so everything fits.
+        slots.append(&mut r.slots);
+        drop(r);
+        slots.pop()
+    }
+}
+
+impl<T> Drop for SlotCache<T> {
+    /// Breaks the slot-to-owner link at the one moment it matters: a slot already returned
+    /// (or released later) would otherwise keep the shared half alive, and it the slot.
+    fn drop(&mut self) {
+        if let Some(returns) = self.returns.get() {
+            let kept = {
+                let mut r = returns.inner.lock().unwrap_or_else(PoisonError::into_inner);
+                r.gone = true;
+                std::mem::take(&mut r.slots)
+            };
+            drop(kept);
         }
     }
 }
@@ -178,8 +321,10 @@ impl<T> fmt::Debug for SlotCache<T> {
 
 /// [`completion`], reusing a slot from `cache` when it has one.
 pub fn completion_from<T: Send>(cache: &SlotCache<T>) -> (Notifier<T>, Waiter<T>) {
-    let reused = cache.slots.try_borrow_mut().ok().and_then(|mut s| s.pop());
-    pair(reused.unwrap_or_else(new_slot))
+    let slot = cache
+        .take()
+        .unwrap_or_else(|| new_slot(Some(Arc::clone(cache.returns()))));
+    pair(slot)
 }
 
 /// The resolving half of a completion. Dropping it unresolved resolves the waiter with
@@ -223,6 +368,7 @@ impl<T: Send> Notifier<T> {
     pub fn notify(mut self, value: T) {
         if let Some(slot) = self.slot.take() {
             slot.resolve(Some(value));
+            release_notifier(slot);
         }
     }
 }
@@ -231,7 +377,16 @@ impl<T> Drop for Notifier<T> {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
             slot.resolve(None);
+            release_notifier(slot);
         }
+    }
+}
+
+/// The notifier's release, after `resolve`'s last touch of the slot (its condvar signal and
+/// wake). Released last (its waiter recycled or dropped first), it returns the slot.
+fn release_notifier<T>(slot: Arc<Slot<T>>) {
+    if slot.release() {
+        return_to_owner(slot);
     }
 }
 
@@ -254,6 +409,10 @@ impl<T> Drop for Notifier<T> {
 /// ```
 pub struct Waiter<T> {
     slot: Arc<Slot<T>>,
+    /// [`recycle_into`](Waiter::recycle_into) released the slot: the waiter may no longer
+    /// use it, and its drop releases nothing. Atomic (and only read on its own thread) so
+    /// the waiter stays `Sync`.
+    released: AtomicBool,
 }
 
 impl<T> fmt::Debug for Waiter<T> {
@@ -263,33 +422,48 @@ impl<T> fmt::Debug for Waiter<T> {
 }
 
 impl<T> Waiter<T> {
-    /// Gives this completion's slot to `cache` for a later [`completion_from`], when nothing
-    /// else holds it: the notifier has resolved or dropped and released it. The slot is reset
-    /// first (no value, not done, no waker, no hook), so the next completion starts fresh. Does
-    /// nothing while the notifier still holds the slot, or when the cache is full.
+    /// Releases this completion's slot, its last use by the waiter: the waiter must not be
+    /// polled, waited on or given `on_settled` afterwards, as the slot may already be
+    /// another completion's. Whichever of the waiter and the notifier releases last returns
+    /// the slot, reset, to the [`SlotCache`] it was made from (#1795): to `cache` itself
+    /// when that is it and this is its thread, else to the cache's shared half. It releases
+    /// whatever the notifier's state, before resolution too (a pending future dropped by
+    /// its owner). A slot from [`completion`] is freed instead.
     pub fn recycle_into(&self, cache: &SlotCache<T>) {
-        if Arc::strong_count(&self.slot) != 1 {
+        if self.released.swap(true, Ordering::Relaxed) || !self.slot.release() {
             return;
         }
-        let Ok(mut slots) = cache.slots.try_borrow_mut() else {
-            return;
-        };
-        if slots.len() >= SlotCache::<T>::CAP {
+        if !cache.owns(&self.slot) {
+            return_to_owner(Arc::clone(&self.slot));
             return;
         }
-        // Taken out under the lock and dropped after it: a value's or waker's drop may run
-        // arbitrary code.
-        let (value, waker, hook) = {
-            let mut s = self.slot.lock();
-            // The resolution took it, or `on_settled` ran it at once: never left behind.
-            debug_assert!(s.settle.is_none());
-            s.done = false;
-            s.resolving = false;
-            s.blocked = false;
-            (s.value.take(), s.waker.take(), s.hook.take())
+        // Reset with no borrow held: the leftovers' drops may run arbitrary code.
+        drop(self.slot.reset());
+        let reentered = match cache.slots.try_borrow_mut() {
+            Ok(mut slots) => {
+                // A full list keeps nothing: the slot is freed with the waiter's `Arc`,
+                // after the borrow.
+                if slots.len() < SlotCache::<T>::CAP {
+                    slots.push(Arc::clone(&self.slot));
+                }
+                false
+            }
+            Err(_) => true,
         };
-        drop((value, waker, hook));
-        slots.push(Arc::clone(&self.slot));
+        if reentered {
+            // A leftover's drop is recycling another completion: the shared half.
+            return_to_owner(Arc::clone(&self.slot));
+        }
+    }
+}
+
+impl<T> Drop for Waiter<T> {
+    /// A waiter dropped without [`recycle_into`](Waiter::recycle_into) releases the slot
+    /// here, and returns it if the notifier already released it.
+    fn drop(&mut self) {
+        if !self.released.load(Ordering::Relaxed) && self.slot.release() {
+            return_to_owner(Arc::clone(&self.slot));
+        }
     }
 }
 
@@ -324,6 +498,10 @@ impl<T: Send> Waiter<T> {
     /// assert_eq!(sum.0.load(Ordering::Relaxed), 7);
     /// ```
     pub fn on_settled(&self, callee: std::sync::Arc<dyn Settle>, arg: u64) {
+        debug_assert!(
+            !self.released.load(Ordering::Relaxed),
+            "used after recycle_into"
+        );
         let mut s = self.slot.lock();
         if s.resolving || s.done {
             drop(s);
@@ -338,6 +516,10 @@ impl<T: Send> Waiter<T> {
     /// [`Waiter::wait`] without consuming the waiter (the loom models recycle it after).
     #[cfg(all(test, loom))]
     fn wait_ref(&self) -> Option<T> {
+        debug_assert!(
+            !self.released.load(Ordering::Relaxed),
+            "used after recycle_into"
+        );
         let mut s = self.slot.lock();
         while !s.done {
             s.blocked = true;
@@ -348,6 +530,10 @@ impl<T: Send> Waiter<T> {
 
     /// Blocks until notified. Returns `None` if the notifier was dropped unresolved.
     pub fn wait(self) -> Option<T> {
+        debug_assert!(
+            !self.released.load(Ordering::Relaxed),
+            "used after recycle_into"
+        );
         let mut s = self.slot.lock();
         while !s.done {
             s.blocked = true;
@@ -361,6 +547,10 @@ impl<T: Send> Future for Waiter<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        debug_assert!(
+            !self.released.load(Ordering::Relaxed),
+            "used after recycle_into"
+        );
         let mut s = self.slot.lock();
         if s.done {
             return Poll::Ready(s.value.take());
@@ -376,7 +566,7 @@ impl<T: Send> Future for Waiter<T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::task::Wake;
 
     /// A waker that counts its wakes.
@@ -461,14 +651,136 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_still_held_by_its_notifier_is_not_recycled() {
+    fn a_slot_its_notifier_releases_last_returns_to_its_owner() {
+        // The waiter recycles first (before the notifier is done with the slot), so the
+        // notifier is the last to release it: the slot goes to the cache's shared half, and
+        // the next completion takes it from there, fresh (#1795).
         let cache = SlotCache::new();
         let (n, w) = completion_from::<u32>(&cache);
+        let slot = Arc::downgrade(&w.slot);
         w.recycle_into(&cache);
-        assert_eq!(cache.slots.borrow().len(), 0);
+        drop(w);
+        assert_eq!(
+            cache.slots.borrow().len(),
+            0,
+            "recycled while the notifier held it"
+        );
+        n.notify(1);
+        assert_eq!(cache.returns().inner.lock().unwrap().slots.len(), 1);
+        let (n, mut w) = completion_from::<u32>(&cache);
+        assert!(
+            slot.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &w.slot)),
+            "the returned slot was not reused"
+        );
+        assert!(
+            poll(&mut w, Waker::noop()).is_pending(),
+            "a stale value was seen"
+        );
+        n.notify(2);
+        assert_eq!(poll(&mut w, Waker::noop()), Poll::Ready(Some(2)));
+    }
+
+    #[test]
+    fn a_slot_released_last_on_another_thread_comes_back() {
+        let cache = SlotCache::new();
+        let (n, w) = completion_from::<u32>(&cache);
+        let slot = Arc::downgrade(&w.slot);
+        w.recycle_into(&cache);
+        drop(w);
+        std::thread::spawn(move || n.notify(1)).join().unwrap();
+        let (n, w) = completion_from::<u32>(&cache);
+        assert!(slot.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &w.slot)));
         drop(n);
-        w.recycle_into(&cache);
-        assert_eq!(cache.slots.borrow().len(), 1);
+        assert_eq!(w.wait(), None);
+    }
+
+    /// Counts its drops.
+    struct Dropped(Arc<AtomicUsize>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn an_exited_threads_returned_slots_are_freed() {
+        // simp724's M1: a slot returned to a thread's shared half, or released after the
+        // thread exited, is freed with it, not kept alive by the slot-to-owner link.
+        thread_local! {
+            static CACHE: SlotCache<Dropped> = const { SlotCache::new() };
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (returned, late, late_slot) = std::thread::spawn(|| {
+            CACHE.with(|cache| {
+                let (n1, w1) = completion_from::<Dropped>(cache);
+                let (n2, w2) = completion_from::<Dropped>(cache);
+                // Released last by its notifier: in the shared half when the thread exits.
+                let returned = Arc::downgrade(&w1.slot);
+                w1.recycle_into(cache);
+                drop(w1);
+                drop(n1);
+                // Released by its notifier only after the thread exits.
+                let late_slot = Arc::downgrade(&w2.slot);
+                w2.recycle_into(cache);
+                drop(w2);
+                (returned, n2, late_slot)
+            })
+        })
+        .join()
+        .unwrap();
+        assert!(
+            returned.upgrade().is_none(),
+            "a returned slot outlived its thread"
+        );
+        late.notify(Dropped(Arc::clone(&drops)));
+        assert!(
+            late_slot.upgrade().is_none(),
+            "a slot released after its thread exited lived on"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the value nobody took was not dropped"
+        );
+    }
+
+    #[test]
+    fn a_leftover_whose_drop_uses_the_cache_does_not_deadlock() {
+        // simp724's M3: a value nobody took is dropped outside the shared half's lock and the
+        // cache's borrow, so a drop that makes and recycles a completion from the same cache
+        // works, on both the notifier-last and the waiter-last path, with the cache full.
+        thread_local! {
+            static CACHE: SlotCache<Reentrant> = const { SlotCache::new() };
+        }
+        struct Reentrant;
+        impl Drop for Reentrant {
+            fn drop(&mut self) {
+                CACHE.with(|c| {
+                    let (n, w) = completion_from::<Reentrant>(c);
+                    drop(n);
+                    w.recycle_into(c);
+                });
+            }
+        }
+        CACHE.with(|cache| {
+            let fill: Vec<_> = (0..2 * SlotCache::<Reentrant>::CAP)
+                .map(|_| completion_from::<Reentrant>(cache))
+                .collect();
+            for (n, w) in fill {
+                drop(n);
+                w.recycle_into(cache);
+            }
+            // Notifier last, its value untaken.
+            let (n, w) = completion_from::<Reentrant>(cache);
+            w.recycle_into(cache);
+            drop(w);
+            n.notify(Reentrant);
+            // Waiter last, its value untaken.
+            let (n, w) = completion_from::<Reentrant>(cache);
+            n.notify(Reentrant);
+            w.recycle_into(cache);
+        });
     }
 
     #[test]
@@ -594,6 +906,93 @@ mod loom_tests {
             });
             notifier.join().unwrap();
             other.join().unwrap();
+        });
+    }
+
+    /// Slots the cache holds in both lists.
+    fn kept(cache: &SlotCache<u32>) -> usize {
+        let shared = cache
+            .returns
+            .get()
+            .map_or(0, |r| r.inner.lock().unwrap().slots.len());
+        cache.slots.borrow().len() + shared
+    }
+
+    /// The notifier and the waiter release in either order (#1795): the slot comes back
+    /// exactly once, to the local list or the shared half, and the next completion reuses
+    /// it fresh.
+    #[test]
+    fn loom_either_side_releases_last() {
+        loom::model(|| {
+            let cache = SlotCache::new();
+            let (n, w) = completion_from::<u32>(&cache);
+            let notifier = thread::spawn(move || n.notify(1));
+            assert_eq!(w.wait_ref(), Some(1));
+            w.recycle_into(&cache);
+            drop(w);
+            notifier.join().unwrap();
+            assert_eq!(kept(&cache), 1, "the slot came back other than once");
+            fresh(&cache);
+        });
+    }
+
+    /// A waiter dropped on a third thread while the notifier resolves: the slot comes back
+    /// once, to the owner's shared half, whichever releases last.
+    #[test]
+    fn loom_a_waiter_dropped_on_a_third_thread() {
+        loom::model(|| {
+            let cache = SlotCache::new();
+            let (n, mut w) = completion_from::<u32>(&cache);
+            assert!(poll_once(&mut w).is_pending());
+            let notifier = thread::spawn(move || n.notify(1));
+            let other = thread::spawn(move || {
+                let _ = poll_once(&mut w);
+                drop(w);
+            });
+            notifier.join().unwrap();
+            other.join().unwrap();
+            assert_eq!(kept(&cache), 1);
+            fresh(&cache);
+        });
+    }
+
+    /// The owner drains its shared half while the notifier, last, pushes the slot there:
+    /// the slot is reused or still kept, never lost or kept twice.
+    #[test]
+    fn loom_the_drain_races_a_remote_return() {
+        loom::model(|| {
+            let cache = SlotCache::new();
+            let (n, w) = completion_from::<u32>(&cache);
+            let first = Arc::clone(&w.slot);
+            w.recycle_into(&cache);
+            drop(w);
+            let notifier = thread::spawn(move || n.notify(1));
+            let (n2, w2) = completion_from::<u32>(&cache);
+            let reused = Arc::ptr_eq(&first, &w2.slot);
+            drop(first);
+            notifier.join().unwrap();
+            assert_eq!(usize::from(reused) + kept(&cache), 1);
+            drop(n2);
+            assert_eq!(w2.wait_ref(), None);
+        });
+    }
+
+    /// The owner's cache is dropped (its thread exiting) while the notifier releases last
+    /// (simp724's M1): the slot isn't left in the shared half.
+    #[test]
+    fn loom_the_owner_exits_while_a_slot_returns() {
+        loom::model(|| {
+            let cache = SlotCache::new();
+            let (n, w) = completion_from::<u32>(&cache);
+            let returns = Arc::clone(cache.returns());
+            w.recycle_into(&cache);
+            drop(w);
+            let notifier = thread::spawn(move || n.notify(1));
+            drop(cache);
+            notifier.join().unwrap();
+            let r = returns.inner.lock().unwrap();
+            assert!(r.gone);
+            assert!(r.slots.is_empty(), "a slot outlived its owner's cache");
         });
     }
 
