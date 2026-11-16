@@ -1610,6 +1610,10 @@ impl Service {
     /// promoted. The loop is started by the caller once the server runs.
     pub(crate) fn replica(mut self, replica: Arc<super::replica::Replica>) -> Self {
         self.replica = Some(replica);
+        // A cluster replica copy (D328) serves reads under its own freshness bound, which
+        // the router checks per request against the client's, never under a lease: copies
+        // stay out of the lease machinery (S3). Its writes are refused by the engine (R6).
+        self.gate = None;
         // A replica's rebalancer could only fail (its writes are refused, R6): none runs
         // until a promote (cli692's F3 on #1583).
         if let Some(part) = &self.part {

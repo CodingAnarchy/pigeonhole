@@ -363,7 +363,7 @@ impl Stream for Rest {
 }
 
 /// The `grpc-timeout` header: digits and a unit (`H`, `M`, `S`, `m`, `u`, `n`).
-fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
+pub(crate) fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
     parse_grpc_timeout(headers.get("grpc-timeout")?.to_str().ok()?)
 }
 
@@ -419,6 +419,26 @@ impl DataGrpc {
     ) -> Result<ServiceReply, Status> {
         call(&self.0, req, op).await
     }
+
+    /// A read a replica may serve (D328): its reply, with the `served-by` and `served-seqno`
+    /// headers when the client asked for a replica.
+    async fn read<T, R>(
+        &self,
+        req: Request<T>,
+        op: impl FnOnce(T) -> ServiceOp,
+        pick: impl FnOnce(ServiceReply) -> Option<R>,
+    ) -> Result<Response<R>, Status> {
+        let (reply, served) = call_served(&self.0, req, op).await?;
+        let mut resp = respond(reply, pick)?;
+        if let Some(served) = served {
+            for (name, value) in served.headers() {
+                if let Ok(value) = value.parse() {
+                    resp.metadata_mut().insert(name, value);
+                }
+            }
+        }
+        Ok(resp)
+    }
 }
 
 /// One gRPC call through the router, for every service.
@@ -427,12 +447,26 @@ async fn call<T>(
     req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<ServiceReply, Status> {
+    call_served(shared, req, op).await.map(|(reply, _)| reply)
+}
+
+/// [`call`], with what served a read a replica could have (D328), for its headers.
+async fn call_served<T>(
+    shared: &Shared,
+    req: Request<T>,
+    op: impl FnOnce(T) -> ServiceOp,
+) -> Result<(ServiceReply, Option<super::replica::Served>), Status> {
     let caller = shared.caller(auth_header(&req))?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
     let min_primary_seqno = super::replica::min_primary_seqno(
         req.metadata()
             .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    );
+    let max_lag = super::replica::read_replica_max_lag(
+        req.metadata()
+            .get(super::replica::READ_REPLICA_MAX_LAG_MS)
             .map(|v| v.as_bytes()),
     );
     // The request's one deadline, from its arrival (#1577).
@@ -446,10 +480,14 @@ async fn call<T>(
     let rpc = op.index();
     let reply = shared
         .router
-        .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+        .dispatch_read(op, &caller, prepaid, min_primary_seqno, max_lag, deadline)
         .await;
+    let (reply, served) = match reply {
+        Ok((reply, served)) => (Ok(reply), served),
+        Err(e) => (Err(e), None),
+    };
     shared.count(rpc, started, &reply);
-    Ok(reply?)
+    Ok((reply?, served))
 }
 
 /// A unary RPC: the call, and its reply's variant.
@@ -1103,10 +1141,11 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::GetRequest>,
     ) -> Result<Response<proto::GetResponse>, Status> {
-        respond(self.call(req, ServiceOp::Get).await?, |r| match r {
+        self.read(req, ServiceOp::Get, |r| match r {
             ServiceReply::Get(r) => Some(r),
             _ => None,
         })
+        .await
     }
 
     async fn multi_get(
@@ -1123,10 +1162,11 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::ReadRowRequest>,
     ) -> Result<Response<proto::ReadRowResponse>, Status> {
-        respond(self.call(req, ServiceOp::ReadRow).await?, |r| match r {
+        self.read(req, ServiceOp::ReadRow, |r| match r {
             ServiceReply::ReadRow(r) => Some(r),
             _ => None,
         })
+        .await
     }
 
     type ScanStream =

@@ -588,3 +588,21 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **A new history bootstraps again.** When the map's `history_epoch` for P is above the epoch in the copy's identity row (a relocate without `--copy`, a restore), the copy bootstraps again from the owner rather than resuming. A copy move resumes.
 - **A move onto a replica's node is refused (S4, until PR 3).** `phdb cluster move`, `relocate` and `restore --partition` with `--to` a node in `P.replicas`; and on that node, `Cluster.Stamp` for P while its replica copy is open (`FailedPrecondition`, naming the copy). `drop-partition` refuses while the copy is open. The steps: set a map without the node in P's replicas, `drop-partition` P there, run the command again.
 - **Outside the lease machinery (S3).** A replica copy is never asked for, confirmed or lapsed, and `Fence`, `Unfence` and `Close` don't act on it (it isn't a partition they find).
+
+## D328 PR 2a: single-partition reads from replicas (1.3.0)
+**A `Get` or `ReadRow` sent with `x-pigeonhole-read-replica-max-lag-ms` may be served by a replica of its partition** (D328 §3). Additive on the wire.
+
+**Headers** (not proto; an ICR line each):
+- **`x-pigeonhole-read-replica-max-lag-ms: N`** (request): the staleness the read accepts. On a single node it's ignored.
+- **`x-pigeonhole-min-primary-seqno: S`** (request, now also on cluster nodes): read-your-writes for the read's partition. On a read across partitions, together with the first header, it's `InvalidArgument`.
+- **`x-pigeonhole-served-by: owner|replica`** and **`x-pigeonhole-served-seqno`** (response): set on a read sent with the first header.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ForwardRequest.to_replica = 44`, `.replica_max_lag_ms = 42`, `.min_primary_seqno = 43`: the entry node chose this node's replica copy. The read is served from the copy, never as owner, else `ReplicaBehind` or `PartitionUnavailable`, and the entry node tries the next replica or the owner.
+- `ForwardResponse.served_seqno = 28`: the seqno the serving node read at, for a single-partition read.
+
+**Behaviour:**
+- **Freshness** is the copy's own clock since the newest owner message whose durable frontier it had applied through (D330's M2: this keeps moving under sustained writes). A copy that's bootstrapping its first copy, or stopped, serves nothing.
+- **Order:** the entry node tries P's replicas in the map's order, skipping one found behind or unreachable in the last 2 s, then the owner, within one deadline from the request's arrival.
+- **A replica copy's reads** don't take P's lease (S3). Its writes stay refused.
+- **Never routed to a replica:** writes, transactions, snapshots, `Subscribe`, schema and admin calls, and (until PR 2b) reads across partitions.

@@ -6332,6 +6332,21 @@ pub struct ForwardRequest {
     /// `Cluster.Forward` takes cluster scope. Set on another call, it's ignored.
     #[prost(bool, tag = "21")]
     pub fanout_part: bool,
+    /// A read the entry node chose this node's replica copy of the partition for (D328): it's
+    /// served from the copy, not as the partition's owner, if the copy's freshness is within
+    /// `replica_max_lag_ms`, else `ReplicaBehind`, and the entry node tries the next replica or
+    /// the owner. Only a single-partition read without a snapshot or transaction is sent so.
+    #[prost(bool, tag = "44")]
+    pub to_replica: bool,
+    /// The client's bound (`x-pigeonhole-read-replica-max-lag-ms`), checked on this node's
+    /// clock: now less the copy's freshness. With `to_replica` only.
+    #[prost(uint64, tag = "42")]
+    pub replica_max_lag_ms: u64,
+    /// The client's read-your-writes seqno for the partition (`x-pigeonhole-min-primary-seqno`):
+    /// the copy waits, within the call's deadline, until it has applied the owner's commits
+    /// through it. 0: none. With `to_replica` only.
+    #[prost(uint64, tag = "43")]
+    pub min_primary_seqno: u64,
     #[prost(
         oneof = "forward_request::Op",
         tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 35, 36, 37, 38, 39, 40, 41"
@@ -6506,6 +6521,11 @@ pub struct ForwardedCaller {
 /// call's own status.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForwardResponse {
+    /// The seqno the serving node read at, in the owner's numbering (D328's
+    /// `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the
+    /// owner's visible seqno after it. Set for a single-partition read; 0 otherwise.
+    #[prost(uint64, tag = "28")]
+    pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
         tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 22, 23, 24"

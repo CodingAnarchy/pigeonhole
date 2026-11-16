@@ -437,11 +437,28 @@ async fn call(
             .get(super::replica::MIN_PRIMARY_SEQNO)
             .map(|v| v.as_bytes()),
     );
+    // A read a replica may serve on a cluster node (D328).
+    let max_lag = super::replica::read_replica_max_lag(
+        headers
+            .get(super::replica::READ_REPLICA_MAX_LAG_MS)
+            .map(|v| v.as_bytes()),
+    );
     let deadline = ReadDeadline::new(arrived, shared.limits.request_timeout, None);
     let reply = shared
         .router
-        .dispatch_after_primary(op, &caller, Some(budget), min_primary_seqno, deadline)
+        .dispatch_read(
+            op,
+            &caller,
+            Some(budget),
+            min_primary_seqno,
+            max_lag,
+            deadline,
+        )
         .await;
+    let (reply, served) = match reply {
+        Ok((reply, served)) => (Ok(reply), served),
+        Err(e) => (Err(e), None),
+    };
     shared.count(rpc, started, &reply);
     // A read's charge (#1567): fitted to the rendered body, then held until it's written.
     let (reply, charge) = match reply {
@@ -494,6 +511,14 @@ async fn call(
         }
         Err(e) => e.into_response(),
     };
+    let mut resp = resp;
+    if let Some(served) = served {
+        for (name, value) in served.headers() {
+            if let Ok(value) = value.parse() {
+                resp.headers_mut().insert(name, value);
+            }
+        }
+    }
     match charge {
         Some(c) => charged(&shared, resp, c).await,
         None => resp,

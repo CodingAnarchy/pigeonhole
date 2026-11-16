@@ -1793,6 +1793,13 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
         self.0.catch_up(&peer, req.metadata()).await?;
+        // The sender's deadline for the call (it sends what's left of its client's), for a
+        // replica copy's read-your-writes wait (D328).
+        let deadline = crate::serve::replica::ReadDeadline::new(
+            std::time::Instant::now(),
+            shared.limits.request_timeout,
+            crate::serve::grpc::grpc_timeout(req.metadata().as_ref()),
+        );
         let msg = req.into_inner();
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
@@ -1804,11 +1811,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             }
             _ => forward::caller_of(msg.caller, &self.0.tokens)?,
         };
-        let reply = shared
+        // A read the entry node chose this node's replica copy for (D328).
+        let replica = msg.to_replica.then_some(crate::serve::router::ReplicaRead {
+            max_lag_ms: msg.replica_max_lag_ms,
+            min_primary_seqno: (msg.min_primary_seqno > 0).then_some(msg.min_primary_seqno),
+        });
+        let (reply, served) = shared
             .router
-            .serve_forwarded(op, &caller, msg.fanout_part)
+            .serve_forwarded(op, &caller, msg.fanout_part, replica.map(|r| (r, deadline)))
             .await?;
-        let (reply, charge) = forward::reply_to_forward(reply)?;
+        let (reply, charge) = forward::reply_to_forward(reply, served)?;
         let mut resp = tonic::Response::new(reply);
         // A read's charge lasts until the reply's body is written: `routes` holds it there.
         if let Some(c) = charge {

@@ -454,12 +454,16 @@ fn a_replica_copy_bootstraps_again_after_a_relocate_without_copy() {
     assert_eq!(bootstraps_in(&dirs[0]), 2, "it bootstrapped again from b");
 }
 
-/// S1: a replica follows its owner's change feed, so an owner started without one answers
-/// its bootstrap with why, and the copy reports `OWNER_FEED_OFF` (not merely behind) with
-/// that reason, rather than a bare engine error.
-#[test]
-fn a_replica_copy_of_a_partition_whose_owner_has_no_feed_says_so() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+/// Three nodes as [`three_way`] places them, c's p3 without a change feed (`phdb serve`
+/// without `--change-feed`): its directories, ports, stop handles and databases.
+fn feedless_p3(
+    rt: &tokio::runtime::Runtime,
+) -> (
+    [PathBuf; 3],
+    Vec<u16>,
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<pigeonhole::Pigeonhole>,
+) {
     let dirs = [test_dir(), test_dir(), test_dir()];
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -498,7 +502,7 @@ fn a_replica_copy_of_a_partition_whose_owner_has_no_feed_says_so() {
         super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
         let db = if id == "c" { p3.take() } else { None };
         let (stop, db) = data_node_full(
-            &rt,
+            rt,
             dir,
             id,
             Some(p),
@@ -511,6 +515,16 @@ fn a_replica_copy_of_a_partition_whose_owner_has_no_feed_says_so() {
         stops.push(stop);
         dbs.extend(db);
     }
+    (dirs, ports, stops, dbs)
+}
+
+/// S1: a replica follows its owner's change feed, so an owner started without one answers
+/// its bootstrap with why, and the copy reports `OWNER_FEED_OFF` (not merely behind) with
+/// that reason, rather than a bare engine error.
+#[test]
+fn a_replica_copy_of_a_partition_whose_owner_has_no_feed_says_so() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, stops, dbs) = feedless_p3(&rt);
     rt.block_on(async {
         set_replicas(ports[0], "p3", &["a"]).await;
         let mut last = None;
@@ -595,4 +609,136 @@ fn a_replica_copy_follows_an_owner_holding_several_partitions() {
     for db in dbs {
         let _ = db.close();
     }
+}
+
+/// A `Get` of `row` in `r` through node `port`, with the replica headers: the bound
+/// (`max_lag_ms`) and, if given, the read-your-writes seqno. Returns the value read and the
+/// `served-by` and `served-seqno` response headers.
+async fn read_through(
+    port: u16,
+    row: &str,
+    max_lag_ms: Option<u64>,
+    min_seqno: Option<u64>,
+) -> Result<(Option<Vec<u8>>, Option<String>, Option<u64>), tonic::Status> {
+    let mut req = tonic::Request::new(crate::serve::proto::GetRequest {
+        table: "r".into(),
+        row: row.as_bytes().to_vec().into(),
+        family: "f".into(),
+        qualifier: b"q".to_vec().into(),
+        ..Default::default()
+    });
+    if let Some(n) = max_lag_ms {
+        req.metadata_mut().insert(
+            crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+            n.to_string().parse().unwrap(),
+        );
+    }
+    if let Some(s) = min_seqno {
+        req.metadata_mut().insert(
+            crate::serve::replica::MIN_PRIMARY_SEQNO,
+            s.to_string().parse().unwrap(),
+        );
+    }
+    let resp = data(port).await.get(req).await?;
+    let header = |name| {
+        resp.metadata()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let by = header(crate::serve::replica::SERVED_BY);
+    let seqno = header(crate::serve::replica::SERVED_SEQNO).and_then(|v| v.parse().ok());
+    let value = resp.into_inner().cell.map(|c| c.value.to_vec());
+    Ok((value, by, seqno))
+}
+
+/// D328 PR 2a: a read that allows staleness is served by p3's replica on a, whichever node
+/// it enters by (a holds the copy; b and c forward to it), and says so; without the header,
+/// it's the owner's, as before, with no served headers.
+#[test]
+fn a_bounded_read_is_served_by_a_replica_and_says_so() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let first = put_in(ports[1], "r", "k1").await;
+        eventually("a's copy to apply the write", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+        for port in ports.iter().copied() {
+            let (value, by, seqno) = read_through(port, "k1", Some(60_000), None).await.unwrap();
+            assert_eq!(value.as_deref(), Some(&b"v"[..]), "through {port}");
+            assert_eq!(by.as_deref(), Some("replica"), "through {port}");
+            assert!(
+                seqno.is_some_and(|s| s >= first),
+                "through {port}: {seqno:?}"
+            );
+        }
+        let (value, by, seqno) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert_eq!((by, seqno), (None, None), "no header, no replica");
+        // Read-your-writes: a write, then a read through b with its seqno sees it, from
+        // the replica once it has applied it (or the owner, if the wait ran out).
+        let second = put_in(ports[1], "r", "k2").await;
+        let (value, _, seqno) = read_through(ports[1], "k2", Some(60_000), Some(second))
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert!(seqno.is_some_and(|s| s >= second), "{seqno:?}");
+    });
+}
+
+/// A replica that isn't fresh (its owner has no change feed, so it never follows) leaves a
+/// bounded read to the owner, which says so; the next read skips it for its back-off.
+#[test]
+fn a_replica_that_isnt_fresh_leaves_the_read_to_the_owner() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, stops, dbs) = feedless_p3(&rt);
+    rt.block_on(async {
+        table_on_p3(ports[0]).await;
+        let first = put_in(ports[1], "r", "k1").await;
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's copy of p3 to open", async || {
+            copy_of(ports[0], "p3").await.is_some()
+        })
+        .await;
+        for _ in 0..2 {
+            let (value, by, seqno) = read_through(ports[1], "k1", Some(60_000), None)
+                .await
+                .unwrap();
+            assert_eq!(value.as_deref(), Some(&b"v"[..]));
+            assert_eq!(by.as_deref(), Some("owner"));
+            assert!(seqno.is_some_and(|s| s >= first), "{seqno:?}");
+        }
+    });
+    drop(stops);
+    for db in dbs {
+        let _ = db.close();
+    }
+}
+
+/// A read across partitions can't take one partition's read-your-writes seqno (D328 §3).
+#[test]
+fn a_read_across_partitions_with_a_seqno_is_refused() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let mut req = tonic::Request::new(crate::serve::proto::MultiGetRequest {
+            table: "r".into(),
+            keys: vec![b"a".to_vec().into(), b"z".to_vec().into()],
+            ..Default::default()
+        });
+        req.metadata_mut().insert(
+            crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+            "1000".parse().unwrap(),
+        );
+        req.metadata_mut().insert(
+            crate::serve::replica::MIN_PRIMARY_SEQNO,
+            "1".parse().unwrap(),
+        );
+        let e = data(ports[1]).await.multi_get(req).await.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
+    });
 }
