@@ -3230,12 +3230,16 @@ impl Service {
         let pinned = self.pinned(&r.snapshot_id, caller)?;
         let table = self.table(&r.table).await?;
         let at = pinned.as_ref().map(|p| p.snapshot().clone());
-        // The qualifier selection (`qualifiers`, #1915 PR 3), applied as a read's own.
-        let qualifiers = r.qualifiers.as_ref().map(|q| proto::Selection {
-            qualifier_prefix: q.prefix.clone(),
-            qualifier_start: q.start.clone(),
-            qualifier_end: q.end.clone(),
-            ..Default::default()
+        // The qualifier selection (`qualifiers`, #1915 PR 3), applied as a read's own. Boxed:
+        // it lives across the search's await, and a `Selection` in place grew every call's
+        // future by its size (serve-get's ceiling on #1957).
+        let qualifiers = r.qualifiers.as_ref().map(|q| {
+            Box::new(proto::Selection {
+                qualifier_prefix: q.prefix.clone(),
+                qualifier_start: q.start.clone(),
+                qualifier_end: q.end.clone(),
+                ..Default::default()
+            })
         });
         // A fault seam (tests): a partition acting as a build before `qualifiers`.
         #[cfg(test)]
@@ -3244,7 +3248,7 @@ impl Service {
                 super::cluster::old_nearest(p.db.path(), super::cluster::OldNearest::Parts)
             })
         });
-        let select = convert::Select::new(qualifiers.as_ref())?.at(at);
+        let select = convert::Select::new(qualifiers.as_deref())?.at(at);
         let k = r.k as usize;
         let search = match &r.source {
             Some(Source::Keys(keys)) => {
