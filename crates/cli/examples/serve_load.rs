@@ -333,10 +333,10 @@ fn key(i: u64) -> Vec<u8> {
 }
 
 /// The shard count to build and serve at: `--shards`, else `phdb serve`'s default
-/// (`placement::default_shards`, half the physical cores).
+/// (`placement::default_shards`, half the physical cores this process may run on, #1921).
 fn shards(args: &Args) -> usize {
     args.shards
-        .unwrap_or_else(|| (num_cpus::get_physical() / 2).max(1))
+        .unwrap_or_else(|| (pigeonhole_io::sys::default_shards() / 2).max(1))
 }
 
 /// The database in `--dir`, built at `shards` if missing. One that exists is served as it

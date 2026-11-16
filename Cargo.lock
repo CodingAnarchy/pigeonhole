@@ -2239,7 +2239,6 @@ dependencies = [
  "hyper-util",
  "insta",
  "nix 0.29.0",
- "num_cpus",
  "pbjson",
  "pigeonhole",
  "pigeonhole-arrow",
