@@ -6,14 +6,16 @@ use super::*;
 static STEP_DELAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Rebuilds wait 5 ms after each document until this is dropped.
-struct SlowSteps(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+struct SlowSteps {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
 
 fn slow_steps() -> SlowSteps {
     let held = STEP_DELAY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
-    SlowSteps(held)
+    SlowSteps { _held: held }
 }
 
 impl Drop for SlowSteps {
@@ -597,7 +599,7 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
     let part = gated_part(&s, &gate);
     // The resume is under way (400 documents at 5 ms each).
     std::thread::sleep(Duration::from_millis(300));
-    let started = std::time::Instant::now();
+    let yielded = crate::serve::texts::YIELDED.load(Ordering::SeqCst);
     let r = s.block_on(part.call(
         ServiceOp::TextRebuild(proto::TextIndexRequest { index: "tx".into() }),
         &Caller::anonymous(),
@@ -608,9 +610,11 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
         panic!("{r:?}");
     };
     assert_eq!(r.documents, 400, "{r:?}");
+    // The resume stopped for it, rather than finishing first (ai1249's S1 on #1996: a time
+    // bound barely told the two apart). Only this test makes a resume yield.
     assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "it waited out the slot"
+        crate::serve::texts::YIELDED.load(Ordering::SeqCst) > yielded,
+        "the resume finished instead of yielding the slot"
     );
     assert!(
         pigeonhole_text::Index::pending_rebuilds(&db)
