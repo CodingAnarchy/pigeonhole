@@ -1755,12 +1755,13 @@ fn read_again(op: &ServiceOp) -> Option<ServiceOp> {
 }
 
 /// Whether a replica's refusal sends the read on to the next replica or the owner (D328):
-/// it's behind, it doesn't hold the copy, or it couldn't be reached. Anything else (a
-/// missing table, the caller's scope) the owner would answer the same.
+/// it's behind, it doesn't hold the copy (or the copy closed under the read, as a map that
+/// drops it closes it), or it couldn't be reached. Anything else (a missing table, the
+/// caller's scope) the owner would answer the same.
 fn falls_back(e: &ApiError) -> bool {
     matches!(
         e.code.as_str(),
-        "ReplicaBehind" | "PartitionUnavailable" | "WrongPartition" | "Unavailable"
+        "ReplicaBehind" | "PartitionUnavailable" | "WrongPartition" | "Unavailable" | "Closed"
     )
 }
 
