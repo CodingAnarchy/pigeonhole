@@ -1437,6 +1437,59 @@ fn an_upload_whose_node_stops_reading_mid_file_ends_stalled_without_its_answer()
 }
 
 #[test]
+fn an_upload_whose_node_never_answers_after_the_last_byte_ends_unanswered() {
+    // #1983: the node answers the status call and takes what is sent, then nothing comes
+    // back from it with the connection up. The source is done, so only the wait for the
+    // node's reply is left, and it ends at its bound: the stall, plus the file's size at
+    // the floor rate.
+    use super::super::transfer::{Stopped, upload_file};
+    let t = Cluster::start();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        let files = close_p1(&t).await;
+        let mute_c = Proxy::to(c);
+        let url = format!("http://{}", mute_c.address);
+        let (channel, token) = super::super::cli::channel(&t.args, &url)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message()));
+        let mut admin = crate::serve::proto::admin_client::AdminClient::new(channel);
+        let header = crate::serve::proto::PartitionUploadHeader {
+            partition: "p1".into(),
+            cluster_id: "c1".into(),
+            epoch: 1,
+            upload_id: "ffeeddccbbaa99887766554433221100".into(),
+            purpose: crate::serve::proto::PartitionUploadPurpose::Relocate as i32,
+            file: Some(files[0].clone()),
+            manifest: files.clone(),
+        };
+        let stops = Arc::clone(&mute_c.from_node);
+        let pass = within(upload_file(
+            &mut admin,
+            token.as_deref(),
+            header,
+            Duration::from_millis(300),
+            |_, mut feed| async move {
+                stops.store(true, Ordering::Relaxed);
+                // The proxy looks at the flag between reads of at most 20 ms: past one, so
+                // a read that began before the flag can't carry the reply back.
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                // One small chunk: it fits what the connection buffers, so the feed
+                // itself never stalls.
+                let chunk = prost::bytes::Bytes::from(vec![0u8; 1 << 10]);
+                assert!(feed.send(chunk).await.is_ok());
+                Ok::<(), std::convert::Infallible>(())
+            },
+        ))
+        .await;
+        // 300 ms, plus the file's size at the floor rate.
+        let Err(Stopped::Unanswered(bound)) = pass else {
+            panic!("the pass didn't end unanswered");
+        };
+        assert!(bound >= Duration::from_millis(300), "{bound:?}");
+    });
+}
+
+#[test]
 fn a_move_copies_a_closed_set_that_holds_an_empty_file() {
     // #1950, 3: a crash can leave a 0-byte WAL stream file in a set. Its only chunk
     // carries the hash and no data, the new node finishes it from a header alone, and the

@@ -1170,6 +1170,11 @@ async fn upload(
                 "the node took nothing of the file for {} s",
                 STALL.as_secs()
             )))),
+            // The node took every byte and never answered (#1983): a break, to resume.
+            Err(Stopped::Unanswered(bound)) => Err(Err(tonic::Status::unavailable(format!(
+                "the node took the file and gave no answer for {} s",
+                bound.as_secs()
+            )))),
             Err(Stopped::Status(s) | Stopped::Upload(s)) => Err(Err(s)),
         };
         match sent {

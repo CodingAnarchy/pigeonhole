@@ -45,6 +45,9 @@ pub(super) enum Stopped<E> {
     /// The node took none of the file for the pass's stall bound, with the connection up
     /// (#1950). The upload is dropped unanswered; what the node holds is there to resume.
     Stalled,
+    /// The node took every byte sent and gave no answer for this long, its
+    /// [`reply_bound`], with the connection up (#1983). What it holds is there to resume.
+    Unanswered(Duration),
     /// The node refused the upload, or it broke.
     Upload(tonic::Status),
 }
@@ -119,6 +122,16 @@ impl futures_core::Stream for Chunks {
     }
 }
 
+/// The slowest a healthy node hashes and syncs a file it holds, in bytes a second: far
+/// under any disk's sequential rate, so only a node that stopped is slower.
+const REPLY_FLOOR: u64 = 8 << 20;
+
+/// The longest [`upload_file`] waits for the node's reply once a file of `bytes` is sent:
+/// `stall`, plus the file's size at [`REPLY_FLOOR`].
+fn reply_bound(bytes: u64, stall: Duration) -> Duration {
+    stall + Duration::from_secs_f64(bytes as f64 / REPLY_FLOOR as f64)
+}
+
 /// One pass of `header`'s upload to the node behind `admin`.
 ///
 /// `None`: nothing was sent, because the node holds the whole file, or an install of the
@@ -130,11 +143,12 @@ impl futures_core::Stream for Chunks {
 ///
 /// A status call the node doesn't answer within `stall`, or a message it takes none of for
 /// that long, ends the pass as [`Stopped::Stalled`],
-/// without waiting for an answer that node may never give. The wait for the node's reply
-/// once everything is sent has no bound: the node hashes and syncs the whole file first.
+/// without waiting for an answer that node may never give. A reply that doesn't come
+/// within [`reply_bound`] of the last byte ends it as [`Stopped::Unanswered`]: the node
+/// hashes and syncs the whole file first, so that wait grows with the file (#1983).
 ///
-/// `stall` is one bound for both waits, the status call's included: sized for a node's
-/// slowest healthy answer, not tuned down as a per-message figure.
+/// `stall` is one bound for both of the first two waits, the status call's included: sized
+/// for a node's slowest healthy answer, not tuned down as a per-message figure.
 pub(super) async fn upload_file<T, E, F>(
     admin: &mut Admin,
     token: Option<&str>,
@@ -163,6 +177,7 @@ where
     if st.complete || st.installing {
         return Ok(None);
     }
+    let bytes = header.file.as_ref().map_or(0, |f| f.bytes);
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let stalled = Arc::new(AtomicBool::new(false));
     let feed = Feed {
@@ -198,7 +213,14 @@ where
     let sent = sent.map_err(Stopped::Source)?;
     let reply = match reply {
         Some(r) => r,
-        None => upload.await,
+        // Everything is sent, and the node hashes and syncs the whole file before it
+        // answers (#1983).
+        None => {
+            let bound = reply_bound(bytes, stall);
+            tokio::time::timeout(bound, upload)
+                .await
+                .map_err(|_| Stopped::Unanswered(bound))?
+        }
     };
     Ok(Some((sent, reply?)))
 }
@@ -233,6 +255,15 @@ mod tests {
             out.push((c.header.is_some(), c.offset, c.data.len()));
         }
         out
+    }
+
+    #[test]
+    fn the_reply_bound_is_the_stall_plus_the_files_size_at_the_floor_rate() {
+        let stall = Duration::from_secs(60);
+        assert_eq!(reply_bound(0, stall), stall);
+        assert_eq!(reply_bound(REPLY_FLOOR, stall), Duration::from_secs(61));
+        // 100 GiB: 60 s and 12,800 s more.
+        assert_eq!(reply_bound(100 << 30, stall), Duration::from_secs(12_860));
     }
 
     #[test]
