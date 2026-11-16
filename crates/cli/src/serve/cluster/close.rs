@@ -118,8 +118,15 @@ impl Node {
     pub(crate) async fn close(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
         let _one = self.fences.changing.lock().await;
         let _open = self.opening.lock().await;
-        if let Some(closed) = self.fences.closed().get(id) {
-            if matches!(closed.files, Hashing::Failed(_)) {
+        // Read in a statement of its own, so the lock is released before `hash_soon` takes
+        // it: held through an `if let`'s body, the second lock never returned.
+        let failed = self
+            .fences
+            .closed()
+            .get(id)
+            .map(|closed| matches!(closed.files, Hashing::Failed(_)));
+        if let Some(failed) = failed {
+            if failed {
                 self.hash_soon(id);
             }
             return Ok(());
