@@ -295,6 +295,12 @@ impl Router {
         }
     }
 
+    /// The memory store's slot of this node's first partition, if the node serves one
+    /// (`--memory`): its name, model and limits are the node's, the same on every partition.
+    pub(crate) fn memory_slot(&self) -> Option<Arc<super::memslot::MemSlot>> {
+        self.parts().first()?.memory.get().cloned()
+    }
+
     /// Partition `id` on a cluster node: `WrongPartition` when the map gives it to another
     /// node, ticket 2's `not_open` when the map gives it here but it isn't open, `NotFound`
     /// when the map has no such partition.
@@ -676,6 +682,14 @@ impl Router {
                 .filter(|d| !d.is_zero())
                 .ok_or_else(ApiError::deadline_exceeded)
         };
+        // `supersedes` changes what's written: the owner applies it, or the call is refused
+        // (#1915 PR 3b). Here, in the forward (boxed), not in `dispatch_by`, whose future
+        // every call holds; an owner that is this node has the feature.
+        if let ServiceOp::Remember(r) = &op
+            && !r.supersedes.is_empty()
+        {
+            self.memory_fields(&op, deadline).await?;
+        }
         let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
         let writes = forward_writes(&op);
         let req = ForwardRequest {

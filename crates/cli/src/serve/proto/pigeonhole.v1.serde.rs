@@ -6269,11 +6269,17 @@ impl serde::Serialize for ForgetResponse {
         if self.forgotten != 0 {
             len += 1;
         }
+        if !self.missing.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForgetResponse", len)?;
         if self.forgotten != 0 {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("forgotten", ToString::to_string(&self.forgotten).as_str())?;
+        }
+        if !self.missing.is_empty() {
+            struct_ser.serialize_field("missing", &self.missing.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
         }
         struct_ser.end()
     }
@@ -6286,11 +6292,13 @@ impl<'de> serde::Deserialize<'de> for ForgetResponse {
     {
         const FIELDS: &[&str] = &[
             "forgotten",
+            "missing",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Forgotten,
+            Missing,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6313,6 +6321,7 @@ impl<'de> serde::Deserialize<'de> for ForgetResponse {
                     {
                         match value {
                             "forgotten" => Ok(GeneratedField::Forgotten),
+                            "missing" => Ok(GeneratedField::Missing),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6333,6 +6342,7 @@ impl<'de> serde::Deserialize<'de> for ForgetResponse {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut forgotten__ = None;
+                let mut missing__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Forgotten => {
@@ -6343,10 +6353,20 @@ impl<'de> serde::Deserialize<'de> for ForgetResponse {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Missing => {
+                            if missing__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("missing"));
+                            }
+                            missing__ = 
+                                Some(map_.next_value::<Vec<::pbjson::private::BytesDeserialize<_>>>()?
+                                    .into_iter().map(|x| x.0).collect())
+                            ;
+                        }
                     }
                 }
                 Ok(ForgetResponse {
                     forgotten: forgotten__.unwrap_or_default(),
+                    missing: missing__.unwrap_or_default(),
                 })
             }
         }
@@ -10855,11 +10875,17 @@ impl serde::Serialize for MarkUsedResponse {
         if self.marked != 0 {
             len += 1;
         }
+        if !self.missing.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MarkUsedResponse", len)?;
         if self.marked != 0 {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("marked", ToString::to_string(&self.marked).as_str())?;
+        }
+        if !self.missing.is_empty() {
+            struct_ser.serialize_field("missing", &self.missing.iter().map(pbjson::private::base64::encode).collect::<Vec<_>>())?;
         }
         struct_ser.end()
     }
@@ -10872,11 +10898,13 @@ impl<'de> serde::Deserialize<'de> for MarkUsedResponse {
     {
         const FIELDS: &[&str] = &[
             "marked",
+            "missing",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Marked,
+            Missing,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10899,6 +10927,7 @@ impl<'de> serde::Deserialize<'de> for MarkUsedResponse {
                     {
                         match value {
                             "marked" => Ok(GeneratedField::Marked),
+                            "missing" => Ok(GeneratedField::Missing),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -10919,6 +10948,7 @@ impl<'de> serde::Deserialize<'de> for MarkUsedResponse {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut marked__ = None;
+                let mut missing__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Marked => {
@@ -10929,10 +10959,20 @@ impl<'de> serde::Deserialize<'de> for MarkUsedResponse {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Missing => {
+                            if missing__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("missing"));
+                            }
+                            missing__ = 
+                                Some(map_.next_value::<Vec<::pbjson::private::BytesDeserialize<_>>>()?
+                                    .into_iter().map(|x| x.0).collect())
+                            ;
+                        }
                     }
                 }
                 Ok(MarkUsedResponse {
                     marked: marked__.unwrap_or_default(),
+                    missing: missing__.unwrap_or_default(),
                 })
             }
         }
@@ -11237,6 +11277,9 @@ impl serde::Serialize for MemoryHit {
         if !self.signals.is_empty() {
             len += 1;
         }
+        if !self.superseded_by.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MemoryHit", len)?;
         if !self.id.is_empty() {
             #[allow(clippy::needless_borrow)]
@@ -11271,6 +11314,11 @@ impl serde::Serialize for MemoryHit {
         if !self.signals.is_empty() {
             struct_ser.serialize_field("signals", &self.signals)?;
         }
+        if !self.superseded_by.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("superseded_by", pbjson::private::base64::encode(&self.superseded_by).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -11290,6 +11338,8 @@ impl<'de> serde::Deserialize<'de> for MemoryHit {
             "score",
             "embedding",
             "signals",
+            "superseded_by",
+            "supersededBy",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -11303,6 +11353,7 @@ impl<'de> serde::Deserialize<'de> for MemoryHit {
             Score,
             Embedding,
             Signals,
+            SupersededBy,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -11333,6 +11384,7 @@ impl<'de> serde::Deserialize<'de> for MemoryHit {
                             "score" => Ok(GeneratedField::Score),
                             "embedding" => Ok(GeneratedField::Embedding),
                             "signals" => Ok(GeneratedField::Signals),
+                            "supersededBy" | "superseded_by" => Ok(GeneratedField::SupersededBy),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -11361,6 +11413,7 @@ impl<'de> serde::Deserialize<'de> for MemoryHit {
                 let mut score__ = None;
                 let mut embedding__ = None;
                 let mut signals__ = None;
+                let mut superseded_by__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -11428,6 +11481,14 @@ impl<'de> serde::Deserialize<'de> for MemoryHit {
                                     .into_iter().map(|(k,v)| (k, v.0)).collect()
                             );
                         }
+                        GeneratedField::SupersededBy => {
+                            if superseded_by__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("supersededBy"));
+                            }
+                            superseded_by__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(MemoryHit {
@@ -11440,6 +11501,7 @@ impl<'de> serde::Deserialize<'de> for MemoryHit {
                     score: score__.unwrap_or_default(),
                     embedding: embedding__,
                     signals: signals__.unwrap_or_default(),
+                    superseded_by: superseded_by__.unwrap_or_default(),
                 })
             }
         }
@@ -18286,9 +18348,15 @@ impl serde::Serialize for RecallResponse {
         if !self.hits.is_empty() {
             len += 1;
         }
+        if self.truncated {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RecallResponse", len)?;
         if !self.hits.is_empty() {
             struct_ser.serialize_field("hits", &self.hits)?;
+        }
+        if self.truncated {
+            struct_ser.serialize_field("truncated", &self.truncated)?;
         }
         struct_ser.end()
     }
@@ -18301,11 +18369,13 @@ impl<'de> serde::Deserialize<'de> for RecallResponse {
     {
         const FIELDS: &[&str] = &[
             "hits",
+            "truncated",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Hits,
+            Truncated,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18328,6 +18398,7 @@ impl<'de> serde::Deserialize<'de> for RecallResponse {
                     {
                         match value {
                             "hits" => Ok(GeneratedField::Hits),
+                            "truncated" => Ok(GeneratedField::Truncated),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18348,6 +18419,7 @@ impl<'de> serde::Deserialize<'de> for RecallResponse {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut hits__ = None;
+                let mut truncated__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Hits => {
@@ -18356,10 +18428,17 @@ impl<'de> serde::Deserialize<'de> for RecallResponse {
                             }
                             hits__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Truncated => {
+                            if truncated__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("truncated"));
+                            }
+                            truncated__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(RecallResponse {
                     hits: hits__.unwrap_or_default(),
+                    truncated: truncated__.unwrap_or_default(),
                 })
             }
         }
@@ -18789,12 +18868,20 @@ impl serde::Serialize for RememberRequest {
         if self.memory.is_some() {
             len += 1;
         }
+        if !self.supersedes.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RememberRequest", len)?;
         if !self.namespace.is_empty() {
             struct_ser.serialize_field("namespace", &self.namespace)?;
         }
         if let Some(v) = self.memory.as_ref() {
             struct_ser.serialize_field("memory", v)?;
+        }
+        if !self.supersedes.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("supersedes", pbjson::private::base64::encode(&self.supersedes).as_str())?;
         }
         struct_ser.end()
     }
@@ -18808,12 +18895,14 @@ impl<'de> serde::Deserialize<'de> for RememberRequest {
         const FIELDS: &[&str] = &[
             "namespace",
             "memory",
+            "supersedes",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Namespace,
             Memory,
+            Supersedes,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18837,6 +18926,7 @@ impl<'de> serde::Deserialize<'de> for RememberRequest {
                         match value {
                             "namespace" => Ok(GeneratedField::Namespace),
                             "memory" => Ok(GeneratedField::Memory),
+                            "supersedes" => Ok(GeneratedField::Supersedes),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18858,6 +18948,7 @@ impl<'de> serde::Deserialize<'de> for RememberRequest {
             {
                 let mut namespace__ = None;
                 let mut memory__ = None;
+                let mut supersedes__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Namespace => {
@@ -18872,11 +18963,20 @@ impl<'de> serde::Deserialize<'de> for RememberRequest {
                             }
                             memory__ = map_.next_value()?;
                         }
+                        GeneratedField::Supersedes => {
+                            if supersedes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("supersedes"));
+                            }
+                            supersedes__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(RememberRequest {
                     namespace: namespace__.unwrap_or_default(),
                     memory: memory__,
+                    supersedes: supersedes__.unwrap_or_default(),
                 })
             }
         }
@@ -18897,6 +18997,9 @@ impl serde::Serialize for RememberResponse {
         if self.outcome != 0 {
             len += 1;
         }
+        if self.supersede_error.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RememberResponse", len)?;
         if !self.id.is_empty() {
             #[allow(clippy::needless_borrow)]
@@ -18907,6 +19010,9 @@ impl serde::Serialize for RememberResponse {
             let v = RememberOutcome::try_from(self.outcome)
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.outcome)))?;
             struct_ser.serialize_field("outcome", &v)?;
+        }
+        if let Some(v) = self.supersede_error.as_ref() {
+            struct_ser.serialize_field("supersede_error", v)?;
         }
         struct_ser.end()
     }
@@ -18920,12 +19026,15 @@ impl<'de> serde::Deserialize<'de> for RememberResponse {
         const FIELDS: &[&str] = &[
             "id",
             "outcome",
+            "supersede_error",
+            "supersedeError",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Id,
             Outcome,
+            SupersedeError,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18949,6 +19058,7 @@ impl<'de> serde::Deserialize<'de> for RememberResponse {
                         match value {
                             "id" => Ok(GeneratedField::Id),
                             "outcome" => Ok(GeneratedField::Outcome),
+                            "supersedeError" | "supersede_error" => Ok(GeneratedField::SupersedeError),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18970,6 +19080,7 @@ impl<'de> serde::Deserialize<'de> for RememberResponse {
             {
                 let mut id__ = None;
                 let mut outcome__ = None;
+                let mut supersede_error__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -18986,11 +19097,18 @@ impl<'de> serde::Deserialize<'de> for RememberResponse {
                             }
                             outcome__ = Some(map_.next_value::<RememberOutcome>()? as i32);
                         }
+                        GeneratedField::SupersedeError => {
+                            if supersede_error__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("supersedeError"));
+                            }
+                            supersede_error__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(RememberResponse {
                     id: id__.unwrap_or_default(),
                     outcome: outcome__.unwrap_or_default(),
+                    supersede_error: supersede_error__,
                 })
             }
         }

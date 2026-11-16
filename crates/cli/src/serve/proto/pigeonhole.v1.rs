@@ -2167,6 +2167,13 @@ pub struct RememberRequest {
     pub namespace: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub memory: ::core::option::Option<NewMemory>,
+    /// The memory this one corrects, in the same namespace (#1915, ICR 0139): the store skips
+    /// near dedup against what it holds (a correction is near what it corrects; exact dedup
+    /// stays), then supersedes this memory with the new one. On a cluster, a call that sets
+    /// it needs every owner to have the `memory_tool_fields` feature (`FailedPrecondition`
+    /// naming the node otherwise), since an older node would ignore it.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub supersedes: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RememberResponse {
@@ -2174,6 +2181,10 @@ pub struct RememberResponse {
     pub id: ::prost::bytes::Bytes,
     #[prost(enumeration = "RememberOutcome", tag = "2")]
     pub outcome: i32,
+    /// With `supersedes`: set when the new memory is stored (`id`) but superseding the old
+    /// one failed, so the old memory is still live. Retry that step with `Supersede` (#1915).
+    #[prost(message, optional, tag = "3")]
+    pub supersede_error: ::core::option::Option<ErrorDetail>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RecallRequest {
@@ -2206,6 +2217,12 @@ pub struct RecallRequest {
 pub struct RecallResponse {
     #[prost(message, repeated, tag = "1")]
     pub hits: ::prost::alloc::vec::Vec<MemoryHit>,
+    /// Whether the byte budget cut hits that would have ranked (#1915). On a cluster, the
+    /// entry node's, from its merged ranking.
+    /// On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+    /// empty (ICR 0139): until every node has it, empty doesn't mean none.
+    #[prost(bool, tag = "2")]
+    pub truncated: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MemoryHit {
@@ -2230,16 +2247,26 @@ pub struct MemoryHit {
     /// `recency`, `graph`).
     #[prost(map = "string, double", tag = "9")]
     pub signals: ::std::collections::HashMap<::prost::alloc::string::String, f64>,
+    /// The memory that supersedes this one, when `superseded` (#1915).
+    /// On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+    /// empty (ICR 0139): until every node has it, empty doesn't mean none.
+    #[prost(bytes = "bytes", tag = "10")]
+    pub superseded_by: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MarkUsedRequest {
     #[prost(bytes = "bytes", repeated, tag = "1")]
     pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MarkUsedResponse {
     #[prost(uint64, tag = "1")]
     pub marked: u64,
+    /// The ids the store doesn't hold (#1915).
+    /// On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+    /// empty (ICR 0139): until every node has it, empty doesn't mean none.
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    pub missing: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SupersedeRequest {
@@ -2264,10 +2291,15 @@ pub struct ForgetRequest {
     #[prost(bytes = "bytes", repeated, tag = "1")]
     pub ids: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ForgetResponse {
     #[prost(uint64, tag = "1")]
     pub forgotten: u64,
+    /// The ids the store didn't hold (#1915).
+    /// On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+    /// empty (ICR 0139): until every node has it, empty doesn't mean none.
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    pub missing: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryWatchRequest {

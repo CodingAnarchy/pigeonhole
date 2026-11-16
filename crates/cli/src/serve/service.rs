@@ -1311,7 +1311,7 @@ pub(crate) struct Partition {
     /// it, and again after the catalog or the engine changes (#1618). Set once: at start on
     /// a single node, and on a cluster partition when the map first places the store on it
     /// (#1915), which it then does for good.
-    memory: std::sync::OnceLock<Arc<super::memslot::MemSlot>>,
+    pub(crate) memory: std::sync::OnceLock<Arc<super::memslot::MemSlot>>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     ///
@@ -2194,6 +2194,7 @@ impl Service {
                     let m = core.mark_used(scope, &ids)?;
                     Ok(proto::MarkUsedResponse {
                         marked: m.marked as u64,
+                        missing: m.missing.iter().map(|id| id.to_bytes().into()).collect(),
                     })
                 })
                 .await
@@ -2229,6 +2230,7 @@ impl Service {
                     }
                     Ok(proto::ForgetResponse {
                         forgotten: done.deleted,
+                        missing: done.missing.iter().map(|id| id.to_bytes().into()).collect(),
                     })
                 })
                 .await
@@ -3756,15 +3758,6 @@ impl Service {
         self.entry_core(&slot, entry)
     }
 
-    /// [`memory_core`](Self::memory_core) on a blocking thread that already holds a memory
-    /// place (M6) and a pool place: a `/mcp` memory tool's (8c-3b). It opens the store here
-    /// if need be.
-    pub(crate) fn memory_core_blocking(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        let slot = self.part()?.memory.get().ok_or_else(|| self.no_memory())?;
-        let entry = slot.get()?;
-        self.entry_core(slot, entry)
-    }
-
     /// The core a slot's entry holds, or why there's none.
     fn entry_core(
         &self,
@@ -3803,20 +3796,12 @@ impl Service {
     }
 
     /// A place under the memory sub-limit (M6), waited for within the request timeout. Taken
-    /// before a blocking-pool place, always: `/mcp` takes it before its request's pool thread
-    /// too, so the two are never waited for in the other order.
+    /// before a blocking-pool place, always, so the two are never waited for in the other
+    /// order. A `/mcp` memory tool's op takes it as the RPC does (#1915 PR 3b): the message
+    /// holds only its `/mcp` place.
     pub(crate) async fn memory_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         budget_within(&self.memory_calls, 1, self.limits.request_timeout)
             .await
-            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
-    }
-
-    /// A place under the memory sub-limit now, or `Overloaded`: for a call already on a
-    /// blocking-pool thread, which mustn't wait for one (`/mcp`'s fallback, ai1249's R1 on
-    /// #1679).
-    pub(crate) fn memory_try_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        Arc::clone(&self.memory_calls)
-            .try_acquire_owned()
             .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
     }
 
@@ -3858,10 +3843,10 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<proto::RememberResponse, ApiError> {
-        let m = super::memory::remember(r)?;
+        let (m, supersedes) = super::memory::remember(r)?;
         self.memory_write("Memory.Remember", caller, budget, move |core, scope| {
-            let (done, _) = core.remember(scope, m, None)?;
-            Ok(super::memory::remembered(&done))
+            let (done, supersede_error) = core.remember(scope, m, supersedes)?;
+            Ok(super::memory::remembered(&done, supersede_error))
         })
         .await
     }
@@ -3887,10 +3872,10 @@ impl Service {
         let namespaces = caller.namespaces.clone();
         let reply = self
             .memory_blocking(move || {
-                let (hits, _stats) =
-                    core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
+                let (hits, stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
                 Ok(proto::RecallResponse {
                     hits: hits.into_iter().map(super::memory::hit).collect(),
+                    truncated: stats.truncated,
                 })
             })
             .await?;
