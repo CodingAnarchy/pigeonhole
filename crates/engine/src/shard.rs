@@ -1851,6 +1851,11 @@ enum MemberKind {
     CommitRecord {
         participants: Holders,
         apply_seqno: Seqno,
+        /// An external abort's encoded share (D329: xid, participants, no reads, no batch):
+        /// the record is an External Abort (type 6), `apply_seqno` the abort's own seqno,
+        /// held until it is written and then released with nothing applied (ICR 0140's E1).
+        /// `None` for a DECISION.
+        external_abort: Option<Box<Vec<u8>>>,
     },
 }
 
@@ -1992,6 +1997,15 @@ impl Member {
                 seqno: self.seqno,
                 coordinator: StreamId(u32::from(coordinator.0)),
                 share: pigeonhole_format::wal::ExternalShare::decode(share, true)?,
+            },
+            MemberKind::CommitRecord {
+                apply_seqno,
+                external_abort: Some(share),
+                ..
+            } => WalRecord::ExternalAbort {
+                seqno: self.seqno,
+                abort_seqno: *apply_seqno,
+                share: pigeonhole_format::wal::ExternalShare::decode(share, false)?,
             },
             MemberKind::CommitRecord { apply_seqno, .. } => WalRecord::Decision {
                 seqno: self.seqno,
@@ -8074,6 +8088,7 @@ impl ShardState {
                 MemberKind::CommitRecord {
                     participants,
                     apply_seqno,
+                    ..
                 } => {
                     if let Some(t) = m.ticket {
                         // A coordinator is always a participant (the first shard of its
@@ -9293,6 +9308,18 @@ impl ShardState {
             MemberKind::CommitRecord {
                 participants,
                 apply_seqno,
+                external_abort: Some(_),
+            } => self.settle_external_abort(
+                m.seqno,
+                apply_seqno,
+                &participants,
+                result.map(|_| ()),
+                ctx,
+            ),
+            MemberKind::CommitRecord {
+                participants,
+                apply_seqno,
+                external_abort: None,
             } => {
                 // D286: a Buffered commit's `Decide`s went out at its decision.
                 if self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent) {
@@ -9818,24 +9845,99 @@ impl ShardState {
     /// on this stream at a seqno of its own (ICR 0140's E1), then its participants drop their
     /// shares (`Decide { commit: false }`), and the decide's reply answers.
     fn abort_external(&mut self, id: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
-        // TODO(D329 PR 1, step 5): the type-6 member. Until it lands, an abort is the
-        // in-memory abort of a round that failed, which a reopen would see in doubt again.
         let c = self.coord.get_mut(&id).expect("present");
         c.decided = true;
-        // Not a failure the caller hears: the abort is its own decision. The `Coord` goes once
-        // every participant answered (`on_applied`), with no reply left to send and no retry.
+        // Not a failure the caller hears: the abort is its own decision. No retry follows,
+        // and the `Coord` goes once every participant answered (`on_applied`).
         c.failed = Some(Error::Conflict);
+        let durability = c.durability;
+        let shards = c.shards.clone();
+        let xid = c.external.as_ref().map(|e| Arc::clone(&e.xid));
+        let streams: Vec<StreamId> = shards.iter().map(|s| StreamId(u32::from(s.0))).collect();
+        let mut body = Vec::new();
+        let encoded = xid
+            .ok_or(Error::Corruption(
+                "an external abort without its xid".into(),
+            ))
+            .and_then(|xid| {
+                pigeonhole_format::wal::ExternalShare::encode(
+                    &xid,
+                    &streams,
+                    std::iter::empty(),
+                    None,
+                    &mut body,
+                )
+                .map_err(Error::from)
+            });
+        if let Err(e) = encoded {
+            // Unreachable for an xid its prepare encoded; the caller hears it, and the
+            // shares stay prepared (a reopen finds them in doubt).
+            if let Some(reply) = self.coord.get_mut(&id).and_then(|c| c.reply.take()) {
+                reply.notify(Err(e));
+            }
+            return;
+        }
+        // The abort's own seqno (ICR 0140's E1): held from here until its record is written,
+        // so a reader's frontier passes it only then, and released with nothing applied.
+        let (abort_seqno, commit_ts) = self.decide_commit();
+        self.pending.push(Member {
+            kind: MemberKind::CommitRecord {
+                participants: shards.into(),
+                apply_seqno: abort_seqno,
+                external_abort: Some(Box::new(body)),
+            },
+            durability,
+            seqno: id,
+            commit_ts,
+            bytes: Bytes::Streams(Vec::new()),
+            reply: Reply::None,
+            submitted_at: 0,
+            validate: None,
+            predicate: None,
+            ticket: None,
+            failed: None,
+            reserved: 0,
+            map_version: 0,
+            retry: None,
+            room_since: 0,
+            decoded: 0,
+            share_wait: 0,
+            rank: 0,
+            voted: false,
+        });
+        let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+    }
+
+    /// An External Abort's record settled (D329): its seqno is released with nothing
+    /// applied, the participants drop their shares, and the decide answers. A record that
+    /// failed to write is the decide's error, the shares still prepared: a reopen finds them
+    /// in doubt, and the caller decides again.
+    fn settle_external_abort(
+        &mut self,
+        id: Seqno,
+        abort_seqno: Seqno,
+        participants: &Holders,
+        result: Result<()>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        self.shared.clock.release(abort_seqno, &self.shared.shm);
+        let Some(c) = self.coord.get_mut(&id) else {
+            return;
+        };
+        let reply = c.reply.take();
         let info = CommitInfo {
             seqno: id,
             durability: c.durability,
         };
-        if let Some(reply) = c.reply.take() {
-            reply.notify(Ok(info.into()));
-        }
         let priority = c.priority;
-        let shards = c.shards.clone();
+        if let Err(e) = result {
+            if let Some(reply) = reply {
+                reply.notify(Err(e));
+            }
+            return;
+        }
         self.mark_aborted(id);
-        for p in shards {
+        for &p in participants.iter() {
             self.send(
                 p,
                 ShardMsg::Decide {
@@ -9851,6 +9953,9 @@ impl ShardState {
                 },
                 ctx,
             );
+        }
+        if let Some(reply) = reply {
+            reply.notify(Ok(info.into()));
         }
     }
 
@@ -9904,6 +10009,7 @@ impl ShardState {
             kind: MemberKind::CommitRecord {
                 participants: holders,
                 apply_seqno,
+                external_abort: None,
             },
             durability,
             seqno,
