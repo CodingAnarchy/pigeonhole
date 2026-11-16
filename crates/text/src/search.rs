@@ -826,6 +826,10 @@ impl<'t> Joined<'t> {
     /// the walk is made here, once, and the walk isn't paid for after point reads already
     /// were (ski-rental's price for not knowing). `None` for the lead's own postings, asked
     /// for only where the phrase occurs.
+    ///
+    /// Under an `id_prefix` the lead's `df` counts documents outside the prefix too, so
+    /// `asked` over-estimates and the walk can be chosen where point reads would have cost
+    /// less: slower then, never a different result (ai1249's S1 on #1997).
     fn new(
         term: &str,
         family: &'static str,
@@ -885,12 +889,13 @@ impl<'t> Joined<'t> {
         *number = found.1;
     }
 
-    fn open(&mut self, t: &'t Rows, s: &Snapshot) -> Result<&mut pigeonhole::RowCells<'t>> {
+    /// Opens the row's walk, once.
+    fn open(&mut self, t: &'t Rows, s: &Snapshot) -> Result<()> {
         if self.cells.is_none() {
             let cells = cells_of(t, s, &self.row, self.family, self.prefix.as_deref()).cells()?;
             self.cells = Some(cells);
         }
-        Ok(self.cells.as_mut().expect("opened above"))
+        Ok(())
     }
 
     /// Whether the term has a cell for `doc`, kept in `value` and `number` if so. `doc`s
