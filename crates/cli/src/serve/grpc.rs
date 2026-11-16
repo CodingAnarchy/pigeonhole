@@ -420,17 +420,14 @@ impl DataGrpc {
         call(&self.0, req, op).await
     }
 
-    /// A read a replica may serve (D328): its reply, with the `served-by` and `served-seqno`
-    /// headers when the client asked for a replica.
+    /// A read a replica may serve, on a cluster node (D328): its reply, with the
+    /// `served-by` and `served-seqno` headers when the client asked for a replica.
     async fn read<T, R>(
         &self,
         req: Request<T>,
         op: impl FnOnce(T) -> ServiceOp,
         pick: impl FnOnce(ServiceReply) -> Option<R>,
     ) -> Result<Response<R>, Status> {
-        if !self.0.router.is_cluster() {
-            return respond(self.call(req, op).await?, pick);
-        }
         let (reply, served) = call_served(&self.0, req, op).await?;
         let mut resp = respond(reply, pick)?;
         if let Some(served) = served {
@@ -1197,11 +1194,16 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::GetRequest>,
     ) -> Result<Response<proto::GetResponse>, Status> {
-        self.read(req, ServiceOp::Get, |r| match r {
+        let pick = |r| match r {
             ServiceReply::Get(r) => Some(r),
             _ => None,
-        })
-        .await
+        };
+        // A single node's read as it always went; a cluster node's, boxed, may be a
+        // replica's and says so (D328).
+        if !self.0.router.is_cluster() {
+            return respond(self.call(req, ServiceOp::Get).await?, pick);
+        }
+        Box::pin(self.read(req, ServiceOp::Get, pick)).await
     }
 
     async fn multi_get(
@@ -1218,11 +1220,16 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::ReadRowRequest>,
     ) -> Result<Response<proto::ReadRowResponse>, Status> {
-        self.read(req, ServiceOp::ReadRow, |r| match r {
+        let pick = |r| match r {
             ServiceReply::ReadRow(r) => Some(r),
             _ => None,
-        })
-        .await
+        };
+        // A single node's read as it always went; a cluster node's, boxed, may be a
+        // replica's and says so (D328).
+        if !self.0.router.is_cluster() {
+            return respond(self.call(req, ServiceOp::ReadRow).await?, pick);
+        }
+        Box::pin(self.read(req, ServiceOp::ReadRow, pick)).await
     }
 
     type ScanStream =
