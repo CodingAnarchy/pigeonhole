@@ -474,7 +474,9 @@ fn waiting_feed_polls_hold_no_blocking_pool_thread() {
 /// `--blocking-threads` (2), each held in flight until all are, then each one's op opening an
 /// uncached table on the pool. Had the messages held the pool's permits, as before the
 /// `/mcp` places, every op would wait for one forever (the requests' 20 s timeout fails the
-/// test); with the places, every read answers.
+/// test); with the places, every read answers. The uncached table open, which takes a pool
+/// permit, is what makes the test bite: were opens ever to leave the pool, it would pass
+/// without the places too, so a change that moves them must give the op another pool wait.
 #[test]
 fn mcp_messages_as_many_as_the_pool_still_reach_it() {
     blocking_threads(2);

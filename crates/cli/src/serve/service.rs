@@ -2981,7 +2981,9 @@ impl Service {
     ///   waits on another's;
     /// - (c) every other wait on the dispatch path is a try or bounded (`--max-concurrent`
     ///   sheds, a forward to a full node answers `Overloaded`, the memory place waits
-    ///   within the request timeout, the stream and scan places are tries);
+    ///   within the request timeout, the stream and scan places are tries; a charged reply
+    ///   a tool still holds keeps its in-flight bytes while the tool makes its next call,
+    ///   whose `budget_within` is bounded);
     /// - (d) tokio's blocking-thread cap leaves room for the ops beside the messages
     ///   (`--blocking-threads` + 16 + `--mcp-blocking`, `serve_shared`).
     ///

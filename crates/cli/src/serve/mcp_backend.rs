@@ -68,10 +68,16 @@ thread_local! {
 /// Runs `f` (a `/mcp` message, on its blocking thread) with its calls' ops within
 /// `deadline`.
 pub(super) fn within<T>(deadline: std::time::Instant, f: impl FnOnce() -> T) -> T {
+    /// Clears the deadline however `f` ends, a panic included: the pool reuses the thread.
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            DEADLINE.with(|d| d.set(None));
+        }
+    }
     DEADLINE.with(|d| d.set(Some(deadline)));
-    let out = f();
-    DEADLINE.with(|d| d.set(None));
-    out
+    let _clear = Clear;
+    f()
 }
 
 impl ServeBackend {
