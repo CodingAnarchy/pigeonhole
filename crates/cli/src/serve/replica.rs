@@ -489,15 +489,17 @@ const PENDING_FRESH: usize = 1024;
 impl Status {
     /// A message with the owner's durable frontier `primary_seqno` arrived at `at`.
     fn heard(&mut self, primary_seqno: u64, at: Instant) {
-        if self
-            .pending_fresh
-            .back()
-            .is_none_or(|&(seqno, _)| primary_seqno > seqno)
-        {
-            if self.pending_fresh.len() == PENDING_FRESH {
-                self.pending_fresh.pop_front();
+        match self.pending_fresh.back_mut() {
+            // The same frontier again (an idle owner's heartbeat): once applied through, the
+            // copy is fresh as of this later message (simp724's M1 on #1989).
+            Some((seqno, arrived)) if *seqno == primary_seqno => *arrived = at,
+            Some(&mut (seqno, _)) if primary_seqno < seqno => {}
+            _ => {
+                if self.pending_fresh.len() == PENDING_FRESH {
+                    self.pending_fresh.pop_front();
+                }
+                self.pending_fresh.push_back((primary_seqno, at));
             }
-            self.pending_fresh.push_back((primary_seqno, at));
         }
         self.settle_fresh();
     }
@@ -842,10 +844,10 @@ impl Replica {
     pub(crate) fn within(&self, max_lag_ms: u64) -> Result<(), ApiError> {
         let s = self.status();
         let lag = self.lag_ms(&s);
-        let serves = matches!(
-            s.state,
-            State::Following | State::Retrying | State::ReBootstrapping
-        ) && s.fresh_at.is_some();
+        // Not while it bootstraps again: after a new history (a relocate without copy, a
+        // restore) the old copy may hold writes the new owner never had, so it isn't a
+        // stale prefix of P's history (simp724's M2 on #1989).
+        let serves = matches!(s.state, State::Following | State::Retrying) && s.fresh_at.is_some();
         if serves && lag <= max_lag_ms {
             return Ok(());
         }
@@ -1195,6 +1197,11 @@ impl Replica {
         // relocate without copy, a restore): its token can't resume there, and the owner
         // can't say so, as it can't tell which partition another database's token was for.
         if let Some(why) = self.history_moved(&db).await {
+            // Its freshness was of the old history's: none until the new copy is followed.
+            let mut s = self.status();
+            s.fresh_at = None;
+            s.pending_fresh.clear();
+            drop(s);
             return Halt::Expired(why);
         }
         let channel = match self.connect().await {
@@ -1687,13 +1694,16 @@ mod tests {
         s.applied = 260;
         s.settle_fresh();
         assert_eq!(s.fresh_at, Some(at(10)));
-        // A message with no newer frontier adds nothing, and an idle owner's message, whose
-        // frontier the copy already holds, makes it fresh as of its arrival at once.
+        // The same frontier again moves the pending message's arrival to the later one, and
+        // an idle owner's message, whose frontier the copy already holds, makes it fresh as
+        // of that message's arrival at once (simp724's M1 on #1989).
         s.heard(400, at(25));
         assert_eq!(s.pending_fresh.len(), 1);
         s.applied = 400;
         s.heard(400, at(30));
-        assert_eq!(s.fresh_at, Some(at(20)), "the first message naming 400");
+        assert_eq!(s.fresh_at, Some(at(30)), "the latest message naming 400");
+        s.heard(400, at(35));
+        assert_eq!(s.fresh_at, Some(at(35)), "an idle owner's heartbeat");
         s.heard(401, at(40));
         s.applied = 401;
         s.settle_fresh();

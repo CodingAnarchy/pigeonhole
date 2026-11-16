@@ -742,3 +742,20 @@ fn a_read_across_partitions_with_a_seqno_is_refused() {
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e:?}");
     });
 }
+
+/// simp724's M1 on #1989: an idle owner's heartbeats name the same durable frontier, and
+/// each keeps its copy fresh. After 3 s with no writes, a read allowing 1.5 s is still the
+/// replica's.
+#[test]
+fn an_idle_owners_replica_stays_fresh() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let (value, by, _) = read_through(ports[1], "k1", Some(1500), None)
+            .await
+            .unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        assert_eq!(by.as_deref(), Some("replica"));
+    });
+}
