@@ -4,7 +4,10 @@
 //! is its own: a move tells the operator to run it again, a restore resumes.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use prost::bytes::Bytes;
 
@@ -39,12 +42,15 @@ pub(super) enum Stopped<E> {
     Status(tonic::Status),
     /// The source failed. It is reported before the upload's own answer.
     Source(E),
+    /// The node took none of the file for the pass's stall bound, with the connection up
+    /// (#1950). The upload is dropped unanswered; what the node holds is there to resume.
+    Stalled,
     /// The node refused the upload, or it broke.
     Upload(tonic::Status),
 }
 
-/// The upload's stream ended: the node answered or the call broke, and
-/// [`upload_file`] has the reason.
+/// The upload's stream ended: the node answered, the call broke, or the node took nothing
+/// for the stall bound. [`upload_file`] has the reason.
 #[derive(Debug)]
 pub(super) struct Ended;
 
@@ -55,6 +61,12 @@ pub(super) struct Feed {
     header: Option<PartitionUploadHeader>,
     at: u64,
     max: usize,
+    /// The longest one message waits for room: the node takes messages as it writes them,
+    /// so longer than this with none taken is a node that stopped reading.
+    stall: Duration,
+    /// Set when a message waited `stall`, for [`upload_file`]. `Relaxed` throughout: the
+    /// source that sets it and the pass that reads it are polled by one task.
+    stalled: Arc<AtomicBool>,
 }
 
 impl Feed {
@@ -71,19 +83,24 @@ impl Feed {
     /// Sends `data` in messages of at most [`max`](Self::max) bytes. The first message of
     /// the pass carries the header, and is sent even when `data` is empty: a file with
     /// nothing left to send still needs its header for the node to finish it (an empty file,
-    /// or one whose every byte arrived before a break).
+    /// or one whose every byte arrived before a break). A message the node leaves no room
+    /// for within the stall bound ends the feed, as a node's answer does (#1950).
     pub(super) async fn send(&mut self, data: Bytes) -> Result<(), Ended> {
         let mut k = 0;
         while k < data.len() || self.header.is_some() {
             let n = (data.len() - k).min(self.max);
-            self.tx
-                .send(PartitionUploadChunk {
-                    header: self.header.take(),
-                    offset: self.at,
-                    data: data.slice(k..k + n),
-                })
-                .await
-                .map_err(|_| Ended)?;
+            let message = PartitionUploadChunk {
+                header: self.header.take(),
+                offset: self.at,
+                data: data.slice(k..k + n),
+            };
+            match tokio::time::timeout(self.stall, self.tx.send(message)).await {
+                Ok(sent) => sent.map_err(|_| Ended)?,
+                Err(_) => {
+                    self.stalled.store(true, Ordering::Relaxed);
+                    return Err(Ended);
+                }
+            }
             k += n;
             self.at += n as u64;
         }
@@ -110,10 +127,19 @@ impl futures_core::Stream for Chunks {
 /// a [`Feed`], and runs beside the upload; the upload's stream ends when `source` returns.
 /// The result is what `source` returned and the node's reply. The reply's `complete` is
 /// the caller's to check.
+///
+/// A status call the node doesn't answer within `stall`, or a message it takes none of for
+/// that long, ends the pass as [`Stopped::Stalled`],
+/// without waiting for an answer that node may never give. The wait for the node's reply
+/// once everything is sent has no bound: the node hashes and syncs the whole file first.
+///
+/// `stall` is one bound for both waits, the status call's included: sized for a node's
+/// slowest healthy answer, not tuned down as a per-message figure.
 pub(super) async fn upload_file<T, E, F>(
     admin: &mut Admin,
     token: Option<&str>,
     header: PartitionUploadHeader,
+    stall: Duration,
     source: impl FnOnce(u64, Feed) -> F,
 ) -> Result<Option<(T, PartitionUploadReply)>, Stopped<E>>
 where
@@ -127,20 +153,25 @@ where
         token,
     )
     .map_err(Stopped::Request)?;
-    let st = admin
-        .partition_upload_status(status)
+    // Bounded like a message: a node that takes the call and never answers it has stopped
+    // reading just the same.
+    let st = tokio::time::timeout(stall, admin.partition_upload_status(status))
         .await
+        .map_err(|_| Stopped::Stalled)?
         .map_err(Stopped::Status)?
         .into_inner();
     if st.complete || st.installing {
         return Ok(None);
     }
     let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let stalled = Arc::new(AtomicBool::new(false));
     let feed = Feed {
         tx,
         header: Some(header),
         at: st.received,
         max: chunk_size(st.max_chunk),
+        stall,
+        stalled: Arc::clone(&stalled),
     };
     let upload = async {
         let chunks = request(Chunks(rx), token).map_err(Stopped::Request)?;
@@ -150,9 +181,25 @@ where
             .map(tonic::Response::into_inner)
             .map_err(Stopped::Upload)
     };
-    // `source` owns the feed, so the upload's stream ends when it returns.
-    let (sent, reply) = tokio::join!(source(st.received, feed), upload);
+    // `source` owns the feed, so the upload's stream ends when it returns. The upload runs
+    // beside it, and may answer first (a refusal).
+    let source = source(st.received, feed);
+    tokio::pin!(source, upload);
+    let mut reply = None;
+    let sent = loop {
+        tokio::select! {
+            sent = &mut source => break sent,
+            r = &mut upload, if reply.is_none() => reply = Some(r),
+        }
+    };
+    if stalled.load(Ordering::Relaxed) {
+        return Err(Stopped::Stalled);
+    }
     let sent = sent.map_err(Stopped::Source)?;
+    let reply = match reply {
+        Some(r) => r,
+        None => upload.await,
+    };
     Ok(Some((sent, reply?)))
 }
 
@@ -172,6 +219,8 @@ mod tests {
                 header: Some(header),
                 at,
                 max,
+                stall: Duration::from_millis(50),
+                stalled: Arc::default(),
             },
             rx,
         )
@@ -219,6 +268,20 @@ mod tests {
         f.send(Bytes::new()).await.unwrap();
         f.send(Bytes::new()).await.unwrap();
         assert_eq!(sent(rx), [(true, 7, 0)]);
+    }
+
+    #[tokio::test]
+    async fn a_message_nothing_takes_within_the_stall_bound_ends_the_feed() {
+        // #1950: the channel holds 8 messages. With nothing reading, the ninth waits the
+        // bound (50 ms here) and no longer.
+        let (mut f, _rx) = feed(1, 0);
+        f.send(Bytes::from_static(b"01234567")).await.unwrap();
+        assert!(!f.stalled.load(Ordering::Relaxed));
+        let started = std::time::Instant::now();
+        assert!(f.send(Bytes::from_static(b"8")).await.is_err());
+        assert!(f.stalled.load(Ordering::Relaxed));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(f.at(), 8, "the message that found no room wasn't counted");
     }
 
     #[tokio::test]
