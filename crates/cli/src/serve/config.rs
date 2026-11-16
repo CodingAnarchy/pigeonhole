@@ -44,9 +44,10 @@ pub(crate) struct ServeArgs {
     /// can then read and write everything. For trusted private networks only.
     #[arg(long)]
     pub insecure_no_tls_no_auth: bool,
-    /// The database's shard count (default: half the physical cores, leaving the rest for the
-    /// network side, on every open; a database with a change feed keeps the count the feed
-    /// recorded). A count other than the feed's reshards it and ends the feed's history.
+    /// The database's shard count (default: half the physical cores this process may run on,
+    /// leaving the rest for the network side, on every open; a database with a change feed
+    /// keeps the count the feed recorded). A count other than the feed's reshards it and ends
+    /// the feed's history.
     #[arg(long, value_name = "N")]
     pub shards: Option<usize>,
     /// Threads dedicated to flush and compaction, pinned (default: a quarter of the physical
