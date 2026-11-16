@@ -3026,21 +3026,6 @@ impl Service {
         self.lite.drain(timeout)
     }
 
-    /// Runs a small, bounded sync call on the light pool if it has a place free now, else on
-    /// the blocking pool, as [`Service::blocking`] (#1880). Only calls whose work per call is
-    /// bounded and small belong here: the light pool runs on the shards' SMT siblings.
-    pub(crate) async fn lite<T: Send + 'static>(
-        &self,
-        f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
-    ) -> Result<T, ApiError> {
-        match self.lite.try_run(f) {
-            Ok(reply) => reply
-                .await
-                .map_err(|_| ApiError::internal("the light pool's call was lost"))?,
-            Err(f) => self.blocking(f).await,
-        }
-    }
-
     /// A `--max-streams` place, now or `Overloaded`: a feed or watch stream's, or a `/mcp`
     /// `feed_poll`'s for its wait.
     pub(crate) fn stream_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
@@ -3698,11 +3683,21 @@ impl Service {
             Ok((reply, r))
         };
         // A page within the default budget is a small, bounded read: the light pool, on the
-        // siblings too. A larger one stays off them (perf287's note on #1880).
-        if budget <= DEFAULT_PAGE_BYTES {
-            self.lite(read).await
+        // siblings too. A larger one stays off them (perf287's note on #1880). The pool is
+        // tried before any await, so the future holds either the reply or the blocking call,
+        // never the closure twice: held across both, it grew every call's dispatch future,
+        // and moving it cost Get and Mutate about 550 instructions of memcpy a call (x86
+        // callgrind on #1972; boxing it instead cost each ReadRow about 10K).
+        let lite = if budget <= DEFAULT_PAGE_BYTES {
+            self.lite.try_run(read)
         } else {
-            self.blocking(read).await
+            Err(read)
+        };
+        match lite {
+            Ok(reply) => reply
+                .await
+                .map_err(|_| ApiError::internal("the light pool's call was lost"))?,
+            Err(read) => self.blocking(read).await,
         }
     }
 
