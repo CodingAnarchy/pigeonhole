@@ -2171,6 +2171,9 @@ pub(crate) struct WaitingSingle {
 /// A share this shard prepared and holds until the decision.
 #[derive(Debug)]
 struct PreparedShare {
+    /// An external transaction's share (D329): kept in doubt across a close and a reopen,
+    /// and decided only by `Engine::decide`.
+    external: Option<Arc<ExternalReq>>,
     bytes: Arc<BatchBuilder>,
     commit_ts: Timestamp,
     /// Arena bytes reserved until the decision.
@@ -9498,6 +9501,43 @@ impl ShardState {
         );
     }
 
+    /// An external PREPARE's record body (D329): `ext`'s xid, the streams of `req`'s
+    /// participants, the reads this shard owns (as [`conflicts`](Self::conflicts) filters
+    /// them, so the logged reads are the ones it validates), and the batch.
+    fn external_share(&self, ext: &ExternalReq, req: &PrepareReq) -> Result<Vec<u8>> {
+        use pigeonhole_format::wal::{ExternalRead, ExternalShare};
+        let streams: Vec<StreamId> = req
+            .participants
+            .iter()
+            .map(|s| StreamId(u32::from(s.0)))
+            .collect();
+        let reads: Vec<ExternalRead<'_>> = req
+            .validate
+            .iter()
+            .flat_map(|v| v.reads.iter())
+            .filter(|r| {
+                self.tablets
+                    .route(r.table, &r.row)
+                    .is_some_and(|(_, shard)| shard == self.id)
+            })
+            .map(|r| ExternalRead {
+                table: r.table,
+                family: r.family,
+                row: &r.row,
+                qualifier: r.qualifier.as_deref(),
+            })
+            .collect();
+        let mut body = Vec::new();
+        ExternalShare::encode(
+            &ext.xid,
+            &streams,
+            reads.into_iter(),
+            Some(req.bytes.batch()),
+            &mut body,
+        )?;
+        Ok(body)
+    }
+
     fn on_prepare(&mut self, req: PrepareReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.closing || self.poisoned {
             let error = Some(if self.closing {
@@ -9516,9 +9556,34 @@ impl ShardState {
             );
             return;
         }
+        // An external share's record body (D329, FORMAT §10.3): the xid, every participant's
+        // stream, the reads this shard validates, then the batch. Built once, here: a rare path.
+        let external = match &req.external {
+            None => None,
+            Some(ext) => match self.external_share(ext, &req) {
+                Ok(body) => Some(Box::new(body)),
+                Err(e) => {
+                    trace!(
+                        "shard {} external prepare {} refused: {e}",
+                        self.id.0, req.seqno
+                    );
+                    self.send(
+                        req.coordinator,
+                        ShardMsg::Prepared {
+                            seqno: req.seqno,
+                            from: self.id,
+                            error: Some(PrepareError::Io),
+                        },
+                        ctx,
+                    );
+                    return;
+                }
+            },
+        };
         self.prepared.insert(
             req.seqno,
             PreparedShare {
+                external: req.external.clone(),
                 bytes: Arc::clone(&req.bytes),
                 // A lower bound set at admission; the decision's timestamp lands later.
                 commit_ts: 0,
@@ -9536,7 +9601,7 @@ impl ShardState {
         self.pending.push(Member {
             kind: MemberKind::Prepare {
                 coordinator: req.coordinator,
-                external: None,
+                external,
             },
             durability: req.durability,
             seqno: req.seqno,
@@ -9655,6 +9720,27 @@ impl ShardState {
             }
             return;
         }
+        // An external transaction (D329): every share is prepared and logged, so the caller
+        // hears so, and the decision waits for `Engine::decide` (`on_external_decide`).
+        if c.external.is_some() {
+            c.awaiting = true;
+            let info = CommitInfo {
+                seqno,
+                durability: c.durability,
+            };
+            if let Some(reply) = c.reply.take() {
+                reply.notify(Ok(info.into()));
+            }
+            return;
+        }
+        self.commit_round(seqno, ctx);
+    }
+
+    /// Commits a cross-shard commit every participant prepared (`seqno` is its id): the
+    /// decision's seqno and timestamp, then its DECISION record, whose settle sends the
+    /// `Decide`s (D263, D278).
+    fn commit_round(&mut self, seqno: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let c = self.coord.get_mut(&seqno).expect("present");
         c.committing = true;
         let reads = c.validate.as_ref().is_some_and(|v| !v.reads.is_empty());
         self.shared.metrics[usize::from(self.id.0)]
