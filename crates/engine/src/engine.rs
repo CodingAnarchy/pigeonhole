@@ -5355,17 +5355,7 @@ impl Inner {
             if meta.options.kind.is_aggregate() {
                 fixed_ts |= check_counter_write(&m, meta, catalog)?;
                 counter_writes += usize::from(matches!(m.kind, Kind::Put | Kind::Merge));
-                converts |= match (meta.options.kind, m.kind) {
-                    (FamilyKind::Hll | FamilyKind::Bloom, Kind::Merge) => true,
-                    (
-                        FamilyKind::SumF64
-                        | FamilyKind::MeanVar
-                        | FamilyKind::Histogram
-                        | FamilyKind::Quantiles,
-                        Kind::Put,
-                    ) => m.value.first() == Some(&(ValueTag::F64 as u8)),
-                    _ => false,
-                };
+                converts |= counter_write_converts(meta.options.kind, &m);
             } else if m.kind == Kind::Put
                 && (meta.options.kind == FamilyKind::Vector
                     || m.value.first() == Some(&(ValueTag::Vector as u8)))
@@ -6493,6 +6483,24 @@ fn family_name(catalog: &Catalog, table: TableId, family: FamilyId) -> String {
     }
 }
 
+/// Whether a counter-family write is rewritten before the WAL (D294, D298): an HLL or bloom
+/// input (an element, written as its one-element state), or an `f64` put into a state kind
+/// (the state of that one input). [`prepare_counter_writes`]' pass-through path relies on
+/// there being none.
+fn counter_write_converts(kind: FamilyKind, m: &Mutation<'_>) -> bool {
+    match (kind, m.kind) {
+        (FamilyKind::Hll | FamilyKind::Bloom, Kind::Merge) => true,
+        (
+            FamilyKind::SumF64
+            | FamilyKind::MeanVar
+            | FamilyKind::Histogram
+            | FamilyKind::Quantiles,
+            Kind::Put,
+        ) => m.value.first() == Some(&(ValueTag::F64 as u8)),
+        _ => false,
+    }
+}
+
 /// `(table, family, row, qualifier, timestamp)` of a cell in a batch.
 type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 
@@ -6524,6 +6532,12 @@ fn prepare_counter_writes(
             if aggregate && matches!(m.kind, Kind::Put | Kind::Merge) {
                 m.ts.get_or_insert(COUNTER_TS);
             }
+            debug_assert!(
+                !catalog
+                    .family(m.family)
+                    .is_some_and(|f| counter_write_converts(f.options.kind, &m)),
+                "a write to convert reached the pass-through path"
+            );
             out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
         }
         return Ok(out);
