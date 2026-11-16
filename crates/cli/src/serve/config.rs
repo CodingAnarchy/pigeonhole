@@ -17,8 +17,9 @@ pub(crate) enum Affinity {
 }
 
 /// `--feed-hub-coalesce-ticks`' default (#1901): 1 on Linux, where a 1 ms tokio sleep lasts
-/// about 2 ms; 0 on Windows and macOS, where an idle runtime's 1 ms sleep lasts 10–16 ms (the
-/// OS timer's tick), too much lag for a server with few hubs (the owner's call, 2026-11-16).
+/// about 2 ms; 0 on Windows and macOS, where an idle runtime's 1 ms sleep lasts the OS timer's
+/// tick (about 14–16 ms on Windows, 3–10 ms and up to 30 ms on macOS), too much lag for a
+/// server with few hubs (the owner's call, 2026-11-16).
 const DEFAULT_HUB_COALESCE_TICKS: u32 = if cfg!(target_os = "linux") { 1 } else { 0 };
 
 /// `phdb serve`'s arguments.
@@ -185,9 +186,9 @@ pub(crate) struct ServeArgs {
     ///
     /// A 1-tick wait really lasts, at p50 (p99), with the hub threads otherwise idle: Linux
     /// 2.1 ms (2.1 ms), Windows 13.6 ms (16 ms), macOS 3–10 ms (up to 30 ms). With other busy
-    /// hubs on the hub threads it lasts about 2 ms on all three. So on Windows and macOS a
-    /// server with few hubs would pay 10–16 ms of lag per wait; one with many busy hubs can
-    /// opt in with 1.
+    /// hubs on the hub threads it lasts about 2 ms on all three. So a server with few hubs
+    /// would pay about 14–16 ms of lag per wait on Windows, and 3–10 ms (up to 30 ms) on
+    /// macOS; one with many busy hubs can opt in with 1.
     #[arg(long, value_name = "TICKS", default_value_t = DEFAULT_HUB_COALESCE_TICKS)]
     pub feed_hub_coalesce_ticks: u32,
     /// As `--feed-hub-coalesce-ticks`, for each subscriber's stream after it delivered a small

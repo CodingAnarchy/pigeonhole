@@ -80,7 +80,8 @@ pub(crate) struct FeedLimits {
 /// core, waking once per commit). The wait comes after work, never before it: a commit after
 /// a quiet gap longer than the wait is read at once. Zero never waits; `phdb serve` waits one
 /// tick on the hub side by default on Linux, and none elsewhere, where a tick lasts the OS
-/// timer's 10–16 ms (`--feed-hub-coalesce-ticks`). Tests keep zero.
+/// timer's: about 14–16 ms on Windows, 3–10 ms (up to 30 ms) on macOS
+/// (`--feed-hub-coalesce-ticks`). Tests keep zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Coalesce {
     pub hub: Duration,

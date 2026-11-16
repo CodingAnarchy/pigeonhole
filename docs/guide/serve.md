@@ -332,7 +332,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
     | Windows | 13.6 ms (16 ms) | 2.0 ms |
     | macOS | 3–10 ms (up to 30 ms) | 2.0 ms |
 
-    Measured with tokio 1.54.1 on GitHub's runners and an Apple-silicon Mac (#1938). Windows' timer ticks every 15.6 ms, and macOS coalesces timer wakes. A server with few hubs would pay 10–16 ms of lag per wait there, so the default doesn't wait. **On Windows or macOS,** a server with many busy hubs can opt in with `--feed-hub-coalesce-ticks 1`.
+    Measured with tokio 1.54.1 on GitHub's runners and an Apple-silicon Mac (#1938). Windows' timer ticks every 15.6 ms, and macOS coalesces timer wakes. A server with few hubs would pay about 14–16 ms of lag per wait on Windows, and 3–10 ms (up to 30 ms) on macOS, so the default doesn't wait there. **On Windows or macOS,** a server with many busy hubs can opt in with `--feed-hub-coalesce-ticks 1`.
   - **Batched notifies:** whatever these are set to, a hub tells its streams about new commits once per batch it reads, not once per commit.
 
   **At saturation, writes come first.** When the feed side can't deliver every commit, the writes still get the rate they ask for, and feed streams fall behind and catch up. `pigeonhole_serve_feed_fell_behind_total` and the streams' lag show it.
