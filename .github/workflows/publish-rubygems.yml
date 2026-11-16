@@ -76,3 +76,36 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           for g in pkg/pigeonhole-db-"$version"-*.gem; do gem push "$g"; done
           gem push pkg/pigeonhole-db-"$version".gem
+
+  # The build's caches (rb-sys-dock-*, about 1.4 GB for seven platforms) are saved under the
+  # tag, where only this tag's runs can read them: once the gems are built they are never
+  # restored again, and they push main's caches out of the repo's 10 GB limit (#1966). The
+  # ref is matched by suffix: GitHub has recorded a tag's caches as refs/heads/refs/tags/vX.
+  drop-tag-caches:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write  # deleting caches; this job only
+    steps:
+      - name: Delete the tag's caches
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_REF: refs/tags/${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+            --jq ".actions_caches[] | select(.ref | endswith(env.TAG_REF)) | .id")
+          n=0
+          for id in $ids; do
+            # Evicted, or deleted by another run, since the list: not a failure.
+            if gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null; then
+              n=$((n + 1))
+            else
+              echo "cache $id: already gone"
+            fi
+          done
+          echo "deleted $n caches for $TAG_REF"
