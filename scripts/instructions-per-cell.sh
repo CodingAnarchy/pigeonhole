@@ -136,8 +136,11 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
         ir=$(callgrind '*hotrow_iteration*' "$env_set" "$bin" 20 "$work")
         report "$name" "$ir" "$(units_of "$work/err")"
     done
+    k=0
     while read -r shape_bin name; do
         ir=$(callgrind '*shape_*' "" "$shape_bin" "$name" 4 "$work")
+        k=$((k + 1))
+        if [[ -n "${CG_KEEP_DIR:-}" ]]; then cp "$work/cg.out" "$CG_KEEP_DIR/$k-$name.cg"; fi
         report "$name" "$ir" "$(units_of "$work/err")"
     done < <(shape_runs "$@")
     for group in "$@"; do
