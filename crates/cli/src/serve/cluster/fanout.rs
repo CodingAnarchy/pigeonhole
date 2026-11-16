@@ -22,7 +22,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use super::forward;
 use super::position::{Kind, Position};
@@ -36,7 +36,8 @@ use crate::serve::proto::{
 };
 use crate::serve::router::{Cluster, Place, Router, Target};
 use crate::serve::service::{
-    PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, page_bytes, room,
+    PageSlot, ScanOpener, ScanPages, ServiceOp, ServiceReply, budget_within, continues, page_bytes,
+    queue_page, room,
 };
 use tokio::sync::Semaphore;
 
@@ -569,8 +570,6 @@ impl Router {
         }
         let slot = self.service.scan_slot()?;
         drop(request);
-        let (tx, rx) = mpsc::channel(1);
-        let (end_tx, end_rx) = oneshot::channel();
         let job = ScanJob {
             reach,
             here,
@@ -583,23 +582,11 @@ impl Router {
             inflight: Arc::clone(self.service.inflight()),
         };
         let metrics = Arc::clone(&self.service.metrics);
-        let started = std::time::Instant::now();
-        tokio::spawn(async move {
-            let outcome = match tokio::spawn(job.run(tx)).await {
-                Ok(outcome) => outcome.map_err(ApiError::for_read),
-                Err(e) => Err(ApiError::internal(format!("the scan failed: {e}"))),
-            };
-            metrics.count(
-                crate::serve::service::SCAN,
-                outcome.as_ref().err().map(|e| e.code.as_str()),
-                started.elapsed(),
-            );
-            drop(slot);
-            if let Err(e) = outcome {
-                let _ = end_tx.send(e);
-            }
-        });
-        Ok(ServiceReply::Scan(ScanPages::new(rx, end_rx)))
+        Ok(ServiceReply::Scan(ScanPages::spawn(
+            |pages| job.run(pages),
+            Some(slot),
+            Some(metrics),
+        )))
     }
 
     /// A partition's part of a scan another node fans out (D317 ticket 4a): served only if
@@ -1379,18 +1366,7 @@ impl ScanJob {
                 let Some(space) = room(&pages, &mut queued, limits.stream_idle).await? else {
                     return Ok(());
                 };
-                let paid = match paid {
-                    Some(paid) => paid,
-                    None => {
-                        let share = usize::try_from(page.bytes)
-                            .unwrap_or(usize::MAX)
-                            .min(limits.max_request_bytes);
-                        budget_within(&self.inflight, share, limits.request_timeout).await?
-                    }
-                };
-                let slot: PageSlot = Arc::new(std::sync::Mutex::new(Some((page, paid))));
-                space.send(Arc::clone(&slot));
-                queued = Some(slot);
+                queued = Some(queue_page(space, page, paid, &self.inflight, &limits).await?);
                 sent_any = true;
             }};
         }
@@ -1442,10 +1418,7 @@ impl ScanJob {
                 if self.limits.hold_after_part_page {
                     hold_after_part_page(&self.inflight).await;
                 }
-                let continued = matches!(
-                    (&last_row, page.rows.first()),
-                    (Some(p), Some(first)) if first.key[..] == p[..]
-                );
+                let continued = continues(last_row.as_deref(), &page.rows);
                 if let Some(n) = remaining.as_mut() {
                     let new_rows = page.rows.len() as u64 - u64::from(continued);
                     *n = n.saturating_sub(new_rows);
