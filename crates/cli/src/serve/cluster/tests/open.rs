@@ -333,6 +333,7 @@ fn opened_off_the_others_cores_alone() {
         epoch: 1,
         memory_bytes: 0,
         history_epoch: 0,
+        replicas: Vec::new(),
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
