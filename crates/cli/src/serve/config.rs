@@ -16,6 +16,11 @@ pub(crate) enum Affinity {
     Off,
 }
 
+/// `--feed-hub-coalesce-ticks`' default (#1901): 1 on Linux, where a 1 ms tokio sleep lasts
+/// about 2 ms; 0 on Windows and macOS, where an idle runtime's 1 ms sleep lasts 10–16 ms (the
+/// OS timer's tick), too much lag for a server with few hubs (the owner's call, 2026-11-16).
+const DEFAULT_HUB_COALESCE_TICKS: u32 = if cfg!(target_os = "linux") { 1 } else { 0 };
+
 /// `phdb serve`'s arguments.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
@@ -171,11 +176,19 @@ pub(crate) struct ServeArgs {
     /// After reading a small batch (a few commits), a subscription's hub waits this many
     /// timer ticks (1 ms each) before reading its change feed again, so the commits arriving
     /// meanwhile are read together: fewer wakes per commit for a few milliseconds more lag
-    /// under steady writes. A commit after a quiet gap is never held back. The default, 1,
-    /// cut CPU per delivered event about 40% on the reference machine, with feed lag p99
-    /// about 3.5 ms at 20K puts/s and 2.2–2.8 ms at 2K. 0 never waits, for the lowest lag
-    /// (#1901).
-    #[arg(long, value_name = "TICKS", default_value_t = 1)]
+    /// under steady writes. A commit after a quiet gap is never held back. 0 never waits, for
+    /// the lowest lag (#1901).
+    ///
+    /// The default is 1 on Linux and 0 elsewhere. On Linux, 1 cut CPU per delivered event
+    /// about 40% on the reference machine, with feed lag p99 about 3.5 ms at 20K puts/s and
+    /// 2.2–2.8 ms at 2K.
+    ///
+    /// A 1-tick wait really lasts, at p50 (p99), with the hub threads otherwise idle: Linux
+    /// 2.1 ms (2.1 ms), Windows 13.6 ms (16 ms), macOS 3–10 ms (up to 30 ms). With other busy
+    /// hubs on the hub threads it lasts about 2 ms on all three. So on Windows and macOS a
+    /// server with few hubs would pay 10–16 ms of lag per wait; one with many busy hubs can
+    /// opt in with 1.
+    #[arg(long, value_name = "TICKS", default_value_t = DEFAULT_HUB_COALESCE_TICKS)]
     pub feed_hub_coalesce_ticks: u32,
     /// As `--feed-hub-coalesce-ticks`, for each subscriber's stream after it delivered a small
     /// batch. 0 (the default) never waits (#1901).
@@ -555,6 +568,24 @@ mod tests {
                 "{flag:?}"
             );
         }
+    }
+
+    /// #1901: the hub waits a tick by default on Linux only, and the flag sets it anywhere.
+    #[test]
+    fn the_hub_coalesce_default_is_one_tick_on_linux_only() {
+        let ticks = |argv: &[&str]| match crate::args::Cli::try_parse_from(argv).unwrap().command {
+            crate::args::Command::Serve(args) => (
+                args.feed_hub_coalesce_ticks,
+                args.feed_client_coalesce_ticks,
+            ),
+            _ => unreachable!(),
+        };
+        let hub = if cfg!(target_os = "linux") { 1 } else { 0 };
+        assert_eq!(ticks(&["phdb", "serve", "db.phdb"]), (hub, 0));
+        let set = ["phdb", "serve", "db.phdb", "--feed-hub-coalesce-ticks", "1"];
+        assert_eq!(ticks(&set), (1, 0));
+        let off = ["phdb", "serve", "db.phdb", "--feed-hub-coalesce-ticks", "0"];
+        assert_eq!(ticks(&off), (0, 0));
     }
 
     #[test]
