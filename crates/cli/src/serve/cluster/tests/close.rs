@@ -379,11 +379,37 @@ fn a_partition_closing_shows_closed_without_the_writer_locks_error() {
     }
 }
 
+/// A file's mode changed until dropped, so a test that fails leaves no unreadable file.
+#[cfg(unix)]
+struct Mode {
+    file: std::path::PathBuf,
+    was: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Mode {
+    fn set(file: &std::path::Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let was = std::fs::metadata(file).unwrap().permissions();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(mode)).unwrap();
+        Self {
+            file: file.to_owned(),
+            was,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Mode {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.file, self.was.clone());
+    }
+}
+
 /// Closing a closed partition whose hash failed takes the hash again, and returns.
 #[cfg(unix)]
 #[test]
 fn a_close_again_after_a_failed_hash_hashes_again() {
-    use std::os::unix::fs::PermissionsExt;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -419,13 +445,19 @@ fn a_close_again_after_a_failed_hash_hashes_again() {
             .unwrap();
         // Unreadable once closed: the open database keeps its descriptor, the hash can't
         // open the file.
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = Mode::set(&file, 0o000);
+        if std::fs::File::open(&file).is_ok() {
+            // Root reads a file whatever its mode (a container's default user), so the
+            // hash can't be made to fail this way.
+            eprintln!("skipped: this user can open a file of mode 000");
+            return;
+        }
         close(a, "p1").await.unwrap();
         eventually("p1's hash to fail", async || {
             !local(a, "p1").await.error.is_empty()
         })
         .await;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(unreadable);
         tokio::time::timeout(std::time::Duration::from_secs(10), close(a, "p1"))
             .await
             .expect("the close again returns")
