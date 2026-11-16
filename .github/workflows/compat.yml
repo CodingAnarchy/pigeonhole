@@ -72,6 +72,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.published.outputs.yes == 'true'
         with:
+          # (#1961) PR runs restore main's caches without saving their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             . -> target
             ${{ matrix.reader }} -> target
