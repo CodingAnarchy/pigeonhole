@@ -152,51 +152,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: hotrow instructions per cell (callgrind)
-            # Examples built at base and head (crates/bench/examples/NAME.rs). The base is
-            # built with the head's sources of these files, so a new or changed example still
-            # has a baseline.
-            examples: hotrow readshapes writepath ycsb scanrate asyncwrites
-            # The hot row's three states run too (scripts/instructions-per-cell.sh's first
-            # argument); `-` skips them.
-            hotrow: hotrow
-            # Shape binaries and their shapes, `EXAMPLE:shape,shape,...` (space-separated), in
-            # the contract of scripts/instructions-per-cell.sh. Add a shape here and it is
-            # reported and checked for regressions on every PR. The write shapes run with
-            # `Options::commit_spin(ZERO)` (crates/bench/examples/support/shards.rs): how
-            # often a waiting client polls depends on thread timing (D198), so counting it
-            # would make the shapes nondeterministic. The default spin is checked on wall
-            # time instead, by crates/bench/examples/commitpath.rs (commit-latency.yml).
-            shapes: >-
-              readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,wide-row-cells-async,scan-budget,scan-budget-twin,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered,knn-exact-f16,knn-exact-bf16,knn-budget
-              writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-put-previous,commit-if-returning,flush,compact
-              ycsb:ycsb-c,ycsb-a
-              scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
-              asyncwrites:commit-put-previous-async,commit-if-returning-async
-          - name: text search instructions per search (callgrind)
-            # The sync text search's floor (#1560 PR 0, crates/bench/examples/textshapes.rs).
-            examples: textshapes
+          - name: commit noise investigation (#1795, scratch)
+            examples: writepath
             hotrow: '-'
             shapes: >-
-              textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2,text-two-terms-prefix-none,text-fuzzy-prefix-none
-          - name: feed and replication instructions per commit (callgrind)
-            # The change feed's drain and a replica's apply (#1828,
-            # crates/bench/examples/feedshapes.rs): commits written in setup, drained or
-            # applied in the measured part. `replicate-apply` last: its setup (a primary and
-            # its feed) is the fullest.
-            examples: feedshapes
-            hotrow: '-'
-            shapes: >-
-              feedshapes:feed-drain,feed-drain-all,replicate-apply
-          - name: phdb serve instructions per call (callgrind)
-            # `phdb serve`'s gRPC calls through its router in process (#1828,
-            # crates/bench/examples/serveshapes.rs): the token check, prepay, decode,
-            # admission, handler, conversion and encode, not the shards' side. `serve-scan`
-            # last: its setup is the fullest (it warms the most rows).
-            examples: serveshapes
-            hotrow: '-'
-            shapes: >-
-              serveshapes:serve-get,serve-read-row,serve-mutate,serve-scan
+              writepath:commit-one,commit-incr,commit-incr-returning,commit-incr-returning-spread,commit-incr,commit-incr-returning,commit-incr,commit-incr-returning
     env:
       EXAMPLES: ${{ matrix.examples }}
       SHAPES: ${{ matrix.shapes }}
@@ -305,6 +265,7 @@ jobs:
         run: |
           set -euo pipefail
           for side in base head; do
+            export CG_KEEP_DIR="/tmp/cg-$side"; mkdir -p "$CG_KEEP_DIR"
             groups=()
             for g in $SHAPES; do
               # Base on its own examples: only the shapes base has a ceiling for.
@@ -417,3 +378,10 @@ jobs:
             echo "a shape is above its absolute ceiling, or has none (D193)"
             exit 1
           fi
+      - name: keep the callgrind outputs (#1795 scratch)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cg-${{ github.run_id }}
+          path: /tmp/cg-*
+          retention-days: 7
