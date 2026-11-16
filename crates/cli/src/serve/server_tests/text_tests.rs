@@ -417,3 +417,97 @@ fn a_close_stops_a_text_rebuild_and_the_next_open_resumes_it() {
     resumed(&db);
     again.part().unwrap().close_users();
 }
+
+/// Leaves a rebuild of index `name` (over `t`) stopped at once: an empty cursor, pending.
+fn stopped(db: &Pigeonhole, name: &str) {
+    let index = pigeonhole_text::Index::open(db, name).unwrap();
+    let r = index
+        .rebuild_with(|_| std::ops::ControlFlow::Break(()))
+        .unwrap();
+    assert!(r.stopped);
+}
+
+#[test]
+fn a_pending_rebuild_that_cant_resume_doesnt_hold_back_the_others() {
+    // ai1249's must on #1975: a pending index whose resume fails (here, a repair a crash left:
+    // `Busy`) is passed over by the run, and the next one still resumes.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 50);
+    let t = db.table("t").unwrap().open().unwrap();
+    for name in ["ta", "tb"] {
+        drop(
+            pigeonhole_text::Index::create(
+                &db,
+                name,
+                pigeonhole_text::Source::new(&t, "f", b"body"),
+                pigeonhole_text::IndexOptions::new(),
+            )
+            .unwrap(),
+        );
+        stopped(&db, name);
+    }
+    // `ta` (first by name) has its repair flag set, as a crashed repair leaves it.
+    db.table("ta")
+        .unwrap()
+        .open()
+        .unwrap()
+        .mutate(b"G")
+        .put("meta", b"repair", b"")
+        .commit()
+        .unwrap();
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    let part = gated_part(&s, &gate);
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let pending = pigeonhole_text::Index::pending_rebuilds(&db).unwrap();
+        if pending == ["ta"] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "tb never resumed: {pending:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    part.part().unwrap().close_users();
+}
+
+#[test]
+fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
+    // ai1249's should 2 on #1975: a client's `Text.Rebuild` while a resume holds the node's
+    // rebuild slot waits for the resume to stop at its next document, then rebuilds from the
+    // top (all 400 documents), instead of `Overloaded`.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    stopped(&db, "tx");
+    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    let part = gated_part(&s, &gate);
+    // The resume is under way (400 documents at 5 ms each).
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let r = s.block_on(part.call(
+        ServiceOp::TextRebuild(proto::TextIndexRequest { index: "tx".into() }),
+        &Caller::anonymous(),
+        None,
+    ));
+    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    let Ok(service::ServiceReply::TextRebuild(r)) = r else {
+        panic!("{r:?}");
+    };
+    assert_eq!(r.documents, 400, "{r:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "it waited out the slot"
+    );
+    assert!(
+        pigeonhole_text::Index::pending_rebuilds(&db)
+            .unwrap()
+            .is_empty()
+    );
+    part.part().unwrap().close_users();
+}

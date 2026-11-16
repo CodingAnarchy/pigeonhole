@@ -2183,9 +2183,13 @@ impl Service {
                     .map(ServiceReply::TextSearch)
                     .map_err(ApiError::for_read)
             }
+            // Boxed: its slot wait and the rebuild's state would otherwise widen the future
+            // every call moves (serve-mutate's ceiling on #1975).
             ServiceOp::TextRebuild(r) => {
                 drop(budget);
-                self.text_rebuild(r).await.map(ServiceReply::TextRebuild)
+                Box::pin(self.text_rebuild(r))
+                    .await
+                    .map(ServiceReply::TextRebuild)
             }
             ServiceOp::TextVerify(r) => {
                 drop(budget);

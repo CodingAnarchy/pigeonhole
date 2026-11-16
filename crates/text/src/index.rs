@@ -200,10 +200,6 @@ pub struct IndexStats {
     pub source_mismatch: u64,
     /// Source cells that aren't valid UTF-8 (skipped).
     pub invalid_utf8: u64,
-    /// Whether the step of [`Index::rebuild_with`] or [`Index::resume_rebuild_with`] stopped
-    /// the walk before its end (#1756). The index is consistent, and a later
-    /// [`Index::resume_rebuild_with`] carries on.
-    pub stopped: bool,
 }
 
 impl IndexStats {
@@ -636,13 +632,15 @@ impl Index {
     }
 
     /// The text indexes in `db` with a stopped rebuild pending (#1756): for a server to
-    /// resume them. A point read per table with the index's families; a table that can't be
-    /// opened now (dropped meanwhile) is passed over.
+    /// resume them. A point read per table with the index's families; a table dropped since
+    /// the catalog was listed is passed over.
     pub fn pending_rebuilds(db: &Pigeonhole) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for name in db.tables() {
-            let Ok(t) = db.table(&name).and_then(|b| b.open()) else {
-                continue;
+            let t = match db.table(&name).and_then(|b| b.open()) {
+                Ok(t) => t,
+                Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => continue,
+                Err(e) => return Err(e.into()),
             };
             let families = t.families();
             if [POST, DF, TERMS, META, STATS]

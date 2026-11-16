@@ -288,12 +288,17 @@ impl Texts {
         if let Some(p) = &self.placement {
             p.enter();
         }
+        // Indexes this run couldn't open or resume: passed over until the next `resume_soon`,
+        // so one bad index never holds the rest back (ai1249 on #1975).
+        let mut failed = std::collections::HashSet::new();
         loop {
             {
                 let mut r = self.resume.lock().unwrap_or_else(PoisonError::into_inner);
-                r.again = false;
+                if std::mem::take(&mut r.again) {
+                    failed.clear();
+                }
             }
-            let wait = match self.resume_pass(slot) {
+            let wait = match self.resume_pass(slot, &mut failed) {
                 Pass::Done => {
                     let mut r = self.resume.lock().unwrap_or_else(PoisonError::into_inner);
                     if r.again && !self.closed.load(Ordering::Acquire) {
@@ -324,7 +329,13 @@ impl Texts {
     }
 
     /// One look at the pending rebuilds: each resumed in turn, under the gate and the slot.
-    fn resume_pass(self: &Arc<Self>, slot: &Arc<RebuildSlot>) -> Pass {
+    /// One that can't be opened or resumed (a custom tokeniser, a repair a crash left, a
+    /// source gone) is logged once, added to `failed`, and passed over by this run.
+    fn resume_pass(
+        self: &Arc<Self>,
+        slot: &Arc<RebuildSlot>,
+        failed: &mut std::collections::HashSet<String>,
+    ) -> Pass {
         if self.closed.load(Ordering::Acquire) {
             return Pass::Closed;
         }
@@ -341,6 +352,7 @@ impl Texts {
                 return Pass::Failed;
             }
         };
+        let names: Vec<String> = names.into_iter().filter(|n| !failed.contains(n)).collect();
         if names.is_empty() {
             return Pass::Done;
         }
@@ -352,10 +364,13 @@ impl Texts {
                 Ok(i) => i,
                 Err(e) => {
                     eprintln!(
-                        "phdb serve: text index {name}: its rebuild can't resume: {}",
+                        "phdb serve: text index {name}: its stopped rebuild can't resume, and \
+                         stays stopped until the partition opens again or a Text.Rebuild of it: \
+                         {}",
                         e.message
                     );
-                    return Pass::Failed;
+                    failed.insert(name);
+                    continue;
                 }
             };
             let held = match self.gate.as_ref().map(super::gate::WriteGate::enter) {
@@ -369,8 +384,12 @@ impl Texts {
             let stop = steps.finish();
             match done {
                 Err(e) => {
-                    eprintln!("phdb serve: text index {name}: its resumed rebuild failed: {e}");
-                    return Pass::Failed;
+                    eprintln!(
+                        "phdb serve: text index {name}: its resumed rebuild failed, and stays \
+                         stopped until the partition opens again or a Text.Rebuild of it: {e}"
+                    );
+                    failed.insert(name);
+                    continue;
                 }
                 Ok(s) if !s.stopped => {
                     eprintln!(
