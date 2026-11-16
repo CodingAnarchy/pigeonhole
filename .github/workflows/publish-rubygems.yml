@@ -101,7 +101,11 @@ jobs:
             --jq ".actions_caches[] | select(.ref | endswith(env.TAG_REF)) | .id")
           n=0
           for id in $ids; do
-            gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null
-            n=$((n + 1))
+            # Evicted, or deleted by another run, since the list: not a failure.
+            if gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null; then
+              n=$((n + 1))
+            else
+              echo "cache $id: already gone"
+            fi
           done
           echo "deleted $n caches for $TAG_REF"
