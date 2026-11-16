@@ -99,6 +99,7 @@ macro_rules! resolves {
         impl Resolve for $submitted {
             type Out = $out;
 
+            #[inline(always)]
             fn poll_outcome(&mut self, cx: &mut Context<'_>) -> Poll<Result<$out>> {
                 match Pin::new(&mut self.pending).poll(cx) {
                     Poll::Ready(r) => Poll::Ready(self.outcome(r)),
@@ -135,6 +136,9 @@ impl<S: Resolve<Out = T>, T> Resolving<S, T> {
         }
     }
 
+    // Inlined into each future's `poll`, as the four copies were: left to the optimizer,
+    // `commit-async` counted 29 instructions more a commit (#1970's first callgrind run).
+    #[inline(always)]
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<T>> {
         match self {
             Self::Pending(s) => match s.poll_outcome(cx) {
