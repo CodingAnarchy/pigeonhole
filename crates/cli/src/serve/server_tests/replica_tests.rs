@@ -1459,3 +1459,49 @@ fn replica_across_an_unrecorded_schema_change(case: &str, legacy: bool) {
         _ => unreachable!(),
     }
 }
+
+#[test]
+fn a_single_node_refuses_a_cluster_tokens_replica_calls() {
+    // simp724's S1 on #1974: a cluster token's replica calls (D328) are one cluster node's of
+    // another. A single node has no peers, so a cluster token there can't `Follow` or take a
+    // replica's bootstrap download, which would read the whole database. An admin token
+    // still can.
+    let s = Server::start("cluster peer-s3cret\nadmin s3cret", limits());
+    s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let with = |token: &str, r: &mut tonic::metadata::MetadataMap| {
+            r.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        };
+        let mut follow = tonic::Request::new(proto::FollowRequest::default());
+        with("peer-s3cret", follow.metadata_mut());
+        let e = proto::replication_client::ReplicationClient::new(channel.clone())
+            .follow(follow)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e:?}");
+        let download = || proto::BackupDownloadRequest {
+            replica: true,
+            ..Default::default()
+        };
+        let mut req = tonic::Request::new(download());
+        with("peer-s3cret", req.metadata_mut());
+        let e = proto::admin_client::AdminClient::new(channel.clone())
+            .backup_download(req)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e:?}");
+        // The admin token's bootstrap download is answered.
+        let mut req = tonic::Request::new(download());
+        with("s3cret", req.metadata_mut());
+        let mut stream = proto::admin_client::AdminClient::new(channel)
+            .backup_download(req)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().is_some());
+    });
+}
