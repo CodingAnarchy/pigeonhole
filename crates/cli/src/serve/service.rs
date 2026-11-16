@@ -1580,13 +1580,12 @@ impl Service {
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
-            // As many places as network workers (simp724's C1 on #1880).
-            lite: Arc::new(super::lite::Lite::new(
-                placement
-                    .as_ref()
-                    .map_or(blocking_threads, |p| p.io_threads),
-                placement.clone(),
-            )),
+            // Only under the mask, as many places as network workers (simp724's C1 on #1880,
+            // S1 on #1972).
+            lite: Arc::new(match &placement {
+                Some(p) if p.masked() => super::lite::Lite::new(p.io_threads, Some(Arc::clone(p))),
+                _ => super::lite::Lite::off(),
+            }),
             mcp_places: Arc::new(Semaphore::new(limits.mcp_blocking.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             bulk_budget: super::bulk::budget_pool(limits.bulk_load_bytes),
@@ -3019,6 +3018,12 @@ impl Service {
         f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
     ) -> Result<T, ApiError> {
         blocking(&self.blocking, f).await
+    }
+
+    /// Waits up to `timeout` for the light pool's running calls (shutdown, before the
+    /// databases close; simp724's S2 on #1972); whether they finished.
+    pub(crate) fn drain_lite(&self, timeout: Duration) -> bool {
+        self.lite.drain(timeout)
     }
 
     /// Runs a small, bounded sync call on the light pool if it has a place free now, else on

@@ -21,12 +21,18 @@
 //!   never waits for a thread.
 //!
 //! The threads start at the first call, each masked as a network worker
-//! ([`Placement::enter_lite`]), and named `phdb-serve-lite`. They end when the last
-//! [`Lite`] goes (each finishes its call first), as the services sharing it do at shutdown.
+//! ([`Placement::enter_lite`]), and named `phdb-serve-lite`. Unmasked (`--affinity off`,
+//! nothing pinned, or not Linux), the blocking pool already runs anywhere, so there is no
+//! light pool ([`Lite::off`]): a second pool would only add concurrency (simp724's S1 on
+//! #1972). At shutdown the server waits for the calls running here ([`Lite::drain`]) before
+//! it closes the databases, as it does for the blocking pool's; the threads end when the
+//! last [`Lite`] goes.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, oneshot};
 
@@ -41,7 +47,11 @@ pub(crate) struct Lite {
     places: Arc<Semaphore>,
     threads: usize,
     placement: Option<Arc<Placement>>,
-    jobs: OnceLock<mpsc::Sender<Job>>,
+    /// The queue the threads read, once the first call has started them; `None` if none
+    /// started, or for [`Lite::off`]: every call then runs on the blocking pool.
+    jobs: OnceLock<Option<mpsc::Sender<Job>>>,
+    /// Threads running: the places [`Lite::drain`] waits to see free.
+    live: AtomicUsize,
 }
 
 impl Lite {
@@ -53,7 +63,15 @@ impl Lite {
             threads,
             placement,
             jobs: OnceLock::new(),
+            live: AtomicUsize::new(0),
         }
+    }
+
+    /// No light pool: every call is handed back, to run on the blocking pool.
+    pub(crate) fn off() -> Self {
+        let lite = Self::new(1, None);
+        let _ = lite.jobs.set(None);
+        lite
     }
 
     /// Runs `f` on the pool if a place is free now, and resolves to its outcome; hands `f`
@@ -63,6 +81,11 @@ impl Lite {
         T: Send + 'static,
         F: FnOnce() -> Result<T, ApiError> + Send + 'static,
     {
+        // Started before a place is taken, so a thread that fails to start can take its
+        // place with it (simp724's nit on #1972).
+        let Some(jobs) = self.jobs.get_or_init(|| self.start()) else {
+            return Err(f);
+        };
         let Ok(place) = Arc::clone(&self.places).try_acquire_owned() else {
             return Err(f);
         };
@@ -76,15 +99,29 @@ impl Lite {
             drop(place);
             let _ = tx.send(out);
         });
-        // If every thread failed to start, the job comes back and is dropped with its place,
-        // and the caller sees its reply channel closed.
-        let _ = self.jobs.get_or_init(|| self.start()).send(job);
+        // The receiver lives as long as a thread does, and threads end only when the sender
+        // goes, so the send can't fail.
+        let _ = jobs.send(job);
         Ok(rx)
     }
 
+    /// Waits up to `timeout` for the calls running on the pool to finish; whether they did.
+    /// For shutdown, once nothing can start a new call.
+    pub(crate) fn drain(&self, timeout: Duration) -> bool {
+        let live = self.live.load(Ordering::Acquire);
+        let until = Instant::now() + timeout;
+        while self.places.available_permits() < live {
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
     /// Starts the threads, all reading one queue. A thread that fails to start takes its
-    /// place with it, so C3 holds with fewer places.
-    fn start(&self) -> mpsc::Sender<Job> {
+    /// place with it, so C3 holds with fewer places; if none starts, there's no queue.
+    fn start(&self) -> Option<mpsc::Sender<Job>> {
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let mut failed = 0;
@@ -110,7 +147,9 @@ impl Lite {
             }
         }
         self.places.forget_permits(failed);
-        tx
+        let started = self.threads - failed;
+        self.live.store(started, Ordering::Release);
+        (started > 0).then_some(tx)
     }
 }
 
@@ -162,6 +201,48 @@ mod tests {
         // The place is free again once the first call has replied.
         let third = lite.try_run(|| Ok(3)).ok().unwrap();
         assert_eq!(third.await.unwrap().unwrap(), 3);
+    }
+
+    #[test]
+    fn with_no_light_pool_every_call_comes_back_unrun() {
+        let Err(back) = Lite::off().try_run(|| Ok(5)) else {
+            panic!("an off pool ran a call");
+        };
+        assert_eq!(back().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_a_running_call_and_gives_up_at_its_timeout() {
+        let lite = Arc::new(Lite::new(2, None));
+        assert!(
+            lite.drain(Duration::ZERO),
+            "nothing started, nothing to wait for"
+        );
+        let (hold, held) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        let call = lite
+            .try_run(move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+                Ok(())
+            })
+            .ok()
+            .unwrap();
+        running.recv().unwrap();
+        assert!(
+            !lite.drain(Duration::from_millis(20)),
+            "a held call isn't drained"
+        );
+        let draining = {
+            let lite = Arc::clone(&lite);
+            std::thread::spawn(move || lite.drain(Duration::from_secs(30)))
+        };
+        hold.send(()).unwrap();
+        assert!(
+            draining.join().unwrap(),
+            "drain returns once the call has finished"
+        );
+        call.await.unwrap().unwrap();
     }
 
     #[tokio::test]
