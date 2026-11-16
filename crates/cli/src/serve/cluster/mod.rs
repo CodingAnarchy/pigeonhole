@@ -1221,8 +1221,9 @@ impl Node {
                 // its lease.
                 lp.awaiting_peers = self.awaiting_peers(&lp.id);
                 lp.lease_remaining_ms = millis(self.lease_remaining(&lp.id));
-            } else if let Some(closed) = self.fences.closed().get(&lp.id) {
-                closed.describe(lp);
+            } else {
+                let id = lp.id.clone();
+                self.fences.closed(&id, |closed| closed.describe(lp));
             }
         }
         NodeStatus {

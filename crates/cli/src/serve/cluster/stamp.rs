@@ -208,7 +208,7 @@ impl Node {
         }
         // Its files changed: a close's hashes of them go, and a map that gives it here
         // opens it.
-        self.fences.closed().remove(&p);
+        self.fences.forget_closed(&p);
         Ok(installed)
     }
 }
