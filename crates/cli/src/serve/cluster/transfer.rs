@@ -64,7 +64,8 @@ pub(super) struct Feed {
     /// The longest one message waits for room: the node takes messages as it writes them,
     /// so longer than this with none taken is a node that stopped reading.
     stall: Duration,
-    /// Set when a message waited `stall`, for [`upload_file`].
+    /// Set when a message waited `stall`, for [`upload_file`]. `Relaxed` throughout: the
+    /// source that sets it and the pass that reads it are polled by one task.
     stalled: Arc<AtomicBool>,
 }
 
@@ -131,6 +132,9 @@ impl futures_core::Stream for Chunks {
 /// that long, ends the pass as [`Stopped::Stalled`],
 /// without waiting for an answer that node may never give. The wait for the node's reply
 /// once everything is sent has no bound: the node hashes and syncs the whole file first.
+///
+/// `stall` is one bound for both waits, the status call's included: sized for a node's
+/// slowest healthy answer, not tuned down as a per-message figure.
 pub(super) async fn upload_file<T, E, F>(
     admin: &mut Admin,
     token: Option<&str>,
