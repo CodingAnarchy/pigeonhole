@@ -5411,7 +5411,11 @@ impl Inner {
             }
         }
         if fixed_ts || counter_writes > 1 || converts {
-            return Ok((prepare_counter_writes(&batch.builder, catalog)?, shards));
+            let combines = counter_writes > 1 || converts;
+            return Ok((
+                prepare_counter_writes(&batch.builder, catalog, combines)?,
+                shards,
+            ));
         }
         Ok((batch.builder, shards))
     }
@@ -6498,7 +6502,32 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// combines into that write with the family's aggregation (a sum, min or max), in write
 /// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
 /// the last write.
-fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<BatchBuilder> {
+///
+/// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
+/// one, the only change is the fixed timestamp, and the batch is copied straight through: no
+/// map, no list of writes, and the copy sized once (#1795: a lone `incr`'s rebuilt batch grew
+/// from `BatchBuilder::new`'s 4 bytes, a calloc and a realloc per commit that glibc 2.43 served
+/// at a cost varying run to run with the heap's state).
+fn prepare_counter_writes(
+    batch: &BatchBuilder,
+    catalog: &Catalog,
+    combines: bool,
+) -> Result<BatchBuilder> {
+    // Each write may gain an 8-byte timestamp.
+    let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
+    if !combines {
+        for m in batch.batch().iter() {
+            let mut m = m?;
+            let aggregate = catalog
+                .family(m.family)
+                .is_some_and(|f| f.options.kind.is_aggregate());
+            if aggregate && matches!(m.kind, Kind::Put | Kind::Merge) {
+                m.ts.get_or_insert(COUNTER_TS);
+            }
+            out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
+        }
+        return Ok(out);
+    }
     struct Write<'a> {
         m: Mutation<'a>,
         /// The value of a combined write, replacing `m.value`.
@@ -6597,7 +6626,6 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         latest.insert(key, writes.len());
         writes.push(Write { m, value: own });
     }
-    let mut out = BatchBuilder::new();
     for w in &writes {
         let m = &w.m;
         let value = w.value.as_deref().unwrap_or(m.value);
