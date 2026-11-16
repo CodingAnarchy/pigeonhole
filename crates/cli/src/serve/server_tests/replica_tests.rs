@@ -588,6 +588,12 @@ fn a_swap_ends_the_old_copy_s_feed_streams_with_an_error() {
 /// it. The primary's background sync is set far off, so a `Buffered` commit reaches the
 /// replica only when a later `GroupSync` commit syncs it: a replica held behind for as long
 /// as the test likes, with no hook.
+///
+/// Two replicas (#1858): `r`, with a 500 ms request timeout, for the reads that wait out
+/// their deadline; `wait`, with a long one, for the reads that must succeed. A successful
+/// read returns once its seqno is applied, so the long timeout costs nothing when the
+/// replica is quick, and a slow runner's catch-up no longer has to fit in what's left of
+/// 500 ms.
 #[test]
 fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let dir = test_dir();
@@ -611,6 +617,10 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     short.request_timeout = Duration::from_millis(500);
     let r = Server::start_replica_with(test_dir(), &p.url, None, short);
     wait_replica(&r, "caught up", caught_up(&p, None));
+    let mut long = limits();
+    long.request_timeout = Duration::from_secs(60);
+    let wait = Server::start_replica_with(test_dir(), &p.url, None, long);
+    wait_replica(&wait, "caught up", caught_up(&p, None));
 
     let mut w = put("x", "f", "q", json!({"bytes": b64(b"mine")}));
     w["durability"] = json!("DURABILITY_BUFFERED");
@@ -633,11 +643,11 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let (status, body) = r.post("Get", &get, None);
     assert_eq!((status, body.get("cell").is_none()), (200, true), "{body}");
 
-    // A read that waits, while the primary syncs: a GroupSync commit covers `x`.
+    // A read that waits, while the primary syncs: a GroupSync commit covers `x`. On the
+    // long-timeout replica, so it ends when the replica applies `x`, however slow the runner.
     let started = std::time::Instant::now();
     let (status, body) = std::thread::scope(|scope| {
-        // Within the replica's 500 ms request timeout.
-        let read = scope.spawn(|| r.rpc_with("Data/Get", &get, None, &header));
+        let read = scope.spawn(|| wait.rpc_with("Data/Get", &get, None, &header));
         std::thread::sleep(Duration::from_millis(200));
         assert!(!read.is_finished(), "the read waits for the replica");
         let sync = put("y", "f", "q", json!({"bytes": b64(b"sync")}));
@@ -652,8 +662,8 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     );
     assert!(started.elapsed() >= Duration::from_millis(200));
 
-    // Over gRPC, as metadata.
-    let mut client = r.grpc();
+    // Over gRPC, as metadata: on `wait` too, which has applied `x` by now.
+    let mut client = wait.grpc();
     let mut req = tonic::Request::new(proto::GetRequest {
         table: "t".into(),
         row: b"x".to_vec().into(),
@@ -666,7 +676,9 @@ fn a_read_with_min_primary_seqno_waits_for_the_replica_to_apply_it() {
     let got = r.block_on(client.get(req)).unwrap().into_inner();
     assert!(got.cell.is_some());
 
-    // A seqno far ahead: ReplicaBehind over gRPC too (UNAVAILABLE).
+    // A seqno far ahead: ReplicaBehind over gRPC too (UNAVAILABLE), on `r`, which gives up
+    // after 500 ms.
+    let mut client = r.grpc();
     let mut req = tonic::Request::new(proto::GetRequest {
         table: "t".into(),
         row: b"x".to_vec().into(),
