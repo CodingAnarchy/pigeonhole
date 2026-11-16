@@ -114,7 +114,11 @@ impl ServeBackend {
                     op,
                     ServiceOp::Recall(_) | ServiceOp::MarkUsed(_) | ServiceOp::Forget(_)
                 ) {
-                    shared.router.memory_fields(&op).await?;
+                    let until = deadline.map_or_else(
+                        || tokio::time::Instant::now() + shared.router.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    shared.router.memory_fields(&op, until).await?;
                 }
                 shared
                     .router

@@ -288,17 +288,17 @@ impl Router {
     /// Every database this server serves: a single node's one, or a cluster node's
     /// partitions open now (D317 ticket 8a). For what's done to each alike: feeds started,
     /// the dump, bulk loads stopped, indexes closed, health.
-    /// The memory store's slot of this node's first partition, if the node serves one
-    /// (`--memory`): its name, model and limits are the node's, the same on every partition.
-    pub(crate) fn memory_slot(&self) -> Option<Arc<super::memslot::MemSlot>> {
-        self.parts().first()?.memory.get().cloned()
-    }
-
     pub(crate) fn parts(&self) -> Vec<PartRef> {
         match &self.cluster {
             None => PartRef::of(&self.service).into_iter().collect(),
             Some(_) => self.partitions().into_iter().map(|(_, p)| p).collect(),
         }
+    }
+
+    /// The memory store's slot of this node's first partition, if the node serves one
+    /// (`--memory`): its name, model and limits are the node's, the same on every partition.
+    pub(crate) fn memory_slot(&self) -> Option<Arc<super::memslot::MemSlot>> {
+        self.parts().first()?.memory.get().cloned()
     }
 
     /// Partition `id` on a cluster node: `WrongPartition` when the map gives it to another
@@ -688,7 +688,7 @@ impl Router {
         if let ServiceOp::Remember(r) = &op
             && !r.supersedes.is_empty()
         {
-            self.memory_fields(&op).await?;
+            self.memory_fields(&op, deadline).await?;
         }
         let budget = self.service.admit(&op.admit(), caller, prepaid).await?;
         let writes = forward_writes(&op);

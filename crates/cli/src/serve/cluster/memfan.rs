@@ -77,7 +77,13 @@ impl Router {
     /// naming it), since an older build would ignore `supersedes` or leave a reply field
     /// empty, a wrong answer rather than a thinner one; one that doesn't answer is
     /// unavailable (`PartitionUnavailable`), as for any call to it. `Ok` on a single node.
-    pub(crate) async fn memory_fields(&self, op: &ServiceOp) -> Result<(), ApiError> {
+    /// The peers are asked within the call's `deadline` (`DeadlineExceeded` past it), so a
+    /// `/mcp` message still holds its place for its deadline and one op at most.
+    pub(crate) async fn memory_fields(
+        &self,
+        op: &ServiceOp,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ApiError> {
         let Some(cluster) = &self.cluster else {
             return Ok(());
         };
@@ -97,10 +103,14 @@ impl Router {
             .keys()
             .filter_map(|p| routes.owner(p).map(|o| (o.node.clone(), o.address.clone())))
             .collect();
-        let down = cluster
-            .node
-            .owners_keep(owners.into_iter(), super::MEMORY_TOOL_FIELDS_FEATURE, what)
-            .await?;
+        let down = tokio::time::timeout_at(
+            deadline,
+            cluster
+                .node
+                .owners_keep(owners.into_iter(), super::MEMORY_TOOL_FIELDS_FEATURE, what),
+        )
+        .await
+        .map_err(|_| ApiError::deadline_exceeded())??;
         if let Some(node) = down.first() {
             let p = parts
                 .keys()

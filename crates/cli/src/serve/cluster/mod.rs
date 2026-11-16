@@ -169,6 +169,11 @@ pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Ve
 #[cfg(test)]
 pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// A hold seam (tests): nodes whose `Status` doesn't answer while their cluster directory
+/// is listed, as a stalled peer's wouldn't.
+#[cfg(test)]
+pub(crate) static HOLD_STATUS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// How [`OLD_NEAREST`] has a node act.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1647,6 +1652,14 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<StatusRequest>,
     ) -> Result<tonic::Response<NodeStatus>, Status> {
         self.caller(&req, READERS, "read the cluster status")?;
+        #[cfg(test)]
+        while HOLD_STATUS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&self.0.dir)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let node = Arc::clone(&self.0);
         let status = tokio::task::spawn_blocking(move || node.status())
             .await

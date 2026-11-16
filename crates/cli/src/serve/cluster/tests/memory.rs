@@ -397,7 +397,7 @@ fn three_nodes(
     [pigeonhole::Pigeonhole; 2],
     [u16; 3],
 ) {
-    let (stops, dbs, ports, _) = three_nodes_with(rt, "");
+    let (stops, dbs, ports, _) = three_nodes_with(rt, "", &crate::serve::server_tests::limits());
     (stops, dbs, ports)
 }
 
@@ -405,6 +405,7 @@ fn three_nodes(
 fn three_nodes_with(
     rt: &tokio::runtime::Runtime,
     tokens: &str,
+    limits: &crate::serve::config::Limits,
 ) -> (
     Vec<tokio::sync::oneshot::Sender<()>>,
     [pigeonhole::Pigeonhole; 2],
@@ -438,7 +439,7 @@ fn three_nodes_with(
             locals,
             listener,
             tokens,
-            crate::serve::server_tests::limits(),
+            *limits,
             false,
             placement,
             None,
@@ -1210,7 +1211,8 @@ mod on_mcp {
     #[test]
     fn a_memory_tool_is_refused_while_a_node_it_reaches_runs_an_older_build() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (_stops, _dbs, [a, b, c], dirs) = three_nodes_with(&rt, "");
+        let (_stops, _dbs, [a, b, c], dirs) =
+            three_nodes_with(&rt, "", &crate::serve::server_tests::limits());
         let zed = ok(
             b,
             "memory_remember",
@@ -1296,7 +1298,8 @@ mod on_mcp {
     #[test]
     fn a_memory_tool_reaching_a_node_that_doesnt_answer_is_unavailable() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (_stops, _dbs, [a, b, _c], dirs) = three_nodes_with(&rt, "");
+        let (_stops, _dbs, [a, b, _c], dirs) =
+            three_nodes_with(&rt, "", &crate::serve::server_tests::limits());
         let entry = (dirs[1].clone(), format!("127.0.0.1:{b}"));
         super::super::super::CUT_OFF
             .lock()
@@ -1315,6 +1318,41 @@ mod on_mcp {
         assert!(err, "{e}");
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
         assert!(e.to_string().contains("p2"), "{e}");
+    }
+
+    /// simp724's N2 on #1963: the gate asks the peers within the message's deadline, so a
+    /// peer whose `Status` stalls costs the message its deadline, not a push timeout past
+    /// it (`DeadlineExceeded`, not the `PartitionUnavailable` a timed-out ask would give).
+    #[test]
+    fn the_memory_gate_waits_for_a_stalled_peer_only_until_the_messages_deadline() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut limits = crate::serve::server_tests::limits();
+        // Shorter than the test cluster's push timeout (500 ms), which bounds each ask.
+        limits.request_timeout = std::time::Duration::from_millis(250);
+        let (_stops, _dbs, [a, _b, _c], dirs) = three_nodes_with(&rt, "", &limits);
+        let session = session_at(&url(a), None);
+        super::super::super::HOLD_STATUS
+            .lock()
+            .unwrap()
+            .push(dirs[1].clone());
+        let started = std::time::Instant::now();
+        let (e, err) = call_at(
+            &url(a),
+            None,
+            &session,
+            "memory_recall",
+            json!({"namespaces": ["alice", "zed"], "text": "lunch"}),
+        );
+        let took = started.elapsed();
+        super::super::super::HOLD_STATUS
+            .lock()
+            .unwrap()
+            .retain(|d| *d != dirs[1]);
+        assert!(err, "{e}");
+        assert_eq!(code(&e), "DeadlineExceeded", "{e}");
+        // The code tells the bound apart (an ask timed out by the push timeout would be
+        // `PartitionUnavailable`); this only catches a gate waiting far longer.
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     /// S5: the memory tools are listed on a node with `--memory` only: its flags (the
@@ -1343,7 +1381,8 @@ mod on_mcp {
     fn a_namespace_scoped_token_gets_its_namespaces_on_every_partition() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tokens = format!("admin all\nwrite ns=alice,zed scoped\ncluster {NODE_TOKEN}\n");
-        let (_stops, _dbs, [a, b, _c], _) = three_nodes_with(&rt, &tokens);
+        let (_stops, _dbs, [a, b, _c], _) =
+            three_nodes_with(&rt, &tokens, &crate::serve::server_tests::limits());
         let t = Some("scoped");
         for (ns, port) in [("alice", a), ("zed", a), ("zed", b)] {
             let (out, err) = tool(
