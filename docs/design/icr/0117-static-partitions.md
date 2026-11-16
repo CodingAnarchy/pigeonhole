@@ -571,3 +571,20 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **A node change:** the writer takes no further change until `L·(1+ρ)` after it saw a majority of both node sets hold the change (audit120's L1); `SetMap` waits that out before it answers.
 - **Two nodes:** a majority is both, so with one down the other stops serving within L.
 
+
+## D328 PR 1: read replicas in the map (1.3.0)
+**A node the map lists in `Partition.replicas` holds a replica copy of the partition, which follows the partition's owner** (D328, #1851). Additive on the wire. Routed reads are PR 2, `phdb cluster promote` PR 3.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`, 2026-11-14):
+- **`Partition.replicas = 7`** (`repeated string`): node ids, in order of preference. Each a map node, none P's `node`, none twice; a map that removes a node must drop it from every list (`InvalidArgument` otherwise). A change to it alone isn't a move. The writer adds the first replicas only once every node reports the map feature `replicas` (`NodeStatus.map_features`).
+- **`LocalPartition.role = 15`** (`PartitionRole`: `PARTITION_ROLE_OWNER`, `PARTITION_ROLE_REPLICA`) and, for a replica copy: **`replica_of = 16`** (the owner node it last dialled), **`replica_applied_seqno = 17`**, **`replica_primary_seqno = 18`**, **`replica_lag_ms = 19`** (since the owner last said it was caught up, on the copy's clock) and **`replica_state = 20`** (`ReplicaState`: `BOOTSTRAPPING`, `FOLLOWING`, `BEHIND`, `STOPPED`, `OWNER_FEED_OFF`). A copy's `error` is its follower's last error while it isn't following.
+- **`PartitionInfo.replica = 9`** (admin.proto, the existing `ReplicaInfo`): set on each replica copy `Admin.Info` lists, beside the partitions the node owns; `primary` is the owner's address. Its `state` is unset.
+- **`/metrics`:** each copy's `pigeonhole_replica_*` gauges, as a single node's replica has them, labelled `pigeonhole_partition`.
+
+**Behaviour:**
+- **The owner's side.** `Replication.Follow` on a cluster node serves the open partition it owns whose database the token names; none gives `WrongPartition` with the node's map version. The stream runs under P's lease (D326): it waits for one and ends with `PartitionUnavailable` when it lapses. `Admin.BackupDownload { partition, replica }` on a cluster node takes a durable snapshot and sends the feed token to follow from.
+- **The owner's change feed must be on (S1).** Without it, both answer `FailedPrecondition` naming `--change-feed`, and the copy reports `OWNER_FEED_OFF`.
+- **Cluster scope.** A cluster-scope token may make `Follow` and a `BackupDownload` with `replica` and a `partition` (the nodes' own calls to each other); every other call keeps its scope.
+- **A new history bootstraps again.** When the map's `history_epoch` for P is above the epoch in the copy's identity row (a relocate without `--copy`, a restore), the copy bootstraps again from the owner rather than resuming. A copy move resumes.
+- **A move onto a replica's node is refused (S4, until PR 3).** `phdb cluster move`, `relocate` and `restore --partition` with `--to` a node in `P.replicas`; and on that node, `Cluster.Stamp` for P while its replica copy is open (`FailedPrecondition`, naming the copy). `drop-partition` refuses while the copy is open. The steps: set a map without the node in P's replicas, `drop-partition` P there, run the command again.
+- **Outside the lease machinery (S3).** A replica copy is never asked for, confirmed or lapsed, and `Fence`, `Unfence` and `Close` don't act on it (it isn't a partition they find).

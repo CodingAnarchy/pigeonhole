@@ -337,8 +337,14 @@ pub(super) async fn run(
     // 2 and 3. Copied, stamped and compared, whatever an earlier run left on NEW (the
     // module docs).
     let mut sent = Vec::new();
+    let set = Set {
+        cluster: &m.cluster_id,
+        p: partition,
+        e,
+        files: &files,
+    };
     for f in &files {
-        sent.push(copy_file(&old, &new, &m.cluster_id, partition, e, f, &files).await?);
+        sent.push(copy_file(&old, &new, &set, f, STALL).await?);
     }
     stop_after(args, Step::Copied)?;
     #[cfg(test)]
@@ -691,17 +697,25 @@ fn upload_id(cluster: &str, p: &str, e: u64, f: &PartitionFile) -> String {
         .collect()
 }
 
-/// Copies file `f` from OLD to an upload on NEW, from what NEW holds of it. Returns the
-/// bytes sent.
-async fn copy_file(
+/// The closed set a move copies: partition `p`'s files at epoch `e` in `cluster`.
+pub(super) struct Set<'a> {
+    pub(super) cluster: &'a str,
+    pub(super) p: &'a str,
+    pub(super) e: u64,
+    pub(super) files: &'a [PartitionFile],
+}
+
+/// Copies file `f` of `set` from OLD to an upload on NEW, from what NEW holds of it. Either
+/// node sending or taking nothing for `stall`, its connection up, fails the copy. Returns
+/// the bytes sent.
+pub(super) async fn copy_file(
     old: &At,
     new: &At,
-    cluster: &str,
-    p: &str,
-    e: u64,
+    set: &Set<'_>,
     f: &PartitionFile,
-    set: &[PartitionFile],
+    stall: Duration,
 ) -> Result<u64, Failure> {
+    let Set { cluster, p, e, .. } = *set;
     let what = format!("{p}'s file {:?}", f.name);
     let header = PartitionUploadHeader {
         partition: p.to_owned(),
@@ -710,18 +724,18 @@ async fn copy_file(
         upload_id: upload_id(cluster, p, e, f),
         purpose: PartitionUploadPurpose::Relocate as i32,
         file: Some(f.clone()),
-        manifest: set.to_vec(),
+        manifest: set.files.to_vec(),
     };
     let download = |from: u64, mut feed: Feed| {
         let what = &what;
         async move {
             // One pass, with every wait bounded: OLD sends a closed file without pause, so
-            // `STALL` of nothing is a stalled stream, and the operator runs the move again.
+            // `stall` of nothing is a stalled stream, and the operator runs the move again.
             let stalled = |_| {
                 Failure::usage(&format!(
                     "node {:?} sent nothing of {what} for {} s: run the move again to resume",
                     old.id,
-                    STALL.as_secs()
+                    stall.as_secs()
                 ))
             };
             let mut admin = old.admin.clone();
@@ -734,13 +748,13 @@ async fn copy_file(
                 },
                 old.token.as_deref(),
             )?);
-            let mut chunks = tokio::time::timeout(STALL, asked)
+            let mut chunks = tokio::time::timeout(stall, asked)
                 .await
                 .map_err(stalled)?
                 .map_err(|s| old.failed(&format!("download {what}"), &s))?
                 .into_inner();
             loop {
-                let Some(chunk) = tokio::time::timeout(STALL, chunks.message())
+                let Some(chunk) = tokio::time::timeout(stall, chunks.message())
                     .await
                     .map_err(stalled)?
                     .map_err(|s| old.failed(&format!("download {what}"), &s))?
@@ -782,6 +796,7 @@ async fn copy_file(
         &mut new.admin.clone(),
         new.token.as_deref(),
         header,
+        stall,
         download,
     )
     .await;
@@ -793,6 +808,14 @@ async fn copy_file(
         Err(Stopped::Request(f) | Stopped::Source(f)) => return Err(f),
         Err(Stopped::Status(s)) => {
             return Err(new.failed(&format!("upload status of {what}"), &s));
+        }
+        // NEW has the connection up and reads nothing: bounded like OLD's side (#1950).
+        Err(Stopped::Stalled) => {
+            return Err(Failure::usage(&format!(
+                "node {:?} took nothing of {what} for {} s: run the move again to resume",
+                new.id,
+                stall.as_secs()
+            )));
         }
         Err(Stopped::Upload(s)) => return Err(new.failed(&format!("upload {what}"), &s)),
     };

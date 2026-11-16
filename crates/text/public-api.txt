@@ -67,6 +67,7 @@ pub fn pigeonhole_text::Index::open_reader(&pigeonhole::db::PigeonholeReader, &s
 pub fn pigeonhole_text::Index::open_reader_with_tokenizer(&pigeonhole::db::PigeonholeReader, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
 pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::Index::over_table(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::pending_rebuilds(&pigeonhole::db::Pigeonhole) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
 pub fn pigeonhole_text::Index::put_in(&self, &mut pigeonhole::write::Transaction, &[u8], &str) -> pigeonhole_text::Result<()>

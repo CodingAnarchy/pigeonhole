@@ -734,6 +734,11 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         if let Some(r) = &replica {
             r.stop().await;
         }
+        // A cluster node's replica copies' followers too (D328): an apply in flight ends
+        // before their engines close.
+        for copy in shared.router.replica_copies() {
+            copy.follower.stop().await;
+        }
         Ok::<_, Failure>(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -746,10 +751,21 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     for part in shared.router.parts() {
         part.close_users();
     }
+    let copies = shared.router.replica_copies();
+    for copy in &copies {
+        if let Some(part) = copy.service.part_opt() {
+            part.close_users();
+        }
+    }
     // The databases to close last: a single node's one, or the partitions a cluster node has
     // open now (those it opened while serving too, and not those it closed, D317 ticket 6);
     // none on a cluster node that only routes.
-    let dbs: Vec<Pigeonhole> = shared.router.parts().iter().map(|p| p.db.clone()).collect();
+    let mut dbs: Vec<Pigeonhole> = shared.router.parts().iter().map(|p| p.db.clone()).collect();
+    dbs.extend(
+        copies
+            .iter()
+            .filter_map(|c| c.service.part_opt().map(|p| p.db.clone())),
+    );
     let closed = match dbs.len() {
         0 => {
             let _ = writeln!(stderr, "phdb serve: stopped");

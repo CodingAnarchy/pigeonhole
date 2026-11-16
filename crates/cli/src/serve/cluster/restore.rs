@@ -47,6 +47,7 @@ use super::map;
 use super::transfer::{Feed, Stopped, upload_file};
 use crate::exit::Failure;
 use crate::output::Report;
+use crate::serve::download::STALL;
 use crate::serve::proto::{
     self, ClusterMap, GetMapRequest, LocalPartitionState, PartitionFile, PartitionUploadHeader,
     PartitionUploadPurpose, StampRequest, StatusRequest,
@@ -1157,13 +1158,18 @@ async fn upload(
         };
         // `Ok`: whether the node holds the whole file. `Err(Ok)`: final. `Err(Err)`: the
         // node's status, a refusal or a break.
-        let sent = match upload_file(&mut admin, token, header.clone(), read).await {
+        let sent = match upload_file(&mut admin, token, header.clone(), STALL, read).await {
             // Complete, or an install of the partition's set is in progress there (a run
             // that stopped in it): the stamp finishes it (#1848).
             Ok(None) => Ok(true),
             Ok(Some(((), reply))) => Ok(reply.complete),
             Err(Stopped::Request(f)) => Err(Ok(f)),
             Err(Stopped::Source(e)) => Err(Ok(Failure::io(&what("read the copy"), &e))),
+            // The node reads nothing, its connection up (#1950): a break, to resume.
+            Err(Stopped::Stalled) => Err(Err(tonic::Status::unavailable(format!(
+                "the node took nothing of the file for {} s",
+                STALL.as_secs()
+            )))),
             Err(Stopped::Status(s) | Stopped::Upload(s)) => Err(Err(s)),
         };
         match sent {

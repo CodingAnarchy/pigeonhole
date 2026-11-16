@@ -212,6 +212,91 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     assert_eq!(&hits[0].id[..], b"doc:1");
 }
 
+/// #1916 (the coordinator's option (a)): a table a text index reads can't be dropped
+/// while the index is there. The refusal names every such index; once they're dropped, the
+/// table drops. Another table, and the index's own table, drop as before.
+#[test]
+fn a_text_index_s_source_table_is_refused_a_drop_naming_the_index() {
+    let s = Server::start("", limits());
+    for name in ["tx", "ty"] {
+        let spec = json!({"name": name, "source_table": "t", "source_family": "f",
+                          "source_qualifier": b64(b"body")});
+        assert_eq!(s.rpc("Text/CreateIndex", &spec, None).0, 200);
+    }
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "{e}"
+    );
+    let message = e["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("\"tx\"") && message.contains("\"ty\""),
+        "{e}"
+    );
+    // Nothing was dropped: the index still writes through to its source.
+    let (status, e) = s.rpc(
+        "Text/Put",
+        &json!({"index": "tx", "id": b64(b"doc"), "text": "still here"}),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    for name in ["tx", "ty"] {
+        let (status, e) = s.rpc("Schema/DropTable", &json!({"name": name}), None);
+        assert_eq!(status, 200, "{name}: {e}");
+    }
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+    assert_eq!(status, 200, "{e}");
+}
+
+/// #1916: a drop of a table that a `Text.CreateIndex` in flight reads is refused too, so the
+/// create can't finish over a dropped (or re-made) source.
+#[test]
+fn a_drop_of_a_source_table_while_an_index_over_it_is_created_is_refused() {
+    let s = Server::start("", limits());
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    crate::serve::texts::HOLD_CREATE.lock().unwrap().push((
+        "tx_1916_held".into(),
+        Arc::clone(&reached),
+        Arc::clone(&release),
+    ));
+    std::thread::scope(|scope| {
+        let creating = scope.spawn(|| {
+            let spec = json!({"name": "tx_1916_held", "source_table": "t",
+                              "source_family": "f", "source_qualifier": b64(b"body")});
+            s.rpc("Text/CreateIndex", &spec, None)
+        });
+        reached.wait();
+        let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+        release.wait();
+        crate::serve::texts::HOLD_CREATE
+            .lock()
+            .unwrap()
+            .retain(|(n, _, _)| n != "tx_1916_held");
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (409, Some("FailedPrecondition")),
+            "{e}"
+        );
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("being created"),
+            "{e}"
+        );
+        let (status, e) = creating.join().unwrap();
+        assert_eq!(status, 200, "{e}");
+    });
+    // Built, it's named by the refusal as any index is.
+    let (_, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+    assert!(
+        e["message"].as_str().unwrap_or("").contains("tx_1916_held"),
+        "{e}"
+    );
+}
+
 /// #1588: dropping a text index's table evicts its cached handle. A search then answers
 /// `TableNotFound`, and a new index made under the name (with `if_missing`, which a cached
 /// handle used to answer at once) is the one served.

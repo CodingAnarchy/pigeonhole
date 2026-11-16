@@ -203,6 +203,44 @@ fn a_bypass_then_the_same_text_stays_stale_until_repair() {
     db.close().unwrap();
 }
 
+/// #1916: `over_table` names the indexes whose source column is in a table, sorted, and
+/// nothing for a table no index reads, an index's own table, or a table that only looks
+/// like an index by name.
+#[test]
+fn over_table_names_the_indexes_a_table_is_the_source_of() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let t = docs(&db);
+    let other = db
+        .table("notes")
+        .unwrap()
+        .family("body", pigeonhole::Family::default())
+        .create()
+        .unwrap();
+    for name in ["z_text", "a_text"] {
+        Index::create(&db, name, source(&t), IndexOptions::new()).unwrap();
+    }
+    Index::create(&db, "notes_text", source(&other), IndexOptions::new()).unwrap();
+    // A custom tokeniser's index counts too: `over_table` reads the source, not the
+    // tokeniser.
+    Index::create_with_tokenizer(
+        &db,
+        "custom_text",
+        source(&t),
+        IndexOptions::new(),
+        Box::new(Spaces(1)),
+    )
+    .unwrap();
+    assert_eq!(
+        Index::over_table(&db, "docs").unwrap(),
+        ["a_text", "custom_text", "z_text"]
+    );
+    assert_eq!(Index::over_table(&db, "notes").unwrap(), ["notes_text"]);
+    assert!(Index::over_table(&db, "a_text").unwrap().is_empty());
+    assert!(Index::over_table(&db, "missing").unwrap().is_empty());
+    db.close().unwrap();
+}
+
 #[test]
 fn create_backfills_a_source_column_and_rebuild_then_changes_nothing() {
     let dir = pigeonhole::doc_support::temp_dir();

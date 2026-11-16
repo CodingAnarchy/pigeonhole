@@ -1,0 +1,53 @@
+name: Cache cleanup
+
+# A closed pull request's Actions caches are never restored again, but they count toward the
+# repo's 10 GB cache limit until they are evicted, and eviction starts with main's (#1961,
+# #1966). PR runs of the CI workflows no longer save caches (save-if: main), but sweep
+# dispatches still save under their branch (`shared-key: sweep`, about 200 MB), so each
+# chunk after the first starts warm. This deletes a pull request's caches once it closes:
+# those under its merge ref and those under its head branch.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  drop:
+    name: drop the closed pull request's caches
+    # A fork's pull request gets a read-only token, and its branch's caches live in the fork.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write  # deleting caches; this job only
+    steps:
+      - name: Delete the caches under refs/pull/N/merge and the head branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MERGE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+          HEAD_REF: refs/heads/${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # A long-lived head branch keeps its caches: other runs restore them (a PR from
+          # main or a release branch, e.g. a forward-port; cli692's S1 on #1968).
+          case "$HEAD_REF" in
+            refs/heads/main | refs/heads/release/*) HEAD_REF="" ;;
+          esac
+          export HEAD_REF
+          ids=$(gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+            --jq ".actions_caches[] | select(.ref == env.MERGE_REF or (env.HEAD_REF != \"\" and .ref == env.HEAD_REF)) | .id")
+          n=0
+          for id in $ids; do
+            # Evicted, or deleted by another run, since the list: not a failure (N1).
+            if gh api -X DELETE "repos/$REPO/actions/caches/$id" > /dev/null; then
+              n=$((n + 1))
+            else
+              echo "cache $id: already gone"
+            fi
+          done
+          echo "deleted $n caches for $MERGE_REF${HEAD_REF:+ and $HEAD_REF}"

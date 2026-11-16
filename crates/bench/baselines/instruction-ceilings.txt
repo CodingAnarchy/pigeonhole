@@ -309,7 +309,12 @@ versions 5195 0.3
 counter 8661 0.5
 rows 17845 0.3
 level-scans 13814 0.6
-short-scans 13068 0.3
+# Raised by D195 (#1971, #1931 PR 2; coordinator 2026-11-16): short-scans 13068 -> 13129
+# (+0.47%). Base 13065, head 13089 (run 43917470810, b5a3e90ba): short-scans is unfiltered and
+# never builds the scan stop. The cost is codegen and layout from SstIter's new 8-byte stop
+# field, which every cursor carries and copies. A scratch A/B built without the other examples
+# measured 12815 -> 12818 for the same code. The head count times 1.003.
+short-scans 13129 0.3
 # Raised by D195 (owner decision, 2026-10-09; up to about 0.5% per shape, with its reason):
 # commit-one 8589 -> 8590 (+0.01%), codegen drift on main after #1512 (D316 A2). #1512 sat
 # exactly at 8589, which zero commit-path cost left unchanged, and main's base build in #1515's
@@ -467,7 +472,15 @@ replicate-apply 6764 0.3
 # 43625456463, 43625461046 and 43628573840 (ubuntu-24.04). The highest count of each shape times
 # 1.003. Spread across these runs: serve-get 68310-68323, serve-read-row 657557-657570,
 # serve-mutate 63474-63924, and serve-scan 8015241-8015247.
-serve-get 68528 0.3
+#
+# Raised by D195 (standing approval of up to ~0.5% a shape; coordinator 2026-11-16):
+# serve-get 68528 -> 68731 (+0.30%) and serve-mutate 64116 -> 64275 (+0.25%). Main's own
+# counts, the base column of 14 PR runs on ubuntu-24.04 between 2026-11-16T04:48Z and 17:52Z
+# (43806328852 ... 43922912077), drifted up to serve-get 68470-68502 and serve-mutate
+# 63675-64082, 27-47 under the old ceilings, so test-only PRs went red on noise (#1977); main
+# after #1970/#1971/#1974/#1977 counted serve-get 68524 and serve-mutate 64059 (run
+# 43943584393). The highest main count times 1.003. serve-mutate's spread (0.64%) is #1900's.
+serve-get 68731 0.3
 serve-read-row 659543 0.3
-serve-mutate 64116 0.3
+serve-mutate 64275 0.3
 serve-scan 8039293 0.3

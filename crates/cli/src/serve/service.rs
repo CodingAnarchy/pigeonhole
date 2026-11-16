@@ -347,6 +347,8 @@ impl ServiceOp {
                     | Self::RecallPool(_)
                     | Self::RecallBodies(_)
             ),
+            peer: matches!(self, Self::Follow(_))
+                || matches!(self, Self::BackupDownload(r) if r.replica && !r.partition.is_empty()),
         }
     }
 
@@ -532,6 +534,11 @@ pub(crate) struct Admit {
     /// A memory call (`Memory`'s RPCs, `/mcp`'s memory tools): the only calls a token
     /// limited to namespaces may make (audit120's F5).
     pub memory: bool,
+    /// A call one cluster node makes of another for a replica copy (D328): `Follow`, and a
+    /// replica's bootstrap download of a partition. On a cluster node, the node's cluster
+    /// token may make it as well as an admin token; a single node's router refuses a cluster
+    /// token's (simp724's S1 on #1974).
+    pub peer: bool,
 }
 
 /// `PermissionDenied` for a call other than a memory call by a token limited to namespaces
@@ -1838,7 +1845,7 @@ impl Service {
         match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
             // A transaction's Commit with writes: the engine's gate (R6) refused it.
             (Err(e), Some(replica)) if e.code == "ReadOnly" => {
-                Err(ApiError::replica_read_only(replica.primary()))
+                Err(ApiError::replica_read_only(&replica.primary()))
             }
             // A cluster partition closed under the call (D317 ticket 6's close, S5): the
             // partition is unavailable here, and the client routes again.
@@ -1901,9 +1908,10 @@ impl Service {
             && call.writes
             && caller.scope.allows(call.scope)
         {
-            return Err(ApiError::replica_read_only(replica.primary()));
+            return Err(ApiError::replica_read_only(&replica.primary()));
         }
-        if !caller.scope.allows(call.scope) {
+        let peer = call.peer && caller.scope == Scope::Cluster;
+        if !caller.scope.allows(call.scope) && !peer {
             return Err(ApiError::permission_denied(&format!("call {}", call.what)));
         }
         if call.size > self.limits.max_request_bytes {
@@ -2689,7 +2697,33 @@ impl Service {
         let place = pool_place(&self.blocking).await?;
         let _schema = self.part()?.schema.lock().await;
         let db = self.part()?.db.clone();
-        let dropped = held(place, move || Ok(db.drop_table(&name)?)).await;
+        let texts = Arc::clone(&self.part()?.texts);
+        let dropped = held(place, move || {
+            // A text index reading the table would be left behind, unable to write, rebuild
+            // or find its documents, and a new table of the name would become its source
+            // (#1916, the coordinator's option (a)). Checked under `schema`, which a text
+            // index's create takes too, so none appears between the check and the drop.
+            if texts.creating_over(&name) {
+                return Err(ApiError::failed_precondition(format!(
+                    "a text index over table {name:?} is being created: once it's built, drop \
+                     the index before the table"
+                )));
+            }
+            let over = pigeonhole_text::Index::over_table(&db, &name)?;
+            if !over.is_empty() {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} is the source of the text index{} {}: drop {} first",
+                    if over.len() == 1 { "" } else { "es" },
+                    over.iter()
+                        .map(|i| format!("{i:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if over.len() == 1 { "it" } else { "them" },
+                )));
+            }
+            Ok(db.drop_table(&name)?)
+        })
+        .await;
         // Whatever the outcome, the next use resolves every name again: the table's handle,
         // and a vector or text index's if it was one, with its rebalancer (#1588). Every
         // cached handle goes, not only the name's: drops are rare, and an open of the name
@@ -2741,6 +2775,22 @@ impl Service {
         self.part.iter().map(|p| (None, p)).collect()
     }
 
+    /// A cluster partition's replicas follow its feed (D328's S1), which is on only with
+    /// `--change-feed` on its owner's node: refused, naming that, for their `Follow` and
+    /// their bootstrap, which would otherwise fail on the engine's own error. `partition` is
+    /// the cluster partition's id; `None` on a single node, whose replicas need no check.
+    fn feed_on_for_replicas(partition: Option<&str>, db: &Pigeonhole) -> Result<(), ApiError> {
+        if let (Some(partition), Ok(info)) = (partition, db.info())
+            && info.feed.is_none()
+        {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {partition}'s change feed is off on this node, so its replicas have \
+                 nothing to follow: start the node with --change-feed"
+            )));
+        }
+        Ok(())
+    }
+
     /// `Replication.Follow` (#1436): under a `--max-streams` slot, on a thread of its own.
     fn follow(&self, r: proto::FollowRequest) -> Result<super::replica::FollowBatches, ApiError> {
         if self.replica_info().is_some() {
@@ -2749,15 +2799,22 @@ impl Service {
                 "a replica can't be followed: follow its primary",
             ));
         }
+        let part = self.part()?;
+        Self::feed_on_for_replicas(self.gate.as_ref().map(|g| g.partition()), &part.db)?;
         let slot = self.stream_slot()?;
-        super::replica::follow(
-            &self.part()?.db,
+        let batches = super::replica::follow(
+            &part.db,
             r.token.to_vec(),
             slot,
             self.limits.stream_idle,
             Arc::clone(&self.metrics),
             self.placement.clone(),
-        )
+        )?;
+        // A cluster partition's, under its lease (D328's M1).
+        match &self.gate {
+            Some(gate) => batches.leased(Arc::clone(gate)),
+            None => Ok(batches),
+        }
     }
 
     /// `Admin.Backup` of `part`: on a thread of its own, one backup at a time (perf287's D1
@@ -2812,6 +2869,10 @@ impl Service {
                 "a replica can't be a bootstrap source: bootstrap from its primary",
             ));
         }
+        // A cluster node's download runs on the node's service, with the partition named.
+        if r.replica && map_version.is_some() {
+            Self::feed_on_for_replicas(Some(&r.partition), &part.db)?;
+        }
         let (id, copy) = if r.backup_id.is_empty() {
             let (db, durable, replica) = (part.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
@@ -2820,7 +2881,9 @@ impl Service {
                 if let Some(map_version) = map_version {
                     // A cluster node's copy: one snapshot for the copy and the identity it
                     // names, so the last chunk says exactly what the file holds.
-                    let snap = if durable {
+                    // A replica copy's bootstrap (D328): durable, with the token of a feed
+                    // of every table from the same snapshot, as a single node's.
+                    let snap = if durable || replica {
                         db.durable_snapshot()?
                     } else {
                         db.snapshot()?
@@ -2830,9 +2893,17 @@ impl Service {
                         .ok_or_else(|| {
                             ApiError::internal("the partition's file has no identity row")
                         })?;
+                    let feed_token = if replica {
+                        let token = db.feed().from_snapshot(&snap).open()?.token();
+                        let token = token.as_bytes().to_vec();
+                        started(token.clone());
+                        token
+                    } else {
+                        Vec::new()
+                    };
                     db.backup_at(&snap, p)?;
                     return Ok(Taken {
-                        feed_token: Vec::new(),
+                        feed_token,
                         identity: Some(CopyIdentity {
                             partition: id.partition_id,
                             cluster_id: id.cluster_id,
@@ -3474,8 +3545,21 @@ impl Service {
         let table = self.table(&r.source_table).await?;
         let source = pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
         let texts = Arc::clone(&self.part()?.texts);
-        self.blocking(move || texts.create(&r.name, source, options, r.if_missing))
-            .await?;
+        // Noted under `schema`, where a drop of the source checks for its indexes (#1916),
+        // and held until the index (its source stored first) is built: a drop then refuses
+        // it, and one that checked first has dropped the source, which the create can't
+        // open. The build itself runs without `schema`, which it could hold for minutes.
+        // The pool place first (its lock order).
+        let place = pool_place(&self.blocking).await?;
+        let creating = {
+            let _schema = self.part()?.schema.lock().await;
+            texts.creating(&r.source_table)
+        };
+        held(place, move || {
+            let _creating = creating;
+            texts.create(&r.name, source, options, r.if_missing)
+        })
+        .await?;
         Ok(proto::Empty {})
     }
 

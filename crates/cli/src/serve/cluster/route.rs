@@ -307,6 +307,7 @@ mod tests {
             node: node.into(),
             epoch,
             memory_bytes: 0,
+            replicas: Vec::new(),
         };
         ClusterMap {
             cluster_id: "c1".into(),

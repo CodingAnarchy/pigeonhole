@@ -19,7 +19,7 @@ use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{FamilyId, TabletId};
 use pigeonhole_memtable::{ArenaSlice, MemIter, MemtableReader};
 use pigeonhole_runtime::ShardId;
-use pigeonhole_sst::{ReadOptions, SstIter};
+use pigeonhole_sst::{ReadOptions, ScanStop, SstIter};
 use smallvec::SmallVec;
 
 use crate::snapshot::{FamilySsts, MemSet, OpenSst, SstSet, View};
@@ -333,6 +333,7 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     // as a row read does: a filtered cursor's jump past it stops there (#1924).
     opts.one_row = one_row;
     opts.stop_jumps = one_row;
+    let first = out.len();
     let reader = |sst: &OpenSst| {
         if CACHE_ONLY {
             sst.reader_cache_only(set, priority)
@@ -367,6 +368,22 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
             filter.clone(),
             opts,
         )?));
+    }
+    // A filtered scan of several rows with an end: a jump that lands at or past the end
+    // stops there, as the scan's resolver does, rather than jumping on row by row through
+    // the rest of the SST (#1931). Built once for the scan's sources, only when one is
+    // filtered (an unfiltered cursor never jumps).
+    if let Some(end) = end
+        && !one_row
+        && !filter.is_all()
+        && out.len() > first
+    {
+        let stop: ScanStop = Arc::new(Box::from(end));
+        for source in &mut out[first..] {
+            if let Source::Sst(s) = source {
+                s.set_stop(&stop);
+            }
+        }
     }
     Ok(())
 }
@@ -471,6 +488,8 @@ struct Level {
     set: Arc<SstSet>,
     filter: ScanFilter,
     opts: ReadOptions,
+    /// Where the scan ends, for each SST the level opens ([`SstIter::set_stop`]).
+    stop: Option<ScanStop>,
     /// Index in `files` of the open SST.
     at: usize,
     /// A seek has positioned the cursor: before one, the open SST's cursor is invalid
@@ -495,7 +514,12 @@ impl Level {
             self.files[i].reader(&self.set, self.opts.priority)?
         };
         self.at = i;
-        Ok(reader.iter(self.filter.clone(), self.opts))
+        let mut iter = reader.iter(self.filter.clone(), self.opts);
+        // Only a filtered bounded scan has one: the rest skip the clone and the store.
+        if let Some(stop) = &self.stop {
+            iter.set_stop(Some(Arc::clone(stop)));
+        }
+        Ok(iter)
     }
 }
 
@@ -508,6 +532,15 @@ impl SstSource {
             self.next_file()?;
         }
         Ok(())
+    }
+
+    /// Ends the scan's filtered jumps at `stop` ([`SstIter::set_stop`]), for the open SST and
+    /// the ones the level opens next.
+    fn set_stop(&mut self, stop: &ScanStop) {
+        self.iter.set_stop(Some(Arc::clone(stop)));
+        if let Some(level) = &mut self.level {
+            level.stop = Some(Arc::clone(stop));
+        }
     }
 
     /// Switches cache-only reads on or off for the open SST and the ones the level opens
@@ -564,6 +597,7 @@ impl SstSource {
             set,
             filter,
             opts,
+            stop: None,
             at: 0,
             positioned: false,
             past_row: Vec::new(),

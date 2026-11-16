@@ -142,6 +142,8 @@ fn info_flush_and_compact_cover_the_nodes_own_partitions() {
                 p.epoch = 2;
             }
         }
+        // The passes before the install, so the wait below is for the pass it starts.
+        let before = super::super::open::missing_passes(&dirs[0]);
         for port in [a, b] {
             client(port)
                 .await
@@ -151,6 +153,12 @@ fn info_flush_and_compact_cover_the_nodes_own_partitions() {
                 .await
                 .unwrap();
         }
+        // a's install opens p2 in the background, and it fails on the missing file: wait
+        // it out, or a's Info below can catch p2 while it is still marked opening.
+        eventually("a's background open of p2 to run", async || {
+            super::super::open::missing_passes(&dirs[0]) > before
+        })
+        .await;
         let i = info(b).await;
         assert!(i.partitions.is_empty() && i.file_bytes == 0, "{i:?}");
         assert_eq!(i.other_partitions, ["p1", "p2"], "{i:?}");

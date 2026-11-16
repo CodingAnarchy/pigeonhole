@@ -43,6 +43,8 @@ pub(crate) struct Server {
     /// partitions (ICR 0134); `None` for one partition, none, or no pinning. A partition
     /// opened while serving confines its compaction there (#1888).
     pub(crate) reserved: Option<Vec<usize>>,
+    /// `--replica-run`: a replica copy's run of events, at most (D328).
+    pub(crate) replica_run: usize,
 }
 
 impl std::fmt::Debug for Server {
@@ -474,6 +476,25 @@ impl Node {
     /// unfenced. Its schema is reconciled to the map before it's swapped in. Already open:
     /// nothing to do.
     pub(crate) async fn open_part(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
+        self.open_as(id, false).await
+    }
+
+    /// Opens this node's replica copy of partition `id` (D328), which the map lists this
+    /// node in `replicas` for, as [`open_part`](Self::open_part) opens an owner's, with these
+    /// differences:
+    /// - **its file:** `DIR/P.phdb`, created empty if missing (its follower's bootstrap
+    ///   fills it). One that isn't a replica's and has tables (an old owner's copy) is
+    ///   refused, as a single node's `--replica-of` refuses one: `drop-partition` moves it
+    ///   aside;
+    /// - **no feed of its own, no lease, no schema reconcile:** its tables and rows arrive
+    ///   by its owner's feed, and every write is refused (`ReplicaReadOnly`). Its gate is
+    ///   never in the node's lease rounds (simp724's S3);
+    /// - **its follower** starts once it's open.
+    pub(crate) async fn open_replica(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
+        self.open_as(id, true).await
+    }
+
+    async fn open_as(self: &Arc<Self>, id: &str, replica: bool) -> Result<(), ApiError> {
         let _one = self.opening.lock().await;
         let server = self
             .server
@@ -489,11 +510,18 @@ impl Node {
             .as_ref()
             .ok_or_else(|| ApiError::internal("not a cluster node"))?;
         let open_now = cluster.parts.load_full();
-        if open_now.contains_key(id) {
+        let copies_now = cluster.replicas.load_full();
+        if open_now.contains_key(id) || copies_now.contains_key(id) {
             return Ok(());
         }
         let map = self.get_map()?;
         let epoch = match map.partitions.iter().find(|p| p.id == id) {
+            Some(p) if replica && p.replicas.contains(&self.id) => p.epoch,
+            Some(_) if replica => {
+                return Err(ApiError::failed_precondition(format!(
+                    "the map doesn't list this node as a replica of partition {id:?}"
+                )));
+            }
             Some(p) if p.node == self.id => p.epoch,
             Some(p) => {
                 return Err(ApiError::failed_precondition(format!(
@@ -510,7 +538,8 @@ impl Node {
         // Its share, as the node's start would split the budget across the new set; the
         // open partitions keep the shares they opened with (resharing an open engine is
         // out of scope, ICR 0117).
-        let n = open_now.len() + 1;
+        // Replica copies are whole engines too, so they count (D328).
+        let n = open_now.len() + copies_now.len() + 1;
         let shares = crate::serve::placement::split(server.shards, server.compaction, n);
         let share = shares[n - 1];
         // Its share of --change-feed is by the new set's shards (#1786).
@@ -545,6 +574,7 @@ impl Node {
                 };
                 let open: Vec<(String, Arc<Service>, Memory, u64)> = open_now
                     .iter()
+                    .chain(copies_now.iter().map(|(pid, c)| (pid, &c.service)))
                     .filter_map(|(pid, s)| {
                         let m = s.part_opt()?.engine_memory()?;
                         Some((pid.clone(), Arc::clone(s), m, asked(pid)))
@@ -611,13 +641,15 @@ impl Node {
                             &node.dir,
                             Some(&cluster_id),
                             &[(part, epoch)],
+                            replica,
                             super::Budget {
                                 shares: &[share],
                                 reserved: confine.as_deref(),
                                 memories: memory.as_ref().map(std::slice::from_ref),
                             },
                             |s, m| {
-                                let feed = server.change_feed.map(|t| {
+                                // A replica copy keeps no feed of its own (D328).
+                                let feed = server.change_feed.filter(|_| !replica).map(|t| {
                                     crate::serve::placement::feed_share(t, s.shards, all_shards)
                                 });
                                 options_for(&server.served, s, m, feed, true)
@@ -651,6 +683,11 @@ impl Node {
                 opened.pinning.shards,
                 opened.pinning.shards_unpinned(),
             )));
+        }
+        if replica {
+            return self
+                .serve_replica(id, opened, &shared, cluster, server, (shrunk, &resplit))
+                .await;
         }
         // Reopened: its files change from here, so the hashes a close kept go (feed1248),
         // in the step that makes it served.
@@ -702,6 +739,91 @@ impl Node {
         Ok(())
     }
 
+    /// Serves `opened` as this node's replica copy of partition `id` (D328), its engine
+    /// open: a read-only service with its follower, in the node's replica copies (not its
+    /// partitions, so no owner's path sees it: lease rounds, reconciles, `Info`'s owners).
+    /// Its gate is the node's lease clock's, never registered, so it's never leased.
+    async fn serve_replica(
+        self: &Arc<Self>,
+        id: &str,
+        mut opened: super::Opened,
+        shared: &Arc<Shared>,
+        cluster: &crate::serve::router::Cluster,
+        server: &Server,
+        (shrunk, resplit): (Resized, &[Resize]),
+    ) -> Result<(), ApiError> {
+        let gate =
+            crate::serve::gate::WriteGate::opened(id, false, Arc::clone(self.grants.clock()));
+        let config = crate::serve::service::PartitionConfig {
+            backups: Arc::clone(&server.backups),
+            placement: Some(Arc::clone(&server.placement)),
+            pinning: opened.pinning,
+            engine_memory: Some(opened.memory),
+        };
+        let follower = crate::serve::replica::Replica::of_partition(self, id, server.replica_run);
+        let service = Arc::new(
+            shared
+                .router
+                .service
+                .for_partition(opened.db.clone(), id, gate, config)
+                .replica(Arc::clone(&follower)),
+        );
+        // The network side's mask leaves its shard cores out too.
+        let mut all = (*cluster.parts.load_full()).clone();
+        for (pid, c) in cluster.replicas.load().iter() {
+            all.insert(pid.clone(), Arc::clone(&c.service));
+        }
+        all.insert(id.to_owned(), Arc::clone(&service));
+        remask_off_async(&server.placement, &all, format!("replica of {id} opened")).await;
+        let mut copies = (*cluster.replicas.load_full()).clone();
+        copies.insert(
+            std::mem::take(&mut opened.id),
+            crate::serve::router::ReplicaCopy {
+                service: Arc::clone(&service),
+                follower: Arc::clone(&follower),
+            },
+        );
+        cluster.replicas.store(Arc::new(copies));
+        shrunk.keep();
+        Resized::grow(resplit, &format!("replica of {id} opened")).await;
+        follower.spawn_on(service, shared.limits.stream_idle);
+        Ok(())
+    }
+
+    /// Closes this node's replica copy of `id` (D328), if it has one: its follower stops
+    /// (an apply in flight finishes), and its engine closes. Its file stays, for a later
+    /// replica here to resume from, or for `drop-partition` to move aside.
+    pub(crate) async fn close_replica(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
+        let _one = self.opening.lock().await;
+        let Some(server) = self.server.get() else {
+            return Ok(());
+        };
+        let Some(shared) = server.shared.upgrade() else {
+            return Ok(());
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return Ok(());
+        };
+        let mut copies = (*cluster.replicas.load_full()).clone();
+        let Some(copy) = copies.remove(id) else {
+            return Ok(());
+        };
+        cluster.replicas.store(Arc::new(copies));
+        copy.follower.stop().await;
+        let service = copy.service;
+        tokio::task::spawn_blocking(move || match service.part_opt() {
+            Some(part) => {
+                part.close_users();
+                part.db.clone().close()
+            }
+            None => Ok(()),
+        })
+        .await?
+        .map_err(|e| ApiError::from_engine(&e))?;
+        eprintln!("phdb serve: replica of partition {id} closed on this node");
+        Ok(())
+    }
+
     /// A partition opened here asks for its lease at once (D326), and the node's renewals
     /// run if they don't yet: a move's new owner serves only once a majority of the map's
     /// nodes hold a map naming it and grant it, so it and the old owner never both serve
@@ -732,6 +854,7 @@ impl Node {
             .filter(|p| p.node == self.id)
             .map(|p| p.id.clone())
             .collect();
+        self.sync_replicas(&map).await;
         for id in mine {
             // Open, or closed by the operator: a close holds until `unfence`.
             // One read, so a reopen between two can't make it look like neither.
@@ -755,6 +878,71 @@ impl Node {
                     "phdb serve: partition {id}: map version {} gives it to this node, and it \
                      didn't open: {}",
                     map.map_version, e.message
+                ),
+            }
+        }
+    }
+
+    /// Whether this node has a replica copy of partition `id` open (D328).
+    pub(crate) fn replica_open(&self, id: &str) -> bool {
+        self.server
+            .get()
+            .and_then(|s| s.shared.upgrade())
+            .is_some_and(|sh| {
+                sh.router
+                    .cluster
+                    .as_ref()
+                    .is_some_and(|c| c.replicas.load().contains_key(id))
+            })
+    }
+
+    /// Brings this node's replica copies in line with `map` (D328): each one the map no
+    /// longer lists here closes (a map that drops it, or gives this node the partition: a
+    /// move or promotion here, simp724's S4), then each it lists here opens. A copy that
+    /// fails to open is reported and tried again at the next map.
+    async fn sync_replicas(self: &Arc<Self>, map: &crate::serve::proto::ClusterMap) {
+        let listed = |id: &str| {
+            map.partitions
+                .iter()
+                .any(|p| p.id == id && p.replicas.contains(&self.id))
+        };
+        let open: Vec<String> = self
+            .server
+            .get()
+            .and_then(|s| s.shared.upgrade())
+            .and_then(|sh| {
+                sh.router
+                    .cluster
+                    .as_ref()
+                    .map(|c| c.replicas.load().keys().cloned().collect())
+            })
+            .unwrap_or_default();
+        for id in open.iter().filter(|id| !listed(id)) {
+            if let Err(e) = self.close_replica(id).await {
+                eprintln!(
+                    "phdb serve: replica of partition {id}: map version {} drops it here, and \
+                     it didn't close: {}",
+                    map.map_version, e.message
+                );
+            }
+        }
+        for p in map
+            .partitions
+            .iter()
+            .filter(|p| p.replicas.contains(&self.id))
+        {
+            if open.contains(&p.id) {
+                continue;
+            }
+            match self.open_replica(&p.id).await {
+                Ok(()) => eprintln!(
+                    "phdb serve: replica of partition {} opened on map version {}",
+                    p.id, map.map_version
+                ),
+                Err(e) => eprintln!(
+                    "phdb serve: replica of partition {}: map version {} lists this node, and \
+                     it didn't open: {}",
+                    p.id, map.map_version, e.message
                 ),
             }
         }

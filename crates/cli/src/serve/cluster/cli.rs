@@ -570,6 +570,17 @@ pub(super) async fn relocate_as(
         r.status = ExitStatus::SUCCESS;
         return Ok(r);
     }
+    // A node holding P's replica copy (D328) holds `P.phdb` open as a replica, where the
+    // stamp would install the owner's: it leaves `replicas` first (simp724's S4; a replica
+    // made the owner in place is `phdb cluster promote`'s, D328's third PR).
+    if p.replicas.iter().any(|r| r == to) {
+        return Err(Failure::usage(&format!(
+            "node {to:?} holds a replica of {partition}: set a map without it in \
+             {partition}'s replicas first (phdb cluster set-map), and once node {to:?} has \
+             closed its copy, move its {partition}.phdb aside (phdb cluster drop-partition \
+             {partition} on that node), then run this again"
+        )));
+    }
     // A restore's old node may have lost P (not listed: `Unspecified`).
     if let Some(state) = old_state
         && !matches!(state, S::Fenced | S::Closed)

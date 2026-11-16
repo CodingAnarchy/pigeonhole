@@ -6,6 +6,10 @@
 //! posting reads), over a level of many SSTs with memtable rows after them, counting the
 //! block reads on the reading thread (`pigeonhole_sst::counting_file_reads`). A filter that
 //! keeps the row's columns reads what an unfiltered read does.
+//!
+//! #1931: a bounded scan of several rows ends at its end the same way. A jump that lands at or
+//! past the scan's end stops there, rather than jumping on row by row through the rest of
+//! the SST.
 
 use crate::common;
 
@@ -154,5 +158,67 @@ fn a_read_whose_filter_keeps_nothing_in_its_row_ends_at_the_row() {
         // a row early in its SST read on through it: 15 to 17 uncached block reads.
         assert!(most <= 4, "scan {scan}: a read made {most} block reads");
     }
+    db.close().unwrap();
+}
+
+/// A cell a scan read: `(row, qualifier)`.
+type Cell = (Vec<u8>, Vec<u8>);
+
+/// `(row, qualifier)` of every cell a scan of rows `[a, b)` reads under `keep` (`None`: every
+/// qualifier), latest versions; and the block reads it made.
+fn scan_range(
+    db: &Engine,
+    t: &pigeonhole_engine::TableInfo,
+    a: u32,
+    b: u32,
+    keep: Option<&[u8]>,
+) -> (Vec<Cell>, u64) {
+    let snap = db.snapshot().unwrap();
+    let mut s = ScanSpec::new(Bound::Included(row(a)), Bound::Excluded(row(b)));
+    if let Some(p) = keep {
+        s.read.qualifiers = QualifierFilter::Prefix(p.to_vec());
+    }
+    pigeonhole_sst::counting_file_reads(|| {
+        let mut got = Vec::new();
+        let mut c = db.scan(&snap, t.id, s).unwrap();
+        while c.next_row().unwrap() {
+            let r = c.row().to_vec();
+            while let Some(cell) = c.next_cell().unwrap() {
+                got.push((r.clone(), cell.qualifier.to_vec()));
+            }
+        }
+        got
+    })
+}
+
+#[test]
+fn a_bounded_scan_whose_filter_keeps_nothing_ends_at_its_end() {
+    let (db, t) = open();
+    let mut most = 0;
+    // Ranges of 10 rows from every 37th: early in an SST, inside one, across the end of
+    // one into the next (a level source opening its next SST), and from the SSTs into the
+    // memtable.
+    let ranges = (0..ROWS + 190).step_by(37).map(|a| (a, a + 10));
+    for (a, b) in ranges {
+        // `~` sorts after `q0` (a seek to the hint), `a` before it (a row skip).
+        for keep in [&b"~"[..], b"a"] {
+            let (got, reads) = scan_range(&db, &t, a, b, Some(keep));
+            assert!(got.is_empty(), "rows {a}..{b}, prefix {keep:?}");
+            most = most.max(reads);
+        }
+        // A prefix that keeps the rows' columns: what an unfiltered scan returns.
+        let (all, _) = scan_range(&db, &t, a, b, None);
+        let rows: std::collections::BTreeSet<_> = all.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(rows.len() as u32, b - a, "rows {a}..{b}");
+        assert_eq!(
+            scan_range(&db, &t, a, b, Some(b"q")).0,
+            all,
+            "rows {a}..{b}"
+        );
+    }
+    // At most the blocks the range's rows fill, in two SSTs at most, and the one past it (4
+    // here). Without the stop, a range read on through the rest of its last SST: up to 9
+    // when the level's next SST doesn't get it.
+    assert!(most <= 4, "a scan made {most} block reads");
     db.close().unwrap();
 }
