@@ -1176,6 +1176,10 @@ struct Proxy {
     to_node: Arc<std::sync::atomic::AtomicBool>,
     /// Set: nothing more comes back from the node.
     from_node: Arc<std::sync::atomic::AtomicBool>,
+    /// Not 0: `from_node` is set once this many bytes have gone to the node, before the
+    /// byte that reaches it is forwarded. So a reply the node gives only after it took
+    /// more than this never comes back.
+    mute_after: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1187,22 +1191,44 @@ impl Proxy {
         listener.set_nonblocking(true).unwrap();
         let flags: [Arc<std::sync::atomic::AtomicBool>; 3] = Default::default();
         let [to_node, from_node, stop] = flags.clone();
+        let mute_after = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mute = (Arc::clone(&mute_after), Arc::clone(&from_node));
         std::thread::spawn(move || {
             let [to_node, from_node, stop] = flags;
+            // `mute`: the count that sets a flag (`mute_after`), on the way to the node.
+            type Mute = Option<(
+                Arc<std::sync::atomic::AtomicU64>,
+                Arc<std::sync::atomic::AtomicBool>,
+            )>;
             let pump = |mut from: std::net::TcpStream,
                         mut to: std::net::TcpStream,
                         stalled: Arc<std::sync::atomic::AtomicBool>,
-                        stop: Arc<std::sync::atomic::AtomicBool>| {
+                        stop: Arc<std::sync::atomic::AtomicBool>,
+                        mute: Mute| {
                 from.set_read_timeout(Some(Duration::from_millis(20)))
                     .unwrap();
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 16 << 10];
+                    let mut forwarded = 0u64;
                     while !stop.load(Ordering::Relaxed) {
                         if stalled.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
-                        match from.read(&mut buf) {
+                        let read = from.read(&mut buf);
+                        // Held, not dropped, when the flag was set during the read: what
+                        // was read before it goes on only once the flag clears.
+                        while stalled.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        if let (Ok(n), Some((after, flag))) = (&read, &mute) {
+                            forwarded += *n as u64;
+                            let after = after.load(Ordering::Relaxed);
+                            if after != 0 && forwarded >= after {
+                                flag.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        match read {
                             Ok(0) => break,
                             Ok(n) if to.write_all(&buf[..n]).is_err() => break,
                             Ok(_) => {}
@@ -1228,14 +1254,22 @@ impl Proxy {
                     node.try_clone().unwrap(),
                     Arc::clone(&to_node),
                     Arc::clone(&stop),
+                    Some(mute.clone()),
                 );
-                pump(node, client, Arc::clone(&from_node), Arc::clone(&stop));
+                pump(
+                    node,
+                    client,
+                    Arc::clone(&from_node),
+                    Arc::clone(&stop),
+                    None,
+                );
             }
         });
         Self {
             address,
             to_node,
             from_node,
+            mute_after,
             stop,
         }
     }
@@ -1470,9 +1504,6 @@ fn an_upload_whose_node_never_answers_after_the_last_byte_ends_unanswered() {
             Duration::from_millis(300),
             |_, mut feed| async move {
                 stops.store(true, Ordering::Relaxed);
-                // The proxy looks at the flag between reads of at most 20 ms: past one, so
-                // a read that began before the flag can't carry the reply back.
-                tokio::time::sleep(Duration::from_millis(60)).await;
                 // One small chunk: it fits what the connection buffers, so the feed
                 // itself never stalls.
                 let chunk = prost::bytes::Bytes::from(vec![0u8; 1 << 10]);
@@ -1486,6 +1517,56 @@ fn an_upload_whose_node_never_answers_after_the_last_byte_ends_unanswered() {
             panic!("the pass didn't end unanswered");
         };
         assert!(bound >= Duration::from_millis(300), "{bound:?}");
+    });
+}
+
+#[test]
+fn a_restores_upload_a_node_never_answers_fails_once_and_says_to_run_it_again() {
+    // #1983, in a restore: the node takes the whole copy and never answers. That is
+    // final, after one bound: a resume would send nothing and wait as long again. A dead
+    // node is another case (it fails the status call); this is a hung hash or sync.
+    use super::super::restore::{Copy, Job, upload};
+    use sha2::Digest;
+    let t = Cluster::start();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        // 32 KiB: more than the status call's bytes by far, and within what a connection
+        // takes with nothing coming back. So the proxy's count is passed in the upload,
+        // after the status call's answer and before the upload's.
+        let data = noise(7, 32 << 10);
+        let path = t.dirs[0].join("a-copy");
+        std::fs::write(&path, &data).unwrap();
+        let mute_c = Proxy::to(c);
+        mute_c.mute_after.store(8 << 10, Ordering::Relaxed);
+        let job = Job {
+            copy: Copy {
+                partition: "p1".into(),
+                path,
+                epoch: 1,
+                bytes: data.len() as u64,
+                sha256: sha2::Sha256::digest(data.as_bytes()).into(),
+            },
+            node: "c".into(),
+            url: format!("http://{}", mute_c.address),
+            epoch: 2,
+            earlier: false,
+        };
+        let e = within(upload(
+            &t.args,
+            None,
+            "c1",
+            &job,
+            Duration::from_millis(300),
+        ))
+        .await
+        .expect_err("c never answers");
+        assert!(
+            e.message()
+                .contains("the node took the file and gave no answer for")
+                && e.message().contains("run the restore again"),
+            "final after one bound, where a break would resume and end without this text: {}",
+            e.message()
+        );
     });
 }
 

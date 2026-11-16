@@ -177,24 +177,24 @@ fn write_progress(dir: &Path, p: &Progress) -> Result<(), Failure> {
 
 /// One partition's copy in the backup.
 #[derive(Debug, Clone)]
-struct Copy {
-    partition: String,
-    path: PathBuf,
+pub(super) struct Copy {
+    pub(super) partition: String,
+    pub(super) path: PathBuf,
     /// The epoch the copy is of.
-    epoch: u64,
-    bytes: u64,
-    sha256: [u8; 32],
+    pub(super) epoch: u64,
+    pub(super) bytes: u64,
+    pub(super) sha256: [u8; 32],
 }
 
 /// One partition's restore: its copy, the node it goes to and its new epoch.
 #[derive(Debug, Clone)]
-struct Job {
-    copy: Copy,
-    node: String,
-    url: String,
-    epoch: u64,
+pub(super) struct Job {
+    pub(super) copy: Copy,
+    pub(super) node: String,
+    pub(super) url: String,
+    pub(super) epoch: u64,
     /// Stamped by an earlier run: no upload, no stamp.
-    earlier: bool,
+    pub(super) earlier: bool,
 }
 
 /// `phdb cluster restore DIR`.
@@ -450,7 +450,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                 break;
             };
             let (args, token, cluster) = (args.clone(), token.clone(), backup_cluster.clone());
-            set.spawn(async move { upload(&args, token.as_deref(), &cluster, &job).await });
+            set.spawn(async move { upload(&args, token.as_deref(), &cluster, &job, STALL).await });
         }
         let Some(done) = set.join_next().await else {
             break;
@@ -844,7 +844,7 @@ async fn restore_partition(
     };
     record_part(&r.dir, &pr, &mut unwritable);
     if !stamped {
-        upload(args, token.as_deref(), &backup_cluster, &job(e + 1)).await?;
+        upload(args, token.as_deref(), &backup_cluster, &job(e + 1), STALL).await?;
     }
     let set = relocate_as(
         args,
@@ -1104,11 +1104,14 @@ async fn live_map(
 /// Uploads `job`'s copy to its node as a restore's set (the main file alone), resuming
 /// from what the node holds after a break. The upload id comes from the copy and the
 /// node, so a restore run again resumes it.
-async fn upload(
+///
+/// `stall` bounds each of the node's waits ([`upload_file`]): [`STALL`] in a restore.
+pub(super) async fn upload(
     args: &NodeArgs,
     token: Option<&str>,
     cluster: &str,
     job: &Job,
+    stall: Duration,
 ) -> Result<(), Failure> {
     let c = &job.copy;
     let what = |m: &str| format!("partition {} to node {}: {m}", c.partition, job.node);
@@ -1158,7 +1161,7 @@ async fn upload(
         };
         // `Ok`: whether the node holds the whole file. `Err(Ok)`: final. `Err(Err)`: the
         // node's status, a refusal or a break.
-        let sent = match upload_file(&mut admin, token, header.clone(), STALL, read).await {
+        let sent = match upload_file(&mut admin, token, header.clone(), stall, read).await {
             // Complete, or an install of the partition's set is in progress there (a run
             // that stopped in it): the stamp finishes it (#1848).
             Ok(None) => Ok(true),
@@ -1168,13 +1171,15 @@ async fn upload(
             // The node reads nothing, its connection up (#1950): a break, to resume.
             Err(Stopped::Stalled) => Err(Err(tonic::Status::unavailable(format!(
                 "the node took nothing of the file for {} s",
-                STALL.as_secs()
+                stall.as_secs()
             )))),
-            // The node took every byte and never answered (#1983): a break, to resume.
-            Err(Stopped::Unanswered(bound)) => Err(Err(tonic::Status::unavailable(format!(
-                "the node took the file and gave no answer for {} s",
+            // The node took every byte and never answered (#1983). Final, as in a move: a
+            // resume would send nothing and wait as long again, for a node whose hash or
+            // sync has hung (simp724 on #1992). A run again resumes it.
+            Err(Stopped::Unanswered(bound)) => Err(Ok(Failure::usage(&what(&format!(
+                "the node took the file and gave no answer for {} s: run the restore again",
                 bound.as_secs()
-            )))),
+            ))))),
             Err(Stopped::Status(s) | Stopped::Upload(s)) => Err(Err(s)),
         };
         match sent {
