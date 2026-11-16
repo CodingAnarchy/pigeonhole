@@ -4,6 +4,13 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-11-15
+
+One cluster fix. Upgrade if you run `phdb serve` nodes in a cluster and close partitions with `phdb cluster close`. Only the public crates move to 1.2.3: the internal crates are unchanged and stay at 3.0.2. The file format, the shared-memory layout and the feed token layout are unchanged, so 1.2.x processes work together, and files move freely between them.
+
+### Fixed
+- `phdb cluster close` on a partition that is already closed and whose file hash failed (the way to retry the hash) never returned, and the node could then no longer fence, unfence, open, close or stamp any partition until it was restarted. It now takes the hash again and returns (#1956).
+
 ## [1.2.2] - 2026-11-15
 
 Two change feed fixes. Upgrade if you serve change feeds with `phdb serve`, or resume durable feeds from tokens after a power loss. The file format, the shared-memory layout and the feed token layout are unchanged, so 1.2.x processes work together, and files move freely between them.
@@ -1000,7 +1007,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.2.0
