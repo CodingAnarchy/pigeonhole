@@ -665,6 +665,9 @@ impl Node {
             .router
             .service
             .for_partition(opened.db.clone(), id, gate, config);
+        // A text index rebuild stopped here or before a move carries on once it takes writes
+        // (#1756).
+        service.resume_text_rebuilds();
         if let Some(part) = service.part_opt()
             && let Some((feeds, hubs)) = shared.feed_runtimes.get()
         {
