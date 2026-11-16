@@ -263,30 +263,43 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
     // Indexes after tables: a text index reads its source table, created above.
     let have: BTreeSet<String> = db.tables().into_iter().collect();
     for (name, i) in &indexes {
+        let exists = have.contains(*name);
         if recorded.contains_key(*name) {
+            // Recorded before its create (below), so a crash between the two leaves it
+            // recorded without its table: make it now. One there that doesn't open (a crash
+            // part way through its create) is left for the operator, since a drop and create
+            // through the API now reaches it: never made again here, as a full index that
+            // stopped opening (a tokeniser change) would come back empty (audit120's R1).
+            if !exists {
+                create_recorded(db, name, i, &mut o);
+            } else if let Err(e) = open_index(db, i) {
+                o.errors.push(format!(
+                    "index {name:?} doesn't open: {e}. Drop the index and create it again"
+                ));
+            }
             continue;
         }
-        let exists = have.contains(*name);
         if !exists {
-            if let Err(e) = create_index(db, i) {
-                o.errors.push(format!("create index {name:?}: {e}"));
+            // Recorded first: a create that fails part way is undone below, and one a crash
+            // cuts short is the map's to finish or drop (audit120's R1).
+            if let Err(e) = record(db, name, i.created) {
+                o.errors.push(e);
                 continue;
             }
-            o.created.push((*name).to_owned());
-        } else {
-            // An index's create isn't one step, so an unrecorded table of its name may be
-            // half made (a crash before `record`, audit120's S2): adopted only if it opens
-            // as the kind the map places, else left unrecorded with an error for `Status`.
-            if let Err(e) = open_index(db, i) {
-                o.errors.push(format!(
-                    "index {name:?}: an unrecorded table of its name doesn't open as the \
-                     index: {e}"
-                ));
-                continue;
-            }
-            if i.created > 0 {
-                o.adopted.push((*name).to_owned());
-            }
+            create_recorded(db, name, i, &mut o);
+            continue;
+        }
+        // An unrecorded table of its name (made by hand, before the map placed it): adopted
+        // only if it opens as the kind the map places, else left unrecorded with an error
+        // for `Status` (audit120's S2).
+        if let Err(e) = open_index(db, i) {
+            o.errors.push(format!(
+                "index {name:?}: an unrecorded table of its name doesn't open as the index: {e}"
+            ));
+            continue;
+        }
+        if i.created > 0 {
+            o.adopted.push((*name).to_owned());
         }
         if let Err(e) = record(db, name, i.created) {
             o.errors.push(e);
@@ -323,7 +336,7 @@ fn index_on(map: &ClusterMap, i: &IndexPlacement, partition: &str) -> bool {
 /// on the installing thread.
 fn create_index(db: &Pigeonhole, i: &IndexPlacement) -> Result<(), String> {
     use crate::serve::proto::index_placement::Kind;
-    match &i.kind {
+    let made = match &i.kind {
         Some(Kind::Vector(r)) => {
             let (spec, options) = crate::serve::indexes::create_args(r).map_err(|e| e.message)?;
             pigeonhole_vector::Index::create(db, &i.name, spec, options)
@@ -343,6 +356,42 @@ fn create_index(db: &Pigeonhole, i: &IndexPlacement) -> Result<(), String> {
                 .map_err(|e| e.to_string())
         }
         None => Err("its placement has no create request".into()),
+    };
+    // A fault seam: the create fails once its table is made (audit120's R1).
+    #[cfg(test)]
+    if made.is_ok() && FAIL_CREATE.with(|f| f.replace(false)) {
+        return Err("injected: the create failed after its table".into());
+    }
+    made
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes this thread's next [`create_index`] fail after its table is made.
+    static FAIL_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Creates recorded index `name` (#1722). A create that fails part way (the text create
+/// makes the table, then commits its config) drops what it made and the record, so the next
+/// reconcile starts again: the table wasn't there before, so nothing is lost. If that drop
+/// fails, the record stays, and the index's `DropTable` reaches the table.
+fn create_recorded(db: &Pigeonhole, name: &str, i: &IndexPlacement, o: &mut Outcome) {
+    let Err(e) = create_index(db, i) else {
+        o.created.push(name.to_owned());
+        return;
+    };
+    o.errors.push(format!("create index {name:?}: {e}"));
+    match db.drop_table(name) {
+        Ok(()) => {}
+        Err(d) if d.code() == ErrorCode::TableNotFound => {}
+        Err(d) => {
+            o.errors
+                .push(format!("drop the index {name:?} its create left: {d}"));
+            return;
+        }
+    }
+    if let Err(u) = unrecord(db, name) {
+        o.errors.push(u);
     }
 }
 
@@ -1270,6 +1319,78 @@ mod tests {
         );
         let r = records(&db).unwrap();
         assert_eq!((r.get("whole"), r.get("half")), (Some(&2), None));
+        db.close().unwrap();
+    }
+
+    /// audit120's R1 on #1994: an index is recorded before its create. A create that fails
+    /// once its table is made leaves neither, and the next reconcile makes it. One recorded
+    /// without its table (a crash between the two) is made; one recorded that doesn't open
+    /// stays, with an error saying to drop and create it again, which its record lets reach it.
+    #[test]
+    fn an_index_is_recorded_before_its_create_and_a_failed_create_is_undone() {
+        use crate::serve::proto::{
+            CreateVectorIndexRequest, Element, IndexPlacement, Metric, VectorSpec,
+            index_placement::Kind,
+        };
+        let db = db();
+        let placement = |name: &str| IndexPlacement {
+            name: name.into(),
+            kind: Some(Kind::Vector(CreateVectorIndexRequest {
+                name: name.into(),
+                spec: Some(VectorSpec {
+                    dim: 2,
+                    element: Element::F32 as i32,
+                    metric: Metric::L2 as i32,
+                }),
+                ..Default::default()
+            })),
+            partitions: vec!["p1".into()],
+            created: 2,
+            ..Default::default()
+        };
+        let mut m = map(2, &[]);
+        m.indexes.push(placement("v"));
+        super::FAIL_CREATE.with(|f| f.set(true));
+        let o = reconcile(&db, "p1", &m);
+        assert!(
+            o.created.is_empty() && o.errors.len() == 1 && o.errors[0].contains("injected"),
+            "{o:?}"
+        );
+        assert!(tables(&db).is_empty(), "{:?}", tables(&db));
+        assert_eq!(records(&db).unwrap().get("v"), None);
+        let o = reconcile(&db, "p1", &m);
+        assert!(o.created == ["v"] && o.errors.is_empty(), "{o:?}");
+        assert_eq!(records(&db).unwrap().get("v"), Some(&2));
+        pigeonhole_vector::Index::open(&db, "v").unwrap();
+
+        // Recorded, its table never made: made now.
+        super::record(&db, "w", 2).unwrap();
+        m.indexes.push(placement("w"));
+        let o = reconcile(&db, "p1", &m);
+        assert!(o.created == ["w"] && o.errors.is_empty(), "{o:?}");
+        pigeonhole_vector::Index::open(&db, "w").unwrap();
+
+        // Recorded, a table of its name that isn't the index: an error, nothing dropped.
+        db.table("x")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        super::record(&db, "x", 2).unwrap();
+        m.indexes.push(placement("x"));
+        let o = reconcile(&db, "p1", &m);
+        assert!(
+            o.errors.len() == 1
+                && o.errors[0].contains("\"x\" doesn't open")
+                && o.errors[0].contains("Drop the index and create it again"),
+            "{o:?}"
+        );
+        assert!(o.dropped.is_empty() && o.created.is_empty(), "{o:?}");
+        assert_eq!(tables(&db), ["v", "w", "x"]);
+        // Its drop through the map (the placement gone) reaches the table.
+        m.indexes.retain(|i| i.name != "x");
+        let o = reconcile(&db, "p1", &m);
+        assert!(o.dropped == ["x"] && o.errors.is_empty(), "{o:?}");
         db.close().unwrap();
     }
 }
