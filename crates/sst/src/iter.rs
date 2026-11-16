@@ -98,7 +98,15 @@ pub struct SstIter {
     /// since [`SstIter::take_stopped`] last asked. Set only where a jump stops; a stale `true`
     /// costs its caller one settle.
     stopped: bool,
+    /// Where a multi-row read ends ([`SstIter::set_stop`]): a jump that lands at or past it
+    /// stops there (#1931). One per read, shared by its sources. A thin pointer (a boxed
+    /// slice behind the `Arc`): every cursor carries the field, most with `None`, and each
+    /// byte it adds is copied with the cursor wherever it moves.
+    stop: Option<ScanStop>,
 }
+
+/// A multi-row read's end, shared by its cursors ([`SstIter::set_stop`]).
+pub type ScanStop = Arc<Box<[u8]>>;
 
 /// Where a cursor's readahead ramp stands ([`SstIter::readahead_ramp`]), to carry it to the
 /// cursor of the next SST a level scan reads on into.
@@ -315,7 +323,16 @@ impl SstIter {
             stepped: 0,
             window: 0,
             stopped: false,
+            stop: None,
         }
+    }
+
+    /// Ends the cursor's filtered jumps at `stop`, a key the read never reads at or past (a
+    /// bounded scan's end, as its resolver stops at): a jump that lands there stops, valid
+    /// but not admitted, instead of jumping on row by row through rows past the read's end
+    /// (#1931). Tested only after a jump. A one-row read needs none: its rows end it.
+    pub fn set_stop(&mut self, stop: Option<ScanStop>) {
+        self.stop = stop;
     }
 
     /// Whether a jump stop ([`ReadOptions::stop_jumps`]) has left the cursor on a key it
@@ -752,6 +769,9 @@ impl SstIter {
                         self.stopped = true;
                         return Ok(());
                     }
+                    if self.past_stop() {
+                        return Ok(());
+                    }
                 }
                 Verdict::Seek => {
                     let hint = std::mem::take(&mut self.hint);
@@ -761,6 +781,9 @@ impl SstIter {
                     r?;
                     if left {
                         self.stopped = true;
+                        return Ok(());
+                    }
+                    if self.past_stop() {
                         return Ok(());
                     }
                 }
@@ -779,6 +802,16 @@ impl SstIter {
             return false;
         };
         !data.key().starts_with(hint) && left_row_of(data.key(), hint)
+    }
+
+    /// Whether a jump landed at or past the read's end ([`SstIter::set_stop`]).
+    #[inline]
+    fn past_stop(&self) -> bool {
+        self.stop.as_deref().is_some_and(|stop| {
+            self.data
+                .as_ref()
+                .is_some_and(|d| d.valid() && d.key() >= stop)
+        })
     }
 
     /// Runs a move and settles; on error the cursor becomes invalid.
