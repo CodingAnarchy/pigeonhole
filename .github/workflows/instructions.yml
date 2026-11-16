@@ -207,6 +207,9 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # (#1961) PR runs restore main's caches without saving their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The .debs the valgrind-debs job saved for this image (or, on a new image, the newest
       # entry for an older one), installed through dpkg with no network; apt when there are
       # none or they don't install (scripts/install-valgrind.sh). A notice names the source.

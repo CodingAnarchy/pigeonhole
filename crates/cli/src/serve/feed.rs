@@ -3329,12 +3329,28 @@ mod tests {
                 let _ = wait.recv();
             });
             parked.recv().unwrap();
+            // All but the last Buffered: 3000 group-syncs took about a minute on Windows CI
+            // (#1961). The subscription reads the durable feed, so the last commit's group
+            // sync makes the whole backlog durable before the hub sees any of it.
+            let mut last = 0;
             for i in 0..BACKLOG {
-                t.mutate(format!("r{i}").as_bytes())
+                let durability = if i + 1 == BACKLOG {
+                    pigeonhole::Durability::GroupSync
+                } else {
+                    pigeonhole::Durability::Buffered
+                };
+                last = t
+                    .mutate(format!("r{i}").as_bytes())
                     .put("f", b"q", b"v")
+                    .durability(durability)
                     .commit()
-                    .unwrap();
+                    .unwrap()
+                    .seqno;
             }
+            assert!(
+                db.durable_snapshot().unwrap().seqno() >= last,
+                "the backlog is durable before the hub is released"
+            );
             // Queued behind the hub's wake: it runs once the hub gives the worker back.
             let probe = {
                 let feeds = Arc::clone(&feeds);
