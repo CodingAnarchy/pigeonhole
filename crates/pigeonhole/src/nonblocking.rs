@@ -87,34 +87,47 @@ pub struct CommitFuture {
 
 /// A submitted commit of one kind: what it waits on, and the public result it makes of the
 /// engine's.
+///
+/// Two methods, so no public result crosses the trait: [`Resolving::poll`] builds it
+/// straight into its own return value, as each future's own `poll` did. One method
+/// returning `Poll<Result<Out>>` counted up to 34 instructions more a commit, even inlined
+/// (#1970's callgrind runs).
 trait Resolve {
+    /// The engine's result.
+    type Raw;
     type Out;
 
-    /// Polls the engine's pending commit, and maps its outcome once it has one.
-    fn poll_outcome(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::Out>>;
+    /// Polls the engine's pending commit.
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<Self::Raw>;
+
+    /// The public result of the engine's.
+    fn resolved(&mut self, r: Self::Raw) -> Result<Self::Out>;
 }
 
 macro_rules! resolves {
-    ($($submitted:ty => $out:ty,)*) => {$(
+    ($($submitted:ty: $pending:ty => $out:ty,)*) => {$(
         impl Resolve for $submitted {
+            type Raw = <$pending as Future>::Output;
             type Out = $out;
 
             #[inline(always)]
-            fn poll_outcome(&mut self, cx: &mut Context<'_>) -> Poll<Result<$out>> {
-                match Pin::new(&mut self.pending).poll(cx) {
-                    Poll::Ready(r) => Poll::Ready(self.outcome(r)),
-                    Poll::Pending => Poll::Pending,
-                }
+            fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<Self::Raw> {
+                Pin::new(&mut self.pending).poll(cx)
+            }
+
+            #[inline(always)]
+            fn resolved(&mut self, r: Self::Raw) -> Result<$out> {
+                self.outcome(r)
             }
         }
     )*};
 }
 
 resolves! {
-    Submitted => CommitInfo,
-    SubmittedReturning => crate::Returned,
-    SubmittedCheck => Option<CommitInfo>,
-    SubmittedCheckReturning => crate::Checked,
+    Submitted: pigeonhole_engine::PendingCommit => CommitInfo,
+    SubmittedReturning: pigeonhole_engine::PendingReturning => crate::Returned,
+    SubmittedCheck: pigeonhole_engine::PendingCheck => Option<CommitInfo>,
+    SubmittedCheckReturning: pigeonhole_engine::PendingCheckReturning => crate::Checked,
 }
 
 /// The state of every commit future: `S` submitted, resolving to a `T`.
@@ -141,8 +154,9 @@ impl<S: Resolve<Out = T>, T> Resolving<S, T> {
     #[inline(always)]
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<T>> {
         match self {
-            Self::Pending(s) => match s.poll_outcome(cx) {
-                Poll::Ready(out) => {
+            Self::Pending(s) => match s.poll_pending(cx) {
+                Poll::Ready(r) => {
+                    let out = s.resolved(r);
                     *self = Self::Ready(None);
                     Poll::Ready(out)
                 }
