@@ -264,6 +264,34 @@ pub(crate) enum Stop {
 pub(crate) static STEP_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// A hold seam (tests): the database whose packs wait after each chunk until a client or a
+/// resume wants the slot, so that one always arrives mid-pack however slow the machine is.
+/// The wait also ends once this is cleared, at a close, and after two minutes (a pack never
+/// asked fails its test rather than hanging it). Other servers' packs in the process don't
+/// wait.
+#[cfg(test)]
+pub(crate) static HOLD_PACK: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+fn hold_pack(texts: &Texts, slot: &RebuildSlot) {
+    let held = || {
+        HOLD_PACK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            == Some(texts.db.path())
+    };
+    let since = std::time::Instant::now();
+    while held()
+        && since.elapsed() < Duration::from_secs(120)
+        && !slot.wanted()
+        && !slot.resume_wants()
+        && !texts.closed.load(Ordering::Acquire)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Inspection counters (tests): packs that stopped for a client's `Text.Rebuild`, and packs
 /// that stopped for a resume, so a test can tell a pack that yielded the slot from one that
 /// finished, and to whom (cli692 on #2018: one count would let either test pass on the
@@ -327,6 +355,11 @@ impl Steps {
             let ms = STEP_DELAY_MS.load(Ordering::Relaxed);
             if ms > 0 {
                 std::thread::sleep(Duration::from_millis(ms));
+            }
+            if self.pack
+                && let Some(slot) = &self.slot
+            {
+                hold_pack(&self.texts, slot);
             }
         }
         // The document just done: a commit that returned past the lease's end is logged, as
