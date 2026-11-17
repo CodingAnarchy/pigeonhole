@@ -409,6 +409,35 @@ fn resumed(db: &Pigeonhole) {
     assert!(v.is_consistent(), "{v:?}");
 }
 
+/// The rebuild step delay ([`STEP_DELAY_MS`](crate::serve::texts::STEP_DELAY_MS)), owned by
+/// one test at a time until the test ends. The seam is one static for the process: a test
+/// that ended used to zero it under another whose rebuild was still running, which then
+/// finished before its fence landed (#1998).
+struct StepDelay(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl StepDelay {
+    fn of(ms: u64) -> Self {
+        static OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let owner = OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::serve::texts::STEP_DELAY_MS.store(ms, Ordering::Relaxed);
+        StepDelay(owner)
+    }
+
+    /// No delay from here on. The test still owns the seam, so no other test slows the
+    /// rest of this one's rebuild.
+    fn off(&self) {
+        crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Drop for StepDelay {
+    fn drop(&mut self) {
+        self.off();
+    }
+}
+
 #[test]
 fn a_fence_stops_a_text_rebuild_at_its_next_document_and_it_resumes_once_unfenced() {
     let s = Server::start("", limits());
@@ -417,7 +446,7 @@ fn a_fence_stops_a_text_rebuild_at_its_next_document_and_it_resumes_once_unfence
     let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
     gate.renew(u64::MAX);
     let part = gated_part(&s, &gate);
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let delay = StepDelay::of(5);
     // The fence lands mid-rebuild (400 documents at 5 ms each).
     let fenced_at = {
         let gate = Arc::clone(&gate);
@@ -436,7 +465,7 @@ fn a_fence_stops_a_text_rebuild_at_its_next_document_and_it_resumes_once_unfence
         .unwrap_err();
     let answered = std::time::Instant::now();
     let fenced_at = fenced_at.join().unwrap();
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    delay.off();
     // Within a document or two of the fence, not the whole rebuild (or the fence's drain).
     assert!(
         answered.saturating_duration_since(fenced_at) < Duration::from_secs(1),
@@ -470,7 +499,7 @@ fn a_close_stops_a_text_rebuild_and_the_next_open_resumes_it() {
     let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
     gate.renew(u64::MAX);
     let part = gated_part(&s, &gate);
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let delay = StepDelay::of(5);
     let texts = Arc::clone(&part.part().unwrap().texts);
     let closer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
@@ -486,7 +515,7 @@ fn a_close_stops_a_text_rebuild_and_the_next_open_resumes_it() {
         ))
         .unwrap_err();
     let took = closer.join().unwrap();
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    delay.off();
     // The close no longer waits for the whole rebuild.
     assert!(took < Duration::from_secs(1), "the close took {took:?}");
     // A cluster partition's close answers `PartitionUnavailable` (D317 ticket 6), carrying
@@ -568,7 +597,7 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
     let db = s.shared.router.service.part().unwrap().db.clone();
     indexed(&db, 400);
     stopped(&db, "tx");
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    let delay = StepDelay::of(5);
     let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
     gate.renew(u64::MAX);
     let part = gated_part(&s, &gate);
@@ -580,7 +609,7 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
         &Caller::anonymous(),
         None,
     ));
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    delay.off();
     let Ok(service::ServiceReply::TextRebuild(r)) = r else {
         panic!("{r:?}");
     };
