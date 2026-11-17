@@ -734,7 +734,8 @@ pub(super) async fn subscribe(s: Subscribe) -> Result<FeedEvents, ApiError> {
 }
 
 /// Runs `member` from `begin` as a task on `runtime` (the feed runtime), or the caller's:
-/// its error, if it fails, goes to `end`, after its last event.
+/// the error it ends with, if any (a failure, or its idle limit's), goes to `end`, after its
+/// last event.
 fn start(
     member: Member,
     begin: Begin,
@@ -742,11 +743,8 @@ fn start(
     runtime: Option<tokio::runtime::Handle>,
 ) -> tokio::task::JoinHandle<()> {
     let run = async move {
-        match member.run(begin).await {
-            Stop::Failed(e) => {
-                let _ = end.send(e);
-            }
-            Stop::Idle | Stop::Gone => {}
+        if let Some(e) = member.run(begin).await {
+            let _ = end.send(e);
         }
     };
     match runtime {
@@ -889,7 +887,7 @@ enum Source {
 enum Stop {
     /// The client went away.
     Gone,
-    /// The client left events untaken for its idle limit (counted and said already).
+    /// The client left events untaken for its idle limit ([`Member::run`] counts it).
     Idle,
     Failed(ApiError),
 }
@@ -933,7 +931,21 @@ enum Woke<T> {
 }
 
 impl Member {
-    async fn run(mut self, begin: Begin) -> Stop {
+    /// Serves the client from `begin` until its stream ends: the error it ends with, if any.
+    /// One that left events untaken for its idle limit is counted and said here, wherever
+    /// it stopped, and ends with a single node's `DeadlineExceeded` (#2021).
+    async fn run(mut self, begin: Begin) -> Option<ApiError> {
+        match self.serve(begin).await {
+            Stop::Gone => None,
+            Stop::Idle => {
+                drop_idle(&self.metrics, &self.partitions, self.started, self.idle);
+                Some(crate::serve::feed::idle_error(self.idle))
+            }
+            Stop::Failed(e) => Some(e),
+        }
+    }
+
+    async fn serve(&mut self, begin: Begin) -> Stop {
         let mut source = match begin {
             Begin::Ring {
                 joined,
@@ -984,10 +996,6 @@ impl Member {
             };
             source = match next {
                 Ok(s) => s,
-                Err(Stop::Idle) => {
-                    drop_idle(&self.metrics, &self.partitions, self.started, self.idle);
-                    return Stop::Idle;
-                }
                 Err(stop) => return stop,
             };
         }
@@ -1726,7 +1734,16 @@ mod tests {
                 "its --max-streams place is free"
             );
             assert_eq!(load(&t.metrics.cluster_merges), 0);
-            drop(t.events);
+            // A client that reads again gets its untaken event, then a single node's
+            // `DeadlineExceeded`, not a clean end (#2021).
+            let mut events = t.events;
+            commit_of(take(&mut events, LIMIT).await);
+            let Some(Some(Err(e))) = take(&mut events, LIMIT).await else {
+                panic!("the stream ends with an error");
+            };
+            assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+            assert!(e.message.contains("--stream-idle-ms (400 ms)"), "{e:?}");
+            assert!(matches!(take(&mut events, LIMIT).await, Some(None)));
 
             // Nothing sent: ten limits later it's still there, never counted.
             let (_p1, events) = fed();
