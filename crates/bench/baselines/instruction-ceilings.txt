@@ -16,6 +16,24 @@
 # (COUNTS from the workflow's head run). It only lowers. Never raise a ceiling without an
 # owner decision; a raise edits this file by hand and cites that decision.
 #
+# RE-BASELINED ON UBUNTU-26.04 (#1795, D195; owner and coordinator, 2026-11-16/17). Every
+# ceiling below was set (raised or lowered) from the instructions jobs on ubuntu-26.04
+# (valgrind 3.26, glibc 2.43) with rustc pinned at 1.100.0: the highest of three samples of
+# identical code (run 43996552014's base and head, run 43996546378's head; that run's base was
+# a stale main and is not used), times (1 + the shape's headroom). The image and the toolchain
+# are pinned in .github/workflows/instructions.yml; moving either is a re-baseline of this whole
+# file in one PR. The comments further down keep each shape's history; their counts are from
+# ubuntu-24.04 unless they say otherwise. text-phrase and text-phrase-slop2 take #1997's phrase
+# join (-77%, -75%) here, with no ceilings commit of their own.
+#
+# commit-incr's headroom is 1.0% on 26.04, and so is its per-change threshold (the workflow's
+# THRESHOLDS), as serve-mutate's. On identical code it counts 11029-11114 (0.77%): a commit's
+# batch buffer is allocated on the client and freed on the shard thread (#320's cross-thread
+# free), and glibc 2.43 serves the next allocation at a cost that varies with the heap's state.
+# 24.04's glibc counted it exactly. #1990 removed the other per-commit allocations of the
+# counter path (0.92-1.2% -> 0.3-0.8%); pooling the batch buffer back to the client is #320's
+# remaining item. Owner's decision, 2026-11-17.
+#
 # Raised by D195 (owner decision, 2026-10-09): flushed 1905 -> 1912 and compacted 1282 -> 1288
 # (#384 merged after these ceilings were measured), get-sst 17883 -> 17983 with headroom 0.5%
 # (placement drift on main after #392/#396). Each is main 99f8929's count times (1 + headroom).
@@ -296,25 +314,25 @@
 # shapes by a few instructions). Left out: multi-get-dense and multi-get-sparse, whose spread
 # (20-40, the note beside them) is inside their headroom (#1373). commit-at and ycsb-a weren't
 # lowerable. counter keeps its permanent 0.5%.
-as-written 1936 0.3
-flushed 1692 0.3
+as-written 1929 0.3
+flushed 1686 0.3
 compacted 1216 0.3
-get-mem 5699 0.1
-get-sst 16701 0.5
-get-miss 3402 0.3
-row 2247 1.0
-scan 1290 0.3
-scan-filtered 5445 0.3
-versions 5195 0.3
-counter 8661 0.5
-rows 17845 0.3
-level-scans 13814 0.6
+get-mem 5682 0.1
+get-sst 16835 0.5
+get-miss 3403 0.3
+row 2221 1.0
+scan 1291 0.3
+scan-filtered 5426 0.3
+versions 4946 0.3
+counter 8685 0.5
+rows 17647 0.3
+level-scans 13650 0.6
 # Raised by D195 (#1971, #1931 PR 2; coordinator 2026-11-16): short-scans 13068 -> 13129
 # (+0.47%). Base 13065, head 13089 (run 43917470810, b5a3e90ba): short-scans is unfiltered and
 # never builds the scan stop. The cost is codegen and layout from SstIter's new 8-byte stop
 # field, which every cursor carries and copies. A scratch A/B built without the other examples
 # measured 12815 -> 12818 for the same code. The head count times 1.003.
-short-scans 13129 0.3
+short-scans 12857 0.3
 # Raised by D195 (owner decision, 2026-10-09; up to about 0.5% per shape, with its reason):
 # commit-one 8589 -> 8590 (+0.01%), codegen drift on main after #1512 (D316 A2). #1512 sat
 # exactly at 8589, which zero commit-path cost left unchanged, and main's base build in #1515's
@@ -326,27 +344,27 @@ short-scans 13129 0.3
 # Raised by D195 (#1792, coordinator 2026-11-12): commit-one 8617 -> 8647 (+0.35%). CI's stable
 # toolchain moved to Rust 1.100, and main's base build counts 8621 (run 43283228102 on #1792, whose head matches base to 0.0%).
 # Base times 1.003.
-commit-one 8647 0.3
+commit-one 8507 0.3
 # Raised by D195 (#1581, #1559 A): commit-sixteen 36382 -> 36521 (+0.38%). It measured
 # 36352 -> 36412 (+60 per commit, +0.17%; run 42133196250), all in ShardState::apply's inlined
 # code (B-tree map, Vec, the futex mutex, shard.rs; integer and tuple code down), and nothing
 # from pigeonhole_cache: inlining and layout moved when the engine binary changed (x86 scratch
 # run 42145473960, perf287 on #1581). The head count times 1.003.
-commit-sixteen 36521 0.3
+commit-sixteen 36330 0.3
 # Raised by D195 (#1905, coordinator 2026-11-14): flush 2087 -> 2089 (+0.1%). Base 2086, head 2089
 # (run 43663495450): codegen from pigeonhole-io's new sys::boot_clock_ns (D326's lease clock),
 # which the engine never calls; #1905 changes nothing on the flush path.
 flush 2089 0.3
-compact 2615 0.5
-ycsb-c 39116 1.0
+compact 2611 0.5
+ycsb-c 38865 1.0
 # ycsb-a (#1305): identical code is usually flat, with occasional outliers up to about 40 per
 # unit (0.16%) from the commit handoff (Signal::wake_target / park_for_reply), inside its 1.0%
 # headroom. Re-run once before treating a delta within 40 in the PR's base-vs-head table as cost.
-ycsb-a 24626 1.0
+ycsb-a 24427 1.0
 # Raised by D195 (#1792, coordinator 2026-11-12): commit-overwrite 10608 -> 10661 (+0.50%). CI's
 # stable toolchain moved to Rust 1.100, and main's base build counts 10613 (run 43283228102 on #1792, whose head matches base to 0.0%).
 # Base times 1.005 would be +0.56%, so the raise stops at 0.5%, leaving 0.45% headroom.
-commit-overwrite 10661 0.5
+commit-overwrite 10528 0.5
 # commit-at (#1305): identical code reads up to about 10 per unit apart (the commit handoff's
 # wake race; --fair-sched doesn't remove it), inside its 0.3% headroom (about 29). Re-run once
 # before treating a delta within 10 in the PR's base-vs-head table as cost.
@@ -357,8 +375,8 @@ commit-overwrite 10661 0.5
 # check that refuses local writes on a replica; Engine::commit +3 and Table::mutate +7 are
 # codegen (the batch's mark already sits in BatchBuilder's padding; one gate word instead cost
 # more, 7ba0fa75). commit-one, at 8603, stays under #1566's 8617. The highest times 1.003.
-commit-at 9573 0.3
-scan-narrow 1381 0.3
+commit-at 9443 0.3
+scan-narrow 1380 0.3
 scan-small 1358 0.3
 scan-wide 1279 0.3
 # commit-async (#1517, D314 amendment 1): +6 per commit for RowMutation's boxed return_previous
@@ -370,16 +388,22 @@ scan-wide 1279 0.3
 # (run 42797804090's base, after #1502) times 1.003.
 # commit-async 8772 -> 8770 (D195, coordinator 2026-11-10): main measures 8743 (run
 # 42926985535's base, d12e10537, after #1677); 8743 times 1.003.
-commit-async 8770 0.3
+commit-async 8702 0.3
 # D314 (#1453): counter increments, blind and returning (from run 41742912352 on 2d06f6ce).
 # commit-incr-returning-spread does a full read and a checkpoint insert per commit: 0.5%.
 # Raised by D195 (#1804, coordinator 2026-11-12): commit-incr 12706 -> 12767 (+0.48%). Main
 # itself counts 12703, 3 under the old ceiling, and identical commit-path code reads a few apart
 # from run to run (#1804's head 12707: its change is on the open path, not the commit path;
 # run 43327505525, ubuntu-24.04). Base times 1.005.
-commit-incr 12767 0.3
-commit-incr-returning 17519 0.3
-commit-incr-returning-spread 34610 0.5
+# Lowered by D195 (#1990, #1795; coordinator 2026-11-16): a counter write that combines with
+# nothing is copied through with its timestamp, with no map, list or regrown batch. Head counts
+# on 4639bf4c9, d183adbb9 and the merge with main 7f4e25c03 (runs 43958715716, 43964740795,
+# 43982811128, ubuntu-24.04): commit-incr 11365-11371 (from 12707, -10.5%), commit-incr-returning
+# 16003-16018 (from 17507, -8.5%), commit-incr-returning-spread 32956-32961 (from 34443,
+# -4.3%). Each is the highest of those counts times (1 + its headroom).
+commit-incr 11226 1.0
+commit-incr-returning 15635 0.3
+commit-incr-returning-spread 32225 0.5
 # D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
 # From runs 41956036295 and 41959886002 on main b0cdbf36 (21600, 21603): the highest times 1.003.
 # Raised by D195 (#1566, D314 amendment 2): 21668 -> 21731 (+0.29%). 21606 -> 21666 (+60,
@@ -387,59 +411,59 @@ commit-incr-returning-spread 34610 0.5
 # columns too (48 bytes, not 24) and commit_returning refuses them. #1566 keeps the engine's
 # state main's (the check's own CheckSlot; read_before::<COLD>); x86 had shown +215 before.
 # The highest times 1.003.
-commit-put-previous 21731 0.3
+commit-put-previous 20794 0.3
 # D314 amendment 2 (#1446, #1566): compare-and-set-then-read, commit-overwrite through
 # commit_if_returning (the condition's read, then the cell again as of the commit). From run
 # 42088494045 on 571a5bf3 (29094): times 1.003.
-commit-if-returning 29182 0.3
-scan-narrow-q1 5053 0.3
-scan-wide-q10 1744 0.3
-scan-wide-q1 13395 0.3
-scan-interleaved 3176 0.3
-wide-row-cells 1505 0.3
-wide-row-pages 1520 0.3
+commit-if-returning 27698 0.3
+scan-narrow-q1 5063 0.3
+scan-wide-q10 1742 0.3
+scan-wide-q1 13365 0.3
+scan-interleaved 3166 0.3
+wide-row-cells 1471 0.3
+wide-row-pages 1528 0.3
 # multi-get-dense, multi-get-sparse (#1305): identical code reads 20-40 per unit apart (glibc
 # __memcmp_avx2_movbe's path depends on where the compared bytes lie; removing the call is
 # #1373), inside their 0.5% headroom (about 63 and 85). Left out of #1305's tightening. Re-run
 # once before treating a delta within 40 in the PR's base-vs-head table as cost.
-multi-get-dense 12568 0.5
-multi-get-sparse 17108 0.5
-knn-exact 1069 0.3
-knn-filtered 2740 0.3
-scan-budget 3341 0.3
-scan-budget-twin 1370 0.3
-knn-exact-f16 1368 0.3
-knn-exact-bf16 1084 0.3
-knn-budget 1069 0.3
+multi-get-dense 12491 0.5
+multi-get-sparse 17035 0.5
+knn-exact 1066 0.3
+knn-filtered 2743 0.3
+scan-budget 2959 0.3
+scan-budget-twin 1373 0.3
+knn-exact-f16 1366 0.3
+knn-exact-bf16 1082 0.3
+knn-budget 1066 0.3
 # #1560 PR 0 (perf287's T3): the sync text search's floor before its read path goes async,
 # from textshapes.rs over a 100,000-document index (hub terms of 95,649 and 67,972
 # postings), one pass of each shape's queries. From run 42133495367 on 814f72c1, head counts
 # times 1.003 (base and head agreed to 0.0% on every shape).
-text-term-rare 270408 0.3
-text-term-hub 70603557 0.3
-text-two-terms 27657383 0.3
-text-five-terms 22144727 0.3
-text-two-terms-k100 52001738 0.3
+text-term-rare 264331 0.3
+text-term-hub 67918973 0.3
+text-two-terms 26841040 0.3
+text-five-terms 21748875 0.3
+text-two-terms-k100 50501746 0.3
 # Raised by D195 (#1792, coordinator 2026-11-12): text-fuzzy 59091020 -> 59386475 (+0.50%). CI's
 # stable toolchain moved to Rust 1.100, and main's base build counts 59349164 (run 43283228102 on #1792, whose head matches base to 0.0%).
 # Base times 1.003 would be +0.74%, so the raise stops at 0.5%, leaving 0.06% headroom.
-text-fuzzy 59386475 0.3
-text-phrase 126670191 0.3
-text-phrase-slop2 131159719 0.3
+text-fuzzy 56151022 0.3
+text-phrase 29318296 0.3
+text-phrase-slop2 32085657 0.3
 # #1924 (#1930): text-two-terms and text-fuzzy restricted to an id prefix no document has.
 # From the instructions run 43697716916 on d00fcafd8 (#1930's code on main 6297da828), head
 # counts times 1.003. New shapes; no existing line changed (coordinator 2026-11-15).
-text-two-terms-prefix-none 131202 0.3
-text-fuzzy-prefix-none 4460813 0.3
+text-two-terms-prefix-none 126007 0.3
+text-fuzzy-prefix-none 4222924 0.3
 # #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
 # a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
 # identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
 # each shape (base and head) times 1.003. Spread across the runs: 0-1 per unit. The async returning
 # commits run in a binary of their own (asyncwrites.rs): in writepath.rs they moved its layout and
 # commit-incr-returning by about 50 (#1874's scratch run).
-wide-row-cells-async 1675 0.3
-commit-put-previous-async 22144 0.3
-commit-if-returning-async 29264 0.3
+wide-row-cells-async 1676 0.3
+commit-put-previous-async 21192 0.3
+commit-if-returning-async 27864 0.3
 # Lowered by #1874 (#1857's every-table check folded into the kept pass, cached per catalog):
 # feed-drain-all 6416 -> 6177, CI's head count 6158 (run 43560343345) times 1.003.
 # Raised by D195 for #1922 (#1827, the capped feed reader's skip index; the owner's standing
@@ -454,9 +478,9 @@ commit-if-returning-async 29264 0.3
 # feed-drain 6159 -> 6174 (+0.24%), feed-drain-all 6174 -> 6189 (+0.24%): +15 a commit, the
 # decoder's fresh-bytes bound and the cursor's fresh end, after a cut from +34 (one compare per
 # fragment on a fresh frame). The re-read was 47.5% of each hub thread (g111).
-feed-drain 6193 0.3
-feed-drain-all 6208 0.3
-replicate-apply 6764 0.3
+feed-drain 5763 0.3
+feed-drain-all 5778 0.3
+replicate-apply 6366 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
 # and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
@@ -480,7 +504,7 @@ replicate-apply 6764 0.3
 # 63675-64082, 27-47 under the old ceilings, so test-only PRs went red on noise (#1977); main
 # after #1970/#1971/#1974/#1977 counted serve-get 68524 and serve-mutate 64059 (run
 # 43943584393). The highest main count times 1.003. serve-mutate's spread (0.64%) is #1900's.
-serve-get 68731 0.3
-serve-read-row 659543 0.3
-serve-mutate 64275 0.3
-serve-scan 8039293 0.3
+serve-get 62889 0.3
+serve-read-row 583699 0.3
+serve-mutate 58700 0.3
+serve-scan 6766417 0.3
