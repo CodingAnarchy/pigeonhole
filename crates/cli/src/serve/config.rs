@@ -267,6 +267,9 @@ pub(crate) struct ServeArgs {
     /// tail while they grow.
     #[arg(long)]
     pub no_wal_preallocate: bool,
+    /// Box-only (scratch/perf2-2034-ab, g152): `Options::punch_freed(true)`.
+    #[arg(long)]
+    pub punch_freed: bool,
     /// Serve this database as a replica of the primary server at this URL (`http://` or
     /// `https://`): it bootstraps from the primary's backup, then follows its durable
     /// commits, and refuses writes until `Admin.Promote`. Reads see a consistent prefix of
