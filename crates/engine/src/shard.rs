@@ -1885,6 +1885,12 @@ pub fn group_sync_depth() -> u32 {
     GROUP_SYNC_DEPTH
 }
 
+// Every member of every group is moved through the group commit: a field that grows it
+// costs each commit (#2000's callgrind: 8 bytes were 55 instructions a commit). A growth
+// fails the build here instead; to take one deliberately, measure the commit shapes.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Member>() == 232);
+
 #[derive(Debug)]
 struct Member {
     kind: MemberKind,
@@ -10022,6 +10028,12 @@ impl ShardState {
             return;
         };
         c.awaiting = false;
+        // The xid leaves the registry now, before its decision's record is written: a second
+        // `decide` from here answers "not in doubt" (`None`) while the record is unwritten, a
+        // window of this one message's group. If the record then fails, the shard dies
+        // (`settle_external_abort`, a failed decision's group), so no process goes on with a
+        // share that `decide` can't reach; the next open finds it in doubt or decided from
+        // what reached the disk (perf2's S1 on #2000).
         if let Some(ext) = &c.external {
             self.shared.external.remove(&ext.xid);
         }
