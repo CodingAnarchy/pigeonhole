@@ -12338,7 +12338,14 @@ impl ShardState {
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
             ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
             ShardMsg::ExternalDecide { id, commit, reply } => {
-                self.on_external_decide(id, commit, reply, ctx);
+                // Refused while closing, as a commit is (perf2's S2 on #2000): the decision
+                // would remove the registry entry with no record written, and the close
+                // could then drop the WAL holding the share's PREPAREs.
+                if self.closing {
+                    reply.notify(Err(Error::Closed));
+                } else {
+                    self.on_external_decide(id, commit, reply, ctx);
+                }
             }
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
