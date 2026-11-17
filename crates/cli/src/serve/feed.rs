@@ -2458,6 +2458,11 @@ impl FeedEvents {
     /// The sink's next event, then its error if it failed. A batch's events come from the
     /// batch, not the channel: one channel pop, one release of its charge (after its last
     /// event) and two clock reads a batch, not one of each an event (#1737's F3-0).
+    ///
+    /// Each event still spends a unit of the task's Tokio budget, as a channel pop does: the
+    /// connection's body task (hyper's `PipeToSendStream`) polls for frames until this goes
+    /// `Pending`, so with the batch's events free it would run up to 128 batches on its
+    /// network worker before yielding it, and the puts that worker serves would wait (#2027).
     fn poll_events(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -2472,8 +2477,13 @@ impl FeedEvents {
             } => (events, draining, taken, end),
         };
         if let Some((rest, _)) = draining.as_mut()
-            && let Some(e) = rest.next()
+            && rest.len() > 0
         {
+            // Out of budget: nothing taken, and the task is woken once it has yielded. The
+            // batch's first event paid through the channel's pop.
+            let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+            let e = rest.next().expect("a batch event left");
+            coop.made_progress();
             if rest.len() == 0 {
                 // Its last event: the batch's bytes go back to the client's buffer.
                 *draining = None;
@@ -2974,6 +2984,66 @@ mod tests {
             .unwrap()
             .expect("not timed out: the client took all along");
         assert_eq!(next_token(&mut events).await, 4);
+    }
+
+    /// #2027: a batch's events spend the task's Tokio budget as channel pops do, so a
+    /// connection taking a long batch gives its worker back every 128 events at most (the
+    /// first event's pop included), and gets every event, in order, across the yields.
+    /// `gate` leases the stream (simp724): a serving lease changes none of that.
+    async fn a_long_batch_yields_every_budget(gate: Option<Arc<crate::serve::gate::WriteGate>>) {
+        const N: u16 = 300;
+        let (sink, events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        let mut events = match gate {
+            Some(g) => events.leased(g).unwrap(),
+            None => events,
+        };
+        let ev = |i: u16| {
+            Out::event(proto::FeedEvent {
+                token: Bytes::copy_from_slice(&i.to_le_bytes()),
+                ..Default::default()
+            })
+        };
+        sink.put_all((0..N).map(ev).collect()).await.unwrap();
+        let mut got = Vec::new();
+        let mut rounds = Vec::new();
+        while got.len() < usize::from(N) {
+            // One task poll: events until the stream says Pending.
+            let n = std::future::poll_fn(|cx| {
+                let mut n = 0;
+                loop {
+                    match Pin::new(&mut events).poll_out(cx) {
+                        Poll::Ready(Some(Ok(e))) => {
+                            got.push(u16::from_le_bytes([e.token()[0], e.token()[1]]));
+                            n += 1;
+                        }
+                        Poll::Pending => return Poll::Ready(n),
+                        Poll::Ready(other) => panic!("an event, not {:?}", other.map(|r| r.err())),
+                    }
+                }
+            })
+            .await;
+            rounds.push(n);
+            // Out of budget: the next poll of the task gets a new one.
+            tokio::task::yield_now().await;
+        }
+        assert!(rounds.iter().all(|&n| n <= 128), "{rounds:?}");
+        assert_eq!(rounds[0], 128, "{rounds:?}");
+        assert_eq!(got, (0..N).collect::<Vec<_>>(), "every event, in order");
+        assert!(!sink.pending(), "the batch's charge is back");
+    }
+
+    #[tokio::test]
+    async fn a_long_batch_gives_its_worker_back_every_128_events() {
+        a_long_batch_yields_every_budget(None).await;
+    }
+
+    #[tokio::test]
+    async fn a_leased_long_batch_gives_its_worker_back_and_delivers_it_all() {
+        use crate::serve::gate::{LeaseClock, WriteGate};
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", false, Arc::clone(&clock));
+        gate.renew(clock.now() + 60_000_000_000);
+        a_long_batch_yields_every_budget(Some(gate)).await;
     }
 
     /// simp724 on #1737's F3-0: a cluster component whose lease runs out while the connection
