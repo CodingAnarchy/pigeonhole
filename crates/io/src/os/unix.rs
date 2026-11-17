@@ -149,6 +149,19 @@ pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     }
     // SAFETY: plain syscall on an fd owned by `file`.
     if unsafe { libc::fallocate(file.as_raw_fd(), 0, start, count) } == 0 {
+        // SCRATCH (#1991 journal lead, not for merge): write zeros over the new range, so
+        // its extents are written now and no later write converts an unwritten extent
+        // (an XFS journal transaction a WAL fdatasync could have to force).
+        use std::os::unix::fs::FileExt;
+        let zeros = vec![0u8; 1 << 20];
+        let mut at = offset;
+        let end = offset + len;
+        while at < end {
+            let n = (end - at).min(zeros.len() as u64) as usize;
+            file.write_all_at(&zeros[..n], at)
+                .map_err(|e| Error::os("zero-fill", e))?;
+            at += n as u64;
+        }
         return Ok(());
     }
     let err = io::Error::last_os_error();
