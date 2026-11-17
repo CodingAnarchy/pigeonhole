@@ -33,7 +33,14 @@ pub(crate) struct Cluster {
     /// apart from `parts`, so nothing that serves or maintains an owner's partition sees
     /// one.
     pub(crate) replicas: Replicas,
+    /// Replicas a routed read found behind or unreachable (D328), by (node, partition), and
+    /// when: skipped for [`REPLICA_BACKOFF`] after, so reads don't each pay for the miss.
+    pub(crate) replica_backoff:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>>,
 }
+
+/// How long a routed read skips a replica it found behind or unreachable (D328).
+const REPLICA_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A cluster node's replica copy of a partition (D328): a read-only service over its
 /// engine, and the follower that applies the owner's feed to it.
@@ -184,6 +191,7 @@ impl Router {
                 uploads,
                 memory: None,
                 replicas: Arc::default(),
+                replica_backoff: Arc::default(),
             }),
         }
     }
@@ -788,6 +796,27 @@ impl Router {
         owner: Target,
         deadline: tokio::time::Instant,
     ) -> Result<ServiceReply, ApiError> {
+        self.forward_to(cluster, op, caller, prepaid, Fwd::Owner(owner), deadline)
+            .await
+            .map(|(reply, _)| reply)
+    }
+
+    /// [`forward`](Self::forward) to `to`: P's owner, or a node holding P's replica copy
+    /// (D328), with the seqno the serving node read at (`ForwardResponse.served_seqno`).
+    /// A replica's `WrongPartition` isn't followed: the caller tries the next replica.
+    async fn forward_to(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        to: Fwd,
+        deadline: tokio::time::Instant,
+    ) -> Result<(ServiceReply, u64), ApiError> {
+        let (owner, replica) = match to {
+            Fwd::Owner(t) => (t, None),
+            Fwd::Replica(t, r) => (t, Some(r)),
+        };
         // One deadline for the whole forward, from the request's arrival: the budget's wait,
         // a send, and after a WrongPartition the pull and the second send (cli692's F2).
         let left = || {
@@ -810,6 +839,9 @@ impl Router {
             fanout_part: false,
             map_version: owner.map_version,
             caller: Some(forward::forwarded_caller(caller)?),
+            to_replica: replica.is_some(),
+            replica_max_lag_ms: replica.map_or(0, |r| r.max_lag_ms),
+            min_primary_seqno: replica.and_then(|r| r.min_primary_seqno).unwrap_or(0),
             op: Some(forward::op_to_forward(op)?),
         };
         // For the rare resend. Cheap: the generated messages hold their bytes as `Bytes`
@@ -820,7 +852,8 @@ impl Router {
             .send(&owner.address, req, left()?, writes)
             .await;
         let reply = match reply {
-            Err(e) if e.code == "WrongPartition" => {
+            // A replica that doesn't hold the map's copy any more: the caller tries the next.
+            Err(e) if e.code == "WrongPartition" && replica.is_none() => {
                 tokio::time::timeout(
                     left()?,
                     cluster
@@ -839,7 +872,10 @@ impl Router {
                 let op = forward::op_of(again.op.clone())?;
                 match cluster.target(&op)? {
                     // The newer map gives the key to this node.
-                    Place::Here(service) => return service.call(op, caller, Some(budget)).await,
+                    Place::Here(service) => {
+                        let reply = service.call(op, caller, Some(budget)).await?;
+                        return Ok((reply, visible_seqno(&service)));
+                    }
                     Place::There(next) => {
                         let mut again = again;
                         again.map_version = next.map_version;
@@ -853,15 +889,18 @@ impl Router {
             reply => reply,
         };
         drop(budget);
-        let reply = forward::reply_of(reply?)?;
+        let reply = reply?;
+        let served = reply.served_seqno;
+        let reply = forward::reply_of(reply)?;
         // A read's reply is charged here too, for this node's own client: its front-end
         // holds the charge until the reply is written (#1567, cli692's F1 on ticket 2).
-        match reply {
+        let reply = match reply {
             ServiceReply::Get(_) | ServiceReply::ReadRow(_) | ServiceReply::MultiGet(_) => {
-                self.service.charge_built(caller, reply).await
+                self.service.charge_built(caller, reply).await?
             }
-            reply => Ok(reply),
-        }
+            reply => reply,
+        };
+        Ok((reply, served))
     }
 
     /// `Feed.Subscribe` on a cluster node (D317 ticket 7): one stream over every partition
@@ -950,17 +989,35 @@ impl Router {
     /// another node's holdings could fill, so fan-outs through several nodes can't wait on
     /// one another (perf287's g78). Only peers call this (`Cluster.Forward` takes cluster
     /// scope), and the `Cluster` calls' concurrency limit bounds how many run at once.
+    ///
+    /// `replica`: a read the sending node chose this node's replica copy of P for (D328),
+    /// with the client's bound and the call's deadline: served from the copy, never as P's
+    /// owner. Returns the seqno it was served at, for a single-partition read.
     pub(crate) async fn serve_forwarded(
         &self,
         op: ServiceOp,
         caller: &Caller,
         fanout_part: bool,
-    ) -> Result<ServiceReply, ApiError> {
+        replica: Option<(ReplicaRead, ReadDeadline)>,
+    ) -> Result<(ServiceReply, u64), ApiError> {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
         if matches!(op, ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) {
-            return self.serve_forwarded_schema(cluster, op, caller).await;
+            return Ok((self.serve_forwarded_schema(cluster, op, caller).await?, 0));
+        }
+        if let Some((read, deadline)) = replica {
+            let partition = {
+                let routes = cluster.node.routes();
+                let Some(routes) = routes.as_ref() else {
+                    return Err(ApiError::wrong_partition(
+                        0,
+                        "this node has no cluster map yet",
+                    ));
+                };
+                route(routes, &op)?
+            };
+            return Self::serve_copy(cluster, &partition, op, caller, None, read, deadline).await;
         }
         let service = {
             let routes = cluster.node.routes();
@@ -973,12 +1030,220 @@ impl Router {
             let p = route(routes, &op)?;
             cluster.owned_here(routes, &p)?
         };
-        match op {
+        let single = matches!(op, ServiceOp::Get(_) | ServiceOp::ReadRow(_));
+        let reply = match op {
             ServiceOp::MultiGet(_) | ServiceOp::Nearest(_) if fanout_part => {
-                service.fanout_part(op, caller).await
+                service.fanout_part(op, caller).await?
             }
-            op => service.call(op, caller, None).await,
+            op => service.call(op, caller, None).await?,
+        };
+        Ok((reply, if single { visible_seqno(&service) } else { 0 }))
+    }
+
+    /// A read from this node's replica copy of `partition` (D328): once the copy has
+    /// applied the client's read-your-writes seqno (within the deadline), and if it's
+    /// fresh within the client's bound, else `ReplicaBehind`. Returns the copy's applied
+    /// seqno after the read: the next read sent with it as its seqno is at least as new.
+    async fn serve_copy(
+        cluster: &Cluster,
+        partition: &str,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        read: ReplicaRead,
+        deadline: ReadDeadline,
+    ) -> Result<(ServiceReply, u64), ApiError> {
+        let copy = cluster
+            .replicas
+            .load()
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::partition_unavailable(format!(
+                    "this node holds no replica copy of partition {partition}"
+                ))
+            })?;
+        copy.service
+            .await_primary(&op, read.min_primary_seqno, deadline)
+            .await?;
+        copy.follower.within(read.max_lag_ms)?;
+        let reply = copy.service.call(op, caller, prepaid).await?;
+        Ok((reply, copy.follower.applied_seqno()))
+    }
+
+    /// A single-partition read a replica may serve (D328): P's replicas in the map's order,
+    /// skipping one found behind or unreachable in the last [`REPLICA_BACKOFF`], each
+    /// checking the bound itself; then P's owner. One deadline for all of them, from the
+    /// request's arrival. A refusal any of them would give (a missing table, the scope)
+    /// ends it there.
+    async fn read_replicas(
+        &self,
+        cluster: &Cluster,
+        op: ServiceOp,
+        caller: &Caller,
+        mut prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        read: ReplicaRead,
+        deadline: ReadDeadline,
+    ) -> Result<(ServiceReply, super::replica::Served), ApiError> {
+        use super::replica::Served;
+        let (partition, owner) = {
+            let routes = cluster.node.routes();
+            let Some(routes) = routes.as_ref() else {
+                return Err(ApiError::partition_unavailable(
+                    "this cluster node has no map yet",
+                ));
+            };
+            let p = route(routes, &op)?;
+            let owner = routes.owner(&p).cloned();
+            (p, owner)
+        };
+        let me = cluster.node.id().to_owned();
+        let replicas = owner
+            .as_ref()
+            .map(|o| o.replicas.clone())
+            .unwrap_or_default();
+        let map_version = cluster
+            .node
+            .routes()
+            .as_ref()
+            .map_or(0, |r| r.map_version());
+        for (node, address) in replicas {
+            let key = (node.clone(), partition.clone());
+            if cluster
+                .replica_backoff
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .is_some_and(|at| at.elapsed() < REPLICA_BACKOFF)
+            {
+                continue;
+            }
+            let Some(again) = read_again(&op) else {
+                break;
+            };
+            let tried = if node == me {
+                Self::serve_copy(
+                    cluster,
+                    &partition,
+                    again,
+                    caller,
+                    prepaid.take(),
+                    read,
+                    deadline,
+                )
+                .await
+            } else {
+                let target = Target {
+                    node: node.clone(),
+                    address,
+                    map_version,
+                };
+                Box::pin(self.forward_to(
+                    cluster,
+                    again,
+                    caller,
+                    prepaid.take(),
+                    Fwd::Replica(target, read),
+                    tokio::time::Instant::from_std(deadline.at),
+                ))
+                .await
+            };
+            match tried {
+                Ok((reply, seqno)) => {
+                    return Ok((
+                        reply,
+                        Served {
+                            replica: true,
+                            seqno,
+                        },
+                    ));
+                }
+                Err(e) if falls_back(&e) => {
+                    cluster
+                        .replica_backoff
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, std::time::Instant::now());
+                }
+                Err(e) => return Err(e),
+            }
         }
+        let (reply, seqno) = match cluster.target(&op)? {
+            Place::Here(service) => {
+                let reply = service.call(op, caller, prepaid).await?;
+                (reply, visible_seqno(&service))
+            }
+            Place::There(owner) => {
+                Box::pin(self.forward_to(
+                    cluster,
+                    op,
+                    caller,
+                    prepaid,
+                    Fwd::Owner(owner),
+                    tokio::time::Instant::from_std(deadline.at),
+                ))
+                .await?
+            }
+        };
+        Ok((
+            reply,
+            Served {
+                replica: false,
+                seqno,
+            },
+        ))
+    }
+
+    /// Whether this is a cluster node's router.
+    pub(crate) fn is_cluster(&self) -> bool {
+        self.cluster.is_some()
+    }
+
+    /// [`dispatch_after_primary`](Self::dispatch_after_primary), and on a cluster node a read
+    /// sent with `x-pigeonhole-read-replica-max-lag-ms` (`max_lag`, as parsed) that a
+    /// replica may serve (D328): with what served it, for the response's headers. Every
+    /// front-end's reads come here.
+    pub(crate) async fn dispatch_read(
+        &self,
+        op: ServiceOp,
+        caller: &Caller,
+        prepaid: Option<tokio::sync::OwnedSemaphorePermit>,
+        min_primary_seqno: Result<Option<u64>, ApiError>,
+        max_lag: Result<Option<u64>, ApiError>,
+        deadline: ReadDeadline,
+    ) -> Result<(ServiceReply, Option<super::replica::Served>), ApiError> {
+        if let Some(cluster) = &self.cluster
+            && let Some(max_lag_ms) = max_lag?
+        {
+            let min_primary_seqno = min_primary_seqno?;
+            if replica_readable(&op) {
+                let read = ReplicaRead {
+                    max_lag_ms,
+                    min_primary_seqno,
+                };
+                let (reply, served) =
+                    Box::pin(self.read_replicas(cluster, op, caller, prepaid, read, deadline))
+                        .await?;
+                return Ok((reply, Some(served)));
+            }
+            // A read across partitions with one partition's seqno can't be honoured: seqnos
+            // are per partition (D328 §3).
+            if min_primary_seqno.is_some() && fans_out(&op) {
+                return Err(ApiError::invalid(format!(
+                    "{} names one partition's seqno, so it can't go with a read across \
+                     partitions",
+                    super::replica::MIN_PRIMARY_SEQNO
+                )));
+            }
+            let reply = self
+                .dispatch_after_primary(op, caller, prepaid, Ok(min_primary_seqno), deadline)
+                .await?;
+            return Ok((reply, None));
+        }
+        let reply = self
+            .dispatch_after_primary(op, caller, prepaid, min_primary_seqno, deadline)
+            .await?;
+        Ok((reply, None))
     }
 
     /// [`dispatch`](Self::dispatch) once a replica has applied the client's
@@ -1006,6 +1271,26 @@ pub(crate) struct Target {
     pub(crate) node: String,
     pub(crate) address: String,
     pub(crate) map_version: u64,
+}
+
+/// Where [`Router::forward_to`] sends a call: P's owner, or a node holding P's replica copy
+/// with the client's bound (D328).
+pub(crate) enum Fwd {
+    Owner(Target),
+    Replica(Target, ReplicaRead),
+}
+
+/// A read a replica may serve (D328): the client's bound and read-your-writes seqno.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplicaRead {
+    pub(crate) max_lag_ms: u64,
+    pub(crate) min_primary_seqno: Option<u64>,
+}
+
+/// The seqno a read on `service`'s partition was served at, read after it: the owner's
+/// visible seqno (`x-pigeonhole-served-seqno`, D328). 0 without a partition.
+fn visible_seqno(service: &Service) -> u64 {
+    service.part().map_or(0, |p| p.db.visible_seqno())
 }
 
 /// Where a routed call goes: a partition's service here, or the node serving it.
@@ -1443,6 +1728,48 @@ fn scan_span<'a>(routes: &'a Routes, r: &ScanRequest) -> Result<Vec<&'a str>, Ap
 
 /// Whether a forward of `op` that fails after it was sent leaves an outcome unknown (B3):
 /// a write, and a transaction's buffered writes, commit and abort (ticket 3).
+/// Whether a replica may serve `op` (D328 PR 2a): a single-partition read with no
+/// snapshot (a transaction's reads are `TxnGet` and `TxnGetRow`, never routed).
+fn replica_readable(op: &ServiceOp) -> bool {
+    match op {
+        ServiceOp::Get(r) => r.snapshot_id.is_empty(),
+        ServiceOp::ReadRow(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether `op` is a read a cluster fans out over partitions.
+fn fans_out(op: &ServiceOp) -> bool {
+    matches!(
+        op,
+        ServiceOp::MultiGet(_)
+            | ServiceOp::Scan(_)
+            | ServiceOp::Nearest(_)
+            | ServiceOp::Traverse(_)
+    )
+}
+
+/// Another copy of a read [`replica_readable`] accepts, for the next replica or the owner:
+/// `ServiceOp` holds its request by value, and only these are tried more than once.
+fn read_again(op: &ServiceOp) -> Option<ServiceOp> {
+    match op {
+        ServiceOp::Get(r) => Some(ServiceOp::Get(r.clone())),
+        ServiceOp::ReadRow(r) => Some(ServiceOp::ReadRow(r.clone())),
+        _ => None,
+    }
+}
+
+/// Whether a replica's refusal sends the read on to the next replica or the owner (D328):
+/// it's behind, it doesn't hold the copy (or the copy closed under the read, as a map that
+/// drops it closes it), or it couldn't be reached. Anything else (a missing table, the
+/// caller's scope) the owner would answer the same.
+fn falls_back(e: &ApiError) -> bool {
+    matches!(
+        e.code.as_str(),
+        "ReplicaBehind" | "PartitionUnavailable" | "WrongPartition" | "Unavailable" | "Closed"
+    )
+}
+
 fn forward_writes(op: &ServiceOp) -> bool {
     // `TxnWrite` needs write scope, so `writes()` has it; a `Commit` without rows commits
     // the buffered ones.

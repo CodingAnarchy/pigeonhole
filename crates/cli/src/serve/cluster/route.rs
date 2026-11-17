@@ -50,6 +50,8 @@ pub(crate) struct Owner {
     /// The epoch P's current history began at (D317 ticket 6): a feed token from an epoch
     /// before it can't resume.
     pub history_epoch: u64,
+    /// P's replicas (D328), in the map's order of preference: each node's id and address.
+    pub replicas: Vec<(String, String)>,
 }
 
 /// The routing view of one map version.
@@ -82,6 +84,14 @@ impl Routes {
                     address: address.to_owned(),
                     epoch: p.epoch,
                     history_epoch: p.history_epoch,
+                    replicas: p
+                        .replicas
+                        .iter()
+                        .map(|r| {
+                            let address = addresses.get(r.as_str()).copied().unwrap_or_default();
+                            (r.clone(), address.to_owned())
+                        })
+                        .collect(),
                 };
                 (p.id.clone(), owner)
             })
@@ -425,6 +435,7 @@ mod tests {
                 address: "127.0.0.1:7002".into(),
                 epoch: 2,
                 history_epoch: 0,
+                replicas: Vec::new(),
             })
         );
         assert_eq!(r.owner("p9"), None);
