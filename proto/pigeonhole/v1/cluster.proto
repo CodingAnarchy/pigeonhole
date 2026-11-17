@@ -122,6 +122,15 @@ message StampRequest {
   bool restore = 5;
   // With `restore`: the cluster the file records, restored into this one as a new cluster.
   string restore_from_cluster_id = 6;
+  // A promotion of this node's replica copy of the partition (D328, `phdb cluster promote`):
+  // the file is a replica database at `replica_epoch` (the owner's epoch at its bootstrap),
+  // not at `from_epoch`. The node makes it a primary at the last commit it applied, then
+  // raises its epoch to `to_epoch`. Refused while the copy is open here. No staged set is
+  // installed.
+  bool promote = 7;
+  // With `promote`: the epoch the CLI found in the copy's identity row, which the file must
+  // still record, so the stamp acts on the copy that was checked.
+  uint64 replica_epoch = 8;
 }
 
 // A partition's state on its node (D317 ticket 6).

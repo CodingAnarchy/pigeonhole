@@ -21648,6 +21648,12 @@ impl serde::Serialize for StampRequest {
         if !self.restore_from_cluster_id.is_empty() {
             len += 1;
         }
+        if self.promote {
+            len += 1;
+        }
+        if self.replica_epoch != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.StampRequest", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -21671,6 +21677,14 @@ impl serde::Serialize for StampRequest {
         if !self.restore_from_cluster_id.is_empty() {
             struct_ser.serialize_field("restore_from_cluster_id", &self.restore_from_cluster_id)?;
         }
+        if self.promote {
+            struct_ser.serialize_field("promote", &self.promote)?;
+        }
+        if self.replica_epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("replica_epoch", ToString::to_string(&self.replica_epoch).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -21691,6 +21705,9 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
             "restore",
             "restore_from_cluster_id",
             "restoreFromClusterId",
+            "promote",
+            "replica_epoch",
+            "replicaEpoch",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -21701,6 +21718,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
             ToEpoch,
             Restore,
             RestoreFromClusterId,
+            Promote,
+            ReplicaEpoch,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -21728,6 +21747,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                             "toEpoch" | "to_epoch" => Ok(GeneratedField::ToEpoch),
                             "restore" => Ok(GeneratedField::Restore),
                             "restoreFromClusterId" | "restore_from_cluster_id" => Ok(GeneratedField::RestoreFromClusterId),
+                            "promote" => Ok(GeneratedField::Promote),
+                            "replicaEpoch" | "replica_epoch" => Ok(GeneratedField::ReplicaEpoch),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -21753,6 +21774,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                 let mut to_epoch__ = None;
                 let mut restore__ = None;
                 let mut restore_from_cluster_id__ = None;
+                let mut promote__ = None;
+                let mut replica_epoch__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -21795,6 +21818,20 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                             }
                             restore_from_cluster_id__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Promote => {
+                            if promote__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("promote"));
+                            }
+                            promote__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ReplicaEpoch => {
+                            if replica_epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaEpoch"));
+                            }
+                            replica_epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(StampRequest {
@@ -21804,6 +21841,8 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                     to_epoch: to_epoch__.unwrap_or_default(),
                     restore: restore__.unwrap_or_default(),
                     restore_from_cluster_id: restore_from_cluster_id__.unwrap_or_default(),
+                    promote: promote__.unwrap_or_default(),
+                    replica_epoch: replica_epoch__.unwrap_or_default(),
                 })
             }
         }

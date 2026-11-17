@@ -6038,6 +6038,17 @@ pub struct StampRequest {
     /// With `restore`: the cluster the file records, restored into this one as a new cluster.
     #[prost(string, tag = "6")]
     pub restore_from_cluster_id: ::prost::alloc::string::String,
+    /// A promotion of this node's replica copy of the partition (D328, `phdb cluster promote`):
+    /// the file is a replica database at `replica_epoch` (the owner's epoch at its bootstrap),
+    /// not at `from_epoch`. The node makes it a primary at the last commit it applied, then
+    /// raises its epoch to `to_epoch`. Refused while the copy is open here. No staged set is
+    /// installed.
+    #[prost(bool, tag = "7")]
+    pub promote: bool,
+    /// With `promote`: the epoch the CLI found in the copy's identity row, which the file must
+    /// still record, so the stamp acts on the copy that was checked.
+    #[prost(uint64, tag = "8")]
+    pub replica_epoch: u64,
 }
 /// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
 /// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).

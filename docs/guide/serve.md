@@ -531,8 +531,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - the IVF and full-text indexes (building them as well as searching them) aren't served by a cluster node (#1722); agent memory and `/mcp` are, across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
-  - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve single-partition reads that allow staleness, but not reads across partitions yet, and none can be promoted. Losing a partition's node still means a restore or [the lost-node recipe](#a-lost-node) (#1851). A cluster node refuses `--replica-of` and `Admin.Promote`;
-  - a `move`, `relocate` or `restore --partition` onto a node that holds the partition's replica is refused. To do it: set a map without that node in the partition's `replicas`, run `phdb cluster drop-partition P --node <that node>`, then run the command again (#1851).
+  - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve single-partition reads that allow staleness, but not reads across partitions yet. A replica is made the owner by hand (`phdb cluster promote`); automatic failover is #1484. A cluster node refuses `--replica-of` and `Admin.Promote`.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -877,7 +876,18 @@ A node writes a partition only while its newest map names it for the partition a
   - **What served it:** the reply's `x-pigeonhole-served-by` header is `replica` or `owner`, and `x-pigeonhole-served-seqno` the seqno it read at (the replica's applied seqno, or the owner's visible seqno, after the read). Send that back as `x-pigeonhole-min-primary-seqno` for reads that never go back in time. A seqno belongs to one history of the partition: after a relocate without `--copy`, a restore or a promotion, the partition's seqnos start again, so a seqno you kept from before names nothing in the new one. Drop it, and take the next read's.
   - **Never from a replica:** writes, transactions, snapshots and reads at a snapshot, subscriptions, schema and admin calls. Reads across partitions (multi-gets, scans, nearest searches, traversals) are the owners' in this release (#1851).
   - **Not promised:** that two reads see the same or a later state (they may hit different replicas) unless you send `served-seqno` back, or any order across partitions.
-- **Not yet (#1851):** reads across partitions from replicas, and `phdb cluster promote`. Moving P onto a node that holds its replica is refused for now ([the steps](#clusters)).
+- **Promoting a replica** (`phdb cluster promote P --to ID --node URL`): node ID, which holds a replica of P, becomes P's owner. Use it when P's node is lost, or to move P with no copy.
+  - **First,** P must be fenced or closed on its owner (`phdb cluster fence`, `close`), or the owner's process stopped (`--old-unreachable`, which still checks briefly that it doesn't answer and serve P).
+  - **What it does:**
+    1. It sets a map without ID in P's replicas, so ID closes its copy.
+    2. It makes the copy a primary at the last commit it applied, and stamps it at the map's epoch + 1.
+    3. It sets the map that gives ID the partition at that epoch, with a **new change-feed history**: feed tokens from before don't resume, and replicas of P copy it again.
+  - **What's lost:** commits the old owner acknowledged after the copy's last one. The report gives `applied_seqno` (the copy's), `owner_durable_seqno` (the owner's, as the copy last heard), and `lost_commits`, their difference. With `--old-unreachable` it can't ask the old owner, so `lost_commits` says the loss is unknown.
+  - **Refused:** a copy from before P's current history (it copies P again first; promote it once it follows), and an owner that still serves P.
+  - **Run it again** to finish one that stopped: it carries on from the closed or stamped copy.
+  - **The old owner afterwards** keeps its files, and serves nothing for P once it holds the new map. Leases (D326) keep it from serving P once ID does. To have it follow ID as a replica: `phdb cluster drop-partition P --node <old owner>` (its files go aside, so copy off anything you want from its tail first), then add it to P's `replicas` with `set-map`. Its unreplicated commits are gone either way.
+- **Moving P onto a node that holds its replica** (`move`, `relocate`, `restore --partition`): the command first sets a map without that node in P's replicas and waits for it to close its copy. The copy's file goes aside when P's files are installed there.
+- **Not yet (#1851):** reads across partitions from replicas.
 
 ### Backup and restore
 - **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json`.

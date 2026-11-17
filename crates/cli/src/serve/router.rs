@@ -751,6 +751,14 @@ impl Router {
                 ServiceOp::Follow(_) => {
                     return Box::pin(self.follow_owned(cluster, op, caller)).await;
                 }
+                // A replica copy is made its partition's owner through the map (D328 PR 3),
+                // never in place: it would be a writer the map doesn't name.
+                ServiceOp::Promote(_) => {
+                    return Err(ApiError::failed_precondition(
+                        "on a cluster node, a partition's replica is promoted with phdb cluster \
+                         promote PARTITION --to NODE, which stamps it and moves the map",
+                    ));
+                }
                 // Served where the partition is, never forwarded (D317 ticket 8b).
                 ServiceOp::Backup(_) | ServiceOp::BackupDownload(_) => {
                     return self.backup(cluster, op, caller, prepaid).await;

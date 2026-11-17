@@ -294,6 +294,8 @@ fn a_stamp_onto_a_node_holding_the_partitions_replica_is_refused() {
                 to_epoch: 2,
                 restore: false,
                 restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
             })
             .await
             .unwrap_err();
@@ -757,5 +759,221 @@ fn an_idle_owners_replica_stays_fresh() {
             .unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
         assert_eq!(by.as_deref(), Some("replica"));
+    });
+}
+
+/// The map as node `port` has it: P's node, epoch, history epoch and replicas.
+async fn placed(port: u16, p: &str) -> (String, u64, u64, Vec<String>) {
+    let m = client(port)
+        .await
+        .get_map(GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let q = m.partitions.into_iter().find(|q| q.id == p).unwrap();
+    (q.node, q.epoch, q.history_epoch, q.replicas)
+}
+
+/// D328 PR 3: a planned promotion. With p3 closed on its owner c (which releases its
+/// lease), `phdb cluster promote p3 --to a` makes a's replica the owner at the next epoch
+/// with a new history: the rows c had are there, writes land on a, and nothing is lost.
+#[test]
+fn a_planned_promotion_makes_the_replica_the_owner() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let last = put_in(ports[1], "r", "k2").await;
+        eventually("a's copy to apply k2", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        let (node, epoch, history, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        assert!(replicas.is_empty(), "{replicas:?}");
+        // The rows the owner had, and a write after it, on a.
+        let after = put_after_move(ports[1], "r", "k3").await;
+        assert!(after > 0);
+        for row in ["k1", "k2", "k3"] {
+            let (value, _, _) = read_through(ports[1], row, None, None).await.unwrap();
+            assert_eq!(value.as_deref(), Some(&b"v"[..]), "{row}");
+        }
+        // Run again: done.
+        let again = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+        ))
+        .await
+        .unwrap();
+        assert!(again.document.contains_key("done"), "{:?}", again.document);
+    });
+}
+
+/// A promotion to a node that holds no replica of the partition is refused, and so is one
+/// whose owner still serves it.
+#[test]
+fn a_promotion_needs_a_replica_and_an_owner_that_stopped_serving() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+        ))
+        .await
+        .err()
+        .expect("the owner still serves p3");
+        assert!(
+            e.message().contains("isn't fenced or closed"),
+            "{}",
+            e.message()
+        );
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "b",
+            true,
+        ))
+        .await
+        .err()
+        .expect("b holds no replica of p3");
+        assert!(
+            e.message().contains("answers and serves") || e.message().contains("no copy"),
+            "{}",
+            e.message()
+        );
+    });
+}
+
+/// `--old-unreachable`: c, p3's owner, stops (real 1.5 s leases here). The promotion goes
+/// ahead, reports the loss as unknown, and a serves p3 once c's lease has run out.
+#[test]
+fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (mut stops, ports) = three_leased(&rt, &dirs);
+    rt.block_on(async {
+        table_on_p3(ports[0]).await;
+        let first = put_after_move(ports[1], "r", "k1").await;
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's copy to apply k1", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+    });
+    let _ = stops.remove(2).send(());
+    rt.block_on(async {
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            true,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("unknown")),
+            "{:?}",
+            r.document
+        );
+        let after = put_after_move(ports[1], "r", "k2").await;
+        assert!(after > 0);
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// S4 (D328 PR 3): a move of p3 onto a, which holds p3's replica, takes a out of p3's
+/// replicas and closes its copy first, then moves p3 there as any move does: its rows and
+/// history come along, and the copy's file went aside.
+#[test]
+fn a_move_onto_a_replicas_node_takes_it_out_of_the_replicas_first() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let (_, _, history_before, _) = placed(ports[1], "p3").await;
+        within(super::super::moving::run(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+        let (node, epoch, history, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("a", 2));
+        assert_eq!(history, history_before, "a move keeps p3's history");
+        assert!(replicas.is_empty(), "{replicas:?}");
+        let after = put_after_move(ports[1], "r", "k2").await;
+        assert!(after > 0);
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// A promotion that stopped after its stamp, before its map (a crash there): a's file is
+/// at the next epoch, a primary, out of p3's replicas, and the map still gives p3 to c.
+/// Run again, it finishes: no second stamp, and the map gives a the partition.
+#[test]
+fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        *super::super::promote::STOP_AFTER_STAMP.lock().unwrap() = Some(args.node.clone());
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1), "the map didn't move");
+        assert!(replicas.is_empty(), "{replicas:?}");
+        let r = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let (node, epoch, history, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
     });
 }
