@@ -991,6 +991,8 @@ fn small_ring() -> crate::serve::config::Limits {
     let mut l = crate::serve::server_tests::limits();
     l.feed_ring_bytes = 4096;
     l.feed_client_events = 1;
+    // And one byte, so every event goes alone, not in a batch (#1737's F3-0).
+    l.feed_client_bytes = 1;
     l.stream_idle = Duration::from_secs(600);
     l
 }
@@ -1153,6 +1155,8 @@ fn a_member_that_stops_reading_is_dropped_without_holding_up_the_others() {
     let mut l = crate::serve::server_tests::limits();
     l.stream_idle = Duration::from_millis(500);
     l.feed_client_events = 1;
+    // And one byte, so every event goes alone, not in a batch (#1737's F3-0).
+    l.feed_client_bytes = 1;
     let t = Three::start_with(l);
     let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
     t.rt.block_on(async {
