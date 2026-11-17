@@ -1719,19 +1719,15 @@ impl Engine {
                         participants,
                         Arc::clone(&e.xid),
                     );
-                    shared
-                        .external
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(
-                            e.xid.to_vec(),
-                            crate::shard::ExternalEntry {
-                                id: *seqno,
-                                coordinator: ShardId(coordinator.0 as u16),
-                                prepared_at: now,
-                                bytes: bytes.len() as u64,
-                            },
-                        );
+                    shared.external.install(
+                        &e.xid,
+                        crate::shard::ExternalEntry {
+                            id: *seqno,
+                            coordinator: ShardId(coordinator.0 as u16),
+                            prepared_at: now,
+                            bytes: bytes.len() as u64,
+                        },
+                    );
                 }
             }
         } else {
@@ -5618,65 +5614,16 @@ impl Inner {
                     .to_owned(),
             ));
         }
-        self.reserve_external(xid, builder.batch().as_bytes().len() as u64)?;
+        // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
+        // one xid can't both log, nor concurrent ones pass a limit together.
+        self.shared
+            .external
+            .reserve(xid, builder.batch().as_bytes().len() as u64)?;
         let prepared = self.submit_external(&view, &builder, &shards, durability, validate, xid);
         // Unless every share was logged (the coordinator replaced the reservation with the
         // xid's entry before it answered), the reservation goes.
-        self.unreserve_external(xid);
+        self.shared.external.unreserve(xid);
         prepared
-    }
-
-    /// Reserves `xid` in the registry for a prepare (an entry with id 0), under the lock that
-    /// checks it: a second prepare of the xid in flight or in doubt is refused, and the
-    /// in-doubt limits count prepares in flight too, so concurrent prepares can't pass
-    /// them together. `Busy` past a limit.
-    fn reserve_external(&self, xid: &[u8], bytes: u64) -> Result<()> {
-        let mut registry = self
-            .shared
-            .external
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if registry.contains_key(xid) {
-            return Err(Error::InvalidArgument(
-                "this xid is prepared here already: decide it first".to_owned(),
-            ));
-        }
-        // The in-doubt limits (D329): past either, no new share, so a home that stopped
-        // deciding can't grow the WAL its shares pin without bound. Taken under the
-        // registry's lock (the only nesting of the two).
-        let (max_shares, max_bytes) = *self
-            .shared
-            .external_limits
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let held: u64 = registry.values().map(|e| e.bytes).sum();
-        if (max_shares > 0 && registry.len() >= max_shares) || (max_bytes > 0 && held >= max_bytes)
-        {
-            return Err(Error::Busy);
-        }
-        registry.insert(
-            xid.to_vec(),
-            crate::shard::ExternalEntry {
-                id: 0,
-                coordinator: ShardId(0),
-                prepared_at: 0,
-                bytes,
-            },
-        );
-        Ok(())
-    }
-
-    /// Drops `xid`'s reservation, if it is still one (id 0): a prepare that logged every
-    /// share left the coordinator's entry in its place.
-    fn unreserve_external(&self, xid: &[u8]) {
-        let mut registry = self
-            .shared
-            .external
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if registry.get(xid).is_some_and(|e| e.id == 0) {
-            registry.remove(xid);
-        }
     }
 
     /// [`prepare_external`](Self::prepare_external)'s submission, once `xid` is reserved.
@@ -5720,21 +5667,13 @@ impl Inner {
             return Err(Error::ReadOnly);
         }
         self.check_writable()?;
-        let Some(entry) = self
-            .shared
-            .external
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(xid)
-            .copied()
-        else {
-            return Ok(None);
+        let entry = match self.shared.external.lookup(xid) {
+            crate::external_registry::Lookup::InDoubt(e) => e,
+            crate::external_registry::Lookup::Absent => return Ok(None),
+            // A prepare of it is still in flight: not in doubt yet, nor decided. The caller
+            // asks again once the prepare has answered.
+            crate::external_registry::Lookup::Reserved => return Err(Error::Busy),
         };
-        // A prepare of it is still in flight: not in doubt yet, nor decided. The caller
-        // asks again once the prepare has answered.
-        if entry.id == 0 {
-            return Err(Error::Busy);
-        }
         let (tx, mut waiter) = crate::write::commit_completion();
         self.shared
             .submitter(entry.coordinator)
@@ -5750,11 +5689,7 @@ impl Inner {
     /// Sets the in-doubt limits (D329, ICR 0140): past `max_shares` transactions in doubt,
     /// or `max_bytes` of their batches, a new prepare answers `Busy`. 0: no limit.
     pub(crate) fn set_in_doubt_limits(&self, max_shares: usize, max_bytes: u64) {
-        *self
-            .shared
-            .external_limits
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = (max_shares, max_bytes);
+        self.shared.external.set_limits(max_shares, max_bytes);
     }
 
     /// The externally prepared transactions in doubt here (D329): each one's xid, and how
@@ -5763,11 +5698,9 @@ impl Inner {
         let now = self.shared.vfs.monotonic_nanos();
         self.shared
             .external
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(_, e)| e.id != 0)
-            .map(|(xid, e)| (xid.clone(), now.saturating_sub(e.prepared_at)))
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, e)| (xid, now.saturating_sub(e.prepared_at)))
             .collect()
     }
 
@@ -7543,8 +7476,7 @@ impl Shared {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             external_flagged: AtomicBool::new(false),
-            external: Mutex::new(std::collections::BTreeMap::new()),
-            external_limits: Mutex::new((0, 0)),
+            external: crate::external_registry::ExternalRegistry::default(),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,
