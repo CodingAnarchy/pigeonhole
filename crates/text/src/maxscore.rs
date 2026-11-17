@@ -31,6 +31,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
+use std::marker::PhantomData;
 use std::task::Poll;
 
 use pigeonhole::{CellEntry, RowCells, Snapshot};
@@ -560,6 +561,30 @@ pub(crate) fn bound_factor(bm: &Bm25, maxtf: Option<i64>, minlen: Option<i64>) -
     }
 }
 
+/// `row`'s posting cells, for ids starting with `prefix`.
+///
+/// One expression a case, never `read = read.qualifier_prefix(p)`: the read builder is a
+/// large struct passed and returned by value, and the reassignment copied it three times a
+/// walk once the compiler stopped inlining the call (#1585: about 53 instructions a walk on
+/// the id-prefix shapes).
+#[inline(always)]
+fn posting_cells<'t>(
+    t: &'t Rows,
+    s: &Snapshot,
+    row: &[u8],
+    prefix: Option<&[u8]>,
+) -> Result<RowCells<'t>> {
+    Ok(match prefix {
+        Some(p) => t
+            .row(row)
+            .family(POST)
+            .snapshot(s)
+            .qualifier_prefix(p)
+            .cells()?,
+        None => t.row(row).family(POST).snapshot(s).cells()?,
+    })
+}
+
 impl<'t, L: Layout> Walk<'t, Blocking, L> {
     /// The walk over `term`'s postings (restricted to doc ids starting with `prefix`), and
     /// its bound: `weight · tf_factor(maxtf, minlen)`. `postings` is the term's `df`.
@@ -577,12 +602,9 @@ impl<'t, L: Layout> Walk<'t, Blocking, L> {
             Ok(t.get_at(s, &row, family, BOUND)?.and_then(|c| c.as_i64()))
         };
         let factor = bound_factor(bm, agg(MAXTF)?, agg(MINLEN)?);
-        let mut read = t.row(&row).family(POST).snapshot(s);
-        if let Some(p) = prefix {
-            read = read.qualifier_prefix(p);
-        }
+        let cells = posting_cells(t, s, &row, prefix)?;
         let blocks = L::open(t, s, &row, prefix)?;
-        let mut w = Walk::opened(row, weight, factor, read.cells()?, postings, blocks);
+        let mut w = Walk::opened(row, weight, factor, cells, postings, blocks);
         match w.step(bm, &mut ()) {
             Poll::Ready(r) => r?,
             Poll::Pending => unreachable!("sync reads are always ready"),
@@ -612,12 +634,9 @@ pub(crate) async fn walk_async<'t, L: Layout>(
         maxtf.and_then(|c| c.as_i64()),
         minlen.and_then(|c| c.as_i64()),
     );
-    let mut read = t.row(&row).family(POST).snapshot(s);
-    if let Some(p) = prefix {
-        read = read.qualifier_prefix(p);
-    }
+    let cells = posting_cells(t, s, &row, prefix)?;
     let blocks = L::open(t, s, &row, prefix)?;
-    let mut w = Walk::opened(row, weight, factor, read.cells()?, postings, blocks);
+    let mut w = Walk::opened(row, weight, factor, cells, postings, blocks);
     std::future::poll_fn(|cx| w.step(bm, &mut Polling::new(cx))).await?;
     Ok(w)
 }
@@ -1269,23 +1288,33 @@ impl<'t, R: Reads, L: Layout> Scored<'t, R, L> {
 
 /// A held result, ordered so the worst is greatest (a lower score, or an equal score with a
 /// larger id): the top of a [`BinaryHeap`] is the one a better candidate replaces.
-struct Held(f64, Vec<u8>);
+///
+/// It carries the layout as a type so each layout's document loop has its own heap code,
+/// as the one loop had before #1585: with one `BinaryHeap<Held>` shared by both loops the
+/// compiler stopped inlining `pop` (about 185 instructions a search on `text-term-rare`).
+struct Held<L>(f64, Vec<u8>, PhantomData<fn() -> L>);
 
-impl PartialEq for Held {
+impl<L> Held<L> {
+    fn new(score: f64, doc: Vec<u8>) -> Self {
+        Held(score, doc, PhantomData)
+    }
+}
+
+impl<L> PartialEq for Held<L> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for Held {}
+impl<L> Eq for Held<L> {}
 
-impl PartialOrd for Held {
+impl<L> PartialOrd for Held<L> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Held {
+impl<L> Ord for Held<L> {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .0
@@ -1343,7 +1372,7 @@ pub(crate) struct TopK<'t, R: Reads, L: Layout> {
     by_bound: Vec<usize>,
     prefix: Vec<f64>,
     /// The held documents, the worst on top.
-    held: BinaryHeap<Held>,
+    held: BinaryHeap<Held<L>>,
     /// How many of `by_bound`'s first clauses are non-essential.
     skip: usize,
     /// The threshold the non-essential prefix and the fuzzy cuts were last taken at.
@@ -1397,7 +1426,7 @@ impl<'t, R: Reads, L: Layout> TopK<'t, R, L> {
         // Best first: score descending, then id ascending (`Held` orders the worst greatest).
         let mut out = self.held.into_vec();
         out.sort();
-        out.into_iter().map(|Held(s, d)| (d, s)).collect()
+        out.into_iter().map(|Held(s, d, _)| (d, s)).collect()
     }
 
     /// Runs the document loop until it's done (`Ready(Ok)`), or, async, until a read is
@@ -1622,7 +1651,7 @@ impl<'t, R: Reads, L: Layout> TopK<'t, R, L> {
             let score = self.contrib.iter().flatten().fold(0.0, |sum, v| sum + v);
             let doc: &[u8] = &self.last;
             if self.held.len() < k {
-                self.held.push(Held(score, doc.to_vec()));
+                self.held.push(Held::new(score, doc.to_vec()));
             } else {
                 // Better than the worst held (`Held`'s order: a higher score, or an equal
                 // score and a smaller id): it takes the worst one's place.
@@ -1634,7 +1663,7 @@ impl<'t, R: Reads, L: Layout> TopK<'t, R, L> {
                 };
                 if better {
                     self.held.pop();
-                    self.held.push(Held(score, doc.to_vec()));
+                    self.held.push(Held::new(score, doc.to_vec()));
                 }
             }
         }
@@ -1675,7 +1704,7 @@ pub(crate) fn top_k<L: Layout>(
         prefix[i + 1] = prefix[i] + clauses[c].bound;
     }
     // The held documents, the worst on top.
-    let mut held: BinaryHeap<Held> = BinaryHeap::with_capacity(k + 1);
+    let mut held: BinaryHeap<Held<L>> = BinaryHeap::with_capacity(k + 1);
     // How many of `by_bound`'s first clauses are non-essential.
     let mut skip = 0;
     // The threshold the non-essential prefix and the fuzzy cuts were last taken at.
@@ -1785,7 +1814,7 @@ pub(crate) fn top_k<L: Layout>(
         // The exact score: contributions in the clauses' fixed order.
         let score = contrib.iter().flatten().fold(0.0, |sum, v| sum + v);
         if held.len() < k {
-            held.push(Held(score, doc.to_vec()));
+            held.push(Held::new(score, doc.to_vec()));
         } else {
             // Better than the worst held (`Held`'s order: a higher score, or an equal score
             // and a smaller id): it takes the worst one's place.
@@ -1797,14 +1826,14 @@ pub(crate) fn top_k<L: Layout>(
             };
             if better {
                 held.pop();
-                held.push(Held(score, doc.to_vec()));
+                held.push(Held::new(score, doc.to_vec()));
             }
         }
     }
     // Best first: score descending, then id ascending (`Held` orders the worst greatest).
     let mut out = held.into_vec();
     out.sort();
-    Ok(out.into_iter().map(|Held(s, d)| (d, s)).collect())
+    Ok(out.into_iter().map(|Held(s, d, _)| (d, s)).collect())
 }
 
 /// A [`Blocking`] read's result: always ready.

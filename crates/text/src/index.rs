@@ -588,9 +588,19 @@ impl Index {
 
     /// The index's table for reads: with the block family in a version 2 index, which a
     /// handle opened before the first pack gets by opening the table again, once.
+    #[inline]
     pub(crate) fn rows(&self, packed: bool) -> Result<&Rows> {
+        if !packed {
+            return Ok(&self.inner.table);
+        }
+        self.rows_packed()
+    }
+
+    /// [`rows`](Self::rows) for a version 2 index, out of line.
+    #[inline(never)]
+    fn rows_packed(&self) -> Result<&Rows> {
         let inn = &*self.inner;
-        if !packed || inn.table.family_info(POSTB).is_some() {
+        if inn.table.family_info(POSTB).is_some() {
             return Ok(&inn.table);
         }
         if let Some(rows) = inn.fresh.get() {
