@@ -3411,30 +3411,14 @@ impl Service {
         &self,
         r: proto::CreateVectorIndexRequest,
     ) -> Result<proto::Empty, ApiError> {
-        let spec = r
-            .spec
-            .as_ref()
-            .ok_or_else(|| ApiError::invalid("an index needs a vector spec"))?;
-        let spec = convert::vector_spec_in(spec)?;
-        let mut options = pigeonhole_vector::IndexOptions::new();
-        if let Some(n) = r.target_list_len {
-            options = options.target_list_len(n);
+        // Where the ids are is a cluster's (#1722): a single node holds them all.
+        if !r.follows.is_empty() || r.placement.is_some() {
+            return Err(ApiError::invalid(
+                "an index's follows and placement are for a cluster node: this server is a \
+                 single node, whose index holds every id",
+            ));
         }
-        if let Some(n) = r.nprobe {
-            options = options.nprobe(n);
-        }
-        if let Some(n) = r.reassign_neighbours {
-            options = options.reassign_neighbours(n);
-        }
-        match proto::Rebalance::try_from(r.rebalance).unwrap_or(proto::Rebalance::Unspecified) {
-            proto::Rebalance::Unspecified => {}
-            proto::Rebalance::Inline => {
-                options = options.rebalance(pigeonhole_vector::Rebalance::Inline);
-            }
-            proto::Rebalance::Background => {
-                options = options.rebalance(pigeonhole_vector::Rebalance::Background);
-            }
-        }
+        let (spec, options) = super::indexes::create_args(&r)?;
         let indexes = Arc::clone(&self.part()?.indexes);
         self.blocking(move || indexes.create(&r.name, spec, options, r.if_missing))
             .await?;

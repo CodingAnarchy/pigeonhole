@@ -9,6 +9,7 @@ import "pigeonhole/v1/data.proto";
 import "pigeonhole/v1/feed.proto";
 import "pigeonhole/v1/memory.proto";
 import "pigeonhole/v1/schema.proto";
+import "pigeonhole/v1/text.proto";
 import "pigeonhole/v1/transactions.proto";
 import "pigeonhole/v1/vector.proto";
 
@@ -171,6 +172,9 @@ message ClusterMap {
   // `nodes` hold the map. Derived where the map is set (a forced map clears it), carried by
   // the changes after it, and cleared by the first one once both majorities hold it.
   repeated Node previous_nodes = 6;
+  // The vector and text indexes' placements (#1722, ICR 0138): each partition named holds a
+  // whole index of the ids in its range.
+  repeated IndexPlacement indexes = 7;
   // The agent memory store's placement (#1915, ICR 0139), if the cluster serves one: each
   // partition named holds a whole store for the namespaces in its range.
   MemoryPlacement memory = 8;
@@ -236,6 +240,31 @@ message MemoryPlacement {
   repeated SplitKey splits = 2;
   // `splits.len() + 1` partition ids, one per range, as `TablePlacement.partitions`.
   repeated string partitions = 3;
+}
+
+// Where an index's ids are (#1722, ICR 0138). An index keeps its rows in one table whose keys
+// aren't its ids (centroids and lists, or postings and counters), so each partition named
+// holds a whole index of its own over the ids in its range, made with the options the
+// create sent. Fixed once written; dropped with `Schema.DropTable` of its name.
+message IndexPlacement {
+  // The index (and its table's) name: unique among the map's tables, indexes and memory
+  // store tables.
+  string name = 1;
+  // The create request, as the client sent it: what each partition creates its index with.
+  oneof kind {
+    CreateVectorIndexRequest vector = 2;
+    CreateTextIndexRequest text = 3;
+  }
+  // A placed table whose ranges and partitions it shares: an id is that table's row key. A
+  // text index always follows its source table (`Text.Put` writes the source row and the
+  // postings in one transaction).
+  string follows = 4;
+  // Or its own ranges over its ids (a vector index only; empty with `follows`), as
+  // `TablePlacement.splits` and `partitions`.
+  repeated SplitKey splits = 5;
+  repeated string partitions = 6;
+  // The map version that created it, as `TablePlacement.created`.
+  uint64 created = 7;
 }
 
 // A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
@@ -439,6 +468,14 @@ message ForwardRequest {
     // diverge (D317 ticket 5). Another node answers `WrongPartition`.
     CreateTableRequest create_table = 19;
     DropTableRequest drop_table = 20;
+    // Index calls (#1722, ICR 0138): a create to the map's writer, as a table's; a write to
+    // the partition holding its id.
+    CreateVectorIndexRequest create_vector_index = 22;
+    VectorInsertRequest vector_insert = 23;
+    VectorDeleteRequest vector_delete = 24;
+    CreateTextIndexRequest create_text_index = 27;
+    TextPutRequest text_put = 28;
+    TextDeleteRequest text_delete = 29;
     // Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
     // that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
     // or ids are in several partitions never comes here whole.

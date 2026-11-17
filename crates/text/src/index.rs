@@ -298,7 +298,7 @@ impl Index {
         let tok = Box::new(Standard {
             stop_words: opts.get_stop_words(),
         });
-        Self::create_inner(db, name, source, opts, tok, true)
+        Self::create_inner(db, name, source, opts, tok, true, true)
     }
 
     /// [`create`](Self::create) with a custom tokeniser. Its name and fingerprint are stored,
@@ -317,7 +317,7 @@ impl Index {
                 Standard::NAME
             )));
         }
-        Self::create_inner(db, name, source, options.checked()?, tokenizer, false)
+        Self::create_inner(db, name, source, options.checked()?, tokenizer, false, true)
     }
 
     fn create_inner(
@@ -327,6 +327,7 @@ impl Index {
         opts: IndexOptions,
         tok: Box<dyn Tokenizer>,
         builtin: bool,
+        fill: bool,
     ) -> Result<Index> {
         if source.table == name {
             return Err(Error::InvalidArgument(
@@ -355,7 +356,7 @@ impl Index {
         }
         let table = builder.create()?;
         let (major, minor, update) = unicode_normalization::UNICODE_VERSION;
-        table
+        let mut config = table
             .mutate(GLOBAL)
             .put_u64(META, LAYOUT, LAYOUT_VERSION)
             .put(META, OPTS, &opts.encode())
@@ -367,8 +368,12 @@ impl Index {
                 META,
                 NORMALIZER_UNICODE,
                 format!("{major}.{minor}.{update}").as_bytes(),
-            )
-            .commit()?;
+            );
+        // Unfilled: a rebuild from the top is pending (the empty cursor), with the config.
+        if !fill {
+            config = config.put(META, REBUILD_AFTER, b"");
+        }
+        config.commit()?;
         let index = Index {
             inner: Arc::new(Inner {
                 db: Handle::W(db.clone()),
@@ -385,7 +390,9 @@ impl Index {
                 builtin,
             }),
         };
-        index.rebuild_inner(Walk::Rebuild { from: None }, |_| ControlFlow::Continue(()))?;
+        if fill {
+            index.rebuild_inner(Walk::Rebuild { from: None }, |_| ControlFlow::Continue(()))?;
+        }
         Ok(index)
     }
 
@@ -420,6 +427,26 @@ impl Index {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// [`create`](Self::create) without the backfill (#1722): the index starts empty, with a
+    /// rebuild from the top pending ([`rebuild_pending`](Self::rebuild_pending) is true), which
+    /// [`resume_rebuild_with`](Self::resume_rebuild_with) then runs in steps. Writes through
+    /// the index meanwhile are indexed at once. For a server that fills an index in the
+    /// background, a document at a time, rather than inside the create (a cluster's
+    /// partitions create their indexes when they take the map). Until the rebuild finishes,
+    /// the index lacks the source rows written before the create.
+    pub fn create_unfilled(
+        db: &Pigeonhole,
+        name: &str,
+        source: Source,
+        options: IndexOptions,
+    ) -> Result<Index> {
+        let opts = options.checked()?;
+        let tok = Box::new(Standard {
+            stop_words: opts.get_stop_words(),
+        });
+        Self::create_inner(db, name, source, opts, tok, true, false)
     }
 
     /// Opens the index `name`, with the built-in tokeniser. Everything else is read back

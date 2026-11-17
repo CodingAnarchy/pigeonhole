@@ -157,6 +157,11 @@ No API change.
 - **Why:** dropping a source table left its indexes unable to write, rebuild or find their documents, and a new table of that name became their source. The coordinator chose to refuse the drop (option (a)). `phdb serve`'s `Schema.DropTable` asks this first and answers `FailedPrecondition`, naming them, and refuses too while a `Text.CreateIndex` over the table is building. The library's `Pigeonhole::drop_table` doesn't know about text indexes, so the guide says to drop the index first.
 - **Test:** two indexes over a table, one with a custom tokeniser, and one over another table: `over_table` names exactly the first table's, and nothing for an index's own table or a missing one.
 
+## Amendment: `Index::create_unfilled` (#1722, the coordinator's call)
+- **`Index::create_unfilled(db, name, source, options) -> Result<Index>`** is additive. It's `create` without the backfill: the index starts empty, with the empty rebuild cursor (#1756) in the config commit, so a rebuild from the top is pending. Writes through the index meanwhile are indexed at once, and `resume_rebuild_with` fills the rest in steps.
+- **Why:** a cluster's partitions create their indexes when they take the map, on the node's installing thread (ICR 0138). A backfill there would hold every later map install behind it. So the partition's background resume (#1756) fills the index a document at a time under its write gate, stopping at fences.
+- **Test:** over 600 source rows, an unfilled index is empty with a rebuild pending. A put through it is there at once. A resume stopped part way, then resumed, ends as a full rebuild with the cursor gone.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 
