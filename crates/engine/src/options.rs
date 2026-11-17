@@ -242,7 +242,8 @@ pub struct EngineOptions {
     /// reclaim leaves enough free space past a reserve, a background pass punches holes in
     /// it, one free block at a time and paced ([`PunchTuning`](crate::PunchTuning)). The
     /// file keeps its length but occupies about its live data on disk. Linux and macOS only
-    /// (elsewhere, or on a filesystem that cannot punch, nothing happens). Off by default.
+    /// (elsewhere, or on a filesystem that cannot punch, nothing happens). On by default
+    /// (D333, from the g152/g153 box runs).
     pub punch_freed: bool,
     /// Overrides how a punch pass runs (D333's defaults otherwise). For tests, which
     /// shrink the reserve and lift the pacing.
@@ -343,7 +344,7 @@ impl EngineOptions {
             write_stall_timeout_nanos: 30_000_000_000,
             arena_chunk_bytes: None,
             grow_ahead: None,
-            punch_freed: false,
+            punch_freed: true,
             punch_tuning: None,
             balance_cold_passes: None,
             compaction_backoff_nanos: 1_000_000_000,

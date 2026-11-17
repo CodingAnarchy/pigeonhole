@@ -48,7 +48,7 @@ pub struct PagerStats {
 
 ```rust
 impl pigeonhole::Options {
-    pub fn punch_freed(self, yes: bool) -> Self; // off by default
+    pub fn punch_freed(self, yes: bool) -> Self; // on by default (D333, after g153)
 }
 
 pub struct EngineOptions {

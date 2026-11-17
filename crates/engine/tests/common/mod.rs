@@ -827,6 +827,8 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
         tuning.min_reserve = 0;
         tuning.trigger_bytes = 64 << 10;
         o.punch_tuning = Some(tuning);
+    } else {
+        o.punch_freed = false;
     }
     o
 }

@@ -287,7 +287,7 @@ impl Default for Options {
             pin_threads: true,
             in_doubt_limits: (0, 0),
             wal_preallocate: false,
-            punch_freed: false,
+            punch_freed: true,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
@@ -529,11 +529,11 @@ impl Options {
         self
     }
 
-    /// Gives the data file's free space back to the filesystem (off by default, D333).
+    /// Gives the data file's free space back to the filesystem (on by default, D333).
     ///
     /// The data file keeps its largest size: space that compaction frees is reused for new
     /// data, but never returned, so after a large delete or a TTL expiry the file can occupy
-    /// several times its live data on disk. With this on, a background pass punches holes in
+    /// several times its live data on disk. With this on (the default), a background pass punches holes in
     /// that free space (`fallocate(FALLOC_FL_PUNCH_HOLE)` on Linux, `F_PUNCHHOLE` on macOS).
     /// The file keeps its length, as `ls -l` shows it, but occupies about its live data, as
     /// `du` shows it.
@@ -556,8 +556,8 @@ impl Options {
     /// ```
     /// use pigeonhole::Options;
     ///
-    /// // A database that deletes or expires much of its data: give the space back.
-    /// let options = Options::default().punch_freed(true);
+    /// // Keep the file's freed space allocated on disk (punching is on by default).
+    /// let options = Options::default().punch_freed(false);
     /// # let _ = options;
     /// ```
     pub fn punch_freed(mut self, yes: bool) -> Self {
