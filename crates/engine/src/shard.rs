@@ -11957,7 +11957,14 @@ impl ShardState {
             for c in self.coord.values_mut().filter(|c| !c.decided) {
                 c.failed.get_or_insert(Error::Closed);
                 if let Some(reply) = c.reply.take() {
-                    reply.notify(Err(Error::Closed));
+                    // An external round (D329) may have every share logged already, which
+                    // the next open finds in doubt: its caller hears `OutcomeUnknown`, never
+                    // `Closed`, and decides it after the reopen (perf2's S4 on #2000).
+                    reply.notify(Err(if c.external.is_some() {
+                        Error::OutcomeUnknown
+                    } else {
+                        Error::Closed
+                    }));
                 }
             }
             // No commit here retries now: a doom kept for one (D276) is moot, and a decided
