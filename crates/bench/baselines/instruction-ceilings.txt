@@ -497,6 +497,11 @@ commit-if-returning-async 27864 0.3
 feed-drain 5763 0.3
 feed-drain-all 5778 0.3
 replicate-apply 6366 0.3
+# #1828 (#2024): agent memory's fused recall (memshapes.rs), per recall. From head 9152b788c on
+# ubuntu-26.04, two runs, base and head of identical engine code each (runs 44085631301 and
+# 44085642059): 11293924, 11295466, 11308932, 11297931 (0.13% spread; a memory's id carries
+# random bytes, so fusion ties may fall differently). The highest times 1.003.
+memory-recall 11342859 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
 # and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
