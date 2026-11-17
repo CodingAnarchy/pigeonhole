@@ -112,6 +112,49 @@ fn settled_commits_trimmed_by_participants_survive_crashes() {
     }
 }
 
+/// D329 (ICR 0140): transactions prepared for an external coordinator, decided some steps
+/// later (commit or abort) or left in doubt across crashes and closes, beside the usual
+/// workload, faults, crashes and tablet changes. A share in doubt holds its rows, so a
+/// write to them answers `Busy` (a single) or `Conflict` (a PREPARE): the quiet runs skip
+/// `check`'s no-`Busy` assertion.
+#[test]
+fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
+    let (mut prepared, mut committed, mut aborted, mut adopted) = (0, 0, 0, 0);
+    for shards in [1, 2, 4] {
+        let mut quiet = Config::quiet(300);
+        let mut crashes = Config::standard(300);
+        let mut moving = Config::standard(300);
+        moving.tablet_ops_ppm = 20_000;
+        moving.balance_fast = true;
+        for cfg in [&mut quiet, &mut crashes, &mut moving] {
+            cfg.shards = shards;
+            cfg.tablet_changes = true;
+            cfg.external_ppm = 150_000;
+        }
+        for cfg in [&quiet, &crashes, &moving] {
+            for seed in seeds() {
+                match run(seed, cfg) {
+                    Ok(stats) => {
+                        eprintln!("shards {shards} seed {seed}: {stats:?}");
+                        prepared += stats.external_in_doubt;
+                        committed += stats.external_committed;
+                        aborted += stats.external_aborted;
+                        adopted += stats.external_adopted;
+                    }
+                    Err(f) => panic!("{f}"),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "external: {prepared} in doubt, {committed} committed, {aborted} aborted, {adopted} found in doubt after a reopen"
+    );
+    assert!(
+        prepared > 0 && committed > 0 && aborted > 0,
+        "no external transaction ran"
+    );
+}
+
 #[test]
 fn runs_with_tablet_changes_off_match_the_model() {
     // Tablet changes are on by default (D129 as amended); the off path keeps its coverage.
