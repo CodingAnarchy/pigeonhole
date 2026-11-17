@@ -1,0 +1,2 @@
+### Changed
+- **`phdb cluster promote` returns once the promoted node serves the partition** (#2035), as `phdb cluster move` does. It used to return as soon as a majority of nodes held the new map, so a read or write sent right after could get a retryable `Unavailable` ("still opening"). The new `--timeout SECS` bounds the wait, and on a timeout the error names the node's last `status` line for the partition.

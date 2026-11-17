@@ -924,6 +924,7 @@ A node writes a partition only while its newest map names it for the partition a
     1. It sets a map without ID in P's replicas, so ID closes its copy.
     2. It makes the copy a primary at the last commit it applied, and stamps it at the map's epoch + 1.
     3. It sets the map that gives ID the partition at that epoch, with a **new change-feed history**: feed tokens from before don't resume, and replicas of P copy it again.
+    4. It waits until ID serves P, as `move` does, so P takes reads and writes there when the command returns. `--timeout SECS` bounds that wait; the error then names ID's last `status` line for P, and the map already gives ID the partition.
   - **What's lost:** commits the old owner acknowledged after the copy's last one. The report gives `applied_seqno` (the copy's), `owner_durable_seqno` (the owner's, as the copy last heard), and `lost_commits`, their difference. With `--old-unreachable` it can't ask the old owner, so `lost_commits` says the loss is unknown.
   - **Refused:** a copy from before P's current history (it copies P again first; promote it once it follows), and an owner that still serves P.
   - **Run it again** to finish one that stopped: it carries on from the closed or stamped copy. If the map changed in between (a `set-map`, relocate or another promote), the rerun is refused, so it can't replace what the partition took since. Check the map, then move ID's file aside (`phdb cluster drop-partition P --node <ID>`).

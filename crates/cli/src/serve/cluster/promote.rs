@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::cli::{NodeArgs, connect, report, request, set_map, url_of};
+use super::moving::{At, serving};
 use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{self, GetMapRequest, StatusRequest};
@@ -111,6 +112,7 @@ pub(crate) async fn promote(
     partition: &str,
     to: &str,
     old_unreachable: bool,
+    timeout: Option<Duration>,
 ) -> Result<Report, Failure> {
     let m = map_of(args).await?;
     let Some(p) = m.partitions.iter().find(|p| p.id == partition).cloned() else {
@@ -128,7 +130,16 @@ pub(crate) async fn promote(
     let Some(new_url) = url(to) else {
         return Err(Failure::usage(&format!("the map has no node {to:?}")));
     };
+    let new_address = m
+        .nodes
+        .iter()
+        .find(|n| n.id == to)
+        .map(|n| n.address.clone())
+        .unwrap_or_default();
     if p.node == to {
+        // Done by an earlier run: still waited for, so the report means it serves (#2035).
+        let new = At::new(args, to, &new_address).await?;
+        serving(&new, partition, p.epoch, timeout).await?;
         let mut r = report(
             "cluster promote",
             vec![
@@ -262,6 +273,10 @@ pub(crate) async fn promote(
         q.replicas.retain(|r| r != to);
     }
     let set = set_map(args, m2, false, Vec::new()).await?;
+    // 4. Serving on ID, as a move waits for its new node (#2035): the report means P takes
+    // reads and writes there.
+    let new = At::new(args, to, &new_address).await?;
+    serving(&new, partition, p.epoch + 1, timeout).await?;
     let lost = if old_unreachable {
         json!(
             "unknown: the old owner couldn't be asked, so commits it acknowledged after the \

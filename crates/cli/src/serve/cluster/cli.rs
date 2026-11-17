@@ -205,6 +205,12 @@ pub(crate) enum ClusterCommand {
         /// so.
         #[arg(long)]
         old_unreachable: bool,
+        /// Give up the wait for `--to` to serve the partition once the map gives it to it
+        /// after SECS (at least 1), as `move --timeout` does. The error names the node's last
+        /// `status` line for the partition. The wait asks the node every 200 ms. Without it,
+        /// the wait goes on as long as it takes, saying every 10 s what it waits for.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
     },
     /// Move a partition to node `--to` with its files copied whole, so its change-feed
     /// history and tokens carry over: fence and close it on the node serving it, copy every
@@ -229,8 +235,8 @@ pub(crate) enum ClusterCommand {
         /// Give up a wait for a node after SECS (at least 1): OLD hashing the closed files, or `--to`
         /// serving the partition once the map gives it to it. The error names the step and
         /// the node's last `status` line for the partition. It bounds each wait, not the
-        /// copy, which takes as long as the files do. Without it, a wait goes on as long as
-        /// it takes, saying every 10 s what it waits for.
+        /// copy, which takes as long as the files do. A wait asks the node every 200 ms.
+        /// Without it, a wait goes on as long as it takes, saying every 10 s what it waits for.
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
@@ -365,11 +371,13 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             to,
             node,
             old_unreachable,
+            timeout,
         } => runtime()?.block_on(super::promote::promote(
             node,
             partition,
             to,
             *old_unreachable,
+            timeout.map(Duration::from_secs),
         )),
     }
 }
