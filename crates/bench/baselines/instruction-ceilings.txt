@@ -468,9 +468,9 @@ text-fuzzy-prefix-none 4222924 0.3
 # 16675984. textpacked builds its index natively, outside valgrind, by copying the textshapes
 # index and packing it, as textshapes builds its own. In that run text-term-hub counted
 # 53370070, 13.7 times text-term-hub-packed. New shapes; no existing line changed (D195).
-text-term-hub-packed 3910417 0.3
-text-two-terms-packed 14663872 0.3
-text-phrase-packed 16726011 0.3
+text-term-hub-packed 3910418 0.3
+text-two-terms-packed 14663873 0.3
+text-phrase-packed 16726012 0.3
 # #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
 # a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
 # identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
