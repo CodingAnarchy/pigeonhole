@@ -138,6 +138,27 @@ pub(crate) fn locality(_file: &fs::File) -> Result<Locality> {
     Ok(Locality::Local)
 }
 
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)`: starts the range's writeback and returns once it
+/// is queued (D334's [`File::start_writeback`](crate::File::start_writeback)).
+///
+/// `SYNC_FILE_RANGE_WRITE` alone, never a `WAIT_*` flag (simp724's M1 on D334): with
+/// `WAIT_AFTER` the kernel runs `file_fdatawait_range`, which checks and advances the file's
+/// writeback error sequence. A writeback error seen there would then be consumed, and the root
+/// commit's later `fdatasync` of the same file would not report it, declaring output durable
+/// that never reached the disk. With `WRITE` alone the error stays for the next sync to see.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_writeback(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+    let start = off(offset, "start_writeback: offset too large")?;
+    let count = off(len, "start_writeback: length too large")?;
+    // SAFETY: plain syscall on an fd owned by `file`.
+    if unsafe { libc::sync_file_range(file.as_raw_fd(), start, count, libc::SYNC_FILE_RANGE_WRITE) }
+        == 0
+    {
+        return Ok(());
+    }
+    Err(Error::os("sync_file_range", io::Error::last_os_error()))
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let start = off(offset, "allocate: offset too large")?;
