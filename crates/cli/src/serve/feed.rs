@@ -62,8 +62,9 @@ pub(crate) struct FeedLimits {
     pub quiet: Duration,
     /// How long a client may leave an event untaken (`--stream-idle-ms`, perf287's G2).
     pub stream_idle: Duration,
-    /// Events a client's connection may hold untaken ([`CLIENT_EVENTS`]), and their encoded
-    /// bytes ([`CLIENT_BYTES`]): the per-client buffer.
+    /// Places in a client's channel, each an event or a batch ([`CLIENT_EVENTS`]), and the
+    /// encoded bytes its connection may hold untaken ([`CLIENT_BYTES`], each event charged at
+    /// least [`EVENT_FLOOR`]): the per-client buffer.
     pub client_events: usize,
     pub client_bytes: usize,
     /// How long a hub on the hub runtime must have had at most one client before it moves
@@ -101,15 +102,22 @@ const NOTIFY_EVERY: u32 = 64;
 /// runtime (#1689): a client that joins and leaves doesn't bounce it on every join.
 pub(crate) const SOLO_AFTER: Duration = Duration::from_secs(1);
 
-/// Events buffered per client. More than one lets the gRPC encoder pack every event that is
-/// ready into one HTTP/2 frame: with one, each event cost every subscriber its own stream
-/// poll, its own trips through the connection's shared lock and its own frame (#1397's
-/// acceptance, ticket 5).
+/// Places in a client's channel: each holds an event or a batch of them ([`Sink::put_all`]).
+/// More than one lets the gRPC encoder pack every event that is ready into one HTTP/2 frame:
+/// with one, each event cost every subscriber its own stream poll, its own trips through the
+/// connection's shared lock and its own frame (#1397's acceptance, ticket 5). The buffer's
+/// bound is [`CLIENT_BYTES`], with each event charged at least [`EVENT_FLOOR`].
 pub(crate) const CLIENT_EVENTS: usize = 64;
 
 /// Encoded bytes buffered per client, at most: the bound on a client's buffer however large
-/// its commits. An event larger than this is still sent, alone.
+/// its commits, and however many events it holds (each charged at least [`EVENT_FLOOR`]). An
+/// event larger than this is still sent, alone.
 pub(crate) const CLIENT_BYTES: usize = 256 << 10;
+
+/// The least an event is charged against [`CLIENT_BYTES`]: its `Out` and its share of a
+/// batch, so a buffer of tiny events is bounded by the same bytes (simp724's (1) on #1737's
+/// F3-0). Without it, 64 batches of 64 progress-sized events would sit outside the bound.
+const EVENT_FLOOR: usize = 64;
 
 /// Where a client starts.
 pub(crate) enum Start {
@@ -175,12 +183,21 @@ impl Tracker {
 /// one. A waiting send's one timer, when it fires, reads it and waits on if the client took
 /// something meanwhile (perf287's profile on #1397: a wake and a new timer per take, per
 /// subscriber, were `Client::send`'s 9.6% self at 16 hubs × 16).
+///
+/// A batch ([`Sink::put_all`]) is stamped when the connection takes it from the channel and
+/// at its last event; its events in between are stamped only while a send waits
+/// ([`TakeClock::watch`]). A clock read per event was 6% of the network workers' cycles at
+/// saturation (g129, #1737), and without a waiting send no one reads the time between. So
+/// a waiting send still sees every take, and a client draining a long batch slowly is slow,
+/// not idle.
 #[derive(Debug)]
 pub(crate) struct TakeClock {
     /// On Tokio's clock, so a paused test clock pauses it too.
     base: tokio::time::Instant,
     /// Nanoseconds from `base` to the last take; 0 before the first.
     last: AtomicU64,
+    /// Sends waiting for room now ([`TakeClock::watch`]).
+    watchers: AtomicUsize,
 }
 
 impl TakeClock {
@@ -188,6 +205,7 @@ impl TakeClock {
         Self {
             base: tokio::time::Instant::now(),
             last: AtomicU64::new(0),
+            watchers: AtomicUsize::new(0),
         }
     }
 
@@ -195,6 +213,24 @@ impl TakeClock {
     pub(crate) fn took(&self) {
         let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.last.store(nanos.max(1), Ordering::Relaxed);
+    }
+
+    /// A take within a batch: stamped only while a send waits for room. Sequentially
+    /// consistent with [`TakeClock::watch`]'s count, which a waiting send raises before it
+    /// reads the time its wait began: a take that reads 0 was ordered before the raise, so
+    /// at most one event at the wait's start goes unstamped, and the wait counts from its
+    /// start anyway (simp724's N1 on #2012).
+    fn took_within(&self) {
+        if self.watchers.load(Ordering::SeqCst) != 0 {
+            self.took();
+        }
+    }
+
+    /// While the guard lives, every take is stamped, not just a batch's first and last: a
+    /// send waiting for room counts its idle limit from the client's last take.
+    fn watch(&self) -> Watch<'_> {
+        self.watchers.fetch_add(1, Ordering::SeqCst);
+        Watch(self)
     }
 
     /// The last take, or the clock's start (the stream's) before the first: what an idle
@@ -209,6 +245,15 @@ impl TakeClock {
             0 => None,
             n => Some(self.base + Duration::from_nanos(n)),
         }
+    }
+}
+
+/// A send waiting for room ([`TakeClock::watch`]).
+struct Watch<'a>(&'a TakeClock);
+
+impl Drop for Watch<'_> {
+    fn drop(&mut self) {
+        self.0.watchers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1557,12 +1602,13 @@ struct Client {
     tracker: Arc<Tracker>,
 }
 
-/// Where a stream's events go: its connection's buffered channel, bounded by events and by
+/// Where a stream's events go: its connection's buffered channel, bounded by places and by
 /// bytes, and ended by the idle limit when the connection stops taking. A single node's
 /// client and a cluster subscription's merge (D317 ticket 7) both send through one.
 pub(crate) struct Sink {
-    tx: mpsc::Sender<(Out, OwnedSemaphorePermit)>,
-    /// The buffer's free bytes: each event in the channel holds its encoded size.
+    tx: mpsc::Sender<(Queued, OwnedSemaphorePermit)>,
+    /// The buffer's free bytes: each event or batch in the channel, or a batch the
+    /// connection is still taking events from, holds its charge ([`EVENT_FLOOR`]).
     budget: Arc<Semaphore>,
     /// When the connection last took an event: a send waiting for room counts its
     /// `--stream-idle-ms` from it (simp724's I1 on #1536).
@@ -1745,10 +1791,19 @@ impl Client {
                 continue;
             }
             let n = batch.len() as u32;
+            // The pass's events go to the connection as one batch (#1737's F3-0): one place in
+            // its channel and one charge against its buffer, not one per event. Its entries
+            // are held as `Arc`s, so the ring overrunning while the batch waits for room takes
+            // none of them: the next read finds the client behind, and it goes on from
+            // `pos.token`, the last commit covered here (simp724's (2)).
+            let mut outs = Vec::with_capacity(batch.len());
             for e in batch.drain(..) {
                 at += 1;
-                self.cover_entry(&e, pos).await?;
+                if let Some(out) = self.cover_entry(&e, pos)? {
+                    outs.push(out);
+                }
             }
+            self.send_all(outs, pos).await?;
             let client = self.feeds.limits.coalesce.client;
             if n <= SMALL_BATCH && !client.is_zero() {
                 quiet_until = Some(Instant::now() + client);
@@ -1886,26 +1941,27 @@ impl Client {
 
     /// Covers one entry of the ring. A client with no prefix sends the entry itself: its
     /// event is encoded once, for every such client (perf287's profile on #1536: building
-    /// and encoding the same event per subscriber was two thirds of the feed's CPU).
-    async fn cover_entry(&self, e: &Arc<Entry>, pos: &mut Position) -> Result<(), ApiError> {
+    /// and encoding the same event per subscriber was two thirds of the feed's CPU). The
+    /// position moves past the entry here; the event, if any, is the caller's to send
+    /// ([`Client::send_all`]).
+    fn cover_entry(&self, e: &Arc<Entry>, pos: &mut Position) -> Result<Option<Out>, ApiError> {
         pos.seqno = Some(e.seqno);
         pos.token = e.token.clone();
         if e.seqno <= self.after || e.encoded().is_none() {
-            return Ok(());
+            return Ok(None);
         }
         if self.prefix.is_empty() {
             if self.skipping(e.seqno)? {
-                return Ok(());
+                return Ok(None);
             }
-            return self.send(Out::Shared(Arc::clone(e)), pos).await;
+            return Ok(Some(Out::Shared(Arc::clone(e))));
         }
         // A prefix: the entry's changes to matching rows, if any (a later progress event
         // carries the position past one with none), the shared encoding when they all
         // match (#1780).
         match prefix_out(e, &self.prefix) {
-            Some(_) if self.skipping(e.seqno)? => Ok(()),
-            Some(out) => self.send(out, pos).await,
-            None => Ok(()),
+            Some(_) if self.skipping(e.seqno)? => Ok(None),
+            out => Ok(out),
         }
     }
 
@@ -1934,6 +1990,19 @@ impl Client {
         pos.last_event = Instant::now();
         Ok(())
     }
+
+    /// Sends `events`, in order, as one batch where the client's buffer allows
+    /// ([`Sink::put_all`]). Each event carries its own token, so a resume after any of them
+    /// neither skips nor repeats.
+    async fn send_all(&self, events: Vec<Out>, pos: &mut Position) -> Result<(), ApiError> {
+        let Some(token) = events.last().map(|e| e.token().clone()) else {
+            return Ok(());
+        };
+        self.sink.put_all(events).await?;
+        pos.sent = token;
+        pos.last_event = Instant::now();
+        Ok(())
+    }
 }
 
 impl Sink {
@@ -1955,6 +2024,7 @@ impl Sink {
         let events = FeedEvents(
             EventSource::Sink {
                 events: rx,
+                draining: None,
                 taken,
                 end: Some(end_rx),
                 start: Some(start_rx),
@@ -1990,7 +2060,8 @@ impl Sink {
         self.budget.available_permits() < self.client_bytes
     }
 
-    /// When the connection last took an event.
+    /// When the connection last took an event ([`TakeClock`]: of a batch, its first and last
+    /// event, and every event while a send waits).
     pub(crate) fn taken(&self) -> &TakeClock {
         &self.taken
     }
@@ -2009,30 +2080,70 @@ impl Sink {
     /// both inside the idle limit, so a connection that takes nothing fills its buffer and
     /// then times out.
     pub(crate) async fn put(&self, event: Out) -> Result<(), ApiError> {
-        let bytes = event.encoded_len().clamp(1, self.client_bytes);
-        let n = u32::try_from(bytes).unwrap_or(u32::MAX);
+        let bytes = charge(&event);
+        self.queue(Queued::One(event), bytes).await
+    }
+
+    /// Queues `events`, in order, as few batches as the buffer allows: each batch is one
+    /// place in the channel and one charge against the buffer, and the connection takes its
+    /// events without going back to the channel (#1737's F3-0: the per-event channel pop,
+    /// buffer release and clock read were about 500 cycles an event on the network workers
+    /// at saturation, g129). A batch closes before an event that would take it past the
+    /// buffer, so none is larger than the buffer but a single event that is.
+    pub(crate) async fn put_all(&self, mut events: Vec<Out>) -> Result<(), ApiError> {
+        while !events.is_empty() {
+            let mut bytes = 0usize;
+            let mut fit = 0;
+            for e in &events {
+                let c = charge(e);
+                if fit > 0 && bytes.saturating_add(c) > self.client_bytes {
+                    break;
+                }
+                bytes = bytes.saturating_add(c);
+                fit += 1;
+            }
+            // The rest, if this batch closes early; usually none, and no allocation.
+            let rest = if fit < events.len() {
+                events.split_off(fit)
+            } else {
+                Vec::new()
+            };
+            let batch = if events.len() == 1 {
+                Queued::One(events.pop().expect("one event"))
+            } else {
+                Queued::Many(events)
+            };
+            self.queue(batch, bytes).await?;
+            events = rest;
+        }
+        Ok(())
+    }
+
+    /// Queues an event or a batch charged `bytes` (at most the whole buffer).
+    async fn queue(&self, item: Queued, bytes: usize) -> Result<(), ApiError> {
+        let n = u32::try_from(bytes.clamp(1, self.client_bytes)).unwrap_or(u32::MAX);
         // The fast path: room in the buffer and a place in the channel at once, with no
         // timer or waiter registered. Arming them on every send was 64% of the samples in
         // futex calls at 256 subscribers (perf287's profile on #1397).
-        let (event, held) = match Arc::clone(&self.budget).try_acquire_many_owned(n) {
-            Ok(room) => match self.tx.try_send((event, room)) {
+        let (item, held) = match Arc::clone(&self.budget).try_acquire_many_owned(n) {
+            Ok(room) => match self.tx.try_send((item, room)) {
                 Ok(()) => return Ok(()),
-                Err(mpsc::error::TrySendError::Full((event, room))) => (event, Some(room)),
+                Err(mpsc::error::TrySendError::Full((item, room))) => (item, Some(room)),
                 Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
             },
-            Err(tokio::sync::TryAcquireError::NoPermits) => (event, None),
+            Err(tokio::sync::TryAcquireError::NoPermits) => (item, None),
             Err(tokio::sync::TryAcquireError::Closed) => return Err(gone()),
         };
         // The slow path, boxed: its timer and waits made this future 1.2 KB, built (and
         // copied) for every event though the fast path needs none of it (#1758's g86c).
-        Box::pin(self.wait_to_put(event, held, n)).await
+        Box::pin(self.wait_to_put(item, held, n)).await
     }
 
-    /// [`Sink::put`]'s slow path: waits for room in the buffer (unless `held`) and a place in
-    /// the channel, within the idle limit.
+    /// [`Sink::queue`]'s slow path: waits for room in the buffer (unless `held`) and a place
+    /// in the channel, within the idle limit.
     async fn wait_to_put(
         &self,
-        event: Out,
+        item: Queued,
         held: Option<OwnedSemaphorePermit>,
         n: u32,
     ) -> Result<(), ApiError> {
@@ -2042,13 +2153,15 @@ impl Sink {
                 Some(room) => room,
                 None => budget.acquire_many_owned(n).await.map_err(|_| ())?,
             };
-            self.tx.send((event, room)).await.map_err(|_| ())
+            self.tx.send((item, room)).await.map_err(|_| ())
         };
         tokio::pin!(queued);
         // The idle limit counts from the client's last take, not from the start of the wait:
         // a large event may wait for most of the buffer to drain, and a client taking events
         // all along is slow, not idle (simp724's I1 on #1536). One timer: when it fires, a
-        // take since the wait began moves the deadline on, and it waits again.
+        // take since the wait began moves the deadline on, and it waits again. Watched, so
+        // takes within a batch are stamped too ([`TakeClock`]), from before the wait begins.
+        let _watch = self.taken.watch();
         let idle = self.stream_idle;
         let began = tokio::time::Instant::now();
         let timer = tokio::time::sleep_until(began + idle);
@@ -2082,6 +2195,18 @@ impl Sink {
 /// The error a send to a client that went away ends with.
 fn gone() -> ApiError {
     ApiError::internal("the client went away")
+}
+
+/// What an event costs a client's buffer: its encoded size, at least [`EVENT_FLOOR`].
+fn charge(event: &Out) -> usize {
+    event.encoded_len().max(EVENT_FLOOR)
+}
+
+/// A place in a client's channel: one event, or a batch of them, in order ([`Sink::put_all`]).
+enum Queued {
+    One(Out),
+    /// At least two events.
+    Many(Vec<Out>),
 }
 
 /// `commit` as the client sees it: its changes to rows under `prefix`, or `None` when it has
@@ -2135,7 +2260,11 @@ impl EventSource {
 
 enum EventSource {
     Sink {
-        events: mpsc::Receiver<(Out, OwnedSemaphorePermit)>,
+        events: mpsc::Receiver<(Queued, OwnedSemaphorePermit)>,
+        /// The rest of a batch taken from the channel, and its charge: held until its last
+        /// event is taken, so the buffer's bound and [`Sink::pending`] count a batch the
+        /// connection holds under back-pressure (simp724's (3) on #1737's F3-0).
+        draining: Option<(std::vec::IntoIter<Out>, OwnedSemaphorePermit)>,
         /// Each take's time, for a send waiting for room.
         taken: Arc<TakeClock>,
         end: Option<oneshot::Receiver<ApiError>>,
@@ -2326,21 +2455,48 @@ impl FeedEvents {
         }
     }
 
-    /// The sink's next event, then its error if it failed.
+    /// The sink's next event, then its error if it failed. A batch's events come from the
+    /// batch, not the channel: one channel pop, one release of its charge (after its last
+    /// event) and two clock reads a batch, not one of each an event (#1737's F3-0).
     fn poll_events(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
-        let (events, taken, end) = match &mut self.0 {
+        let (events, draining, taken, end) = match &mut self.0 {
             EventSource::Sink {
-                events, taken, end, ..
-            } => (events, taken, end),
+                events,
+                draining,
+                taken,
+                end,
+                ..
+            } => (events, draining, taken, end),
         };
+        if let Some((rest, _)) = draining.as_mut()
+            && let Some(e) = rest.next()
+        {
+            if rest.len() == 0 {
+                // Its last event: the batch's bytes go back to the client's buffer.
+                *draining = None;
+                taken.took();
+            } else {
+                taken.took_within();
+            }
+            return Poll::Ready(Some(Ok(e)));
+        }
+        *draining = None;
         match events.poll_recv(cx) {
             // Taken: its bytes go back to the client's buffer.
-            Poll::Ready(Some((e, room))) => {
+            Poll::Ready(Some((Queued::One(e), room))) => {
                 drop(room);
                 taken.took();
+                return Poll::Ready(Some(Ok(e)));
+            }
+            // A batch: its bytes stay charged until its last event is taken.
+            Poll::Ready(Some((Queued::Many(batch), room))) => {
+                taken.took();
+                let mut rest = batch.into_iter();
+                let e = rest.next().expect("a batch holds at least two events");
+                *draining = Some((rest, room));
                 return Poll::Ready(Some(Ok(e)));
             }
             Poll::Pending => return Poll::Pending,
@@ -2712,6 +2868,131 @@ mod tests {
             assert!(size <= 512, "Sink::put's future is {size} bytes");
             put.await.unwrap();
         });
+    }
+
+    /// A small event whose token is `i`, so the order it comes out in can be checked.
+    fn ev(i: u8) -> Out {
+        Out::event(proto::FeedEvent {
+            token: Bytes::from(vec![i]),
+            ..Default::default()
+        })
+    }
+
+    /// The token of the next event `events` gives, which must be one.
+    async fn next_token(events: &mut FeedEvents) -> u8 {
+        match next_out(events).await {
+            Some(Ok(e)) => e.token()[0],
+            other => panic!("an event, not {:?}", other.map(|r| r.err())),
+        }
+    }
+
+    /// #1737's F3-0: a batch's events come out in order, one channel place for all of them,
+    /// and the batch's charge stays on the client's buffer until its last event is taken
+    /// (simp724's (3)), so `pending` says so while the connection holds the rest.
+    #[tokio::test]
+    async fn a_batch_is_taken_in_order_and_holds_its_charge_to_its_last_event() {
+        let (sink, mut events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        sink.put_all((0..5).map(ev).collect()).await.unwrap();
+        assert_eq!(
+            sink.budget.available_permits(),
+            sink.client_bytes - 5 * EVENT_FLOOR,
+            "five tiny events, each charged the floor"
+        );
+        assert_eq!(sink.tx.max_capacity() - sink.tx.capacity(), 1, "one place");
+        for i in 0..5 {
+            assert!(
+                sink.pending(),
+                "charged until the batch's last event is taken"
+            );
+            assert_eq!(next_token(&mut events).await, i);
+        }
+        assert!(!sink.pending(), "the batch's charge is back");
+    }
+
+    /// simp724's (1) on #1737's F3-0: tiny events are charged [`EVENT_FLOOR`] each, and a
+    /// batch closes before an event that would take it past the buffer. With room for four,
+    /// ten events go as batches of four, four and two; each waits for the one before to be
+    /// taken to its last event, and all ten come out in order.
+    #[tokio::test]
+    async fn a_batch_closes_before_the_buffer_and_tiny_events_are_charged_a_floor() {
+        let limits = FeedLimits {
+            client_bytes: 4 * EVENT_FLOOR,
+            ..limits_solo_after(SOLO_AFTER)
+        };
+        let (sink, mut events, _end) = Sink::new(&limits);
+        let sink = Arc::new(sink);
+        let putter = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move { sink.put_all((0..10).map(ev).collect()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(sink.budget.available_permits(), 0, "four fill the buffer");
+        for i in 0..3 {
+            assert_eq!(next_token(&mut events).await, i);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !putter.is_finished(),
+            "the next four wait for the last of the first"
+        );
+        assert_eq!(
+            sink.tx.max_capacity() - sink.tx.capacity(),
+            0,
+            "nothing queued"
+        );
+        for i in 3..10 {
+            assert_eq!(next_token(&mut events).await, i);
+        }
+        putter.await.unwrap().unwrap();
+        assert!(!sink.pending());
+    }
+
+    /// simp724's I1 on #1536, with batches (#1737's F3-0): a client that takes a batch's
+    /// events one every 200 ms, under the 250 ms idle limit, while a send waits for the room
+    /// the batch holds, is slow, not idle. Takes within a batch are stamped while a send
+    /// waits, so the wait counts from the last of them. On a paused clock, so exact.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_taking_a_batch_slowly_is_slow_not_idle() {
+        let limits = FeedLimits {
+            client_bytes: 4 * EVENT_FLOOR,
+            stream_idle: Duration::from_millis(250),
+            ..limits_solo_after(SOLO_AFTER)
+        };
+        let (sink, mut events, _end) = Sink::new(&limits);
+        let sink = Arc::new(sink);
+        sink.put_all((0..4).map(ev).collect()).await.unwrap();
+        let putter = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move { sink.put(ev(4)).await })
+        };
+        for i in 0..4 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(next_token(&mut events).await, i);
+        }
+        putter
+            .await
+            .unwrap()
+            .expect("not timed out: the client took all along");
+        assert_eq!(next_token(&mut events).await, 4);
+    }
+
+    /// simp724 on #1737's F3-0: a cluster component whose lease runs out while the connection
+    /// holds the rest of a batch ends with the lease's error before the batch's next event.
+    #[tokio::test]
+    async fn a_lease_that_runs_out_mid_batch_ends_the_stream_before_its_next_event() {
+        use crate::serve::gate::{LeaseClock, WriteGate};
+        let clock = Arc::new(LeaseClock::default());
+        let gate = WriteGate::opened("p1", false, Arc::clone(&clock));
+        let (sink, events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        let mut events = events.leased(Arc::clone(&gate)).unwrap();
+        gate.renew(clock.now() + 300_000_000);
+        sink.put_all((0..3).map(ev).collect()).await.unwrap();
+        assert_eq!(next_token(&mut events).await, 0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Some(Err(e)) = next_out(&mut events).await else {
+            panic!("the lease's error, not the batch's next event");
+        };
+        assert_eq!(e.code, "PartitionUnavailable", "{}", e.message);
     }
 
     fn limits_solo_after(solo_after: Duration) -> FeedLimits {

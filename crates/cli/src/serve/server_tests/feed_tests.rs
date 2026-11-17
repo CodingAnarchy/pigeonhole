@@ -153,6 +153,8 @@ fn a_laggard_dropped_between_two_passed_over_commits_misses_nothing() {
     l.feed_ring_bytes = 2048; // a few entries
     // A one-event buffer: a client that takes nothing stops reading the ring at once.
     l.feed_client_events = 1;
+    // And one byte, so every event goes alone, not in a batch (#1737's F3-0).
+    l.feed_client_bytes = 1;
     let s = Server::start("", l);
     let mut slow = direct_feed(&s, subscribe(&["t"], b"a"));
     let mut want = vec![write_row(&s, b"a0")];
@@ -225,12 +227,16 @@ fn stalled_feed(client_events: usize, client_bytes: usize, writes: usize) -> (Ve
 
 #[test]
 fn a_feed_client_that_takes_nothing_fills_its_buffer_then_times_out() {
-    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, super::feed::CLIENT_BYTES, 100);
-    assert_eq!(
-        got,
-        written[..super::feed::CLIENT_EVENTS],
-        "the full buffer, in order"
+    // The buffer's bound is its bytes, each event charged at least 64 (#1737's F3-0): its
+    // places may each hold a batch. 8 KiB holds at most 128 events, so 200 writes overflow
+    // it however the client's reads batch them, and the 64 places hold at least 64.
+    let (got, written) = stalled_feed(super::feed::CLIENT_EVENTS, 8 << 10, 200);
+    assert!(
+        (super::feed::CLIENT_EVENTS..=128).contains(&got.len()),
+        "{} events buffered",
+        got.len()
     );
+    assert_eq!(got, written[..got.len()], "the full buffer, in order");
 }
 
 #[test]
@@ -333,6 +339,8 @@ fn feed_streams_match_a_direct_feed_across_fall_offs() {
     l.feed_ring_bytes = 2048;
     // One-event buffers, so a stalled round takes clients off the ring.
     l.feed_client_events = 1;
+    // And one byte, so every event goes alone, not in a batch (#1737's F3-0).
+    l.feed_client_bytes = 1;
     l.max_catch_up = 2;
     // A client stalls for runs of rounds by design; on a slow runner a run outlasted the 5 s
     // idle limit and the stream ended DeadlineExceeded (Windows, #1592's CI). Idling out has
@@ -506,6 +514,172 @@ fn feed_streams_and_hubs_are_capped() {
 }
 
 #[test]
+fn a_client_whose_batch_waits_while_the_ring_overruns_it_misses_and_repeats_nothing() {
+    // simp724's (2) on #1737's F3-0: a client's ring reads go as batches of a few events
+    // (a 512-byte buffer), so while it takes nothing a batch waits for room and the small
+    // ring overruns it. Its entries are held, so the batch goes whole once there's room; the
+    // next read finds the client behind, and it goes on from the last commit it covered.
+    let mut l = limits();
+    l.feed_ring_bytes = 2048; // a few entries
+    l.feed_client_bytes = 512;
+    // Not an idle-limit test: out of reach of a slow runner (#1531).
+    l.stream_idle = Duration::from_secs(600);
+    let s = Server::start("", l);
+    let mut slow = direct_feed(&s, subscribe(&["t"], b""));
+    let written: Vec<u64> = (0..80)
+        .map(|i| write_row(&s, format!("r{i:04}").as_bytes()))
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let got: Vec<u64> = drain(&s, &mut slow, Duration::from_millis(600))
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
+    assert_eq!(got, written, "every commit, once, in order");
+    let stats = &s.shared.router.service.part().unwrap().feeds.stats;
+    assert!(
+        stats.fell_behind.load(Ordering::Relaxed) >= 1,
+        "it fell off the ring"
+    );
+}
+
+#[test]
+fn clients_falling_off_together_past_the_catch_up_cap_each_deliver_everything() {
+    // simp724 on #1737's F3-0: at saturation many clients may fall off the ring at once,
+    // more than there are catch-up slots. Each waits its turn, holding no reader, then
+    // catches up and rejoins: every one delivers every commit once, in order, and none hangs.
+    let mut l = limits();
+    l.feed_ring_bytes = 2048;
+    l.feed_client_bytes = 512;
+    l.max_catch_up = 1;
+    l.stream_idle = Duration::from_secs(600);
+    let s = Server::start("", l);
+    let mut clients: Vec<_> = (0..4)
+        .map(|_| direct_feed(&s, subscribe(&["t"], b"")))
+        .collect();
+    let written: Vec<u64> = (0..80)
+        .map(|i| write_row(&s, format!("r{i:04}").as_bytes()))
+        .collect();
+    // Take from every client in turn, never one to the end first: a client waiting for the
+    // slot gets it only once the holder has caught up, which needs its events taken (#1531).
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut got = vec![Vec::new(); clients.len()];
+    while got.iter().any(|g| g.len() < written.len()) && std::time::Instant::now() < deadline {
+        for (i, c) in clients.iter_mut().enumerate() {
+            while got[i].len() < written.len()
+                && let Some(e) = next_event(&s, c, Duration::from_millis(50))
+            {
+                got[i].extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+            }
+        }
+    }
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(g, &written, "client {i}: every commit, once, in order");
+    }
+    let stats = &s.shared.router.service.part().unwrap().feeds.stats;
+    assert!(
+        stats.fell_behind.load(Ordering::Relaxed) >= 2,
+        "more than one fell off the ring"
+    );
+}
+
+/// `behind` clients fall off the ring and are kept off it, while `live` others are drained,
+/// with writes going on: every round, each one behind delivers a commit within 2 s (simp724
+/// on #2012, after g134's 37 s with no rejoin). Once writes stop, every client delivers every
+/// commit once, in order, and each one behind rejoins the ring. No client waits for a
+/// catch-up slot.
+fn catch_up_keeps_moving_while_writes_go_on(behind: usize, live: usize) {
+    let mut l = limits();
+    l.feed_ring_bytes = 2048; // a few entries
+    l.feed_client_bytes = 512;
+    l.max_catch_up = 8;
+    l.stream_idle = Duration::from_secs(600);
+    let s = Server::start("", l);
+    let mut clients: Vec<_> = (0..behind + live)
+        .map(|_| direct_feed(&s, subscribe(&["t"], b"")))
+        .collect();
+    let mut got = vec![Vec::new(); clients.len()];
+    let mut written = Vec::new();
+    let take_live = |clients: &mut [super::feed::FeedEvents], got: &mut [Vec<u64>]| {
+        for (i, c) in clients.iter_mut().enumerate().skip(behind) {
+            got[i].extend(
+                drain(&s, c, Duration::from_millis(20))
+                    .into_iter()
+                    .map(|(n, _, _)| n),
+            );
+        }
+    };
+    // The first `behind` take nothing while 80 commits overrun the ring.
+    for chunk in 0..8 {
+        for i in 0..10 {
+            written.push(write_row(&s, format!("r{chunk}-{i}").as_bytes()));
+        }
+        take_live(&mut clients, &mut got);
+    }
+    let feeds = &s.shared.router.service.part().unwrap().feeds;
+    // Then each round writes 10 and takes at most 4 from each one behind, so none of them
+    // catches up while writes go on: each must still move.
+    for round in 0..30 {
+        for i in 0..10 {
+            written.push(write_row(&s, format!("w{round}-{i}").as_bytes()));
+        }
+        for (i, c) in clients.iter_mut().enumerate().take(behind) {
+            let before = got[i].len();
+            while got[i].len() < before + 4
+                && let Some(e) = next_event(&s, c, Duration::from_secs(2))
+            {
+                got[i].extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+            }
+            assert!(
+                got[i].len() > before,
+                "client {i} delivered nothing for 2 s in round {round} (catching_up {})",
+                feeds.gauges().catching_up
+            );
+        }
+        take_live(&mut clients, &mut got);
+    }
+    assert!(
+        feeds.gauges().catching_up >= behind,
+        "the clients behind read their own streams to the end of the writes"
+    );
+    // Writes stop: take from every client in turn until each has every commit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while got.iter().any(|g| g.len() < written.len()) && std::time::Instant::now() < deadline {
+        for (i, c) in clients.iter_mut().enumerate() {
+            got[i].extend(
+                drain(&s, c, Duration::from_millis(50))
+                    .into_iter()
+                    .map(|(n, _, _)| n),
+            );
+        }
+    }
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(g, &written, "client {i}: every commit, once, in order");
+    }
+    wait_for("every client behind rejoins the ring", || {
+        feeds.gauges().catching_up == 0
+    });
+    let stats = &feeds.stats;
+    assert!(stats.fell_behind.load(Ordering::Relaxed) >= behind as u64);
+    assert!(stats.rejoined.load(Ordering::Relaxed) >= behind as u64);
+    assert_eq!(
+        stats.catch_up_waits.load(Ordering::Relaxed),
+        0,
+        "no client waited for a slot"
+    );
+}
+
+#[test]
+fn clients_kept_behind_while_writes_go_on_keep_moving_and_rejoin() {
+    catch_up_keeps_moving_while_writes_go_on(4, 2);
+}
+
+#[test]
+fn a_lone_client_kept_behind_among_live_ones_keeps_moving_and_rejoins() {
+    // simp724: the path with no other catch-up traffic around it.
+    catch_up_keeps_moving_while_writes_go_on(1, 3);
+}
+
+#[test]
 fn catch_up_streams_past_the_cap_wait_their_turn() {
     // perf287's (2) on ticket 5: at most --max-catch-up clients read their own feed at once;
     // the rest wait, and are counted, then deliver everything all the same.
@@ -515,6 +689,8 @@ fn catch_up_streams_past_the_cap_wait_their_turn() {
     // asks for it. With a deeper one it could buffer all five, rejoin and free the slot
     // first.
     l.feed_client_events = 1;
+    // And one byte, so every event goes alone, not in a batch (#1737's F3-0).
+    l.feed_client_bytes = 1;
     // Not an idle-limit test: out of reach of a slow runner (#1531).
     l.stream_idle = Duration::from_secs(600);
     let s = Server::start("", l);
