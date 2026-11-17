@@ -74,7 +74,8 @@ What the public API does, and the first release with each piece. The [README's l
 | | `Text.Search` across an index's partitions, scored as one index (#2029) | in review, 1.3.0 |
 | | `Text.Rebuild` and `Vectors.BulkLoad` across partitions (#1722) | to come, 1.3.0 |
 | | feed subscriptions' events handed over in batches on a cluster too (#2014) | on `main`, 1.3.0 |
-| | transactions across partitions: `BeginRequest.spans_partitions`, two-phase commit (D329, #1483; the engine's part is #2000) | in review, 1.3.0 |
+| | transactions across partitions (D329, #1483): the engine's part, transactions prepared and aborted for an external coordinator (#2000, ICR 0140) | on `main`, 1.3.0 |
+| | the cluster side: `BeginRequest.spans_partitions`, two-phase commit across partitions | to come, 1.3.0 |
 | | automatic failover, off by default (D330, #1484) | planned, 1.3.0 |
 | | online split and range move (D331, #1499) | planned, 1.3.0 |
 | | a balancer, off by default (D332, #1485) | planned, 1.3.0 |

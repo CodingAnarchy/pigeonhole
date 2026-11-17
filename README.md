@@ -79,7 +79,7 @@ One line per family of operations, with the calls that do it, a guide page that 
   - **`phdb cluster restore --partition`** puts one partition back from a cluster backup. Guide: [Backup and restore](docs/guide/serve.md#backup-and-restore);
   - **`Admin.Info`, `Flush` and `Compact`** on a cluster node.
 
-  Planned for 1.3.0 and not yet on `main`: transactions across partitions (D329, #1483), automatic failover (D330, #1484), online split and range move (D331, #1499) and a balancer (D332, #1485). [`docs/status.md`](docs/status.md#capabilities) has each one's state.
+  Planned for 1.3.0 and not yet on `main`: transactions across partitions (D329, #1483; the engine's part is on `main`, the cluster side is to come), automatic failover (D330, #1484), online split and range move (D331, #1499) and a balancer (D332, #1485). [`docs/status.md`](docs/status.md#capabilities) has each one's state.
 
   Guide: [Clusters](docs/guide/serve.md#clusters). Reference: [`phdb serve`](docs/guide/agent-reference.md#phdb-serve-120).
 
