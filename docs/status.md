@@ -63,7 +63,7 @@ What the public API does, and the first release with each piece. The [README's l
 | Clusters | `phdb serve --cluster`, `phdb cluster` | released, 1.2.0 |
 | | read replicas of a partition: copies in the map's `replicas` (D328, #1851) | on `main`, 1.3.0 |
 | | reads from a replica within a staleness bound: `Get`, `ReadRow`, `MultiGet`, `Scan`, `Vectors.Nearest`, `Graph.Traverse` (`x-pigeonhole-read-replica-max-lag-ms`) | on `main`, 1.3.0 |
-| | promoting a replica: `phdb cluster promote` (#2007) | in review, 1.3.0 |
+| | promoting a replica to owner by hand: `phdb cluster promote` (#2007) | on `main`, 1.3.0 |
 | | a partition serves only under a majority's lease: `--cluster-lease-ms` (D326) | on `main`, 1.3.0 |
 | | agent memory on a cluster node: `--memory`, a `memory` placement; `Recall`, `Watch`, `MarkUsed`, `Forget` across partitions (#1915, ICR 0139) | on `main`, 1.3.0 |
 | | `/mcp` on a cluster node (#1915) | on `main`, 1.3.0 |
