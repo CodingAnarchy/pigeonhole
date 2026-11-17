@@ -353,6 +353,18 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
   **At saturation, writes come first.** When the feed side can't deliver every commit, the writes still get the rate they ask for, and feed streams fall behind and catch up. `pigeonhole_serve_feed_fell_behind_total` and the streams' lag show it.
   - On the AX102 at 16 table sets × 16 streams and 55K puts/s, about 14M events/s didn't fit in 3 feed threads and 1 hub thread. More hub threads delivered less.
   - Size the feed side for headroom. #1737 tracks scaling it.
+  - **A server that's mostly feed delivery** can raise `--feed-threads` and `--feed-hub-threads`, but it gives up write rate for it. Since #2012, a stream hands its connection a batch per ring pass, and more threads now deliver more. Same AX102 load, both arms with #2012:
+
+    | | default (3 feed, 1 hub) | `--feed-threads 4 --feed-hub-threads 2` |
+    |---|--:|--:|
+    | puts/s (55K offered) | 54.7K | 49.2–49.6K |
+    | put p99, from each put's due time | 38–116 ms | 8.4–9.2 s |
+    | put service p99 | 0.55–0.72 ms | 1.4–1.5 ms |
+    | events delivered per stream | 2.56–2.61M | 4.43–4.47M |
+    | feed lag p99 | 49–52 s | 0.2–0.36 s |
+    | streams that fell behind | 0 | 0 |
+
+    With the raised counts, writes no longer get the rate they ask for. The 8–9 s is a client queue that kept growing. The default keeps writes first. #2014 brings the same batching to cluster subscriptions.
   - Before #1734, the masked server did the opposite: it held writes to about 33K of the 55K puts/s and delivered every event, or switched between the two. The network threads now also run on the shards' SMT siblings (Placement, below), so the writes no longer queue behind delivery for a CPU.
 
   Each stream's framing still runs on its connection's network thread.
