@@ -1051,6 +1051,7 @@ impl Member {
     fn after_put(&mut self, put: Result<(), ApiError>, sent: Option<Bytes>) -> Result<(), Stop> {
         match put {
             Ok(()) => {}
+            // The sink's only `DeadlineExceeded` is its idle limit (`feed::idle_error`).
             Err(e) if e.code == "DeadlineExceeded" => return Err(Stop::Idle),
             Err(_) => return Err(Stop::Gone),
         }
@@ -1696,6 +1697,87 @@ mod tests {
             assert_eq!(live.members(), 1, "it found the key's new hub");
             assert_eq!(ended.members(), 0, "and left the ended one");
             run.abort();
+        });
+    }
+
+    #[test]
+    fn a_joiner_idle_while_its_state_events_wait_is_counted_and_answered() {
+        // simp724 on #2021: a joiner sends its parts' state events before it reads the ring.
+        // A client that takes none of them is ended at the limit there too: counted once,
+        // and answered with `DeadlineExceeded` after what was queued.
+        const LIMIT: Duration = Duration::from_millis(400);
+        paused().block_on(async {
+            let (_p0, events) = fed();
+            let m = merging(vec![Some(events)], QUIET);
+            let plan = plan_of(&m);
+            let node = Arc::clone(&plan.ctx.node);
+            let parts = vec!["p0".to_string()];
+            let hub = Arc::new(ClusterHub::new(
+                RingOf::new(ClusterRing::new(parts.clone())),
+                false,
+                Arc::default(),
+                Arc::clone(&node.feed_hubs.live),
+                Arc::default(),
+            ));
+            // 1 KiB holds one 800-byte state event, so the second waits for room.
+            let limits = crate::serve::feed::FeedLimits {
+                ring_bytes: 1 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: QUIET,
+                stream_idle: LIMIT,
+                client_events: crate::serve::feed::CLIENT_EVENTS,
+                client_bytes: 1024,
+                solo_after: crate::serve::feed::SOLO_AFTER,
+                coalesce: crate::serve::feed::Coalesce::default(),
+            };
+            let (sink, mut events, end) = Sink::new(&limits);
+            let metrics = Arc::new(Metrics::default());
+            let tracker: Arc<Tracker> = Arc::default();
+            let now = tokio::time::Instant::now();
+            let member = Member {
+                sink,
+                plan,
+                key: test_key(),
+                node: Arc::clone(&node),
+                hub: None,
+                own: Vec::new(),
+                token: Bytes::new(),
+                sent: Bytes::new(),
+                last_event: now,
+                waiting_since: now,
+                quiet: QUIET,
+                idle: LIMIT,
+                catch_up: Arc::new(Semaphore::new(1)),
+                metrics: Arc::clone(&metrics),
+                tracker: Arc::clone(&tracker),
+                partitions: parts,
+                started: std::time::Instant::now(),
+                _slot: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            };
+            let begin = Begin::Ring {
+                joined: Joined::new(&hub, &tracker, &metrics),
+                at: 0,
+                own: vec![0],
+                token: Bytes::new(),
+                out: vec![Bytes::from(vec![0u8; 800]); 3],
+            };
+            let handle = start(member, begin, end, None);
+            tokio::time::sleep(LIMIT / 2).await;
+            assert!(!handle.is_finished(), "not yet: half the limit");
+            tokio::time::sleep(LIMIT).await;
+            assert!(handle.is_finished(), "ended at the limit");
+            assert_eq!(load(&metrics.feed_idle_drops), 1);
+            assert!(matches!(
+                take(&mut events, LIMIT).await,
+                Some(Some(Ok(Out::Spliced { .. })))
+            ));
+            let Some(Some(Err(e))) = take(&mut events, LIMIT).await else {
+                panic!("the stream ends with an error");
+            };
+            assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+            assert!(e.message.contains("--stream-idle-ms (400 ms)"), "{e:?}");
+            assert!(matches!(take(&mut events, LIMIT).await, Some(None)));
         });
     }
 
