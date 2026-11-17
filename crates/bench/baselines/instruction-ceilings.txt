@@ -439,15 +439,22 @@ knn-budget 1066 0.3
 # from textshapes.rs over a 100,000-document index (hub terms of 95,649 and 67,972
 # postings), one pass of each shape's queries. From run 42133495367 on 814f72c1, head counts
 # times 1.003 (base and head agreed to 0.0% on every shape).
-text-term-rare 264331 0.3
-text-term-hub 67918973 0.3
-text-two-terms 26841040 0.3
-text-five-terms 21748875 0.3
-text-two-terms-k100 50501746 0.3
+# Lowered by D195 (#2008, audit120 2026-11-17, in turn after #1969): #2003 (the term walk's
+# buffer reuse and floor) merged before #1969 moved callgrind to ubuntu-26.04, so #1969's
+# ceilings for these six were measured without it. From run 44009894873 on #2008 (main
+# 5ed9b12b9 with #2003, base and head within 0.0%), head counts times 1.003: text-term-rare
+# 264331 -> 258776, text-term-hub 67918973 -> 53530471, text-two-terms 26841040 -> 25223361,
+# text-five-terms 21748875 -> 21431428, text-two-terms-k100 50501746 -> 48539361, text-fuzzy
+# 56151022 -> 53811510. The phrase and prefix-none shapes are unchanged.
+text-term-rare 258776 0.3
+text-term-hub 53530471 0.3
+text-two-terms 25223361 0.3
+text-five-terms 21431428 0.3
+text-two-terms-k100 48539361 0.3
 # Raised by D195 (#1792, coordinator 2026-11-12): text-fuzzy 59091020 -> 59386475 (+0.50%). CI's
 # stable toolchain moved to Rust 1.100, and main's base build counts 59349164 (run 43283228102 on #1792, whose head matches base to 0.0%).
 # Base times 1.003 would be +0.74%, so the raise stops at 0.5%, leaving 0.06% headroom.
-text-fuzzy 56151022 0.3
+text-fuzzy 53811510 0.3
 text-phrase 29318296 0.3
 text-phrase-slop2 32085657 0.3
 # #1924 (#1930): text-two-terms and text-fuzzy restricted to an id prefix no document has.

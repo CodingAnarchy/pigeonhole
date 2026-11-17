@@ -853,6 +853,17 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 - **Depth 2 also bounds the syncs** a shard can pile onto the device.
 - macOS keeps 1, for D207's reason: `F_FULLFSYNC` serializes on the device.
 
+**Reaffirmed 2026-11-16 (owner, closing #1621 as a documented residue).** Depth 2 has a known cost on Linux, and depth 1 a larger one:
+- **The cost of 2:**
+  - Sync N+1's writeback walk (`write_cache_pages`, `WB_SYNC_ALL`) can lock the WAL's tail page cache folio (about 1 MiB on XFS's large folios) and then wait out sync N's writeback of it, holding the lock.
+  - The shard driver's next `pwrite` into that folio waits for the lock, about one I/O completion (~5.85 ms).
+  - g117, g120 and g123 traced it end to end: the driver's wait, the io-wq FSYNC worker as the waker, and the worker blocked 99.8% of the wait. At 55K puts/s on the AX102 it's about 70–85 waits of 5 ms or more per 10 minutes, around p99.99 of puts.
+- **The cost of 1** (g125, 2026-11-16, main 8069e476c):
+  - It removes those waits (80 → 0 per session), but fails D213's gate row in all 3 runs: 2.06–2.07M against 2.36–2.39M ops/s (−13%), p99 214–246 µs against the 200 µs target.
+  - This table's own 16-client row has reversed on today's main (depth 1 now +6%, p99 94–98 against 106–113 µs), but the gate row decides.
+- So the depth stays 2.
+- A depth that adapts to load (1 unless commits queue behind a sync) is the lever left, unplanned, pending #1991 (the late-session p99 ramp, which these waits don't cause).
+
 <a id="d222"></a>
 ## D222 — Scans read 16 data blocks ahead, without merging adjacent fetches; `PIGEONHOLE_READAHEAD` is removed (owner decision, 2026-10-12; engine, #431)
 
