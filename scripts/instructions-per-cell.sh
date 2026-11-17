@@ -46,6 +46,9 @@
 # removes the setup.
 #
 # Output: one line per state or shape, `name instructions_per_unit`.
+#
+# With `CG_OUT_DIR` set (Linux), each state's and shape's callgrind output is kept there as
+# `NAME.callgrind.out`, for the instructions workflow's retry artifact.
 set -euo pipefail
 
 bin="${1:-target/release/examples/hotrow}"
@@ -114,6 +117,12 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
             --callgrind-out-file="$work/cg.out" "$@" </dev/null >/dev/null 2>"$work/err"
         sed -n 's/^summary: \([0-9]*\).*/\1/p' "$work/cg.out"
     }
+    keep_output() { # name: keeps the last run's callgrind output in CG_OUT_DIR, if set
+        if [[ -n "${CG_OUT_DIR:-}" ]]; then
+            mkdir -p "$CG_OUT_DIR"
+            cp "$work/cg.out" "$CG_OUT_DIR/$1.callgrind.out"
+        fi
+    }
     guard() { # name, pattern, environment, then the command: fails if setup alone is counted
         local name="$1" pattern="$2" env_set="$3"
         shift 3
@@ -135,10 +144,12 @@ if [[ "$(uname)" == Linux ]] && command -v valgrind >/dev/null; then
         name="${s%%:*}"; env_set="${s#*:}"
         ir=$(callgrind '*hotrow_iteration*' "$env_set" "$bin" 20 "$work")
         report "$name" "$ir" "$(units_of "$work/err")"
+        keep_output "$name"
     done
     while read -r shape_bin name; do
         ir=$(callgrind '*shape_*' "" "$shape_bin" "$name" 4 "$work")
         report "$name" "$ir" "$(units_of "$work/err")"
+        keep_output "$name"
     done < <(shape_runs "$@")
     for group in "$@"; do
         last="${group##*,}"; last="${last##*:}"

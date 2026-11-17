@@ -49,6 +49,9 @@ pub(crate) enum LoadError {
     PastEnd,
 }
 
+/// `[from, to)` unit ranges, in order (the holes of a punch pass, D333).
+pub(crate) type UnitRanges = Vec<(u64, u64)>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Alloc {
     free: FreeLists,
@@ -66,6 +69,12 @@ pub(crate) struct Alloc {
     /// and the file length (units) from which it does.
     ahead_class: u8,
     ahead_from: u64,
+    /// Free space known to be a hole (D333): `[from, to)` in units, disjoint and not
+    /// adjacent, always inside free blocks. An allocation takes its range out.
+    punched: BTreeMap<u64, u64>,
+    /// The block a punch pass took out of the free map ([`Alloc::take_for_punch`]), held as
+    /// a placeholder until [`Alloc::end_punch`]: `(unit, class)`.
+    punching: Option<(u64, u8)>,
 }
 
 /// A region `Alloc::clear_for` could clear: occupied units, first unit, and occupants as
@@ -140,6 +149,8 @@ impl Alloc {
             held: BTreeMap::new(),
             ahead_class: Extent::MAX_CLASS,
             ahead_from: AHEAD_FROM_UNITS,
+            punched: BTreeMap::new(),
+            punching: None,
         };
         a.free_range(1, a.frontier);
         a
@@ -169,6 +180,8 @@ impl Alloc {
             held: BTreeMap::new(),
             ahead_class: Extent::MAX_CLASS,
             ahead_from: AHEAD_FROM_UNITS,
+            punched: BTreeMap::new(),
+            punching: None,
         };
         let mut next = 1;
         for (u, class) in extents {
@@ -232,6 +245,7 @@ impl Alloc {
     }
 
     fn mark_used(&mut self, unit: u64, class: u8) -> Extent {
+        self.unpunch(unit, unit + units(class));
         self.used.insert(
             unit,
             Used {
@@ -291,7 +305,10 @@ impl Alloc {
     /// the file inline, and the file is long enough ([`AHEAD_FROM_UNITS`] by default: a
     /// small database never grows ahead).
     pub(crate) fn wants_ahead(&self) -> bool {
+        // A block mid-punch is free space for this: it is back in the map in a moment.
+        let punching = self.punching.is_some_and(|(_, k)| k >= self.ahead_class);
         self.frontier >= self.ahead_from
+            && !punching
             && (self.ahead_class..=Extent::MAX_CLASS).all(|k| self.free[k as usize].is_empty())
     }
 
@@ -485,7 +502,162 @@ impl Alloc {
         for set in &mut self.free {
             set.split_off(&end);
         }
+        self.unpunch(end, u64::MAX);
         self.frontier = end;
+    }
+
+    /// Takes `[from, to)` out of the punched set: it is about to hold data, or leaves the
+    /// file.
+    fn unpunch(&mut self, from: u64, to: u64) {
+        let first = self
+            .punched
+            .range(..from)
+            .next_back()
+            .filter(|&(_, &end)| end > from)
+            .map(|(&start, _)| start)
+            .unwrap_or(from);
+        let inside: Vec<(u64, u64)> = self
+            .punched
+            .range(first..to)
+            .map(|(&a, &b)| (a, b))
+            .collect();
+        for (a, b) in inside {
+            self.punched.remove(&a);
+            if a < from {
+                self.punched.insert(a, from);
+            }
+            if b > to {
+                self.punched.insert(to, b);
+            }
+        }
+    }
+
+    /// Adds `[from, to)` to the punched set, merging with touching ranges.
+    fn add_punched(&mut self, mut from: u64, mut to: u64) {
+        if let Some((&a, &b)) = self.punched.range(..=from).next_back()
+            && b >= from
+        {
+            from = a;
+            to = to.max(b);
+            self.punched.remove(&a);
+        }
+        while let Some((&a, &b)) = self.punched.range(from..=to).next() {
+            to = to.max(b);
+            self.punched.remove(&a);
+        }
+        self.punched.insert(from, to);
+    }
+
+    /// The first unit past the lowest `reserve` units of free space, in whole blocks: the
+    /// lowest block that starts once the blocks below it hold `reserve` units. `None` if the
+    /// free space never reaches it. Walks the free lists in address order (a merge of the
+    /// per-class sets), visiting only the blocks inside the reserve.
+    fn punch_cutoff(&self, reserve: u64) -> Option<u64> {
+        let mut iters: Vec<_> = (0..CLASSES)
+            .map(|k| self.free[k].iter().copied().peekable())
+            .collect();
+        let mut kept = 0;
+        loop {
+            let (k, u) = iters
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(k, it)| it.peek().map(|&u| (k, u)))
+                .min_by_key(|&(_, u)| u)?;
+            if kept >= reserve {
+                return Some(u);
+            }
+            iters[k].next();
+            kept += units(k as u8);
+        }
+    }
+
+    /// Whether all of `[from, to)` is punched (one range covers it: ranges never touch).
+    fn all_punched(&self, from: u64, to: u64) -> bool {
+        self.punched
+            .range(..=from)
+            .next_back()
+            .is_some_and(|(_, &end)| end >= to)
+    }
+
+    /// The parts of `[from, to)` not yet punched.
+    fn unpunched(&self, from: u64, to: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut at = from;
+        let first = self
+            .punched
+            .range(..from)
+            .next_back()
+            .filter(|&(_, &end)| end > from)
+            .map(|(&start, _)| start)
+            .unwrap_or(from);
+        for (&a, &b) in self.punched.range(first..to) {
+            if a > at {
+                out.push((at, a));
+            }
+            at = at.max(b);
+        }
+        if at < to {
+            out.push((at, to));
+        }
+        out
+    }
+
+    /// Takes one free block out of the free map for a punch pass (D333): of the free blocks
+    /// past the lowest `reserve` units of free space, the largest with space not yet
+    /// punched (the highest on a tie). It is held as a placeholder, so nothing is allocated
+    /// in it, nothing moves or truncates it, and no region is cleared around it, until
+    /// [`end_punch`](Self::end_punch). Returns it as `(unit, class)` with the unit ranges
+    /// still to punch, or `None` if there is none or a pass already holds one.
+    pub(crate) fn take_for_punch(&mut self, reserve: u64) -> Option<(u64, u8, UnitRanges)> {
+        if self.punching.is_some() {
+            return None;
+        }
+        // Bounded under the allocator lock (simp724's S1 on #2033): the walk to the
+        // reserve's end visits only the blocks inside the reserve, and the pick then goes
+        // from the largest class down, each from its highest block, stopping at the first
+        // with space not yet punched.
+        let cutoff = self.punch_cutoff(reserve)?;
+        let (unit, class) = (0..CLASSES as u8).rev().find_map(|k| {
+            self.free[k as usize]
+                .range(cutoff..)
+                .rev()
+                .find(|&&u| !self.all_punched(u, u + units(k)))
+                .map(|&u| (u, k))
+        })?;
+        let ranges = self.unpunched(unit, unit + units(class));
+        self.free[class as usize].remove(&unit);
+        self.used.insert(
+            unit,
+            Used {
+                class,
+                retired: None,
+                published: false,
+                placeholder: true,
+            },
+        );
+        self.used_units += units(class);
+        self.punching = Some((unit, class));
+        Some((unit, class, ranges))
+    }
+
+    /// Returns the block [`take_for_punch`](Self::take_for_punch) took to the free map,
+    /// recording `[from, to)` ranges of it as punched (those the filesystem took back).
+    pub(crate) fn end_punch(&mut self, punched: &[(u64, u64)]) {
+        let Some((unit, class)) = self.punching.take() else {
+            return;
+        };
+        let used = self.used.remove(&unit).expect("the punching block is held");
+        debug_assert!(used.placeholder && used.class == class);
+        self.used_units -= units(class);
+        self.free_block(unit, class);
+        for &(a, b) in punched {
+            self.add_punched(a, b);
+        }
+    }
+
+    /// Units of free space known to be holes.
+    pub(crate) fn punched_units(&self) -> u64 {
+        self.punched.iter().map(|(a, b)| b - a).sum()
     }
 
     /// Live extents past the point the live set would end at if packed toward the start of
@@ -702,6 +874,44 @@ impl Alloc {
         }
         assert_eq!(used, self.used_units);
         assert_eq!(retired, self.retired_units);
+        // The block a pass holds is a placeholder in the used map and in no free list.
+        if let Some((u, k)) = self.punching {
+            let x = self.used.get(&u).expect("the punching block is held");
+            assert!(x.placeholder && x.class == k, "punching block {u}: {x:?}");
+            assert!(
+                (0..CLASSES).all(|c| !self.free[c].contains(&u)),
+                "punching block {u} is also free"
+            );
+        }
+        // Holes lie in free space only, as disjoint, non-touching ranges.
+        let mut prev = 0;
+        for (&a, &b) in &self.punched {
+            assert!(
+                a < b && (prev == 0 || a > prev),
+                "punched ranges {a}..{b} after {prev}"
+            );
+            prev = b;
+            let mut at = a;
+            while at < b {
+                // The block a pass holds keeps its holes while it is out of the free map.
+                if let Some((u, k)) = self.punching
+                    && (u..u + units(k)).contains(&at)
+                {
+                    at = u + units(k);
+                    continue;
+                }
+                let (k, u) = (0..CLASSES)
+                    .find_map(|k| {
+                        self.free[k]
+                            .range(..=at)
+                            .next_back()
+                            .filter(|&&u| at < u + (1 << k))
+                            .map(|&u| (k, u))
+                    })
+                    .unwrap_or_else(|| panic!("punched unit {at} is not free"));
+                at = u + (1 << k);
+            }
+        }
         spans.sort_unstable();
         let mut next = 0;
         for (s, e) in spans {
@@ -995,6 +1205,226 @@ mod tests {
         a.alloc_grown(2);
         a.release_ahead(from, end, false);
         assert_eq!(a.frontier(), 12);
+        a.check();
+    }
+
+    /// Units 1..64 free in blocks of every size: 1, 2..4, 4..8, 8..16, 16..32, 32..64.
+    fn free_ladder() -> Alloc {
+        let a = Alloc::empty(64);
+        a.check();
+        a
+    }
+
+    #[test]
+    fn a_punch_takes_the_largest_block_past_the_reserve_and_records_its_holes() {
+        let mut a = free_ladder();
+        // Nothing kept: the largest block, 32..64.
+        let (unit, class, todo) = a.take_for_punch(0).unwrap();
+        assert_eq!((unit, class, &todo[..]), (32, 5, &[(32, 64)][..]));
+        a.check();
+        assert!(a.take_for_punch(0).is_none(), "one block at a time");
+        assert_eq!(a.alloc_free(5), None, "held while it is punched");
+        a.end_punch(&todo);
+        a.check();
+        assert_eq!(a.punched_units(), 32);
+        // Punched already: the next pass takes the next largest.
+        let (unit, _, todo) = a.take_for_punch(0).unwrap();
+        assert_eq!(unit, 16);
+        a.end_punch(&todo);
+        assert_eq!(a.punched_units(), 48);
+        // The holes coalesced with the rest of the free map: one 32..64 block again, which an
+        // allocation fills, taking it out of the holes.
+        assert_eq!(a.alloc_free(5), Some(ext(32, 5)));
+        a.check();
+        assert_eq!(a.punched_units(), 16);
+    }
+
+    #[test]
+    fn the_reserve_keeps_the_lowest_free_space_unpunched() {
+        let mut a = free_ladder();
+        // 16 units kept: blocks 1, 2..4, 4..8 and 8..16 (15 units) and then 16..32 (the
+        // block that reaches 16) are the reserve; only 32..64 may be punched.
+        let (unit, _, todo) = a.take_for_punch(16).unwrap();
+        assert_eq!(unit, 32);
+        a.end_punch(&todo);
+        assert!(
+            a.take_for_punch(16).is_none(),
+            "everything past the reserve is a hole"
+        );
+        // All of it kept: nothing to punch.
+        assert!(free_ladder().take_for_punch(64).is_none());
+    }
+
+    #[test]
+    fn a_failed_punch_records_nothing_and_a_partial_one_its_part() {
+        let mut a = free_ladder();
+        let (_, _, todo) = a.take_for_punch(0).unwrap();
+        a.end_punch(&[]);
+        a.check();
+        assert_eq!(a.punched_units(), 0);
+        let (_, _, again) = a.take_for_punch(0).unwrap();
+        assert_eq!(again, todo, "tried again");
+        a.end_punch(&[(32, 40)]);
+        let (unit, _, rest) = a.take_for_punch(0).unwrap();
+        assert_eq!(
+            (unit, &rest[..]),
+            (32, &[(40, 64)][..]),
+            "only what is left"
+        );
+        a.end_punch(&rest);
+        a.check();
+    }
+
+    #[test]
+    fn allocations_and_truncation_take_space_out_of_the_holes() {
+        let mut a = free_ladder();
+        let (_, _, todo) = a.take_for_punch(0).unwrap();
+        a.end_punch(&todo);
+        // A small allocation splits the punched block: only its unit leaves the holes.
+        let x = a.alloc_lowest(0).unwrap();
+        assert_eq!(x, ext(1, 0));
+        let y = a.alloc_free(3).unwrap();
+        assert_eq!(y, ext(8, 3), "the smallest free class, not the hole");
+        assert_eq!(a.punched_units(), 32);
+        let z = a.alloc_lowest(4).unwrap();
+        assert_eq!(z, ext(16, 4));
+        let w = a.alloc_free(2).unwrap();
+        assert_eq!(w, ext(4, 2));
+        let v = a.alloc_free(1).unwrap();
+        assert_eq!(v, ext(2, 1));
+        // The next allocation of class 2 splits 32..64: 32..36 holds data now.
+        assert_eq!(a.alloc_free(2), Some(ext(32, 2)));
+        assert_eq!(a.punched_units(), 28);
+        a.check();
+        // Truncating drops the tail's holes with it.
+        a.release_live(ext(32, 2));
+        a.truncate(a.used_end());
+        a.check();
+        assert_eq!(a.punched_units(), 0);
+        assert_eq!(a.frontier(), 32);
+    }
+
+    /// simp724's C2 on #2013: every user of the placeholder flag treats a block mid-punch as
+    /// allocated.
+    #[test]
+    fn a_block_mid_punch_is_neither_moved_nor_truncated_nor_cleared_around() {
+        // Live at 1 and 2..4; 4..8, 8..16 and the tail 16..32 free.
+        let mut a = Alloc::load(32, [ext(1, 0), ext(2, 1)]).unwrap();
+        let (unit, class, todo) = a.take_for_punch(0).unwrap();
+        assert_eq!((unit, class), (16, 4), "the tail");
+        // A shrink names no extent to move (the block is not live data) and cannot cut the
+        // file below it while it is held.
+        assert!(a.shrink_plan().is_empty());
+        assert_eq!(a.used_end(), 32);
+        a.truncate(a.used_end());
+        a.check();
+        assert_eq!(a.frontier(), 32);
+        // No region is cleared around it: a 16-unit extent above finds 16..32 occupied by a
+        // placeholder it may not move.
+        let mut b = Alloc::load(64, [ext(1, 0), ext(32, 4)]).unwrap();
+        let (u, k, t) = b.take_for_punch(0).unwrap();
+        assert_eq!((u, k), (48, 4));
+        b.end_punch(&t);
+        let (u, k, _) = b.take_for_punch(0).unwrap();
+        assert_eq!((u, k), (16, 4));
+        assert!(b.clear_for(ext(32, 4), &|_| true, 16, 512).is_none());
+        b.check();
+        // Once returned, the tail truncates as before, holes and all.
+        a.end_punch(&todo);
+        a.truncate(a.used_end());
+        a.check();
+        assert_eq!((a.frontier(), a.punched_units()), (4, 0));
+    }
+
+    /// The pick `take_for_punch` must make, the obvious way: every free block in address
+    /// order, the ones past the reserve, the largest (then highest) with space not punched.
+    fn naive_punch_pick(a: &Alloc, reserve: u64) -> Option<(u64, u8, UnitRanges)> {
+        if a.punching.is_some() {
+            return None;
+        }
+        let mut blocks: Vec<(u64, u8)> = (0..CLASSES)
+            .flat_map(|k| a.free[k].iter().map(move |&u| (u, k as u8)))
+            .collect();
+        blocks.sort_unstable();
+        let mut kept = 0;
+        blocks
+            .into_iter()
+            .skip_while(|&(_, k)| {
+                let keep = kept < reserve;
+                kept += units(k);
+                keep
+            })
+            .filter_map(|(u, k)| {
+                let todo = a.unpunched(u, u + units(k));
+                (!todo.is_empty()).then_some((u, k, todo))
+            })
+            .max_by_key(|&(u, k, _)| (k, u))
+    }
+
+    #[derive(Debug, Clone)]
+    enum PunchOp {
+        Alloc(u8),
+        Release(usize),
+        Punch { reserve: u64, keep: usize },
+        Truncate,
+    }
+
+    fn punch_op() -> impl proptest::strategy::Strategy<Value = PunchOp> {
+        use proptest::prelude::*;
+        prop_oneof![
+            3 => (0u8..6).prop_map(PunchOp::Alloc),
+            2 => any::<usize>().prop_map(PunchOp::Release),
+            3 => (0u64..96, 0usize..4).prop_map(|(reserve, keep)| PunchOp::Punch { reserve, keep }),
+            1 => Just(PunchOp::Truncate),
+        ]
+    }
+
+    proptest::proptest! {
+        /// simp724's S1 on #2033: the bounded pick agrees with the naive one on any free
+        /// map, holes and all.
+        #[test]
+        fn the_bounded_punch_pick_matches_the_naive_one(
+            ops in proptest::collection::vec(punch_op(), 1..80),
+        ) {
+            let mut a = Alloc::empty(128);
+            let mut live: Vec<Extent> = Vec::new();
+            for op in ops {
+                match op {
+                    PunchOp::Alloc(k) => live.extend(a.alloc_lowest(k)),
+                    PunchOp::Release(i) if !live.is_empty() => {
+                        let x = live.swap_remove(i % live.len());
+                        proptest::prop_assert!(a.release_live(x));
+                    }
+                    PunchOp::Release(_) => {}
+                    PunchOp::Punch { reserve, keep } => {
+                        let want = naive_punch_pick(&a, reserve);
+                        let got = a.take_for_punch(reserve);
+                        proptest::prop_assert_eq!(&got, &want);
+                        a.check();
+                        if let Some((_, _, todo)) = got {
+                            // Record all, some or none of it (a failed or partial punch).
+                            a.end_punch(&todo[..keep.min(todo.len())]);
+                        }
+                    }
+                    PunchOp::Truncate => a.truncate(a.used_end()),
+                }
+                a.check();
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_mid_punch_does_not_make_the_file_grow_ahead() {
+        // Exactly one free block of the ahead class: taking it for a punch is not a reason
+        // to grow.
+        let mut a = Alloc::load(8, [ext(1, 0), ext(2, 1)]).unwrap();
+        a.set_ahead(2, 0);
+        assert!(!a.wants_ahead());
+        let (unit, class, todo) = a.take_for_punch(0).unwrap();
+        assert_eq!((unit, class), (4, 2));
+        assert!(!a.wants_ahead());
+        a.end_punch(&todo);
+        assert!(!a.wants_ahead());
         a.check();
     }
 

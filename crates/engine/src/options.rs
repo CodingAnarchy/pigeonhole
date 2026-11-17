@@ -44,6 +44,11 @@ pub struct EngineOptions {
     /// about each other and would pin to the same CPUs: give each process its own CPUs (an
     /// affinity mask, a cpuset) or turn this off.
     pub pin_threads: bool,
+    /// The in-doubt limits for transactions prepared for an external coordinator (D329,
+    /// ICR 0140): past `.0` transactions reserved or in doubt, or `.1` bytes of their
+    /// batches, a new [`Txn::prepare`](crate::Txn::prepare) answers `Busy`. 0: no limit (the
+    /// default). An open option, so an automatic recovery's new instance keeps them.
+    pub in_doubt_limits: (usize, u64),
     /// Extra threads dedicated to flush and compaction; 0 (the default here) runs them on the
     /// shards. `pigeonhole::Options` defaults engine-owned opens to a quarter of the physical
     /// cores (half with `CpuProfile::Server`), 1 to one per shard (D289); this crate keeps 0 so its deterministic tests run flush on the shard.
@@ -290,6 +295,7 @@ impl EngineOptions {
             shards: 0,
             default_shards: 0,
             pin_threads: true,
+            in_doubt_limits: (0, 0),
             compaction_threads: 0,
             compaction_cpu_set: None,
             shard_threads: 0,

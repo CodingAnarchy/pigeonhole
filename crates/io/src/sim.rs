@@ -1372,6 +1372,38 @@ impl File for SimFile {
         self.change_len(len)
     }
 
+    /// Zeroes the range (clamped to the file's length) as an unsynced write of zeros: a
+    /// power loss keeps the old bytes or the zeros, sector by sector under
+    /// [`FaultPlan::torn_writes`], as for any write (simp724's S3 on #2013). Draws nothing
+    /// from the fault RNG and injects no error, so turning punching on leaves a seed's
+    /// faults where they were.
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
+        self.check_writable("punch_hole: file not opened for writing")?;
+        self.with(|st| {
+            let node = st.node(self.node);
+            let size = node.data.len() as u64;
+            let end = offset.saturating_add(len).min(size);
+            if offset >= end {
+                return Ok(());
+            }
+            let (start, n) = (offset as usize, (end - offset) as usize); // within the file
+            let zeros = vec![0u8; n];
+            let sum = digest(&zeros);
+            write_into(&mut node.data, start, &zeros);
+            node.pending.push(Pending::Write {
+                offset: start,
+                data: zeros,
+            });
+            st.mutated(|| SimOp::Write {
+                node: self.node,
+                offset,
+                len: n as u64,
+                digest: sum,
+            });
+            Ok(())
+        })
+    }
+
     fn allocate(&self, offset: u64, len: u64) -> Result<()> {
         let end = offset
             .checked_add(len)

@@ -591,6 +591,35 @@ fn an_idle_feed_reads_the_streams_once_per_frontier() {
     db.close().unwrap();
 }
 
+/// D329 (ICR 0140's E3): an external share in doubt keeps an idle feed's shortcut (#1448).
+/// It ends only by a record of its own, which moves the frontier, so polls while it waits
+/// read nothing; commits after it arrive, and it arrives once decided.
+#[test]
+fn an_external_share_in_doubt_keeps_an_idle_feed_idle() {
+    let vfs = SimVfs::new(3149);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let f = a.family("f").unwrap().id;
+    let mut txn = db.begin().unwrap();
+    txn.batch()
+        .put(a.id, f, b"held", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    txn.prepare(b"x1", Durability::GroupSync).unwrap();
+    let s1 = single(&db, &a, b"a1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s1);
+    assert_eq!(r.held_prepares(), 1, "the share is held");
+    let reads = r.stream_reads();
+    for _ in 0..100 {
+        assert!(matches!(r.try_next().unwrap(), Next::Pending));
+    }
+    assert_eq!(r.stream_reads(), reads, "an idle poll read the streams");
+    let decided = db.decide(b"x1", true).unwrap().expect("in doubt");
+    assert_eq!(next(&mut r).seqno, decided.seqno);
+    assert_eq!(r.held_prepares(), 0);
+    db.close().unwrap();
+}
+
 /// Every commit a feed delivers until nothing more comes within a short wait.
 fn drain_seqnos(r: &mut FeedReader) -> Vec<Seqno> {
     let mut got = Vec::new();

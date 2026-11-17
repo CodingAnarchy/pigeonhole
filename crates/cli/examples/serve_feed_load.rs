@@ -18,6 +18,9 @@
 //!   subscription, sixteen streams on each (perf287's row on #1518: per-hub costs add up);
 //!   `--hubs` and `--per-hub` scale it.
 //!
+//! `--feed-retention BYTES` sets the change feed's retention (default 1 GiB, or
+//! `PH_FEED_RETENTION`); the header prints it.
+//!
 //! A discarded 0-subscriber warm-up runs first (`--warmup false` skips it). `--dump-every
 //! SECS` sends the server SIGUSR1 during each put loop, so its feed dump (each hub's ring and
 //! where its clients are) lands on stderr beside the rows.
@@ -138,6 +141,30 @@ struct Args {
     /// its feed hubs and their clients to stderr (Unix).
     #[arg(long, value_name = "SECS")]
     dump_every: Option<u64>,
+    /// The change feed's retention the database is created with, in bytes (#2002). Without
+    /// it, the `PH_FEED_RETENTION` environment variable (the box scripts set it), else 1 GiB.
+    /// A `--serve-arg=--change-feed` still overrides it on the server.
+    #[arg(long, value_name = "BYTES")]
+    feed_retention: Option<u64>,
+}
+
+/// The feed retention to create the database with: `--feed-retention`, else
+/// `PH_FEED_RETENTION`, else 1 GiB. A value that isn't a positive byte count is an error,
+/// not a silent default (#2002: sessions ran at 1 GiB whatever their script asked for).
+fn feed_retention(args: &Args) -> Result<u64, Box<dyn std::error::Error>> {
+    let bytes = match (args.feed_retention, std::env::var("PH_FEED_RETENTION")) {
+        (Some(bytes), _) => bytes,
+        (None, Ok(v)) => v
+            .trim()
+            .parse()
+            .map_err(|e| format!("PH_FEED_RETENTION={v:?} isn't a byte count: {e}"))?,
+        (None, Err(std::env::VarError::NotPresent)) => 1 << 30,
+        (None, Err(e)) => return Err(format!("PH_FEED_RETENTION: {e}").into()),
+    };
+    if bytes == 0 {
+        return Err("the feed retention must be at least 1 byte".into());
+    }
+    Ok(bytes)
 }
 
 /// Feed streams per connection: the server allows 128 HTTP/2 streams on one connection
@@ -147,7 +174,8 @@ const STREAMS_PER_CONNECTION: usize = 64;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     epoch();
-    let file = prepare(&args)?;
+    let retention = feed_retention(&args)?;
+    let file = prepare(&args, retention)?;
     // The server first, so it doesn't inherit the client's CPUs.
     let server = Server::start(&args, &file)?;
     // Then this process's CPUs, before the runtime starts its threads: they inherit them.
@@ -157,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_all(args, server))
+        .block_on(run_all(args, server, retention))
 }
 
 /// Pins the calling thread, and the threads it starts after, to `list` (Linux).
@@ -189,7 +217,11 @@ fn cpu_list(list: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
     Ok(out)
 }
 
-async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_all(
+    args: Args,
+    mut server: Server,
+    retention: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("http://127.0.0.1:{}", args.port);
     let channel = connect(&url, &args).await?;
     println!(
@@ -209,6 +241,9 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
     if let Some(rate) = args.put_rate {
         println!("offered: {rate:.0} puts/s across {} writers", args.writers);
     }
+    // What the database was created with: a script checks it took effect here, without
+    // sampling `/metrics` (a `--serve-arg=--change-feed` on the server overrides it).
+    println!("feed retention: {retention} bytes");
     println!(
         "{:<22} {:>10} {:>9} {:>9} {:>9} {:>12} {:>12} {:>11} {:>11} {:>7} {:>8} {:>8}",
         "scenario",
@@ -299,7 +334,7 @@ async fn run_all(args: Args, mut server: Server) -> Result<(), Box<dyn std::erro
 }
 
 /// The database: the change feed on, `busy` and `tiny`, closed again for the server.
-fn prepare(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn prepare(args: &Args, retention: u64) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&args.dir);
     std::fs::create_dir_all(&args.dir)?;
     let file = args.dir.join("load.phdb");
@@ -308,7 +343,7 @@ fn prepare(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
         Options::default()
             .create_if_missing(true)
             .shards(args.shards)
-            .change_feed(FeedRetention::bytes(1 << 30)),
+            .change_feed(FeedRetention::bytes(retention)),
     )?;
     for t in ["busy", "tiny"]
         .into_iter()

@@ -263,7 +263,8 @@ impl QueryStats {
     /// # Errors
     /// `InvalidArgument` for a version this build doesn't read (a newer build's), or bytes
     /// that don't parse. That includes numbers out of range: a negative count, a `df` above
-    /// the documents, a boost outside (0, 1], or a term or expansion listed twice.
+    /// the documents, a boost outside (0, 1], more expansions than `max_expansions`, or a
+    /// term or expansion listed twice.
     pub fn from_bytes(bytes: &[u8]) -> Result<QueryStats> {
         let mut r = Reader(bytes);
         let version = r.u8()?;
@@ -316,8 +317,19 @@ impl QueryStats {
             if clauses.is_empty() {
                 return Err(unparsed("a fuzzy term has no clause"));
             }
+            // A part's expansions and a merge's are cut to `max_expansions`, which also
+            // bounds the check for one listed twice below (audit120 on #2025). Both counts
+            // come from the bytes, so nothing is reserved from them: the vector grows as
+            // expansions parse, and bytes that claim more than they hold end early
+            // (audit120's must on #2029).
+            let count = r.len()?;
+            if count > max_expansions {
+                return Err(unparsed(
+                    "a fuzzy term has more expansions than max_expansions",
+                ));
+            }
             let mut expansions: Vec<Expansion> = Vec::new();
-            for _ in 0..r.len()? {
+            for _ in 0..count {
                 let term = r.string()?;
                 let distance = r.u8()?;
                 let df = r.i64()?;

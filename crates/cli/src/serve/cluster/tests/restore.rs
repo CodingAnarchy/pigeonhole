@@ -846,6 +846,8 @@ fn a_partition_restore_passes_every_copys_epoch_not_only_the_maps() {
                 to_epoch: 2,
                 restore: false,
                 restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
             })
             .await
             .unwrap();

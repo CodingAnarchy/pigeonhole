@@ -2181,15 +2181,21 @@ impl Sink {
                         timer.as_mut().reset(from + idle);
                         continue;
                     }
-                    return Err(ApiError::deadline(format!(
-                        "the client took no feed event for --stream-idle-ms ({} ms); resume \
-                         from the last event's token",
-                        idle.as_millis()
-                    )));
+                    return Err(idle_error(idle));
                 }
             }
         }
     }
+}
+
+/// The error a feed stream whose client took no event for `idle` (`--stream-idle-ms`) ends
+/// with, on a single node or a cluster (#2021): resumable from the last event's token.
+pub(crate) fn idle_error(idle: Duration) -> ApiError {
+    ApiError::deadline(format!(
+        "the client took no feed event for --stream-idle-ms ({} ms); resume from the last \
+         event's token",
+        idle.as_millis()
+    ))
 }
 
 /// The error a send to a client that went away ends with.

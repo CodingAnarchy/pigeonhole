@@ -774,9 +774,16 @@ impl Catalog {
     /// Places every tablet for `shards` shards keeping each shard within `max_slots`
     /// `(tablet, family)` slots where it can (with tablet changes on; owners are not
     /// persisted, D130). In tablet id order, a tablet goes to shard `tablet % shards` when
-    /// that fits, else to the shard holding the fewest slots. Returns the most slots any
-    /// shard ends up holding, above `max_slots` only when the tablets fit no other way.
-    pub(crate) fn place(&mut self, shards: usize, max_slots: usize) -> usize {
+    /// that fits, else to the shard holding the fewest slots. A tablet in `pins` (an
+    /// in-doubt external share's, D329) goes to its pinned shard first, whatever its slots.
+    /// Returns the most slots any shard ends up holding, above `max_slots` only when the
+    /// tablets fit no other way.
+    pub(crate) fn place(
+        &mut self,
+        shards: usize,
+        max_slots: usize,
+        pins: &HashMap<TabletId, ShardId>,
+    ) -> usize {
         let shards = shards.max(1);
         let mut slots = vec![0usize; shards];
         let widths: HashMap<TableId, usize> = self
@@ -784,7 +791,19 @@ impl Catalog {
             .values()
             .map(|t| (t.id, t.families.len()))
             .collect();
-        for t in Arc::make_mut(&mut self.tablets).values_mut() {
+        let tablets = Arc::make_mut(&mut self.tablets);
+        for t in tablets.values_mut() {
+            if let Some(&pin) = pins.get(&t.id)
+                && usize::from(pin.0) < shards
+            {
+                slots[usize::from(pin.0)] += widths.get(&t.table).copied().unwrap_or(0);
+                t.shard = pin;
+            }
+        }
+        for t in tablets.values_mut() {
+            if pins.contains_key(&t.id) && usize::from(t.shard.0) < shards {
+                continue;
+            }
             let width = widths.get(&t.table).copied().unwrap_or(0);
             let preferred = usize::from(shard_for(t.id, shards).0);
             let shard = if slots[preferred] + width <= max_slots {
