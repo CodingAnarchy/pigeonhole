@@ -739,7 +739,12 @@ fn skewed_corpus() -> Vec<(String, String)> {
 #[test]
 fn a_text_search_across_partitions_scores_as_one_index() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (mut stops, [p1, _p2], [a, _b, c], _) = three_nodes(&rt);
+    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    // A new index fills from its source in the background, and a strict search on a
+    // partition still filling answers Unavailable, so each step waits for its fill.
+    let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.rebuild_pending().unwrap())
+    };
     let reference = test_dir();
     let db = pigeonhole::Pigeonhole::open(reference.join("ref.db"), pigeonhole::Options::default())
         .unwrap();
@@ -786,6 +791,10 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             .create_index(text_index("ut"))
             .await
             .unwrap();
+        eventually("both partitions fill ut", async || {
+            filled(&p1, "ut") && filled(&p2, "ut")
+        })
+        .await;
         for (id, text) in &docs {
             put_text(c, "ut", id, text).await;
         }
@@ -882,6 +891,7 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             })
             .await
             .unwrap();
+        eventually("p1 fills st", async || filled(&p1, "st")).await;
         for (id, text) in docs.iter().take(30) {
             put_text(c, "st", id, text).await;
         }
@@ -929,6 +939,7 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             })
             .await
             .unwrap();
+        eventually("p2 fills st2", async || filled(&p2, "st2")).await;
         put_text(c, "st2", "x1", "alpha pad").await;
 
         // b (p2, from "m") stops. A search needs every partition's statistics, so even one
