@@ -7,7 +7,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, EngineOptions, Error, FamilyOptions, ValueRef, WriteBatch};
+use pigeonhole_engine::{Engine, EngineOptions, Error, FamilyOptions, Fault, ValueRef, WriteBatch};
 use pigeonhole_format::Durability;
 use pigeonhole_io::sim::SimVfs;
 
@@ -307,5 +307,90 @@ fn a_read_only_open_lists_a_share_in_doubt_and_cannot_decide_it() {
     let t = db.table("t").expect("table t");
     db.decide(b"ro", true).unwrap().expect("in doubt");
     assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"v"[..]));
+    db.close().unwrap();
+}
+
+/// perf2's M2 on #2000: a commit right behind an external abort becomes visible on an
+/// otherwise idle database. The abort's seqno is held until its type 6 is written; its
+/// release must wake the commit's visibility wait, or nothing later would.
+/// `Fault::HoldDecisionRecords` keeps the type 6 unwritten while the commit, reserved after
+/// the abort's seqno, applies and waits.
+#[test]
+fn a_commit_right_behind_an_abort_becomes_visible_on_an_idle_database() {
+    let vfs = SimVfs::new(28);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    txn(&db, &t, b"held", &[b"held"], b"v")
+        .prepare(b"m2", Durability::GroupSync)
+        .unwrap();
+    db.inject(Fault::HoldDecisionRecords, true);
+    let decider = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.decide(b"m2", false))
+    };
+    // The coordinator took the decision (and reserved the abort's seqno) once the xid has
+    // left the registry; its type 6 is held.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !db.in_doubt().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the decide never reached its coordinator"
+        );
+        std::thread::yield_now();
+    }
+    let (done, rx) = std::sync::mpsc::channel();
+    let committer = {
+        let db = Arc::clone(&db);
+        let table = t.id;
+        std::thread::spawn(move || {
+            let mut wb = WriteBatch::new();
+            wb.put(table, f, b"free", b"q", None, ValueRef::Bytes(b"v"))
+                .unwrap();
+            let c = db.commit(wb, Some(Durability::GroupSync)).unwrap();
+            done.send(c.seqno).unwrap();
+        })
+    };
+    // Behind the held abort, the commit can't become visible.
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(200))
+            .is_err()
+    );
+    db.release_held_decisions();
+    let seqno = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the commit behind the abort never became visible");
+    let abort = decider.join().unwrap().unwrap().expect("in doubt");
+    assert!(
+        seqno > abort.seqno,
+        "the commit {seqno} is behind the abort {}",
+        abort.seqno
+    );
+    committer.join().unwrap();
+    db.close().unwrap();
+}
+
+/// perf2's S2 on #2000: a decide once the database is closing is refused (`Closed`), and the
+/// share stays in doubt for the next open, its PREPAREs kept.
+#[test]
+fn a_decide_after_the_close_is_refused_and_the_share_stays_in_doubt() {
+    let vfs = SimVfs::new(29);
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &t, b"s", &[b"s"], b"v")
+            .prepare(b"s2", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+        assert!(db.decide(b"s2", true).is_err(), "a decide after the close");
+    }
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let doubt: Vec<Vec<u8>> = db.in_doubt().into_iter().map(|(x, _)| x).collect();
+    assert_eq!(doubt, [b"s2".to_vec()]);
+    db.decide(b"s2", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
