@@ -1527,6 +1527,11 @@ impl<'t, R: Reads, L: Layout> TopK<'t, R, L> {
                 else {
                     break;
                 };
+                // Candidates ascend, as in [`top_k`] (#2010).
+                debug_assert!(
+                    !decided || next > self.last.as_slice(),
+                    "a candidate at or before the last document decided"
+                );
                 // The candidate, in `last`'s buffer: once it's decided, it's the last
                 // document decided, which the next pass's re-walk steps past. No allocation
                 // per candidate; a document that enters the top `k` is copied.
@@ -1753,6 +1758,15 @@ pub(crate) fn top_k<L: Layout>(
         let Some(next) = essential.iter().filter_map(|&c| clauses[c].doc()).min() else {
             break;
         };
+        // Candidates ascend: every essential walk stands after the last document decided (a
+        // fuzzy expansion walked again steps past it, [`Walk::pass`]). In a version 2 index
+        // a walk left on that document changes no result (the other clauses' lookups don't
+        // look behind themselves, so it scores too little to enter twice), so this check
+        // is what catches it there (#2010).
+        debug_assert!(
+            !decided || next > last.as_slice(),
+            "a candidate at or before the last document decided"
+        );
         // The candidate, in `last`'s buffer: once it's decided, it's the last document
         // decided, which the next pass's re-walk steps past. No allocation per candidate; a
         // document that enters the top `k` is copied.
