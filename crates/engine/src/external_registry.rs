@@ -16,8 +16,8 @@
 //!   again). Two decides of one xid both reach the coordinator, whose shard thread orders
 //!   them: the second finds it decided.
 //!
-//! Lock order: `entries` → `limits`, in `reserve` only; nothing is sent or waited on under
-//! either. Loom-modelled (`loom_tests`).
+//! One lock, `entries`, a leaf: nothing is sent or waited on under it. The limits are fixed
+//! at open. Loom-modelled (`loom_tests`).
 
 #[cfg(engine_loom)]
 use loom::sync::Mutex;
@@ -72,28 +72,28 @@ impl Slot {
 #[derive(Debug)]
 pub(crate) struct ExternalRegistry {
     entries: Mutex<BTreeMap<Vec<u8>, Slot>>,
-    /// The most xids reserved or in doubt, and the most bytes of their batches; 0 for none.
-    limits: Mutex<(usize, u64)>,
+    /// The most xids reserved or in doubt, and the most bytes of their batches; 0 for none
+    /// (`EngineOptions::in_doubt_limits`, fixed at open).
+    limits: (usize, u64),
 }
 
 impl Default for ExternalRegistry {
     fn default() -> Self {
-        Self {
-            entries: Mutex::new(BTreeMap::new()),
-            limits: Mutex::new((0, 0)),
-        }
+        Self::new((0, 0))
     }
 }
 
 impl ExternalRegistry {
-    fn entries(&self) -> impl std::ops::DerefMut<Target = BTreeMap<Vec<u8>, Slot>> + '_ {
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    /// An empty registry with the in-doubt `limits` (`EngineOptions::in_doubt_limits`).
+    pub(crate) fn new(limits: (usize, u64)) -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+            limits,
+        }
     }
 
-    /// Sets the in-doubt limits: past `max_shares` xids or `max_bytes` of batches, a
-    /// [`reserve`](Self::reserve) answers `Busy`. 0: no limit.
-    pub(crate) fn set_limits(&self, max_shares: usize, max_bytes: u64) {
-        *self.limits.lock().unwrap_or_else(PoisonError::into_inner) = (max_shares, max_bytes);
+    fn entries(&self) -> impl std::ops::DerefMut<Target = BTreeMap<Vec<u8>, Slot>> + '_ {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Reserves `xid` for a prepare of `bytes`. `InvalidArgument` if it is reserved or in
@@ -105,7 +105,7 @@ impl ExternalRegistry {
                 "this xid is prepared here already: decide it first".to_owned(),
             ));
         }
-        let (max_shares, max_bytes) = *self.limits.lock().unwrap_or_else(PoisonError::into_inner);
+        let (max_shares, max_bytes) = self.limits;
         let held: u64 = entries.values().map(Slot::bytes).sum();
         if (max_shares > 0 && entries.len() >= max_shares) || (max_bytes > 0 && held >= max_bytes) {
             return Err(Error::Busy);
@@ -285,8 +285,7 @@ mod loom_tests {
         // doubt or reserved at a time, so one of them is refused `Busy` unless the other
         // failed and dropped its reservation first.
         loom::model(|| {
-            let r = Arc::new(ExternalRegistry::default());
-            r.set_limits(1, 0);
+            let r = Arc::new(ExternalRegistry::new((1, 0)));
             let spawn = |xid: &'static [u8], id| {
                 let r = Arc::clone(&r);
                 thread::spawn(move || prepare(&r, xid, id, true))

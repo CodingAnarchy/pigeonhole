@@ -2414,12 +2414,6 @@ impl Engine {
         self.inner.in_doubt()
     }
 
-    /// The in-doubt limits (D329): past `max_shares` transactions in doubt, or `max_bytes`
-    /// of their batches, a new [`Txn::prepare`] answers `Busy`. 0: no limit.
-    pub fn set_in_doubt_limits(&self, max_shares: usize, max_bytes: u64) {
-        self.inner.set_in_doubt_limits(max_shares, max_bytes);
-    }
-
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
     /// after this commit (D314): its value as a read at the commit's seqno sees it, with a TTL judged at
     /// the commit's timestamp, in the order the batch first wrote each cell. `batch`
@@ -5686,12 +5680,6 @@ impl Inner {
         Ok((info.seqno != 0).then_some(info))
     }
 
-    /// Sets the in-doubt limits (D329, ICR 0140): past `max_shares` transactions in doubt,
-    /// or `max_bytes` of their batches, a new prepare answers `Busy`. 0: no limit.
-    pub(crate) fn set_in_doubt_limits(&self, max_shares: usize, max_bytes: u64) {
-        self.shared.external.set_limits(max_shares, max_bytes);
-    }
-
     /// The externally prepared transactions in doubt here (D329): each one's xid, and how
     /// long ago (the engine's monotonic clock) it was prepared, in nanoseconds.
     pub(crate) fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
@@ -7476,7 +7464,7 @@ impl Shared {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             external_flagged: AtomicBool::new(false),
-            external: crate::external_registry::ExternalRegistry::default(),
+            external: crate::external_registry::ExternalRegistry::new(options.in_doubt_limits),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,

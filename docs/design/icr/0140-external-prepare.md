@@ -64,7 +64,7 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 - **Follow-up, #1993 (Post-1.0):** hold the position only and read the record again at its Decision, so a held share costs a few bytes whatever its batch.
 
 ## Limits
-- `Engine::set_in_doubt_limits(max_shares, max_bytes)`: past either, a new prepare answers `Busy`, so a home that stops deciding can't pin unbounded WAL. The engine's default is no limit; `phdb serve` sets it from `--txn-max-in-doubt-wal-bytes` (D329 PR 2).
+- `EngineOptions::in_doubt_limits` (`pigeonhole::Options::in_doubt_limits`, hidden behind the feature): past either the count or the bytes, a new prepare answers `Busy`, so a home that stops deciding can't pin unbounded WAL. An open option, so an automatic recovery's new instance keeps it. The engine's default is no limit; `phdb serve` sets it from `--txn-max-in-doubt-wal-bytes` (D329 PR 2).
 - **Serve default:** 16 MiB of batches in doubt per partition, so 64 feed subscribers hold at most 1 GiB in the worst case (perf2's condition 2). Raising it is a deliberate operator choice.
 - Not supported in PR 1, and refused with `InvalidArgument`: values large enough to be stored apart (the share's batch must be whole in its record), and prepares with no writes.
 
