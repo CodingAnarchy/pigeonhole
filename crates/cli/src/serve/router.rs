@@ -714,19 +714,26 @@ impl Router {
                     );
                     return match op {
                         ServiceOp::Nearest(_) => {
-                            Box::pin(self.fan_nearest(cluster, op, caller, prepaid, deadline)).await
+                            Box::pin(self.fan_nearest(cluster, op, caller, prepaid, deadline, None))
+                                .await
                         }
                         ServiceOp::Traverse(_) => {
-                            Box::pin(self.fan_traverse(cluster, op, caller, prepaid, deadline))
-                                .await
+                            Box::pin(
+                                self.fan_traverse(cluster, op, caller, prepaid, deadline, None),
+                            )
+                            .await
                         }
                         _ => {
-                            Box::pin(self.fan_multi_get(cluster, op, caller, prepaid, deadline))
-                                .await
+                            Box::pin(
+                                self.fan_multi_get(cluster, op, caller, prepaid, deadline, None),
+                            )
+                            .await
                         }
                     };
                 }
-                ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
+                ServiceOp::Scan(_) => {
+                    return self.fan_scan(cluster, op, caller, prepaid, None).await;
+                }
                 // A memory call across partitions (#1915): a recall in steps, a `MarkUsed`
                 // or `Forget` split.
                 ServiceOp::Recall(_) | ServiceOp::MarkUsed(_) | ServiceOp::Forget(_)
@@ -1017,6 +1024,9 @@ impl Router {
                 };
                 route(routes, &op)?
             };
+            if fanout_part && matches!(op, ServiceOp::MultiGet(_) | ServiceOp::Nearest(_)) {
+                return Self::serve_copy_part(cluster, &partition, op, caller, read).await;
+            }
             return Self::serve_copy(cluster, &partition, op, caller, None, read, deadline).await;
         }
         let service = {
@@ -1069,6 +1079,32 @@ impl Router {
         copy.follower.within(read.max_lag_ms)?;
         let reply = copy.service.call(op, caller, prepaid).await?;
         Ok((reply, copy.follower.applied_seqno()))
+    }
+
+    /// One partition's part of a read another node fans out, from this node's replica copy
+    /// (D328 PR 2b): no budget of its own, as an owner's part has none, and the copy's
+    /// freshness within the bound before and after.
+    async fn serve_copy_part(
+        cluster: &Cluster,
+        partition: &str,
+        op: ServiceOp,
+        caller: &Caller,
+        read: ReplicaRead,
+    ) -> Result<(ServiceReply, u64), ApiError> {
+        let copy = cluster
+            .replicas
+            .load()
+            .get(partition)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::partition_unavailable(format!(
+                    "this node holds no replica copy of partition {partition}"
+                ))
+            })?;
+        copy.follower.within(read.max_lag_ms)?;
+        let reply = copy.service.fanout_part(op, caller).await?;
+        copy.follower.within(read.max_lag_ms)?;
+        Ok((reply, 0))
     }
 
     /// A single-partition read a replica may serve (D328): P's replicas in the map's order,
@@ -1216,6 +1252,64 @@ impl Router {
             && let Some(max_lag_ms) = max_lag?
         {
             let min_primary_seqno = min_primary_seqno?;
+            // A fanned-out read's parts, from each partition's replicas first (D328 PR 2b). At
+            // a snapshot it's the owner's, as `dispatch_by` routes it.
+            let fan_read = ReplicaRead {
+                max_lag_ms,
+                min_primary_seqno: None,
+            };
+            if min_primary_seqno.is_none() {
+                let at = tokio::time::Instant::from_std(deadline.at);
+                match &op {
+                    ServiceOp::MultiGet(r) if snapshot_of(r.selection.as_ref()).is_none() => {
+                        let reply = Box::pin(self.fan_multi_get(
+                            cluster,
+                            op,
+                            caller,
+                            prepaid,
+                            at,
+                            Some(fan_read),
+                        ))
+                        .await?;
+                        return Ok((reply, None));
+                    }
+                    ServiceOp::Nearest(r) if r.snapshot_id.is_empty() => {
+                        let reply = Box::pin(self.fan_nearest(
+                            cluster,
+                            op,
+                            caller,
+                            prepaid,
+                            at,
+                            Some(fan_read),
+                        ))
+                        .await?;
+                        return Ok((reply, None));
+                    }
+                    ServiceOp::Traverse(r) if r.snapshot_id.is_empty() => {
+                        let reply = Box::pin(self.fan_traverse(
+                            cluster,
+                            op,
+                            caller,
+                            prepaid,
+                            at,
+                            Some(fan_read),
+                        ))
+                        .await?;
+                        return Ok((reply, None));
+                    }
+                    _ => {}
+                }
+            }
+            // A scan's pages, from each partition's replicas first (D328 PR 2b, S2).
+            if matches!(op, ServiceOp::Scan(_)) && min_primary_seqno.is_none() {
+                let read = ReplicaRead {
+                    max_lag_ms,
+                    min_primary_seqno: None,
+                };
+                let reply =
+                    Box::pin(self.fan_scan(cluster, op, caller, prepaid, Some(read))).await?;
+                return Ok((reply, None));
+            }
             if replica_readable(&op) {
                 let read = ReplicaRead {
                     max_lag_ms,
@@ -1285,6 +1379,50 @@ pub(crate) enum Fwd {
 pub(crate) struct ReplicaRead {
     pub(crate) max_lag_ms: u64,
     pub(crate) min_primary_seqno: Option<u64>,
+}
+
+/// A node's routed reads' record of replicas found behind or unreachable (D328).
+pub(crate) type Backoff =
+    Arc<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>>;
+
+/// What a fanned-out read needs to try P's replicas (D328 PR 2b): the client's bound, this
+/// node's own copies and the node's back-off record.
+#[derive(Clone, Debug)]
+pub(crate) struct ReplicaRoute {
+    pub(crate) read: ReplicaRead,
+    pub(crate) copies: Replicas,
+    pub(crate) backoff: Backoff,
+}
+
+impl ReplicaRoute {
+    /// The route of a read with `read`'s bound on `cluster`.
+    pub(crate) fn of(cluster: &Cluster, read: ReplicaRead) -> Self {
+        Self {
+            read,
+            copies: Arc::clone(&cluster.replicas),
+            backoff: Arc::clone(&cluster.replica_backoff),
+        }
+    }
+
+    /// Whether `node`'s replica of `partition` was found behind or unreachable lately.
+    pub(crate) fn backed_off(&self, node: &str, partition: &str) -> bool {
+        self.backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(node.to_owned(), partition.to_owned()))
+            .is_some_and(|at| at.elapsed() < REPLICA_BACKOFF)
+    }
+
+    /// Records `node`'s replica of `partition` as behind or unreachable now.
+    pub(crate) fn back_off(&self, node: &str, partition: &str) {
+        self.backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (node.to_owned(), partition.to_owned()),
+                std::time::Instant::now(),
+            );
+    }
 }
 
 /// The seqno a read on `service`'s partition was served at, read after it: the owner's
@@ -1763,7 +1901,7 @@ fn read_again(op: &ServiceOp) -> Option<ServiceOp> {
 /// it's behind, it doesn't hold the copy (or the copy closed under the read, as a map that
 /// drops it closes it), or it couldn't be reached. Anything else (a missing table, the
 /// caller's scope) the owner would answer the same.
-fn falls_back(e: &ApiError) -> bool {
+pub(crate) fn falls_back(e: &ApiError) -> bool {
     matches!(
         e.code.as_str(),
         "ReplicaBehind" | "PartitionUnavailable" | "WrongPartition" | "Unavailable" | "Closed"

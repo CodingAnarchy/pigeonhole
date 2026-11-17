@@ -759,3 +759,127 @@ fn an_idle_owners_replica_stays_fresh() {
         assert_eq!(by.as_deref(), Some("replica"));
     });
 }
+
+/// Every row of a scan of `r` through node `port`, with the staleness bound, a page at most
+/// `page_bytes`: the rows' keys in order, and each page's `served_seqno`.
+async fn scan_through(port: u16, max_lag_ms: u64, page_bytes: u64) -> (Vec<Vec<u8>>, Vec<u64>) {
+    let mut req = tonic::Request::new(crate::serve::proto::ScanRequest {
+        table: "r".into(),
+        page_bytes,
+        ..Default::default()
+    });
+    req.metadata_mut().insert(
+        crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+        max_lag_ms.to_string().parse().unwrap(),
+    );
+    let mut stream = data(port).await.scan(req).await.unwrap().into_inner();
+    let (mut keys, mut served) = (Vec::new(), Vec::new());
+    while let Some(page) = stream.message().await.unwrap() {
+        served.push(page.served_seqno);
+        for row in page.rows {
+            if keys.last() != Some(&row.key.to_vec()) {
+                keys.push(row.key.to_vec());
+            }
+        }
+    }
+    (keys, served)
+}
+
+/// D328 PR 2b: a scan sent with the bound reads p3's pages from its replica, each page
+/// with the seqno it was read at; and when the replica falls behind partway (the seam),
+/// the rest of p3 comes from the owner, from the last page's position: every row once, in
+/// order.
+#[test]
+fn a_bounded_scan_reads_a_replica_and_goes_on_at_the_owner_if_it_falls_behind() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let mut last = 0;
+        for i in 0..40 {
+            last = put_in(ports[1], "r", &format!("k{i:03}")).await;
+        }
+        eventually("a's copy to apply the rows", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        let want: Vec<Vec<u8>> = (0..40).map(|i| format!("k{i:03}").into_bytes()).collect();
+        // k1 from `following` sorts first.
+        let want = std::iter::once(b"k1".to_vec())
+            .chain(want)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (keys, served) = scan_through(ports[1], 60_000, 256).await;
+        assert_eq!(keys, want);
+        assert!(served.iter().any(|&s| s >= last), "{served:?}");
+        // The replica falls behind after 2 pages: the rest is the owner's.
+        crate::serve::service::BEHIND_AFTER_PAGES
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), 2));
+        let (keys, _) = scan_through(ports[1], 60_000, 256).await;
+        assert_eq!(keys, want, "every row once, in order");
+    });
+    crate::serve::service::BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != dirs[0]);
+}
+
+/// D328 PR 2b: with p3's owner (c) stopped, reads that allow staleness still answer from
+/// p3's replica on a (fresh within the bound for a while yet): a multi-get's part, a scan's
+/// pages and a get. The same multi-get without the header can't be served.
+#[test]
+fn bounded_reads_answer_from_the_replica_while_the_owner_is_down() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, mut stops, _dbs) = following(&rt);
+    // Fresh first (a bounded read is the replica's), then the owner goes.
+    rt.block_on(eventually("a's copy to be fresh", async || {
+        read_through(ports[1], "k1", Some(60_000), None)
+            .await
+            .is_ok_and(|(_, by, _)| by.as_deref() == Some("replica"))
+    }));
+    let _ = stops.remove(2).send(());
+    rt.block_on(async {
+        let multi_get = |bound: bool| {
+            let mut req = tonic::Request::new(crate::serve::proto::MultiGetRequest {
+                table: "r".into(),
+                keys: vec![b"k1".to_vec().into()],
+                ..Default::default()
+            });
+            if bound {
+                req.metadata_mut().insert(
+                    crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+                    "60000".parse().unwrap(),
+                );
+            }
+            req
+        };
+        let got = data(ports[1])
+            .await
+            .multi_get(multi_get(true))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.rows.len(), 1, "{got:?}");
+        let (keys, _) = scan_through(ports[1], 60_000, 4096).await;
+        assert_eq!(keys, vec![b"k1".to_vec()]);
+        let (value, by, _) = read_through(ports[1], "k1", Some(60_000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (value.as_deref(), by.as_deref()),
+            (Some(&b"v"[..]), Some("replica"))
+        );
+        assert!(
+            data(ports[1])
+                .await
+                .multi_get(multi_get(false))
+                .await
+                .is_err(),
+            "without the header it's the stopped owner's"
+        );
+    });
+}

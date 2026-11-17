@@ -512,6 +512,13 @@ message ForwardScanRequest {
   string partition = 3;
   // The scan, with `after` (if any) this partition's own position and `limit` what's left.
   ScanRequest scan = 4;
+  // As `ForwardRequest`'s (D328): the entry node chose this node's replica copy of the
+  // partition. Each page is read from the copy only while it's fresh within
+  // `replica_max_lag_ms`, else the stream ends with `ReplicaBehind` and the entry node
+  // continues from the last page's position on the next replica or the owner.
+  bool to_replica = 7;
+  uint64 replica_max_lag_ms = 5;
+  uint64 min_primary_seqno = 6;
 }
 
 // The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
