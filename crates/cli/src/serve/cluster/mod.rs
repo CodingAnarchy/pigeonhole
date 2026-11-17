@@ -17,6 +17,7 @@ pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod hub;
 pub(crate) mod identity;
+mod indexfan;
 pub(crate) mod lease;
 pub(crate) mod map;
 mod memfan;
@@ -1845,7 +1846,13 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         });
         let (reply, served) = shared
             .router
-            .serve_forwarded(op, &caller, msg.fanout_part, replica.map(|r| (r, deadline)))
+            .serve_forwarded(
+                op,
+                &caller,
+                msg.fanout_part,
+                &msg.partition,
+                replica.map(|r| (r, deadline)),
+            )
             .await?;
         let (reply, charge) = forward::reply_to_forward(reply, served)?;
         let mut resp = tonic::Response::new(reply);
