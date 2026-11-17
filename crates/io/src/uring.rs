@@ -659,6 +659,10 @@ impl File for UringFile {
         self.file.allocate(offset, len)
     }
 
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
+        self.file.punch_hole(offset, len)
+    }
+
     fn lock(&self, byte: u64, mode: LockMode) -> Result<()> {
         self.file.lock(byte, mode)
     }

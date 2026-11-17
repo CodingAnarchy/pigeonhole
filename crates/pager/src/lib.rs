@@ -372,6 +372,9 @@ impl OpenedPager {
                 ahead_flight: Mutex::new(None),
                 growths_ahead: AtomicU64::new(0),
                 ahead_nanos: AtomicU64::new(0),
+                punches: AtomicU64::new(0),
+                punch_bytes: AtomicU64::new(0),
+                punch_nanos: AtomicU64::new(0),
                 side: SideSyncs::default(),
                 root_observer: OnceLock::new(),
                 root_intent: OnceLock::new(),
@@ -442,6 +445,11 @@ struct Inner {
     /// on the allocating thread.
     growths_ahead: AtomicU64,
     ahead_nanos: AtomicU64,
+    /// Blocks of free space punched (D333), the bytes given back, and the nanoseconds the
+    /// punches took.
+    punches: AtomicU64,
+    punch_bytes: AtomicU64,
+    punch_nanos: AtomicU64,
     /// Growth and truncation syncs in flight, which a commit must see the outcome of before
     /// it publishes (D58), without holding the allocator lock (#182).
     side: SideSyncs,
@@ -1421,6 +1429,58 @@ impl Pager {
         Some(try_lock(&self.inner.alloc)?.reclaim(oldest_live.min(durable)))
     }
 
+    /// Gives one block of free space back to the filesystem (D333, #2013): of the free
+    /// blocks past the lowest `reserve` bytes of free space (kept, since the allocator hands
+    /// low space out again first and a write into a hole allocates again), the largest with
+    /// space not yet punched. Returns the bytes punched, or `None` if there is nothing to
+    /// punch (or another pass holds a block).
+    ///
+    /// Free space is what no root that may be recovered and no live view references: the
+    /// space reuse already overwrites ([`Pager::reclaim`] clamps to the durable root). The
+    /// block is held while it is punched, outside the allocator lock, so no allocation lands
+    /// in it, no relocation or truncation moves it, and the next large allocation does not
+    /// grow the file for want of it. A failed punch records nothing; a filesystem that cannot
+    /// punch fails with [`ErrorKind::Unsupported`].
+    pub fn punch_free(&self, reserve: u64) -> Result<Option<u64>> {
+        if !self.inner.writable {
+            return Err(io_err(ErrorKind::Unsupported, "punch on a read-only pager"));
+        }
+        let Some((_, _, ranges)) = lock(&self.inner.alloc).take_for_punch(reserve.div_ceil(UNIT_BYTES))
+        else {
+            return Ok(None);
+        };
+        let started = std::time::Instant::now();
+        let mut done = Vec::with_capacity(ranges.len());
+        let mut failed = None;
+        for &(a, b) in &ranges {
+            match self
+                .inner
+                .file
+                .punch_hole(a * UNIT_BYTES, (b - a) * UNIT_BYTES)
+            {
+                Ok(()) => done.push((a, b)),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        lock(&self.inner.alloc).end_punch(&done);
+        let bytes: u64 = done.iter().map(|(a, b)| (b - a) * UNIT_BYTES).sum();
+        if bytes > 0 {
+            self.inner.punches.fetch_add(1, Ordering::Relaxed);
+            self.inner.punch_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        self.inner.punch_nanos.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(Some(bytes)),
+        }
+    }
+
     /// Holds the allocator's lock until the guard drops (test hook: makes
     /// [`Pager::try_reclaim`] skip, as another thread's growth or commit would).
     #[doc(hidden)]
@@ -1625,6 +1685,10 @@ impl Pager {
             growth_nanos: self.inner.growth_nanos.load(Ordering::Relaxed),
             growths_ahead: self.inner.growths_ahead.load(Ordering::Relaxed),
             ahead_nanos: self.inner.ahead_nanos.load(Ordering::Relaxed),
+            punched_bytes: alloc.punched_units() * UNIT_BYTES,
+            punches: self.inner.punches.load(Ordering::Relaxed),
+            punch_bytes: self.inner.punch_bytes.load(Ordering::Relaxed),
+            punch_nanos: self.inner.punch_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -1666,6 +1730,15 @@ pub struct PagerStats {
     pub growths_ahead: u64,
     /// Wall-clock nanoseconds their `fallocate`s took on the allocating thread.
     pub ahead_nanos: u64,
+    /// Free bytes now known to be holes ([`Pager::punch_free`], D333): the file's apparent
+    /// length less this is about what it occupies on disk. An allocation there fills it.
+    pub punched_bytes: u64,
+    /// Blocks punched since open.
+    pub punches: u64,
+    /// Bytes given back to the filesystem since open.
+    pub punch_bytes: u64,
+    /// Wall-clock nanoseconds the punches took.
+    pub punch_nanos: u64,
 }
 
 #[cfg(test)]

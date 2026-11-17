@@ -145,6 +145,46 @@ pub trait File: Send + Sync + Debug {
     /// Preallocates `[offset, offset + len)` so later writes there need no metadata update.
     fn allocate(&self, offset: u64, len: u64) -> Result<()>;
 
+    /// Gives the filesystem back the blocks under `[offset, offset + len)`, keeping the
+    /// file's length: the range then reads back as zeros (D333, ICR 0144). For space no
+    /// reader can reach any more; the bytes there are gone, so never call it on data
+    /// anything may still read or recover.
+    ///
+    /// A punch is not ordered with a later sync: after a power loss the range may read back
+    /// as zeros or as its old bytes. A range past the end changes nothing.
+    ///
+    /// - Linux: `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+    /// - macOS: `fcntl(F_PUNCHHOLE)`, whose offset and length must be multiples of the
+    ///   filesystem's block size (`EINVAL` otherwise, reported as an error, not as
+    ///   unsupported).
+    /// - Elsewhere, and on a filesystem that cannot punch: fails with
+    ///   [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported), as does the default.
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_io::{File, OpenOptions, Vfs};
+    /// use pigeonhole_io::sim::SimVfs;
+    ///
+    /// # fn main() -> pigeonhole_io::Result<()> {
+    /// let vfs = SimVfs::new(7);
+    /// let f = vfs.open(Path::new("/db/f"), OpenOptions::read_write_create())?;
+    /// f.write_at(&[9; 8192], 0)?;
+    /// f.punch_hole(0, 4096)?;
+    /// let mut buf = [1; 8192];
+    /// f.read_at(&mut buf, 0)?;
+    /// assert!(buf[..4096].iter().all(|&b| b == 0) && buf[4096..].iter().all(|&b| b == 9));
+    /// assert_eq!(f.len()?, 8192);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
+        let _ = (offset, len);
+        Err(crate::Error::new(
+            crate::ErrorKind::Unsupported,
+            "punch_hole: not supported here",
+        ))
+    }
+
     /// Takes a byte-range lock on the single byte at `byte`. Never blocks: fails with
     /// `ErrorKind::Locked` if a conflicting lock is held. Taking `Exclusive` while holding
     /// `Shared` is an upgrade attempt. `Exclusive` needs a handle opened for writing (POSIX

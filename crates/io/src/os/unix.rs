@@ -194,6 +194,59 @@ pub(crate) fn allocate(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     extend(file, offset, len)
 }
 
+/// Gives back the blocks under `[offset, offset + len)`, keeping the length (D333): see
+/// [`File::punch_hole`](crate::File::punch_hole). A filesystem that cannot punch
+/// (`EOPNOTSUPP`, or a kernel without it) is [`ErrorKind::Unsupported`].
+#[cfg(target_os = "linux")]
+pub(crate) fn punch_hole(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+    let start = off(offset, "punch_hole: offset too large")?;
+    let count = off(len, "punch_hole: length too large")?;
+    if count == 0 {
+        return Ok(());
+    }
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    // SAFETY: plain syscall on an fd owned by `file`.
+    if unsafe { libc::fallocate(file.as_raw_fd(), mode, start, count) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) => Err(Error::new(
+            ErrorKind::Unsupported,
+            "punch_hole: the filesystem cannot punch holes",
+        )),
+        _ => Err(Error::os("fallocate(PUNCH_HOLE)", err)),
+    }
+}
+
+/// As the Linux `punch_hole`, through `F_PUNCHHOLE`: its offset and length must be
+/// multiples of the filesystem's block size, else `EINVAL`, which is an error, not
+/// [`ErrorKind::Unsupported`] (simp724's S1 on #2013).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn punch_hole(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: off(offset, "punch_hole: offset too large")?,
+        fp_length: off(len, "punch_hole: length too large")?,
+    };
+    // SAFETY: `hole` is a valid `fpunchhole_t` for F_PUNCHHOLE on an fd owned by `file`.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &hole) } != -1 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOTSUP) => Err(Error::new(
+            ErrorKind::Unsupported,
+            "punch_hole: the filesystem cannot punch holes",
+        )),
+        _ => Err(Error::os("F_PUNCHHOLE", err)),
+    }
+}
+
 /// Grows the file to cover `[offset, offset + len)` if it is shorter.
 fn extend(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let end = offset

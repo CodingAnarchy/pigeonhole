@@ -146,6 +146,8 @@ struct Progress {
     relocations: u64,
     /// Data extents placed in the freed tail of a trimmed output.
     tail_reuses: u64,
+    /// Free blocks punched (D333).
+    punches: u64,
 }
 
 /// The workload state carried across steps.
@@ -287,6 +289,13 @@ fn step(st: &mut State, rng: &mut Rng, progress: &mut Progress) -> pigeonhole_pa
         pager.retire(e, version);
     }
     pager.reclaim(version);
+    // Give every free block back to the filesystem (D333, #2013): a crash at any punch
+    // recovers every live byte, since only space no recoverable root names is free. Draws
+    // nothing from `rng`, and returns each block to the free map as it was, so the
+    // allocations (and the seed known to relocate) are unchanged.
+    while let Some(bytes) = pager.punch_free(0)? {
+        progress.punches += u64::from(bytes > 0);
+    }
     if rng.below(4) == 0 {
         pager.truncate_tail()?;
     }
@@ -370,9 +379,15 @@ fn sweep(name: &str, plan: FaultPlan, seeds: &[u64]) {
         let mut coverage = Progress::default();
         workload(&clean_ref, seed, &mut coverage).unwrap();
         println!(
-            "{name} seed {seed}: {} appends, {} rollovers, {} relocations, {} tail reuses",
-            coverage.appends, coverage.rollovers, coverage.relocations, coverage.tail_reuses
+            "{name} seed {seed}: {} appends, {} rollovers, {} relocations, {} tail reuses, \
+             {} punches",
+            coverage.appends,
+            coverage.rollovers,
+            coverage.relocations,
+            coverage.tail_reuses,
+            coverage.punches
         );
+        assert!(coverage.punches > 0, "{name} seed {seed}: nothing punched");
         assert!(
             coverage.appends > 0 && coverage.rollovers >= 2,
             "{coverage:?}"
