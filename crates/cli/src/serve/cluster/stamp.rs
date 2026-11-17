@@ -345,12 +345,27 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
         // A replica database takes no local write (R6) until it's a primary: at the last
         // commit it applied, as `phdb promote` makes one. Once promoted it can't follow
         // again, so a promote that stops after this is finished or its file moved aside.
-        if req.promote
-            && db
+        if req.promote {
+            let following = db
                 .replicated_seqno()
                 .map_err(|e| ApiError::internal(format!("read the copy's state: {e}")))?
-                .is_some()
-        {
+                .is_some();
+            // Already a primary, and not at `to_epoch` (done, above): an earlier promote
+            // stamped it, and the map has moved since (a set-map, relocate or promote), or
+            // it stopped between its promote and its identity. Stamping it again would give
+            // P this file's history over whatever P took since (simp724's M1 on #2007).
+            if !following {
+                return Err(ApiError::failed_precondition(format!(
+                    "{} is already a primary, at epoch {}: an earlier promote stopped after \
+                     promoting it, and the map has moved on (this promote is from epoch {}). \
+                     Stamped again it would replace what {p} took since. Check the map; to \
+                     make this node a replica of {p} again, move the file aside (phdb cluster \
+                     drop-partition {p} on this node)",
+                    main.display(),
+                    id.epoch,
+                    req.from_epoch
+                )));
+            }
             db.promote()
                 .map_err(|e| ApiError::internal(format!("promote {}: {e}", main.display())))?;
         }

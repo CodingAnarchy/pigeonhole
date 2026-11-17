@@ -1044,6 +1044,73 @@ fn a_promotion_doesnt_overwrite_a_map_changed_since_its_stamp() {
     });
 }
 
+/// simp724's M1 on #2007, the rerun's side: a promote stopped after its stamp, then a
+/// set-map moved p3's epoch on (p3 still on c). The rerun reads the new epoch, so a's file
+/// looks like an unstamped copy at it; the stamp refuses a file that's already a primary, and
+/// the map stays as the set-map left it.
+#[test]
+fn a_promotion_rerun_refuses_once_the_map_moved_past_its_stamp() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        // A set-map: p3's epoch 1 -> 2, still on c.
+        let mut m = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let expected = m.map_version;
+        m.map_version += 1;
+        for q in m.partitions.iter_mut().filter(|q| q.id == "p3") {
+            q.epoch += 1;
+        }
+        client(ports[0])
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        eventually("a to hold p3 at epoch 2 in its map", async || {
+            placed(ports[1], "p3").await.1 == 2
+        })
+        .await;
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("a's file is already a primary");
+        assert!(e.message().contains("already a primary"), "{}", e.message());
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 2), "the set-map's map stays");
+        assert!(replicas.is_empty(), "{replicas:?}");
+    });
+}
+
 /// Every row of a scan of `r` through node `port`, with the staleness bound, a page at most
 /// `page_bytes`: the rows' keys in order, and each page's `served_seqno`.
 async fn scan_through(port: u16, max_lag_ms: u64, page_bytes: u64) -> (Vec<Vec<u8>>, Vec<u64>) {
