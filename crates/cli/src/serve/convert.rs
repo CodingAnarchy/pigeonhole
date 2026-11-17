@@ -795,8 +795,18 @@ impl<'t> Kinds<'t> {
         if let Some((_, v)) = self.seen.borrow().iter().find(|(f, _)| f == family) {
             return *v;
         }
+        let view = View::of(self.table, family);
+        self.seen.borrow_mut().push((family.to_owned(), view));
+        view
+    }
+}
+
+impl View {
+    /// `family`'s view in `table`, looked up once, for a reply that meets one family (a
+    /// `Get`): no [`Kinds`] list, and no copy of the family's name (#1828).
+    pub(crate) fn of(table: &Table, family: &str) -> View {
         use pigeonhole::Aggregation as A;
-        let view = match self.table.family_info(family).and_then(|i| i.aggregation) {
+        match table.family_info(family).and_then(|i| i.aggregation) {
             Some(A::Hll) => View::Hll,
             Some(A::MeanVar) => View::MeanVar,
             Some(A::Histogram(_)) => View::Histogram,
@@ -804,9 +814,7 @@ impl<'t> Kinds<'t> {
             Some(A::Bloom(_)) => View::Bloom,
             Some(A::Set) => View::Set,
             _ => View::None,
-        };
-        self.seen.borrow_mut().push((family.to_owned(), view));
-        view
+        }
     }
 }
 
