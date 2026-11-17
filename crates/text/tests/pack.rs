@@ -554,6 +554,24 @@ fn an_edit_that_keeps_a_terms_frequency_leaves_no_cell_a_pack_cannot_reach() {
     db.close().unwrap();
 }
 
+#[test]
+fn list_names_the_text_indexes_and_no_other_table() {
+    let db = sim(7);
+    assert!(Index::list(&db).expect("list").is_empty());
+    // `pair` makes a source table and its index: only the index is listed.
+    let (_, a) = pair(&db, "a", IndexOptions::new());
+    let (_, _b) = pair(&db, "b", IndexOptions::new().positions(false));
+    let mut names = Index::list(&db).expect("list");
+    names.sort();
+    assert_eq!(names, ["a_text", "b_text"]);
+    // Packed or not.
+    a.put(b"d1", "one two").expect("put");
+    a.pack().expect("pack");
+    let mut names = Index::list(&db).expect("list");
+    names.sort();
+    assert_eq!(names, ["a_text", "b_text"]);
+}
+
 fn ids_of(hits: &[Hit]) -> Vec<Vec<u8>> {
     hits.iter().map(|h| h.id.clone()).collect()
 }

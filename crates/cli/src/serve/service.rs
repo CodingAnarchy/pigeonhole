@@ -1042,6 +1042,35 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     }
 }
 
+/// `--text-pack`'s counters (#1585): each partition's background pack.
+fn render_text_packs(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
+    type Read = fn(&super::texts::PackCounters) -> u64;
+    let families: [(&str, Read); 4] = [
+        ("pigeonhole_serve_text_pack_passes_total", |c| {
+            c.passes.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_postings_total", |c| {
+            c.postings.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_refused_total", |c| {
+            c.refused.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_conflicts_total", |c| {
+            c.conflicts.load(Ordering::Relaxed)
+        }),
+    ];
+    for (name, read) in families {
+        render_family(
+            out,
+            name,
+            "counter",
+            parts
+                .iter()
+                .map(|(id, part)| (*id, read(&part.texts.packs))),
+        );
+    }
+}
+
 /// A cluster node's partitions' unpinned engine threads (D317 ticket 8a's pinning check):
 /// shard drivers and compaction threads apart (cli692's note on the 8a plan). A single
 /// node's output doesn't change: they're labelled partitions' only.
@@ -1573,7 +1602,18 @@ impl Service {
         }
         if let Some(part) = &self.part {
             part.texts.resume_soon(&self.text_rebuilds);
+            // With `--text-pack`, its indexes are packed in the background too (#1585).
+            part.texts.pack_soon(&self.text_rebuilds);
         }
+    }
+
+    /// `--text-pack` (#1585): this node's partitions pack their text indexes in the
+    /// background. Off unless called: a packed index can't be read by a 1.2 build.
+    pub(crate) fn text_pack(self, on: bool) -> Self {
+        if on {
+            self.text_rebuilds.pack_on();
+        }
+        self
     }
 
     /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
@@ -2475,6 +2515,22 @@ impl Service {
                 .await
                 .map(ServiceReply::Nearest)
                 .map_err(ApiError::for_read),
+            // An index's part (#1722 PR 1b): the partition's own search or check.
+            ServiceOp::VectorSearch(r) => self
+                .vector_search(r)
+                .await
+                .map(ServiceReply::VectorSearch)
+                .map_err(ApiError::for_read),
+            ServiceOp::VectorVerify(r) => self
+                .vector_verify(r)
+                .await
+                .map(ServiceReply::VectorVerify)
+                .map_err(ApiError::for_read),
+            ServiceOp::TextVerify(r) => self
+                .text_verify(r)
+                .await
+                .map(ServiceReply::TextVerify)
+                .map_err(ApiError::for_read),
             ServiceOp::RecallPool(r) => self
                 .recall_pool(r, caller)
                 .await
@@ -2484,7 +2540,8 @@ impl Service {
                 .await
                 .map_err(ApiError::for_read),
             _ => Err(ApiError::internal(
-                "a fan-out's local part is a multi-get, a nearest search or a recall's step",
+                "a fan-out's local part is a multi-get, a nearest search, an index's search or \
+                 check, or a recall's step",
             )),
         }
     }
@@ -2769,6 +2826,9 @@ impl Service {
             let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
         }
         render_bulk(&mut text, parts);
+        if self.text_rebuilds.packs() {
+            render_text_packs(&mut text, parts);
+        }
         render_pinning(&mut text, parts);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);

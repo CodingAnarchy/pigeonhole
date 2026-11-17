@@ -531,7 +531,8 @@ pub(crate) fn single<'a>(
     .memory_opt(
         memory(args, &db, replica.is_none(), &placement, stderr)?,
         args.memory_calls.unwrap_or(0),
-    );
+    )
+    .text_pack(args.text_pack);
     if let Some(r) = &replica {
         service = service.replica(Arc::clone(r));
     }

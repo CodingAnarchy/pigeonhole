@@ -145,6 +145,12 @@ impl Reach {
                         to_replica: false,
                         replica_max_lag_ms: 0,
                         min_primary_seqno: 0,
+                        // An index's part names its partition (#1722): its request doesn't.
+                        partition: if forward::names_partition(&op) {
+                            partition.to_owned()
+                        } else {
+                            String::new()
+                        },
                         map_version,
                         caller: Some(forward::forwarded_caller(caller)?),
                         op: Some(op.clone()),
@@ -203,6 +209,12 @@ impl Reach {
                     to_replica: true,
                     replica_max_lag_ms: route.read.max_lag_ms,
                     min_primary_seqno: 0,
+                    // As the owner's part above: only an index's part names its partition.
+                    partition: if forward::names_partition(op) {
+                        partition.to_owned()
+                    } else {
+                        String::new()
+                    },
                     map_version: routes.map_version(),
                     caller: Some(forward::forwarded_caller(caller)?),
                     op: Some(op.clone()),

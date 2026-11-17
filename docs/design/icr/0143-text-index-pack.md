@@ -1,6 +1,6 @@
 # 0143: `Index::pack` and text index layout version 2 (packed posting blocks)
 
-**Status:** Approved. The number and the names came from the coordinator (`.coord/numbers.md`), for #1585, in 1.3.0 by the owner's scope call. The design (`.coord/audit120-design-1585-1586.md`, Part 2) was reviewed by ai1249 (text) and perf2 (measurement). This file grows with #1585's PRs: PR 3b (below) adds the layout, the pack and the merged read path, with a walk that passes whole blocks by their bound; a later PR adds `phdb serve --text-pack`.
+**Status:** Approved. The number and the names came from the coordinator (`.coord/numbers.md`), for #1585, in 1.3.0 by the owner's scope call. The design (`.coord/audit120-design-1585-1586.md`, Part 2) was reviewed by ai1249 (text) and perf2 (measurement). This file grows with #1585's PRs: PR 3b (below) adds the layout, the pack and the merged read path, with a walk that passes whole blocks by their bound; PR 5 (at the end) adds `phdb serve --text-pack`.
 
 ## Why
 
@@ -93,3 +93,25 @@ Version 1 is D309 §2, unchanged. Version 2 adds:
 ### Tests
 
 `crates/text/tests/pack.rs` and `search_async.rs`: a packed index answers every search as a twin that is never packed, through writes, deletes and packs in between (sync, async, random queries, id prefixes, with and without positions); the first pack's rules; stop and resume; packs beside rebuilds, repairs and concurrent writers.
+
+## PR 5: `phdb serve --text-pack`
+
+### Public API (additive)
+
+- **`phdb serve --text-pack`** (a switch, off by default, per node): the node's partitions pack their text indexes in the background. Without it a server never packs; there is no pack RPC.
+- **`Index::list(db: &Pigeonhole) -> Result<Vec<String>>`** (`pigeonhole-text`): the text indexes in a database, by name. A catalog listing (the tables with an index's families), opening none as an index. `Index::pending_rebuilds` is this list filtered by its cursor read.
+- **Metrics**, present only with the flag, per partition on a cluster node: `pigeonhole_serve_text_pack_passes_total`, `pigeonhole_serve_text_pack_postings_total`, `pigeonhole_serve_text_pack_refused_total`, `pigeonhole_serve_text_pack_conflicts_total`.
+
+### What the server does
+
+- **A thread per partition** (`phdb-serve-text-pack`, placed off the shards' cores as the rebuild's is), started where a stopped rebuild's resume is started: at the partition's open and after a promote, never on a replica copy. It passes over the partition's indexes at once, then every 60 seconds, until the partition closes.
+- **A pass** packs each index with `Index::pack_with` and default options, a chunk at a time. Its step is the rebuild's (`Steps`): it enters the partition's write gate for each chunk, so a fence or a lost lease stops the pack at its next chunk, and the pass waits until the partition takes writes again.
+- **It holds the node's rebuild slot, and ranks last for it:** one rebuild or pack at a time on a node. A pack stops at its next chunk for a client's `Text.Rebuild` (which waits for it, as for a resume) and for a stopped rebuild's resume on any partition (cli692's S1 on #2018): a resume that finds a pack on the slot marks it wanted, the pack's next step yields, and no pack takes the slot while a resume wanted it within the last 3 seconds (three of the resume thread's looks, so a resume that went away stops counting). A cluster index still filling therefore waits for one chunk, not a pass.
+- **An index with a rebuild pending** (stopped, or a cluster index still filling) is passed over: the resume thread finishes it, and a later pass packs it.
+- **The first pack keeps `Index::pack`'s refusal:** with a reader process attached the pack is refused, logged and counted once for the index (not once a pass), and tried again each pass. So is any other failure, such as a table with an index's families that doesn't open as one. The server never passes `with_readers(true)`: it can't know the readers' release.
+- **A pack that ends in `Conflict`** (a chunk that kept conflicting with writers down to the smallest chunk) is not a failure: the cursor stays and the next pass carries on (ai1249's S2 on #2009). It is counted apart (`…_conflicts_total`), so a pack that conflicts on every pass shows. `Index::pack`'s own contract doesn't change.
+- **A shutdown** stops the pack at its next chunk and waits for the thread before the database closes. The cursor stays, and the next start carries on from it.
+
+### Tests
+
+`crates/cli/src/serve/server_tests/text_tests.rs`: a server without the flag never packs and shows no pack metric; with it the index is packed, a search agrees before and after and finds a later write, and the counters show it; a reader process attached holds the first pack off until it closes; a fenced partition packs nothing until unfenced; a client's `Text.Rebuild` and a stopped rebuild's resume each take the slot from a pack part-way (the second fails if a pack ignores a waiting resume); a `--replica-of` replica with the flag packs only once promoted; a refusal is counted once for an index. `crates/text/tests/pack.rs`: `Index::list`.

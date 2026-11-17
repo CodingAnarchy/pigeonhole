@@ -17,6 +17,7 @@ pub(crate) mod fence;
 pub(crate) mod forward;
 pub(crate) mod hub;
 pub(crate) mod identity;
+mod indexfan;
 pub(crate) mod lease;
 pub(crate) mod map;
 mod memfan;
@@ -1845,7 +1846,13 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         });
         let (reply, served) = shared
             .router
-            .serve_forwarded(op, &caller, msg.fanout_part, replica.map(|r| (r, deadline)))
+            .serve_forwarded(
+                op,
+                &caller,
+                msg.fanout_part,
+                &msg.partition,
+                replica.map(|r| (r, deadline)),
+            )
             .await?;
         let (reply, charge) = forward::reply_to_forward(reply, served)?;
         let mut resp = tonic::Response::new(reply);
@@ -2240,7 +2247,8 @@ pub(crate) fn run(
         Arc::clone(&metrics),
         Some(Arc::clone(&placement)),
     )
-    .memory_opt(None, args.memory_calls.unwrap_or(0));
+    .memory_opt(None, args.memory_calls.unwrap_or(0))
+    .text_pack(args.text_pack);
     // `--memory` (#1915): each partition the map places the store on opens its own, with
     // this node's embedder and options, when a reconcile finds it placed. The map may place
     // it later; it can't place another store.
