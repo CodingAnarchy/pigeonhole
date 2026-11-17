@@ -166,6 +166,11 @@ pub(crate) enum Stop {
 pub(crate) static STEP_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// An inspection counter (tests): resumes that stopped for a client's `Text.Rebuild`, so a
+/// test can tell a resume that yielded the slot from one that finished (#1995).
+#[cfg(test)]
+pub(crate) static YIELDED: AtomicUsize = AtomicUsize::new(0);
+
 /// A rebuild's step (#1756), run after each document's transaction: the gate's hold for the
 /// next document, as `gated`'s slices take one each (so a fence's drain waits for one
 /// document), or a stop.
@@ -470,6 +475,10 @@ impl Texts {
                     );
                 }
                 Ok(s) => {
+                    #[cfg(test)]
+                    if matches!(stop, Some(Stop::Yielded)) {
+                        YIELDED.fetch_add(1, Ordering::SeqCst);
+                    }
                     eprintln!(
                         "phdb serve: text index {name}: its resumed rebuild stopped again after \
                          {} documents ({})",
