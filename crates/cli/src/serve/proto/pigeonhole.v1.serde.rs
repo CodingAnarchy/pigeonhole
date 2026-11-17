@@ -7677,6 +7677,15 @@ impl serde::Serialize for ForwardScanRequest {
         if self.scan.is_some() {
             len += 1;
         }
+        if self.to_replica {
+            len += 1;
+        }
+        if self.replica_max_lag_ms != 0 {
+            len += 1;
+        }
+        if self.min_primary_seqno != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForwardScanRequest", len)?;
         if self.map_version != 0 {
             #[allow(clippy::needless_borrow)]
@@ -7691,6 +7700,19 @@ impl serde::Serialize for ForwardScanRequest {
         }
         if let Some(v) = self.scan.as_ref() {
             struct_ser.serialize_field("scan", v)?;
+        }
+        if self.to_replica {
+            struct_ser.serialize_field("to_replica", &self.to_replica)?;
+        }
+        if self.replica_max_lag_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("replica_max_lag_ms", ToString::to_string(&self.replica_max_lag_ms).as_str())?;
+        }
+        if self.min_primary_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("min_primary_seqno", ToString::to_string(&self.min_primary_seqno).as_str())?;
         }
         struct_ser.end()
     }
@@ -7707,6 +7729,12 @@ impl<'de> serde::Deserialize<'de> for ForwardScanRequest {
             "caller",
             "partition",
             "scan",
+            "to_replica",
+            "toReplica",
+            "replica_max_lag_ms",
+            "replicaMaxLagMs",
+            "min_primary_seqno",
+            "minPrimarySeqno",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7715,6 +7743,9 @@ impl<'de> serde::Deserialize<'de> for ForwardScanRequest {
             Caller,
             Partition,
             Scan,
+            ToReplica,
+            ReplicaMaxLagMs,
+            MinPrimarySeqno,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7740,6 +7771,9 @@ impl<'de> serde::Deserialize<'de> for ForwardScanRequest {
                             "caller" => Ok(GeneratedField::Caller),
                             "partition" => Ok(GeneratedField::Partition),
                             "scan" => Ok(GeneratedField::Scan),
+                            "toReplica" | "to_replica" => Ok(GeneratedField::ToReplica),
+                            "replicaMaxLagMs" | "replica_max_lag_ms" => Ok(GeneratedField::ReplicaMaxLagMs),
+                            "minPrimarySeqno" | "min_primary_seqno" => Ok(GeneratedField::MinPrimarySeqno),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7763,6 +7797,9 @@ impl<'de> serde::Deserialize<'de> for ForwardScanRequest {
                 let mut caller__ = None;
                 let mut partition__ = None;
                 let mut scan__ = None;
+                let mut to_replica__ = None;
+                let mut replica_max_lag_ms__ = None;
+                let mut min_primary_seqno__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::MapVersion => {
@@ -7791,6 +7828,28 @@ impl<'de> serde::Deserialize<'de> for ForwardScanRequest {
                             }
                             scan__ = map_.next_value()?;
                         }
+                        GeneratedField::ToReplica => {
+                            if to_replica__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("toReplica"));
+                            }
+                            to_replica__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ReplicaMaxLagMs => {
+                            if replica_max_lag_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaMaxLagMs"));
+                            }
+                            replica_max_lag_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::MinPrimarySeqno => {
+                            if min_primary_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("minPrimarySeqno"));
+                            }
+                            min_primary_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(ForwardScanRequest {
@@ -7798,6 +7857,9 @@ impl<'de> serde::Deserialize<'de> for ForwardScanRequest {
                     caller: caller__,
                     partition: partition__.unwrap_or_default(),
                     scan: scan__,
+                    to_replica: to_replica__.unwrap_or_default(),
+                    replica_max_lag_ms: replica_max_lag_ms__.unwrap_or_default(),
+                    min_primary_seqno: min_primary_seqno__.unwrap_or_default(),
                 })
             }
         }
@@ -21073,6 +21135,9 @@ impl serde::Serialize for ScanPage {
         if !self.missing.is_empty() {
             len += 1;
         }
+        if self.served_seqno != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ScanPage", len)?;
         if !self.rows.is_empty() {
             struct_ser.serialize_field("rows", &self.rows)?;
@@ -21090,6 +21155,11 @@ impl serde::Serialize for ScanPage {
         if !self.missing.is_empty() {
             struct_ser.serialize_field("missing", &self.missing)?;
         }
+        if self.served_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("served_seqno", ToString::to_string(&self.served_seqno).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -21104,6 +21174,8 @@ impl<'de> serde::Deserialize<'de> for ScanPage {
             "next",
             "bytes",
             "missing",
+            "served_seqno",
+            "servedSeqno",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -21112,6 +21184,7 @@ impl<'de> serde::Deserialize<'de> for ScanPage {
             Next,
             Bytes,
             Missing,
+            ServedSeqno,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -21137,6 +21210,7 @@ impl<'de> serde::Deserialize<'de> for ScanPage {
                             "next" => Ok(GeneratedField::Next),
                             "bytes" => Ok(GeneratedField::Bytes),
                             "missing" => Ok(GeneratedField::Missing),
+                            "servedSeqno" | "served_seqno" => Ok(GeneratedField::ServedSeqno),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -21160,6 +21234,7 @@ impl<'de> serde::Deserialize<'de> for ScanPage {
                 let mut next__ = None;
                 let mut bytes__ = None;
                 let mut missing__ = None;
+                let mut served_seqno__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Rows => {
@@ -21190,6 +21265,14 @@ impl<'de> serde::Deserialize<'de> for ScanPage {
                             }
                             missing__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ServedSeqno => {
+                            if served_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("servedSeqno"));
+                            }
+                            served_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(ScanPage {
@@ -21197,6 +21280,7 @@ impl<'de> serde::Deserialize<'de> for ScanPage {
                     next: next__.unwrap_or_default(),
                     bytes: bytes__.unwrap_or_default(),
                     missing: missing__.unwrap_or_default(),
+                    served_seqno: served_seqno__.unwrap_or_default(),
                 })
             }
         }

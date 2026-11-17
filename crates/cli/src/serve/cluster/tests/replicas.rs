@@ -396,7 +396,11 @@ fn a_replica_copy_follows_a_moved_owner_without_bootstrapping_again() {
         .await
         .unwrap();
         let after = put_after_move(ports[0], "r", "k2").await;
-        eventually(
+        // The copy retried its old owner while the partition moved, its pause doubling up
+        // to the follower's MAX_BACKOFF (10 s), and a map change doesn't wake it: a wait
+        // past that, not `eventually`'s 5 s (#2015, a flake under a loaded full run).
+        eventually_within(
+            Duration::from_secs(30),
             "a's replica of p3 to follow b past a write there",
             async || {
                 copy_of(ports[0], "p3").await.is_some_and(|lp| {
@@ -439,7 +443,11 @@ fn a_replica_copy_bootstraps_again_after_a_relocate_without_copy() {
         .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
         let after = put_after_move(ports[0], "r", "k2").await;
-        eventually(
+        // The copy retried its old owner while the partition moved, its pause doubling up
+        // to the follower's MAX_BACKOFF (10 s), and a map change doesn't wake it: a wait
+        // past that, not `eventually`'s 5 s (#2015, a flake under a loaded full run).
+        eventually_within(
+            Duration::from_secs(30),
             "a's replica of p3 to follow b past a write there",
             async || {
                 copy_of(ports[0], "p3").await.is_some_and(|lp| {
@@ -758,4 +766,188 @@ fn an_idle_owners_replica_stays_fresh() {
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
         assert_eq!(by.as_deref(), Some("replica"));
     });
+}
+
+/// Every row of a scan of `r` through node `port`, with the staleness bound, a page at most
+/// `page_bytes`: the rows' keys in order, and each page's `served_seqno`.
+async fn scan_through(port: u16, max_lag_ms: u64, page_bytes: u64) -> (Vec<Vec<u8>>, Vec<u64>) {
+    let mut req = tonic::Request::new(crate::serve::proto::ScanRequest {
+        table: "r".into(),
+        page_bytes,
+        ..Default::default()
+    });
+    req.metadata_mut().insert(
+        crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+        max_lag_ms.to_string().parse().unwrap(),
+    );
+    let mut stream = data(port).await.scan(req).await.unwrap().into_inner();
+    let (mut keys, mut served) = (Vec::new(), Vec::new());
+    while let Some(page) = stream.message().await.unwrap() {
+        served.push(page.served_seqno);
+        for row in page.rows {
+            if keys.last() != Some(&row.key.to_vec()) {
+                keys.push(row.key.to_vec());
+            }
+        }
+    }
+    (keys, served)
+}
+
+/// D328 PR 2b: a scan sent with the bound reads p3's pages from its replica, each page
+/// with the seqno it was read at; and when the replica falls behind partway (the seam),
+/// the rest of p3 comes from the owner, from the last page's position: every row once, in
+/// order.
+#[test]
+fn a_bounded_scan_reads_a_replica_and_goes_on_at_the_owner_if_it_falls_behind() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let mut last = 0;
+        for i in 0..40 {
+            last = put_in(ports[1], "r", &format!("k{i:03}")).await;
+        }
+        eventually("a's copy to apply the rows", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        let want: Vec<Vec<u8>> = (0..40).map(|i| format!("k{i:03}").into_bytes()).collect();
+        // k1 from `following` sorts first.
+        let want = std::iter::once(b"k1".to_vec())
+            .chain(want)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (keys, served) = scan_through(ports[1], 60_000, 256).await;
+        assert_eq!(keys, want);
+        assert!(served.iter().any(|&s| s >= last), "{served:?}");
+        // The replica falls behind after 2 pages: the rest is the owner's.
+        crate::serve::service::BEHIND_AFTER_PAGES
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), 2));
+        let (keys, _) = scan_through(ports[1], 60_000, 256).await;
+        assert_eq!(keys, want, "every row once, in order");
+    });
+    crate::serve::service::BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != dirs[0]);
+}
+
+/// D328 PR 2b: with p3's owner (c) stopped, reads that allow staleness still answer from
+/// p3's replica on a (fresh within the bound for a while yet): a multi-get's part, a scan's
+/// pages and a get. The same multi-get without the header can't be served.
+#[test]
+fn bounded_reads_answer_from_the_replica_while_the_owner_is_down() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, mut stops, _dbs) = following(&rt);
+    // Fresh first (a bounded read is the replica's), then the owner goes.
+    rt.block_on(eventually("a's copy to be fresh", async || {
+        read_through(ports[1], "k1", Some(60_000), None)
+            .await
+            .is_ok_and(|(_, by, _)| by.as_deref() == Some("replica"))
+    }));
+    let _ = stops.remove(2).send(());
+    rt.block_on(async {
+        let multi_get = |bound: bool| {
+            let mut req = tonic::Request::new(crate::serve::proto::MultiGetRequest {
+                table: "r".into(),
+                keys: vec![b"k1".to_vec().into()],
+                ..Default::default()
+            });
+            if bound {
+                req.metadata_mut().insert(
+                    crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+                    "60000".parse().unwrap(),
+                );
+            }
+            req
+        };
+        let got = data(ports[1])
+            .await
+            .multi_get(multi_get(true))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.rows.len(), 1, "{got:?}");
+        let (keys, _) = scan_through(ports[1], 60_000, 4096).await;
+        assert_eq!(keys, vec![b"k1".to_vec()]);
+        let (value, by, _) = read_through(ports[1], "k1", Some(60_000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (value.as_deref(), by.as_deref()),
+            (Some(&b"v"[..]), Some("replica"))
+        );
+        assert!(
+            data(ports[1])
+                .await
+                .multi_get(multi_get(false))
+                .await
+                .is_err(),
+            "without the header it's the stopped owner's"
+        );
+    });
+}
+
+/// simp724's S1 on #2001: a scan never goes back in time across a source change. a and b
+/// both hold p3's replica; b's copy stops applying (a seam: still fresh within the read's
+/// bound), and rows written then are a's only. a falls behind
+/// after 2 pages (the seam): b's first page would be older than what a sent, so b is left
+/// too, and the owner finishes. Every row once, in order, and no page older than one before.
+#[test]
+fn a_scan_never_goes_back_in_time_across_a_source_change() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        set_replicas(ports[0], "p3", &["a", "b"]).await;
+        let first = put_in(ports[2], "r", "k0").await;
+        eventually("b's copy to apply k0", async || {
+            copy_of(ports[1], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+        // Fresh first: an idle owner's heartbeats name the frontier b has applied through.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // b's copy applies nothing from here: rows after it are a's (and c's) only.
+        crate::serve::replica::HOLD_APPLIES
+            .lock()
+            .unwrap()
+            .push(dirs[1].clone());
+        let mut last = 0;
+        for i in 0..40 {
+            last = put_in(ports[2], "r", &format!("k{i:03}")).await;
+        }
+        eventually("a's copy to apply the rows", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        crate::serve::service::BEHIND_AFTER_PAGES
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), 2));
+        let (keys, served) = scan_through(ports[2], 60_000, 256).await;
+        let want: std::collections::BTreeSet<Vec<u8>> = std::iter::once(b"k0".to_vec())
+            .chain(std::iter::once(b"k1".to_vec()))
+            .chain((0..40).map(|i| format!("k{i:03}").into_bytes()))
+            .collect();
+        assert_eq!(keys, want.into_iter().collect::<Vec<_>>());
+        assert!(
+            served.windows(2).all(|w| w[0] <= w[1] || w[1] == 0),
+            "a page older than one before it: {served:?}"
+        );
+    });
+    crate::serve::replica::HOLD_APPLIES
+        .lock()
+        .unwrap()
+        .retain(|d| *d != dirs[1]);
+    crate::serve::service::BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != dirs[0]);
 }
