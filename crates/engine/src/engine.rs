@@ -2571,6 +2571,17 @@ impl Engine {
         self.inner.decide(xid, commit)
     }
 
+    /// [`decide`](Self::decide) without waiting (D329): `None` when `xid` isn't in doubt
+    /// here; otherwise the [`PendingCommit`] resolves as `decide` returns, except that a
+    /// decide another call won meanwhile resolves with seqno 0. It never blocks, so a thread
+    /// that drives a shard may call it (D88).
+    pub fn submit_decide(&self, xid: &[u8], commit: bool) -> Result<Option<PendingCommit>> {
+        Ok(self
+            .inner
+            .submit_decide(xid, commit)?
+            .map(PendingCommit::from))
+    }
+
     /// The externally prepared transactions in doubt here (D329): each xid, with how long
     /// ago it was prepared, in nanoseconds.
     pub fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
@@ -5725,18 +5736,19 @@ impl Inner {
         self.submission(routed)
     }
 
-    /// Prepares `batch` (validated by `validate`) as transaction `xid` of an external
-    /// coordinator (D329, ICR 0140): every share is logged as an external PREPARE and holds
-    /// its rows, and the commit's decision waits for [`Engine::decide`], across a close and a
-    /// reopen. It always takes the cross-shard path, even for one shard. Off the commit
-    /// paths: nothing on them changes.
-    pub(crate) fn prepare_external(
+    /// Submits `batch` (validated by `validate`) for preparing as transaction `xid` of an
+    /// external coordinator (D329, ICR 0140), without waiting: every share is logged as an
+    /// external PREPARE and holds its rows, and the commit's decision waits for
+    /// [`Engine::decide`], across a close and a reopen. It always takes the cross-shard path,
+    /// even for one shard. Off the commit paths: nothing on them changes. Also the
+    /// reservation's token, for the blocking form's prompt release.
+    pub(crate) fn submit_prepare_external(
         &self,
         batch: WriteBatch,
         durability: Durability,
         validate: Option<Arc<Validate>>,
         xid: &[u8],
-    ) -> Result<CommitInfo> {
+    ) -> Result<(Submission, u64)> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -5772,35 +5784,23 @@ impl Inner {
             ));
         }
         // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
-        // one xid can't both log, nor concurrent ones pass a limit together.
+        // one xid can't both log, nor concurrent ones pass a limit together. The request
+        // holds the reservation from here: any error below drops it, and with it the
+        // reservation (`ExternalReq`'s drop).
         let token = self
             .shared
             .external
             .reserve(xid, builder.batch().as_bytes().len() as u64)?;
-        let prepared = self.submit_external(&view, &builder, &shards, durability, validate, xid);
-        // Unless every share was logged (the coordinator replaced the reservation with the
-        // xid's entry before it answered), this prepare's reservation goes; a later
-        // prepare's of the same xid has its own token and stays (perf2's S3).
-        self.shared.external.unreserve(xid, token);
-        prepared
-    }
-
-    /// [`prepare_external`](Self::prepare_external)'s submission, once `xid` is reserved.
-    fn submit_external(
-        &self,
-        view: &View,
-        builder: &BatchBuilder,
-        shards: &Shards,
-        durability: Durability,
-        validate: Option<Arc<Validate>>,
-        xid: &[u8],
-    ) -> Result<CommitInfo> {
+        let ext = Arc::new(crate::shard::ExternalReq {
+            xid: xid.into(),
+            reservation: Some((Arc::downgrade(&self.shared), token)),
+        });
         self.flag_external()?;
-        let parts = split_by_shard(view, builder, shards)?;
+        let parts = split_by_shard(&view, &builder, &shards)?;
         let target = shards[0];
-        let (tx, mut waiter) = crate::write::commit_completion();
+        let (tx, waiter) = crate::write::commit_completion();
         let msg = ShardMsg::Coordinate(Box::new(CoordinateReq {
-            external: Some(Arc::new(crate::shard::ExternalReq { xid: xid.into() })),
+            external: Some(ext),
             parts,
             durability,
             reply: tx,
@@ -5814,7 +5814,33 @@ impl Inner {
             wait: None,
         }));
         self.shared.submitter(target).submit(msg)?;
-        crate::write::wait_blocking(&self.shared, &mut waiter, false)
+        Ok((
+            Submission {
+                waiter,
+                shared: self.shard_ref(target),
+                spins: false,
+            },
+            token,
+        ))
+    }
+
+    /// [`submit_prepare_external`](Self::submit_prepare_external), waited for. The answer in,
+    /// this prepare's reservation goes at once, so the caller may prepare the xid again
+    /// straight after a refusal, without waiting for the coordination's last handle.
+    pub(crate) fn prepare_external(
+        &self,
+        batch: WriteBatch,
+        durability: Durability,
+        validate: Option<Arc<Validate>>,
+        xid: &[u8],
+    ) -> Result<CommitInfo> {
+        let (mut sub, token) = self.submit_prepare_external(batch, durability, validate, xid)?;
+        let prepared = crate::write::wait_blocking(&self.shared, &mut sub.waiter, false);
+        // Unless every share was logged (the coordinator replaced the reservation with the
+        // xid's entry before it answered), this prepare's reservation goes; a later
+        // prepare's of the same xid has its own token and stays (perf2's S3).
+        self.shared.external.unreserve(xid, token);
+        prepared
     }
 
     /// Decides the externally prepared transaction `xid` (D329, ICR 0140): `commit` applies
@@ -5822,6 +5848,16 @@ impl Inner {
     /// dropped (`Some` with its id). `None` when `xid` isn't in doubt here: decided already,
     /// or never prepared. Idempotent.
     pub(crate) fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<CommitInfo>> {
+        let Some(mut sub) = self.submit_decide(xid, commit)? else {
+            return Ok(None);
+        };
+        let info = crate::write::wait_blocking(&self.shared, &mut sub.waiter, false)?;
+        Ok((info.seqno != 0).then_some(info))
+    }
+
+    /// [`decide`](Self::decide) without waiting: `None` when `xid` isn't in doubt here.
+    /// The submission resolves with seqno 0 if another decide of it won meanwhile.
+    pub(crate) fn submit_decide(&self, xid: &[u8], commit: bool) -> Result<Option<Submission>> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -5833,7 +5869,7 @@ impl Inner {
             // asks again once the prepare has answered.
             crate::external_registry::Lookup::Reserved => return Err(Error::Busy),
         };
-        let (tx, mut waiter) = crate::write::commit_completion();
+        let (tx, waiter) = crate::write::commit_completion();
         self.shared
             .submitter(entry.coordinator)
             .submit(ShardMsg::ExternalDecide {
@@ -5841,8 +5877,11 @@ impl Inner {
                 commit,
                 reply: tx,
             })?;
-        let info = crate::write::wait_blocking(&self.shared, &mut waiter, false)?;
-        Ok((info.seqno != 0).then_some(info))
+        Ok(Some(Submission {
+            waiter,
+            shared: self.shard_ref(entry.coordinator),
+            spins: false,
+        }))
     }
 
     /// The externally prepared transactions in doubt here (D329): each one's xid, and how

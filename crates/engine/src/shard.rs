@@ -1553,6 +1553,23 @@ pub(crate) use crate::external_registry::ExternalEntry;
 pub(crate) struct ExternalReq {
     /// The caller's transaction id.
     pub xid: Arc<[u8]>,
+    /// The prepare's reservation of `xid` in `Shared::external` and its token, released
+    /// when the last handle on this request drops: its message, its coordinator's entry and
+    /// its shares hold one, so however the coordination ends (an answer, a refusal, a
+    /// dropped reply, a close) the reservation goes with it. A no-op once the coordinator
+    /// installed the xid's entry, or once a later prepare reserved the xid (its token
+    /// differs). `None` for a share recovery reinstalled.
+    pub reservation: Option<(std::sync::Weak<Shared>, u64)>,
+}
+
+impl Drop for ExternalReq {
+    fn drop(&mut self) {
+        if let Some((shared, token)) = &self.reservation
+            && let Some(shared) = shared.upgrade()
+        {
+            shared.external.unreserve(&self.xid, *token);
+        }
+    }
 }
 
 /// Why a participant could not prepare.
@@ -4360,7 +4377,10 @@ impl ShardState {
         self.prepared.insert(
             seqno,
             PreparedShare {
-                external: Some(Arc::new(ExternalReq { xid })),
+                external: Some(Arc::new(ExternalReq {
+                    xid,
+                    reservation: None,
+                })),
                 bytes,
                 commit_ts: self.last_stamp + 1,
                 reserved: 0,
@@ -4388,7 +4408,10 @@ impl ShardState {
         self.coord.insert(
             seqno,
             Coord {
-                external: Some(Arc::new(ExternalReq { xid })),
+                external: Some(Arc::new(ExternalReq {
+                    xid,
+                    reservation: None,
+                })),
                 awaiting: true,
                 participants: participants.len(),
                 // D329 prepares at GroupSync at least; its decision is logged so too.

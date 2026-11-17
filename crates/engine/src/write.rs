@@ -1393,6 +1393,27 @@ impl Txn {
         engine.shared.refuse_blocking_on_driver("Txn::prepare")?;
         engine.prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
     }
+
+    /// [`prepare`](Self::prepare) without waiting (D329): the [`PendingCommit`] resolves as
+    /// `prepare` returns. It never blocks, so a thread that drives a shard may call it (D88).
+    /// A refused prepare's reservation of `xid` goes once its coordination's last handle
+    /// does, shortly after the answer: a prepare of the same xid straight after may meet
+    /// `InvalidArgument` until then (the blocking form releases it with the answer).
+    pub fn submit_prepare(
+        self,
+        xid: &[u8],
+        durability: Durability,
+    ) -> crate::Result<PendingCommit> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+        } = self;
+        engine
+            .submit_prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
+            .map(|(sub, _)| PendingCommit::from(sub))
+    }
 }
 
 // ---- caller-runs (#1176) -----------------------------------------------------------------

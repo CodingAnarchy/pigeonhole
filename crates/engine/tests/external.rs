@@ -485,3 +485,59 @@ fn a_shares_read_holds_survive_a_reopen() {
     db.decide(b"rh", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
+
+/// The non-blocking forms (for the model-check harness and async callers): `submit_prepare`
+/// and `submit_decide` resolve as the blocking calls return, and a refused prepare whose
+/// `PendingCommit` is dropped unread still releases its reservation when its coordination's
+/// last handle goes (`ExternalReq`'s drop), so the xid prepares again.
+#[test]
+fn the_non_blocking_forms_resolve_and_a_dropped_refusal_releases_its_xid() {
+    let vfs = SimVfs::new(33);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    let p = txn(&db, &t, b"a", &[b"a", b"z"], b"v")
+        .submit_prepare(b"nb", Durability::GroupSync)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(p.seqno > 0);
+    let d = db
+        .submit_decide(b"nb", true)
+        .unwrap()
+        .expect("in doubt")
+        .wait()
+        .unwrap();
+    assert!(d.seqno > p.seqno);
+    assert!(db.submit_decide(b"nb", true).unwrap().is_none(), "decided");
+
+    // A prepare refused (`Conflict`: a row it read changed), its answer never read.
+    let stale = txn(&db, &t, b"r", &[b"other"], b"v");
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"changed"))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    drop(
+        stale
+            .submit_prepare(b"again", Durability::GroupSync)
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match txn(&db, &t, b"q", &[b"q"], b"v").prepare(b"again", Durability::GroupSync) {
+            Ok(_) => break,
+            Err(Error::InvalidArgument(_)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the reservation was never released"
+                );
+                std::thread::yield_now();
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    db.decide(b"again", false).unwrap().expect("in doubt");
+    db.close().unwrap();
+}
