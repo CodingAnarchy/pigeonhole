@@ -1045,7 +1045,7 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
 /// `--text-pack`'s counters (#1585): each partition's background pack.
 fn render_text_packs(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     type Read = fn(&super::texts::PackCounters) -> u64;
-    let families: [(&str, Read); 3] = [
+    let families: [(&str, Read); 4] = [
         ("pigeonhole_serve_text_pack_passes_total", |c| {
             c.passes.load(Ordering::Relaxed)
         }),
@@ -1054,6 +1054,9 @@ fn render_text_packs(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
         }),
         ("pigeonhole_serve_text_pack_refused_total", |c| {
             c.refused.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_conflicts_total", |c| {
+            c.conflicts.load(Ordering::Relaxed)
         }),
     ];
     for (name, read) in families {

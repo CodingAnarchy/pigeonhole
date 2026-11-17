@@ -66,6 +66,9 @@ pub(crate) struct PackCounters {
     pub(crate) postings: AtomicU64,
     /// Packs refused or failed: a first pack with reader processes attached, or an error.
     pub(crate) refused: AtomicU64,
+    /// Packs that stopped because a chunk kept conflicting with writers: the next pass
+    /// carries on. One that grows every pass is a pack that never gets through (ai1249).
+    pub(crate) conflicts: AtomicU64,
 }
 
 /// How long the pack thread waits between passes. A pass over indexes with nothing new
@@ -579,7 +582,9 @@ impl Texts {
             match done {
                 // A chunk that kept conflicting with writers: the cursor stays, and the next
                 // pass carries on from it (ai1249's S2 on #2009). Not a failure.
-                Err(e) if e.code() == pigeonhole::ErrorCode::Conflict => {}
+                Err(e) if e.code() == pigeonhole::ErrorCode::Conflict => {
+                    self.packs.conflicts.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(e) => fail(refused, e.to_string()),
                 Ok(s) => {
                     self.packs.postings.fetch_add(s.postings, Ordering::Relaxed);

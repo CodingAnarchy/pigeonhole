@@ -716,6 +716,10 @@ fn text_pack_packs_the_indexes_in_the_background_and_searches_agree() {
         text.contains("# TYPE pigeonhole_serve_text_pack_passes_total counter"),
         "{text}"
     );
+    assert!(
+        text.contains("pigeonhole_serve_text_pack_conflicts_total 0"),
+        "{text}"
+    );
 }
 
 #[test]

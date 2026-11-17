@@ -100,7 +100,7 @@ Version 1 is D309 §2, unchanged. Version 2 adds:
 
 - **`phdb serve --text-pack`** (a switch, off by default, per node): the node's partitions pack their text indexes in the background. Without it a server never packs; there is no pack RPC.
 - **`Index::list(db: &Pigeonhole) -> Result<Vec<String>>`** (`pigeonhole-text`): the text indexes in a database, by name. A catalog listing (the tables with an index's families), opening none as an index. `Index::pending_rebuilds` is this list filtered by its cursor read.
-- **Metrics**, present only with the flag, per partition on a cluster node: `pigeonhole_serve_text_pack_passes_total`, `pigeonhole_serve_text_pack_postings_total`, `pigeonhole_serve_text_pack_refused_total`.
+- **Metrics**, present only with the flag, per partition on a cluster node: `pigeonhole_serve_text_pack_passes_total`, `pigeonhole_serve_text_pack_postings_total`, `pigeonhole_serve_text_pack_refused_total`, `pigeonhole_serve_text_pack_conflicts_total`.
 
 ### What the server does
 
@@ -109,7 +109,7 @@ Version 1 is D309 §2, unchanged. Version 2 adds:
 - **It holds the node's rebuild slot as a resume does:** one rebuild or pack at a time on a node, and a pack stops at its next chunk for a client's `Text.Rebuild`.
 - **An index with a rebuild pending** (stopped, or a cluster index still filling) is passed over: the resume thread finishes it, and a later pass packs it.
 - **The first pack keeps `Index::pack`'s refusal:** with a reader process attached the pack is refused, logged once for the index, counted, and tried again each pass. The server never passes `with_readers(true)`: it can't know the readers' release.
-- **A pack that ends in `Conflict`** (a chunk that kept conflicting with writers down to the smallest chunk) is neither logged nor counted: the cursor stays and the next pass carries on (ai1249's S2 on #2009). `Index::pack`'s own contract doesn't change.
+- **A pack that ends in `Conflict`** (a chunk that kept conflicting with writers down to the smallest chunk) is not a failure: the cursor stays and the next pass carries on (ai1249's S2 on #2009). It is counted apart (`…_conflicts_total`), so a pack that conflicts on every pass shows. `Index::pack`'s own contract doesn't change.
 - **A shutdown** stops the pack at its next chunk and waits for the thread before the database closes. The cursor stays, and the next start carries on from it.
 
 ### Tests
