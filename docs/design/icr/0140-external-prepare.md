@@ -35,7 +35,7 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 - **`incompat` bit 2:** set in both pages before the first type 5, and never cleared. Retained feed segments keep such records past every checkpoint, as with bit 1.
 
 ## Engine
-- **Holding the decision:** `PreparedShare` gains its external fields (xid, reads), and the local coordinator's `Coord` holds its decision for `decide`. A registry, `Shared::external` (a leaf mutex: xid → id, coordinator, participants, prepared-at, WAL bytes), serves `decide`, `in_doubt` and the limits. It's a concurrency.md row, with loom models of two `decide`s, and of a `decide` racing `prepare`'s insert.
+- **Holding the decision:** `PreparedShare` gains its external fields (xid, reads), and the local coordinator's `Coord` holds its decision for `decide`. A registry, `ExternalRegistry` (`Shared::external`: xid → id, coordinator, prepared-at, batch bytes), serves `decide`, `in_doubt` and the limits. A prepare reserves its xid there, under the lock that checks for the xid and the limits, before it submits; the coordinator replaces the reservation with the entry before it answers. So two prepares of one xid never both log, and concurrent prepares never pass a limit together. A `decide` of a reserved xid answers `Busy`. It's a concurrency.md protocol row, loom-modelled: two prepares of one xid, a `decide` racing a prepare, two `decide`s racing the removal, and the limit under concurrent prepares.
 - **Recovery:**
   - Type 5 is stashed with its reads.
   - A Decision with every participant present applies. An Abort drops.
