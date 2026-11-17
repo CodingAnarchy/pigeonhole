@@ -32,7 +32,8 @@ use pigeonhole_format::sst::{Footer, Properties};
 use pigeonhole_format::superblock::{ExtentRef, Superblock};
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value, encode_value};
 use pigeonhole_format::wal::{
-    BatchBuilder, FRAME_SIZE, FrameEncoder, SegmentHeader, StreamList, WalRecord,
+    BatchBuilder, ExternalRead, ExternalShare, FRAME_SIZE, FrameEncoder, SegmentHeader, StreamList,
+    WalRecord,
 };
 use pigeonhole_format::{
     BlobFileId, FamilyId, FormatVersion, Lsn, SstId, StreamId, TableId, TabletId,
@@ -851,6 +852,39 @@ fn wal() {
     let b = batch();
     let mut participants = Vec::new();
     StreamList::encode(&[StreamId(0), StreamId(5)], &mut participants).unwrap();
+    // D329's external share: an xid, both streams, a cell read and a family read, the batch.
+    let reads = [
+        ExternalRead {
+            table: TableId(7),
+            family: FamilyId(2),
+            row: b"acct:1",
+            qualifier: Some(b"balance"),
+        },
+        ExternalRead {
+            table: TableId(7),
+            family: FamilyId(3),
+            row: b"acct:2",
+            qualifier: None,
+        },
+    ];
+    let mut prepared = Vec::new();
+    ExternalShare::encode(
+        b"p1:h3-00ff",
+        &[StreamId(0), StreamId(5)],
+        reads.iter().copied(),
+        Some(b.batch()),
+        &mut prepared,
+    )
+    .unwrap();
+    let mut aborted = Vec::new();
+    ExternalShare::encode(
+        b"p1:h3-00ff",
+        &[StreamId(0), StreamId(5)],
+        std::iter::empty(),
+        None,
+        &mut aborted,
+    )
+    .unwrap();
     let records = [
         (
             "wal_record_batch.bin",
@@ -885,15 +919,35 @@ fn wal() {
                 participants: StreamList::new(&participants).unwrap(),
             },
         ),
+        (
+            "wal_record_external_prepare.bin",
+            WalRecord::ExternalPrepare {
+                seqno: 104,
+                coordinator: StreamId(0),
+                share: ExternalShare::decode(&prepared, true).unwrap(),
+            },
+        ),
+        (
+            "wal_record_external_abort.bin",
+            WalRecord::ExternalAbort {
+                seqno: 104,
+                abort_seqno: 105,
+                share: ExternalShare::decode(&aborted, false).unwrap(),
+            },
+        ),
     ];
     let mut frames = Vec::new();
     let mut enc = FrameEncoder::new(9, FRAME_SIZE as u64 * 2 - 100);
-    for (name, rec) in &records {
+    for (i, (name, rec)) in records.iter().enumerate() {
         let mut out = Vec::new();
         rec.encode(&mut out);
         check(name, &out);
         assert_eq!(&WalRecord::decode(&out).unwrap(), rec);
-        enc.encode(&out, &mut frames);
+        // `wal_fragments.bin` is frozen at 1.0 over the first four records; D329's are
+        // checked alone.
+        if i < 4 {
+            enc.encode(&out, &mut frames);
+        }
     }
     // Starting 100 bytes before a frame end, so the first record is split First/Last.
     check("wal_fragments.bin", &frames);

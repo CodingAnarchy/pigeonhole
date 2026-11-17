@@ -31,6 +31,7 @@ mod close_gate;
 mod compact;
 mod engine;
 mod error;
+mod external_registry;
 mod feed;
 mod feed_reader;
 #[cfg(all(test, engine_loom))]

@@ -126,6 +126,12 @@ fn seqno_of(rec: &WalRecord<'_>) -> Seqno {
         WalRecord::Decision {
             seqno, apply_seqno, ..
         } => (*seqno).max(*apply_seqno),
+        // An external PREPARE's id, and an external abort's own seqno (D329, ICR 0140: E1, E2),
+        // so a reopen never hands either out again.
+        WalRecord::ExternalPrepare { seqno, .. } => *seqno,
+        WalRecord::ExternalAbort {
+            seqno, abort_seqno, ..
+        } => (*seqno).max(*abort_seqno),
         // `WalRecord::decode` returns no other type in this build (a newer one is corrupt).
         _ => 0,
     }

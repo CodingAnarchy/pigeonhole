@@ -709,6 +709,133 @@ fn block_cache(bytes: usize, _shards: usize) -> Arc<BlockCache> {
 /// The `(tablet, family)` slots one record writes on one shard.
 type Slots = Vec<(TabletId, FamilyId)>;
 
+/// An external PREPARE's fields at replay (D329): what reinstalling it needs beside its batch.
+struct ExternalStash {
+    xid: Arc<[u8]>,
+    participants: Vec<StreamId>,
+    /// The rows it read on its shard, for its read holds.
+    read: Vec<(TableId, Vec<u8>)>,
+}
+
+/// The tablets in-doubt external shares hold, each with the shard whose stream logged the
+/// share (D329, perf2's M1 on #2000). Tablet owners aren't persisted: a reopen places every
+/// tablet again, so a tablet that moved before a prepare would land on another shard than
+/// the share's holds, and its writes would pass them. Open pins these tablets to the
+/// logging shard before it places the rest. A read-only pre-pass over the WAL with
+/// recovery's own in-doubt rule, run only when tablet changes are on and the file has
+/// `incompat` bit 2. `Unsupported` if two in-doubt shares from different streams touch one
+/// tablet, which no run of this build leaves (a tablet change touching an in-doubt share
+/// is given up).
+fn external_pins(
+    vfs: &VfsRef,
+    path: &Path,
+    db_id: [u8; 16],
+    catalog: &Catalog,
+    shards: usize,
+) -> Result<HashMap<TabletId, ShardId>> {
+    // Each external PREPARE: (stream, id) -> (coordinator, participants, rows).
+    #[allow(clippy::type_complexity)]
+    let mut shares: HashMap<
+        (StreamId, Seqno),
+        (StreamId, Vec<StreamId>, Vec<(TableId, Vec<u8>)>),
+    > = HashMap::new();
+    let mut prepared: HashSet<(StreamId, Seqno)> = HashSet::new();
+    let mut decided: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
+    let mut aborted: HashSet<(StreamId, Seqno)> = HashSet::new();
+    for stream in discover_streams(vfs, path)? {
+        let checkpoint = catalog
+            .checkpoints
+            .get(&stream)
+            .copied()
+            .unwrap_or_default();
+        let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
+        while let Some((_, record)) = rec.next_record()? {
+            match record {
+                WalRecord::Prepare { seqno, .. } => {
+                    prepared.insert((stream, seqno));
+                }
+                WalRecord::ExternalPrepare {
+                    seqno,
+                    coordinator,
+                    share,
+                } => {
+                    prepared.insert((stream, seqno));
+                    let mut rows = Vec::new();
+                    if let Some(batch) = share.batch() {
+                        for m in batch.iter() {
+                            let m = m?;
+                            rows.push((m.table, m.row.to_vec()));
+                        }
+                    }
+                    for r in share.reads() {
+                        let r = r?;
+                        rows.push((r.table, r.row.to_vec()));
+                    }
+                    shares.insert(
+                        (stream, seqno),
+                        (coordinator, share.participants().iter().collect(), rows),
+                    );
+                }
+                WalRecord::Commit {
+                    seqno,
+                    participants,
+                }
+                | WalRecord::Decision {
+                    seqno,
+                    participants,
+                    ..
+                } => {
+                    decided.insert((stream, seqno), participants.iter().collect());
+                }
+                WalRecord::ExternalAbort { seqno, share, .. } => {
+                    aborted.insert((stream, seqno));
+                    // Its shares are settled: drop the rows of those read already (perf2's
+                    // nit), so the pass keeps rows of undecided shares only.
+                    for p in share.participants().iter() {
+                        shares.remove(&(p, seqno));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let map = TabletMap::build(1, &catalog.tablets());
+    let mut pins: HashMap<TabletId, ShardId> = HashMap::new();
+    for ((stream, seqno), (coordinator, participants, rows)) in &shares {
+        // Recovery's rule: in doubt when every participant's PREPARE is here and neither a
+        // complete decision nor an abort is.
+        let complete = decided
+            .get(&(*coordinator, *seqno))
+            .is_some_and(|ps| ps.iter().all(|p| prepared.contains(&(*p, *seqno))));
+        let in_doubt = !complete
+            && !aborted.contains(&(*coordinator, *seqno))
+            && participants
+                .iter()
+                .all(|p| prepared.contains(&(*p, *seqno)));
+        // A stream past the shard count is a layout change, which open refuses later.
+        if !in_doubt || stream.0 as usize >= shards {
+            continue;
+        }
+        let shard = ShardId(stream.0 as u16);
+        for (table, row) in rows {
+            let Some((tablet, _)) = map.route(*table, row) else {
+                continue;
+            };
+            match pins.insert(tablet, shard) {
+                Some(other) if other != shard => {
+                    return Err(Error::Unsupported(
+                        "in-doubt external transactions logged by two shards touch one tablet, \
+                         which this build never leaves: decide them with the build that \
+                         prepared them",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(pins)
+}
+
 /// A replayed record of one stream, kept until every stream is read and the cross-shard
 /// decisions are resolved.
 struct ReplayedRecord {
@@ -1210,9 +1337,32 @@ impl Engine {
         //    chunk size shrinks when they do not (#104). Off, tablets stay where `shard_for`
         //    puts them, and the chunks are sized the same way for the slots that gives (#283).
         let arena_len = shm.arena(0).2;
+        // In-doubt external shares hold their tablets on the shard that logged them (D329,
+        // perf2's M1 on #2000). Whether tablet changes are on is this open's choice, and an
+        // earlier open's may have moved a tablet, so the pre-pass runs whenever the file may
+        // hold external PREPAREs; a read-only open holds nothing, and skips it.
+        let pins = if !no_writes
+            && pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0
+        {
+            external_pins(&vfs, path, db_id, &catalog, shards)?
+        } else {
+            HashMap::new()
+        };
+        if !options.tablet_changes
+            && pins
+                .iter()
+                .any(|(&tablet, &shard)| crate::catalog::shard_for(tablet, shards) != shard)
+        {
+            // Off, every tablet goes to `shard_for`'s shard: one an in-doubt share holds
+            // elsewhere (moved by an earlier open) can't be placed there.
+            return Err(Error::Unsupported(
+                "an in-doubt external transaction holds a tablet a tablet change moved: open \
+                 with tablet changes on, and decide it first",
+            ));
+        }
         let chunk = if options.tablet_changes {
             let base = arena_chunk_size(arena_len, 0);
-            let placed = catalog.place(shards, max_slots(arena_len, base));
+            let placed = catalog.place(shards, max_slots(arena_len, base), &pins);
             arena_chunk_size(arena_len, placed)
         } else {
             arena_chunk_size(arena_len, catalog.max_slots_per_shard(shards))
@@ -1372,6 +1522,11 @@ impl Engine {
         let mut max_seqno = 0;
         let mut recoveries: Vec<(StreamId, Recovery)> = Vec::new();
         let mut stashed: Vec<(StreamId, Seqno, u64, StreamId, Vec<u8>)> = Vec::new();
+        // D329: each external PREPARE's xid, participant streams and logged reads, by
+        // `(stream, id)` (its batch is in `stashed`), and each external abort's
+        // `(coordinator stream, id)`.
+        let mut external: HashMap<(StreamId, Seqno), ExternalStash> = HashMap::new();
+        let mut external_aborts: HashSet<(StreamId, Seqno)> = HashSet::new();
         // `(coordinator stream, seqno) -> participant streams` of every COMMIT decision.
         // With the seqno and timestamp a DECISION applies the commit at (D263);
         // `None` for a 0.3.0 COMMIT, whose PREPAREs apply at their own.
@@ -1461,6 +1616,60 @@ impl Engine {
                             kind: ReplayedRecordKind::Commit,
                         });
                     }
+                    WalRecord::ExternalPrepare {
+                        seqno,
+                        coordinator,
+                        share,
+                    } => {
+                        let Some(batch) = share.batch() else {
+                            return Err(Error::Corruption(
+                                "an external PREPARE without its batch".into(),
+                            ));
+                        };
+                        // What recovery relies on (perf2's N1 on #2000): the xid that encode
+                        // never writes empty, and this stream and the coordinator among the
+                        // participants (else the share would be held with no `Coord` and no
+                        // registry entry, for good).
+                        let participants: Vec<StreamId> = share.participants().iter().collect();
+                        if share.xid().is_empty()
+                            || !participants.contains(&stream)
+                            || !participants.contains(&coordinator)
+                        {
+                            return Err(Error::Corruption(
+                                "an external PREPARE whose xid is empty, or whose stream or \
+                                 coordinator isn't among its participants"
+                                    .into(),
+                            ));
+                        }
+                        let mut read = Vec::new();
+                        for r in share.reads() {
+                            let r = r?;
+                            read.push((r.table, r.row.to_vec()));
+                        }
+                        stashed.push((stream, seqno, 0, coordinator, batch.as_bytes().to_vec()));
+                        external.insert(
+                            (stream, seqno),
+                            ExternalStash {
+                                xid: share.xid().into(),
+                                participants,
+                                read,
+                            },
+                        );
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Prepare { coordinator },
+                        });
+                    }
+                    WalRecord::ExternalAbort { seqno, .. } => {
+                        external_aborts.insert((stream, seqno));
+                        // An abort's record: its id is aborted (`log_replayed`, no apply).
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Commit,
+                        });
+                    }
                     // `WalRecord::decode` returns no other type in this build.
                     _ => return Err(Error::Corruption("wal record type".into())),
                 }
@@ -1509,6 +1718,25 @@ impl Engine {
             }
             applied_slots.insert((*stream, *seqno), (apply_seqno, per_shard));
         }
+        // D329: an external PREPARE with no decision and no abort, whose every participant's
+        // PREPARE is here, is in doubt: kept, held again, and decided by the caller. One
+        // with a participant's record missing (a torn tail below its durability) is dropped
+        // as aborted, as a D263 PREPARE is.
+        let in_doubt: Vec<(StreamId, Seqno, StreamId)> = stashed
+            .iter()
+            .filter(|(stream, seqno, _, coordinator, _)| {
+                external.get(&(*stream, *seqno)).is_some_and(|e| {
+                    !complete(*coordinator, *seqno)
+                        && !external_aborts.contains(&(*coordinator, *seqno))
+                        && e.participants
+                            .iter()
+                            .all(|p| prepared.contains(&(*p, *seqno)))
+                })
+            })
+            .map(|(stream, seqno, _, coordinator, _)| (*stream, *seqno, *coordinator))
+            .collect();
+        let in_doubt_ids: HashSet<(StreamId, Seqno)> =
+            in_doubt.iter().map(|(s, id, _)| (*s, *id)).collect();
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
         // The allocator starts above every recovered seqno, and shm mirrors it (D271); its
         // timestamp is seeded once replay has raised the floors (below).
@@ -1543,6 +1771,15 @@ impl Engine {
             }
             on.into_iter().collect()
         };
+        // D329: an in-doubt share's records must stay in their streams, which a changed layout
+        // or a spilled replay checkpoints past (`flush_recovered`). Refused rather than
+        // losing it: open with the shard count it was written with, and decide it.
+        if !no_writes && !same_layout && !in_doubt.is_empty() {
+            return Err(Error::Unsupported(
+                "this database has externally prepared transactions in doubt: open it with \
+                 the shard count and memory it was written with, and decide them first",
+            ));
+        }
         if no_writes {
             // A read-only open (ICR 0059) keeps what it replayed in its memtables, whatever
             // the layout (replay routes each record to the shard owning its rows), and
@@ -1550,6 +1787,30 @@ impl Engine {
             // as they are for the next writable open to replay.
             drop(replayed);
             drop(recoveries);
+            // D329: its shares in doubt are listed (`in_doubt`), for an operator to see; no
+            // share is held, and `decide` is refused (`ReadOnly`), so nothing else is.
+            let now = shared.vfs.monotonic_nanos();
+            for (stream, seqno, coordinator) in &in_doubt {
+                if stream != coordinator {
+                    continue;
+                }
+                if let (Some(e), Some((.., bytes))) = (
+                    external.get(&(*stream, *seqno)),
+                    stashed
+                        .iter()
+                        .find(|(s, id, ..)| s == stream && id == seqno),
+                ) {
+                    shared.external.install(
+                        &e.xid,
+                        crate::shard::ExternalEntry {
+                            id: *seqno,
+                            coordinator: ShardId(coordinator.0 as u16),
+                            prepared_at: now,
+                            bytes: bytes.len() as u64,
+                        },
+                    );
+                }
+            }
         } else if same_layout {
             for ((stream, records), (_, rec)) in replayed.into_iter().zip(&recoveries) {
                 let i = stream.0 as usize;
@@ -1583,6 +1844,7 @@ impl Engine {
                                 slots,
                                 applied: applied
                                     .map(|(s, _)| (*s, holders_of(coordinator, r.seqno))),
+                                in_doubt: in_doubt_ids.contains(&(stream, r.seqno)),
                             }
                         }
                         ReplayedRecordKind::Commit => ReplayedKind::Commit {
@@ -1609,6 +1871,45 @@ impl Engine {
                 note_feed_marks(&shared, i, &wal);
                 states[i].set_wal(Box::new(wal));
                 have_wal[i] = true;
+            }
+            // D329: each in-doubt share is held again on its shard, and its coordinator
+            // awaits `decide`, before any shard admits a write.
+            let now = shared.vfs.monotonic_nanos();
+            for (stream, seqno, coordinator) in &in_doubt {
+                let (Some(e), Some((.., bytes))) = (
+                    external.get(&(*stream, *seqno)),
+                    stashed
+                        .iter()
+                        .find(|(s, id, ..)| s == stream && id == seqno),
+                ) else {
+                    continue;
+                };
+                let participants: Vec<ShardId> =
+                    e.participants.iter().map(|p| ShardId(p.0 as u16)).collect();
+                let batch = BatchBuilder::from_batch(pigeonhole_format::wal::BatchRef::new(bytes)?);
+                states[stream.0 as usize].reinstall_external_share(
+                    *seqno,
+                    batch,
+                    &e.read,
+                    participants.clone(),
+                    Arc::clone(&e.xid),
+                );
+                if stream == coordinator {
+                    states[stream.0 as usize].reinstall_external_coord(
+                        *seqno,
+                        participants,
+                        Arc::clone(&e.xid),
+                    );
+                    shared.external.install(
+                        &e.xid,
+                        crate::shard::ExternalEntry {
+                            id: *seqno,
+                            coordinator: ShardId(coordinator.0 as u16),
+                            prepared_at: now,
+                            bytes: bytes.len() as u64,
+                        },
+                    );
+                }
             }
         } else {
             flush_recovered(
@@ -2277,6 +2578,32 @@ impl Engine {
     pub fn commit(&self, batch: WriteBatch, durability: Option<Durability>) -> Result<CommitInfo> {
         self.inner.shared.refuse_blocking_on_driver("commit")?;
         self.inner.commit_blocking(batch, durability)
+    }
+
+    /// Decides the externally prepared transaction `xid` (D329, ICR 0140; [`Txn::prepare`]):
+    /// `commit` applies its shares and answers the commit's seqno, an abort drops them and
+    /// answers its id; `None` when `xid` isn't in doubt here (decided already, or never
+    /// prepared). Idempotent.
+    pub fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<CommitInfo>> {
+        self.inner.shared.refuse_blocking_on_driver("decide")?;
+        self.inner.decide(xid, commit)
+    }
+
+    /// [`decide`](Self::decide) without waiting (D329): `None` when `xid` isn't in doubt
+    /// here; otherwise the [`PendingCommit`] resolves as `decide` returns, except that a
+    /// decide another call won meanwhile resolves with seqno 0. It never blocks, so a thread
+    /// that drives a shard may call it (D88).
+    pub fn submit_decide(&self, xid: &[u8], commit: bool) -> Result<Option<PendingCommit>> {
+        Ok(self
+            .inner
+            .submit_decide(xid, commit)?
+            .map(PendingCommit::from))
+    }
+
+    /// The externally prepared transactions in doubt here (D329): each xid, with how long
+    /// ago it was prepared, in nanoseconds.
+    pub fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
+        self.inner.in_doubt()
     }
 
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
@@ -5421,6 +5748,190 @@ impl Inner {
         self.submission(routed)
     }
 
+    /// Submits `batch` (validated by `validate`) for preparing as transaction `xid` of an
+    /// external coordinator (D329, ICR 0140), without waiting: every share is logged as an
+    /// external PREPARE and holds its rows, and the commit's decision waits for
+    /// [`Engine::decide`], across a close and a reopen. It always takes the cross-shard path,
+    /// even for one shard. Off the commit paths: nothing on them changes. Also the
+    /// reservation's token, for the blocking form's prompt release.
+    pub(crate) fn submit_prepare_external(
+        &self,
+        batch: WriteBatch,
+        durability: Durability,
+        validate: Option<Arc<Validate>>,
+        xid: &[u8],
+    ) -> Result<(Submission, u64)> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        if xid.is_empty() || xid.len() > pigeonhole_format::key::MAX_KEY_PART {
+            return Err(Error::InvalidArgument(
+                "an external xid is 1 byte to 64 KiB".to_owned(),
+            ));
+        }
+        // A share in doubt is logged, but a `None` decision writes no record: its abort or
+        // commit would be lost to any crash, and the share come back in doubt after the
+        // caller heard its outcome (found by the model-check harness).
+        if durability == Durability::None {
+            return Err(Error::InvalidArgument(
+                "an external prepare and its decision are logged: Buffered at least".to_owned(),
+            ));
+        }
+        let view = self.shared.view.load();
+        let (builder, mut shards) = self.route(batch, &view)?;
+        let (builder, large) = self.separate_large(builder)?;
+        if large.is_some() {
+            // A large value's blob file is kept only by its commit's success; an in-doubt
+            // share would need it kept across a reopen too (not in ICR 0140's first part).
+            return Err(Error::InvalidArgument(
+                "a prepared transaction can't hold a value over the inline limit".to_owned(),
+            ));
+        }
+        if let Some(reads) = validate.as_ref().map(|v| &v.reads) {
+            for r in reads {
+                if let Some((_, shard)) = view.tablets().route(r.table, &r.row)
+                    && !shards.contains(&shard)
+                {
+                    shards.push(shard);
+                }
+            }
+        }
+        if shards.is_empty() || builder.is_empty() {
+            return Err(Error::InvalidArgument(
+                "an external prepare needs writes (a read-only prepare is ICR 0140's later part)"
+                    .to_owned(),
+            ));
+        }
+        // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
+        // one xid can't both log, nor concurrent ones pass a limit together. The request
+        // holds the reservation from here: any error below drops it, and with it the
+        // reservation (`ExternalReq`'s drop).
+        let token = self
+            .shared
+            .external
+            .reserve(xid, builder.batch().as_bytes().len() as u64)?;
+        let ext = Arc::new(crate::shard::ExternalReq {
+            xid: xid.into(),
+            reservation: Some((Arc::downgrade(&self.shared.external), token)),
+        });
+        self.flag_external()?;
+        let parts = split_by_shard(&view, &builder, &shards)?;
+        let target = shards[0];
+        let (tx, waiter) = crate::write::commit_completion();
+        let msg = ShardMsg::Coordinate(Box::new(CoordinateReq {
+            external: Some(ext),
+            parts,
+            durability,
+            reply: tx,
+            submitted_at: self.shared.vfs.monotonic_nanos(),
+            validate,
+            map_version: view.tablets.version(),
+            epoch: 0,
+            first_seqno: 0,
+            prev_shards: Vec::new(),
+            attempts: 0,
+            wait: None,
+        }));
+        self.shared.submitter(target).submit(msg)?;
+        Ok((
+            Submission {
+                waiter,
+                shared: self.shard_ref(target),
+                spins: false,
+            },
+            token,
+        ))
+    }
+
+    /// [`submit_prepare_external`](Self::submit_prepare_external), waited for. The answer in,
+    /// this prepare's reservation goes at once, so the caller may prepare the xid again
+    /// straight after a refusal, without waiting for the coordination's last handle.
+    pub(crate) fn prepare_external(
+        &self,
+        batch: WriteBatch,
+        durability: Durability,
+        validate: Option<Arc<Validate>>,
+        xid: &[u8],
+    ) -> Result<CommitInfo> {
+        let (mut sub, token) = self.submit_prepare_external(batch, durability, validate, xid)?;
+        let prepared = crate::write::wait_blocking(&self.shared, &mut sub.waiter, false);
+        // Unless every share was logged (the coordinator replaced the reservation with the
+        // xid's entry before it answered), this prepare's reservation goes; a later
+        // prepare's of the same xid has its own token and stays (perf2's S3).
+        self.shared.external.unreserve(xid, token);
+        prepared
+    }
+
+    /// Decides the externally prepared transaction `xid` (D329, ICR 0140): `commit` applies
+    /// its shares (`Some` with the commit's seqno once applied), and otherwise they are
+    /// dropped (`Some` with its id). `None` when `xid` isn't in doubt here: decided already,
+    /// or never prepared. Idempotent.
+    pub(crate) fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<CommitInfo>> {
+        let Some(mut sub) = self.submit_decide(xid, commit)? else {
+            return Ok(None);
+        };
+        let info = crate::write::wait_blocking(&self.shared, &mut sub.waiter, false)?;
+        Ok((info.seqno != 0).then_some(info))
+    }
+
+    /// [`decide`](Self::decide) without waiting: `None` when `xid` isn't in doubt here.
+    /// The submission resolves with seqno 0 if another decide of it won meanwhile.
+    pub(crate) fn submit_decide(&self, xid: &[u8], commit: bool) -> Result<Option<Submission>> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        let entry = match self.shared.external.lookup(xid) {
+            crate::external_registry::Lookup::InDoubt(e) => e,
+            crate::external_registry::Lookup::Absent => return Ok(None),
+            // A prepare of it is still in flight: not in doubt yet, nor decided. The caller
+            // asks again once the prepare has answered.
+            crate::external_registry::Lookup::Reserved => return Err(Error::Busy),
+        };
+        let (tx, waiter) = crate::write::commit_completion();
+        self.shared
+            .submitter(entry.coordinator)
+            .submit(ShardMsg::ExternalDecide {
+                id: entry.id,
+                commit,
+                reply: tx,
+            })?;
+        Ok(Some(Submission {
+            waiter,
+            shared: self.shard_ref(entry.coordinator),
+            spins: false,
+        }))
+    }
+
+    /// The externally prepared transactions in doubt here (D329): each one's xid, and how
+    /// long ago (the engine's monotonic clock) it was prepared, in nanoseconds.
+    pub(crate) fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
+        let now = self.shared.vfs.monotonic_nanos();
+        self.shared
+            .external
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, e)| (xid, now.saturating_sub(e.prepared_at)))
+            .collect()
+    }
+
+    /// Sets `incompat` bit 2 in both superblock pages before the first external PREPARE
+    /// (D329): once per database, under the manifest writer's lock.
+    fn flag_external(&self) -> Result<()> {
+        if self.shared.external_flagged.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut writer = self
+            .shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE)?;
+        self.shared.external_flagged.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Routes `batch` and sends its request to its shard (a cross-shard commit's
     /// coordinator). With `admit` (an async commit's admission and bytes), it first charges
     /// that shard (D236), so the commit is routed once; without room it builds the request
@@ -5534,6 +6045,7 @@ impl Inner {
         let parts = split_by_shard(&view, &builder, &shards)?;
         let target = shards[0];
         let msg = ShardMsg::Coordinate(Box::new(CoordinateReq {
+            external: None,
             parts,
             durability,
             reply: tx,
@@ -7223,6 +7735,10 @@ impl Shared {
             // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
+            external_flagged: AtomicBool::new(false),
+            external: Arc::new(crate::external_registry::ExternalRegistry::new(
+                options.in_doubt_limits,
+            )),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,
