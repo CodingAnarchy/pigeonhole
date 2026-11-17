@@ -196,6 +196,9 @@ impl Writer {
         }
         let offset = self.pos;
         let header = encode_record_header(value);
+        // An append that failed part-way may have hinted past `pos`, which it never moved:
+        // this one writes those bytes again, so they count as unhinted (perf2 on #2028).
+        self.hinted = self.hinted.min(offset);
         let mut at = offset;
         for mut bytes in [&header[..], value] {
             while !bytes.is_empty() {
