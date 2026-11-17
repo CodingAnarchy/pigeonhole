@@ -200,6 +200,117 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
     if let Some(m) = &map.memory {
         validate_memory(m, &partitions, &tables)?;
     }
+    validate_indexes(map, &partitions, &tables)?;
+    Ok(())
+}
+
+/// Checks the indexes' placements (#1722, ICR 0138): each a unique name that no table or
+/// memory store table takes, its create request, and either a placed table it follows or
+/// its own split keys and partitions (a vector index only: a text index always follows its
+/// source table, whose rows `Text.Put` writes beside the postings).
+fn validate_indexes(
+    map: &ClusterMap,
+    partitions: &HashMap<&str, &crate::serve::proto::Partition>,
+    tables: &HashSet<&str>,
+) -> Result<(), Refusal> {
+    use crate::serve::proto::index_placement::Kind;
+    let store_tables = map
+        .memory
+        .as_ref()
+        .map(|m| pigeonhole_memory::Store::table_names(&m.store))
+        .unwrap_or_default();
+    let mut names = HashSet::new();
+    for i in &map.indexes {
+        let name = i.name.as_str();
+        if name.is_empty() {
+            return Err("an index placement has no name".into());
+        }
+        if name.starts_with(RESERVED_PREFIX) {
+            return Err(format!(
+                "index {name:?}: the {RESERVED_PREFIX} prefix is reserved"
+            ));
+        }
+        if tables.contains(name) || store_tables.iter().any(|t| t == name) {
+            return Err(format!(
+                "index {name:?} has the name of a table the map places: an index is a table \
+                 of its own"
+            ));
+        }
+        if !names.insert(name) {
+            return Err(format!("index {name:?} is placed twice"));
+        }
+        match &i.kind {
+            None => return Err(format!("index {name:?} has no create request")),
+            Some(Kind::Vector(r)) if r.name != name => {
+                return Err(format!(
+                    "index {name:?}'s create request names index {:?}",
+                    r.name
+                ));
+            }
+            Some(Kind::Text(r)) if r.name != name => {
+                return Err(format!(
+                    "index {name:?}'s create request names index {:?}",
+                    r.name
+                ));
+            }
+            Some(Kind::Text(r)) if i.follows != r.source_table => {
+                return Err(format!(
+                    "text index {name:?} must follow its source table {:?}: a document's \
+                     postings are written beside its source row",
+                    r.source_table
+                ));
+            }
+            Some(_) => {}
+        }
+        if !i.follows.is_empty() {
+            if !i.splits.is_empty() || !i.partitions.is_empty() {
+                return Err(format!(
+                    "index {name:?} follows table {:?}, so it takes that table's ranges and \
+                     names no split keys or partitions of its own",
+                    i.follows
+                ));
+            }
+            if !tables.contains(i.follows.as_str()) {
+                return Err(format!(
+                    "index {name:?} follows table {:?}, which the map doesn't place",
+                    i.follows
+                ));
+            }
+            continue;
+        }
+        let mut last: Option<Vec<u8>> = None;
+        for k in &i.splits {
+            let k = split_key_bytes(k).map_err(|e| format!("index {name:?}: {e}"))?;
+            if k.is_empty() {
+                return Err(format!(
+                    "index {name:?}: a split key is empty (the first range starts there already)"
+                ));
+            }
+            if last.as_ref().is_some_and(|l| *l >= k) {
+                return Err(format!(
+                    "index {name:?}: split keys must be distinct and in increasing order"
+                ));
+            }
+            last = Some(k);
+        }
+        if i.partitions.len() != i.splits.len() + 1 {
+            return Err(format!(
+                "index {name:?}: {} split key(s) make {} ranges, but {} partition(s) are given",
+                i.splits.len(),
+                i.splits.len() + 1,
+                i.partitions.len()
+            ));
+        }
+        if let Some(p) = i
+            .partitions
+            .iter()
+            .find(|p| !partitions.contains_key(p.as_str()))
+        {
+            return Err(format!(
+                "index {name:?} is placed on partition {p:?}, which the map doesn't list"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -370,12 +481,40 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         }
         used.extend(m.partitions.iter().map(String::as_str));
     }
+    // An index's placement is fixed once written, as a table's is (#1722): its partitions
+    // hold whole indexes of their ranges. Dropping it (`DropTable` of its name) is a schema
+    // change.
+    let new_indexes: HashMap<&str, _> = new.indexes.iter().map(|i| (i.name.as_str(), i)).collect();
+    for i in &old.indexes {
+        let Some(n) = new_indexes.get(i.name.as_str()) else {
+            continue;
+        };
+        let keys = |p: &crate::serve::proto::IndexPlacement| -> Vec<Vec<u8>> {
+            p.splits
+                .iter()
+                .map(|k| split_key_bytes(k).unwrap_or_default())
+                .collect()
+        };
+        if i.kind != n.kind
+            || i.follows != n.follows
+            || keys(i) != keys(n)
+            || i.partitions != n.partitions
+            || i.created != n.created
+        {
+            return Err(format!(
+                "index {:?}'s placement or options changed: an index is fixed once written \
+                 (drop it, then create it again)",
+                i.name
+            ));
+        }
+        used.extend(i.partitions.iter().map(String::as_str));
+    }
     let new_partitions: HashMap<&str, _> =
         new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
     for p in &old.partitions {
         if !new_partitions.contains_key(p.id.as_str()) && used.contains(p.id.as_str()) {
             return Err(format!(
-                "partition {:?} holds a table or memory placement and can't be dropped",
+                "partition {:?} holds a table, index or memory placement and can't be dropped",
                 p.id
             ));
         }
@@ -489,11 +628,13 @@ pub(crate) fn with_history(
 pub(crate) fn canonical(map: &ClusterMap) -> ClusterMap {
     let mut m = map.clone();
     let memory = m.memory.iter_mut().flat_map(|p| p.splits.iter_mut());
+    let indexes = m.indexes.iter_mut().flat_map(|i| i.splits.iter_mut());
     for k in m
         .tables
         .iter_mut()
         .flat_map(|t| t.splits.iter_mut())
         .chain(memory)
+        .chain(indexes)
     {
         if let Ok(b) = split_key_bytes(k) {
             k.key = Some(match String::from_utf8(b) {
@@ -574,6 +715,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 1,
             previous_nodes: Vec::new(),
+            indexes: Vec::new(),
             memory: None,
             nodes: vec![node("a", 7001), node("b", 7002)],
             partitions: vec![part("p1", "a"), part("p2", "b"), part("p3", "b")],
@@ -736,6 +878,151 @@ mod tests {
         }
     }
 
+    /// Indexes (#1722): a vector and a text index following `users`, and a vector index of
+    /// its own ids, split at "k" over p1 and p3.
+    fn with_indexes() -> ClusterMap {
+        use crate::serve::proto::{
+            CreateTextIndexRequest, CreateVectorIndexRequest, IndexPlacement, index_placement,
+        };
+        let mut m = map();
+        let vector = |name: &str| {
+            Some(index_placement::Kind::Vector(CreateVectorIndexRequest {
+                name: name.into(),
+                ..Default::default()
+            }))
+        };
+        m.indexes = vec![
+            IndexPlacement {
+                name: "users_vec".into(),
+                kind: vector("users_vec"),
+                follows: "users".into(),
+                ..Default::default()
+            },
+            IndexPlacement {
+                name: "users_text".into(),
+                kind: Some(index_placement::Kind::Text(CreateTextIndexRequest {
+                    name: "users_text".into(),
+                    source_table: "users".into(),
+                    ..Default::default()
+                })),
+                follows: "users".into(),
+                ..Default::default()
+            },
+            IndexPlacement {
+                name: "own_vec".into(),
+                kind: vector("own_vec"),
+                splits: vec![text("k")],
+                partitions: vec!["p1".into(), "p3".into()],
+                ..Default::default()
+            },
+        ];
+        m
+    }
+
+    #[test]
+    fn an_index_follows_a_placed_table_or_has_its_own_ranges() {
+        use crate::serve::proto::index_placement::Kind;
+        validate(&with_indexes(), true).unwrap();
+        let set = |i: usize, f: &dyn Fn(&mut crate::serve::proto::IndexPlacement)| {
+            let mut m = with_indexes();
+            f(&mut m.indexes[i]);
+            m
+        };
+        for (m, says) in [
+            (set(0, &|i| i.name = String::new()), "no name"),
+            (
+                set(0, &|i| i.name = "users".into()),
+                "has the name of a table",
+            ),
+            (set(0, &|i| i.name = "__phdb_x".into()), "reserved"),
+            (set(1, &|i| i.name = "other".into()), "names index"),
+            (set(0, &|i| i.kind = None), "no create request"),
+            (set(0, &|i| i.follows = "nope".into()), "doesn't place"),
+            (
+                set(0, &|i| i.partitions = vec!["p1".into()]),
+                "names no split keys or partitions",
+            ),
+            (
+                set(1, &|i| i.follows = String::new()),
+                "must follow its source",
+            ),
+            (
+                set(2, &|i| i.partitions = vec!["p1".into()]),
+                "partition(s) are given",
+            ),
+            (
+                set(2, &|i| i.partitions = vec!["p1".into(), "p9".into()]),
+                "doesn't list",
+            ),
+            (set(2, &|i| i.splits = vec![text("")]), "empty"),
+        ] {
+            refused(validate(&m, true), says);
+        }
+        // Two placements of one name.
+        let mut m = with_indexes();
+        let again = m.indexes[0].clone();
+        m.indexes.push(again);
+        refused(validate(&m, true), "placed twice");
+        // A memory store's tables are taken too.
+        let mut m = with_indexes();
+        m.memory = Some(crate::serve::proto::MemoryPlacement {
+            store: "notes".into(),
+            splits: Vec::new(),
+            partitions: vec!["p1".into()],
+        });
+        m.indexes[0].name = "mem_notes".into();
+        if let Some(Kind::Vector(r)) = &mut m.indexes[0].kind {
+            r.name = "mem_notes".into();
+        }
+        refused(validate(&m, true), "has the name of a table");
+    }
+
+    #[test]
+    fn an_index_is_fixed_once_written_and_its_table_stays_while_it_follows() {
+        let old = with_indexes();
+        let next = |f: &dyn Fn(&mut ClusterMap)| {
+            let mut m = with_indexes();
+            m.map_version = 2;
+            f(&mut m);
+            m
+        };
+        validate_change(&old, &next(&|_| {})).unwrap();
+        // A key in its other form is the same key.
+        validate_change(&old, &next(&|m| m.indexes[2].splits = vec![raw(b"k")])).unwrap();
+        // Dropping an index is a schema change.
+        validate_change(&old, &next(&|m| m.indexes.remove(2).name.clear())).unwrap();
+        for (why, change) in [
+            (
+                "re-split",
+                &(|m: &mut ClusterMap| m.indexes[2].splits = vec![text("j")])
+                    as &dyn Fn(&mut ClusterMap),
+            ),
+            ("moved", &|m: &mut ClusterMap| {
+                m.indexes[2].partitions = vec!["p2".into(), "p3".into()];
+            }),
+            ("recreated", &|m: &mut ClusterMap| m.indexes[0].created = 9),
+            ("other options", &|m: &mut ClusterMap| {
+                m.indexes[0].kind = m.indexes[2].kind.clone();
+            }),
+        ] {
+            let e = validate_change(&old, &next(change)).expect_err(why);
+            assert!(e.contains("fixed once written"), "{why}: {e}");
+        }
+        // A table an index follows can't go while the index does (#1916's rule).
+        refused(
+            validate(&next(&|m| m.tables.retain(|t| t.name != "users")), true),
+            "doesn't place",
+        );
+        // An index of its own ranges keeps its partitions in the map.
+        let mut m = next(&|_| {});
+        m.tables.retain(|t| t.group != "o");
+        m.partitions.retain(|p| p.id != "p3");
+        refused(
+            validate_change(&old, &m),
+            "holds a table, index or memory placement",
+        );
+    }
+
     #[test]
     fn a_memory_placement_is_fixed_once_written_and_holds_its_partitions() {
         let old = with_memory();
@@ -776,7 +1063,7 @@ mod tests {
         m.partitions.retain(|p| p.id != "p1");
         refused(
             validate_change(&old, &m),
-            "holds a table or memory placement",
+            "holds a table, index or memory placement",
         );
         // A first placement is a change like any other.
         validate_change(&map(), &next(&|_| {})).unwrap();

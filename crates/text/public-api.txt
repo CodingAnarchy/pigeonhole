@@ -60,6 +60,7 @@ pub pigeonhole_text::Hit::text: core::option::Option<alloc::string::String>
 pub struct pigeonhole_text::Index
 impl pigeonhole_text::Index
 pub fn pigeonhole_text::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::create_unfilled(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::create_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::delete(&self, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &[u8]) -> pigeonhole_text::Result<bool>
