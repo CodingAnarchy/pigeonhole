@@ -494,6 +494,10 @@ message ForwardRequest {
     CreateTextIndexRequest create_text_index = 27;
     TextPutRequest text_put = 28;
     TextDeleteRequest text_delete = 29;
+    // One partition's part of a rebuild across an index's partitions (#1722 PR 2c): the
+    // client's request as it is, on the partition `partition` names. A write, served as
+    // the partition's own `Text.Rebuild`.
+    TextIndexRequest text_rebuild = 30;
     // As `vector_verify`.
     TextIndexRequest text_verify = 31;
     // The two rounds of a text search across an index's partitions (#1722 PR 2b): each
@@ -643,6 +647,8 @@ message ForwardResponse {
     // One partition's part of an index search or check (#1722 PR 1b).
     VectorSearchResponse vector_search = 13;
     VectorVerifyResponse vector_verify = 14;
+    // A rebuild's part (#1722 PR 2c).
+    TextRebuildResponse text_rebuild = 15;
     TextVerifyResponse text_verify = 16;
     // A text search's two rounds (#1722 PR 2b).
     TextStatsResponse text_stats = 17;

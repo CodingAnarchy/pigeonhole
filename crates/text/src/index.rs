@@ -459,9 +459,12 @@ impl Index {
                 NORMALIZER_UNICODE,
                 format!("{major}.{minor}.{update}").as_bytes(),
             );
-        // Unfilled: a rebuild from the top is pending (the empty cursor), with the config.
+        // Unfilled: a rebuild from the top is pending (the empty cursor), with the config,
+        // and marked as the fill (#1722 PR 2c).
         if !fill {
-            config = config.put(META, REBUILD_AFTER, b"");
+            config = config
+                .put(META, REBUILD_AFTER, b"")
+                .put(META, UNFILLED, b"");
         }
         config.commit()?;
         let index = Index {
@@ -878,6 +881,16 @@ impl Index {
     /// Whether a stopped rebuild is pending (a cursor is kept): one point read.
     pub fn rebuild_pending(&self) -> Result<bool> {
         Ok(self.rebuild_cursor()?.is_some())
+    }
+
+    /// Whether the index was created unfilled ([`create_unfilled`](Self::create_unfilled))
+    /// and no walk of its whole source has finished since (#1722 PR 2c): one point read.
+    /// Until then it lacks source rows written before its create, so a search's answer is
+    /// short. [`rebuild_pending`](Self::rebuild_pending) is true then too, but also while
+    /// a client's [`rebuild`](Self::rebuild) runs or is stopped part way, when every
+    /// document is indexed, some perhaps with postings the rebuild hasn't reconciled yet.
+    pub fn fill_pending(&self) -> Result<bool> {
+        Ok(self.inner.table.get(GLOBAL, META, UNFILLED)?.is_some())
     }
 
     fn rebuild_cursor(&self) -> Result<Option<Vec<u8>>> {
@@ -1342,14 +1355,21 @@ impl Index {
         }
     }
 
-    /// A walk that reached the source's end: a rebuild's cursor goes.
+    /// A walk that reached the source's end: a rebuild's cursor goes, and so does an
+    /// unfilled index's mark (#1722 PR 2c), a repair's too: every source row has been
+    /// visited.
     fn rebuilt(&self, repairing: bool, stats: RebuildStats) -> Result<RebuildStats> {
-        if !repairing && self.rebuild_pending()? {
-            self.w()
-                .table
-                .mutate(GLOBAL)
-                .delete_column(META, REBUILD_AFTER)
-                .commit()?;
+        let cursor = !repairing && self.rebuild_pending()?;
+        let unfilled = self.fill_pending()?;
+        if cursor || unfilled {
+            let mut m = self.w().table.mutate(GLOBAL);
+            if cursor {
+                m = m.delete_column(META, REBUILD_AFTER);
+            }
+            if unfilled {
+                m = m.delete_column(META, UNFILLED);
+            }
+            m.commit()?;
         }
         Ok(stats)
     }

@@ -155,9 +155,12 @@ impl Reach {
                         caller: Some(forward::forwarded_caller(caller)?),
                         op: Some(op.clone()),
                     };
+                    // A rebuild's part is a write (#1722 PR 2c): past the deadline, its
+                    // outcome is unknown, not its node unavailable.
+                    let writes = matches!(op, forward_request::Op::TextRebuild(_));
                     let sent = self
                         .forwarder
-                        .send(&address, req, self.within()?, false)
+                        .send(&address, req, self.within()?, writes)
                         .await;
                     match sent {
                         Err(e) if e.code == "WrongPartition" && !pulled => {
