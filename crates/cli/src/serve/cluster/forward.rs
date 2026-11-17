@@ -463,6 +463,7 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::TextCreateIndex(r) => Op::CreateTextIndex(r),
         ServiceOp::TextPut(r) => Op::TextPut(r),
         ServiceOp::TextDelete(r) => Op::TextDelete(r),
+        ServiceOp::TextRebuild(r) => Op::TextRebuild(r),
         ServiceOp::TextVerify(r) => Op::TextVerify(r),
         ServiceOp::TextStats(r) => Op::TextStats(r),
         ServiceOp::TextSearchPart(r) => Op::TextSearch(r),
@@ -484,7 +485,7 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
 }
 
 /// Whether a fanned-out part of `op` names its partition in `ForwardRequest.partition`
-/// (#1722): an index search or check, whose request names only the index.
+/// (#1722): an index search, check or rebuild, whose request names only the index.
 pub(crate) fn names_partition(op: &forward_request::Op) -> bool {
     use forward_request::Op;
     matches!(
@@ -492,6 +493,7 @@ pub(crate) fn names_partition(op: &forward_request::Op) -> bool {
         Op::VectorSearch(_)
             | Op::VectorVerify(_)
             | Op::TextVerify(_)
+            | Op::TextRebuild(_)
             | Op::TextStats(_)
             | Op::TextSearch(_)
     )
@@ -528,6 +530,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::CreateTextIndex(r) => ServiceOp::TextCreateIndex(r),
             Op::TextPut(r) => ServiceOp::TextPut(r),
             Op::TextDelete(r) => ServiceOp::TextDelete(r),
+            Op::TextRebuild(r) => ServiceOp::TextRebuild(r),
             Op::TextVerify(r) => ServiceOp::TextVerify(r),
             Op::TextStats(r) => ServiceOp::TextStats(r),
             Op::TextSearch(r) => ServiceOp::TextSearchPart(r),
@@ -566,6 +569,7 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Nearest(r) => Reply::Nearest(r),
         ServiceReply::VectorSearch(r) => Reply::VectorSearch(r),
         ServiceReply::VectorVerify(r) => Reply::VectorVerify(r),
+        ServiceReply::TextRebuild(r) => Reply::TextRebuild(r),
         ServiceReply::TextVerify(r) => Reply::TextVerify(r),
         ServiceReply::TextStats(r) => Reply::TextStats(r),
         ServiceReply::TextSearch(r) => Reply::TextSearch(r),
@@ -612,6 +616,7 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Nearest(r) => ServiceReply::Nearest(r),
             Reply::VectorSearch(r) => ServiceReply::VectorSearch(r),
             Reply::VectorVerify(r) => ServiceReply::VectorVerify(r),
+            Reply::TextRebuild(r) => ServiceReply::TextRebuild(r),
             Reply::TextVerify(r) => ServiceReply::TextVerify(r),
             Reply::TextStats(r) => ServiceReply::TextStats(r),
             Reply::TextSearch(r) => ServiceReply::TextSearch(r),

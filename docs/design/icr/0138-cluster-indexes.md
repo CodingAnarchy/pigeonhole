@@ -189,7 +189,7 @@ Every write touches shared rows. So each partition an index is placed on holds a
 
 **Unreachable and filling partitions (T3: strict by default):**
 - **Strict:** a part that fails fails the search, its message naming the partition. Round 1 needs every partition, so a search fails even when `id_prefix` lies in partitions that answered.
-- **A partition whose index is still filling** (PR 1a's background fill: `rebuild_pending`) answers either round with `Unavailable` ("still filling"), since its statistics and hits would be short. On a cluster no client rebuild runs yet, so a pending rebuild is the fill. A client's `Text.Rebuild` sets `rebuild_pending` too, while its index stays whole, so with this check a strict search would fail during a healthy rebuild. PR 2c, which serves `Text.Rebuild` on a cluster, tells the two apart (the coordinator's call on audit120's nit), and can't land without it.
+- **A partition whose index is still filling** (PR 1a's background fill: `rebuild_pending`) answers either round with `Unavailable` ("still filling"), since its statistics and hits would be short. On a cluster no client rebuild runs yet, so a pending rebuild is the fill. A client's `Text.Rebuild` sets `rebuild_pending` too, while its index stays whole, so with this check a strict search would fail during a healthy rebuild. PR 2c, which serves `Text.Rebuild` on a cluster, tells the two apart (the coordinator's call on audit120's nit): the check reads `fill_pending` there.
 - **With `allow_partial`:** a part that fails with `PartitionUnavailable` or `Unavailable` is skipped, and `partial` is set: the answer is short in its statistics, its hits or both (audit120's should on #2029: a client checking `partial` alone never takes a short answer as whole).
   - Missing from round 1, the search scores with the merge of the parts that answered. That partition isn't asked for round 2, and its ranges that `id_prefix` meets go in `missing`.
   - Missing from round 2, its ranges that `id_prefix` meets go in `missing`.
@@ -217,3 +217,38 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - round 1 sent only to the partitions `id_prefix` meets;
   - the merge breaking ties by id descending;
   - a partition missing round 1 not setting `partial`.
+
+## PR 2c: `Text.Rebuild` across an index's partitions
+
+**proto (additive, numbers from `.coord/numbers.md`):** `ForwardRequest.op` arm `TextIndexRequest text_rebuild = 30`, and `ForwardResponse.reply` arm `TextRebuildResponse text_rebuild = 15`. The part names its partition (`ForwardRequest.partition`).
+
+**The fill, told from a client's rebuild (`pigeonhole-text`):**
+- **Why:** a cluster's background fill (PR 1a) and a client's `Text.Rebuild` both keep a rebuild cursor (`rebuild_pending`). During the fill the index lacks source rows; during a client's rebuild every document is indexed, some with postings it hasn't reconciled yet, as on a single node, where searches go on throughout.
+- **The mark:** `create_unfilled` writes an `unfilled` column in the index's `META` row, beside the cursor. A walk that reaches the source's end clears it: the fill's resume, a client's rebuild (which starts over, so one that began during the fill fills it), or a repair. A client's rebuild never sets it, and a stopped one leaves it as it was.
+- **The API:** `Index::fill_pending()`, one point read, additive. The serve's search rounds answer `Unavailable` ("still filling") on `fill_pending`, not `rebuild_pending`.
+- **Indexes from before the mark:** an index created unfilled by a pre-2c build of `main` has no mark, so its partition answers searches while its fill finishes. Only unreleased builds made such indexes (cluster indexes are new in 1.3.0).
+
+**The rebuild, at the node called (`indexfan.rs`):**
+- **Every partition of the index** gets the client's request as a part, served as that partition's own `Text.Rebuild`: admitted, gated and fenced as a write (`fanout_part` hands it to `call`). The counts are summed.
+- **One node's partitions in turn:** a node has one rebuild slot, and a second client's rebuild is `Overloaded` at once. So the entry node groups the partitions by the node the map names, runs each node's in the map's order, and the nodes at once (within `--fanout-forwards`).
+- **Strict:** a part that fails fails the call, naming its partition. The others' work stands; parts not started don't run, and a part already running on another node goes on (a write finishes if its caller goes away). There's no `allow_partial`: a rebuild is a write, and rebuilding again is safe.
+- **A part past the deadline:** the forward is a write (`writes` in `Forwarder::send`), so a part on another node that outlasts the request's deadline answers `OutcomeUnknown`, not `PartitionUnavailable`. Its rebuild goes on there. A part served on the node called has the same deadline (a timeout around the part, simp724's S1 on #2041): its rebuild runs on a thread of its own, so it goes on too. The error names the node's partitions that hadn't started (simp724's N1). A single node has no such deadline for a write once it starts; a cluster's forwarded writes all have one (B3), and rebuild parts keep it (the coordinator's call, 2026-11-17: an unbounded forward would hold a client and a connection for minutes). The guide says how to tell when it's done: a retry's part answers `Overloaded` while the node still rebuilds, and `Text.Verify`'s `source_mismatch` reaches 0. A retry is safe.
+- **A map change mid-call:** a partition moved to a node already rebuilding answers `Overloaded`, naming it.
+
+**Also in this PR:**
+- **FORMAT.md 14.1** lists the `unfilled` cell, and ICR 0105's `create_unfilled` amendment the mark (audit120's S1 on #2041).
+- **`from_bytes`'s repeated-expansion check** goes through a set of the terms seen, so it's linear in the bytes (audit120's nit on #2029).
+- **The PR 2b test's fill waits** take 30 s, for a loaded runner (audit120's caution on #2029).
+
+**Tests:**
+- **Through three nodes** (`a_text_rebuild_runs_on_every_partition_of_its_index`): a serves p1 and p3, b serves p2. Source rows are written around two indexes, `ut` (over p1 and p2) and `tt` (over p1 and p3, both a's).
+  - A rebuild of `ut` through c answers 40 documents and 40 changed, each partition then holds its 20, and a strict search finds all 40.
+  - A rebuild of `tt` through b runs a's two partitions in turn (40 and 40), and again answers 0 changed.
+  - With b stopped, a rebuild of `ut` answers `PartitionUnavailable`, naming p2.
+- **PR 1a's test:** a rebuild through b answers the summed counts, where it answered `Unsupported`.
+- **The library** (`rebuild_stop.rs`): an unfilled index is pending a fill until its resume finishes, and when opened again; a filled index's stopped rebuild leaves a rebuild pending and no fill; a client's rebuild and a repair each fill an unfilled index.
+- **Unit:** a filled index's partition answers a search's round while a client's rebuild is stopped part way.
+- **Mutations, all caught:**
+  - the check reading `rebuild_pending` again (the unit test);
+  - every partition rebuilt at once, not grouped by node (the cluster test: `Overloaded` "already rebuilding");
+  - a finished walk leaving the mark (the library tests).
