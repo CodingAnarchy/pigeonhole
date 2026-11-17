@@ -1583,7 +1583,7 @@ impl Service {
             // Only under the mask, as many places as network workers (simp724's C1 on #1880,
             // S1 on #1972).
             lite: Arc::new(match &placement {
-                Some(p) if p.masked() => super::lite::Lite::new(p.io_threads, Some(Arc::clone(p))),
+                Some(p) if p.masked() => super::lite::Lite::new((p.io_threads / 2).max(1), Some(Arc::clone(p))),
                 _ => super::lite::Lite::off(),
             }),
             mcp_places: Arc::new(Semaphore::new(limits.mcp_blocking.max(1))),
