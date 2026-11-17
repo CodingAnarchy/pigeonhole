@@ -4388,6 +4388,28 @@ impl ShardState {
     ) {
         let reads: Vec<u64> = read.iter().map(|(t, row)| hash_row(*t, row)).collect();
         let bytes = Arc::new(batch);
+        // Its replayed PREPARE was logged with no slots (replay applied nothing of it): the
+        // slots it writes here, as an appended PREPARE logs them, so once it is decided its
+        // record stays needed until they're flushed at the decision's seqno. Without them a
+        // checkpoint could pass the record with its writes still in memtables, and a crash
+        // then lose an acknowledged commit (found by the model-check harness). Before any
+        // checkpoint pass has indexed the log.
+        let slots = self.slots_of(bytes.batch());
+        let (base, upto) = (self.log_base, self.indexed_upto);
+        if let Some((k, l)) = self
+            .log
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find(|(_, l)| l.seqno == seqno && matches!(l.kind, LoggedKind::Prepare { .. }))
+        {
+            debug_assert!(base + k as u64 >= upto, "a share reinstalled after a pass");
+            if let LoggedKind::Prepare { slots: s } = &mut l.kind
+                && s.is_empty()
+            {
+                *s = slots;
+            }
+        }
         self.track_share_rows(bytes.batch(), true);
         self.track_share_reads(&reads, true);
         self.prepared.insert(

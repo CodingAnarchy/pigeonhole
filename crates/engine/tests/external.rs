@@ -635,3 +635,71 @@ fn a_plain_cross_shard_commit_over_a_held_row_is_busy_not_conflict() {
     db.decide(b"pl", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
+
+/// A share reinstalled at a reopen and then decided commit keeps its PREPARE needed until
+/// its writes are flushed (found by the model-check harness): its replayed record had no
+/// slots, so another slot's flush let the checkpoint pass it with the writes still in a
+/// memtable, and a crash then lost the acknowledged commit.
+#[test]
+fn a_reinstalled_shares_commit_survives_a_crash_after_another_slots_flush() {
+    let vfs = SimVfs::new(38);
+    let opts = || {
+        let mut o = owned(Arc::clone(&vfs), 1);
+        o.memtable_freeze_bytes = 0; // the floor: two arena chunks
+        o
+    };
+    {
+        let db = Engine::open(Path::new(DB), opts()).unwrap();
+        let a = db
+            .create_table("a", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        db.create_table("b", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &a, b"x", &[b"x"], b"decided")
+            .prepare(b"rs", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+    }
+    {
+        let db = Engine::open(Path::new(DB), opts()).unwrap();
+        let b = db.table("b").expect("table b");
+        db.decide(b"rs", true).unwrap().expect("in doubt");
+        // Enough in b alone to freeze and flush its slot, which moves the checkpoint.
+        let bf = b.family("f").unwrap().id;
+        let flushes = db.metrics().flushes;
+        let value = vec![7u8; 4 << 10];
+        for i in 0..512u32 {
+            let mut wb = WriteBatch::new();
+            wb.put(
+                b.id,
+                bf,
+                format!("r{i:05}").as_bytes(),
+                b"q",
+                None,
+                ValueRef::Bytes(&value),
+            )
+            .unwrap();
+            db.commit(wb, Some(Durability::GroupSync)).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while db.metrics().flushes == flushes {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "b's slot never flushed"
+            );
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // A process crash: what was written stays, nothing more runs (no close, no flush).
+        vfs.crash(pigeonhole_io::sim::CrashKind::Process);
+        drop(db);
+    }
+    let db = Engine::open(Path::new(DB), opts()).unwrap();
+    let a = db.table("a").expect("table a");
+    assert_eq!(
+        get_bytes(&db, &a, b"x").as_deref(),
+        Some(&b"decided"[..]),
+        "the decided commit survived the crash"
+    );
+    db.close().unwrap();
+}
