@@ -5049,3 +5049,38 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - *A separate coordinator log:* it needs its own storage, fencing and moves, all of which the home partition already has.
 - *Non-blocking commit (3PC, Paxos Commit):* a partition with one owner blocks its own writes when down anyway. Revisit with replica failover (#1484).
 - *A cluster clock for one snapshot:* a large change to timestamps and visibility; later global-snapshot work.
+
+<a id="d334"></a>
+## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
+
+**Decided:**
+- **The SST writer** calls `File::start_writeback` (ICR 0145) for each 1 MiB chunk right after writing it. On Linux that's `sync_file_range(SYNC_FILE_RANGE_WRITE)`; macOS, Windows, the simulator and direct-I/O handles do nothing.
+- **Durability is unchanged:** the pager's root commit still syncs the data file before its superblock. The sync now finds the output mostly written back.
+- **No option.** There's a follow-up for the blob writer's per-value writes.
+
+**Why (#1991, g130–g143 on the AX102):**
+- **The stall:** in g69's sustained GroupSync session at 55K puts/s, put p99.9 climbed through the session to 30–50 ms. The cause was a WAL group sync's small write waiting about 12 ms inside the NVMe drive, behind a burst of the data file's 128 KiB writes. SST output was written buffered and sent to the device all at once by the root commit's `sync_data` of the whole data file.
+- **Ruled out:**
+  - locks (g132);
+  - io-wq queueing (g138);
+  - overlapping syncs (g141);
+  - request tags (g142);
+  - wbt (g140);
+  - the flusher (g140);
+  - compaction thread count (g137);
+  - the XFS journal (g137).
+- **g143, the depth-1 build against this change, one session each:**
+
+  | | d1 | this change |
+  |---|---|---|
+  | row 10–16 put p99 | 6.5–17.3 ms | 0.25–0.26 ms |
+  | p99.9 | 29.5–47.3 ms | 0.41–0.91 ms |
+  | WAL fsyncs ≥ 5 ms | 683 | 19 |
+  | data-file device writes ≥ 5 ms | 35,001 | 0 |
+  | flushes / compactions | 301 / 75 | 303 / 75 |
+  | write MB/s | 151 | 147 |
+  | compaction CPU | 0.10 cores | 0.08 cores |
+  | write stalls | 0 | 0 |
+
+- **Before merge:** a box A/B at main's defaults (group sync depth 2) and across the gate's write rows.
+

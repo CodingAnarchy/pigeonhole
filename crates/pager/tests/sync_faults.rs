@@ -50,6 +50,11 @@ fn take_one(n: &AtomicU32) -> bool {
 #[derive(Debug, Default)]
 struct Faults {
     fail_sync_all: AtomicU32,
+    /// `sync_data` / `submit_sync_data` calls to fail (D334's test: a writeback hint must
+    /// never hide a sync failure from the root commit).
+    fail_sync_data: AtomicU32,
+    /// `start_writeback` calls passed through (D334).
+    hints: AtomicU32,
     no_space: AtomicBool,
     /// `allocate` calls refused for `no_space`.
     refused: AtomicU32,
@@ -144,10 +149,26 @@ impl File for FaultFile {
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
         self.inner.submit_write(buf, offset)
     }
+    fn start_writeback(&self, offset: u64, len: u64) -> Result<()> {
+        self.faults.hints.fetch_add(1, Ordering::AcqRel);
+        self.inner.start_writeback(offset, len)
+    }
     fn sync_data(&self) -> Result<()> {
+        if take_one(&self.faults.fail_sync_data) {
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected sync_data failure",
+            ));
+        }
         self.inner.sync_data()
     }
     fn submit_sync_data(&self) -> Completion<()> {
+        if take_one(&self.faults.fail_sync_data) {
+            return Completion::ready(Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected sync_data failure",
+            )));
+        }
         if !self.faults.hold.load(Ordering::Acquire) {
             return self.inner.submit_sync_data();
         }
@@ -541,4 +562,20 @@ fn a_blocking_commit_drives_a_growth_ahead_only_its_thread_completes() {
     drop(pager);
     sim.set_deferred_io(false);
     assert_eq!(reopened_root(&vfs), root(2));
+}
+
+/// D334 (simp724's M1): a writeback hint never stands in for the root commit's sync. Output
+/// written and hinted, then a failing `sync_data` of the data file: the commit fails, and the
+/// root it names is not the one a reopen finds.
+#[test]
+fn a_hinted_output_whose_sync_fails_fails_the_commit() {
+    let (vfs, faults, pager) = setup();
+    let sst = pager.allocate(64 << 10).unwrap();
+    pager.write(sst, 0, &[7; 4096]).unwrap();
+    pager.file().start_writeback(sst.offset(), 4096).unwrap();
+    assert_eq!(faults.hints.load(Ordering::Acquire), 1);
+    faults.fail_sync_data.store(1, Ordering::Release);
+    assert!(pager.commit_root(root(2)).is_err());
+    drop(pager);
+    assert_eq!(reopened_root(&vfs), root(1));
 }
