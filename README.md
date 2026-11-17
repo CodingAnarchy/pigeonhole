@@ -75,7 +75,7 @@ One line per family of operations, with the calls that do it, a guide page that 
   - agent memory and `/mcp` on a cluster node;
   - `Admin.Info`, `Flush` and `Compact` on a cluster node.
 
-  Indexed vector and text search across partitions (#1722) is still in review. Guide: [Clusters](docs/guide/serve.md#clusters). Reference: [`phdb serve`](docs/guide/agent-reference.md#phdb-serve-120).
+  Vector and text indexes on a cluster are coming in 1.3.0: creates, drops and writes routed by id are in review (#1994), and searches across an index's partitions are in progress (#1722). Guide: [Clusters](docs/guide/serve.md#clusters). Reference: [`phdb serve`](docs/guide/agent-reference.md#phdb-serve-120).
 
 ## Data model
 A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, timestamp) → value`.

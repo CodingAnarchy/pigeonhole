@@ -40,7 +40,8 @@ What the public API does, and the first release with each piece. The [README's l
 | Change feeds | `Options::change_feed`, `Table::feed()`, `Feed::next`, `FeedToken` | released, 1.1.0 |
 | | a feed of every table, `Pigeonhole::feed()` | released, 1.2.0 |
 | Snapshots, backups, reader processes | `snapshot`, `durable_snapshot`, `backup`, `open_reader` | released, 1.0.0 |
-| | `backup_at`, `Options::read_only` | released, 1.2.0 |
+| | `Options::read_only` (an open that writes nothing to the files) | released, 1.1.0 |
+| | `backup_at`; read-only opens of read-only files (#1348) | released, 1.2.0 |
 | Async | module `nonblocking` | released, 1.0.0 |
 | Arrow export | `pigeonhole-arrow` | released, 1.0.0 |
 | Python and Ruby | `pigeonhole-db` | released, 1.1.0 |
@@ -53,7 +54,8 @@ What the public API does, and the first release with each piece. The [README's l
 | | read replicas of a partition (#1851) | on `main`, 1.3.0 |
 | | agent memory and `/mcp` on a cluster node (#1915) | on `main`, 1.3.0 |
 | | `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852) | on `main`, 1.3.0 |
-| | indexed vector and text search across partitions (#1722) | in progress, 1.3.0 |
+| | vector and text indexes on a cluster: creates, drops and writes routed by id (#1994) | in review, 1.3.0 |
+| | searches across an index's partitions (#1722) | in progress, 1.3.0 |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.

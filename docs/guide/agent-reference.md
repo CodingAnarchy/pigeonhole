@@ -405,13 +405,13 @@ Full page: [`serve.md`](serve.md); [ICR 0112](../design/icr/0112-network-api.md)
 
 | Item | Rule |
 |---|---|
-| Start | `phdb serve FILE [--create] [--listen ADDR:PORT]` (default `127.0.0.1:7448`). Security: `--tls-cert`, `--tls-key`, `--token-file` (`read`, `write` and `admin` tokens, optionally limited to namespaces). Change feed: `--change-feed BYTES`. Backups: `--backup-dir`. Agent memory: `--memory NAME`. |
+| Start | `phdb serve FILE [--create] [--listen ADDR:PORT]` (default `127.0.0.1:7448`). Security: `--tls-cert`, `--tls-key`, `--token-file` (`read`, `write` and `admin` tokens, optionally limited to memory namespaces). Change feed: `--change-feed BYTES`. Backups: `--backup-dir`. Agent memory: `--memory NAME`. |
 | Protocols | gRPC (package `pigeonhole.v1`, `proto/pigeonhole/v1/*.proto`) and HTTP/JSON (`POST /v1/<Service>/<Method>`) on one port; remote MCP at `/mcp` (`phdb mcp`'s tools). |
 | Services | `Data` (reads, writes, scans, batches), `Transactions`, `Snapshots`, `Schema`, `Admin` (info, flush, compact, backups), `Feed`, `Graph`, `Vectors` (nearest search and the IVF index), `Text`, `Memory`, `Replication`, `Cluster`. |
 | Retries | Reads may be retried. Retry a write only when its error's `ErrorDetail` says `retry_safe`. |
 | Read replicas | `--replica-of URL` with `--replica-token-file` (an admin token of the primary's); the primary needs `--backup-dir` and its change feed on. A replica refuses writes with `ReadOnly`, naming the primary. `phdb promote FILE` (offline) or `Admin.Promote` turns it into a primary. |
 | Clusters | `phdb serve --cluster DIR --node-id ID`: static key-range partitions in a map that `phdb cluster` manages (`init-partition`, `set-map`, `show-map`, `status`, `fence`, `unfence`, `move`, `relocate`, `close`, `drop-partition`, `backup`, `restore`). Any node routes any call. Transactions and snapshots stay within one partition, and a write across partitions answers `CrossPartition`. |
-| Clusters, on `main` for 1.3.0 | Read replicas of a partition (a map's `replicas`); agent memory with `--memory` on every node, and `/mcp`; `Admin.Info`, `Flush` and `Compact` on a cluster node. Indexed vector and text search across partitions is not on `main` yet (#1722). |
+| Clusters, on `main` for 1.3.0 | Read replicas of a partition (a map's `replicas`); agent memory with `--memory` on every node, and `/mcp`; `Admin.Info`, `Flush` and `Compact` on a cluster node. Not on `main` yet: vector and text indexes on a cluster, with creates, drops and writes routed by id (in review, #1994), and searches across an index's partitions (#1722). |
 | Metrics | Prometheus text at `/metrics` ([`observability.md`](observability.md)). |
 
 ## Arrow export: `pigeonhole-arrow` (#691)
