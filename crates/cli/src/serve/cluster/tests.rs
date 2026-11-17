@@ -704,6 +704,9 @@ fn a_forward_from_a_newer_peer_that_cant_give_its_map_writes_nothing() {
             map_version: 99,
             caller: Some(caller),
             fanout_part: false,
+            to_replica: false,
+            replica_max_lag_ms: 0,
+            min_primary_seqno: 0,
             op: Some(forward_request::Op::Mutate(super::proto::MutateRequest {
                 writes: Some(put_row("bob", "1")),
                 durability: 0,

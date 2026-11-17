@@ -427,6 +427,18 @@ message ForwardRequest {
   // admission and no reply charge, its scope still checked. Only a peer sends it:
   // `Cluster.Forward` takes cluster scope. Set on another call, it's ignored.
   bool fanout_part = 21;
+  // A read the entry node chose this node's replica copy of the partition for (D328): it's
+  // served from the copy, not as the partition's owner, if the copy's freshness is within
+  // `replica_max_lag_ms`, else `ReplicaBehind`, and the entry node tries the next replica or
+  // the owner. Only a single-partition read without a snapshot or transaction is sent so.
+  bool to_replica = 44;
+  // The client's bound (`x-pigeonhole-read-replica-max-lag-ms`), checked on this node's
+  // clock: now less the copy's freshness. With `to_replica` only.
+  uint64 replica_max_lag_ms = 42;
+  // The client's read-your-writes seqno for the partition (`x-pigeonhole-min-primary-seqno`):
+  // the copy waits, within the call's deadline, until it has applied the owner's commits
+  // through it. 0: none. With `to_replica` only.
+  uint64 min_primary_seqno = 43;
   oneof op {
     GetRequest get = 3;
     ReadRowRequest read_row = 4;
@@ -581,6 +593,10 @@ message ForwardResponse {
     RecallPoolResponse recall_pool = 23;
     RecallBodiesResponse recall_bodies = 24;
   }
+  // The seqno the serving node read at, in the owner's numbering (D328's
+  // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the
+  // owner's visible seqno after it. Set for a single-partition read; 0 otherwise.
+  uint64 served_seqno = 28;
 }
 
 message ForwardSubscribeRequest {

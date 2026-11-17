@@ -363,7 +363,7 @@ impl Stream for Rest {
 }
 
 /// The `grpc-timeout` header: digits and a unit (`H`, `M`, `S`, `m`, `u`, `n`).
-fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
+pub(crate) fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
     parse_grpc_timeout(headers.get("grpc-timeout")?.to_str().ok()?)
 }
 
@@ -421,12 +421,50 @@ impl DataGrpc {
     }
 }
 
+tokio::task_local! {
+    /// What served a read a replica could have (D328), set by [`call`] on a cluster node
+    /// for [`served_headers`] to put on the response.
+    static SERVED: std::cell::Cell<Option<super::replica::Served>>;
+}
+
+/// A cluster node's `Data` route's middleware (D328): the `served-by` and `served-seqno`
+/// headers of a read a replica could have served. Only a cluster node mounts it, so a
+/// single node's calls are as they were (the serve callgrind shapes, D193).
+pub(crate) async fn served_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    SERVED
+        .scope(std::cell::Cell::new(None), async move {
+            let mut resp = next.run(req).await;
+            if let Some(served) = SERVED.with(std::cell::Cell::get) {
+                for (name, value) in served.headers() {
+                    if let Ok(value) = value.parse() {
+                        resp.headers_mut().insert(name, value);
+                    }
+                }
+            }
+            resp
+        })
+        .await
+}
+
 /// One gRPC call through the router, for every service.
 async fn call<T>(
     shared: &Shared,
     req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<ServiceReply, Status> {
+    // A cluster node's calls may carry the replica header (D328): boxed, so a single node's
+    // calls keep the future and the cost they had.
+    if shared.router.is_cluster() {
+        let (reply, served) = Box::pin(call_served(shared, req, op)).await?;
+        if let Some(served) = served {
+            // For [`served_headers`], which wraps a cluster node's `Data` route.
+            let _ = SERVED.try_with(|slot| slot.set(Some(served)));
+        }
+        return Ok(reply);
+    }
     let caller = shared.caller(auth_header(&req))?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
@@ -450,6 +488,70 @@ async fn call<T>(
         .await;
     shared.count(rpc, started, &reply);
     Ok(reply?)
+}
+
+/// [`call`] on a cluster node, with what served a read a replica could have (D328), for its
+/// headers. A single node's calls never come here, so their cost stays as it was (the
+/// serve callgrind shapes, D193).
+async fn call_served<T>(
+    shared: &Shared,
+    req: Request<T>,
+    op: impl FnOnce(T) -> ServiceOp,
+) -> Result<(ServiceReply, Option<super::replica::Served>), Status> {
+    let caller = shared.caller(auth_header(&req))?;
+    let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
+    let started = Instant::now();
+    let min_primary_seqno = super::replica::min_primary_seqno(
+        req.metadata()
+            .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    );
+    // Only a cluster node reads the replica header (D328): a single node's calls keep
+    // their cost (the serve callgrind shapes, D193).
+    let max_lag = if shared.router.is_cluster() {
+        super::replica::read_replica_max_lag(
+            req.metadata()
+                .get(super::replica::READ_REPLICA_MAX_LAG_MS)
+                .map(|v| v.as_bytes()),
+        )
+    } else {
+        Ok(None)
+    };
+    // The request's one deadline, from its arrival (#1577).
+    let arrived = req.extensions().get::<Arrived>().map_or(started, |a| a.0);
+    let deadline = ReadDeadline::new(
+        arrived,
+        shared.limits.request_timeout,
+        grpc_timeout(req.metadata().as_ref()),
+    );
+    let op = op(req.into_inner());
+    let rpc = op.index();
+    // A call without the header goes as it always did; one with it, boxed, so its future
+    // doesn't widen every call's.
+    let (reply, served) = match max_lag {
+        Ok(None) => (
+            shared
+                .router
+                .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+                .await,
+            None,
+        ),
+        max_lag => match Box::pin(shared.router.dispatch_read(
+            op,
+            &caller,
+            prepaid,
+            min_primary_seqno,
+            max_lag,
+            deadline,
+        ))
+        .await
+        {
+            Ok((reply, served)) => (Ok(reply), served),
+            Err(e) => (Err(e), None),
+        },
+    };
+    shared.count(rpc, started, &reply);
+    Ok((reply?, served))
 }
 
 /// A unary RPC: the call, and its reply's variant.

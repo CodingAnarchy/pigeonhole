@@ -6588,6 +6588,15 @@ impl serde::Serialize for ForwardRequest {
         if self.fanout_part {
             len += 1;
         }
+        if self.to_replica {
+            len += 1;
+        }
+        if self.replica_max_lag_ms != 0 {
+            len += 1;
+        }
+        if self.min_primary_seqno != 0 {
+            len += 1;
+        }
         if self.op.is_some() {
             len += 1;
         }
@@ -6602,6 +6611,19 @@ impl serde::Serialize for ForwardRequest {
         }
         if self.fanout_part {
             struct_ser.serialize_field("fanout_part", &self.fanout_part)?;
+        }
+        if self.to_replica {
+            struct_ser.serialize_field("to_replica", &self.to_replica)?;
+        }
+        if self.replica_max_lag_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("replica_max_lag_ms", ToString::to_string(&self.replica_max_lag_ms).as_str())?;
+        }
+        if self.min_primary_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("min_primary_seqno", ToString::to_string(&self.min_primary_seqno).as_str())?;
         }
         if let Some(v) = self.op.as_ref() {
             match v {
@@ -6718,6 +6740,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "caller",
             "fanout_part",
             "fanoutPart",
+            "to_replica",
+            "toReplica",
+            "replica_max_lag_ms",
+            "replicaMaxLagMs",
+            "min_primary_seqno",
+            "minPrimarySeqno",
             "get",
             "read_row",
             "readRow",
@@ -6777,6 +6805,9 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             MapVersion,
             Caller,
             FanoutPart,
+            ToReplica,
+            ReplicaMaxLagMs,
+            MinPrimarySeqno,
             Get,
             ReadRow,
             Mutate,
@@ -6833,6 +6864,9 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "mapVersion" | "map_version" => Ok(GeneratedField::MapVersion),
                             "caller" => Ok(GeneratedField::Caller),
                             "fanoutPart" | "fanout_part" => Ok(GeneratedField::FanoutPart),
+                            "toReplica" | "to_replica" => Ok(GeneratedField::ToReplica),
+                            "replicaMaxLagMs" | "replica_max_lag_ms" => Ok(GeneratedField::ReplicaMaxLagMs),
+                            "minPrimarySeqno" | "min_primary_seqno" => Ok(GeneratedField::MinPrimarySeqno),
                             "get" => Ok(GeneratedField::Get),
                             "readRow" | "read_row" => Ok(GeneratedField::ReadRow),
                             "mutate" => Ok(GeneratedField::Mutate),
@@ -6887,6 +6921,9 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                 let mut map_version__ = None;
                 let mut caller__ = None;
                 let mut fanout_part__ = None;
+                let mut to_replica__ = None;
+                let mut replica_max_lag_ms__ = None;
+                let mut min_primary_seqno__ = None;
                 let mut op__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -6909,6 +6946,28 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                                 return Err(serde::de::Error::duplicate_field("fanoutPart"));
                             }
                             fanout_part__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ToReplica => {
+                            if to_replica__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("toReplica"));
+                            }
+                            to_replica__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ReplicaMaxLagMs => {
+                            if replica_max_lag_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("replicaMaxLagMs"));
+                            }
+                            replica_max_lag_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::MinPrimarySeqno => {
+                            if min_primary_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("minPrimarySeqno"));
+                            }
+                            min_primary_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
                         }
                         GeneratedField::Get => {
                             if op__.is_some() {
@@ -7140,6 +7199,9 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                     map_version: map_version__.unwrap_or_default(),
                     caller: caller__,
                     fanout_part: fanout_part__.unwrap_or_default(),
+                    to_replica: to_replica__.unwrap_or_default(),
+                    replica_max_lag_ms: replica_max_lag_ms__.unwrap_or_default(),
+                    min_primary_seqno: min_primary_seqno__.unwrap_or_default(),
                     op: op__,
                 })
             }
@@ -7155,10 +7217,18 @@ impl serde::Serialize for ForwardResponse {
     {
         use serde::ser::SerializeStruct;
         let mut len = 0;
+        if self.served_seqno != 0 {
+            len += 1;
+        }
         if self.reply.is_some() {
             len += 1;
         }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForwardResponse", len)?;
+        if self.served_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("served_seqno", ToString::to_string(&self.served_seqno).as_str())?;
+        }
         if let Some(v) = self.reply.as_ref() {
             match v {
                 forward_response::Reply::Get(v) => {
@@ -7227,6 +7297,8 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
         D: serde::Deserializer<'de>,
     {
         const FIELDS: &[&str] = &[
+            "served_seqno",
+            "servedSeqno",
             "get",
             "read_row",
             "readRow",
@@ -7257,6 +7329,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
+            ServedSeqno,
             Get,
             ReadRow,
             Mutate,
@@ -7296,6 +7369,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                         E: serde::de::Error,
                     {
                         match value {
+                            "servedSeqno" | "served_seqno" => Ok(GeneratedField::ServedSeqno),
                             "get" => Ok(GeneratedField::Get),
                             "readRow" | "read_row" => Ok(GeneratedField::ReadRow),
                             "mutate" => Ok(GeneratedField::Mutate),
@@ -7333,9 +7407,18 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                 where
                     V: serde::de::MapAccess<'de>,
             {
+                let mut served_seqno__ = None;
                 let mut reply__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
+                        GeneratedField::ServedSeqno => {
+                            if served_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("servedSeqno"));
+                            }
+                            served_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                         GeneratedField::Get => {
                             if reply__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("get"));
@@ -7465,6 +7548,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                     }
                 }
                 Ok(ForwardResponse {
+                    served_seqno: served_seqno__.unwrap_or_default(),
                     reply: reply__,
                 })
             }

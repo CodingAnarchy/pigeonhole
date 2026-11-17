@@ -88,12 +88,24 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         ))
         .service(admin.clone());
     let shed = Arc::clone(&shared);
-    let limited = axum::Router::new()
-        .route("/v1/{service}/{method}", post(call))
-        .route_service(
+    let limited = axum::Router::new().route("/v1/{service}/{method}", post(call));
+    // A cluster node's reads may be a replica's, and say so in their headers (D328): only
+    // there is the middleware mounted, so a single node's `Data` calls are as they were.
+    let limited = if shared.router.is_cluster() {
+        limited.route_service(
+            "/pigeonhole.v1.Data/{*method}",
+            tower::ServiceBuilder::new()
+                .layer(axum::middleware::from_fn(super::grpc::served_headers))
+                .layer(prepay())
+                .service(data),
+        )
+    } else {
+        limited.route_service(
             "/pigeonhole.v1.Data/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(data),
         )
+    };
+    let limited = limited
         .route_service(
             "/pigeonhole.v1.Transactions/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(txns),
@@ -437,11 +449,39 @@ async fn call(
             .get(super::replica::MIN_PRIMARY_SEQNO)
             .map(|v| v.as_bytes()),
     );
+    // A read a replica may serve on a cluster node (D328).
+    let max_lag = if shared.router.is_cluster() {
+        super::replica::read_replica_max_lag(
+            headers
+                .get(super::replica::READ_REPLICA_MAX_LAG_MS)
+                .map(|v| v.as_bytes()),
+        )
+    } else {
+        Ok(None)
+    };
     let deadline = ReadDeadline::new(arrived, shared.limits.request_timeout, None);
-    let reply = shared
-        .router
-        .dispatch_after_primary(op, &caller, Some(budget), min_primary_seqno, deadline)
-        .await;
+    let (reply, served) = match max_lag {
+        Ok(None) => (
+            shared
+                .router
+                .dispatch_after_primary(op, &caller, Some(budget), min_primary_seqno, deadline)
+                .await,
+            None,
+        ),
+        max_lag => match Box::pin(shared.router.dispatch_read(
+            op,
+            &caller,
+            Some(budget),
+            min_primary_seqno,
+            max_lag,
+            deadline,
+        ))
+        .await
+        {
+            Ok((reply, served)) => (Ok(reply), served),
+            Err(e) => (Err(e), None),
+        },
+    };
     shared.count(rpc, started, &reply);
     // A read's charge (#1567): fitted to the rendered body, then held until it's written.
     let (reply, charge) = match reply {
@@ -494,6 +534,14 @@ async fn call(
         }
         Err(e) => e.into_response(),
     };
+    let mut resp = resp;
+    if let Some(served) = served {
+        for (name, value) in served.headers() {
+            if let Ok(value) = value.parse() {
+                resp.headers_mut().insert(name, value);
+            }
+        }
+    }
     match charge {
         Some(c) => charged(&shared, resp, c).await,
         None => resp,

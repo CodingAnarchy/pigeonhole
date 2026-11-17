@@ -723,6 +723,9 @@ impl Router {
                 .unwrap_or_default();
             let req = ForwardRequest {
                 fanout_part: false,
+                to_replica: false,
+                replica_max_lag_ms: 0,
+                min_primary_seqno: 0,
                 map_version: map.map_version,
                 caller: Some(super::forward::forwarded_caller(caller)?),
                 op: Some(op.clone()),
