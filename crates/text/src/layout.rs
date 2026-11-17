@@ -15,6 +15,10 @@ pub(crate) const GLOBAL: &[u8] = b"G";
 pub(crate) const POST: &str = "post";
 /// `P{t}`: one column per document, its positions as ascending LEB128 deltas.
 pub(crate) const POS: &str = "pos";
+/// `P{t}`, in a version 2 index: one column per packed block of postings, the qualifier the
+/// block's last document id, the value the block ([`crate::block`]). Added to the table by
+/// the first [`Index::pack`](crate::Index::pack).
+pub(crate) const POSTB: &str = "postb";
 /// `P{t}`: a counter, the term's document frequency, at [`N`].
 pub(crate) const DF: &str = "df";
 /// `P{t}`: a `max` aggregate, the largest term frequency any posting had (MaxScore, M1).
@@ -44,14 +48,61 @@ pub(crate) const TOKENIZER: &[u8] = b"tokenizer";
 pub(crate) const FINGERPRINT: &[u8] = b"fingerprint";
 /// The normaliser's Unicode version, for diagnostics (D309 rev 6 §A.9).
 pub(crate) const NORMALIZER_UNICODE: &[u8] = b"normalizer-unicode";
-/// Present while [`Index::repair`](crate::Index::repair) runs.
+/// The index's state, which every search and every write through the index reads:
+/// - **absent:** layout version 1, and no repair running;
+/// - **[`PACKED`]:** layout version 2, and no repair running;
+/// - **anything else** (it is written empty): [`Index::repair`](crate::Index::repair) is
+///   running, and the read fails with `Busy`.
+///
+/// One cell for both, so a search learns the layout from the read it already made for the
+/// repair flag (#1585), and a handle opened before the first pack needs no reopen. A 1.2
+/// build, which knows only "present means a repair", fails with `Busy` on a packed index it
+/// had open, where it would otherwise search past the packed postings without knowing.
 pub(crate) const REPAIR: &[u8] = b"repair";
+/// [`REPAIR`]'s value in a version 2 index with no repair running.
+pub(crate) const PACKED: &[u8] = b"v2";
+/// A stopped pack's cursor (#1585): [`pack_cursor`] of the last posting cell its last chunk
+/// took, or empty before its first chunk. Absent when no pack is part way.
+pub(crate) const PACK_AFTER: &[u8] = b"pack-after";
 /// A stopped rebuild's cursor (#1756): the last source row it reconciled, which
 /// [`Index::resume_rebuild_with`](crate::Index::resume_rebuild_with) continues after. Absent
 /// when no rebuild is pending.
 pub(crate) const REBUILD_AFTER: &[u8] = b"rebuild-after";
 
+/// The layout an index is created with: postings as one cell a document.
 pub(crate) const LAYOUT_VERSION: u64 = 1;
+/// The layout after the first [`Index::pack`](crate::Index::pack) (#1585, ICR 0143): packed
+/// blocks ([`POSTB`]) under the cells, and tombstones ([`TOMBSTONE`]) where a posting is
+/// deleted.
+pub(crate) const LAYOUT_PACKED: u64 = 2;
+
+/// A deleted posting's [`POST`] value in a version 2 index (its [`POS`] value is empty): it
+/// hides the document's posting in a packed block until the next pack removes both. A real
+/// posting has a frequency of at least 1, and a real position list is never empty.
+pub(crate) const TOMBSTONE: u64 = 0;
+
+/// A pack cursor: the term's length (`u32` LE), the term, then the document id.
+pub(crate) fn pack_cursor(term: &[u8], doc: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + term.len() + doc.len());
+    v.extend_from_slice(&(term.len() as u32).to_le_bytes());
+    v.extend_from_slice(term);
+    v.extend_from_slice(doc);
+    v
+}
+
+/// A pack cursor's term and document id; `None` for the empty cursor (from the top).
+pub(crate) fn unpack_cursor(b: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+    if b.is_empty() {
+        return Ok(None);
+    }
+    let bad = || Error::Corruption("a pack cursor doesn't parse".into());
+    let n = u32::from_le_bytes(b.get(..4).ok_or_else(bad)?.try_into().expect("4 bytes")) as usize;
+    let rest = &b[4..];
+    if rest.len() < n {
+        return Err(bad());
+    }
+    Ok(Some(rest.split_at(n)))
+}
 
 pub(crate) fn post_row(term: &str) -> Vec<u8> {
     [POST_PREFIX, term.as_bytes()].concat()

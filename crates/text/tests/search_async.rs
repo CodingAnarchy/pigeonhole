@@ -28,7 +28,11 @@ fn opts(vfs: &Arc<SimVfs>) -> Options {
 
 /// A corpus of `n` documents (skewed words: "the" is a hub term), flushed and compacted into
 /// several SST blocks, a few more in a memtable; reopened, so the block cache is cold.
-fn build(vfs: &Arc<SimVfs>, n: u32, seed: u64) -> Pigeonhole {
+///
+/// With `packed` (#1585) the index is packed once the corpus is in: a version 2 index, its
+/// postings in blocks, then some deletes (tombstones over the blocks) and the last few
+/// documents as cells over them.
+fn build(vfs: &Arc<SimVfs>, n: u32, seed: u64, packed: bool) -> Pigeonhole {
     let db = Pigeonhole::open(PATH, opts(vfs)).expect("open");
     let docs = db
         .table("docs")
@@ -49,6 +53,20 @@ fn build(vfs: &Arc<SimVfs>, n: u32, seed: u64) -> Pigeonhole {
         index.put(&doc, &text(&mut rng, 30)).unwrap();
         if i % 1000 == 999 {
             db.flush().unwrap();
+        }
+    }
+    if packed {
+        index.pack().unwrap();
+        db.flush().unwrap();
+        for i in (0..n).step_by(17) {
+            index.delete(format!("d{i:05}").as_bytes()).unwrap();
+        }
+        for i in (0..n).step_by(17) {
+            let doc = format!("d{i:05}").into_bytes();
+            index.put(&doc, &text(&mut rng, 30)).unwrap();
+        }
+        for i in (5..n).step_by(29) {
+            index.delete(format!("d{i:05}").as_bytes()).unwrap();
         }
     }
     db.compact().unwrap();
@@ -106,9 +124,20 @@ const QUERIES: &[&str] = &[
 
 #[test]
 fn an_async_search_returns_what_the_sync_one_returns() {
+    async_equals_sync(false);
+}
+
+/// The same over a version 2 index (#1585): blocks, tombstones over them and cells over
+/// them, each tier read without blocking.
+#[test]
+fn an_async_search_of_a_packed_index_returns_what_the_sync_one_returns() {
+    async_equals_sync(true);
+}
+
+fn async_equals_sync(packed: bool) {
     for seed in [1u64, 1560] {
         let vfs = SimVfs::new(seed);
-        let db = build(&vfs, 3000, seed);
+        let db = build(&vfs, 3000, seed, packed);
         let index = Index::open(&db, "docs_text").expect("open index");
         let mut pendings = 0;
         for q in QUERIES {
@@ -130,7 +159,7 @@ fn an_async_search_returns_what_the_sync_one_returns() {
                 pendings += pending;
                 let (got, got_stats) = got.expect("run_with_stats_async");
                 let (want, want_stats) = search().run_with_stats().expect("run_with_stats");
-                let ctx = format!("seed {seed}, {q:?}, k {k}, prefix {prefix:?}");
+                let ctx = format!("seed {seed}, packed {packed}, {q:?}, k {k}, prefix {prefix:?}");
                 assert_eq!(got, want, "{ctx}");
                 assert_eq!(format!("{got_stats:?}"), format!("{want_stats:?}"), "{ctx}");
                 assert_eq!(reads, 0, "{ctx}: synchronous reads");
@@ -150,7 +179,7 @@ fn an_async_search_returns_what_the_sync_one_returns() {
 fn async_search_futures_are_send() {
     fn send<T: Send>(_: &T) {}
     let vfs = SimVfs::new(7);
-    let db = build(&vfs, 50, 7);
+    let db = build(&vfs, 50, 7, false);
     let index = Index::open(&db, "docs_text").expect("open index");
     let run = index.search("memory", 3).run_async();
     send(&run);
@@ -207,10 +236,49 @@ fn random_query(rng: &mut Rng) -> Query {
 /// synchronously. `TEXT_SEED=<n>` runs one seed (a long sweep passes its seeds that way).
 #[test]
 fn async_equals_sync_over_random_corpora_and_queries() {
+    random_rounds(false);
+}
+
+/// The property over a version 2 index (#1585), packed again part way between rounds, and
+/// against a twin that is never packed and gets the same writes: the packed index's hits
+/// and stats are the twin's, for every random query.
+#[test]
+fn a_packed_index_equals_its_twin_and_async_equals_sync_over_random_queries() {
+    random_rounds(true);
+}
+
+fn random_rounds(packed: bool) {
     for seed in seeds(&[11, 12, 13]) {
         let vfs = SimVfs::new(seed);
-        let db = build(&vfs, 600, seed);
+        let db = build(&vfs, 600, seed, packed);
         let index = Index::open(&db, "docs_text").expect("open index");
+        // The twin: the same corpus and the same writes, never packed.
+        let twin = packed.then(|| {
+            let vfs = SimVfs::new(seed);
+            let db = build(&vfs, 600, seed, false);
+            let index = Index::open(&db, "docs_text").expect("open the twin");
+            // What `build` does to a packed index after its pack, in the same order.
+            let mut rng = Rng::new(seed);
+            for _ in 0..600 {
+                text(&mut rng, 30);
+            }
+            for i in (0..600).step_by(17) {
+                index.delete(format!("d{i:05}").as_bytes()).unwrap();
+            }
+            for i in (0..600).step_by(17) {
+                let doc = format!("d{i:05}").into_bytes();
+                index.put(&doc, &text(&mut rng, 30)).unwrap();
+            }
+            for i in (5..600).step_by(29) {
+                index.delete(format!("d{i:05}").as_bytes()).unwrap();
+            }
+            // The last documents, with the texts the packed build drew for them.
+            for i in 600..620 {
+                let doc = format!("d{i:05}").into_bytes();
+                index.put(&doc, &text(&mut rng, 30)).unwrap();
+            }
+            (db, index)
+        });
         let mut rng = Rng::new(seed ^ 0x1560);
         let mut next_doc = 620;
         for round in 0..3 {
@@ -218,11 +286,32 @@ fn async_equals_sync_over_random_corpora_and_queries() {
                 for _ in 0..40 {
                     let doc = format!("d{:05}", rng.below(next_doc));
                     index.delete(doc.as_bytes()).unwrap();
+                    if let Some((_, twin)) = &twin {
+                        twin.delete(doc.as_bytes()).unwrap();
+                    }
                 }
                 for _ in 0..20 {
                     let doc = format!("d{next_doc:05}");
-                    index.put(doc.as_bytes(), &text(&mut rng, 30)).unwrap();
+                    let t = text(&mut rng, 30);
+                    index.put(doc.as_bytes(), &t).unwrap();
+                    if let Some((_, twin)) = &twin {
+                        twin.put(doc.as_bytes(), &t).unwrap();
+                    }
                     next_doc += 1;
+                }
+                if packed && round == 1 {
+                    // Part of a pack: some terms' tombstones and cells are merged, the rest
+                    // wait.
+                    let st = index
+                        .pack_with(pigeonhole_text::PackOptions::new(), |st| {
+                            if st.terms >= 6 {
+                                std::ops::ControlFlow::Break(())
+                            } else {
+                                std::ops::ControlFlow::Continue(())
+                            }
+                        })
+                        .unwrap();
+                    assert!(st.stopped, "{st:?}");
                 }
             }
             for i in 0..40 {
@@ -255,7 +344,28 @@ fn async_equals_sync_over_random_corpora_and_queries() {
                 assert_eq!(got, want, "{ctx}");
                 assert_eq!(format!("{got_stats:?}"), format!("{want_stats:?}"), "{ctx}");
                 assert_eq!(reads, 0, "{ctx}: synchronous reads");
+                if let Some((_, twin)) = &twin {
+                    let mut s = twin
+                        .search(query.clone(), k)
+                        .highlight(highlight)
+                        .max_expansions(max)
+                        .prefix_length(prefix_length);
+                    if let Some(p) = &prefix {
+                        s = s.id_prefix(p.as_bytes());
+                    }
+                    let (plain, plain_stats) = s.run_with_stats().expect("the twin");
+                    assert_eq!(want, plain, "{ctx}: against the twin");
+                    assert_eq!(
+                        format!("{want_stats:?}"),
+                        format!("{plain_stats:?}"),
+                        "{ctx}: against the twin"
+                    );
+                }
             }
+        }
+        if let Some((db, twin)) = twin {
+            drop(twin);
+            db.close().unwrap();
         }
         drop(index);
         vfs.complete_all_io();
@@ -271,7 +381,7 @@ fn async_equals_sync_over_random_corpora_and_queries() {
 #[test]
 fn a_warm_phrase_search_yields_without_io() {
     let vfs = SimVfs::new(5);
-    let db = build(&vfs, 3000, 5);
+    let db = build(&vfs, 3000, 5, false);
     let index = Index::open(&db, "docs_text").expect("open index");
     let search = || index.search("\"the memory\" \"the store\" \"the agent\" memory~", 10);
     // Warm the cache.
