@@ -681,6 +681,10 @@ impl Phrase {
 /// is the sum of its terms' (D309 §4.3). Its frequency is its exact occurrences at slop 0,
 /// and its sloppy frequency (`Σ 1 / (distance + 1)` over its matches, D309 rev 6 §B) above
 /// that.
+///
+/// A join in document order (#1586): the lead term's position row is walked, and each other
+/// term is brought to the lead's document ([`Joined`]). Positions are decoded only for a
+/// document every term has, into buffers reused from one document to the next.
 fn score_phrase(
     t: &Rows,
     s: &Snapshot,
@@ -693,33 +697,33 @@ fn score_phrase(
     let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
         return Ok(scores);
     };
-    let terms = &phrase.terms;
-    let mut by_term: BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u32>>> = BTreeMap::new();
-    let lead_term = terms[plan.lead].0.as_str();
-    by_term.insert(lead_term, read_positions(t, s, lead_term, None, prefix)?);
-    for (term, _) in terms {
-        if by_term.contains_key(term.as_str()) {
-            continue;
+    let lead_term = phrase.terms[plan.lead].0.as_str();
+    let mut lead = cells_of(t, s, &post_row(lead_term), POS, prefix).cells()?;
+    let mut others = plan.others(df_of, phrase, prefix);
+    // The lead's postings, for the length of each document the phrase is in.
+    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix);
+    let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
+    'docs: while let Some(e) = lead.next()? {
+        for (o, list) in others.iter_mut().zip(&mut lists[1..]) {
+            // A document without every term can't hold the phrase.
+            if !o.at(t, s, e.qualifier)? {
+                continue 'docs;
+            }
+            decode_positions(&o.value, list)?;
         }
-        let keep = &by_term[lead_term];
-        let got = read_positions(t, s, term, Some(keep), prefix)?;
-        by_term.insert(term, got);
-    }
-    for (doc, lead_ps) in &by_term[lead_term] {
-        let Some(freq) = plan.freq(phrase, &by_term, doc, lead_ps) else {
+        decode_positions(e.cell.value(), &mut lists[0])?;
+        let Some(freq) = plan.freq(phrase, &lists) else {
             continue;
         };
-        let len = match t.get_at(s, &post_row(lead_term), POST, doc)? {
-            Some(c) => c.as_u64(),
-            None => return Err(corrupt("a position has no posting")),
-        };
-        scores.insert(doc.clone(), plan.score(bm, freq, len)?);
+        if !lens.at(t, s, e.qualifier)? {
+            return Err(corrupt("a position has no posting"));
+        }
+        scores.insert(e.qualifier.to_vec(), plan.score(bm, freq, lens.number)?);
     }
     Ok(scores)
 }
 
-/// [`score_phrase`] as a future (#1560): the same positions and lengths, read without
-/// blocking.
+/// [`score_phrase`] as a future (#1560): the same join, read without blocking.
 #[cfg(feature = "async")]
 async fn score_phrase_async(
     t: &Rows,
@@ -734,33 +738,252 @@ async fn score_phrase_async(
     let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
         return Ok(scores);
     };
-    let terms = &phrase.terms;
-    let mut by_term: BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u32>>> = BTreeMap::new();
-    let lead_term = terms[plan.lead].0.as_str();
-    let lead = read_positions_async(t, s, lead_term, None, prefix, budget).await?;
-    by_term.insert(lead_term, lead);
-    for (term, _) in terms {
-        if by_term.contains_key(term.as_str()) {
-            continue;
+    let lead_term = phrase.terms[plan.lead].0.as_str();
+    let mut lead = cells_of(t, s, &post_row(lead_term), POS, prefix).cells()?;
+    let mut others = plan.others(df_of, phrase, prefix);
+    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix);
+    let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
+    'docs: loop {
+        budget.spend(1).await;
+        let Some(e) = lead.next_async().await? else {
+            break;
+        };
+        for (o, list) in others.iter_mut().zip(&mut lists[1..]) {
+            if !o.at_async(t, s, e.qualifier, budget).await? {
+                continue 'docs;
+            }
+            decode_positions(&o.value, list)?;
         }
-        let keep = Some(&by_term[lead_term]);
-        let got = read_positions_async(t, s, term, keep, prefix, budget).await?;
-        by_term.insert(term, got);
-    }
-    for (doc, lead_ps) in &by_term[lead_term] {
-        let Some(freq) = plan.freq(phrase, &by_term, doc, lead_ps) else {
+        decode_positions(e.cell.value(), &mut lists[0])?;
+        let Some(freq) = plan.freq(phrase, &lists) else {
             continue;
         };
-        // A cached get resolves at once: without a budget, a phrase over a hub term's
-        // documents would never yield (ai1249's R1).
-        budget.spend(crate::maxscore::LOOKUP_STEPS).await;
-        let len = match t.get_at_async(s, &post_row(lead_term), POST, doc).await? {
-            Some(c) => c.as_u64(),
-            None => return Err(corrupt("a position has no posting")),
-        };
-        scores.insert(doc.clone(), plan.score(bm, freq, len)?);
+        // Its reads spend the budget themselves: a cached get resolves at once, and
+        // without one a phrase over a hub term's documents would never yield (ai1249's R1).
+        if !lens.at_async(t, s, e.qualifier, budget).await? {
+            return Err(corrupt("a position has no posting"));
+        }
+        scores.insert(e.qualifier.to_vec(), plan.score(bm, freq, lens.number)?);
     }
     Ok(scores)
+}
+
+/// The read of a posting row's `family`, restricted to ids starting with `prefix`.
+fn cells_of<'t>(
+    t: &'t Rows,
+    s: &Snapshot,
+    row: &[u8],
+    family: &'static str,
+    prefix: Option<&[u8]>,
+) -> pigeonhole::RowRead<'t> {
+    let read = t.row(row).family(family).snapshot(s);
+    match prefix {
+        Some(p) => read.qualifier_prefix(p),
+        None => read,
+    }
+}
+
+/// One of a phrase's posting-row families in the join (#1586): a term's cells in the
+/// documents the lead's walk asks for, which come in ascending order. The other terms'
+/// positions are read this way, and so are the lead's own postings, for the length of a
+/// document the phrase is in.
+///
+/// Reached by point reads or by the row's own walk, whichever costs less, at a point read's
+/// price of [`LOOKUP_IN_STEPS`](crate::maxscore::LOOKUP_IN_STEPS) steps (perf287's measure,
+/// #1368). So a rare lead beside a common word reads the common word's row at the lead's
+/// documents only, and two common words are merged a step at a time.
+/// - **Another term's positions:** the lead's `df` says how many documents will be asked
+///   for, so the choice is made up front.
+/// - **The lead's postings:** asked for only where the phrase occurs, which isn't known, so
+///   by MaxScore's rule for a non-essential clause (`Walk::lookup`, ski-rental): point reads
+///   until they'd cost more than stepping through what's left of the row, then the walk for
+///   good.
+struct Joined<'t> {
+    row: Vec<u8>,
+    family: &'static str,
+    prefix: Option<Vec<u8>>,
+    /// The row's walk, opened when the join switches to it.
+    cells: Option<pigeonhole::RowCells<'t>>,
+    /// The document the walk stands on, once it has stepped. A buffer, reused.
+    doc: Vec<u8>,
+    /// The cell of the document last found ([`at`](Self::at) returned `true`): its value
+    /// (a buffer, reused), and the value as a number, if it is one.
+    value: Vec<u8>,
+    number: Option<u64>,
+    /// Whether the walk has run off the row's end.
+    ended: bool,
+    /// The row's postings (the term's `df`), the steps the walk has taken, and the point
+    /// reads done.
+    postings: u64,
+    stepped: u64,
+    lookups: u64,
+    advancing: bool,
+}
+
+impl<'t> Joined<'t> {
+    /// `asked` is how many documents the join will ask for, where that's known: the
+    /// lead's `df`, for another term's positions. Then the choice between point reads and
+    /// the walk is made here, once, and the walk isn't paid for after point reads already
+    /// were (ski-rental's price for not knowing). `None` for the lead's own postings, asked
+    /// for only where the phrase occurs.
+    ///
+    /// Under an `id_prefix` the lead's `df` counts documents outside the prefix too, so
+    /// `asked` over-estimates and the walk can be chosen where point reads would have cost
+    /// less: slower then, never a different result (ai1249's S1 on #1997).
+    fn new(
+        term: &str,
+        family: &'static str,
+        postings: i64,
+        asked: Option<i64>,
+        prefix: Option<&[u8]>,
+    ) -> Self {
+        let postings = postings.max(0) as u64;
+        let advancing = asked.is_some_and(|n| {
+            (n.max(0) as u64).saturating_mul(crate::maxscore::LOOKUP_IN_STEPS) > postings
+        });
+        Joined {
+            row: post_row(term),
+            family,
+            prefix: prefix.map(<[u8]>::to_vec),
+            cells: None,
+            doc: Vec::new(),
+            value: Vec::new(),
+            number: None,
+            ended: false,
+            postings,
+            stepped: 0,
+            lookups: 0,
+            advancing,
+        }
+    }
+
+    /// Whether the next document is reached by the row's walk: decided once per document,
+    /// and for good once it says yes.
+    fn walks(&mut self) -> bool {
+        if !self.advancing {
+            self.lookups += 1;
+            let left = self.postings.saturating_sub(self.stepped);
+            self.advancing = self
+                .lookups
+                .saturating_mul(crate::maxscore::LOOKUP_IN_STEPS)
+                > left;
+        }
+        self.advancing
+    }
+
+    /// Whether the walk has to move to reach `doc`: not once it has ended, or stands at or
+    /// past `doc`.
+    fn behind(&self, doc: &[u8]) -> bool {
+        !self.ended && (self.cells.is_none() || self.doc.as_slice() < doc)
+    }
+
+    /// Whether the walk, standing at or past `doc`, stands on it.
+    fn here(&self, doc: &[u8]) -> bool {
+        !self.ended && self.doc.as_slice() == doc
+    }
+
+    /// Keeps the cell found: its value, and the value as a number.
+    fn keep(value: &mut Vec<u8>, number: &mut Option<u64>, found: (&[u8], Option<u64>)) {
+        value.clear();
+        value.extend_from_slice(found.0);
+        *number = found.1;
+    }
+
+    /// Opens the row's walk, once.
+    fn open(&mut self, t: &'t Rows, s: &Snapshot) -> Result<()> {
+        if self.cells.is_none() {
+            let cells = cells_of(t, s, &self.row, self.family, self.prefix.as_deref()).cells()?;
+            self.cells = Some(cells);
+        }
+        Ok(())
+    }
+
+    /// Whether the term has a cell for `doc`, kept in `value` and `number` if so. `doc`s
+    /// ascend.
+    fn at(&mut self, t: &'t Rows, s: &Snapshot, doc: &[u8]) -> Result<bool> {
+        if !self.walks() {
+            return Ok(match t.get_at(s, &self.row, self.family, doc)? {
+                Some(c) => {
+                    Self::keep(&mut self.value, &mut self.number, (c.value(), c.as_u64()));
+                    true
+                }
+                None => false,
+            });
+        }
+        if self.behind(doc) {
+            // A posting passed costs a key compare: only the one stood on is copied.
+            self.open(t, s)?;
+            let cells = self.cells.as_mut().expect("opened above");
+            loop {
+                self.stepped += 1;
+                let Some(e) = cells.next()? else {
+                    self.ended = true;
+                    break;
+                };
+                if e.qualifier < doc {
+                    continue;
+                }
+                self.doc.clear();
+                self.doc.extend_from_slice(e.qualifier);
+                Self::keep(
+                    &mut self.value,
+                    &mut self.number,
+                    (e.cell.value(), e.cell.as_u64()),
+                );
+                break;
+            }
+        }
+        Ok(self.here(doc))
+    }
+
+    /// [`at`](Self::at) without blocking: point reads as futures, and the walk by seeking
+    /// (a cold row then reads only the blocks it lands in, perf287's T1 on #1560). A seek
+    /// counts one step, so the switch to walking comes a little later than the sync join's.
+    #[cfg(feature = "async")]
+    async fn at_async(
+        &mut self,
+        t: &'t Rows,
+        s: &Snapshot,
+        doc: &[u8],
+        budget: &mut crate::maxscore::Budget,
+    ) -> Result<bool> {
+        if !self.walks() {
+            budget.spend(crate::maxscore::LOOKUP_STEPS).await;
+            return Ok(
+                match t.get_at_async(s, &self.row, self.family, doc).await? {
+                    Some(c) => {
+                        Self::keep(&mut self.value, &mut self.number, (c.value(), c.as_u64()));
+                        true
+                    }
+                    None => false,
+                },
+            );
+        }
+        if self.behind(doc) {
+            budget.spend(1).await;
+            self.open(t, s)?;
+            let cells = self.cells.as_mut().expect("opened above");
+            let (family, at) = (self.family, &mut self.doc);
+            let (value, number) = (&mut self.value, &mut self.number);
+            // Only when behind `doc`, so the seek never stands on `doc` already (a seek
+            // from a posting lands after it).
+            let found = std::future::poll_fn(|cx| match cells.poll_seek(cx, family, doc) {
+                std::task::Poll::Ready(Ok(Some(e))) => {
+                    at.clear();
+                    at.extend_from_slice(e.qualifier);
+                    Self::keep(value, number, (e.cell.value(), e.cell.as_u64()));
+                    std::task::Poll::Ready(Ok(true))
+                }
+                std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(Ok(false)),
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            })
+            .await?;
+            self.stepped += 1;
+            self.ended = !found;
+        }
+        Ok(self.here(doc))
+    }
 }
 
 /// What a phrase scores with, past its reads: its idf (the sum of its terms'), its lead term
@@ -770,6 +993,9 @@ struct PhrasePlan {
     idf: f64,
     lead: usize,
     groups: Vec<usize>,
+    /// Each term's place in the join's position lists: 0 for the lead term, then the other
+    /// distinct terms in the phrase's order. A repeated word's terms share one.
+    slots: Vec<usize>,
 }
 
 impl PhrasePlan {
@@ -787,30 +1013,52 @@ impl PhrasePlan {
             .iter()
             .map(|(term, _)| terms.iter().position(|(t, _)| t == term).expect("itself"))
             .collect();
-        Some(PhrasePlan { idf, lead, groups })
+        let mut distinct = vec![terms[lead].0.as_str()];
+        let slots = terms
+            .iter()
+            .map(|(term, _)| {
+                distinct.iter().position(|t| t == term).unwrap_or_else(|| {
+                    distinct.push(term);
+                    distinct.len() - 1
+                })
+            })
+            .collect();
+        Some(PhrasePlan {
+            idf,
+            lead,
+            groups,
+            slots,
+        })
     }
 
-    /// The phrase's frequency in `doc`, from its terms' positions there; `None` when it
-    /// doesn't occur (a term is missing, or no match).
-    fn freq(
+    /// The join's other terms: the distinct terms besides the lead, in `slots`' order.
+    fn others<'t>(
         &self,
+        df_of: &HashMap<String, i64>,
         phrase: &Phrase,
-        by_term: &BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u32>>>,
-        doc: &[u8],
-        lead_ps: &[u32],
-    ) -> Option<f64> {
+        prefix: Option<&[u8]>,
+    ) -> Vec<Joined<'t>> {
+        let mut others: Vec<Joined<'t>> = Vec::new();
+        for ((term, _), &slot) in phrase.terms.iter().zip(&self.slots) {
+            if slot == others.len() + 1 {
+                let asked = Some(df_of[&phrase.terms[self.lead].0]);
+                others.push(Joined::new(term, POS, df_of[term], asked, prefix));
+            }
+        }
+        others
+    }
+
+    /// The phrase's frequency in a document every term is in, from the join's position
+    /// lists there (`slots`); `None` when it doesn't occur.
+    fn freq(&self, phrase: &Phrase, by_slot: &[Vec<u32>]) -> Option<f64> {
         let terms = &phrase.terms;
-        let lists: Option<Vec<&[u32]>> = terms
-            .iter()
-            .map(|(term, _)| by_term[term.as_str()].get(doc).map(Vec::as_slice))
-            .collect();
-        // A document without every term can't hold the phrase.
-        let lists = lists?;
+        let lead_ps = by_slot[0].as_slice();
+        let lists = || self.slots.iter().map(|&slot| by_slot[slot].as_slice());
         let lead_off = terms[self.lead].1;
         let freq = if phrase.slop == 0 {
             let mut n = 0u32;
             'start: for &p in lead_ps {
-                for ((_, off), ps) in terms.iter().zip(&lists) {
+                for ((_, off), ps) in terms.iter().zip(lists()) {
                     let Some(at) = (p + off).checked_sub(lead_off) else {
                         continue 'start;
                     };
@@ -822,11 +1070,10 @@ impl PhrasePlan {
             }
             f64::from(n)
         } else {
-            let walks: Vec<(&[u32], u32, usize)> = lists
-                .iter()
+            let walks: Vec<(&[u32], u32, usize)> = lists()
                 .zip(terms)
                 .zip(&self.groups)
-                .map(|((ps, (_, off)), g)| (*ps, *off, *g))
+                .map(|((ps, (_, off)), g)| (ps, *off, *g))
                 .collect();
             crate::sloppy::sloppy_freq(&walks, phrase.slop)
         };
@@ -839,60 +1086,4 @@ impl PhrasePlan {
         let len = unposting(posting.ok_or_else(|| corrupt("a posting isn't a u64"))?).1;
         Ok(self.idf * bm.tf_factor(freq, f64::from(len)))
     }
-}
-
-/// A term's positions by document, for the documents in `keep` (all when `None`).
-fn read_positions(
-    t: &Rows,
-    s: &Snapshot,
-    term: &str,
-    keep: Option<&BTreeMap<Vec<u8>, Vec<u32>>>,
-    prefix: Option<&[u8]>,
-) -> Result<BTreeMap<Vec<u8>, Vec<u32>>> {
-    let mut out = BTreeMap::new();
-    let mut read = t.row(&post_row(term)).family(POS).snapshot(s);
-    if let Some(p) = prefix {
-        read = read.qualifier_prefix(p);
-    }
-    let mut cells = read.cells()?;
-    while let Some(e) = cells.next()? {
-        if keep.is_some_and(|k| !k.contains_key(e.qualifier)) {
-            continue;
-        }
-        let mut ps = Vec::new();
-        decode_positions(e.cell.value(), &mut ps)?;
-        out.insert(e.qualifier.to_vec(), ps);
-    }
-    Ok(out)
-}
-
-/// [`read_positions`] as a future: the position row walked with [`RowCells::next_async`].
-#[cfg(feature = "async")]
-async fn read_positions_async(
-    t: &Rows,
-    s: &Snapshot,
-    term: &str,
-    keep: Option<&BTreeMap<Vec<u8>, Vec<u32>>>,
-    prefix: Option<&[u8]>,
-    budget: &mut crate::maxscore::Budget,
-) -> Result<BTreeMap<Vec<u8>, Vec<u32>>> {
-    let mut out = BTreeMap::new();
-    let mut read = t.row(&post_row(term)).family(POS).snapshot(s);
-    if let Some(p) = prefix {
-        read = read.qualifier_prefix(p);
-    }
-    let mut cells = read.cells()?;
-    loop {
-        budget.spend(1).await;
-        let Some(e) = cells.next_async().await? else {
-            break;
-        };
-        if keep.is_some_and(|k| !k.contains_key(e.qualifier)) {
-            continue;
-        }
-        let mut ps = Vec::new();
-        decode_positions(e.cell.value(), &mut ps)?;
-        out.insert(e.qualifier.to_vec(), ps);
-    }
-    Ok(out)
 }

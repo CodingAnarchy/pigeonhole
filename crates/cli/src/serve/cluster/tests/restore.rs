@@ -254,7 +254,7 @@ fn a_restore_refuses_a_copy_that_isnt_the_manifests() {
         .block_on(restore(
             &args(ports[0]),
             &RestoreArgs {
-                map: Some(edited),
+                map: Some(edited.clone()),
                 ..restore_args(&out)
             },
         ))
@@ -262,6 +262,32 @@ fn a_restore_refuses_a_copy_that_isnt_the_manifests() {
         .unwrap();
     assert!(
         e.message().contains("tables aren't the backup's"),
+        "{}",
+        e.message()
+    );
+    // So is one with an index the backup's map doesn't place (#1722): its reconcile would
+    // make it again, empty.
+    let mut m =
+        super::super::map::parse_json(&std::fs::read_to_string(out.join("map.json")).unwrap())
+            .unwrap();
+    m.indexes.push(crate::serve::proto::IndexPlacement {
+        name: "v".into(),
+        follows: m.tables[0].name.clone(),
+        ..Default::default()
+    });
+    std::fs::write(&edited, super::super::map::canonical_json(&m)).unwrap();
+    let e = rt
+        .block_on(restore(
+            &args(ports[0]),
+            &RestoreArgs {
+                map: Some(edited),
+                ..restore_args(&out)
+            },
+        ))
+        .err()
+        .unwrap();
+    assert!(
+        e.message().contains("indexes aren't the backup's"),
         "{}",
         e.message()
     );
