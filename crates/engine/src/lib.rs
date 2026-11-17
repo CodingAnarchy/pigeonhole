@@ -48,6 +48,7 @@ mod manifest;
 mod nonblocking;
 mod options;
 mod position;
+mod punch;
 mod purge_guard;
 mod read;
 mod row_cache;
@@ -81,6 +82,7 @@ pub use feed_reader::{
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};
+pub use punch::PunchTuning;
 pub use position::ColumnPosition;
 pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, NEAREST_POLL_CELLS, PendingNearest, Score};

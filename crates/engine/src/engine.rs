@@ -7200,6 +7200,13 @@ impl Shared {
             manifest_queue: Default::default(),
             manifest_busy: AtomicBool::new(false),
             pager: Arc::clone(pager),
+            punch: options.punch_freed.then(|| {
+                crate::punch::Punch::new(
+                    options.punch_tuning.unwrap_or_default(),
+                    options.memtable_budget,
+                    shards,
+                )
+            }),
             cache: Arc::clone(cache),
             row_cache: None,
             row_epochs: None,
