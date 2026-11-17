@@ -323,7 +323,7 @@ fn a_restore_run_again_skips_what_an_earlier_run_did() {
         // Stopped after every stamp, before the map.
         assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
         assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
-        *FAIL_AT.lock().unwrap() = Some((out.clone(), "stamped"));
+        FAIL_AT.lock().unwrap().push((out.clone(), "stamped"));
         let e = restore(&args(a), &restore_args(&out)).await.err().unwrap();
         assert!(e.message().contains("after stamped"), "{}", e.message());
         assert!(progress.exists());
@@ -350,10 +350,15 @@ fn a_restore_run_again_skips_what_an_earlier_run_did() {
         // their nodes, fenced. Run again, it only unfences: no epoch 4.
         assert!(on_each(&ports, "fence").await.iter().all(Result::is_ok));
         assert!(on_each(&ports, "close").await.iter().all(Result::is_ok));
-        *FAIL_AT.lock().unwrap() = Some((out.clone(), "mapped"));
+        FAIL_AT.lock().unwrap().push((out.clone(), "mapped"));
         let e = restore(&args(a), &restore_args(&out)).await.err().unwrap();
         assert!(e.message().contains("after mapped"), "{}", e.message());
-        assert_eq!(epochs(&the_live_map(c).await), [3, 3, 3]);
+        // A map set answers once a majority holds it: c may take it a push later (#2015,
+        // a Windows run read c's map before it had).
+        eventually("c to hold the restore's map, at epoch 3", async || {
+            epochs(&the_live_map(c).await) == [3, 3, 3]
+        })
+        .await;
         let report = restore(&args(a), &restore_args(&out)).await.unwrap();
         assert_eq!(
             report.document["resumed"], "the map was set by an earlier run",
@@ -793,7 +798,7 @@ fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
         })
         .await;
         // Run again, stopped after its map: the stamp at 3 doesn't fit, so it stamps at 6.
-        *FAIL_AT.lock().unwrap() = Some((out.clone(), "mapped"));
+        FAIL_AT.lock().unwrap().push((out.clone(), "mapped"));
         let e = restore(&args(a), &part_args(&out, "p3", None))
             .await
             .err()
