@@ -74,6 +74,10 @@ pub(crate) struct Punch {
     /// free space can move from inside the reserve to past it (allocations take low space
     /// while reclaims free high space) without the unpunched total growing.
     idle_at: AtomicU64,
+    /// When the next block may be punched (monotonic nanoseconds), carried from one pass to
+    /// the next so chained passes keep `bytes_per_sec` (simp724's N2 on #2034). One pass at
+    /// a time writes it.
+    next_at: AtomicU64,
     /// Passes started.
     pub passes: AtomicU64,
     /// Punches that failed, the `Unsupported` one included.
@@ -90,6 +94,7 @@ impl Punch {
             running: AtomicBool::new(false),
             unsupported: AtomicBool::new(false),
             idle_at: AtomicU64::new(0),
+            next_at: AtomicU64::new(0),
             passes: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
         }
@@ -110,6 +115,7 @@ impl Punch {
         if self.unsupported.load(Ordering::Relaxed)
             || self.running.load(Ordering::Relaxed)
             || shared.pager_poisoned.load(Ordering::Acquire)
+            || shared.closed.load(Ordering::Acquire)
         {
             return false;
         }
@@ -160,8 +166,6 @@ pub(crate) struct PunchPass {
     /// Stopped at [`PunchTuning::pass_bytes`] with space possibly left: its drop starts the
     /// next pass if the gate still passes, rather than waiting for a manifest commit.
     capped: bool,
-    /// When the next block may be punched (monotonic nanoseconds).
-    next_at: u64,
 }
 
 impl PunchPass {
@@ -173,7 +177,6 @@ impl PunchPass {
             shared,
             punched: 0,
             capped: false,
-            next_at: 0,
         }
     }
 }
@@ -206,8 +209,9 @@ impl Task for PunchPass {
         }
         let simulated = self.shared.vfs.clock_is_simulated();
         let now = self.shared.vfs.monotonic_nanos();
-        if !simulated && now < self.next_at {
-            return TaskPoll::SleepUntil(self.next_at);
+        let next_at = punch.next_at.load(Ordering::Relaxed);
+        if !simulated && now < next_at {
+            return TaskPoll::SleepUntil(next_at);
         }
         let reserve = punch.reserve(self.shared.pager.stats().file_bytes);
         match self.shared.pager.punch_free(reserve) {
@@ -221,11 +225,12 @@ impl Task for PunchPass {
                 punch.idle_at.store(0, Ordering::Relaxed);
                 let pause = u128::from(bytes) * 1_000_000_000
                     / u128::from(punch.tuning.bytes_per_sec.max(1));
-                self.next_at = now.saturating_add(u64::try_from(pause).unwrap_or(u64::MAX));
+                let next_at = now.saturating_add(u64::try_from(pause).unwrap_or(u64::MAX));
+                punch.next_at.store(next_at, Ordering::Relaxed);
                 if simulated {
                     TaskPoll::Pending
                 } else {
-                    TaskPoll::SleepUntil(self.next_at)
+                    TaskPoll::SleepUntil(next_at)
                 }
             }
             Err(e) => {
