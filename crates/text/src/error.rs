@@ -27,7 +27,11 @@ pub enum Error {
     /// The index is being repaired ([`Index::repair`](crate::Index::repair)): writes through
     /// it and searches of it fail with this while the repair runs. Retry after it finishes.
     Busy,
-    /// The index was created with another tokeniser (its name or fingerprint differs).
+    /// [`Index::pack`](crate::Index::pack) won't run now, and says why: reader processes are
+    /// attached before an index's first pack, or a rebuild is pending.
+    PackRefused(String),
+    /// The index was created with another tokeniser (its name or fingerprint differs), or
+    /// holds a posting block in a format this build doesn't read.
     Mismatch(String),
     /// The index's rows don't parse.
     Corruption(String),
@@ -66,7 +70,7 @@ impl Error {
             Error::InvalidArgument(_) | Error::InvalidQuery { .. } | Error::Mismatch(_) => {
                 ErrorCode::InvalidArgument
             }
-            Error::Busy => ErrorCode::Busy,
+            Error::Busy | Error::PackRefused(_) => ErrorCode::Busy,
             Error::Corruption(_) => ErrorCode::Corruption,
         }
     }
@@ -79,7 +83,8 @@ impl fmt::Display for Error {
             Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Error::InvalidQuery { at, reason } => write!(f, "invalid query at byte {at}: {reason}"),
             Error::Busy => f.write_str("the index is being repaired"),
-            Error::Mismatch(m) => write!(f, "tokeniser mismatch: {m}"),
+            Error::PackRefused(m) => write!(f, "the index can't be packed now: {m}"),
+            Error::Mismatch(m) => write!(f, "mismatch: {m}"),
             Error::Corruption(m) => write!(f, "index corruption: {m}"),
         }
     }

@@ -23,6 +23,7 @@ pub pigeonhole_text::Error::InvalidArgument(alloc::string::String)
 pub pigeonhole_text::Error::InvalidQuery::at: usize
 pub pigeonhole_text::Error::InvalidQuery::reason: pigeonhole_text::QueryErrorKind
 pub pigeonhole_text::Error::Mismatch(alloc::string::String)
+pub pigeonhole_text::Error::PackRefused(alloc::string::String)
 impl pigeonhole_text::Error
 pub fn pigeonhole_text::Error::code(&self) -> pigeonhole::error::ErrorCode
 impl core::convert::From<pigeonhole::error::Error> for pigeonhole_text::Error
@@ -69,6 +70,9 @@ pub fn pigeonhole_text::Index::open_reader_with_tokenizer(&pigeonhole::db::Pigeo
 pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
 pub fn pigeonhole_text::Index::over_table(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
+pub fn pigeonhole_text::Index::pack(&self) -> pigeonhole_text::Result<pigeonhole_text::PackStats>
+pub fn pigeonhole_text::Index::pack_pending(&self) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::pack_with(&self, pigeonhole_text::PackOptions, impl core::ops::function::FnMut(&pigeonhole_text::PackStats) -> core::ops::control_flow::ControlFlow<()>) -> pigeonhole_text::Result<pigeonhole_text::PackStats>
 pub fn pigeonhole_text::Index::pending_rebuilds(&pigeonhole::db::Pigeonhole) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
 pub fn pigeonhole_text::Index::put_in(&self, &mut pigeonhole::write::Transaction, &[u8], &str) -> pigeonhole_text::Result<()>
@@ -106,15 +110,26 @@ pub pigeonhole_text::IndexStats::counter_drift: u64
 pub pigeonhole_text::IndexStats::documents: u64
 pub pigeonhole_text::IndexStats::forward_mismatch: u64
 pub pigeonhole_text::IndexStats::invalid_utf8: u64
+pub pigeonhole_text::IndexStats::packed: u64
 pub pigeonhole_text::IndexStats::postings: u64
 pub pigeonhole_text::IndexStats::source_mismatch: u64
 pub pigeonhole_text::IndexStats::terms: u64
+pub pigeonhole_text::IndexStats::tombstones: u64
 impl pigeonhole_text::IndexStats
 pub fn pigeonhole_text::IndexStats::is_consistent(&self) -> bool
 #[non_exhaustive] pub struct pigeonhole_text::Match
 pub pigeonhole_text::Match::clause: usize
 pub pigeonhole_text::Match::occurrence: u32
 pub pigeonhole_text::Match::range: core::ops::range::Range<usize>
+#[non_exhaustive] pub struct pigeonhole_text::PackOptions
+impl pigeonhole_text::PackOptions
+pub fn pigeonhole_text::PackOptions::new() -> Self
+pub fn pigeonhole_text::PackOptions::with_readers(self, bool) -> Self
+#[non_exhaustive] pub struct pigeonhole_text::PackStats
+pub pigeonhole_text::PackStats::postings: u64
+pub pigeonhole_text::PackStats::stopped: bool
+pub pigeonhole_text::PackStats::terms: u64
+pub pigeonhole_text::PackStats::tombstones: u64
 pub struct pigeonhole_text::Query
 impl pigeonhole_text::Query
 pub fn pigeonhole_text::Query::clauses(&self) -> &[pigeonhole_text::Clause]
