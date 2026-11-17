@@ -377,6 +377,12 @@ pub pigeonhole::EngineMetrics::feed_background_syncs: u64
 pub pigeonhole::EngineMetrics::feed_sidecar_syncs: u64
 pub pigeonhole::EngineMetrics::file_growth_nanos: u64
 pub pigeonhole::EngineMetrics::file_growths: u64
+pub pigeonhole::EngineMetrics::file_punch_bytes: u64
+pub pigeonhole::EngineMetrics::file_punch_nanos: u64
+pub pigeonhole::EngineMetrics::file_punch_passes: u64
+pub pigeonhole::EngineMetrics::file_punch_refusals: u64
+pub pigeonhole::EngineMetrics::file_punched_bytes: u64
+pub pigeonhole::EngineMetrics::file_punches: u64
 pub pigeonhole::EngineMetrics::flush_failures: u64
 pub pigeonhole::EngineMetrics::flushes: u64
 pub pigeonhole::EngineMetrics::group_sync_nanos: u64

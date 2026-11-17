@@ -101,6 +101,22 @@ pub struct EngineMetrics {
     pub file_growths: u64,
     /// Nanoseconds those growths held the page allocator.
     pub file_growth_nanos: u64,
+    /// Free blocks given back to the filesystem as holes
+    /// ([`Options::punch_freed`](crate::Options::punch_freed), D333). 0 with it off.
+    pub file_punches: u64,
+    /// Nanoseconds those punches took.
+    pub file_punch_nanos: u64,
+    /// Bytes those punches gave back.
+    pub file_punch_bytes: u64,
+    /// Gauge: free bytes of the file that are holes now. The file's length less this is
+    /// about what it occupies on disk; space reused since its punch no longer counts.
+    pub file_punched_bytes: u64,
+    /// Punch passes started (a background pass punches a bounded amount, paced).
+    pub file_punch_passes: u64,
+    /// Punches that failed. A filesystem that cannot punch fails once, and punching stops
+    /// until the next open; one that keeps failing otherwise retries only as free space
+    /// grows. Many of these point at the filesystem, not the database.
+    pub file_punch_refusals: u64,
     /// File reads made synchronously inside async reads: a separated value too large to
     /// cache, a block the cache could not keep, or a read that missed too often. 0 when
     /// async reads never block their executor thread.
@@ -395,6 +411,12 @@ impl EngineMetrics {
             block_cache_pinned_warnings: m.block_cache_pinned_warnings,
             file_growths: m.file_growths.0,
             file_growth_nanos: m.file_growths.1,
+            file_punches: m.file_punches.0,
+            file_punch_nanos: m.file_punches.1,
+            file_punch_bytes: m.file_punch_bytes,
+            file_punched_bytes: m.file_punched_bytes,
+            file_punch_passes: m.file_punch_passes.0,
+            file_punch_refusals: m.file_punch_passes.1,
             async_sync_reads: m.async_sync_reads,
             shard_busy_nanos: m.shard_busy_nanos,
             memtable_bytes: m.memtable_bytes,
@@ -441,12 +463,6 @@ pub(crate) fn internal(
         ("wal_rollover_blocks", m.wal_rollover_blocks),
         ("file_growths_ahead", m.file_growths_ahead.0),
         ("file_growth_ahead_nanos", m.file_growths_ahead.1),
-        ("file_punches", m.file_punches.0),
-        ("file_punch_nanos", m.file_punches.1),
-        ("file_punch_bytes", m.file_punch_bytes),
-        ("file_punched_bytes", m.file_punched_bytes),
-        ("file_punch_passes", m.file_punch_passes.0),
-        ("file_punch_refusals", m.file_punch_passes.1),
         ("default_ts_lead_micros", m.default_ts_lead_micros.0),
         ("max_default_ts_lead_micros", m.default_ts_lead_micros.1),
         ("shard_parks", m.shard_idle.0),
@@ -693,6 +709,17 @@ mod tests {
         assert_eq!((e.pacing_stalls, e.pacing_stall_nanos), (33, 34));
         assert_eq!((e.block_cache_hits, e.block_cache_misses), (7, 8));
         assert_eq!((e.file_growths, e.file_growth_nanos), (11, 12));
+        assert_eq!(
+            [
+                e.file_punches,
+                e.file_punch_nanos,
+                e.file_punch_bytes,
+                e.file_punched_bytes,
+                e.file_punch_passes,
+                e.file_punch_refusals
+            ],
+            [51, 52, 53, 54, 55, 56]
+        );
         assert_eq!((e.threads_started, e.threads_pinned), (17, 3));
         assert_eq!(e.cross_shard.rounds, 22);
 
@@ -706,18 +733,6 @@ mod tests {
         assert_eq!(
             (get("file_growths_ahead"), get("file_growth_ahead_nanos")),
             (Some(13), Some(14))
-        );
-        assert_eq!(
-            [
-                "file_punches",
-                "file_punch_nanos",
-                "file_punch_bytes",
-                "file_punched_bytes",
-                "file_punch_passes",
-                "file_punch_refusals"
-            ]
-            .map(get),
-            [51, 52, 53, 54, 55, 56].map(Some)
         );
         assert_eq!(
             (get("shard_parks"), get("shard_wakes")),
