@@ -670,3 +670,343 @@ fn a_node_owning_two_partitions_of_an_index_serves_each_part_on_its_own() {
         }
     });
 }
+
+/// `Text.Put` through `port`, tried again while the partitions are still making the index
+/// at their reconcile.
+async fn put_text(port: u16, index: &str, id: &str, text: &str) {
+    let mut api = TextClient::new(channel(port).await);
+    let put = TextPutRequest {
+        index: index.into(),
+        id: id.as_bytes().to_vec().into(),
+        text: text.into(),
+    };
+    let mut tries = 0;
+    while let Err(e) = api.put(put.clone()).await {
+        tries += 1;
+        assert!(tries < 200, "{e}");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// A skewed corpus over `users`' two ranges (p1 below "m", p2 from it): `alpha` is rare in
+/// p1 and in most of p2, `beta` the other way round, and `zeta` is in p2's `z` documents
+/// only. With each partition's own statistics, the two would rank differently.
+fn skewed_corpus() -> Vec<(String, String)> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let mut docs = Vec::new();
+    let mut doc = |id: String, words: &[(&str, u64)], next: &mut dyn FnMut(u64) -> u64| {
+        let mut text = vec!["pad"; 4 + next(8) as usize];
+        for (word, in_100) in words {
+            for _ in 0..(1 + next(3)) {
+                if next(100) < *in_100 {
+                    text.push(word);
+                }
+            }
+        }
+        let last = text.len() - 1;
+        text.swap(0, last);
+        docs.push((id, text.join(" ")));
+    };
+    for i in 0..40 {
+        let words = [("alpha", 10), ("beta", 70), ("gamma", 40)];
+        doc(format!("a{i:03}"), &words, &mut next);
+    }
+    for i in 0..120 {
+        let words = [("alpha", 80), ("beta", 5), ("gamma", 40)];
+        doc(format!("n{i:03}"), &words, &mut next);
+    }
+    for i in 0..10 {
+        let words = [("alpha", 30), ("zeta", 90), ("beta", 50)];
+        doc(format!("z{i:03}"), &words, &mut next);
+    }
+    docs
+}
+
+/// #1722 PR 2b: a text search across an index's partitions gives the hits and scores one
+/// index holding every document gives (a reference index on a database of its own, made
+/// with the same options): terms, a phrase, a fuzzy term and mixes, with `id_prefix`
+/// inside one range and across both, a term only one partition holds, and a skewed corpus
+/// where each partition's own statistics would score differently. A fuzzy term cut at
+/// `max_expansions` is flagged. An index on one partition answers in one round. With a partition's node stopped, a search fails unless it
+/// has `allow_partial`, which scores with the partitions that answered, names what it
+/// missed, and sets `partial` whenever anything is missing.
+#[test]
+fn a_text_search_across_partitions_scores_as_one_index() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    // A new index fills from its source in the background, and a strict search on a
+    // partition still filling answers Unavailable, so each step waits for its fill.
+    let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.rebuild_pending().unwrap())
+    };
+    let reference = test_dir();
+    let db = pigeonhole::Pigeonhole::open(reference.join("ref.db"), pigeonhole::Options::default())
+        .unwrap();
+    let table = db
+        .table("users")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    let options = crate::serve::texts::options(&text_index("ut")).unwrap();
+    let one = pigeonhole_text::Index::create(
+        &db,
+        "ut",
+        pigeonhole_text::Source::new(&table, "f", b"body"),
+        options,
+    )
+    .unwrap();
+    // A fuzzy term with more than `max_expansions` (50) terms one edit from `abcd`, half of
+    // them in each partition.
+    let mut variants: Vec<String> = Vec::new();
+    for ch in b'a'..=b'z' {
+        let ch = char::from(ch);
+        if ch != 'c' {
+            variants.push(format!("ab{ch}d"));
+        }
+        if ch != 'd' {
+            variants.push(format!("abc{ch}"));
+        }
+    }
+    variants.push("abcde".into());
+    variants.push("abc".into());
+    assert!(variants.len() > 50);
+    let mut docs = skewed_corpus();
+    for (i, v) in variants.iter().enumerate() {
+        let id = if i % 2 == 0 { "c" } else { "q" };
+        docs.push((format!("{id}{i:03}"), format!("{v} pad pad")));
+    }
+    for (id, text) in &docs {
+        one.put(id.as_bytes(), text).unwrap();
+    }
+    rt.block_on(async {
+        users_family(a).await;
+        TextClient::new(channel(c).await)
+            .create_index(text_index("ut"))
+            .await
+            .unwrap();
+        eventually("both partitions fill ut", async || {
+            filled(&p1, "ut") && filled(&p2, "ut")
+        })
+        .await;
+        for (id, text) in &docs {
+            put_text(c, "ut", id, text).await;
+        }
+        let mut api = TextClient::new(channel(c).await);
+        let search = |syntax: &str, prefix: &str| crate::serve::proto::TextSearchRequest {
+            index: "ut".into(),
+            query: Some(crate::serve::proto::text_search_request::Query::Syntax(
+                syntax.into(),
+            )),
+            k: 10,
+            id_prefix: prefix.as_bytes().to_vec().into(),
+            ..Default::default()
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+        for syntax in [
+            "alpha",
+            "beta",
+            "zeta",
+            "alpha beta gamma",
+            "zeta alpha",
+            "\"alpha beta\"",
+            "alhpa~1 gamma",
+            "zeta~1",
+        ] {
+            for prefix in ["", "a", "n", "z"] {
+                let got = api
+                    .search(search(syntax, prefix))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let mut s = one.search(syntax, 10);
+                if !prefix.is_empty() {
+                    s = s.id_prefix(prefix.as_bytes().to_vec());
+                }
+                let want = s.run().unwrap();
+                let ids = |h: &[crate::serve::proto::TextHit]| -> Vec<Vec<u8>> {
+                    h.iter().map(|h| h.id.to_vec()).collect()
+                };
+                let want_ids: Vec<Vec<u8>> = want.iter().map(|h| h.id.clone()).collect();
+                assert_eq!(ids(&got.hits), want_ids, "{syntax:?} under {prefix:?}");
+                for (g, w) in got.hits.iter().zip(&want) {
+                    assert!(
+                        close(g.score, w.score),
+                        "{syntax:?}: {} vs {}",
+                        g.score,
+                        w.score
+                    );
+                }
+                assert!(!got.partial && got.missing.is_empty() && got.cut_clauses.is_empty());
+                // Something to compare: every query matches across both ranges, and `zeta`
+                // (in p2's `z` documents only) under `z`.
+                if prefix.is_empty() || (syntax.starts_with("zeta") && prefix == "z") {
+                    assert!(!got.hits.is_empty(), "{syntax:?} under {prefix:?}");
+                }
+            }
+        }
+        // The round matters: p1's own statistics score its `alpha` documents otherwise.
+        let local = pigeonhole_text::Index::open(&p1, "ut")
+            .unwrap()
+            .search("alpha", 10)
+            .run()
+            .unwrap();
+        let global = api.search(search("alpha", "a")).await.unwrap().into_inner();
+        assert_eq!(local[0].id, global.hits[0].id.to_vec());
+        assert!(!close(local[0].score, global.hits[0].score));
+
+        // The cut: flagged on the cluster as on the one index (its expansions may differ).
+        let got = api.search(search("abcd~1", "")).await.unwrap().into_inner();
+        assert_eq!(got.cut_clauses, [0]);
+        let (_, one_stats) = one.search("abcd~1", 10).run_with_stats().unwrap();
+        assert!(one_stats.fuzzy[0].cut);
+
+        // An index on one partition: one round, its own statistics the whole index's.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "solo".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: Vec::new(),
+                    partitions: vec!["p1".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        TextClient::new(channel(c).await)
+            .create_index(CreateTextIndexRequest {
+                source_table: "solo".into(),
+                ..text_index("st")
+            })
+            .await
+            .unwrap();
+        eventually("p1 fills st", async || filled(&p1, "st")).await;
+        for (id, text) in docs.iter().take(30) {
+            put_text(c, "st", id, text).await;
+        }
+        let got = api
+            .search(crate::serve::proto::TextSearchRequest {
+                index: "st".into(),
+                ..search("alpha beta", "")
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let own = pigeonhole_text::Index::open(&p1, "st")
+            .unwrap()
+            .search("alpha beta", 10)
+            .run()
+            .unwrap();
+        assert!(!own.is_empty());
+        assert_eq!(got.hits.len(), own.len());
+        for (g, w) in got.hits.iter().zip(&own) {
+            assert_eq!(g.id.to_vec(), w.id);
+            assert!(close(g.score, w.score));
+        }
+
+        // And one on p2 only, for a search that misses only its one round below.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "solo2".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: Vec::new(),
+                    partitions: vec!["p2".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        TextClient::new(channel(c).await)
+            .create_index(CreateTextIndexRequest {
+                source_table: "solo2".into(),
+                ..text_index("st2")
+            })
+            .await
+            .unwrap();
+        eventually("p2 fills st2", async || filled(&p2, "st2")).await;
+        put_text(c, "st2", "x1", "alpha pad").await;
+
+        // b (p2, from "m") stops. A search needs every partition's statistics, so even one
+        // whose prefix is in p1 fails, unless it allows a partial answer.
+        stops.remove(1).send(()).unwrap();
+        let mut api = TextClient::new(channel(a).await);
+        let e = api.search(search("alpha", "a")).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("partition p2"), "{e}");
+        let partial = |syntax: &str, prefix: &str| crate::serve::proto::TextSearchRequest {
+            allow_partial: true,
+            ..search(syntax, prefix)
+        };
+        let got = api
+            .search(partial("alpha", "a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.partial);
+        assert!(got.missing.is_empty(), "{:?}", got.missing);
+        assert!(!got.hits.is_empty());
+        assert!(got.hits.iter().all(|h| h.id.starts_with(b"a")));
+        // Scored with p1's statistics alone: p1's own scores.
+        let own = pigeonhole_text::Index::open(&p1, "ut")
+            .unwrap()
+            .search("alpha", 10)
+            .id_prefix(b"a".to_vec())
+            .run()
+            .unwrap();
+        assert_eq!(got.hits.len(), own.len());
+        for (g, w) in got.hits.iter().zip(&own) {
+            assert_eq!(g.id.to_vec(), w.id);
+            assert!(close(g.score, w.score));
+        }
+        let got = api.search(partial("alpha", "")).await.unwrap().into_inner();
+        assert!(got.partial);
+        assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+        let m = &got.missing[0];
+        assert_eq!(
+            (
+                m.partition.as_str(),
+                m.table.as_str(),
+                &m.start[..],
+                &m.end[..]
+            ),
+            ("p2", "ut", &b"m"[..], &b""[..])
+        );
+        assert!(got.hits.iter().all(|h| h.id.as_ref() < &b"m"[..]));
+        // Missing only round 2 (an index on one partition has no round 1): `partial` too,
+        // so a client reading it alone never takes a short answer as whole.
+        let solo2 = |allow_partial| crate::serve::proto::TextSearchRequest {
+            index: "st2".into(),
+            allow_partial,
+            ..search("alpha", "")
+        };
+        let e = api.search(solo2(false)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let got = api.search(solo2(true)).await.unwrap().into_inner();
+        assert!(got.hits.is_empty());
+        assert!(got.partial);
+        assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+        assert_eq!(
+            (
+                got.missing[0].partition.as_str(),
+                got.missing[0].table.as_str()
+            ),
+            ("p2", "st2")
+        );
+    });
+}

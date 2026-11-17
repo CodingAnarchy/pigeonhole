@@ -284,7 +284,7 @@ fn start_of(
         })
 }
 
-fn missing(table: &str, r: &PartRange) -> MissingRange {
+pub(super) fn missing(table: &str, r: &PartRange) -> MissingRange {
     MissingRange {
         partition: r.partition.clone(),
         table: table.to_owned(),
@@ -294,7 +294,7 @@ fn missing(table: &str, r: &PartRange) -> MissingRange {
 }
 
 /// Whether `e` lets an `allow_partial` read skip the partition.
-fn skippable(e: &ApiError) -> bool {
+pub(super) fn skippable(e: &ApiError) -> bool {
     e.code == "PartitionUnavailable"
 }
 

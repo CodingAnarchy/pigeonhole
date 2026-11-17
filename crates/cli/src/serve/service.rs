@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use pigeonhole::{KeySet, KeysPosition, Pigeonhole, RowPosition, ScanPosition, Table};
+use pigeonhole_text::QueryStats;
 use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
@@ -93,6 +94,11 @@ pub(crate) enum ServiceOp {
     /// one's own spanning recall ([`Service::fanout_part`]).
     RecallPool(proto::RecallPoolRequest),
     RecallBodies(proto::RecallBodiesRequest),
+    /// A text search's rounds on one partition of its index (#1722 PR 2b, ICR 0138): only
+    /// from another node, or this one's own search across the partitions
+    /// ([`Service::fanout_part`]).
+    TextStats(proto::TextStatsRequest),
+    TextSearchPart(proto::TextSearchPartRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -135,6 +141,7 @@ pub(crate) enum ServiceReply {
     MemoryWatch(super::memory::MemoryEvents),
     RecallPool(proto::RecallPoolResponse),
     RecallBodies(proto::RecallBodiesResponse),
+    TextStats(proto::TextStatsResponse),
     /// A unary read's reply with its share of `--inflight-bytes` (#1567): held until the
     /// reply's body has been written ([`super::charge`]).
     Charged(Box<ServiceReply>, super::charge::Charge),
@@ -324,6 +331,8 @@ impl ServiceOp {
             Self::MemoryWatch(_) => MEMORY_WATCH,
             Self::RecallPool(_) => 50,
             Self::RecallBodies(_) => 51,
+            Self::TextStats(_) => 52,
+            Self::TextSearchPart(_) => 53,
         }
     }
 
@@ -382,6 +391,8 @@ impl ServiceOp {
             | Self::VectorVerify(_)
             | Self::TextSearch(_)
             | Self::TextVerify(_)
+            | Self::TextStats(_)
+            | Self::TextSearchPart(_)
             | Self::Recall(_)
             | Self::RecallPool(_)
             | Self::RecallBodies(_)
@@ -476,6 +487,8 @@ impl ServiceOp {
             Self::MemoryWatch(r) => r.encoded_len(),
             Self::RecallPool(r) => r.encoded_len(),
             Self::RecallBodies(r) => r.encoded_len(),
+            Self::TextStats(r) => r.encoded_len(),
+            Self::TextSearchPart(r) => r.encoded_len(),
         }
     }
 
@@ -500,6 +513,8 @@ impl ServiceOp {
                 | Self::Nearest(_)
                 | Self::VectorSearch(_)
                 | Self::TextSearch(_)
+                | Self::TextStats(_)
+                | Self::TextSearchPart(_)
                 | Self::Recall(_)
                 | Self::RecallPool(_)
                 | Self::RecallBodies(_)
@@ -687,7 +702,7 @@ fn step_recall(r: Option<proto::RecallRequest>) -> Result<crate::memcore::Recall
         .and_then(super::memory::recall)
 }
 
-pub(crate) const RPCS: [&str; 52] = [
+pub(crate) const RPCS: [&str; 54] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -742,6 +757,10 @@ pub(crate) const RPCS: [&str; 52] = [
     // client's call.
     "Memory.RecallPool",
     "Memory.RecallBodies",
+    // A text search's rounds across an index's partitions (#1722 PR 2b): served for
+    // another node's search, never a client's call.
+    "Text.Stats",
+    "Text.SearchPart",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -2336,6 +2355,20 @@ impl Service {
                     .await
                     .map_err(ApiError::for_read)
             }
+            ServiceOp::TextStats(r) => {
+                drop(budget);
+                self.text_stats(r)
+                    .await
+                    .map(ServiceReply::TextStats)
+                    .map_err(ApiError::for_read)
+            }
+            ServiceOp::TextSearchPart(r) => {
+                drop(budget);
+                self.text_search_part(r)
+                    .await
+                    .map(ServiceReply::TextSearch)
+                    .map_err(ApiError::for_read)
+            }
             ServiceOp::MemoryWatch(r) => {
                 drop(budget);
                 self.memory_watch(r, caller)
@@ -2539,9 +2572,19 @@ impl Service {
                 .recall_bodies(r, caller)
                 .await
                 .map_err(ApiError::for_read),
+            ServiceOp::TextStats(r) => self
+                .text_stats(r)
+                .await
+                .map(ServiceReply::TextStats)
+                .map_err(ApiError::for_read),
+            ServiceOp::TextSearchPart(r) => self
+                .text_search_part(r)
+                .await
+                .map(ServiceReply::TextSearch)
+                .map_err(ApiError::for_read),
             _ => Err(ApiError::internal(
                 "a fan-out's local part is a multi-get, a nearest search, an index's search or \
-                 check, or a recall's step",
+                 check, a text search's round, or a recall's step",
             )),
         }
     }
@@ -3671,19 +3714,86 @@ impl Service {
         &self,
         r: proto::TextSearchRequest,
     ) -> Result<proto::TextSearchResponse, ApiError> {
+        self.text_search_with(r, None, false).await
+    }
+
+    /// A search's round 2 on one partition of a text index across several (#1722 PR 2b,
+    /// ICR 0138): its top `k`, scored with every partition's statistics merged. Without
+    /// statistics (an index on one partition), its own: the whole index's.
+    async fn text_search_part(
+        &self,
+        r: proto::TextSearchPartRequest,
+    ) -> Result<proto::TextSearchResponse, ApiError> {
+        let search = r
+            .search
+            .ok_or_else(|| ApiError::invalid("a text search's part carries no search"))?;
+        let stats = if r.stats.is_empty() {
+            None
+        } else {
+            Some(unreadable_stats(QueryStats::from_bytes(&r.stats))?)
+        };
+        self.text_search_with(search, stats, true).await
+    }
+
+    /// A text search, with `stats` to score with (round 2 across partitions), or reading
+    /// its own. `part`: a partition's part of a search across the index's partitions,
+    /// which a partition whose index is still filling can't answer.
+    async fn text_search_with(
+        &self,
+        r: proto::TextSearchRequest,
+        stats: Option<QueryStats>,
+        part: bool,
+    ) -> Result<proto::TextSearchResponse, ApiError> {
         if r.k == 0 || r.k > MAX_NEAREST_K {
             return Err(ApiError::invalid(format!("k is 1 to {MAX_NEAREST_K}")));
         }
         let query = super::texts::query(&r)?;
         let index = self.text_index(&r.index).await?;
         self.blocking(move || {
+            if part {
+                filled(&index, &r.index)?;
+            }
             let mut s = index.search(query, r.k as usize).highlight(r.highlight);
             if !r.id_prefix.is_empty() {
                 s = s.id_prefix(r.id_prefix.to_vec());
             }
-            let hits = s.run()?;
+            if let Some(stats) = stats {
+                s = s.stats(stats);
+            }
+            let (hits, stats) = s.run_with_stats()?;
             Ok(proto::TextSearchResponse {
                 hits: hits.into_iter().map(super::texts::hit).collect(),
+                cut_clauses: stats
+                    .fuzzy
+                    .iter()
+                    .filter(|f| f.cut)
+                    .map(|f| u32::try_from(f.clause).unwrap_or(u32::MAX))
+                    .collect(),
+                ..Default::default()
+            })
+        })
+        .await
+    }
+
+    /// A search's round 1 on one partition of a text index across several (#1722 PR 2b,
+    /// ICR 0138): the partition's statistics for the query, read at one snapshot, as
+    /// `QueryStats`' versioned bytes. `k` and `id_prefix` don't change them.
+    async fn text_stats(
+        &self,
+        r: proto::TextStatsRequest,
+    ) -> Result<proto::TextStatsResponse, ApiError> {
+        let r = r
+            .search
+            .ok_or_else(|| ApiError::invalid("a text search's statistics carry no search"))?;
+        let query = super::texts::query(&r)?;
+        let index = self.text_index(&r.index).await?;
+        self.blocking(move || {
+            filled(&index, &r.index)?;
+            // `k` doesn't change the statistics (nor do `id_prefix` or `highlight`), so
+            // the request's isn't checked here: the node called checked it once.
+            let stats = index.search(query, 1).query_stats()?;
+            Ok(proto::TextStatsResponse {
+                stats: stats.to_bytes().into(),
             })
         })
         .await
@@ -5197,6 +5307,31 @@ fn create_in(
     })
 }
 
+/// A text index's partition can answer a search's round only once it's filled: a cluster
+/// creates its indexes unfilled, and fills them from the source in the background (#1722
+/// PR 1a). Until then its statistics and hits would be short. `Unavailable`, which an
+/// `allow_partial` search skips as it does an unreachable partition.
+fn filled(index: &pigeonhole_text::Index, name: &str) -> Result<(), ApiError> {
+    if index.rebuild_pending()? {
+        return Err(ApiError::unavailable(format!(
+            "text index {name:?} is still filling from its source on this partition"
+        )));
+    }
+    Ok(())
+}
+
+/// Another node's `QueryStats` bytes, or `FailedPrecondition`: a version this build doesn't
+/// read (the nodes' builds differ), or bytes it refuses.
+pub(crate) fn unreadable_stats(
+    stats: pigeonhole_text::Result<QueryStats>,
+) -> Result<QueryStats, ApiError> {
+    stats.map_err(|e| {
+        ApiError::failed_precondition(format!(
+            "a text search's statistics from another node that this node can't read: {e}"
+        ))
+    })
+}
+
 /// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
 /// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
 fn reserved(name: &str) -> Result<(), ApiError> {
@@ -5207,4 +5342,40 @@ fn reserved(name: &str) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod text_part_tests {
+    use super::filled;
+    use pigeonhole::{Family, Options, Pigeonhole};
+    use pigeonhole_text::{Index, IndexOptions, Source};
+
+    /// #1722 PR 2b: a partition whose text index is still filling from its source (a
+    /// cluster creates it unfilled) can't answer a search's round: `Unavailable`, which an
+    /// `allow_partial` search skips. Once filled, it answers.
+    #[test]
+    fn a_text_index_still_filling_answers_no_round() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let table = db
+            .table("docs")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let index = Index::create_unfilled(
+            &db,
+            "x",
+            Source::new(&table, "f", b"body"),
+            IndexOptions::new(),
+        )
+        .unwrap();
+        let e = filled(&index, "x").unwrap_err();
+        assert_eq!(e.code, "Unavailable", "{}", e.message);
+        assert!(e.message.contains("still filling"), "{}", e.message);
+        index
+            .resume_rebuild_with(|_| std::ops::ControlFlow::Continue(()))
+            .unwrap();
+        filled(&index, "x").unwrap();
+    }
 }
