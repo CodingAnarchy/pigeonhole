@@ -462,6 +462,15 @@ text-phrase-slop2 32085657 0.3
 # counts times 1.003. New shapes; no existing line changed (coordinator 2026-11-15).
 text-two-terms-prefix-none 126007 0.3
 text-fuzzy-prefix-none 4222924 0.3
+# #1585 PR 3b (#2009): the hub, two-term and phrase searches on a packed index (layout version
+# 2, ICR 0143), in crates/bench/examples/textpacked.rs. From the instructions run 44030799563
+# on 1227b02aa (ubuntu-26.04, rustc 1.100.0), head counts times 1.003: 3898721, 14620012 and
+# 16675984. textpacked builds its index natively, outside valgrind, by copying the textshapes
+# index and packing it, as textshapes builds its own. In that run text-term-hub counted
+# 53370070, 13.7 times text-term-hub-packed. New shapes; no existing line changed (D195).
+text-term-hub-packed 3910417 0.3
+text-two-terms-packed 14663872 0.3
+text-phrase-packed 16726011 0.3
 # #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
 # a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
 # identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
