@@ -410,7 +410,8 @@ fn a_phrase_scores_the_same_by_point_reads_by_walking_and_across_the_switch() {
     let bm = Bm25::new(&model);
     for phrase in [
         // The lead in 6 documents beside one in 600: 6 × 14 point reads cost less than
-        // walking 600 postings. Its lengths: point reads, then the walk.
+        // walking 600 postings. Its lengths switch to the walk at the first lookup (14 is
+        // more than the 6 postings left); the phrases below cover their point reads.
         vec!["vector", "store"],
         // The lead in 200 beside one in 600: the walk from the start. Its lengths: point
         // reads for the first matches, then the walk.
