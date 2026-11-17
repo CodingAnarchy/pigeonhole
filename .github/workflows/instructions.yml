@@ -31,6 +31,8 @@ on:
       - 'crates/bench/examples/textshapes.rs'
       - 'crates/bench/examples/textpacked.rs'
       - 'crates/bench/examples/feedshapes.rs'
+      - 'crates/bench/examples/memshapes.rs'
+      - 'crates/memory/**'
       - 'crates/bench/examples/serveshapes.rs'
       - 'crates/cli/src/serve/**'
       # The serve path is mostly third-party code (tonic, axum, hyper, h2): a dependency bump
@@ -185,15 +187,18 @@ jobs:
             shapes: >-
               textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2,text-two-terms-prefix-none,text-fuzzy-prefix-none
               textpacked:text-term-hub-packed,text-two-terms-packed,text-phrase-packed
-          - name: feed and replication instructions per commit (callgrind)
+          - name: feed, replication and memory instructions per unit (callgrind)
             # The change feed's drain and a replica's apply (#1828,
             # crates/bench/examples/feedshapes.rs): commits written in setup, drained or
             # applied in the measured part. `replicate-apply` last: its setup (a primary and
-            # its feed) is the fullest.
-            examples: feedshapes
+            # its feed) is the fullest. Agent memory's fused recall (#1828,
+            # crates/bench/examples/memshapes.rs): memories written in setup, recalled in the
+            # measured part.
+            examples: feedshapes memshapes
             hotrow: '-'
             shapes: >-
               feedshapes:feed-drain,feed-drain-all,replicate-apply
+              memshapes:memory-recall
           - name: phdb serve instructions per call (callgrind)
             # `phdb serve`'s gRPC calls through its router in process (#1828,
             # crates/bench/examples/serveshapes.rs): the token check, prepay, decode,
