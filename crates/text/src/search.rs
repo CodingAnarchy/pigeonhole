@@ -9,7 +9,8 @@ use crate::fuzzy::{Expansion, edits, expand};
 use crate::highlight::{Match, Want, find};
 use crate::index::{Index, Rows};
 use crate::layout::*;
-use crate::maxscore::{Bm25, Scored};
+use crate::maxscore::{Blocking, Bm25, Scored, sync};
+use crate::merged::{Merged, Side, Tier};
 use crate::query::{Clause, Fuzziness, Query};
 
 /// One search result.
@@ -194,10 +195,12 @@ impl<'a> Search<'a> {
                 &owned
             }
         };
-        let t = &inn.table;
-        if t.get_at(s, GLOBAL, META, REPAIR)?.is_some() {
-            return Err(Error::Busy);
-        }
+        // The index's state, in one read ([`REPAIR`]): a repair running, or the layout.
+        let packed = match inn.table.get_at(s, GLOBAL, META, REPAIR)? {
+            None => false,
+            Some(c) => crate::index::packed_state(c.value())?,
+        };
+        let t = index.rows(packed)?;
         let mut r = self.resolve()?;
         if self.k == 0 || (r.terms.is_empty() && r.phrases.is_empty() && r.fuzzy.is_empty()) {
             return Ok((Vec::new(), SearchStats::default()));
@@ -262,7 +265,7 @@ impl<'a> Search<'a> {
         // The phrases, scored up front (D309 §4.2): their bounds are their actual maxima.
         let mut phrase_scores = Vec::with_capacity(r.phrases.len());
         for phrase in &r.phrases {
-            phrase_scores.push(score_phrase(t, s, &bm, &df_of, phrase, prefix)?);
+            phrase_scores.push(score_phrase(t, s, &bm, &df_of, phrase, prefix, packed)?);
         }
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
         // A stale hit (its source deleted around the index) is skipped and the next one takes
@@ -273,7 +276,7 @@ impl<'a> Search<'a> {
             for term in &r.terms {
                 let df = df_of[term];
                 if df > 0 {
-                    clauses.push(Scored::term(t, s, &bm, term, df, prefix)?);
+                    clauses.push(Scored::term(t, s, &bm, term, df, prefix, packed)?);
                 }
             }
             for exps in &expanded {
@@ -287,7 +290,7 @@ impl<'a> Search<'a> {
                         .iter()
                         .map(|e| (e.term.as_str(), df, e.df.max(0) as u64, e.boost))
                         .collect();
-                    clauses.push(Scored::fuzzy(t, s, &bm, &e, prefix)?);
+                    clauses.push(Scored::fuzzy(t, s, &bm, &e, prefix, packed)?);
                 }
             }
             for ps in &phrase_scores {
@@ -389,10 +392,11 @@ impl<'a> Search<'a> {
                 &owned
             }
         };
-        let t = &inn.table;
-        if t.get_at_async(s, GLOBAL, META, REPAIR).await?.is_some() {
-            return Err(Error::Busy);
-        }
+        let packed = match inn.table.get_at_async(s, GLOBAL, META, REPAIR).await? {
+            None => false,
+            Some(c) => crate::index::packed_state(c.value())?,
+        };
+        let t = index.rows(packed)?;
         let mut r = self.resolve()?;
         if self.k == 0 || (r.terms.is_empty() && r.phrases.is_empty() && r.fuzzy.is_empty()) {
             return Ok((Vec::new(), SearchStats::default()));
@@ -472,8 +476,9 @@ impl<'a> Search<'a> {
         let prefix = self.prefix.as_deref();
         let mut phrase_scores = Vec::with_capacity(r.phrases.len());
         for phrase in &r.phrases {
-            phrase_scores
-                .push(score_phrase_async(t, s, &bm, &df_of, phrase, prefix, &mut budget).await?);
+            phrase_scores.push(
+                score_phrase_async(t, s, &bm, &df_of, phrase, prefix, packed, &mut budget).await?,
+            );
         }
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
         let mut want = self.k;
@@ -491,6 +496,7 @@ impl<'a> Search<'a> {
                         bm.idf(df),
                         df.max(0) as u64,
                         prefix,
+                        packed,
                     )
                     .await?;
                     clauses.push(Scored::of_term(w));
@@ -511,6 +517,7 @@ impl<'a> Search<'a> {
                                 e.boost * bm.idf(df),
                                 e.df.max(0) as u64,
                                 prefix,
+                                packed,
                             )
                             .await?,
                         );
@@ -692,39 +699,180 @@ fn score_phrase(
     df_of: &HashMap<String, i64>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
+    packed: bool,
+) -> Result<BTreeMap<Vec<u8>, f64>> {
+    let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
+        return Ok(BTreeMap::new());
+    };
+    let row = post_row(&phrase.terms[plan.lead].0);
+    let cells = cells_of(t, s, &row, POS, prefix).cells()?;
+    if packed {
+        let lead = MergedLead::new(t, s, &row, cells, prefix)?;
+        join(t, s, bm, df_of, phrase, prefix, &plan, lead, packed)
+    } else {
+        join(t, s, bm, df_of, phrase, prefix, &plan, cells, packed)
+    }
+}
+
+/// The lead term's positions in document order: its position cells in a version 1 index
+/// (the walk the join had before #1585, monomorphized to the same code), the merged stream
+/// in a version 2 one.
+trait Lead {
+    /// A posting of the lead's, lent until the next step.
+    type At<'a>: At
+    where
+        Self: 'a;
+
+    /// The next document with the term.
+    fn next(&mut self) -> Result<Option<Self::At<'_>>>;
+}
+
+/// One posting of a [`Lead`]: its document and its encoded positions there.
+trait At {
+    fn doc(&self) -> &[u8];
+    fn positions(&self) -> &[u8];
+}
+
+impl At for pigeonhole::CellEntry<'_> {
+    #[inline(always)]
+    fn doc(&self) -> &[u8] {
+        self.qualifier
+    }
+
+    #[inline(always)]
+    fn positions(&self) -> &[u8] {
+        self.cell.value()
+    }
+}
+
+impl At for (&[u8], &[u8]) {
+    fn doc(&self) -> &[u8] {
+        self.0
+    }
+
+    fn positions(&self) -> &[u8] {
+        self.1
+    }
+}
+
+impl<'t> Lead for pigeonhole::RowCells<'t> {
+    type At<'a>
+        = pigeonhole::CellEntry<'a>
+    where
+        Self: 'a;
+
+    #[inline(always)]
+    fn next(&mut self) -> Result<Option<Self::At<'_>>> {
+        Ok(pigeonhole::RowCells::next(self)?)
+    }
+}
+
+/// A version 2 index's lead: its position cells over its blocks.
+struct MergedLead<'t> {
+    cells: pigeonhole::RowCells<'t>,
+    merged: Merged<'t>,
+    /// The posting handed out last, passed at the next call.
+    on: Option<Tier>,
+}
+
+impl<'t> MergedLead<'t> {
+    fn new(
+        t: &'t Rows,
+        s: &Snapshot,
+        row: &[u8],
+        cells: pigeonhole::RowCells<'t>,
+        prefix: Option<&[u8]>,
+    ) -> Result<Self> {
+        Ok(MergedLead {
+            cells,
+            merged: Merged::new(t, s, row, POS, prefix)?,
+            on: None,
+        })
+    }
+}
+
+impl<'t> Lead for MergedLead<'t> {
+    type At<'a>
+        = (&'a [u8], &'a [u8])
+    where
+        Self: 'a;
+
+    fn next(&mut self) -> Result<Option<Self::At<'_>>> {
+        if let Some(tier) = self.on.take() {
+            self.merged.skip(tier);
+        }
+        sync(
+            self.merged
+                .settle::<Blocking>(&mut self.cells, &mut (), None),
+        )?;
+        self.on = self.merged.head();
+        Ok(self
+            .on
+            .map(|tier| (self.merged.id(tier), self.merged.positions(tier))))
+    }
+}
+
+impl MergedLead<'_> {
+    /// [`Lead::next`] without blocking.
+    #[cfg(feature = "async")]
+    async fn next_async(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        use crate::maxscore::{Nonblocking, Polling};
+        if let Some(tier) = self.on.take() {
+            self.merged.skip(tier);
+        }
+        let (merged, cells) = (&mut self.merged, &mut self.cells);
+        std::future::poll_fn(|cx| merged.settle::<Nonblocking>(cells, &mut Polling::new(cx), None))
+            .await?;
+        self.on = self.merged.head();
+        Ok(self
+            .on
+            .map(|tier| (self.merged.id(tier), self.merged.positions(tier))))
+    }
+}
+
+/// [`score_phrase`]'s join, over the lead's stream.
+#[allow(clippy::too_many_arguments)]
+fn join(
+    t: &Rows,
+    s: &Snapshot,
+    bm: &Bm25,
+    df_of: &HashMap<String, i64>,
+    phrase: &Phrase,
+    prefix: Option<&[u8]>,
+    plan: &PhrasePlan,
+    mut lead: impl Lead,
+    packed: bool,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
-    let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
-        return Ok(scores);
-    };
     let lead_term = phrase.terms[plan.lead].0.as_str();
-    let mut lead = cells_of(t, s, &post_row(lead_term), POS, prefix).cells()?;
-    let mut others = plan.others(df_of, phrase, prefix);
+    let mut others = plan.others(df_of, phrase, prefix, packed);
     // The lead's postings, for the length of each document the phrase is in.
-    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix);
+    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix, packed);
     let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
     'docs: while let Some(e) = lead.next()? {
+        let doc = e.doc();
         for (o, list) in others.iter_mut().zip(&mut lists[1..]) {
             // A document without every term can't hold the phrase.
-            if !o.at(t, s, e.qualifier)? {
+            if !o.at(t, s, doc)? {
                 continue 'docs;
             }
             decode_positions(&o.value, list)?;
         }
-        decode_positions(e.cell.value(), &mut lists[0])?;
+        decode_positions(e.positions(), &mut lists[0])?;
         let Some(freq) = plan.freq(phrase, &lists) else {
             continue;
         };
-        if !lens.at(t, s, e.qualifier)? {
+        if !lens.at(t, s, doc)? {
             return Err(corrupt("a position has no posting"));
         }
-        scores.insert(e.qualifier.to_vec(), plan.score(bm, freq, lens.number)?);
+        scores.insert(doc.to_vec(), plan.score(bm, freq, lens.number)?);
     }
     Ok(scores)
 }
 
 /// [`score_phrase`] as a future (#1560): the same join, read without blocking.
 #[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
 async fn score_phrase_async(
     t: &Rows,
     s: &Snapshot,
@@ -732,38 +880,108 @@ async fn score_phrase_async(
     df_of: &HashMap<String, i64>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
+    packed: bool,
+    budget: &mut crate::maxscore::Budget,
+) -> Result<BTreeMap<Vec<u8>, f64>> {
+    let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
+        return Ok(BTreeMap::new());
+    };
+    let row = post_row(&phrase.terms[plan.lead].0);
+    let cells = cells_of(t, s, &row, POS, prefix).cells()?;
+    let lead = match packed {
+        true => AsyncLead::Merged(MergedLead::new(t, s, &row, cells, prefix)?),
+        false => AsyncLead::Cells(cells),
+    };
+    join_async(t, s, bm, df_of, phrase, prefix, &plan, lead, packed, budget).await
+}
+
+/// The async join's lead: a [`Lead`] by a match. A trait's async method with a lent item
+/// gives a future that isn't `Send` for every lifetime, which `run_async` promises.
+// One a phrase, held in the search's future: boxing the larger variant would only add an
+// allocation.
+#[cfg(feature = "async")]
+#[allow(clippy::large_enum_variant)]
+enum AsyncLead<'t> {
+    Cells(pigeonhole::RowCells<'t>),
+    Merged(MergedLead<'t>),
+}
+
+/// One posting of an [`AsyncLead`].
+#[cfg(feature = "async")]
+enum AsyncAt<'a> {
+    Cell(pigeonhole::CellEntry<'a>),
+    Merged((&'a [u8], &'a [u8])),
+}
+
+#[cfg(feature = "async")]
+impl AsyncLead<'_> {
+    async fn next(&mut self) -> Result<Option<AsyncAt<'_>>> {
+        Ok(match self {
+            AsyncLead::Cells(cells) => cells.next_async().await?.map(AsyncAt::Cell),
+            AsyncLead::Merged(lead) => lead.next_async().await?.map(AsyncAt::Merged),
+        })
+    }
+}
+
+#[cfg(feature = "async")]
+impl AsyncAt<'_> {
+    fn doc(&self) -> &[u8] {
+        match self {
+            AsyncAt::Cell(e) => e.doc(),
+            AsyncAt::Merged(e) => e.doc(),
+        }
+    }
+
+    fn positions(&self) -> &[u8] {
+        match self {
+            AsyncAt::Cell(e) => e.positions(),
+            AsyncAt::Merged(e) => e.positions(),
+        }
+    }
+}
+
+/// [`join`] as a future.
+#[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
+async fn join_async<'t>(
+    t: &'t Rows,
+    s: &Snapshot,
+    bm: &Bm25,
+    df_of: &HashMap<String, i64>,
+    phrase: &Phrase,
+    prefix: Option<&[u8]>,
+    plan: &PhrasePlan,
+    mut lead: AsyncLead<'t>,
+    packed: bool,
     budget: &mut crate::maxscore::Budget,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
-    let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
-        return Ok(scores);
-    };
     let lead_term = phrase.terms[plan.lead].0.as_str();
-    let mut lead = cells_of(t, s, &post_row(lead_term), POS, prefix).cells()?;
-    let mut others = plan.others(df_of, phrase, prefix);
-    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix);
+    let mut others = plan.others(df_of, phrase, prefix, packed);
+    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix, packed);
     let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
     'docs: loop {
         budget.spend(1).await;
-        let Some(e) = lead.next_async().await? else {
+        let Some(e) = lead.next().await? else {
             break;
         };
+        let doc = e.doc();
         for (o, list) in others.iter_mut().zip(&mut lists[1..]) {
-            if !o.at_async(t, s, e.qualifier, budget).await? {
+            if !o.at_async(t, s, doc, budget).await? {
                 continue 'docs;
             }
             decode_positions(&o.value, list)?;
         }
-        decode_positions(e.cell.value(), &mut lists[0])?;
+        decode_positions(e.positions(), &mut lists[0])?;
         let Some(freq) = plan.freq(phrase, &lists) else {
             continue;
         };
         // Its reads spend the budget themselves: a cached get resolves at once, and
         // without one a phrase over a hub term's documents would never yield (ai1249's R1).
-        if !lens.at_async(t, s, e.qualifier, budget).await? {
+        if !lens.at_async(t, s, doc, budget).await? {
             return Err(corrupt("a position has no posting"));
         }
-        scores.insert(e.qualifier.to_vec(), plan.score(bm, freq, lens.number)?);
+        scores.insert(doc.to_vec(), plan.score(bm, freq, lens.number)?);
     }
     Ok(scores)
 }
@@ -818,6 +1036,10 @@ struct Joined<'t> {
     stepped: u64,
     lookups: u64,
     advancing: bool,
+    /// In a version 2 index: the row's blocks under its cells, opened at the first document
+    /// asked for.
+    packed: bool,
+    merged: Option<Box<Merged<'t>>>,
 }
 
 impl<'t> Joined<'t> {
@@ -836,6 +1058,7 @@ impl<'t> Joined<'t> {
         postings: i64,
         asked: Option<i64>,
         prefix: Option<&[u8]>,
+        packed: bool,
     ) -> Self {
         let postings = postings.max(0) as u64;
         let advancing = asked.is_some_and(|n| {
@@ -854,7 +1077,146 @@ impl<'t> Joined<'t> {
             stepped: 0,
             lookups: 0,
             advancing,
+            packed,
+            merged: None,
         }
+    }
+
+    /// Whether a cell of this join's family is a tombstone (a version 2 index's deleted
+    /// posting): no posting, and it hides the block's.
+    fn tombstone(&self, value: &[u8], number: Option<u64>) -> bool {
+        if self.family == POST {
+            number == Some(TOMBSTONE)
+        } else {
+            value.is_empty()
+        }
+    }
+
+    /// Opens the row's blocks, once (a version 2 index).
+    fn open_merged(&mut self, t: &'t Rows, s: &Snapshot) -> Result<()> {
+        if self.merged.is_none() {
+            self.merged = Some(Box::new(Merged::new(
+                t,
+                s,
+                &self.row,
+                self.family,
+                self.prefix.as_deref(),
+            )?));
+        }
+        Ok(())
+    }
+
+    /// Keeps the block tier's posting for `doc`, if it stands on it.
+    fn keep_block(&mut self, doc: &[u8]) -> bool {
+        let m = self.merged.as_ref().expect("opened");
+        if !m.block_has(doc) {
+            return false;
+        }
+        self.value.clear();
+        if self.family == POST {
+            self.number = m.post(Tier::Block).ok();
+        } else {
+            self.value.extend_from_slice(m.positions(Tier::Block));
+            self.number = None;
+        }
+        true
+    }
+
+    /// [`at`](Self::at) in a version 2 index. The block tier always advances to `doc` (a
+    /// block passed costs a key compare); the cell tier is reached by point reads or by its
+    /// walk, by the rule it had. The cell wins, and a tombstone means no posting.
+    fn at_merged(&mut self, t: &'t Rows, s: &Snapshot, doc: &[u8]) -> Result<bool> {
+        self.open_merged(t, s)?;
+        let m = self.merged.as_mut().expect("opened above");
+        sync(m.blocks_to::<Blocking>(&mut (), doc))?;
+        if !self.walks() {
+            if let Some(c) = t.get_at(s, &self.row, self.family, doc)? {
+                if self.tombstone(c.value(), c.as_u64()) {
+                    return Ok(false);
+                }
+                Self::keep(&mut self.value, &mut self.number, (c.value(), c.as_u64()));
+                return Ok(true);
+            }
+            return Ok(self.keep_block(doc));
+        }
+        self.open(t, s)?;
+        let cells = self.cells.as_mut().expect("opened above");
+        let m = self.merged.as_mut().expect("opened above");
+        sync(m.cells_to::<Blocking>(cells, &mut (), doc))?;
+        self.stepped = m.stepped;
+        if m.cell_side(doc) == Side::Here {
+            return Ok(match self.family == POST {
+                true => match m.cell_post()? {
+                    Some(v) => {
+                        self.number = Some(v);
+                        true
+                    }
+                    None => false,
+                },
+                false => match m.cell_positions() {
+                    Some(ps) => {
+                        self.value.clear();
+                        self.value.extend_from_slice(ps);
+                        true
+                    }
+                    None => false,
+                },
+            });
+        }
+        Ok(self.keep_block(doc))
+    }
+
+    /// [`at_merged`](Self::at_merged) without blocking.
+    #[cfg(feature = "async")]
+    async fn at_merged_async(
+        &mut self,
+        t: &'t Rows,
+        s: &Snapshot,
+        doc: &[u8],
+        budget: &mut crate::maxscore::Budget,
+    ) -> Result<bool> {
+        use crate::maxscore::{Nonblocking, Polling};
+        self.open_merged(t, s)?;
+        let m = self.merged.as_mut().expect("opened above");
+        std::future::poll_fn(|cx| m.blocks_to::<Nonblocking>(&mut Polling::new(cx), doc)).await?;
+        if !self.walks() {
+            budget.spend(crate::maxscore::LOOKUP_STEPS).await;
+            if let Some(c) = t.get_at_async(s, &self.row, self.family, doc).await? {
+                if self.tombstone(c.value(), c.as_u64()) {
+                    return Ok(false);
+                }
+                Self::keep(&mut self.value, &mut self.number, (c.value(), c.as_u64()));
+                return Ok(true);
+            }
+            return Ok(self.keep_block(doc));
+        }
+        budget.spend(1).await;
+        self.open(t, s)?;
+        let cells = self.cells.as_mut().expect("opened above");
+        let m = self.merged.as_mut().expect("opened above");
+        std::future::poll_fn(|cx| m.cells_to::<Nonblocking>(cells, &mut Polling::new(cx), doc))
+            .await?;
+        self.stepped = m.stepped;
+        if m.cell_side(doc) == Side::Here {
+            return Ok(match self.family == POST {
+                true => match m.cell_post()? {
+                    Some(v) => {
+                        self.number = Some(v);
+                        true
+                    }
+                    None => false,
+                },
+                false => match m.cell_positions() {
+                    Some(ps) => {
+                        self.value.clear();
+                        self.value.extend_from_slice(ps);
+                        true
+                    }
+                    None => false,
+                },
+            });
+        }
+        Ok(self.keep_block(doc))
     }
 
     /// Whether the next document is reached by the row's walk: decided once per document,
@@ -901,6 +1263,9 @@ impl<'t> Joined<'t> {
     /// Whether the term has a cell for `doc`, kept in `value` and `number` if so. `doc`s
     /// ascend.
     fn at(&mut self, t: &'t Rows, s: &Snapshot, doc: &[u8]) -> Result<bool> {
+        if self.packed {
+            return self.at_merged(t, s, doc);
+        }
         if !self.walks() {
             return Ok(match t.get_at(s, &self.row, self.family, doc)? {
                 Some(c) => {
@@ -947,6 +1312,9 @@ impl<'t> Joined<'t> {
         doc: &[u8],
         budget: &mut crate::maxscore::Budget,
     ) -> Result<bool> {
+        if self.packed {
+            return self.at_merged_async(t, s, doc, budget).await;
+        }
         if !self.walks() {
             budget.spend(crate::maxscore::LOOKUP_STEPS).await;
             return Ok(
@@ -1037,12 +1405,13 @@ impl PhrasePlan {
         df_of: &HashMap<String, i64>,
         phrase: &Phrase,
         prefix: Option<&[u8]>,
+        packed: bool,
     ) -> Vec<Joined<'t>> {
         let mut others: Vec<Joined<'t>> = Vec::new();
         for ((term, _), &slot) in phrase.terms.iter().zip(&self.slots) {
             if slot == others.len() + 1 {
                 let asked = Some(df_of[&phrase.terms[self.lead].0]);
-                others.push(Joined::new(term, POS, df_of[term], asked, prefix));
+                others.push(Joined::new(term, POS, df_of[term], asked, prefix, packed));
             }
         }
         others

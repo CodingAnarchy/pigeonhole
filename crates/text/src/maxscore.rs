@@ -39,6 +39,7 @@ use crate::index::Rows;
 
 use crate::error::{Result, corrupt};
 use crate::layout::*;
+use crate::merged::{Merged, Side, Tier};
 
 /// A point read's cost in posting steps (perf287's ski-rental rule, #1368): measured at
 /// 100,000 documents on a laptop, on one hub term's posting row (67,972 postings), a
@@ -120,6 +121,7 @@ pub(crate) trait Reads {
     fn seek<'c>(
         cells: &'c mut RowCells<'_>,
         cx: &mut Self::Cx<'_, '_>,
+        family: &str,
         doc: &[u8],
     ) -> Poll<pigeonhole::Result<Option<CellEntry<'c>>>>;
 
@@ -201,6 +203,7 @@ impl Reads for Blocking {
     fn seek<'c>(
         _: &'c mut RowCells<'_>,
         (): &mut (),
+        _: &str,
         _: &[u8],
     ) -> Poll<pigeonhole::Result<Option<CellEntry<'c>>>> {
         unreachable!("a sync walk skips by stepping")
@@ -345,9 +348,10 @@ impl Reads for Nonblocking {
     fn seek<'c>(
         cells: &'c mut RowCells<'_>,
         cx: &mut Polling<'_, '_>,
+        family: &str,
         doc: &[u8],
     ) -> Poll<pigeonhole::Result<Option<CellEntry<'c>>>> {
-        cells.poll_seek(cx.cx, POST, doc)
+        cells.poll_seek(cx.cx, family, doc)
     }
 
     fn get(
@@ -388,7 +392,7 @@ impl Reads for Nonblocking {
 /// Whether a contribution is under `floor`, with the bounds' slack: the test
 /// [`Scored::drop_below`] applies to an expansion's bound, applied to one posting.
 #[inline(always)]
-fn under(here: f64, floor: f64) -> bool {
+pub(crate) fn under(here: f64, floor: f64) -> bool {
     here * (1.0 + SLACK) < floor
 }
 
@@ -462,6 +466,11 @@ pub(crate) struct Walk<'t, R: Reads> {
     /// threshold only rises. If another clause brings it up as a candidate, it is scored
     /// without this contribution, lower still. A document that does enter never had a
     /// posting passed, so its score is the same.
+    ///
+    /// **An async walk** stands on each posting it reads, so a `Pending` in the middle of a
+    /// pass can leave it on one under the floor. That posting is then scored as any
+    /// candidate is, and can't reach the top `k` by the same bound: the result doesn't
+    /// change, and the next poll passes on from it (ai1249's S1 on #2003).
     floor: f64,
     /// The postings the row holds (its `df`), and how many the walk has stepped past. With
     /// `id_prefix` the walk reads only part of the row, so `df` over-estimates what's left:
@@ -474,6 +483,9 @@ pub(crate) struct Walk<'t, R: Reads> {
     advancing: bool,
     /// A point lookup in flight (async only).
     get: R::Get,
+    /// In a version 2 index (#1585): the row's packed blocks, merged under `cells`. `None`
+    /// in a version 1 index, whose walk is the code it was.
+    packed: Option<Box<Merged<'t>>>,
 }
 
 /// MaxScore's bound factor for a term (M1): the largest frequency at the shortest length any
@@ -490,6 +502,7 @@ pub(crate) fn bound_factor(bm: &Bm25, maxtf: Option<i64>, minlen: Option<i64>) -
 impl<'t> Walk<'t, Blocking> {
     /// The walk over `term`'s postings (restricted to doc ids starting with `prefix`), and
     /// its bound: `weight · tf_factor(maxtf, minlen)`. `postings` is the term's `df`.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         t: &'t Rows,
         s: &Snapshot,
@@ -498,6 +511,7 @@ impl<'t> Walk<'t, Blocking> {
         weight: f64,
         postings: u64,
         prefix: Option<&[u8]>,
+        packed: bool,
     ) -> Result<(Self, f64)> {
         let row = post_row(term);
         let agg = |family: &str| -> Result<Option<i64>> {
@@ -508,7 +522,14 @@ impl<'t> Walk<'t, Blocking> {
         if let Some(p) = prefix {
             read = read.qualifier_prefix(p);
         }
+        let merged = match packed {
+            true => Some(Merged::new(t, s, &row, POST, prefix)?),
+            false => None,
+        };
         let mut w = Walk::opened(row, weight, factor, read.cells()?, postings);
+        if let Some(m) = merged {
+            w = w.merged(m);
+        }
         match w.step(bm, &mut ()) {
             Poll::Ready(r) => r?,
             Poll::Pending => unreachable!("sync reads are always ready"),
@@ -521,6 +542,7 @@ impl<'t> Walk<'t, Blocking> {
 /// [`Walk::new`] as a future (#1560): the bound's aggregates read with point-read futures,
 /// and the walk stepped onto its first posting without blocking.
 #[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn walk_async<'t>(
     t: &'t Rows,
     s: &Snapshot,
@@ -529,6 +551,7 @@ pub(crate) async fn walk_async<'t>(
     weight: f64,
     postings: u64,
     prefix: Option<&[u8]>,
+    packed: bool,
 ) -> Result<Walk<'t, Nonblocking>> {
     let row = post_row(term);
     let maxtf = t.get_at_async(s, &row, MAXTF, BOUND).await?;
@@ -542,7 +565,14 @@ pub(crate) async fn walk_async<'t>(
     if let Some(p) = prefix {
         read = read.qualifier_prefix(p);
     }
+    let merged = match packed {
+        true => Some(Merged::new(t, s, &row, POST, prefix)?),
+        false => None,
+    };
     let mut w = Walk::opened(row, weight, factor, read.cells()?, postings);
+    if let Some(m) = merged {
+        w = w.merged(m);
+    }
     std::future::poll_fn(|cx| w.step(bm, &mut Polling::new(cx))).await?;
     Ok(w)
 }
@@ -568,7 +598,14 @@ impl<'t, R: Reads> Walk<'t, R> {
             lookups: 0,
             advancing: false,
             get: R::Get::default(),
+            packed: None,
         }
+    }
+
+    /// The walk over a version 2 index's row: `cells` merged over the row's blocks.
+    pub(crate) fn merged(mut self, merged: Merged<'t>) -> Self {
+        self.packed = Some(Box::new(merged));
+        self
     }
 
     fn doc(&self) -> Option<&[u8]> {
@@ -579,7 +616,179 @@ impl<'t, R: Reads> Walk<'t, R> {
     /// inlined into `TopK::run`, it doubled the loop's own cost on the text shapes.
     #[inline(never)]
     pub(crate) fn step(&mut self, bm: &Bm25, cx: &mut R::Cx<'_, '_>) -> Poll<Result<()>> {
+        if self.packed.is_some() {
+            return self.step_merged(bm, cx);
+        }
         R::skip_while(self, bm, cx, self.floor, |_| false)
+    }
+
+    /// [`step`](Self::step) in a version 2 index: to the merged stream's next posting that
+    /// reaches the floor.
+    ///
+    /// An async walk stands on each posting it reads, as the unpacked one does, so a
+    /// `Pending` mid-pass can leave it on a posting under the floor. That is the posting it
+    /// would have passed: a candidate there is scored with it and can't reach the top `k`
+    /// ([`Walk::floor`]), and the next poll goes on from it.
+    fn step_merged(&mut self, bm: &Bm25, cx: &mut R::Cx<'_, '_>) -> Poll<Result<()>> {
+        let Walk {
+            packed,
+            cells,
+            cur,
+            weight,
+            floor,
+            stepped,
+            ..
+        } = self;
+        let m = packed.as_deref_mut().expect("a merged walk");
+        if let Some(doc) = cur.doc() {
+            m.pass(doc);
+        }
+        loop {
+            if R::spend(cx, 1) {
+                return Poll::Pending;
+            }
+            // A block that can't hold a posting at the floor is passed whole.
+            ready!(m.settle::<R>(cells, cx, Some((bm, *weight, *floor))));
+            *stepped = m.stepped;
+            let Some(tier) = m.head() else {
+                cur.clear();
+                return Poll::Ready(Ok(()));
+            };
+            let (tf, len) = unposting(match m.post(tier) {
+                Ok(v) => v,
+                Err(e) => return Poll::Ready(Err(e)),
+            });
+            let here = *weight * bm.tf_factor(f64::from(tf), f64::from(len));
+            if under(here, *floor) {
+                if R::ASYNC {
+                    cur.set(m.id(tier), here);
+                }
+                m.skip(tier);
+                continue;
+            }
+            cur.set(m.id(tier), here);
+            return Poll::Ready(Ok(()));
+        }
+    }
+
+    /// [`advance`](Self::advance) in a version 2 index: both tiers to `doc`, then the
+    /// stream's posting there or after. Every move is a target, so a re-poll repeats it.
+    fn advance_merged(
+        &mut self,
+        bm: &Bm25,
+        cx: &mut R::Cx<'_, '_>,
+        doc: &[u8],
+        past: bool,
+    ) -> Poll<Result<()>> {
+        let Walk {
+            packed,
+            cells,
+            cur,
+            weight,
+            stepped,
+            ..
+        } = self;
+        let m = packed.as_deref_mut().expect("a merged walk");
+        if R::spend(cx, 1) {
+            return Poll::Pending;
+        }
+        ready!(m.cells_to::<R>(cells, cx, doc));
+        ready!(m.blocks_to::<R>(cx, doc));
+        if past {
+            m.pass(doc);
+        }
+        ready!(m.settle::<R>(cells, cx, None));
+        *stepped = m.stepped;
+        let Some(tier) = m.head() else {
+            cur.clear();
+            return Poll::Ready(Ok(()));
+        };
+        let (tf, len) = unposting(match m.post(tier) {
+            Ok(v) => v,
+            Err(e) => return Poll::Ready(Err(e)),
+        });
+        cur.set(
+            m.id(tier),
+            *weight * bm.tf_factor(f64::from(tf), f64::from(len)),
+        );
+        Poll::Ready(Ok(()))
+    }
+
+    /// [`lookup`](Self::lookup) in a version 2 index.
+    ///
+    /// The block tier always advances to `doc`: a block passed costs a key compare and is
+    /// never decoded, so there is nothing for a point read to save. The cell tier answers
+    /// from where it stands when it can (its head is past `doc`, or on it, or it has no
+    /// cells: a fully packed row costs no read at all), and otherwise by the unpacked walk's
+    /// rule: point reads until they'd cost more than stepping through what's left
+    /// ([`LOOKUP_IN_STEPS`]), then advancing for good. `cur` isn't moved by the point-read
+    /// path, as in the unpacked walk; [`pass`](Self::pass) brings it up when the walk is
+    /// walked again.
+    fn lookup_merged(
+        &mut self,
+        t: &Rows,
+        s: &Snapshot,
+        bm: &Bm25,
+        cx: &mut R::Cx<'_, '_>,
+        doc: &[u8],
+    ) -> Poll<Result<f64>> {
+        let score = |weight: f64, v: u64| {
+            let (tf, len) = unposting(v);
+            weight * bm.tf_factor(f64::from(tf), f64::from(len))
+        };
+        if !R::get_pending(&self.get) {
+            if !self.advancing {
+                let m = self.packed.as_deref_mut().expect("a merged walk");
+                ready!(m.blocks_to::<R>(cx, doc));
+                match m.cell_side(doc) {
+                    Side::Absent => {
+                        return Poll::Ready(match m.block_has(doc) {
+                            true => m.post(Tier::Block).map(|v| score(self.weight, v)),
+                            false => Ok(0.0),
+                        });
+                    }
+                    Side::Here => {
+                        return Poll::Ready(
+                            m.cell_post()
+                                .map(|v| v.map_or(0.0, |v| score(self.weight, v))),
+                        );
+                    }
+                    Side::Behind => {}
+                }
+                if R::spend(cx, LOOKUP_IN_STEPS as u32) {
+                    return Poll::Pending;
+                }
+                self.lookups += 1;
+                let left = self.postings.saturating_sub(m.stepped);
+                self.advancing = self.lookups.saturating_mul(LOOKUP_IN_STEPS) > left;
+            }
+            if self.advancing {
+                if self.doc().is_some_and(|d| d < doc) {
+                    ready!(self.advance_merged(bm, cx, doc, false));
+                }
+                return Poll::Ready(Ok(match self.cur.get() {
+                    Some((d, c)) if d == doc => c,
+                    _ => 0.0,
+                }));
+            }
+        }
+        // The cell by a point read; without one, the block's posting.
+        match ready!(R::get(t, s, &self.row, doc, &mut self.get, cx)) {
+            Some(v) => {
+                let v = v.ok_or_else(|| corrupt("a posting isn't a u64"))?;
+                Poll::Ready(Ok(match v {
+                    TOMBSTONE => 0.0,
+                    v => score(self.weight, v),
+                }))
+            }
+            None => {
+                let m = self.packed.as_deref().expect("a merged walk");
+                Poll::Ready(match m.block_has(doc) {
+                    true => m.post(Tier::Block).map(|v| score(self.weight, v)),
+                    false => Ok(0.0),
+                })
+            }
+        }
     }
 
     /// Stands `cur` on `e`, the posting stepped to (`None`: the row is done). On the walk's
@@ -629,6 +838,9 @@ impl<'t, R: Reads> Walk<'t, R> {
         doc: &[u8],
         past: bool,
     ) -> Poll<Result<()>> {
+        if self.packed.is_some() {
+            return self.advance_merged(bm, cx, doc, past);
+        }
         if !R::ASYNC {
             return if past {
                 self.skip_while(bm, cx, |d| d <= doc)
@@ -640,7 +852,7 @@ impl<'t, R: Reads> Walk<'t, R> {
             if R::spend(cx, 1) {
                 return Poll::Pending;
             }
-            let e = ready!(R::seek(&mut self.cells, cx, doc));
+            let e = ready!(R::seek(&mut self.cells, cx, POST, doc));
             self.stepped += 1;
             match e {
                 Some(e) if past && e.qualifier == doc => continue,
@@ -675,6 +887,9 @@ impl<'t, R: Reads> Walk<'t, R> {
         cx: &mut R::Cx<'_, '_>,
         doc: &[u8],
     ) -> Poll<Result<f64>> {
+        if self.packed.is_some() {
+            return self.lookup_merged(t, s, bm, cx, doc);
+        }
         if !R::get_pending(&self.get) {
             if !self.advancing {
                 if R::spend(cx, LOOKUP_IN_STEPS as u32) {
@@ -751,8 +966,9 @@ impl<'t> Scored<'t, Blocking> {
         term: &str,
         df: i64,
         prefix: Option<&[u8]>,
+        packed: bool,
     ) -> Result<Self> {
-        let (walk, _) = Walk::new(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix)?;
+        let (walk, _) = Walk::new(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix, packed)?;
         Ok(Scored::of_term(walk))
     }
 
@@ -765,10 +981,12 @@ impl<'t> Scored<'t, Blocking> {
         bm: &Bm25,
         expansions: &[(&str, i64, u64, f64)],
         prefix: Option<&[u8]>,
+        packed: bool,
     ) -> Result<Self> {
         let mut walks = Vec::with_capacity(expansions.len());
         for &(term, df, postings, boost) in expansions {
-            let (walk, _) = Walk::new(t, s, bm, term, boost * bm.idf(df), postings, prefix)?;
+            let (walk, _) =
+                Walk::new(t, s, bm, term, boost * bm.idf(df), postings, prefix, packed)?;
             walks.push(walk);
         }
         Ok(Scored::of_fuzzy(walks))
@@ -1554,7 +1772,7 @@ pub(crate) fn top_k(
 
 /// A [`Blocking`] read's result: always ready.
 #[inline(always)]
-fn sync<T>(p: Poll<T>) -> T {
+pub(crate) fn sync<T>(p: Poll<T>) -> T {
     match p {
         Poll::Ready(v) => v,
         Poll::Pending => unreachable!("sync reads are always ready"),
