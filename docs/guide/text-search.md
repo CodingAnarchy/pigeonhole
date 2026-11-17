@@ -199,6 +199,49 @@ assert_eq!(stats.tombstones, 4, "until the next pack");
 - **A backup or a replica** of a packed index is a packed index: restore or promote it only where 1.3 runs.
 - **File size:** the cells a pack removes are reclaimed by compaction, as any delete is. A packed index is smaller once it has compacted.
 
+## A collection split across indexes
+**New in 1.3 (#1722, ICR 0138).** BM25 scores depend on the whole collection: its document count, its average length and each term's document frequency. When one collection is split across several indexes (several databases, or a cluster's partitions), each part searched on its own scores with its own numbers. Skewed parts, such as one tenant per part, then rank differently than one index would. `QueryStats` lets the parts score as one index:
+1. **Read each part's statistics:** `index.search(q, k).query_stats()`. Every part is read, including parts that `id_prefix` wouldn't reach, because the statistics are the whole collection's.
+2. **Merge them:** `QueryStats::merge(parts)`. The counts are summed, and each fuzzy term's expansions are joined and cut again to `max_expansions`.
+3. **Search each part with the merged statistics:** `index.search(q, k).stats(merged).run()`. Use the same query and fuzzy options as in step 1, or the search fails with `InvalidArgument`.
+4. **Merge the hits** by score descending, then id ascending, and keep the first `k`.
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_text::{Index, IndexOptions, QueryStats, Source};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let index = |name: &str| -> pigeonhole_text::Result<Index> {
+#     let t = db.table(name)?.family("body", Family::default()).create_if_missing()?;
+#     Index::create(&db, &format!("{name}_text"), Source::new(&t, "body", b"text"), IndexOptions::new())
+# };
+let parts = [index("tenant_a")?, index("tenant_b")?];
+parts[0].put(b"a:1", "the March meeting")?;
+parts[1].put(b"b:1", "meeting notes")?;
+parts[1].put(b"b:2", "notes on the meeting room")?;
+let q = "meeting notes";
+let stats = QueryStats::merge(
+    parts.iter().map(|p| p.search(q, 10).query_stats()).collect::<Result<Vec<_>, _>>()?,
+)?;
+let mut hits = Vec::new();
+for p in &parts {
+    hits.extend(p.search(q, 10).stats(stats.clone()).run()?);
+}
+hits.sort_by(|x, y| y.score.total_cmp(&x.score).then_with(|| x.id.cmp(&y.id)));
+hits.truncate(10);
+assert_eq!(hits[0].id, b"b:1");
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **The scores are one index's,** up to float rounding in the order a document's clauses are added.
+- **A cut fuzzy term can differ.** If a fuzzy term had more matches than `max_expansions` in any part, `stats.cut(clause)` is `true`. A part cuts the terms it ranks last, so the merged set can miss a term that one index would keep. A larger `max_expansions` makes a cut rarer.
+- **Each part's statistics are read at one snapshot,** the search's if it has one. The parts' snapshots are separate, so a write that lands between steps 1 and 3 is counted in one step and not the other.
+- **To send statistics to another process,** use `stats.to_bytes()` and `QueryStats::from_bytes`. The encoding starts with a version byte, and `from_bytes` refuses a version it doesn't know (`InvalidArgument`).
+- **On one index,** a search already works this way: it reads its own statistics, then ranks with them.
+
 ## Performance
 MaxScore reads only the postings that can still change the top `k`. The result is the same as scoring every document.
 
@@ -240,7 +283,7 @@ The write rate stays flat from the first document to the millionth. A full compa
 | Error | When |
 |---|---|
 | `InvalidQuery { at, reason }` | A query string doesn't parse: an unclosed quote, a bad slop or fuzzy distance, or a fuzzy word inside a phrase. |
-| `InvalidArgument` | A phrase on an index without positions, a document over `max_terms`, a bad option, or a table that isn't an index. |
+| `InvalidArgument` | A phrase on an index without positions, a document over `max_terms`, a bad option, or a table that isn't an index. Also query statistics of another query or other fuzzy options, statistics that don't parse, or a newer version's. |
 | `Busy` | A write or search while `repair` runs: retry after it finishes. |
 | `PackRefused` | `pack` before an index's first pack while reader processes are attached, or while a rebuild is pending. Its message says which. Code `Busy`. |
 | `Mismatch` | `open` with another tokeniser or tokeniser version than the index was made with, or a packed block in a format a later release wrote. |

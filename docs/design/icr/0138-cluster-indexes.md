@@ -114,3 +114,52 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - `index_partitions` by prefix, with a partition holding two ranges listed once;
   - a named part routes only to a partition the index is on (`WrongPartition` otherwise; `InvalidArgument` for a call that doesn't name one);
   - the hit merge's order and cut.
+
+## PR 2a: `pigeonhole-text`'s `QueryStats`
+
+**No proto or engine changes.** This adds a library API (in `crates/text/public-api.txt`), with the single-index search moved onto it.
+
+**The API (T2):**
+- **`QueryStats`:** opaque (a tuple struct with a private field), `Debug` and `Clone`. It holds the document count and total length, each query term's and phrase term's `df`, each fuzzy term's kept expansions (term, distance, `df`, boost) and whether it was cut, and the fuzzy options it was read under (`max_expansions`, `prefix_length`).
+- **`Search::query_stats(self) -> Result<QueryStats>`,** and `query_stats_async` under the `async` feature. This is round 1, read at the search's snapshot, or one taken for it, so each part's numbers come from one snapshot. **It's on `Search`, not `Index` as the design note had it:** round 1 needs the fuzzy options (`max_expansions` and `prefix_length` decide the expansions), and the search builder carries them. `k`, `id_prefix`, `highlight` and `stats` don't change it.
+- **`Search::stats(self, QueryStats) -> Self`:** round 2. The search scores with the given numbers. Each fuzzy term expands to the given expansions, whatever this index's own walk would keep. The statistics must be for the same resolved terms, phrase terms and fuzzy terms (with the same clauses and edits), read with the same fuzzy options. Otherwise the search fails with `InvalidArgument`.
+- **`QueryStats::merge(impl IntoIterator<Item = QueryStats>) -> Result<QueryStats>`:**
+  - the counts are summed (saturating);
+  - each fuzzy term's expansions are joined by term with their `df`s summed, then cut again to `max_expansions` by the search's own order: closest, then highest `df`, then bytewise;
+  - `cut` is set when any part cut or the re-cut dropped a term;
+  - `InvalidArgument` for no parts, or for parts of different queries or fuzzy options.
+- **`QueryStats::cut(&self, clause: usize) -> bool`:** whether a fuzzy term of that clause was cut. **`QueryStats::documents(&self) -> u64`.**
+- **`QueryStats::to_bytes` and `from_bytes`:**
+  - **The layout:** version byte `1`, then little-endian fixed-width fields. Terms are sorted, so equal statistics give equal bytes.
+  - **Refusals:** `from_bytes` refuses another version ("query statistics of version N; this build reads version 1"), bytes that end early or run on, and out-of-range fields. Each is an `InvalidArgument`.
+  - **Allocation:** nothing is preallocated from a count read off the wire.
+
+**One code path:** `run` and `run_with_stats` (and their async forms) gather the index's statistics into the same struct `query_stats` returns, then rank with it. A search given statistics replaces the gather with them, and reads only its own postings counts: each term's, each phrase term's and each given expansion's `df` here.
+
+**Two numbers per term, kept apart:**
+- **To score:** the idf, a phrase's idf, the fuzzy blended `df` (the largest among the given expansions) and BM25's `n` and average length all come from the statistics.
+- **To walk:** a term's walk, an expansion's walk, a phrase's lead choice and its join's point-read or walk choice use the postings here.
+- **A term with postings neither here nor elsewhere,** a fuzzy expansion with none here, and a phrase with a term missing here all add no clause, as an absent term always did.
+- On one index the two numbers are the same map (`Dfs::both` looks a term up once).
+
+**Cost on one index:** the move adds no reads. The order is unchanged: `REPAIR`, the `S` counters, each term's `df`, the fuzzy walks, then the phrases. One read moved: an empty index used to return before reading `len` and the `df`s, and now reads them. The text callgrind shapes are the check, and the PR quotes them.
+
+**Tests (`crates/text/tests/query_stats.rs`):**
+- **A split matches one index:**
+  - **The setup:** 300 seeded documents in two tenants' parts, skewed one to two, and the same documents in one index.
+  - **The queries:** terms, phrases, a sloppy phrase, fuzzy terms and a mix, each with no prefix, a prefix in one part, and a prefix inside a range.
+  - **The checks:** with every match, and with the top 10, the merged parts' scores equal the one index's at each place (relative 1e-9), and each hit's score is that document's score in the one index.
+  - **Both layouts:** the same again with every index packed.
+- **Own statistics:** an index searched with its own `query_stats` returns exactly `run_with_stats`'s hits and stats. This covers highlighting, an id prefix, and the async forms of both calls.
+- **A term in one part only:** the other part, given the merged statistics, finds nothing and fails nothing. This holds for a term, a phrase and a fuzzy term.
+- **audit120's cut shape:** `max_expansions` 2, where each part cuts the globally most frequent term. Each part's statistics, and the merge, flag `cut` on the fuzzy clause and not on the term clause. The search runs over the re-cut set.
+- **The encoding:**
+  - `to_bytes` round-trips, and the search gives the same answer with the decoded statistics;
+  - a newer version is refused with its number;
+  - every truncation, and a trailing byte, is refused.
+- **Refusals:** statistics of another term, of a missing fuzzy term, under other fuzzy options or with other edits; a merge of different queries; and a merge of nothing.
+- **Mutations, all caught:**
+  - a term or a phrase scored with this part's `df`;
+  - the blended fuzzy `df` taken from this part's postings;
+  - a merge that doesn't sum the expansions' `df`s;
+  - a merge that doesn't re-cut.

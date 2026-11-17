@@ -5,13 +5,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use pigeonhole::Snapshot;
 
 use crate::error::{Error, Result, corrupt};
-use crate::fuzzy::{Expansion, edits, expand};
+use crate::fuzzy::{edits, expand};
 use crate::highlight::{Match, Want, find};
 use crate::index::{Index, Rows};
 use crate::layout::*;
 use crate::maxscore::{Blocking, Bm25, Cells, Layout, Packed, Scored, sync};
 use crate::merged::{Merged, Side, Tier};
 use crate::query::{Clause, Fuzziness, Query};
+use crate::stats::{Fuzzy, QueryStats, Stats, other_query};
 
 /// One search result.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +82,109 @@ struct Resolved {
     wants: Vec<(usize, Want)>,
 }
 
+impl Resolved {
+    /// Whether no clause can match anything.
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.phrases.is_empty() && self.fuzzy.is_empty()
+    }
+
+    /// Its terms, then its phrases' terms (a term may come more than once).
+    fn all_terms(&self) -> impl Iterator<Item = &String> {
+        self.terms.iter().chain(
+            self.phrases
+                .iter()
+                .flat_map(|p| p.terms.iter().map(|(t, _)| t)),
+        )
+    }
+}
+
+/// The `df`s of a search's terms and phrase terms: the one each scores with, and its
+/// postings in this index, which a walk steps through. They're the same numbers (`here` is
+/// `None`) unless the search was given statistics ([`Search::stats`], ICR 0138).
+#[derive(Clone, Copy)]
+struct Dfs<'a> {
+    score: &'a HashMap<String, i64>,
+    here: Option<&'a HashMap<String, i64>>,
+}
+
+impl Dfs<'_> {
+    /// The `df` `term` scores with.
+    fn score(&self, term: &str) -> i64 {
+        self.score[term]
+    }
+
+    /// `term`'s postings here.
+    fn here(&self, term: &str) -> i64 {
+        self.here.unwrap_or(self.score)[term]
+    }
+
+    /// Both, with one lookup when they're the same.
+    fn both(&self, term: &str) -> (i64, i64) {
+        let score = self.score[term];
+        (score, self.here.map_or(score, |h| h[term]))
+    }
+}
+
+/// What a search given statistics reads of its own index (ICR 0138): the postings here of
+/// each term they hold, and of each fuzzy term's given expansions, in their order. A term
+/// can have a `df` in the statistics and no postings here.
+struct Here {
+    df: HashMap<String, i64>,
+    fuzzy: Vec<Vec<i64>>,
+}
+
+impl Here {
+    fn read(t: &Rows, s: &Snapshot, given: &Stats) -> Result<Here> {
+        let mut df = HashMap::with_capacity(given.df.len());
+        for term in given.df.keys() {
+            df.insert(term.clone(), term_df(t, s, term)?);
+        }
+        let mut fuzzy = Vec::with_capacity(given.fuzzy.len());
+        for f in &given.fuzzy {
+            let mut ns = Vec::with_capacity(f.expansions.len());
+            for e in &f.expansions {
+                ns.push(term_df(t, s, &e.term)?);
+            }
+            fuzzy.push(ns);
+        }
+        Ok(Here { df, fuzzy })
+    }
+
+    #[cfg(feature = "async")]
+    async fn read_async(t: &Rows, s: &Snapshot, given: &Stats) -> Result<Here> {
+        let mut df = HashMap::with_capacity(given.df.len());
+        let terms: Vec<&String> = given.df.keys().collect();
+        for term in terms {
+            df.insert(term.clone(), term_df_async(t, s, term).await?);
+        }
+        let mut fuzzy = Vec::with_capacity(given.fuzzy.len());
+        for f in &given.fuzzy {
+            let mut ns = Vec::with_capacity(f.expansions.len());
+            for e in &f.expansions {
+                ns.push(term_df_async(t, s, &e.term).await?);
+            }
+            fuzzy.push(ns);
+        }
+        Ok(Here { df, fuzzy })
+    }
+}
+
+/// `term`'s document frequency: its posting row's `df` counter.
+fn term_df(t: &Rows, s: &Snapshot, term: &str) -> Result<i64> {
+    Ok(t.get_at(s, &post_row(term), DF, N)?
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0))
+}
+
+/// [`term_df`] as a future.
+#[cfg(feature = "async")]
+async fn term_df_async(t: &Rows, s: &Snapshot, term: &str) -> Result<i64> {
+    Ok(t.get_at_async(s, &post_row(term), DF, N)
+        .await?
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0))
+}
+
 /// A search to run ([`Index::search`]).
 #[derive(Debug)]
 #[must_use = "a search does nothing until it runs"]
@@ -93,6 +197,8 @@ pub struct Search<'a> {
     max_expansions: usize,
     prefix_length: usize,
     highlight: bool,
+    /// The statistics to score with ([`Search::stats`]), or `None` for its own.
+    given: Option<QueryStats>,
 }
 
 /// A phrase as the evaluator matches it: each term with its offset from the first, and the
@@ -114,6 +220,7 @@ impl<'a> Search<'a> {
             max_expansions: DEFAULT_MAX_EXPANSIONS,
             prefix_length: 0,
             highlight: false,
+            given: None,
         }
     }
 
@@ -171,20 +278,58 @@ impl<'a> Search<'a> {
     /// The top `k` hits: by score descending, then id ascending.
     ///
     /// `InvalidQuery` for a query string that didn't parse; `InvalidArgument` for a phrase
-    /// on an index without positions. It fails with `Busy` while a [`repair`](Index::repair)
-    /// runs: retry after it finishes.
+    /// on an index without positions, or for [`stats`](Self::stats) of another query. It
+    /// fails with `Busy` while a [`repair`](Index::repair) runs: retry after it finishes.
     pub fn run(self) -> Result<Vec<Hit>> {
         self.run_with_stats().map(|(hits, _)| hits)
     }
 
+    /// Scores with `stats` instead of this index's own statistics (#1722, ICR 0138): the
+    /// merged statistics of every index a collection is split into, so each part's scores
+    /// are the whole collection's ([`QueryStats`] has the steps). Each fuzzy term expands
+    /// to the terms `stats` kept, whatever this index's own walk would keep.
+    ///
+    /// The statistics must be of this search's query, read with the same
+    /// [`max_expansions`](Self::max_expansions) and [`prefix_length`](Self::prefix_length),
+    /// or the search fails with `InvalidArgument`.
+    pub fn stats(mut self, stats: QueryStats) -> Self {
+        self.given = Some(stats);
+        self
+    }
+
+    /// This index's statistics for the query (#1722, ICR 0138): its document count and
+    /// length, each term's document frequency and each fuzzy term's expansions, all read at
+    /// one snapshot (the search's, or the latest). [`QueryStats`] says what they're for.
+    ///
+    /// They're the whole index's: `k`, [`id_prefix`](Self::id_prefix),
+    /// [`highlight`](Self::highlight) and [`stats`](Self::stats) don't change them. The
+    /// fuzzy options do.
+    ///
+    /// # Errors
+    /// As [`run`](Self::run).
+    pub fn query_stats(self) -> Result<QueryStats> {
+        self.check()?;
+        let index = self.index;
+        let owned;
+        let s = match self.snapshot {
+            Some(s) => s,
+            None => {
+                owned = index.inner.db.snapshot()?;
+                &owned
+            }
+        };
+        let packed = match index.inner.table.get_at(s, GLOBAL, META, REPAIR)? {
+            None => false,
+            Some(c) => crate::index::packed_state(c.value())?,
+        };
+        let t = index.rows(packed)?;
+        let mut r = self.resolve()?;
+        Ok(QueryStats(self.gather(t, s, &mut r)?))
+    }
+
     /// [`run`](Self::run), with what the search met.
     pub fn run_with_stats(self) -> Result<(Vec<Hit>, SearchStats)> {
-        self.query.check()?;
-        if self.max_expansions == 0 {
-            return Err(Error::InvalidArgument(
-                "max_expansions must be at least 1".into(),
-            ));
-        }
+        self.check()?;
         let index = self.index;
         let inn = &*index.inner;
         let owned;
@@ -202,70 +347,41 @@ impl<'a> Search<'a> {
         };
         let t = index.rows(packed)?;
         let mut r = self.resolve()?;
-        if self.k == 0 || (r.terms.is_empty() && r.phrases.is_empty() && r.fuzzy.is_empty()) {
+        if self.k == 0 || r.is_empty() {
             return Ok((Vec::new(), SearchStats::default()));
         }
-        let counter = |q: &[u8]| -> Result<i64> {
-            Ok(t.get_at(s, STATS_ROW, STATS, q)?
-                .and_then(|c| c.as_i64())
-                .unwrap_or(0))
+        // The statistics it scores with: its own, or the ones it was given.
+        let given = self.given.as_ref().map(|g| &g.0);
+        let gathered;
+        let stats = match given {
+            Some(g) => {
+                self.matches(&r, g)?;
+                g
+            }
+            None => {
+                gathered = self.gather(t, s, &mut r)?;
+                &gathered
+            }
         };
-        let n = counter(DOCS)?;
-        if n <= 0 {
+        let Some(bm) = stats.bm25(inn.opts.get_k1(), inn.opts.get_b()) else {
             return Ok((Vec::new(), SearchStats::default()));
-        }
-        let bm = Bm25 {
-            n: n as f64,
-            avglen: (counter(LEN)?.max(0) as f64 / n as f64).max(f64::MIN_POSITIVE),
-            k1: inn.opts.get_k1(),
-            b: inn.opts.get_b(),
         };
-        let mut df_of: HashMap<String, i64> = HashMap::new();
-        for term in r.terms.iter().chain(
-            r.phrases
-                .iter()
-                .flat_map(|p| p.terms.iter().map(|(t, _)| t)),
-        ) {
-            if !df_of.contains_key(term) {
-                let df = t
-                    .get_at(s, &post_row(term), DF, N)?
-                    .and_then(|c| c.as_i64())
-                    .unwrap_or(0);
-                df_of.insert(term.clone(), df);
-            }
-        }
-        // Each fuzzy term's expansions, from the whole dictionary (not only `id_prefix`'s
-        // documents), as the ranking statistics are.
-        let mut expanded: Vec<Vec<Expansion>> = Vec::with_capacity(r.fuzzy.len());
-        let mut fuzzy_stats = Vec::with_capacity(r.fuzzy.len());
-        for f in &r.fuzzy {
-            let (exps, cut) = expand(
-                t,
-                s,
-                &f.term,
-                f.edits,
-                self.prefix_length,
-                self.max_expansions,
-            )?;
-            if self.highlight {
-                let set: BTreeSet<String> = exps.iter().map(|e| e.term.clone()).collect();
-                for &c in &f.clauses {
-                    r.wants.push((c, Want::Terms(set.clone())));
-                }
-            }
-            fuzzy_stats.push(FuzzyStats {
-                clause: f.clauses[0],
-                term: f.term.clone(),
-                expansions: exps.len(),
-                cut,
-            });
-            expanded.push(exps);
-        }
+        // Given statistics: the terms' postings here, which its walks step through.
+        let here = match given {
+            Some(g) => Some(Here::read(t, s, g)?),
+            None => None,
+        };
+        let dfs = Dfs {
+            score: &stats.df,
+            here: here.as_ref().map(|h| &h.df),
+        };
+        let postings = here.as_ref().map(|h| h.fuzzy.as_slice());
+        let fuzzy_stats = self.fuzzy_stats(&mut r, stats);
         let prefix = self.prefix.as_deref();
         // The phrases, scored up front (D309 §4.2): their bounds are their actual maxima.
         let mut phrase_scores = Vec::with_capacity(r.phrases.len());
         for phrase in &r.phrases {
-            phrase_scores.push(score_phrase(t, s, &bm, &df_of, phrase, prefix, packed)?);
+            phrase_scores.push(score_phrase(t, s, &bm, dfs, phrase, prefix, packed)?);
         }
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
         // A stale hit (its source deleted around the index) is skipped and the next one takes
@@ -280,8 +396,9 @@ impl<'a> Search<'a> {
                     s,
                     &bm,
                     &r.terms,
-                    &df_of,
-                    &expanded,
+                    dfs,
+                    &stats.fuzzy,
+                    postings,
                     &phrase_scores,
                     prefix,
                     want,
@@ -291,8 +408,9 @@ impl<'a> Search<'a> {
                     s,
                     &bm,
                     &r.terms,
-                    &df_of,
-                    &expanded,
+                    dfs,
+                    &stats.fuzzy,
+                    postings,
                     &phrase_scores,
                     prefix,
                     want,
@@ -319,6 +437,104 @@ impl<'a> Search<'a> {
             }
             want = self.k + stats.stale as usize;
         }
+    }
+
+    /// The checks before any read: the query parses, and `max_expansions` isn't 0.
+    fn check(&self) -> Result<()> {
+        self.query.check()?;
+        if self.max_expansions == 0 {
+            return Err(Error::InvalidArgument(
+                "max_expansions must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The index's statistics for the resolved query `r`, at `s`. Its fuzzy terms move
+    /// into them.
+    fn gather(&self, t: &Rows, s: &Snapshot, r: &mut Resolved) -> Result<Stats> {
+        let counter = |q: &[u8]| -> Result<i64> {
+            Ok(t.get_at(s, STATS_ROW, STATS, q)?
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0))
+        };
+        let docs = counter(DOCS)?;
+        let len = counter(LEN)?;
+        let mut df: HashMap<String, i64> = HashMap::new();
+        for term in r.all_terms() {
+            if !df.contains_key(term) {
+                df.insert(term.clone(), term_df(t, s, term)?);
+            }
+        }
+        // Each fuzzy term's expansions, from the whole dictionary (not only `id_prefix`'s
+        // documents), as the ranking statistics are.
+        let mut fuzzy = Vec::with_capacity(r.fuzzy.len());
+        for f in std::mem::take(&mut r.fuzzy) {
+            let (expansions, cut) = expand(
+                t,
+                s,
+                &f.term,
+                f.edits,
+                self.prefix_length,
+                self.max_expansions,
+            )?;
+            fuzzy.push(Fuzzy {
+                clauses: f.clauses,
+                term: f.term,
+                edits: f.edits,
+                expansions,
+                cut,
+            });
+        }
+        Ok(Stats {
+            docs,
+            len,
+            max_expansions: self.max_expansions,
+            prefix_length: self.prefix_length,
+            df,
+            fuzzy,
+        })
+    }
+
+    /// `InvalidArgument` unless `given` holds the statistics of the resolved query `r`,
+    /// read with this search's fuzzy options.
+    fn matches(&self, r: &Resolved, given: &Stats) -> Result<()> {
+        let terms: BTreeSet<&String> = r.all_terms().collect();
+        let same = given.max_expansions == self.max_expansions
+            && given.prefix_length == self.prefix_length
+            && terms.len() == given.df.len()
+            && terms.iter().all(|t| given.df.contains_key(*t))
+            && given.fuzzy.len() == r.fuzzy.len()
+            && given
+                .fuzzy
+                .iter()
+                .zip(&r.fuzzy)
+                .all(|(g, f)| g.term == f.term && g.edits == f.edits && g.clauses == f.clauses);
+        match same {
+            true => Ok(()),
+            false => Err(other_query()),
+        }
+    }
+
+    /// What [`SearchStats::fuzzy`] reports of `stats`' fuzzy terms; with highlighting, each
+    /// one's expansions are added to what its clauses look for.
+    fn fuzzy_stats(&self, r: &mut Resolved, stats: &Stats) -> Vec<FuzzyStats> {
+        let mut out = Vec::with_capacity(stats.fuzzy.len());
+        for f in &stats.fuzzy {
+            if self.highlight {
+                let set: BTreeSet<String> = f.expansions.iter().map(|e| e.term.clone()).collect();
+                for &c in &f.clauses {
+                    r.wants.push((c, Want::Terms(set.clone())));
+                }
+            }
+            out.push(FuzzyStats {
+                clause: f.clauses[0],
+                term: f.term.clone(),
+                expansions: f.expansions.len(),
+                cut: f.cut,
+            });
+        }
+        out
     }
 
     /// A hit on `id`, its source holding `value`: with its text and matches when
@@ -369,6 +585,39 @@ impl<'a> Search<'a> {
         self.run_with_stats_async().await.map(|(hits, _)| hits)
     }
 
+    /// [`query_stats`](Self::query_stats) as a future, as [`run_async`](Self::run_async).
+    ///
+    /// # Errors
+    /// As [`run`](Self::run).
+    #[cfg(feature = "async")]
+    pub async fn query_stats_async(self) -> Result<QueryStats> {
+        self.check()?;
+        let index = self.index;
+        let owned;
+        let s = match self.snapshot {
+            Some(s) => s,
+            None => {
+                owned = index.inner.db.snapshot()?;
+                &owned
+            }
+        };
+        let packed = match index
+            .inner
+            .table
+            .get_at_async(s, GLOBAL, META, REPAIR)
+            .await?
+        {
+            None => false,
+            Some(c) => crate::index::packed_state(c.value())?,
+        };
+        let t = index.rows(packed)?;
+        let mut r = self.resolve()?;
+        let mut budget = crate::maxscore::Budget::new();
+        Ok(QueryStats(
+            self.gather_async(t, s, &mut r, &mut budget).await?,
+        ))
+    }
+
     /// [`run_with_stats`](Self::run_with_stats) as a future, as
     /// [`run_async`](Self::run_async).
     ///
@@ -376,12 +625,7 @@ impl<'a> Search<'a> {
     /// As [`run`](Self::run).
     #[cfg(feature = "async")]
     pub async fn run_with_stats_async(self) -> Result<(Vec<Hit>, SearchStats)> {
-        self.query.check()?;
-        if self.max_expansions == 0 {
-            return Err(Error::InvalidArgument(
-                "max_expansions must be at least 1".into(),
-            ));
-        }
+        self.check()?;
         let index = self.index;
         let inn = &*index.inner;
         let owned;
@@ -398,86 +642,43 @@ impl<'a> Search<'a> {
         };
         let t = index.rows(packed)?;
         let mut r = self.resolve()?;
-        if self.k == 0 || (r.terms.is_empty() && r.phrases.is_empty() && r.fuzzy.is_empty()) {
+        if self.k == 0 || r.is_empty() {
             return Ok((Vec::new(), SearchStats::default()));
-        }
-        let counter = |q: &'static [u8]| async move {
-            Ok::<i64, Error>(
-                t.get_at_async(s, STATS_ROW, STATS, q)
-                    .await?
-                    .and_then(|c| c.as_i64())
-                    .unwrap_or(0),
-            )
-        };
-        let n = counter(DOCS).await?;
-        if n <= 0 {
-            return Ok((Vec::new(), SearchStats::default()));
-        }
-        let bm = Bm25 {
-            n: n as f64,
-            avglen: (counter(LEN).await?.max(0) as f64 / n as f64).max(f64::MIN_POSITIVE),
-            k1: inn.opts.get_k1(),
-            b: inn.opts.get_b(),
-        };
-        let mut df_of: HashMap<String, i64> = HashMap::new();
-        // Collected first: an iterator chain with closures held across an `.await` makes the
-        // future not `Send`.
-        let terms: Vec<String> = r
-            .terms
-            .iter()
-            .chain(
-                r.phrases
-                    .iter()
-                    .flat_map(|p| p.terms.iter().map(|(t, _)| t)),
-            )
-            .cloned()
-            .collect();
-        for term in terms {
-            if let std::collections::hash_map::Entry::Vacant(e) = df_of.entry(term) {
-                let df = t
-                    .get_at_async(s, &post_row(e.key()), DF, N)
-                    .await?
-                    .and_then(|c| c.as_i64())
-                    .unwrap_or(0);
-                e.insert(df);
-            }
         }
         // One step budget for the search's work outside MaxScore (ai1249's R1 on #1642): the
         // fuzzy walks, the phrase position walks and their lengths. Shared, so a poll does
         // at most a budget's work across them, not a budget per loop.
         let mut budget = crate::maxscore::Budget::new();
-        let mut expanded: Vec<Vec<Expansion>> = Vec::with_capacity(r.fuzzy.len());
-        let mut fuzzy_stats = Vec::with_capacity(r.fuzzy.len());
-        for f in &r.fuzzy {
-            let (exps, cut) = crate::fuzzy::expand_async(
-                t,
-                s,
-                &f.term,
-                f.edits,
-                self.prefix_length,
-                self.max_expansions,
-                &mut budget,
-            )
-            .await?;
-            if self.highlight {
-                let set: BTreeSet<String> = exps.iter().map(|e| e.term.clone()).collect();
-                for &c in &f.clauses {
-                    r.wants.push((c, Want::Terms(set.clone())));
-                }
+        let given = self.given.as_ref().map(|g| &g.0);
+        let gathered;
+        let stats = match given {
+            Some(g) => {
+                self.matches(&r, g)?;
+                g
             }
-            fuzzy_stats.push(FuzzyStats {
-                clause: f.clauses[0],
-                term: f.term.clone(),
-                expansions: exps.len(),
-                cut,
-            });
-            expanded.push(exps);
-        }
+            None => {
+                gathered = self.gather_async(t, s, &mut r, &mut budget).await?;
+                &gathered
+            }
+        };
+        let Some(bm) = stats.bm25(inn.opts.get_k1(), inn.opts.get_b()) else {
+            return Ok((Vec::new(), SearchStats::default()));
+        };
+        let here = match given {
+            Some(g) => Some(Here::read_async(t, s, g).await?),
+            None => None,
+        };
+        let dfs = Dfs {
+            score: &stats.df,
+            here: here.as_ref().map(|h| &h.df),
+        };
+        let postings = here.as_ref().map(|h| h.fuzzy.as_slice());
+        let fuzzy_stats = self.fuzzy_stats(&mut r, stats);
         let prefix = self.prefix.as_deref();
         let mut phrase_scores = Vec::with_capacity(r.phrases.len());
         for phrase in &r.phrases {
             phrase_scores.push(
-                score_phrase_async(t, s, &bm, &df_of, phrase, prefix, packed, &mut budget).await?,
+                score_phrase_async(t, s, &bm, dfs, phrase, prefix, packed, &mut budget).await?,
             );
         }
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
@@ -490,8 +691,9 @@ impl<'a> Search<'a> {
                         s,
                         &bm,
                         &r.terms,
-                        &df_of,
-                        &expanded,
+                        dfs,
+                        &stats.fuzzy,
+                        postings,
                         &phrase_scores,
                         prefix,
                         want,
@@ -504,8 +706,9 @@ impl<'a> Search<'a> {
                         s,
                         &bm,
                         &r.terms,
-                        &df_of,
-                        &expanded,
+                        dfs,
+                        &stats.fuzzy,
+                        postings,
                         &phrase_scores,
                         prefix,
                         want,
@@ -534,6 +737,65 @@ impl<'a> Search<'a> {
             }
             want = self.k + stats.stale as usize;
         }
+    }
+
+    /// [`gather`](Self::gather) as a future: the fuzzy walks spend `budget`.
+    #[cfg(feature = "async")]
+    async fn gather_async(
+        &self,
+        t: &Rows,
+        s: &Snapshot,
+        r: &mut Resolved,
+        budget: &mut crate::maxscore::Budget,
+    ) -> Result<Stats> {
+        let counter = |q: &'static [u8]| async move {
+            Ok::<i64, Error>(
+                t.get_at_async(s, STATS_ROW, STATS, q)
+                    .await?
+                    .and_then(|c| c.as_i64())
+                    .unwrap_or(0),
+            )
+        };
+        let docs = counter(DOCS).await?;
+        let len = counter(LEN).await?;
+        let mut df: HashMap<String, i64> = HashMap::new();
+        // Collected first: an iterator chain with closures held across an `.await` makes the
+        // future not `Send`.
+        let terms: Vec<String> = r.all_terms().cloned().collect();
+        for term in terms {
+            if let std::collections::hash_map::Entry::Vacant(e) = df.entry(term) {
+                let n = term_df_async(t, s, e.key()).await?;
+                e.insert(n);
+            }
+        }
+        let mut fuzzy = Vec::with_capacity(r.fuzzy.len());
+        for f in std::mem::take(&mut r.fuzzy) {
+            let (expansions, cut) = crate::fuzzy::expand_async(
+                t,
+                s,
+                &f.term,
+                f.edits,
+                self.prefix_length,
+                self.max_expansions,
+                budget,
+            )
+            .await?;
+            fuzzy.push(Fuzzy {
+                clauses: f.clauses,
+                term: f.term,
+                edits: f.edits,
+                expansions,
+                cut,
+            });
+        }
+        Ok(Stats {
+            docs,
+            len,
+            max_expansions: self.max_expansions,
+            prefix_length: self.prefix_length,
+            df,
+            fuzzy,
+        })
     }
 
     /// The query's distinct terms, phrases and fuzzy terms, normalised and tokenised as the
@@ -652,7 +914,8 @@ impl<'a> Search<'a> {
     }
 }
 
-/// The top `want` documents of the query's clauses, by MaxScore, over the layout `L`.
+/// The top `want` documents of the query's clauses, by MaxScore, over the layout `L`. A
+/// term, or a fuzzy term's expansion, with no postings here adds no clause.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn rank<L: Layout>(
@@ -660,30 +923,31 @@ fn rank<L: Layout>(
     s: &Snapshot,
     bm: &Bm25,
     terms: &BTreeSet<String>,
-    df_of: &HashMap<String, i64>,
-    expanded: &[Vec<Expansion>],
+    dfs: Dfs<'_>,
+    fuzzy: &[Fuzzy],
+    postings: Option<&[Vec<i64>]>,
     phrase_scores: &[BTreeMap<Vec<u8>, f64>],
     prefix: Option<&[u8]>,
     want: usize,
 ) -> Result<Vec<(Vec<u8>, f64)>> {
     let mut clauses = Vec::with_capacity(terms.len() + phrase_scores.len());
     for term in terms {
-        let df = df_of[term];
-        if df > 0 {
-            clauses.push(Scored::<Blocking, L>::term(t, s, bm, term, df, prefix)?);
+        let (df, here) = dfs.both(term);
+        if here > 0 {
+            clauses.push(Scored::<Blocking, L>::term(
+                t,
+                s,
+                bm,
+                term,
+                df,
+                here as u64,
+                prefix,
+            )?);
         }
     }
-    for exps in expanded {
-        if !exps.is_empty() {
-            // Lucene's blended statistics (TopTermsBlendedFreqScoringRewrite): every
-            // kept expansion scores with the largest df among them, so a rare
-            // misspelling's idf no longer lifts it above the common word it misspells
-            // (term frequency and length still count).
-            let df = exps.iter().map(|e| e.df).max().expect("not empty");
-            let e: Vec<(&str, i64, u64, f64)> = exps
-                .iter()
-                .map(|e| (e.term.as_str(), df, e.df.max(0) as u64, e.boost))
-                .collect();
+    for (i, f) in fuzzy.iter().enumerate() {
+        let e = expansions(f, i, postings);
+        if !e.is_empty() {
             clauses.push(Scored::fuzzy(t, s, bm, &e, prefix)?);
         }
     }
@@ -691,6 +955,29 @@ fn rank<L: Layout>(
         clauses.push(Scored::phrase(ps.clone()));
     }
     crate::maxscore::top_k(t, s, bm, clauses, want)
+}
+
+/// The `i`th fuzzy term's expansions with postings here, as [`Scored::fuzzy`] takes them:
+/// `(term, df, postings, boost)`. Lucene's blended statistics
+/// (TopTermsBlendedFreqScoringRewrite): every kept expansion scores with the largest `df`
+/// among them, so a rare misspelling's idf no longer lifts it above the common word it
+/// misspells (term frequency and length still count).
+fn expansions<'f>(
+    f: &'f Fuzzy,
+    i: usize,
+    postings: Option<&[Vec<i64>]>,
+) -> Vec<(&'f str, i64, u64, f64)> {
+    let Some(df) = f.expansions.iter().map(|e| e.df).max() else {
+        return Vec::new();
+    };
+    f.expansions
+        .iter()
+        .enumerate()
+        .filter_map(|(j, e)| {
+            let here = postings.map_or(e.df, |p| p[i][j]);
+            (here > 0).then_some((e.term.as_str(), df, here as u64, e.boost))
+        })
+        .collect()
 }
 
 /// [`rank`] as a future (#1560).
@@ -701,8 +988,9 @@ async fn rank_async<L: Layout>(
     s: &Snapshot,
     bm: &Bm25,
     terms: &BTreeSet<String>,
-    df_of: &HashMap<String, i64>,
-    expanded: &[Vec<Expansion>],
+    dfs: Dfs<'_>,
+    fuzzy: &[Fuzzy],
+    postings: Option<&[Vec<i64>]>,
     phrase_scores: &[BTreeMap<Vec<u8>, f64>],
     prefix: Option<&[u8]>,
     want: usize,
@@ -711,28 +999,26 @@ async fn rank_async<L: Layout>(
     let mut clauses: Vec<Scored<'_, Nonblocking, L>> =
         Vec::with_capacity(terms.len() + phrase_scores.len());
     for term in terms {
-        let df = df_of[term];
-        if df > 0 {
-            let w =
-                crate::maxscore::walk_async(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix)
-                    .await?;
+        let (df, here) = dfs.both(term);
+        if here > 0 {
+            let w = crate::maxscore::walk_async(t, s, bm, term, bm.idf(df), here as u64, prefix)
+                .await?;
             clauses.push(Scored::of_term(w));
         }
     }
-    for exps in expanded {
-        if !exps.is_empty() {
-            // Lucene's blended statistics, as `rank`.
-            let df = exps.iter().map(|e| e.df).max().expect("not empty");
-            let mut walks = Vec::with_capacity(exps.len());
-            for e in exps {
+    for (i, f) in fuzzy.iter().enumerate() {
+        let e = expansions(f, i, postings);
+        if !e.is_empty() {
+            let mut walks = Vec::with_capacity(e.len());
+            for (term, df, postings, boost) in e {
                 walks.push(
                     crate::maxscore::walk_async(
                         t,
                         s,
                         bm,
-                        &e.term,
-                        e.boost * bm.idf(df),
-                        e.df.max(0) as u64,
+                        term,
+                        boost * bm.idf(df),
+                        postings,
                         prefix,
                     )
                     .await?,
@@ -775,21 +1061,21 @@ fn score_phrase(
     t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
-    df_of: &HashMap<String, i64>,
+    dfs: Dfs<'_>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
     packed: bool,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
-    let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
+    let Some(plan) = PhrasePlan::new(bm, dfs, phrase) else {
         return Ok(BTreeMap::new());
     };
     let row = post_row(&phrase.terms[plan.lead].0);
     let cells = cells_of(t, s, &row, POS, prefix).cells()?;
     if packed {
         let lead = MergedLead::new(t, s, &row, cells, prefix)?;
-        join::<Packed>(t, s, bm, df_of, phrase, prefix, &plan, lead)
+        join::<Packed>(t, s, bm, dfs, phrase, prefix, &plan, lead)
     } else {
-        join::<Cells>(t, s, bm, df_of, phrase, prefix, &plan, cells)
+        join::<Cells>(t, s, bm, dfs, phrase, prefix, &plan, cells)
     }
 }
 
@@ -915,7 +1201,7 @@ fn join<L: Layout>(
     t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
-    df_of: &HashMap<String, i64>,
+    dfs: Dfs<'_>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
     plan: &PhrasePlan,
@@ -923,9 +1209,9 @@ fn join<L: Layout>(
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
     let lead_term = phrase.terms[plan.lead].0.as_str();
-    let mut others = plan.others::<L>(df_of, phrase, prefix);
+    let mut others = plan.others::<L>(dfs, phrase, prefix);
     // The lead's postings, for the length of each document the phrase is in.
-    let mut lens = Joined::<L>::new(lead_term, POST, df_of[lead_term], None, prefix);
+    let mut lens = Joined::<L>::new(lead_term, POST, dfs.here(lead_term), None, prefix);
     let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
     'docs: while let Some(e) = lead.next()? {
         let doc = e.doc();
@@ -955,23 +1241,23 @@ async fn score_phrase_async(
     t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
-    df_of: &HashMap<String, i64>,
+    dfs: Dfs<'_>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
     packed: bool,
     budget: &mut crate::maxscore::Budget,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
-    let Some(plan) = PhrasePlan::new(bm, df_of, phrase) else {
+    let Some(plan) = PhrasePlan::new(bm, dfs, phrase) else {
         return Ok(BTreeMap::new());
     };
     let row = post_row(&phrase.terms[plan.lead].0);
     let cells = cells_of(t, s, &row, POS, prefix).cells()?;
     if packed {
         let lead = AsyncLead::Merged(MergedLead::new(t, s, &row, cells, prefix)?);
-        join_async::<Packed>(t, s, bm, df_of, phrase, prefix, &plan, lead, budget).await
+        join_async::<Packed>(t, s, bm, dfs, phrase, prefix, &plan, lead, budget).await
     } else {
         let lead = AsyncLead::Cells(cells);
-        join_async::<Cells>(t, s, bm, df_of, phrase, prefix, &plan, lead, budget).await
+        join_async::<Cells>(t, s, bm, dfs, phrase, prefix, &plan, lead, budget).await
     }
 }
 
@@ -1027,7 +1313,7 @@ async fn join_async<'t, L: Layout>(
     t: &'t Rows,
     s: &Snapshot,
     bm: &Bm25,
-    df_of: &HashMap<String, i64>,
+    dfs: Dfs<'_>,
     phrase: &Phrase,
     prefix: Option<&[u8]>,
     plan: &PhrasePlan,
@@ -1036,8 +1322,8 @@ async fn join_async<'t, L: Layout>(
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
     let lead_term = phrase.terms[plan.lead].0.as_str();
-    let mut others = plan.others::<L>(df_of, phrase, prefix);
-    let mut lens = Joined::<L>::new(lead_term, POST, df_of[lead_term], None, prefix);
+    let mut others = plan.others::<L>(dfs, phrase, prefix);
+    let mut lens = Joined::<L>::new(lead_term, POST, dfs.here(lead_term), None, prefix);
     let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
     'docs: loop {
         budget.spend(1).await;
@@ -1450,15 +1736,17 @@ struct PhrasePlan {
 }
 
 impl PhrasePlan {
-    /// `None` when a term isn't in the index: no document can hold the phrase.
-    fn new(bm: &Bm25, df_of: &HashMap<String, i64>, phrase: &Phrase) -> Option<Self> {
+    /// `None` when a term has no postings here: no document here can hold the phrase. The
+    /// idf is from the `df`s it scores with, and the lead the term with the fewest postings
+    /// here.
+    fn new(bm: &Bm25, dfs: Dfs<'_>, phrase: &Phrase) -> Option<Self> {
         let terms = &phrase.terms;
-        if terms.iter().any(|(term, _)| df_of[term] <= 0) {
+        if terms.iter().any(|(term, _)| dfs.here(term) <= 0) {
             return None;
         }
-        let idf: f64 = terms.iter().map(|(term, _)| bm.idf(df_of[term])).sum();
+        let idf: f64 = terms.iter().map(|(term, _)| bm.idf(dfs.score(term))).sum();
         let lead = (0..terms.len())
-            .min_by_key(|&i| df_of[&terms[i].0])
+            .min_by_key(|&i| dfs.here(&terms[i].0))
             .expect("a phrase has terms");
         let groups = terms
             .iter()
@@ -1485,15 +1773,15 @@ impl PhrasePlan {
     /// The join's other terms: the distinct terms besides the lead, in `slots`' order.
     fn others<'t, L: Layout>(
         &self,
-        df_of: &HashMap<String, i64>,
+        dfs: Dfs<'_>,
         phrase: &Phrase,
         prefix: Option<&[u8]>,
     ) -> Vec<Joined<'t, L>> {
         let mut others: Vec<Joined<'t, L>> = Vec::new();
         for ((term, _), &slot) in phrase.terms.iter().zip(&self.slots) {
             if slot == others.len() + 1 {
-                let asked = Some(df_of[&phrase.terms[self.lead].0]);
-                others.push(Joined::new(term, POS, df_of[term], asked, prefix));
+                let asked = Some(dfs.here(&phrase.terms[self.lead].0));
+                others.push(Joined::new(term, POS, dfs.here(term), asked, prefix));
             }
         }
         others
