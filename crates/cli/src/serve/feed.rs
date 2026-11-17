@@ -216,8 +216,10 @@ impl TakeClock {
     }
 
     /// A take within a batch: stamped only while a send waits for room. Sequentially
-    /// consistent with [`TakeClock::watch`]'s count, so a take after a wait began, which is
-    /// all the wait counts from, sees the wait.
+    /// consistent with [`TakeClock::watch`]'s count, which a waiting send raises before it
+    /// reads the time its wait began: a take that reads 0 was ordered before the raise, so
+    /// at most one event at the wait's start goes unstamped, and the wait counts from its
+    /// start anyway (simp724's N1 on #2012).
     fn took_within(&self) {
         if self.watchers.load(Ordering::SeqCst) != 0 {
             self.took();
