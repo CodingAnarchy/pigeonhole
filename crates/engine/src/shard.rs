@@ -922,7 +922,7 @@ impl Shared {
     /// Starts a punch pass (D333) if punching is on, none is running and enough free space
     /// past the reserve is not yet a hole. On the first shard: the pass is offloaded to a
     /// background worker when there is one.
-    fn maybe_punch(&self) {
+    pub(crate) fn maybe_punch(&self) {
         let Some(punch) = &self.punch else { return };
         if !punch.should_start(self) {
             return;

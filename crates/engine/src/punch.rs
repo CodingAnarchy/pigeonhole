@@ -5,8 +5,9 @@
 //! hole. Once that passes the reserve by a block's worth, it starts one [`PunchPass`] (never
 //! two at once): a background task that punches one free block per slice
 //! ([`Pager::punch_free`](pigeonhole_pager::Pager::punch_free)), the largest past the
-//! reserve first. A pass stops after [`PunchTuning::pass_bytes`] or when nothing is left,
-//! and sleeps between blocks to stay under [`PunchTuning::bytes_per_sec`] (on a real clock;
+//! reserve first. A pass stops when nothing is left, or after [`PunchTuning::pass_bytes`];
+//! one stopped there starts the next at once if the gate still passes, so an idle database
+//! keeps punching until it is done (g152 row 2), and sleeps between blocks to stay under [`PunchTuning::bytes_per_sec`] (on a real clock;
 //! a simulated one punches without pacing).
 //!
 //! Only free space is punched: what no recoverable root and no live view names, which
@@ -156,6 +157,9 @@ fn unpunched_free(s: &pigeonhole_pager::PagerStats) -> u64 {
 pub(crate) struct PunchPass {
     shared: Arc<Shared>,
     punched: u64,
+    /// Stopped at [`PunchTuning::pass_bytes`] with space possibly left: its drop starts the
+    /// next pass if the gate still passes, rather than waiting for a manifest commit.
+    capped: bool,
     /// When the next block may be punched (monotonic nanoseconds).
     next_at: u64,
 }
@@ -168,6 +172,7 @@ impl PunchPass {
         Self {
             shared,
             punched: 0,
+            capped: false,
             next_at: 0,
         }
     }
@@ -177,6 +182,9 @@ impl Drop for PunchPass {
     fn drop(&mut self) {
         if let Some(p) = &self.shared.punch {
             p.finished();
+            if self.capped {
+                self.shared.maybe_punch();
+            }
         }
     }
 }
@@ -189,8 +197,11 @@ impl Task for PunchPass {
         // The pager refuses a poisoned punch itself (M1); this only stops the pass early.
         if self.shared.closed.load(Ordering::Acquire)
             || self.shared.pager_poisoned.load(Ordering::Acquire)
-            || self.punched >= punch.tuning.pass_bytes
         {
+            return TaskPoll::Done;
+        }
+        if self.punched >= punch.tuning.pass_bytes {
+            self.capped = true;
             return TaskPoll::Done;
         }
         let simulated = self.shared.vfs.clock_is_simulated();
