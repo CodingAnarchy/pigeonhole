@@ -43,6 +43,9 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
   - A participant missing: dropped as aborted. That is only a torn tail below GroupSync, a disk that lies, which the guide states.
   - `log_replayed` no longer aborts an in-doubt type 5. `flush_recovered` checkpoints only to the first in-doubt record. A layout change with shares in doubt is refused at open.
   - `max_seqno` counts type 5's id and type 6's `abort_seqno` (E2).
+  - Tablet owners aren't persisted, so a tablet that moved before a prepare would be placed elsewhere at the reopen than its share's holds (perf2's M1 on #2000). With tablet changes on and bit 2 set, open pre-scans the WAL with the same in-doubt rule and pins each tablet an in-doubt share touches (its writes and its reads) to the shard that logged it, before placing the rest. Two in-doubt shares from different shards on one tablet, which no run of this build leaves, refuse the open.
+  - The share's record is built at the member's admission, with the tablet map its group validates by, so the reads it logs are the ones the shard validated.
+  - Recovery refuses a type 5 with an empty xid, or whose stream or coordinator isn't among its participants (`Corruption`).
 - **Close and moves:**
   - A close doesn't wait for external shares; they stay in the WAL.
   - `nothing_in_flight` ignores them.
