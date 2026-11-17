@@ -342,12 +342,18 @@ fn a_resume_through_another_node_delivers_the_rest_with_no_repeat_and_no_gap() {
         .unwrap();
         let (seen, _) = commits(&mut s, first.len()).await;
         drop(s);
-        // The client handled the first 45, then stopped; its last checkpoint is at or before.
-        let handled = 45;
-        let at = (0..handled)
-            .rev()
+        // The client handled a few events past a checkpoint, then stopped. Where checkpoints
+        // fall depends on when the member moves from its own merge to its hub's ring (each
+        // counts 8 from its own start), so the stop is placed from the ones it got: 4 past
+        // the first at or after event 30, before the next one 8 on.
+        let at = (30..first.len())
             .find(|&i| seen[i].token.is_some())
             .expect("a checkpoint");
+        let handled = at + 4;
+        assert!(
+            seen[at + 1..handled].iter().all(|x| x.token.is_none()),
+            "checkpoints 8 apart"
+        );
         let token = seen[at].token.clone().unwrap();
         let mut last: BTreeMap<String, u64> = BTreeMap::new();
         for s in &seen[..handled] {
