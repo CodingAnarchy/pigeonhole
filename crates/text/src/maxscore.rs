@@ -1759,10 +1759,11 @@ pub(crate) fn top_k<L: Layout>(
             break;
         };
         // Candidates ascend: every essential walk stands after the last document decided (a
-        // fuzzy expansion walked again steps past it, [`Walk::pass`]). In a version 2 index
-        // a walk left on that document changes no result (the other clauses' lookups don't
-        // look behind themselves, so it scores too little to enter twice), so this check
-        // is what catches it there (#2010).
+        // fuzzy expansion walked again steps past it, [`Walk::pass`]). A walk left on that
+        // document makes it a candidate twice. In a version 2 index that can change no hit
+        // (a clause already past the document adds nothing the second time, so it may
+        // score too little to enter again), so this check, not a result, is what a test
+        // can rely on there (#2010).
         debug_assert!(
             !decided || next > last.as_slice(),
             "a candidate at or before the last document decided"
