@@ -95,7 +95,10 @@ fn the_reserve_keeps_low_free_space_written() {
     // A reserve at least as large as the low block keeps it written; the high one goes.
     assert!(low.offset() < keep.offset() && keep.offset() < high.offset());
     punch_all(&pager, MIB);
-    assert!(read_all(&pager, low).iter().all(|&b| b == 4), "in the reserve");
+    assert!(
+        read_all(&pager, low).iter().all(|&b| b == 4),
+        "in the reserve"
+    );
     assert!(read_all(&pager, high).iter().all(|&b| b == 0), "past it");
     assert!(read_all(&pager, keep).iter().all(|&b| b == 5), "live");
 }

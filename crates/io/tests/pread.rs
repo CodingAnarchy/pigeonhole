@@ -455,3 +455,30 @@ fn start_writeback_is_a_harmless_hint() {
     file.read_at(&mut back, 4096).unwrap();
     assert_eq!(back, data);
 }
+
+/// D333 (ICR 0144): on Linux and macOS a punch gives the filesystem its blocks back (the
+/// file's allocated size falls) while its length is kept.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[test]
+fn a_punched_range_gives_its_blocks_back() {
+    use std::os::unix::fs::MetadataExt;
+    const MIB: u64 = 1 << 20;
+    let dir = TempDir::new("punch");
+    let path = dir.0.join(unique("punch"));
+    let vfs = PreadVfs::new(1);
+    let file = vfs.open(&path, OpenOptions::read_write_create()).unwrap();
+    file.write_at(&vec![3u8; (8 * MIB) as usize], 0).unwrap();
+    file.sync_all().unwrap();
+    let before = std::fs::metadata(&path).unwrap().blocks() * 512;
+    // The filesystems tests run on (APFS, ext4, xfs, tmpfs) all punch.
+    file.punch_hole(2 * MIB, 4 * MIB).unwrap();
+    file.sync_all().unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    assert_eq!(meta.len(), 8 * MIB);
+    let after = meta.blocks() * 512;
+    // A FUSE filesystem (a container's fuse-overlayfs) reports its own block counts; the
+    // punch still happens there (the parity suite reads the zeros back).
+    if file.locality().unwrap() != pigeonhole_io::Locality::Fuse {
+        assert!(after + 3 * MIB <= before, "allocated {before} -> {after}");
+    }
+}

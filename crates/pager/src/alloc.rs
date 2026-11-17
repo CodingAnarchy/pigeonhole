@@ -49,6 +49,9 @@ pub(crate) enum LoadError {
     PastEnd,
 }
 
+/// `[from, to)` unit ranges, in order (the holes of a punch pass, D333).
+pub(crate) type UnitRanges = Vec<(u64, u64)>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Alloc {
     free: FreeLists,
@@ -574,7 +577,7 @@ impl Alloc {
     /// in it, nothing moves or truncates it, and no region is cleared around it, until
     /// [`end_punch`](Self::end_punch). Returns it as `(unit, class)` with the unit ranges
     /// still to punch, or `None` if there is none or a pass already holds one.
-    pub(crate) fn take_for_punch(&mut self, reserve: u64) -> Option<(u64, u8, Vec<(u64, u64)>)> {
+    pub(crate) fn take_for_punch(&mut self, reserve: u64) -> Option<(u64, u8, UnitRanges)> {
         if self.punching.is_some() {
             return None;
         }
@@ -847,7 +850,10 @@ impl Alloc {
         // Holes lie in free space only, as disjoint, non-touching ranges.
         let mut prev = 0;
         for (&a, &b) in &self.punched {
-            assert!(a < b && (prev == 0 || a > prev), "punched ranges {a}..{b} after {prev}");
+            assert!(
+                a < b && (prev == 0 || a > prev),
+                "punched ranges {a}..{b} after {prev}"
+            );
             prev = b;
             let mut at = a;
             while at < b {
@@ -1205,7 +1211,10 @@ mod tests {
         let (unit, _, todo) = a.take_for_punch(16).unwrap();
         assert_eq!(unit, 32);
         a.end_punch(&todo);
-        assert!(a.take_for_punch(16).is_none(), "everything past the reserve is a hole");
+        assert!(
+            a.take_for_punch(16).is_none(),
+            "everything past the reserve is a hole"
+        );
         // All of it kept: nothing to punch.
         assert!(free_ladder().take_for_punch(64).is_none());
     }
@@ -1221,7 +1230,11 @@ mod tests {
         assert_eq!(again, todo, "tried again");
         a.end_punch(&[(32, 40)]);
         let (unit, _, rest) = a.take_for_punch(0).unwrap();
-        assert_eq!((unit, &rest[..]), (32, &[(40, 64)][..]), "only what is left");
+        assert_eq!(
+            (unit, &rest[..]),
+            (32, &[(40, 64)][..]),
+            "only what is left"
+        );
         a.end_punch(&rest);
         a.check();
     }

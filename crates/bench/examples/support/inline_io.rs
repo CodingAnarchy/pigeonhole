@@ -163,11 +163,8 @@ impl File for InlineFile {
         self.inner.allocate(offset, len)
     }
 
-
     fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
-
         self.inner.punch_hole(offset, len)
-
     }
 
     fn lock(&self, byte: u64, mode: LockMode) -> Result<()> {

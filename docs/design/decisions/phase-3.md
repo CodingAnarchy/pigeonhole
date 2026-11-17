@@ -5017,3 +5017,26 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 
 - **Before merge:** a box A/B at main's defaults (group sync depth 2) and across the gate's write rows.
 
+<a id="d333"></a>
+## D333 — Punch the data file's free space, off by default (coordinator, 2026-11-17; engine/pager/io, #2013; ICR 0144)
+
+**Decided:**
+- **What's punched:** free space only, past a reserve of the lowest free space, one block at a time, largest first. That's space no recoverable root names (`reclaim` clamps to the durable root, D61) and no live view or reader-process pin reaches: what the allocator would already reuse and overwrite.
+- **How:** `File::punch_hole` (ICR 0144). On Linux, `fallocate(PUNCH_HOLE | KEEP_SIZE)`; on macOS, `F_PUNCHHOLE` (whole 64 KiB units, so always block-aligned); elsewhere, and on a filesystem that refuses, nothing (`Unsupported`, counted, and not tried again until the next open).
+- **While a block is punched** it is held as a placeholder with the allocator lock released: no allocation lands there, no relocation or truncation moves it, and no region is cleared around it. The next large allocation does not grow the file for want of it.
+- **Holes are tracked** in memory, so passes skip them, and an allocation takes its range out. They aren't persisted: after a reopen the first passes punch the same space again, which changes nothing on disk.
+- **Who runs it (PR 2):** a background task on the pool (D284), never under the allocator lock, after a reclaim that freed at least a pass's worth.
+- **Defaults** (approved 2026-11-17, S2 amended):
+  - reserve = min(max(64 MiB, 2 × memtable budget × shards), about ¼ of the file);
+  - at most 256 MiB a pass;
+  - at most 64 MiB/s across passes.
+- **Off by default** (`Options::punch_freed`) until a box A/B (g69's session, ycsb-a/f and the D213 group-commit row, with D334 in both arms) shows no regression and reports the file's size on disk against its apparent size.
+- **WAL slots are not punched:** the WAL's preallocation (#1621) keeps them written.
+
+**Why (#2013):** the data file keeps its high-water size. Compaction's freed space is reused but never given back, and `truncate_tail` returns only a free tail. After a large delete or TTL expiry, the file can hold several times its live data on disk.
+
+**Reviewed by simp724 (2026-11-17), taken in the code:**
+- **C1:** every raw byte copy of a live data file reads through a pinned view, or by extent (`Engine::backup` reads through a pinned snapshot).
+- **C2:** every user of the placeholder flag (`truncate`, the shrink plan, region clearing, `abandon`) treats a block mid-punch as allocated, with a test of a shrink while a pass holds a block at the tail.
+- **S1:** only whole filesystem blocks are punched; macOS's `EINVAL` is an error, never "unsupported".
+- **S3:** the simulator's punch survives a power loss zeroed or not, at random.

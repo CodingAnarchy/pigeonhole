@@ -1445,7 +1445,8 @@ impl Pager {
         if !self.inner.writable {
             return Err(io_err(ErrorKind::Unsupported, "punch on a read-only pager"));
         }
-        let Some((_, _, ranges)) = lock(&self.inner.alloc).take_for_punch(reserve.div_ceil(UNIT_BYTES))
+        let Some((_, _, ranges)) =
+            lock(&self.inner.alloc).take_for_punch(reserve.div_ceil(UNIT_BYTES))
         else {
             return Ok(None);
         };
