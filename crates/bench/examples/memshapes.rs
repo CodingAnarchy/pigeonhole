@@ -177,14 +177,6 @@ fn embedding(rng: &mut Rng) -> Vec<f32> {
 }
 
 #[inline(never)]
-/// D291 counter checkpoints the shard has kept since open (a test hook).
-fn checkpoints(db: &pigeonhole::Pigeonhole) -> u64 {
-    db.internal_metrics()
-        .into_iter()
-        .find(|(n, _)| *n == "counter_checkpoints_kept")
-        .map_or(0, |(_, v)| v)
-}
-
 fn shape_memory_recall(store: &Store, queries: &[(String, Vec<f32>)]) -> usize {
     let _measured = Measured::start();
     let mut n = 0;
@@ -201,4 +193,19 @@ fn shape_memory_recall(store: &Store, queries: &[(String, Vec<f32>)]) -> usize {
         n += 1;
     }
     n
+}
+
+/// D291 counter checkpoints the shard has taken since open, kept and dropped: a fold that
+/// sends one costs the recall either way (simp724's S1 on #2042). A test hook.
+fn checkpoints(db: &pigeonhole::Pigeonhole) -> u64 {
+    db.internal_metrics()
+        .into_iter()
+        .filter(|(n, _)| {
+            matches!(
+                *n,
+                "counter_checkpoints_kept" | "counter_checkpoints_dropped"
+            )
+        })
+        .map(|(_, v)| v)
+        .sum()
 }
