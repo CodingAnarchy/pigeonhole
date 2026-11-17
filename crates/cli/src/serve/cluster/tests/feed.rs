@@ -1981,15 +1981,19 @@ fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or
         // sooner would keep it going.
         metric_until(c, "pigeonhole_serve_feed_idle_drops_total", |n| n == 1).await;
         let mut seen = Vec::new();
-        // A cluster member's idle end closes its stream (hub.rs `start`: only a failure
-        // sends an error; #2021).
-        while let Some(e) = tokio::time::timeout(Duration::from_secs(10), s.message())
-            .await
-            .expect("the stream ends at its idle limit")
-            .unwrap()
-        {
-            seen.extend(seen_of(&e));
-        }
+        // What was queued, then a single node's `DeadlineExceeded` (#2021).
+        let end = loop {
+            match tokio::time::timeout(Duration::from_secs(10), s.message())
+                .await
+                .expect("the stream ends at its idle limit")
+            {
+                Ok(Some(e)) => seen.extend(seen_of(&e)),
+                Ok(None) => panic!("a clean end, after {} commits", seen.len()),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(end.code(), tonic::Code::DeadlineExceeded, "{end:?}");
+        assert!(end.message().contains("--stream-idle-ms"), "{end:?}");
         assert!(
             !seen.is_empty() && seen.len() < want.len(),
             "{} of {} before the end",
