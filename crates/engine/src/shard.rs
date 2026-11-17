@@ -1568,6 +1568,11 @@ pub(crate) struct ExternalReq {
 }
 
 impl Drop for ExternalReq {
+    /// Frees the prepare's reservation if it is still one. A reservation is freed without
+    /// an install while every share was logged only on the `OutcomeUnknown` paths (the close
+    /// gave up, or a shard died), when the database admits no prepare, so the xid can't be
+    /// prepared again beside shares that will come back in doubt; a future `OutcomeUnknown`
+    /// on a live database would need to keep the slot (perf2 on #2000).
     fn drop(&mut self) {
         if let Some((registry, token)) = &self.reservation
             && let Some(registry) = registry.upgrade()
