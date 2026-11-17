@@ -620,3 +620,26 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **Scans (S2):** each page checks the copy's freshness before its snapshot and again before it's sent. Past the bound the stream ends with `ReplicaBehind`, and the entry node reopens the partition from the last page's position on the next replica or the owner: rows aren't skipped or repeated, and the row limit carries over.
 - **A scan, nearest search or traversal at a snapshot, or a multi-get at one,** stays the owner's. Read-your-writes with a read across partitions stays refused (PR 2a).
 - **The response headers** `served-by` and `served-seqno` aren't set on reads across partitions, whose parts can come from different places. A scan's pages carry `served_seqno` instead.
+
+## D328 PR 3: promotion, and moves onto a replica's node (1.3.0)
+**`phdb cluster promote P --to ID` makes a node holding P's replica P's owner** (D328 §6). Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `StampRequest.promote = 7`: the file is this node's replica copy of P, at `replica_epoch`. The node makes it a primary at the last commit it applied (`Pigeonhole::promote`) if it's still a replica, then raises its epoch to `to_epoch`. Refused with a staged set, with `restore`, or while the copy is open here.
+- `StampRequest.replica_epoch = 8`: the epoch the copy's identity row records, the owner's at its bootstrap (`e_b`). The file must still record it, and it must be at most `from_epoch`.
+
+**Status:** a replica copy's `LocalPartition.epoch` is now its identity epoch (`e_b`), not the map's.
+
+**Behaviour:**
+- **Promote** checks:
+  - the owner is fenced or closed, or `--old-unreachable` (refused if it answers and serves P);
+  - ID's copy satisfies `history_epoch <= e_b <=` the map's epoch.
+- **Promote's steps:**
+  1. A map without ID in P's replicas (which closes the copy).
+  2. The stamp with `promote`.
+  3. The map with P on ID at the epoch + 1 and a new history.
+  4. The report: `applied_seqno`, `owner_durable_seqno` and `lost_commits` ("unknown" with `--old-unreachable`).
+- **A rerun** finishes from the closed or stamped copy, if the map still has P where the stopped run left it. Once the map has moved on (a set-map, relocate or promote since), the stamp refuses a file that's already a primary, rather than stamp it over what P took since: the operator moves it aside.
+- **Not in 1.3.0:** making the old owner a replica automatically (the owner's #1484 call: the operator rejoins it).
+- **`Admin.Promote` on a cluster node** answers `FailedPrecondition`, naming `phdb cluster promote`.
+- **S4, now done for you:** `move`, `relocate` and `restore --partition` with `--to` a node in `P.replicas` first set a map without it there, and wait for it to close its copy. The set installed replaces the copy's file, which goes aside. The node still refuses `Stamp` while a copy of P is open, as the safety net.
