@@ -110,6 +110,22 @@ pub trait File: Send + Sync + Debug {
     /// Submits a write of `buf` at `offset` and returns at once.
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion;
 
+    /// Starts writing `len` bytes at `offset` back to the device, without waiting for them,
+    /// as a hint that they are complete and a sync will want them (D334): a writer of a long
+    /// output calls it per chunk, so the output's sync finds it mostly written back instead
+    /// of sending it to the device in one burst that a small, latency-bound write (a WAL
+    /// commit's) then waits behind inside the device (#1991).
+    ///
+    /// Never a durability step: [`File::sync_data`] still makes the bytes durable, and an
+    /// implementation may do nothing. Linux uses `sync_file_range(SYNC_FILE_RANGE_WRITE)`;
+    /// macOS and Windows have no range writeback that returns without waiting
+    /// (`F_FULLFSYNC` and `FlushFileBuffers` flush the whole file), so there it is a no-op,
+    /// as it is on a direct-I/O handle (no page cache) and in the simulator (which keeps
+    /// the bytes unsynced, so a crash test sees the same states as without the hint).
+    fn start_writeback(&self, _offset: u64, _len: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Makes written data durable (fdatasync / F_FULLFSYNC / FlushFileBuffers).
     ///
     /// Callers may not rely on it to make a length change durable: after `set_len`,

@@ -1026,16 +1026,28 @@ impl Member {
     }
 
     async fn send(&mut self, out: Out, checkpoint: bool) -> Result<(), Stop> {
+        self.before_put();
+        let put = self.sink.put(out).await;
+        self.after_put(put, checkpoint.then(|| self.token.clone()))
+    }
+
+    /// Notes when the client's buffer goes from empty to holding events (#1798 (a)).
+    fn before_put(&mut self) {
         if !self.sink.pending() {
             self.waiting_since = tokio::time::Instant::now();
         }
-        match self.sink.put(out).await {
+    }
+
+    /// After a put: its error as the member's [`Stop`], or `sent` (a checkpoint's token, if
+    /// it carried one) as what the client has.
+    fn after_put(&mut self, put: Result<(), ApiError>, sent: Option<Bytes>) -> Result<(), Stop> {
+        match put {
             Ok(()) => {}
             Err(e) if e.code == "DeadlineExceeded" => return Err(Stop::Idle),
             Err(_) => return Err(Stop::Gone),
         }
-        if checkpoint {
-            self.sent = self.token.clone();
+        if let Some(token) = sent {
+            self.sent = token;
         }
         self.last_event = tokio::time::Instant::now();
         Ok(())
@@ -1133,6 +1145,11 @@ impl Member {
                 }
                 continue;
             }
+            // The pass's events go to the client as one batch (#2014, as a single node's do
+            // since #2012): one channel place and one charge, not one per event.
+            let mut outs = Vec::with_capacity(batch.len());
+            // The token of the pass's last checkpointed event, if it sends one.
+            let mut sent: Option<Bytes> = None;
             for (k, e) in batch.drain(..).enumerate() {
                 at += 1;
                 let send = match e.commit {
@@ -1143,24 +1160,42 @@ impl Member {
                 if checkpoint {
                     self.token = e.token.clone();
                 }
-                if send && !checkpoint && self.sent.is_empty() {
+                if send && !checkpoint && self.sent.is_empty() && sent.is_none() {
                     // Its first commit carries a checkpoint, as every subscription's does:
                     // its own, never ahead of this commit (so a resume repeats at most).
                     let mut tail = prost::bytes::BytesMut::with_capacity(e.tail.len() + 80);
                     tail.extend_from_slice(&e.tail);
                     super::feed::put_field(&mut tail, super::feed::TOKEN_FIELD, &self.token);
-                    let out = Out::Spliced {
+                    outs.push(Out::Spliced {
                         body: e.body.clone(),
                         tail: tail.freeze(),
-                    };
-                    self.send(out, true).await?;
+                    });
+                    sent = Some(self.token.clone());
                 } else if send {
-                    self.send(Out::Merged(Arc::clone(&e)), checkpoint).await?;
+                    outs.push(Out::Merged(Arc::clone(&e)));
+                    if checkpoint {
+                        sent = Some(self.token.clone());
+                    }
                 }
                 self.cover_to(&after[k * n..(k + 1) * n]);
             }
             after.clear();
+            self.send_all(outs, sent).await?;
         }
+    }
+
+    /// Sends a ring pass's events as one batch ([`Sink::put_all`]); `sent`, the token of its
+    /// last checkpointed event, if any, becomes what the client has. A failure ends the
+    /// member (`run` returns on any [`Stop`]): the events already queued still go out, and
+    /// the client resumes from the last token it received, so nothing here reads `sent`
+    /// again (simp724 on #2014).
+    async fn send_all(&mut self, outs: Vec<Out>, sent: Option<Bytes>) -> Result<(), Stop> {
+        if outs.is_empty() {
+            return Ok(());
+        }
+        self.before_put();
+        let put = self.sink.put_all(outs).await;
+        self.after_put(put, sent)
     }
 
     /// Off the ring's tail: a merge of its own from its last checkpoint, with a

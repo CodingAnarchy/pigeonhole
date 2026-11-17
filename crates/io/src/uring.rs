@@ -505,6 +505,12 @@ impl File for UringFile {
         self.file.direct_align()
     }
 
+    /// The writeback is started on this thread, as [`PreadFile`]'s is: a submission that
+    /// returns once the kernel has queued the range's writeback (D334).
+    fn start_writeback(&self, offset: u64, len: u64) -> Result<()> {
+        self.file.start_writeback(offset, len)
+    }
+
     /// A slot of the registered pool of the ring this thread submits to (a fixed buffer,
     /// read without pinning its pages), or a plain buffer when none is free.
     fn read_buf(&self, len: usize) -> IoBuf {

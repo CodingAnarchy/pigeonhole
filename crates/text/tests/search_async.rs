@@ -411,3 +411,130 @@ fn a_warm_phrase_search_yields_without_io() {
     drop(index);
     db.close().unwrap();
 }
+
+/// #2010: a fuzzy expansion that is walked again mid-search steps past the last document
+/// decided (`Walk::pass`, #1363). Nothing failed when it stopped on that document instead:
+/// the document then became a candidate a second time and was returned twice.
+///
+/// The search is `wa~1 zeta` at top 2. `wa` expands to `wa` (boost 1) and `wb` (boost 0.5):
+///
+/// | documents | text | fuzzy clause | `zeta` |
+/// |---|---|---|---|
+/// | `d000`, `d001` | `wa` and 4 pads | `weak` | |
+/// | `d002` | `wa` × 4 | `strong` | |
+/// | `d002x` | `wb` and 8 pads | little | |
+/// | `d003` | `zeta` × 2, `wb` × 3, 4 pads | `wb` (the row's bound) | `zeta` (the row's bound) |
+/// | `d004` to `d023` | `zeta` and 12 pads | | less |
+/// | `e000` to `e030` | `wb` and 8 pads | little | |
+/// | `f000` to `f399` | 6 pads | | |
+///
+/// 1. `d000` and `d001` fill the top 2, so the threshold is `weak`. `wb`'s bound is under
+///    it (`wb < weak`): `wb` stops being walked, standing on `d002x`, its first posting.
+///    `zeta` stays essential (`weak < zeta`).
+/// 2. `d002` enters. `d003` is a candidate through `zeta`, scores `zeta + wb` and enters:
+///    the threshold is `strong`. `wb`'s part came by a point read (its row has 30 more
+///    postings, so reading is cheaper than stepping), which leaves its walk on `d002x`.
+/// 3. `zeta` turns non-essential (`zeta < strong`), and what the fuzzy clause must bring
+///    alone falls to `strong − zeta`, under `wb`'s bound: `wb` is walked again, from
+///    `d002x`, with `d003` the last document decided. It must step to `e000`.
+/// 4. If it stops on `d003`, that is the fuzzy clause's next candidate. `zeta`'s lookup is a
+///    point read too (20 postings are left in its row), so it scores `zeta + wb` again,
+///    above the worst held (`strong`): the hits are `d003` twice.
+///
+/// **The walk must start before `d003`.** A walk standing on the document itself always
+/// moves off it (every advance steps at least once), which is why a first version of this
+/// test, with `d003` as `wb`'s only posting, passed with all three mutants.
+///
+/// **On a packed index step 4 shows in no hit.** There a lookup doesn't look behind its
+/// walk, so `zeta`, already past `d003`, adds nothing the second time and `d003` scores too
+/// little to enter twice. What fails is the document loop's own check that candidates
+/// ascend (a `debug_assert`, in both loops), which the tests' profile has on.
+///
+/// The four inequalities are asserted from the index's own scores, so a change to the
+/// corpus or to BM25 that takes the search off this path fails here rather than passing
+/// quietly. Sync and async, unpacked and packed: the sync walk, the async walk's seek and
+/// the merged walk each have their own "past", and a mutant of each fails this test.
+#[test]
+fn a_fuzzy_expansion_walked_again_steps_past_the_last_decided_document() {
+    for packed in [false, true] {
+        let vfs = SimVfs::new(2010);
+        let db = Pigeonhole::open(PATH, opts(&vfs)).expect("open");
+        let docs = db
+            .table("docs")
+            .unwrap()
+            .family("body", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let index =
+            Index::create(&db, "docs_text", source(&docs), IndexOptions::new()).expect("create");
+        let pads = |n: usize| " pad".repeat(n);
+        let put = |id: String, text: String| index.put(id.as_bytes(), &text).unwrap();
+        put("d000".into(), format!("wa{}", pads(4)));
+        put("d001".into(), format!("wa{}", pads(4)));
+        put("d002".into(), "wa wa wa wa".into());
+        put("d002x".into(), format!("wb{}", pads(8)));
+        put("d003".into(), format!("zeta zeta wb wb wb{}", pads(4)));
+        for i in 4..24 {
+            put(format!("d{i:03}"), format!("zeta{}", pads(12)));
+        }
+        for i in 0..31 {
+            put(format!("e{i:03}"), format!("wb{}", pads(8)));
+        }
+        for i in 0..400 {
+            put(format!("f{i:03}"), pads(6));
+        }
+        if packed {
+            index.pack().unwrap();
+        }
+        // From a cold cache, as the other tests here: the async search then yields at its
+        // reads.
+        drop(index);
+        db.close().unwrap();
+        let db = Pigeonhole::open(PATH, opts(&vfs)).expect("reopen");
+        let index = Index::open(&db, "docs_text").expect("open index");
+
+        // The scenario's scores, from the index itself.
+        let fuzzy = index
+            .search(Query::new().fuzzy("wa", Fuzziness::One), 40)
+            .run()
+            .unwrap();
+        let of = |id: &[u8]| {
+            fuzzy
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap_or_else(|| panic!("{:?} isn't a fuzzy match", id))
+                .score
+        };
+        let (weak, strong, wb) = (of(b"d000"), of(b"d002"), of(b"d003"));
+        let zeta = index.search(Query::new().term("zeta"), 1).run().unwrap();
+        assert_eq!(zeta[0].id, b"d003");
+        let zeta = zeta[0].score;
+        let ctx = format!("packed {packed}: weak {weak}, strong {strong}, wb {wb}, zeta {zeta}");
+        assert!(
+            wb < weak,
+            "{ctx}: wb must go unwalked at the first threshold"
+        );
+        assert!(weak < zeta, "{ctx}: zeta must stay essential then");
+        assert!(zeta < strong, "{ctx}: zeta must turn non-essential");
+        assert!(strong - zeta < wb, "{ctx}: wb must be walked again");
+
+        let query = || Query::new().fuzzy("wa", Fuzziness::One).term("zeta");
+        let ids = |hits: &[pigeonhole_text::Hit]| -> Vec<String> {
+            hits.iter()
+                .map(|h| String::from_utf8_lossy(&h.id).into_owned())
+                .collect()
+        };
+        let got = index.search(query(), 2).run().unwrap();
+        assert_eq!(ids(&got), ["d003", "d002"], "{ctx}: sync");
+        assert!((got[0].score - (zeta + wb)).abs() < 1e-9, "{ctx}: {got:?}");
+        assert!((got[1].score - strong).abs() < 1e-9, "{ctx}: {got:?}");
+        let (hits, _) = drive(&vfs, index.search(query(), 2).run_async());
+        let hits = hits.expect("run_async");
+        assert_eq!(ids(&hits), ["d003", "d002"], "{ctx}: async");
+        assert_eq!(hits, got, "{ctx}: async against sync");
+
+        drop(index);
+        vfs.complete_all_io();
+        db.close().unwrap();
+    }
+}

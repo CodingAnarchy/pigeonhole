@@ -966,3 +966,103 @@ fn a_one_row_read_never_reads_the_block_after_its_row() {
         "no row ended a block, so the test checks nothing"
     );
 }
+
+/// A file that records [`File::start_writeback`] calls and passes everything else through.
+#[derive(Debug)]
+struct Hinted {
+    inner: pigeonhole_io::FileRef,
+    hints: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+impl pigeonhole_io::File for Hinted {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.inner.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.inner.write_at(buf, offset)
+    }
+    fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_read(buf, offset)
+    }
+    fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_write(buf, offset)
+    }
+    fn start_writeback(&self, offset: u64, len: u64) -> pigeonhole_io::Result<()> {
+        self.hints.lock().unwrap().push((offset, len));
+        self.inner.start_writeback(offset, len)
+    }
+    fn sync_data(&self) -> pigeonhole_io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn submit_sync_data(&self) -> pigeonhole_io::Completion<()> {
+        self.inner.submit_sync_data()
+    }
+    fn sync_all(&self) -> pigeonhole_io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn len(&self) -> pigeonhole_io::Result<u64> {
+        self.inner.len()
+    }
+    fn set_len(&self, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn allocate(&self, offset: u64, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.allocate(offset, len)
+    }
+    fn lock(&self, byte: u64, mode: pigeonhole_io::LockMode) -> pigeonhole_io::Result<()> {
+        self.inner.lock(byte, mode)
+    }
+    fn unlock(&self, byte: u64) -> pigeonhole_io::Result<()> {
+        self.inner.unlock(byte)
+    }
+    fn identity(&self) -> pigeonhole_io::Result<pigeonhole_io::FileIdentity> {
+        self.inner.identity()
+    }
+    fn is_local(&self) -> pigeonhole_io::Result<bool> {
+        self.inner.is_local()
+    }
+}
+
+/// D334 (#1991): the writer starts each written chunk's writeback as it writes it, so the
+/// root commit's sync doesn't send a whole output to the device at once. The hints cover the
+/// data written, chunk by chunk, from the extent's start, in order and without gaps.
+#[test]
+fn the_writer_starts_each_chunks_writeback_as_it_writes_it() {
+    let (_vfs, file) = sim_file(11, EXTENT);
+    let hinted = Arc::new(Hinted {
+        inner: file.clone(),
+        hints: std::sync::Mutex::new(Vec::new()),
+    });
+    let l = Layout {
+        block_size: 4096,
+        restart_interval: 16,
+        compression: pigeonhole_format::compress::Compression::None,
+        compression_level: 3,
+        bloom_bits: 10,
+    };
+    let mut w = SstWriter::new(hinted.clone(), EXTENT, SstId(3), options(&l));
+    let mut key = Vec::new();
+    let value = vec![7u8; 1000];
+    // About 3 MiB of blocks: several 1 MiB chunks and a partial last one.
+    for i in 0u32..3000 {
+        key.clear();
+        encode_key(&mut key, &i.to_be_bytes(), b"q", 1, 1, Kind::Put).unwrap();
+        w.add(&key, &value).unwrap();
+    }
+    let meta = w.finish().unwrap();
+    let hints = hinted.hints.lock().unwrap().clone();
+    assert!(hints.len() >= 3, "{hints:?}");
+    let mut at = EXTENT.offset();
+    for &(offset, len) in &hints {
+        assert_eq!(offset, at, "a hint out of order or with a gap: {hints:?}");
+        assert!(len > 0 && len <= 2 << 20, "{hints:?}");
+        at += len;
+    }
+    // The hinted data reaches the footer's region; the SST still reads back whole.
+    assert!(at > EXTENT.offset() + (2 << 20), "{at}");
+    let r = open(&file, &meta);
+    assert_eq!(
+        scan(&mut r.iter(ScanFilter::all(), ReadOptions::default())).len(),
+        3000
+    );
+}

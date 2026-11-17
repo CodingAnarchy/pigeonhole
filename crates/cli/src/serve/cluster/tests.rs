@@ -199,15 +199,21 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("the move or relocation finishes within 2 minutes")
 }
 
-/// Waits for `cond` (a node's state settling after a background push or pull).
-async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
-    for _ in 0..100 {
+/// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
+async fn eventually(what: &str, cond: impl AsyncFnMut() -> bool) {
+    eventually_within(Duration::from_secs(5), what, cond).await;
+}
+
+/// [`eventually`], waiting up to `limit`.
+async fn eventually_within(limit: Duration, what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    let until = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < until {
         if cond().await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("{what}: never happened");
+    panic!("{what}: never happened within {limit:?}");
 }
 
 /// Runs `test` on a thread of its own and fails if it isn't done within `limit`, so a test
