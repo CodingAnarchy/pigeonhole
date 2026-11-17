@@ -11972,7 +11972,9 @@ impl ShardState {
                 ctx.spawn(Box::new(ManifestPump::new(Arc::clone(&self.shared))));
             }
             ShardMsg::Punch => {
-                ctx.spawn(Box::new(crate::punch::PunchPass::new(Arc::clone(&self.shared))));
+                ctx.spawn(Box::new(crate::punch::PunchPass::new(Arc::clone(
+                    &self.shared,
+                ))));
             }
             ShardMsg::DropTablets { tablets } => {
                 if self.drop_tablets(&tablets).is_err() {

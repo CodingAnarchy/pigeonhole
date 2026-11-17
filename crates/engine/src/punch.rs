@@ -62,6 +62,15 @@ pub(crate) struct Punch {
     running: AtomicBool,
     /// The filesystem refused with `Unsupported`: no more passes until the next open.
     unsupported: AtomicBool,
+    /// The unpunched free bytes when the last pass found nothing to punch (0 after one
+    /// that punched). The gate can pass with nothing to punch: holes inside the reserve
+    /// count toward it, and the reserve's last block may overshoot it by up to a block
+    /// (simp724 on #2033). So the next pass waits until that much free space grows by
+    /// `trigger_bytes`, rather than starting an empty pass after every commit. The cost:
+    /// after an empty pass, up to `trigger_bytes` of newly punchable space can wait, since
+    /// free space can move from inside the reserve to past it (allocations take low space
+    /// while reclaims free high space) without the unpunched total growing.
+    idle_at: AtomicU64,
     /// Passes started.
     pub passes: AtomicU64,
     /// Punches that failed (the `Unsupported` one included).
@@ -77,6 +86,7 @@ impl Punch {
                 .saturating_mul(shards as u64),
             running: AtomicBool::new(false),
             unsupported: AtomicBool::new(false),
+            idle_at: AtomicU64::new(0),
             passes: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
         }
@@ -98,12 +108,7 @@ impl Punch {
             return false;
         }
         let s = shared.pager.stats();
-        let free = s
-            .file_bytes
-            .saturating_sub(s.allocated_bytes)
-            .saturating_sub(s.retired_bytes)
-            .saturating_sub(s.punched_bytes);
-        if free < self.reserve(s.file_bytes).saturating_add(self.tuning.trigger_bytes) {
+        if !self.gate(unpunched_free(&s), s.file_bytes) {
             return false;
         }
         self.running
@@ -111,10 +116,34 @@ impl Punch {
             .is_ok()
     }
 
+    /// Whether `free` unpunched bytes in a file of `file_bytes` call for a pass: a trigger's
+    /// worth past the reserve, and past the last empty pass's mark.
+    fn gate(&self, free: u64, file_bytes: u64) -> bool {
+        let floor = self
+            .reserve(file_bytes)
+            .max(self.idle_at.load(Ordering::Relaxed));
+        free >= floor.saturating_add(self.tuning.trigger_bytes)
+    }
+
+    /// A pass found nothing more to punch, having punched `punched` bytes, with `free`
+    /// unpunched bytes left: sets the idle mark after an empty pass, clears it otherwise.
+    fn ended(&self, punched: u64, free: u64) {
+        let idle = if punched == 0 { free } else { 0 };
+        self.idle_at.store(idle, Ordering::Relaxed);
+    }
+
     /// The pass ended (or never started): the next trigger may start another.
     pub(crate) fn finished(&self) {
         self.running.store(false, Ordering::Release);
     }
+}
+
+/// Free bytes that are not holes yet: the file less what is allocated, retired or punched.
+fn unpunched_free(s: &pigeonhole_pager::PagerStats) -> u64 {
+    s.file_bytes
+        .saturating_sub(s.allocated_bytes)
+        .saturating_sub(s.retired_bytes)
+        .saturating_sub(s.punched_bytes)
 }
 
 /// One punch pass (module docs): one block per slice, paced, at most
@@ -152,8 +181,7 @@ impl Task for PunchPass {
         let Some(punch) = self.shared.punch.as_ref() else {
             return TaskPoll::Done;
         };
-        if self.shared.closed.load(Ordering::Acquire) || self.punched >= punch.tuning.pass_bytes
-        {
+        if self.shared.closed.load(Ordering::Acquire) || self.punched >= punch.tuning.pass_bytes {
             return TaskPoll::Done;
         }
         let simulated = self.shared.vfs.clock_is_simulated();
@@ -163,10 +191,16 @@ impl Task for PunchPass {
         }
         let reserve = punch.reserve(self.shared.pager.stats().file_bytes);
         match self.shared.pager.punch_free(reserve) {
-            Ok(None) => TaskPoll::Done,
+            Ok(None) => {
+                // Nothing (more) to punch: the gate waits for free space to grow past this.
+                punch.ended(self.punched, unpunched_free(&self.shared.pager.stats()));
+                TaskPoll::Done
+            }
             Ok(Some(bytes)) => {
                 self.punched += bytes;
-                let pause = u128::from(bytes) * 1_000_000_000 / u128::from(punch.tuning.bytes_per_sec.max(1));
+                punch.idle_at.store(0, Ordering::Relaxed);
+                let pause = u128::from(bytes) * 1_000_000_000
+                    / u128::from(punch.tuning.bytes_per_sec.max(1));
                 self.next_at = now.saturating_add(u64::try_from(pause).unwrap_or(u64::MAX));
                 if simulated {
                     TaskPoll::Pending
@@ -176,7 +210,8 @@ impl Task for PunchPass {
             }
             Err(e) => {
                 punch.refusals.fetch_add(1, Ordering::Relaxed);
-                if matches!(&e, pigeonhole_pager::Error::Io(io) if io.kind == ErrorKind::Unsupported) {
+                if matches!(&e, pigeonhole_pager::Error::Io(io) if io.kind == ErrorKind::Unsupported)
+                {
                     punch.unsupported.store(true, Ordering::Relaxed);
                 }
                 TaskPoll::Done
@@ -186,5 +221,34 @@ impl Task for PunchPass {
 
     fn name(&self) -> &'static str {
         "punch"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// simp724 on #2033: after an empty pass the gate waits for a trigger's worth more free
+    /// space than it saw; a pass that punches clears the mark.
+    #[test]
+    fn an_empty_pass_holds_the_gate_until_free_space_grows_by_a_trigger() {
+        let p = Punch::new(PunchTuning::default(), 0, 1);
+        let file = 4096 * MIB;
+        let (reserve, trigger) = (64 * MIB, 64 * MIB);
+        assert!(!p.gate(reserve + trigger - 1, file));
+        assert!(p.gate(reserve + trigger, file));
+        // A pass that found nothing at 200 MiB free: the next needs 264 MiB.
+        p.ended(0, 200 * MIB);
+        assert!(!p.gate(200 * MIB, file));
+        assert!(!p.gate(200 * MIB + trigger - 1, file));
+        assert!(p.gate(200 * MIB + trigger, file));
+        // A pass that punched clears the mark: back to the reserve's gate.
+        p.ended(MIB, 0);
+        assert!(p.gate(reserve + trigger, file));
+        // The reserve: twice the memtable budgets, capped at a quarter of the file.
+        let q = Punch::new(PunchTuning::default(), 128 * MIB, 4);
+        assert_eq!(q.reserve(file), 1024 * MIB);
+        assert_eq!(q.reserve(1024 * MIB), 256 * MIB);
+        assert_eq!(p.reserve(file), 64 * MIB);
     }
 }

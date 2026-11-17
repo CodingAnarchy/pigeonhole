@@ -441,6 +441,12 @@ pub(crate) fn internal(
         ("wal_rollover_blocks", m.wal_rollover_blocks),
         ("file_growths_ahead", m.file_growths_ahead.0),
         ("file_growth_ahead_nanos", m.file_growths_ahead.1),
+        ("file_punches", m.file_punches.0),
+        ("file_punch_nanos", m.file_punches.1),
+        ("file_punch_bytes", m.file_punch_bytes),
+        ("file_punched_bytes", m.file_punched_bytes),
+        ("file_punch_passes", m.file_punch_passes.0),
+        ("file_punch_refusals", m.file_punch_passes.1),
         ("default_ts_lead_micros", m.default_ts_lead_micros.0),
         ("max_default_ts_lead_micros", m.default_ts_lead_micros.1),
         ("shard_parks", m.shard_idle.0),
@@ -658,6 +664,10 @@ mod tests {
         m.unpin = (9, 10);
         m.file_growths = (11, 12);
         m.file_growths_ahead = (13, 14);
+        m.file_punches = (51, 52);
+        m.file_punch_bytes = 53;
+        m.file_punched_bytes = 54;
+        m.file_punch_passes = (55, 56);
         m.shard_idle = (15, 16);
         m.pinned_threads = (3, 17); // (pinned, started)
         m.visibility_waits = (18, 19);
@@ -696,6 +706,18 @@ mod tests {
         assert_eq!(
             (get("file_growths_ahead"), get("file_growth_ahead_nanos")),
             (Some(13), Some(14))
+        );
+        assert_eq!(
+            [
+                "file_punches",
+                "file_punch_nanos",
+                "file_punch_bytes",
+                "file_punched_bytes",
+                "file_punch_passes",
+                "file_punch_refusals"
+            ]
+            .map(get),
+            [51, 52, 53, 54, 55, 56].map(Some)
         );
         assert_eq!(
             (get("shard_parks"), get("shard_wakes")),
