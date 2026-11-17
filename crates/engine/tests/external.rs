@@ -596,3 +596,42 @@ fn an_external_prepare_at_none_is_refused() {
     db.decide(b"none", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
+
+/// A plain commit across shards over a row an in-doubt share holds is refused `Busy`, as a
+/// single is: it read nothing, so `Conflict` would be wrong (found by the model-check
+/// harness, where a plain commit's `Conflict` is a protocol failure).
+#[test]
+fn a_plain_cross_shard_commit_over_a_held_row_is_busy_not_conflict() {
+    let vfs = SimVfs::new(36);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    // A row of another table on the other shard, so the plain commit is cross-shard.
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let uf = u.family("f").unwrap().id;
+    let (held, other) = (b"held".to_vec(), b"other".to_vec());
+    let here = db.shard_of(t.id, &held).expect("routed");
+    if db.shard_of(u.id, &other) == Some(here) {
+        finish(
+            db.move_tablet_pending(u.id, &other, (1 - here) as u16)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    txn(&db, &t, &held, &[held.as_slice()], b"v")
+        .prepare(b"pl", Durability::GroupSync)
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, &held, b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    wb.put(u.id, uf, &other, b"q", None, ValueRef::Bytes(b"y"))
+        .unwrap();
+    let w = db.commit(wb, Some(Durability::GroupSync));
+    assert!(matches!(w, Err(Error::Busy)), "{w:?}");
+    db.decide(b"pl", false).unwrap().expect("in doubt");
+    db.close().unwrap();
+}

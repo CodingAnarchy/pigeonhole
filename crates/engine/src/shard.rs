@@ -7673,14 +7673,17 @@ impl ShardState {
                 && self.overlaps_undecided(&m)
             {
                 // D329: over an external share in doubt, whose decision may take as long as
-                // its caller does, nothing waits or retries: a PREPARE fails `Conflict` and a
-                // single `Busy`, at once, both retry-safe.
+                // its caller does, nothing waits or retries: a transaction's PREPARE (one
+                // that validates reads) fails `Conflict`, and any other write `Busy` (a plain
+                // cross-shard commit read nothing to conflict on), at once, both retry-safe.
                 if self.overlaps_external(&m) {
-                    m.failed = Some(if matches!(m.kind, MemberKind::Single) {
-                        Error::Busy
-                    } else {
-                        Error::Conflict
-                    });
+                    m.failed = Some(
+                        if matches!(m.kind, MemberKind::Single) || m.validate.is_none() {
+                            Error::Busy
+                        } else {
+                            Error::Conflict
+                        },
+                    );
                     self.settle(m, Ok(()), ctx);
                     continue;
                 }
