@@ -665,6 +665,9 @@ impl File for UringFile {
         self.file.allocate(offset, len)
     }
 
+    /// Directly on the file, not through the ring (on purpose, simp724's N2 on #2033):
+    /// `IORING_OP_FALLOCATE` would bring nothing, a punch being a rare background call that
+    /// runs off the commit path, and the pread file's call maps errors the same way.
     fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
         self.file.punch_hole(offset, len)
     }
