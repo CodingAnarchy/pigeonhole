@@ -464,6 +464,8 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::TextPut(r) => Op::TextPut(r),
         ServiceOp::TextDelete(r) => Op::TextDelete(r),
         ServiceOp::TextVerify(r) => Op::TextVerify(r),
+        ServiceOp::TextStats(r) => Op::TextStats(r),
+        ServiceOp::TextSearchPart(r) => Op::TextSearch(r),
         ServiceOp::Remember(r) => Op::Remember(r),
         ServiceOp::Recall(r) => Op::Recall(r),
         ServiceOp::MarkUsed(r) => Op::MarkUsed(r),
@@ -487,7 +489,11 @@ pub(crate) fn names_partition(op: &forward_request::Op) -> bool {
     use forward_request::Op;
     matches!(
         op,
-        Op::VectorSearch(_) | Op::VectorVerify(_) | Op::TextVerify(_)
+        Op::VectorSearch(_)
+            | Op::VectorVerify(_)
+            | Op::TextVerify(_)
+            | Op::TextStats(_)
+            | Op::TextSearch(_)
     )
 }
 
@@ -523,6 +529,8 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::TextPut(r) => ServiceOp::TextPut(r),
             Op::TextDelete(r) => ServiceOp::TextDelete(r),
             Op::TextVerify(r) => ServiceOp::TextVerify(r),
+            Op::TextStats(r) => ServiceOp::TextStats(r),
+            Op::TextSearch(r) => ServiceOp::TextSearchPart(r),
             Op::Remember(r) => ServiceOp::Remember(r),
             Op::Recall(r) => ServiceOp::Recall(r),
             Op::MarkUsed(r) => ServiceOp::MarkUsed(r),
@@ -559,6 +567,8 @@ pub(crate) fn reply_to_forward(
         ServiceReply::VectorSearch(r) => Reply::VectorSearch(r),
         ServiceReply::VectorVerify(r) => Reply::VectorVerify(r),
         ServiceReply::TextVerify(r) => Reply::TextVerify(r),
+        ServiceReply::TextStats(r) => Reply::TextStats(r),
+        ServiceReply::TextSearch(r) => Reply::TextSearch(r),
         ServiceReply::Remember(r) => Reply::Remember(r),
         ServiceReply::Recall(r) => Reply::Recall(r),
         ServiceReply::MarkUsed(r) => Reply::MarkUsed(r),
@@ -603,6 +613,8 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::VectorSearch(r) => ServiceReply::VectorSearch(r),
             Reply::VectorVerify(r) => ServiceReply::VectorVerify(r),
             Reply::TextVerify(r) => ServiceReply::TextVerify(r),
+            Reply::TextStats(r) => ServiceReply::TextStats(r),
+            Reply::TextSearch(r) => ServiceReply::TextSearch(r),
             Reply::Remember(r) => ServiceReply::Remember(r),
             Reply::Recall(r) => ServiceReply::Recall(r),
             Reply::MarkUsed(r) => ServiceReply::MarkUsed(r),

@@ -4014,6 +4014,12 @@ pub struct TextSearchRequest {
     /// Return each hit's text with the matches' ranges.
     #[prost(bool, tag = "6")]
     pub highlight: bool,
+    /// On a cluster (#1722, ICR 0138): go on when partitions of the index can't answer,
+    /// rather than fail with `PartitionUnavailable`. The search then scores with the
+    /// statistics of the partitions that answered (`partial`), and skips the hits of those
+    /// that didn't (`missing`). A single node ignores it.
+    #[prost(bool, tag = "7")]
+    pub allow_partial: bool,
     #[prost(oneof = "text_search_request::Query", tags = "2, 3")]
     pub query: ::core::option::Option<text_search_request::Query>,
 }
@@ -4071,6 +4077,19 @@ pub struct Fuzzy {
 pub struct TextSearchResponse {
     #[prost(message, repeated, tag = "1")]
     pub hits: ::prost::alloc::vec::Vec<TextHit>,
+    /// With `allow_partial`: some partitions' statistics are missing, so the scores aren't
+    /// the ones the whole index would give.
+    #[prost(bool, tag = "2")]
+    pub partial: bool,
+    /// With `allow_partial`: the id ranges whose partitions didn't answer, whose hits are
+    /// missing.
+    #[prost(message, repeated, tag = "3")]
+    pub missing: ::prost::alloc::vec::Vec<MissingRange>,
+    /// The fuzzy clauses (indexes into the query's clauses) whose expansions were cut at
+    /// `max_expansions`: matching terms were left out. A fuzzy term two clauses yield is
+    /// listed under the first. On a cluster, a cut in any partition counts.
+    #[prost(uint32, repeated, tag = "4")]
+    pub cut_clauses: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TextHit {
@@ -7274,7 +7293,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7351,6 +7370,13 @@ pub mod forward_request {
         /// As `vector_verify`.
         #[prost(message, tag = "31")]
         TextVerify(super::TextIndexRequest),
+        /// The two rounds of a text search across an index's partitions (#1722 PR 2b): each
+        /// partition's statistics for the query, then its part of the search scored with the
+        /// partitions' merged statistics.
+        #[prost(message, tag = "32")]
+        TextStats(super::TextStatsRequest),
+        #[prost(message, tag = "33")]
+        TextSearch(super::TextSearchPartRequest),
         /// Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
         /// that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
         /// or ids are in several partitions never comes here whole.
@@ -7373,6 +7399,34 @@ pub mod forward_request {
         #[prost(message, tag = "41")]
         RecallBodies(super::RecallBodiesRequest),
     }
+}
+/// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
+/// partition's statistics for the query, read at one snapshot. Every partition of the index
+/// is asked, whatever `id_prefix` says: a search's statistics cover the whole index.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextStatsRequest {
+    /// The client's search, as it is.
+    #[prost(message, optional, tag = "1")]
+    pub search: ::core::option::Option<TextSearchRequest>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextStatsResponse {
+    /// `pigeonhole_text::QueryStats`'s versioned bytes. A version the sending node doesn't
+    /// read fails the search with `FailedPrecondition`: the nodes' builds differ.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub stats: ::prost::bytes::Bytes,
+}
+/// Round 2 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
+/// partition's top `k`, scored with every partition's statistics merged.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextSearchPartRequest {
+    /// The client's search, as it is.
+    #[prost(message, optional, tag = "1")]
+    pub search: ::core::option::Option<TextSearchRequest>,
+    /// The merged `QueryStats`' versioned bytes. Empty for an index on one partition, whose
+    /// own statistics are the whole index's: that part reads them itself, in one round.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub stats: ::prost::bytes::Bytes,
 }
 /// One partition's step of a recall whose namespaces are on several partitions (#1915,
 /// ICR 0139): its pool of candidates, or with `hop` its part of one hop of the graph
@@ -7476,7 +7530,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -7519,6 +7573,11 @@ pub mod forward_response {
         VectorVerify(super::VectorVerifyResponse),
         #[prost(message, tag = "16")]
         TextVerify(super::TextVerifyResponse),
+        /// A text search's two rounds (#1722 PR 2b).
+        #[prost(message, tag = "17")]
+        TextStats(super::TextStatsResponse),
+        #[prost(message, tag = "18")]
+        TextSearch(super::TextSearchResponse),
         /// The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
         /// answer `empty`.
         #[prost(message, tag = "19")]

@@ -546,7 +546,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - backups and restore;
   - several partitions per node.
 - **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
-  - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search` and both kinds' `Verify` across an index's partitions, but doesn't yet run `Text.Search`, `Text.Rebuild` or `Vectors.BulkLoad` across them ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
+  - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Text.Search` and both kinds' `Verify` across an index's partitions, but doesn't yet run `Text.Rebuild` or `Vectors.BulkLoad` across them ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
   - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve single-partition reads that allow staleness, but not reads across partitions yet, and none can be promoted. Losing a partition's node still means a restore or [the lost-node recipe](#a-lost-node) (#1851). A cluster node refuses `--replica-of` and `Admin.Promote`;
@@ -635,7 +635,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again. A fanned-out read's part whose partition a newer map dropped since the read began answers `WrongPartition` too: read the map again and retry.
 - **Refused with `Unsupported`** on a cluster node in this release:
-  - the index calls not yet run across an index's partitions: `Vectors.BulkLoad`, and `Text.Search` and `Rebuild` (#1722, 1.3.0). Creates, drops, writes, `Vectors.Search` and both kinds' `Verify` work ([Indexes on a cluster](#indexes-on-a-cluster));
+  - the index calls not yet run across an index's partitions: `Vectors.BulkLoad` and `Text.Rebuild` (#1722, 1.3.0). Creates, drops, writes, both kinds' `Search` and both kinds' `Verify` work ([Indexes on a cluster](#indexes-on-a-cluster));
   - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
   - `/mcp` on a node that only routes ([Remote MCP](#remote-mcp)).
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
@@ -686,7 +686,17 @@ An IVF or BM25 index on a cluster (#1722, ICR 0138) is an **index placement** in
   - **`stats`** sums the partitions' `lists_probed` and `lists`.
   - **A partition that can't be reached** fails the search with `PartitionUnavailable`, and the error names it. There's no `allow_partial` for it yet. A search whose `id_prefix` lies in reachable partitions doesn't need the others.
 - **`Vectors.Verify` and `Text.Verify`** check every partition's index and sum the counts. A partition whose check fails, or that can't be reached, fails the call, and the error names it. The sums are the partitions' counts added up, so a term found in two partitions counts twice in `terms`.
-- **Not yet:** `Text.Search` and `Text.Rebuild` answer `Unsupported` until #1722 PR 2, and `Vectors.BulkLoad` until #1722 PR 3. Use `Vectors.Insert` meanwhile.
+- **`Text.Search`** goes through any node and scores as one index holding every partition's documents would: the same hits and scores, by BM25 over the whole index's statistics. It runs in two rounds.
+  - **Round 1:** every partition of the index sends its statistics for the query (its document count and length, each term's document frequency, each fuzzy term's expansions), read at one snapshot. Every partition is asked, whatever `id_prefix` says, since a search's statistics cover the whole index, as on a single node. The node you called adds them up.
+  - **Round 2:** each partition `id_prefix` meets (every one without a prefix) ranks its documents with those statistics, and the node you called keeps the first `k` by score, then id.
+  - **An index on one partition** answers in one round: its own statistics are the whole index's.
+  - **The cost** is one more round trip to every partition of the index. On the reference machine, round 1 took 9–23 µs of compute for terms and phrases, 0.24–0.41 ms for `~1` fuzzy terms and 2.3–3.8 ms for `~2`, plus 0.14–0.37 ms for the round trip at 2–8 partitions (#1722's g108).
+  - **Skewed data:** a search's latency follows the partition with the most matching documents, so split a large tenant's range rather than adding partitions.
+  - **The rounds run at different times.** A document written between them is ranked with the statistics round 1 read, so it scores as if those statistics had included it; a term only it holds scores as one no document holds. Every partition scores with the same numbers, so the ranking stays consistent with itself. A single node reads both at one snapshot.
+  - **Fuzzy terms after a cut:** each partition keeps a fuzzy term's `max_expansions` best expansions (50), and the node you called keeps the best of their union. When any partition cut, the expansions can differ from one index's: a term every partition left out can be the one a single index would keep first. `cut_clauses` names the clauses whose fuzzy terms were cut, here or on a single node.
+  - **A partition that can't answer,** because its node can't be reached or its index is still filling, fails the search with `PartitionUnavailable` or `Unavailable`, naming it. That holds even when `id_prefix` is in other partitions: the search needs every partition's statistics.
+  - **With `allow_partial: true`,** the search goes on without it. Missing from round 1, it scores with the statistics of the partitions that answered and sets `partial`: the scores are then not the whole index's. Missing from round 2 (or from round 1, when `id_prefix` meets it), its ranges are named in `missing`, and its hits are left out.
+- **Not yet:** `Text.Rebuild` answers `Unsupported` until its own #1722 PR, and `Vectors.BulkLoad` until #1722 PR 3. Use `Vectors.Insert` meanwhile.
 
 ### Schema through the cluster
 Tables and their families live in the cluster map ([D317](../design/decisions/phase-3.md#d317)). `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes: `write` to create (`if_missing` included), `admin` to drop, `read` to list and describe. Every node makes its partitions' files follow the map.
@@ -729,7 +739,7 @@ Scans and multi-gets read across the partitions, in key order, and return what o
   - **Snapshots:** a traversal reads each hop at its own time, and each partition at its own snapshot, rather than at one snapshot for the whole traversal.
   - **Latency:** each hop is a round trip to the partitions' nodes, so a deep traversal of a graph spread across nodes costs hops × that round trip. Keep a graph's tables in one partition where you can.
   - **With `allow_partial`:** a `Nearest` result is exact over the partitions reached. A traversal skips an unreachable partition's frontier nodes, so it doesn't follow their edges, and the later hops and the ranking are exact only over what was reached. `missing` names what was skipped.
-- **Index searches:** `Vectors.Search` fans out across an index's partitions, with `nprobe` per partition ([Indexes on a cluster](#indexes-on-a-cluster)). `Text.Search` on a cluster comes with #1722 PR 2.
+- **Index searches:** `Vectors.Search` fans out across an index's partitions, with `nprobe` per partition ([Indexes on a cluster](#indexes-on-a-cluster)). `Text.Search` scores as one index would, over every partition's statistics.
 
 ### Feeds
 `Feed.Subscribe` works the same through any node. The node you call follows every partition that holds the subscription's tables, opening a single-node subscription on each partition's node, and merges them into one stream. With a `prefix`, only the partitions whose key ranges can hold such rows are followed.

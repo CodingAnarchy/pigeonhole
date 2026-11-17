@@ -726,7 +726,8 @@ impl Router {
                 // A search or check across an index's partitions (#1722 PR 1b).
                 ServiceOp::VectorSearch(_)
                 | ServiceOp::VectorVerify(_)
-                | ServiceOp::TextVerify(_) => {
+                | ServiceOp::TextVerify(_)
+                | ServiceOp::TextSearch(_) => {
                     let deadline = deadline.map_or_else(
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
@@ -1052,6 +1053,8 @@ impl Router {
             | ServiceOp::VectorSearch(_)
             | ServiceOp::VectorVerify(_)
             | ServiceOp::TextVerify(_)
+            | ServiceOp::TextStats(_)
+            | ServiceOp::TextSearchPart(_)
                 if fanout_part =>
             {
                 service.fanout_part(op, caller).await?
@@ -1552,10 +1555,6 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::VectorDelete(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextPut(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextDelete(r) => index_route(routes, &r.index, &r.id),
-        // Exact text search across an index's partitions comes with #1722 PR 2.
-        ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
-            "Text.Search isn't supported on a cluster yet",
-        )),
         ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
             "Vectors.BulkLoad isn't supported on a cluster yet",
         )),
@@ -1568,9 +1567,13 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         op if map_schema_change(op) => Err(unrouted()),
         // Fanned out across the index's partitions by `dispatch`, each part naming its
         // partition (#1722 PR 1b): [`index_part_route`].
-        ServiceOp::VectorSearch(_) | ServiceOp::VectorVerify(_) | ServiceOp::TextVerify(_) => {
-            Err(unrouted())
-        }
+        // A text search's two rounds (#1722 PR 2b) too.
+        ServiceOp::VectorSearch(_)
+        | ServiceOp::VectorVerify(_)
+        | ServiceOp::TextVerify(_)
+        | ServiceOp::TextSearch(_)
+        | ServiceOp::TextStats(_)
+        | ServiceOp::TextSearchPart(_) => Err(unrouted()),
         ServiceOp::Traverse(_)
         | ServiceOp::ListTables(_)
         | ServiceOp::DescribeTable(_)
@@ -1599,10 +1602,12 @@ pub(crate) fn map_schema_change(op: &ServiceOp) -> bool {
 /// the map places the op's index on it; else `WrongPartition`, since the sending node's
 /// map placed it there.
 fn index_part_route(routes: &Routes, op: &ServiceOp, partition: &str) -> Result<String, ApiError> {
-    let index = match op {
+    let index: &str = match op {
         ServiceOp::VectorSearch(r) => &r.index,
         ServiceOp::VectorVerify(r) => &r.index,
         ServiceOp::TextVerify(r) => &r.index,
+        ServiceOp::TextStats(r) => r.search.as_ref().map_or("", |s| s.index.as_str()),
+        ServiceOp::TextSearchPart(r) => r.search.as_ref().map_or("", |s| s.index.as_str()),
         _ => {
             return Err(ApiError::invalid(format!(
                 "a forwarded {} doesn't name a partition",
