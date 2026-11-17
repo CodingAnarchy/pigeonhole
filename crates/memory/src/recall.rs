@@ -644,7 +644,9 @@ impl<'a> Recall<'a> {
     /// The key a recall at `s` keeps its namespace counts under, or `None` when it keeps
     /// none (a reader process: a writer's restart can lose commits a reader saw and use their
     /// seqnos again, and a reader has no generation to tell them apart). Read before the
-    /// counts: a recovery after it fails the reads at `s` instead of keeping them.
+    /// counts, so a count is only ever kept under `s`'s own generation: `s` carries the
+    /// generation it was taken in, and once a recovery passes it, every read at `s` fails
+    /// with `SnapshotExpired` and nothing is kept.
     fn counts_at(&self, s: &Snapshot) -> Option<crate::ivf::At> {
         match (self.counts, &self.db) {
             (Some(_), Snap::W(db)) => Some((db.recovery_stats().generation, s.seqno())),

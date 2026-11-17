@@ -249,7 +249,8 @@ const NS_COUNTS_MAX: usize = 4096;
 pub(crate) struct NsCounts {
     /// Namespace to `((generation, seqno), count)`.
     counts: std::sync::Mutex<std::collections::HashMap<String, (At, u64)>>,
-    /// Counter reads (an inspection count for tests).
+    /// Counter reads kept here (an inspection count for tests): a reader process keeps
+    /// none, so its reads aren't counted.
     #[cfg(feature = "__unstable-hooks")]
     pub(crate) reads: std::sync::atomic::AtomicU64,
 }
