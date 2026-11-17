@@ -5776,6 +5776,14 @@ impl Inner {
                 "an external xid is 1 byte to 64 KiB".to_owned(),
             ));
         }
+        // A share in doubt is logged, but a `None` decision writes no record: its abort or
+        // commit would be lost to any crash, and the share come back in doubt after the
+        // caller heard its outcome (found by the model-check harness).
+        if durability == Durability::None {
+            return Err(Error::InvalidArgument(
+                "an external prepare and its decision are logged: Buffered at least".to_owned(),
+            ));
+        }
         let view = self.shared.view.load();
         let (builder, mut shards) = self.route(batch, &view)?;
         let (builder, large) = self.separate_large(builder)?;

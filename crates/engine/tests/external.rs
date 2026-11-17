@@ -573,3 +573,26 @@ fn an_open_without_tablet_changes_is_refused_while_a_moved_tablet_is_held() {
     assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"held"[..]));
     db.close().unwrap();
 }
+
+/// A share in doubt is logged, but a `None` decision writes no record, so a crash could
+/// bring a decided share back in doubt: an external prepare at `None` is refused (found by
+/// the model-check harness's external ops).
+#[test]
+fn an_external_prepare_at_none_is_refused() {
+    let vfs = SimVfs::new(35);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    assert!(matches!(
+        txn(&db, &t, b"n", &[b"n"], b"v").prepare(b"none", Durability::None),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(db.in_doubt().is_empty());
+    // Refused before reserving: the xid prepares at a logged level.
+    txn(&db, &t, b"n", &[b"n"], b"v")
+        .prepare(b"none", Durability::Buffered)
+        .unwrap();
+    db.decide(b"none", false).unwrap().expect("in doubt");
+    db.close().unwrap();
+}
