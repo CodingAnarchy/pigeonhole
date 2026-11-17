@@ -72,7 +72,8 @@ What the public API does, and the first release with each piece. The [README's l
 | | vector and text indexes on a cluster: `Vectors.CreateIndex`, `Text.CreateIndex`, writes routed by id (#1994, ICR 0138) | on `main`, 1.3.0 |
 | | `Vectors.Search`, `Vectors.Verify` and `Text.Verify` across an index's partitions (#2016) | on `main`, 1.3.0 |
 | | `Text.Search` across an index's partitions, scored as one index (#2029) | on `main`, 1.3.0 |
-| | `Text.Rebuild` and `Vectors.BulkLoad` across partitions (#1722) | to come, 1.3.0 |
+| | `Text.Rebuild` across an index's partitions, its counts summed (#2041) | on `main`, 1.3.0 |
+| | `Vectors.BulkLoad` across partitions (#1722) | to come, 1.3.0 |
 | | feed subscriptions' events handed over in batches on a cluster too (#2014) | on `main`, 1.3.0 |
 | | transactions across partitions (D329, #1483): the engine's part, transactions prepared and aborted for an external coordinator (#2000, ICR 0140) | on `main`, 1.3.0 |
 | | the cluster side: `BeginRequest.spans_partitions`, two-phase commit across partitions | to come, 1.3.0 |
