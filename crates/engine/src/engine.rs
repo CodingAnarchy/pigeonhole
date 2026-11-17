@@ -1484,6 +1484,21 @@ impl Engine {
                                 "an external PREPARE without its batch".into(),
                             ));
                         };
+                        // What recovery relies on (perf2's N1 on #2000): the xid that encode
+                        // never writes empty, and this stream and the coordinator among the
+                        // participants (else the share would be held with no `Coord` and no
+                        // registry entry, for good).
+                        let participants: Vec<StreamId> = share.participants().iter().collect();
+                        if share.xid().is_empty()
+                            || !participants.contains(&stream)
+                            || !participants.contains(&coordinator)
+                        {
+                            return Err(Error::Corruption(
+                                "an external PREPARE whose xid is empty, or whose stream or \
+                                 coordinator isn't among its participants"
+                                    .into(),
+                            ));
+                        }
                         let mut read = Vec::new();
                         for r in share.reads() {
                             let r = r?;
@@ -1494,7 +1509,7 @@ impl Engine {
                             (stream, seqno),
                             ExternalStash {
                                 xid: share.xid().into(),
-                                participants: share.participants().iter().collect(),
+                                participants,
                                 read,
                             },
                         );
