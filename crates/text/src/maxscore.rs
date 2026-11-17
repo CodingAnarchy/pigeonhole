@@ -49,7 +49,7 @@ use crate::layout::*;
 /// real index switches to advancing a little late, never early. A modestly wrong value
 /// costs a constant factor (ski-rental's bound assumes the price is right; one off by a
 /// factor `f` costs up to about `f` times more, perf287 on #1377).
-const LOOKUP_IN_STEPS: u64 = 14;
+pub(crate) const LOOKUP_IN_STEPS: u64 = 14;
 
 /// [`LOOKUP_IN_STEPS`] as a step budget's charge for a point read (#1560).
 #[cfg(feature = "async")]
@@ -142,6 +142,7 @@ pub(crate) trait Reads {
         w: &mut Walk<'t, Self>,
         bm: &Bm25,
         cx: &mut Self::Cx<'_, '_>,
+        floor: f64,
         skip: impl Fn(&[u8]) -> bool,
     ) -> Poll<Result<()>>
     where
@@ -155,7 +156,16 @@ pub(crate) trait Reads {
             w.stepped += 1;
             match e {
                 Some(e) if skip(e.qualifier) => continue,
-                e => return Poll::Ready(Walk::<Self>::hold(&mut w.cur, w.weight, bm, e)),
+                e => {
+                    if let Err(e) = Walk::<Self>::hold(&mut w.cur, w.weight, bm, e) {
+                        return Poll::Ready(Err(e));
+                    }
+                    // A posting under the walk's floor can't matter ([`Walk::floor`]).
+                    if w.cur.get().is_some_and(|(_, c)| under(c, floor)) {
+                        continue;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -213,6 +223,7 @@ impl Reads for Blocking {
         w: &mut Walk<'t, Self>,
         bm: &Bm25,
         (): &mut (),
+        floor: f64,
         skip: impl Fn(&[u8]) -> bool,
     ) -> Poll<Result<()>> {
         Poll::Ready(loop {
@@ -221,7 +232,7 @@ impl Reads for Blocking {
                 Ok(e) => e,
                 Err(e) => break Err(e.into()),
             }) else {
-                w.cur = None;
+                w.cur.clear();
                 break Ok(());
             };
             if skip(e.qualifier) {
@@ -232,10 +243,13 @@ impl Reads for Blocking {
                 None => break Err(corrupt("a posting isn't a u64")),
             };
             let (tf, len) = unposting(posting);
-            w.cur = Some((
-                e.qualifier.to_vec(),
-                w.weight * bm.tf_factor(f64::from(tf), f64::from(len)),
-            ));
+            let here = w.weight * bm.tf_factor(f64::from(tf), f64::from(len));
+            // A posting under the walk's floor can't matter ([`Walk::floor`]): passed
+            // without a copy of its document.
+            if under(here, floor) {
+                continue;
+            }
+            w.cur.set(e.qualifier, here);
             break Ok(());
         })
     }
@@ -371,6 +385,65 @@ impl Reads for Nonblocking {
 
 /// A term's posting row, walked in document order. A posting contributes
 /// `weight · tf_factor`: the weight is the term's idf, times its boost in a fuzzy clause.
+/// Whether a contribution is under `floor`, with the bounds' slack: the test
+/// [`Scored::drop_below`] applies to an expansion's bound, applied to one posting.
+#[inline(always)]
+fn under(here: f64, floor: f64) -> bool {
+    here * (1.0 + SLACK) < floor
+}
+
+/// The posting a walk, or a fuzzy clause, stands on: its document and contribution there.
+///
+/// The document's buffer is reused from one posting to the next (#1585): a `Vec` per posting
+/// was 7% of a hub-term search's instructions in the allocator alone (the callgrind split of
+/// `text-term-hub`, run 43979031087).
+#[derive(Default)]
+pub(crate) struct Cur {
+    doc: Vec<u8>,
+    here: f64,
+    /// Whether it stands on a posting: `doc` and `here` are stale otherwise.
+    on: bool,
+}
+
+impl Cur {
+    #[inline(always)]
+    fn set(&mut self, doc: &[u8], here: f64) {
+        self.doc.clear();
+        self.doc.extend_from_slice(doc);
+        self.here = here;
+        self.on = true;
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.on = false;
+    }
+
+    #[inline(always)]
+    fn doc(&self) -> Option<&[u8]> {
+        if self.on {
+            Some(self.doc.as_slice())
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self) -> Option<(&[u8], f64)> {
+        if self.on {
+            Some((self.doc.as_slice(), self.here))
+        } else {
+            None
+        }
+    }
+
+    /// The contribution where it stands, 0 off the end.
+    #[inline(always)]
+    fn here(&self) -> f64 {
+        if self.on { self.here } else { 0.0 }
+    }
+}
+
 pub(crate) struct Walk<'t, R: Reads> {
     row: Vec<u8>,
     weight: f64,
@@ -379,7 +452,17 @@ pub(crate) struct Walk<'t, R: Reads> {
     /// Boxed: a walk is far larger than a phrase clause.
     cells: Box<RowCells<'t>>,
     /// The posting the walk stands on: its document and contribution.
-    cur: Option<(Vec<u8>, f64)>,
+    cur: Cur,
+    /// What a posting must add for its document to be able to reach the top `k`, once `k`
+    /// are held: the threshold less every other clause's bound ([`Scored::drop_below`]).
+    /// [`step`](Self::step) passes a posting that adds less, without standing on it (#1585).
+    ///
+    /// **Exact.** Such a document scores at most this posting's contribution plus the other
+    /// clauses' bounds, which is under the threshold, so it can't enter the top `k`, and the
+    /// threshold only rises. If another clause brings it up as a candidate, it is scored
+    /// without this contribution, lower still. A document that does enter never had a
+    /// posting passed, so its score is the same.
+    floor: f64,
     /// The postings the row holds (its `df`), and how many the walk has stepped past. With
     /// `id_prefix` the walk reads only part of the row, so `df` over-estimates what's left:
     /// it switches to advancing a little later than it could, which costs a little and never
@@ -478,7 +561,8 @@ impl<'t, R: Reads> Walk<'t, R> {
             weight,
             bound: weight * factor,
             cells: Box::new(cells),
-            cur: None,
+            cur: Cur::default(),
+            floor: f64::NEG_INFINITY,
             postings,
             stepped: 0,
             lookups: 0,
@@ -488,28 +572,23 @@ impl<'t, R: Reads> Walk<'t, R> {
     }
 
     fn doc(&self) -> Option<&[u8]> {
-        self.cur.as_ref().map(|(d, _)| d.as_slice())
+        self.cur.doc()
     }
 
     /// Out of line, as the sync walk's step was before #1560 (the compiler's choice then):
     /// inlined into `TopK::run`, it doubled the loop's own cost on the text shapes.
     #[inline(never)]
     pub(crate) fn step(&mut self, bm: &Bm25, cx: &mut R::Cx<'_, '_>) -> Poll<Result<()>> {
-        self.skip_while(bm, cx, |_| false)
+        R::skip_while(self, bm, cx, self.floor, |_| false)
     }
 
     /// Stands `cur` on `e`, the posting stepped to (`None`: the row is done). On the walk's
     /// fields, not `self`: `e` borrows its cells. Always inline: out of line, `e` was copied
     /// in on every posting (`memcpy`, about 12 instructions a posting on #1560's profile).
     #[inline(always)]
-    fn hold(
-        cur: &mut Option<(Vec<u8>, f64)>,
-        weight: f64,
-        bm: &Bm25,
-        e: Option<CellEntry<'_>>,
-    ) -> Result<()> {
+    fn hold(cur: &mut Cur, weight: f64, bm: &Bm25, e: Option<CellEntry<'_>>) -> Result<()> {
         let Some(e) = e else {
-            *cur = None;
+            cur.clear();
             return Ok(());
         };
         let (tf, len) = unposting(
@@ -517,10 +596,10 @@ impl<'t, R: Reads> Walk<'t, R> {
                 .as_u64()
                 .ok_or_else(|| corrupt("a posting isn't a u64"))?,
         );
-        *cur = Some((
-            e.qualifier.to_vec(),
+        cur.set(
+            e.qualifier,
             weight * bm.tf_factor(f64::from(tf), f64::from(len)),
-        ));
+        );
         Ok(())
     }
 
@@ -535,7 +614,8 @@ impl<'t, R: Reads> Walk<'t, R> {
         cx: &mut R::Cx<'_, '_>,
         skip: impl Fn(&[u8]) -> bool,
     ) -> Poll<Result<()>> {
-        R::skip_while(self, bm, cx, skip)
+        // No floor: a lookup's walk answers for one document, whatever it adds.
+        R::skip_while(self, bm, cx, f64::NEG_INFINITY, skip)
     }
 
     /// Stands on the first posting at or after `doc`, or after it with `past`: by stepping
@@ -608,8 +688,8 @@ impl<'t, R: Reads> Walk<'t, R> {
                 if self.doc().is_some_and(|d| d < doc) {
                     ready!(self.advance(bm, cx, doc, false));
                 }
-                return Poll::Ready(Ok(match &self.cur {
-                    Some((d, c)) if d.as_slice() == doc => *c,
+                return Poll::Ready(Ok(match self.cur.get() {
+                    Some((d, c)) if d == doc => c,
                     _ => 0.0,
                 }));
             }
@@ -639,7 +719,7 @@ pub(crate) enum Clause<'t, R: Reads> {
         solo: usize,
         /// The document the clause stands on (the walked ones' smallest) and its
         /// contribution there.
-        cur: Option<(Vec<u8>, f64)>,
+        cur: Cur,
     },
     /// A phrase, scored up front: its documents and their scores, in document order.
     Phrase {
@@ -714,7 +794,7 @@ impl<'t, R: Reads> Scored<'t, R> {
             clause: Clause::Fuzzy {
                 walks,
                 solo,
-                cur: None,
+                cur: Cur::default(),
             },
             bound: bound * (1.0 + SLACK),
         };
@@ -727,15 +807,18 @@ impl<'t, R: Reads> Scored<'t, R> {
     fn settle(&mut self) {
         if let Clause::Fuzzy { walks, solo, cur } = &mut self.clause {
             let walks = &walks[..*solo];
-            *cur = walks.iter().filter_map(|w| w.doc()).min().map(|doc| {
-                let best = walks
-                    .iter()
-                    .filter_map(|w| w.cur.as_ref())
-                    .filter(|(d, _)| d.as_slice() == doc)
-                    .map(|(_, c)| *c)
-                    .fold(0.0, f64::max);
-                (doc.to_vec(), best)
-            });
+            match walks.iter().filter_map(|w| w.doc()).min() {
+                Some(doc) => {
+                    let best = walks
+                        .iter()
+                        .filter_map(|w| w.cur.get())
+                        .filter(|(d, _)| *d == doc)
+                        .map(|(_, c)| c)
+                        .fold(0.0, f64::max);
+                    cur.set(doc, best);
+                }
+                None => cur.clear(),
+            }
         }
     }
 
@@ -755,7 +838,7 @@ impl<'t, R: Reads> Scored<'t, R> {
     fn doc(&self) -> Option<&[u8]> {
         match &self.clause {
             Clause::Term(w) => w.doc(),
-            Clause::Fuzzy { cur, .. } => cur.as_ref().map(|(d, _)| d.as_slice()),
+            Clause::Fuzzy { cur, .. } => cur.doc(),
             Clause::Phrase { scores, at } => scores.get(*at).map(|(d, _)| d.as_slice()),
         }
     }
@@ -763,9 +846,7 @@ impl<'t, R: Reads> Scored<'t, R> {
     /// The contribution where it stands.
     fn here(&self) -> f64 {
         match &self.clause {
-            Clause::Term(Walk { cur, .. }) | Clause::Fuzzy { cur, .. } => {
-                cur.as_ref().map_or(0.0, |(_, c)| *c)
-            }
+            Clause::Term(Walk { cur, .. }) | Clause::Fuzzy { cur, .. } => cur.here(),
             Clause::Phrase { scores, at } => scores.get(*at).map_or(0.0, |(_, c)| *c),
         }
     }
@@ -777,11 +858,11 @@ impl<'t, R: Reads> Scored<'t, R> {
         match &mut self.clause {
             Clause::Term(w) => ready!(w.step(bm, cx)),
             Clause::Fuzzy { walks, solo, cur } => {
-                let Some((doc, _)) = cur.as_ref() else {
+                let Some(doc) = cur.doc() else {
                     return Poll::Ready(Ok(()));
                 };
                 for w in walks[..*solo].iter_mut() {
-                    if w.doc() == Some(doc.as_slice()) {
+                    if w.doc() == Some(doc) {
                         ready!(w.step(bm, cx));
                     }
                 }
@@ -912,6 +993,10 @@ impl<'t, R: Reads> Scored<'t, R> {
     /// Dropped expansions aren't looked up either: by the same bound, they can't change
     /// the score of a document that enters.
     fn drop_below(&mut self, cut: f64) {
+        // A term's walk passes the postings that the same bound rules out ([`Walk::floor`]).
+        if let Clause::Term(w) = &mut self.clause {
+            w.floor = cut;
+        }
         let Clause::Fuzzy { walks, .. } = &mut self.clause else {
             return;
         };
