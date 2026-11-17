@@ -30,7 +30,7 @@ pub trait File {
 impl Pager {
     /// Gives one block of free space back to the filesystem: of the free blocks past the
     /// lowest `reserve` bytes of free space, the largest with space not yet punched.
-    /// `None` if there is nothing to punch.
+    /// `None` if there is nothing to punch, or if another call holds a block right now.
     pub fn punch_free(&self, reserve: u64) -> Result<Option<u64>>;
 }
 

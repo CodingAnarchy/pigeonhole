@@ -548,6 +548,37 @@ impl Alloc {
         self.punched.insert(from, to);
     }
 
+    /// The first unit past the lowest `reserve` units of free space, in whole blocks: the
+    /// lowest block that starts once the blocks below it hold `reserve` units. `None` if the
+    /// free space never reaches it. Walks the free lists in address order (a merge of the
+    /// per-class sets), visiting only the blocks inside the reserve.
+    fn punch_cutoff(&self, reserve: u64) -> Option<u64> {
+        let mut iters: Vec<_> = (0..CLASSES)
+            .map(|k| self.free[k].iter().copied().peekable())
+            .collect();
+        let mut kept = 0;
+        loop {
+            let (k, u) = iters
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(k, it)| it.peek().map(|&u| (k, u)))
+                .min_by_key(|&(_, u)| u)?;
+            if kept >= reserve {
+                return Some(u);
+            }
+            iters[k].next();
+            kept += units(k as u8);
+        }
+    }
+
+    /// Whether all of `[from, to)` is punched (one range covers it: ranges never touch).
+    fn all_punched(&self, from: u64, to: u64) -> bool {
+        self.punched
+            .range(..=from)
+            .next_back()
+            .is_some_and(|(_, &end)| end >= to)
+    }
+
     /// The parts of `[from, to)` not yet punched.
     fn unpunched(&self, from: u64, to: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
@@ -581,23 +612,19 @@ impl Alloc {
         if self.punching.is_some() {
             return None;
         }
-        let mut blocks: Vec<(u64, u8)> = (0..CLASSES)
-            .flat_map(|k| self.free[k].iter().map(move |&u| (u, k as u8)))
-            .collect();
-        blocks.sort_unstable();
-        let mut kept = 0;
-        let (unit, class, ranges) = blocks
-            .into_iter()
-            .skip_while(|&(_, k)| {
-                let keep = kept < reserve;
-                kept += units(k);
-                keep
-            })
-            .filter_map(|(u, k)| {
-                let todo = self.unpunched(u, u + units(k));
-                (!todo.is_empty()).then_some((u, k, todo))
-            })
-            .max_by_key(|&(u, k, _)| (k, u))?;
+        // Bounded under the allocator lock (simp724's S1 on #2033): the walk to the
+        // reserve's end visits only the blocks inside the reserve, and the pick then goes
+        // from the largest class down, each from its highest block, stopping at the first
+        // with space not yet punched.
+        let cutoff = self.punch_cutoff(reserve)?;
+        let (unit, class) = (0..CLASSES as u8).rev().find_map(|k| {
+            self.free[k as usize]
+                .range(cutoff..)
+                .rev()
+                .find(|&&u| !self.all_punched(u, u + units(k)))
+                .map(|&u| (u, k))
+        })?;
+        let ranges = self.unpunched(unit, unit + units(class));
         self.free[class as usize].remove(&unit);
         self.used.insert(
             unit,
@@ -847,6 +874,15 @@ impl Alloc {
         }
         assert_eq!(used, self.used_units);
         assert_eq!(retired, self.retired_units);
+        // The block a pass holds is a placeholder in the used map and in no free list.
+        if let Some((u, k)) = self.punching {
+            let x = self.used.get(&u).expect("the punching block is held");
+            assert!(x.placeholder && x.class == k, "punching block {u}: {x:?}");
+            assert!(
+                (0..CLASSES).all(|c| !self.free[c].contains(&u)),
+                "punching block {u} is also free"
+            );
+        }
         // Holes lie in free space only, as disjoint, non-touching ranges.
         let mut prev = 0;
         for (&a, &b) in &self.punched {
@@ -1298,6 +1334,83 @@ mod tests {
         a.truncate(a.used_end());
         a.check();
         assert_eq!((a.frontier(), a.punched_units()), (4, 0));
+    }
+
+    /// The pick `take_for_punch` must make, the obvious way: every free block in address
+    /// order, the ones past the reserve, the largest (then highest) with space not punched.
+    fn naive_punch_pick(a: &Alloc, reserve: u64) -> Option<(u64, u8, UnitRanges)> {
+        if a.punching.is_some() {
+            return None;
+        }
+        let mut blocks: Vec<(u64, u8)> = (0..CLASSES)
+            .flat_map(|k| a.free[k].iter().map(move |&u| (u, k as u8)))
+            .collect();
+        blocks.sort_unstable();
+        let mut kept = 0;
+        blocks
+            .into_iter()
+            .skip_while(|&(_, k)| {
+                let keep = kept < reserve;
+                kept += units(k);
+                keep
+            })
+            .filter_map(|(u, k)| {
+                let todo = a.unpunched(u, u + units(k));
+                (!todo.is_empty()).then_some((u, k, todo))
+            })
+            .max_by_key(|&(u, k, _)| (k, u))
+    }
+
+    #[derive(Debug, Clone)]
+    enum PunchOp {
+        Alloc(u8),
+        Release(usize),
+        Punch { reserve: u64, keep: usize },
+        Truncate,
+    }
+
+    fn punch_op() -> impl proptest::strategy::Strategy<Value = PunchOp> {
+        use proptest::prelude::*;
+        prop_oneof![
+            3 => (0u8..6).prop_map(PunchOp::Alloc),
+            2 => any::<usize>().prop_map(PunchOp::Release),
+            3 => (0u64..96, 0usize..4).prop_map(|(reserve, keep)| PunchOp::Punch { reserve, keep }),
+            1 => Just(PunchOp::Truncate),
+        ]
+    }
+
+    proptest::proptest! {
+        /// simp724's S1 on #2033: the bounded pick agrees with the naive one on any free
+        /// map, holes and all.
+        #[test]
+        fn the_bounded_punch_pick_matches_the_naive_one(
+            ops in proptest::collection::vec(punch_op(), 1..80),
+        ) {
+            let mut a = Alloc::empty(128);
+            let mut live: Vec<Extent> = Vec::new();
+            for op in ops {
+                match op {
+                    PunchOp::Alloc(k) => live.extend(a.alloc_lowest(k)),
+                    PunchOp::Release(i) if !live.is_empty() => {
+                        let x = live.swap_remove(i % live.len());
+                        proptest::prop_assert!(a.release_live(x));
+                    }
+                    PunchOp::Release(_) => {}
+                    PunchOp::Punch { reserve, keep } => {
+                        let want = naive_punch_pick(&a, reserve);
+                        let got = a.take_for_punch(reserve);
+                        proptest::prop_assert_eq!(&got, &want);
+                        a.check();
+                        if let Some((_, _, todo)) = got {
+                            // Record all, some or none of it (a failed or partial punch).
+                            a.end_punch(&todo[..keep.min(todo.len())]);
+                        }
+                    }
+                    PunchOp::Truncate => a.truncate(a.used_end()),
+                }
+                a.check();
+            }
+        }
     }
 
     #[test]

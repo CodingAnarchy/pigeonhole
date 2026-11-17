@@ -606,6 +606,19 @@ struct PendingCommit {
     features: Features,
 }
 
+/// The block a punch pass holds ([`Pager::punch_free`]): returned to the free map, with the
+/// ranges punched so far recorded, when this drops, on the way out or in an unwind.
+struct EndPunch<'a> {
+    alloc: &'a Mutex<Alloc>,
+    done: Vec<(u64, u64)>,
+}
+
+impl Drop for EndPunch<'_> {
+    fn drop(&mut self) {
+        lock(self.alloc).end_punch(&self.done);
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1433,7 +1446,8 @@ impl Pager {
     /// blocks past the lowest `reserve` bytes of free space (kept, since the allocator hands
     /// low space out again first and a write into a hole allocates again), the largest with
     /// space not yet punched. Returns the bytes punched, or `None` if there is nothing to
-    /// punch (or another pass holds a block).
+    /// punch, or if another call holds a block right now (one block at a time: a caller
+    /// that runs passes from several threads sees `None` from all but one).
     ///
     /// Free space is what no root that may be recovered and no live view references: the
     /// space reuse already overwrites ([`Pager::reclaim`] clamps to the durable root). The
@@ -1451,7 +1465,12 @@ impl Pager {
             return Ok(None);
         };
         let started = std::time::Instant::now();
-        let mut done = Vec::with_capacity(ranges.len());
+        // Returns the block even if a punch panics (simp724's S2 on #2033): a block left
+        // held would stop every later pass and stay out of the free map until reopen.
+        let mut held = EndPunch {
+            alloc: &self.inner.alloc,
+            done: Vec::with_capacity(ranges.len()),
+        };
         let mut failed = None;
         for &(a, b) in &ranges {
             match self
@@ -1459,15 +1478,15 @@ impl Pager {
                 .file
                 .punch_hole(a * UNIT_BYTES, (b - a) * UNIT_BYTES)
             {
-                Ok(()) => done.push((a, b)),
+                Ok(()) => held.done.push((a, b)),
                 Err(e) => {
                     failed = Some(e);
                     break;
                 }
             }
         }
-        lock(&self.inner.alloc).end_punch(&done);
-        let bytes: u64 = done.iter().map(|(a, b)| (b - a) * UNIT_BYTES).sum();
+        let bytes: u64 = held.done.iter().map(|(a, b)| (b - a) * UNIT_BYTES).sum();
+        drop(held);
         if bytes > 0 {
             self.inner.punches.fetch_add(1, Ordering::Relaxed);
             self.inner.punch_bytes.fetch_add(bytes, Ordering::Relaxed);
