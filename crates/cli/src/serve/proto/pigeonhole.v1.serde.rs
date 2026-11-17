@@ -6597,6 +6597,9 @@ impl serde::Serialize for ForwardRequest {
         if self.min_primary_seqno != 0 {
             len += 1;
         }
+        if !self.partition.is_empty() {
+            len += 1;
+        }
         if self.op.is_some() {
             len += 1;
         }
@@ -6624,6 +6627,9 @@ impl serde::Serialize for ForwardRequest {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("min_primary_seqno", ToString::to_string(&self.min_primary_seqno).as_str())?;
+        }
+        if !self.partition.is_empty() {
+            struct_ser.serialize_field("partition", &self.partition)?;
         }
         if let Some(v) = self.op.as_ref() {
             match v {
@@ -6690,6 +6696,12 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::VectorDelete(v) => {
                     struct_ser.serialize_field("vector_delete", v)?;
                 }
+                forward_request::Op::VectorSearch(v) => {
+                    struct_ser.serialize_field("vector_search", v)?;
+                }
+                forward_request::Op::VectorVerify(v) => {
+                    struct_ser.serialize_field("vector_verify", v)?;
+                }
                 forward_request::Op::CreateTextIndex(v) => {
                     struct_ser.serialize_field("create_text_index", v)?;
                 }
@@ -6698,6 +6710,9 @@ impl serde::Serialize for ForwardRequest {
                 }
                 forward_request::Op::TextDelete(v) => {
                     struct_ser.serialize_field("text_delete", v)?;
+                }
+                forward_request::Op::TextVerify(v) => {
+                    struct_ser.serialize_field("text_verify", v)?;
                 }
                 forward_request::Op::Remember(v) => {
                     struct_ser.serialize_field("remember", v)?;
@@ -6746,6 +6761,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "replicaMaxLagMs",
             "min_primary_seqno",
             "minPrimarySeqno",
+            "partition",
             "get",
             "read_row",
             "readRow",
@@ -6781,12 +6797,18 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "vectorInsert",
             "vector_delete",
             "vectorDelete",
+            "vector_search",
+            "vectorSearch",
+            "vector_verify",
+            "vectorVerify",
             "create_text_index",
             "createTextIndex",
             "text_put",
             "textPut",
             "text_delete",
             "textDelete",
+            "text_verify",
+            "textVerify",
             "remember",
             "recall",
             "mark_used",
@@ -6808,6 +6830,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             ToReplica,
             ReplicaMaxLagMs,
             MinPrimarySeqno,
+            Partition,
             Get,
             ReadRow,
             Mutate,
@@ -6829,9 +6852,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             CreateVectorIndex,
             VectorInsert,
             VectorDelete,
+            VectorSearch,
+            VectorVerify,
             CreateTextIndex,
             TextPut,
             TextDelete,
+            TextVerify,
             Remember,
             Recall,
             MarkUsed,
@@ -6867,6 +6893,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "toReplica" | "to_replica" => Ok(GeneratedField::ToReplica),
                             "replicaMaxLagMs" | "replica_max_lag_ms" => Ok(GeneratedField::ReplicaMaxLagMs),
                             "minPrimarySeqno" | "min_primary_seqno" => Ok(GeneratedField::MinPrimarySeqno),
+                            "partition" => Ok(GeneratedField::Partition),
                             "get" => Ok(GeneratedField::Get),
                             "readRow" | "read_row" => Ok(GeneratedField::ReadRow),
                             "mutate" => Ok(GeneratedField::Mutate),
@@ -6888,9 +6915,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "createVectorIndex" | "create_vector_index" => Ok(GeneratedField::CreateVectorIndex),
                             "vectorInsert" | "vector_insert" => Ok(GeneratedField::VectorInsert),
                             "vectorDelete" | "vector_delete" => Ok(GeneratedField::VectorDelete),
+                            "vectorSearch" | "vector_search" => Ok(GeneratedField::VectorSearch),
+                            "vectorVerify" | "vector_verify" => Ok(GeneratedField::VectorVerify),
                             "createTextIndex" | "create_text_index" => Ok(GeneratedField::CreateTextIndex),
                             "textPut" | "text_put" => Ok(GeneratedField::TextPut),
                             "textDelete" | "text_delete" => Ok(GeneratedField::TextDelete),
+                            "textVerify" | "text_verify" => Ok(GeneratedField::TextVerify),
                             "remember" => Ok(GeneratedField::Remember),
                             "recall" => Ok(GeneratedField::Recall),
                             "markUsed" | "mark_used" => Ok(GeneratedField::MarkUsed),
@@ -6924,6 +6954,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                 let mut to_replica__ = None;
                 let mut replica_max_lag_ms__ = None;
                 let mut min_primary_seqno__ = None;
+                let mut partition__ = None;
                 let mut op__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -6968,6 +6999,12 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             min_primary_seqno__ = 
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
+                        }
+                        GeneratedField::Partition => {
+                            if partition__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partition"));
+                            }
+                            partition__ = Some(map_.next_value()?);
                         }
                         GeneratedField::Get => {
                             if op__.is_some() {
@@ -7116,6 +7153,20 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::VectorDelete)
 ;
                         }
+                        GeneratedField::VectorSearch => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vectorSearch"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::VectorSearch)
+;
+                        }
+                        GeneratedField::VectorVerify => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vectorVerify"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::VectorVerify)
+;
+                        }
                         GeneratedField::CreateTextIndex => {
                             if op__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("createTextIndex"));
@@ -7135,6 +7186,13 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                                 return Err(serde::de::Error::duplicate_field("textDelete"));
                             }
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextDelete)
+;
+                        }
+                        GeneratedField::TextVerify => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textVerify"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextVerify)
 ;
                         }
                         GeneratedField::Remember => {
@@ -7202,6 +7260,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                     to_replica: to_replica__.unwrap_or_default(),
                     replica_max_lag_ms: replica_max_lag_ms__.unwrap_or_default(),
                     min_primary_seqno: min_primary_seqno__.unwrap_or_default(),
+                    partition: partition__.unwrap_or_default(),
                     op: op__,
                 })
             }
@@ -7267,6 +7326,15 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::Table(v) => {
                     struct_ser.serialize_field("table", v)?;
                 }
+                forward_response::Reply::VectorSearch(v) => {
+                    struct_ser.serialize_field("vector_search", v)?;
+                }
+                forward_response::Reply::VectorVerify(v) => {
+                    struct_ser.serialize_field("vector_verify", v)?;
+                }
+                forward_response::Reply::TextVerify(v) => {
+                    struct_ser.serialize_field("text_verify", v)?;
+                }
                 forward_response::Reply::Remember(v) => {
                     struct_ser.serialize_field("remember", v)?;
                 }
@@ -7316,6 +7384,12 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "empty",
             "nearest",
             "table",
+            "vector_search",
+            "vectorSearch",
+            "vector_verify",
+            "vectorVerify",
+            "text_verify",
+            "textVerify",
             "remember",
             "recall",
             "mark_used",
@@ -7342,6 +7416,9 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             Empty,
             Nearest,
             Table,
+            VectorSearch,
+            VectorVerify,
+            TextVerify,
             Remember,
             Recall,
             MarkUsed,
@@ -7382,6 +7459,9 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "empty" => Ok(GeneratedField::Empty),
                             "nearest" => Ok(GeneratedField::Nearest),
                             "table" => Ok(GeneratedField::Table),
+                            "vectorSearch" | "vector_search" => Ok(GeneratedField::VectorSearch),
+                            "vectorVerify" | "vector_verify" => Ok(GeneratedField::VectorVerify),
+                            "textVerify" | "text_verify" => Ok(GeneratedField::TextVerify),
                             "remember" => Ok(GeneratedField::Remember),
                             "recall" => Ok(GeneratedField::Recall),
                             "markUsed" | "mark_used" => Ok(GeneratedField::MarkUsed),
@@ -7501,6 +7581,27 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("table"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::Table)
+;
+                        }
+                        GeneratedField::VectorSearch => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vectorSearch"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::VectorSearch)
+;
+                        }
+                        GeneratedField::VectorVerify => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("vectorVerify"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::VectorVerify)
+;
+                        }
+                        GeneratedField::TextVerify => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textVerify"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::TextVerify)
 ;
                         }
                         GeneratedField::Remember => {

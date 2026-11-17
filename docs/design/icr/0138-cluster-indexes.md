@@ -55,7 +55,7 @@ Every write touches shared rows. So each partition an index is placed on holds a
 - **`Schema.DropTable`** of an index's name removes its placement.
 - **`Vectors.Insert` and `Delete`, `Text.Put` and `Delete`** route to the partition holding the id, by the table the index follows or by its own ranges. They're served there or forwarded, as a single-row call is.
   - **Not in the table routes:** an index's own table isn't routed by its ids. Data calls on it stay as before.
-- **Still `Unsupported` until the later PRs:** `Vectors.Search` (use `Vectors.Nearest`), `Verify` and `BulkLoad`, and `Text.Search`, `Rebuild` and `Verify`. The search refusals are split by kind.
+- **Still `Unsupported` until the later PRs:** `Vectors.Search` (use `Vectors.Nearest`), `Verify` and `BulkLoad`, and `Text.Search`, `Rebuild` and `Verify`. The search refusals are split by kind. (PR 1b serves `Vectors.Search` and both `Verify`s, below.)
 
 **Backups, restores and the rest (the reviews, audit120 and simp724 on #1994):**
 - **A backup** is refused, as for a table, when an index is dropped and created again or placed differently while it runs (`backup::moved`): copies either side would hold two incarnations, and a restore would make the older one's partitions again, empty.
@@ -76,3 +76,36 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - creates with neither or both of `follows`/`placement`, or following an unplaced table, are refused;
   - the first index waits for every node to report `indexes` (a test seam hides it on one node).
 - **Unit tests:** map validation and change rules, and index routes.
+
+## PR 1b: the vector search fan-out, and `Verify`
+
+**proto (additive):**
+- **`cluster.proto`:**
+  - `ForwardRequest.op` arms `vector_search = 25`, `vector_verify = 26` and `text_verify = 31`, each the client's request;
+  - `ForwardResponse.reply` arms `vector_search = 13`, `vector_verify = 14` and `text_verify = 16`;
+  - `ForwardRequest.partition = 50` (string, outside the oneof). This is the partition a fanned-out part of an index's search or check is for. Its request names only the index, and a node can own several of the index's partitions, as it can a table's. The owner serves that partition if it owns it and the map places the index on it, else `WrongPartition`. It's empty on every other call. PR 2's text parts use it too.
+
+**The calls:**
+- **`Vectors.Search`:**
+  - **Where it goes:** to each partition whose range meets `id_prefix` (`Routes::index_partitions`, listing a partition once however many of the index's ranges it holds). Without a prefix, it goes to every partition of the index. Each part is the client's request as it is.
+  - **The merge:** the entry node keeps the first `k` by `(distance, id)`. `stats` sums `lists_probed` and `lists`. `k` and the query are checked once, at the entry node.
+  - **Not a single index's answer:** each partition trained its own centroids, so `nprobe` and `max_probe` are per partition, and recall and cost rise with the partitions. perf287's g108 measured this (the guide quotes it). With every list probed, the search is exact over every row.
+  - **Ties at the cut** are each partition's (list, then id). So across partitions they're ordered by id only among the hits returned.
+  - **Unreachable:** a part that fails fails the search (`PartitionUnavailable` for an unreachable node). There's no `allow_partial` in v1.
+- **`Vectors.Verify` and `Text.Verify`:** sent to every partition of the index, with the counts summed. A part that fails fails the call, its message prefixed with the partition's id.
+- **The parts:** each is served like a nearest search's (`fanout_part`). The entry node holds the in-flight budget: two default read pages for a search (the reply's charge is then fitted to its size), and a small share for a check. The owner serves its part with no admission of its own, its scope and lease still checked. At most `--fanout-forwards` parts run at once. Parts go to the owner, never to a replica copy (D328).
+- **A forwarded index search or check without `partition`** isn't routed by its content (`unrouted`).
+- **Still `Unsupported`:** `Text.Search` and `Text.Rebuild` (PR 2), and `Vectors.BulkLoad` (PR 3).
+
+**Tests:**
+- **Through three nodes:**
+  - a search through the routing-only node returns both partitions' hits in `(distance, id)` order, and `stats.lists` is both partitions' list counts;
+  - an `id_prefix` reaches only its partition;
+  - `Vectors.Verify` and `Text.Verify` sum both partitions;
+  - an index not in the map answers `TableNotFound`;
+  - with 300 seeded vectors over an index's own two ranges and `nprobe` covering every list, the top 10 equal a brute-force L2 ranking;
+  - with one partition's node stopped, a search whose prefix lies in the other partition answers, one without a prefix answers `PartitionUnavailable`, and a check fails naming the stopped partition.
+- **Unit tests:**
+  - `index_partitions` by prefix, with a partition holding two ranges listed once;
+  - a named part routes only to a partition the index is on (`WrongPartition` otherwise; `InvalidArgument` for a call that doesn't name one);
+  - the hit merge's order and cut.

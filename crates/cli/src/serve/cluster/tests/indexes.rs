@@ -270,34 +270,76 @@ fn an_index_created_through_any_node_holds_each_partitions_range() {
         .await;
         assert_eq!((docs(&p1), docs(&p2)), (1, 1));
 
-        // Searches, verifies and rebuilds across partitions come with PR 1b and PR 2.
-        let not_yet = |e: tonic::Status| {
-            assert_eq!(code(&e), "Unsupported", "{e}");
-            assert!(
-                e.message().contains("isn't supported on a cluster yet"),
-                "{e}"
-            );
+        // A search through any node fans out to the partitions its prefix meets, and the
+        // hits merge by (distance, id); a check sums every partition's counts (PR 1b).
+        let mut vectors = VectorsClient::new(channel(c).await);
+        let search = |prefix: &[u8], stats| VectorSearchRequest {
+            index: "uv".into(),
+            query: Some(Vector {
+                element: Element::F32 as i32,
+                dim: 2,
+                data: [1.0f32, 2.0]
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<u8>>()
+                    .into(),
+            }),
+            k: 5,
+            id_prefix: prefix.to_vec().into(),
+            stats,
+            ..Default::default()
         };
-        let mut vectors = VectorsClient::new(channel(a).await);
-        not_yet(
-            vectors
-                .search(VectorSearchRequest {
-                    index: "uv".into(),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err(),
-        );
-        not_yet(
-            vectors
-                .verify(VectorVerifyRequest { index: "uv".into() })
-                .await
-                .unwrap_err(),
-        );
+        let ids = |r: crate::serve::proto::VectorSearchResponse| -> Vec<Vec<u8>> {
+            r.hits.into_iter().map(|h| h.id.to_vec()).collect()
+        };
+        let all = vectors
+            .search(search(b"", true))
+            .await
+            .unwrap()
+            .into_inner();
+        let lists = |db: &pigeonhole::Pigeonhole| {
+            pigeonhole_vector::Index::open(db, "uv")
+                .unwrap()
+                .verify()
+                .unwrap()
+                .list_lens
+                .len() as u32
+        };
+        assert_eq!(all.stats.unwrap().lists, lists(&p1) + lists(&p2));
+        assert_eq!(ids(all), [b"alice".to_vec(), b"zed".to_vec()]);
+        let z = vectors
+            .search(search(b"z", false))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(z.stats.is_none());
+        assert_eq!(ids(z), [b"zed".to_vec()]);
+        let checked = vectors
+            .verify(VectorVerifyRequest { index: "uv".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(checked.vectors, 2);
         let mut text = TextClient::new(channel(a).await);
         let ut = || TextIndexRequest { index: "ut".into() };
-        not_yet(text.rebuild(ut()).await.unwrap_err());
-        not_yet(text.verify(ut()).await.unwrap_err());
+        let checked = text.verify(ut()).await.unwrap().into_inner();
+        assert_eq!((checked.documents, checked.forward_mismatch), (2, 0));
+        let e = vectors
+            .search(VectorSearchRequest {
+                index: "nope".into(),
+                ..search(b"", false)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "TableNotFound", "{e}");
+
+        // Rebuilds across partitions come with PR 2.
+        let e = text.rebuild(ut()).await.unwrap_err();
+        assert_eq!(code(&e), "Unsupported", "{e}");
+        assert!(
+            e.message().contains("isn't supported on a cluster yet"),
+            "{e}"
+        );
 
         // The followed table stays while its indexes do (#1916's rule).
         let mut schema = SchemaClient::new(channel(b).await);
@@ -405,5 +447,126 @@ fn the_first_index_waits_for_every_node_to_keep_indexes() {
             .await
             .unwrap();
         eventually("p1 creates it", async || has_table(&p1, "uv")).await;
+    });
+}
+
+/// A vector search across an index's partitions, with `nprobe` covering every list, is an
+/// exact search over every row: its top `k` are a single index's. A search whose prefix
+/// is in a reachable partition goes on while another partition is down; one that needs the
+/// down partition, and a check, fail naming it.
+#[test]
+fn a_vector_search_across_partitions_is_exact_with_every_list_probed() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, _dbs, [a, _b, c], _) = three_nodes(&rt);
+    rt.block_on(async {
+        let mut api = VectorsClient::new(channel(c).await);
+        let mut own = vector_index("own");
+        // p2 below "k", p1 from it.
+        own.placement = Some(TablePlacementRequest {
+            group: String::new(),
+            splits: vec![b"k".to_vec().into()],
+            partitions: vec!["p2".into(), "p1".into()],
+        });
+        api.create_index(own).await.unwrap();
+        // A fixed seed's vectors, the ids spread over both ranges.
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut rows = Vec::new();
+        for i in 0..300u32 {
+            let id = format!("{}{i:03}", char::from(b'a' + (i % 26) as u8)).into_bytes();
+            let v = [next(), next()];
+            let data: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let insert = VectorInsertRequest {
+                index: "own".into(),
+                id: id.clone().into(),
+                vector: Some(Vector {
+                    element: Element::F32 as i32,
+                    dim: 2,
+                    data: data.into(),
+                }),
+            };
+            let mut tries = 0;
+            // The partitions create the index at their reconcile, just after the map has it.
+            while let Err(e) = api.insert(insert.clone()).await {
+                tries += 1;
+                assert!(tries < 200, "{e}");
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            rows.push((id, v));
+        }
+        let q = [0.5f32, 0.25];
+        let query = Vector {
+            element: Element::F32 as i32,
+            dim: 2,
+            data: q
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
+        };
+        let lists = api
+            .verify(VectorVerifyRequest {
+                index: "own".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(lists.vectors, 300);
+        let k = 10;
+        let got = api
+            .search(VectorSearchRequest {
+                index: "own".into(),
+                query: Some(query.clone()),
+                k,
+                nprobe: lists.lists as u32,
+                stats: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let stats = got.stats.unwrap();
+        assert_eq!(stats.lists_probed, stats.lists);
+        let mut want: Vec<(f32, Vec<u8>)> = rows
+            .iter()
+            .map(|(id, v)| {
+                let d = (v[0] - q[0]).powi(2) + (v[1] - q[1]).powi(2);
+                (d, id.clone())
+            })
+            .collect();
+        want.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let want: Vec<Vec<u8>> = want.into_iter().take(k as usize).map(|w| w.1).collect();
+        let ids: Vec<Vec<u8>> = got.hits.iter().map(|h| h.id.to_vec()).collect();
+        assert_eq!(ids, want);
+        assert!(got.hits.windows(2).all(|w| w[0].distance <= w[1].distance));
+
+        // b (p2, below "k") stops: a search within p1's range goes on, one needing p2
+        // fails, and so does a check, naming p2.
+        stops.remove(1).send(()).unwrap();
+        let mut api = VectorsClient::new(channel(a).await);
+        let search = |prefix: &[u8]| VectorSearchRequest {
+            index: "own".into(),
+            query: Some(query.clone()),
+            k,
+            id_prefix: prefix.to_vec().into(),
+            ..Default::default()
+        };
+        let found = api.search(search(b"m")).await.unwrap().into_inner();
+        assert!(!found.hits.is_empty());
+        assert!(found.hits.iter().all(|h| h.id.starts_with(b"m")));
+        let e = api.search(search(b"")).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let e = api
+            .verify(VectorVerifyRequest {
+                index: "own".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(e.message().contains("partition p2"), "{e}");
     });
 }
