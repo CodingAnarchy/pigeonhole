@@ -3332,7 +3332,7 @@ fn member_req(m: Member) -> CommitReq {
     let bytes = match m.bytes {
         Bytes::Own(b) => b,
         Bytes::Shared(b) => (*b).clone(),
-        Bytes::Streams(_) | Bytes::ExternalAbort(_) => BatchBuilder::new(),
+        Bytes::Streams(_) => BatchBuilder::new(),
     };
     CommitReq {
         bytes,
