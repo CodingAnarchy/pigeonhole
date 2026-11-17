@@ -1851,15 +1851,6 @@ enum MemberKind {
     CommitRecord {
         participants: Holders,
         apply_seqno: Seqno,
-        /// An external abort's encoded share (D329: xid, participants, no reads, no batch):
-        /// the record is an External Abort (type 6), `apply_seqno` the abort's own seqno,
-        /// held until it is written and then released with nothing applied (ICR 0140's E1).
-        /// `None` for a DECISION.
-        #[allow(
-            clippy::box_collection,
-            reason = "one pointer, not a slice's two words: every member keeps its size"
-        )]
-        external_abort: Option<Box<Vec<u8>>>,
     },
 }
 
@@ -1926,6 +1917,12 @@ enum Bytes {
     Shared(Arc<BatchBuilder>),
     /// A COMMIT record's encoded participant list.
     Streams(Vec<u8>),
+    /// An external abort's encoded share (D329: xid, participants, no reads, no batch): the
+    /// `CommitRecord` member carrying it is an External Abort (type 6), its `apply_seqno`
+    /// the abort's own seqno, held until it is written and then released with nothing
+    /// applied (ICR 0140's E1). Here, not a field of `CommitRecord`, so every member keeps
+    /// its size (#2000's callgrind).
+    ExternalAbort(Vec<u8>),
 }
 
 impl Bytes {
@@ -1935,7 +1932,7 @@ impl Bytes {
         let built = match self {
             Bytes::Own(b) => b.batch(),
             Bytes::Shared(b) => b.batch(),
-            Bytes::Streams(v) => return BatchRef::new(v),
+            Bytes::Streams(v) | Bytes::ExternalAbort(v) => return BatchRef::new(v),
         };
         debug_assert!(
             BatchRef::new(built.as_bytes()).is_ok(),
@@ -1948,7 +1945,7 @@ impl Bytes {
         match self {
             Bytes::Own(b) => b.batch().as_bytes(),
             Bytes::Shared(b) => b.batch().as_bytes(),
-            Bytes::Streams(v) => v,
+            Bytes::Streams(v) | Bytes::ExternalAbort(v) => v,
         }
     }
 }
@@ -2002,15 +1999,18 @@ impl Member {
                 coordinator: StreamId(u32::from(coordinator.0)),
                 share: pigeonhole_format::wal::ExternalShare::decode(share, true)?,
             },
-            MemberKind::CommitRecord {
-                apply_seqno,
-                external_abort: Some(share),
-                ..
-            } => WalRecord::ExternalAbort {
-                seqno: self.seqno,
-                abort_seqno: *apply_seqno,
-                share: pigeonhole_format::wal::ExternalShare::decode(share, false)?,
-            },
+            MemberKind::CommitRecord { apply_seqno, .. }
+                if matches!(self.bytes, Bytes::ExternalAbort(_)) =>
+            {
+                WalRecord::ExternalAbort {
+                    seqno: self.seqno,
+                    abort_seqno: *apply_seqno,
+                    share: pigeonhole_format::wal::ExternalShare::decode(
+                        self.bytes.as_slice(),
+                        false,
+                    )?,
+                }
+            }
             MemberKind::CommitRecord { apply_seqno, .. } => WalRecord::Decision {
                 seqno: self.seqno,
                 apply_seqno: *apply_seqno,
@@ -9462,8 +9462,7 @@ impl ShardState {
             MemberKind::CommitRecord {
                 participants,
                 apply_seqno,
-                external_abort: Some(_),
-            } => self.settle_external_abort(
+            } if matches!(m.bytes, Bytes::ExternalAbort(_)) => self.settle_external_abort(
                 m.seqno,
                 apply_seqno,
                 &participants,
@@ -9473,7 +9472,6 @@ impl ShardState {
             MemberKind::CommitRecord {
                 participants,
                 apply_seqno,
-                external_abort: None,
             } => {
                 // D286: a Buffered commit's `Decide`s went out at its decision.
                 if self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent) {
@@ -10048,12 +10046,11 @@ impl ShardState {
             kind: MemberKind::CommitRecord {
                 participants: shards.into(),
                 apply_seqno: abort_seqno,
-                external_abort: Some(Box::new(body)),
             },
             durability,
             seqno: id,
             commit_ts,
-            bytes: Bytes::Streams(Vec::new()),
+            bytes: Bytes::ExternalAbort(body),
             reply: Reply::None,
             submitted_at: 0,
             validate: None,
@@ -10183,7 +10180,6 @@ impl ShardState {
             kind: MemberKind::CommitRecord {
                 participants: holders,
                 apply_seqno,
-                external_abort: None,
             },
             durability,
             seqno,
