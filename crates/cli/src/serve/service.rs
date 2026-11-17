@@ -1197,6 +1197,8 @@ pub(crate) struct Service {
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
     blocking: Arc<Semaphore>,
+    /// The light pool (#1880): small, bounded sync calls on the network workers' CPUs.
+    lite: Arc<super::lite::Lite>,
     /// `/mcp` messages running at once (`--mcp-blocking`), each on a blocking thread of
     /// its own, outside `blocking`, whose permits its tools' ops take (ICR 0139's PR 3
     /// section).
@@ -1535,6 +1537,7 @@ impl Service {
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
+            lite: Arc::clone(&self.lite),
             mcp_places: Arc::clone(&self.mcp_places),
             scans: Arc::clone(&self.scans),
             bulk_budget: Arc::clone(&self.bulk_budget),
@@ -1602,6 +1605,12 @@ impl Service {
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
+            // Only under the mask, as many places as network workers (simp724's C1 on #1880,
+            // S1 on #1972).
+            lite: Arc::new(match &placement {
+                Some(p) if p.masked() => super::lite::Lite::new(p.io_threads, Some(Arc::clone(p))),
+                _ => super::lite::Lite::off(),
+            }),
             mcp_places: Arc::new(Semaphore::new(limits.mcp_blocking.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             bulk_budget: super::bulk::budget_pool(limits.bulk_load_bytes),
@@ -3112,6 +3121,12 @@ impl Service {
         blocking(&self.blocking, f).await
     }
 
+    /// Waits up to `timeout` for the light pool's running calls (shutdown, before the
+    /// databases close; simp724's S2 on #1972); whether they finished.
+    pub(crate) fn drain_lite(&self, timeout: Duration) -> bool {
+        self.lite.drain(timeout)
+    }
+
     /// A `--max-streams` place, now or `Overloaded`: a feed or watch stream's, or a `/mcp`
     /// `feed_poll`'s for its wait.
     pub(crate) fn stream_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
@@ -3738,7 +3753,8 @@ impl Service {
     /// A row's selected cells, a page at a time: whole columns, at most `page_bytes` by
     /// D308's measure (perf287's S1) and `page_cells` cells, resumed from `after`. The
     /// first column always comes back, so a page makes progress even when one column is
-    /// larger than the budget. On the blocking pool, since row pages are sync-only (D196).
+    /// larger than the budget. Sync, since row pages are sync-only (D196): a page within the
+    /// default budget on the light pool (#1880), a larger one on the blocking pool.
     /// TODO(#398, #1286): `read_async`-based paging, so a row read holds no blocking thread.
     async fn read_row(
         &self,
@@ -3754,7 +3770,7 @@ impl Service {
             r.page_cells as usize
         };
         // The request comes back with the reply, for a strict path's second read (#1661).
-        self.blocking(move || {
+        let read = move || {
             let reply = (|| -> Result<proto::ReadRowResponse, ApiError> {
                 let at = pinned.as_ref().map(|p| p.snapshot().clone());
                 let select = convert::Select::new(r.selection.as_ref())?.at(at);
@@ -3810,8 +3826,24 @@ impl Service {
                 })
             })()?;
             Ok((reply, r))
-        })
-        .await
+        };
+        // A page within the default budget is a small, bounded read: the light pool, on the
+        // siblings too. A larger one stays off them (perf287's note on #1880). The pool is
+        // tried before any await, so the future holds either the reply or the blocking call,
+        // never the closure twice: held across both, it grew every call's dispatch future,
+        // and moving it cost Get and Mutate about 550 instructions of memcpy a call (x86
+        // callgrind on #1972; boxing it instead cost each ReadRow about 10K).
+        let lite = if budget <= DEFAULT_PAGE_BYTES {
+            self.lite.try_run(read)
+        } else {
+            Err(read)
+        };
+        match lite {
+            Ok(reply) => reply
+                .await
+                .map_err(|_| ApiError::internal("the light pool's call was lost"))?,
+            Err(read) => self.blocking(read).await,
+        }
     }
 
     /// A scan as a stream of pages (ICR 0112): each page is one `read_within` on the
