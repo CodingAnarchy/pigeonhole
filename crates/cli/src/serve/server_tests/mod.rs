@@ -63,16 +63,7 @@ struct Server {
 
 /// A fresh directory for a server's files, with its `backups`.
 fn test_dir() -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "phdb-serve-{}-{nanos}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = crate::test_dir::fresh("phdb-serve-");
     std::fs::create_dir_all(dir.join("backups")).unwrap();
     dir
 }

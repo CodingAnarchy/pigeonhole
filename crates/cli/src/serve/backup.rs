@@ -592,10 +592,9 @@ mod tests {
     use super::*;
 
     fn fresh(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("phdb-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.canonicalize().unwrap()
+        crate::test_dir::fresh(&format!("phdb-{name}-"))
+            .canonicalize()
+            .unwrap()
     }
 
     /// A backup thread runs on the placement's free cores even when it's spawned from a

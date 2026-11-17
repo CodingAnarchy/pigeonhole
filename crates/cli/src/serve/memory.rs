@@ -536,9 +536,7 @@ pub(crate) mod tests {
 
     /// A store `notes` in a fresh database with a change feed, and its directory.
     pub(crate) fn core(name: &str) -> (Arc<MemCore>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("phdb-memwatch-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::fresh(&format!("phdb-memwatch-{name}-"));
         let db = pigeonhole::Pigeonhole::open(
             dir.join("m.phdb"),
             pigeonhole::Options::default()

@@ -826,9 +826,7 @@ mod tests {
     }
 
     fn db(name: &str) -> (Pigeonhole, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("phdb-sessions-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::fresh(&format!("phdb-sessions-{name}-"));
         let db = Pigeonhole::open(
             dir.join("s.phdb"),
             Options::default().create_if_missing(true).shards(1),

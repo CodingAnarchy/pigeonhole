@@ -6,29 +6,23 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-/// A directory under the system temp dir, removed when dropped.
-pub struct TempDir(PathBuf);
+/// A new directory under the system temp dir, removed when dropped. Its name is random,
+/// so it's never one an earlier run left: macOS reuses process ids (#2015).
+pub struct TempDir(tempfile::TempDir);
 
 impl TempDir {
     pub fn new(name: &str) -> Self {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("phdb-test-{}-{n}-{name}", std::process::id()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
+        Self(
+            tempfile::Builder::new()
+                .prefix(&format!("phdb-test-{name}-"))
+                .tempdir()
+                .unwrap(),
+        )
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 
