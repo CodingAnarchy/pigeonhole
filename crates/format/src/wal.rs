@@ -663,8 +663,22 @@ pub enum WalRecord<'a> {
 /// then, in an [`WalRecord::ExternalPrepare`], the batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExternalShare<'a> {
-    /// The whole encoded body, for [`WalRecord::split`].
+    /// The whole encoded body, checked by [`ExternalShare::decode`]; the fields are read
+    /// from it on access. Only the body is kept: every [`WalRecord`] is sized for its largest
+    /// variant, and a share's decoded fields grew it from 48 to 120 bytes, which every
+    /// commit's record paid for (#2000's callgrind).
     body: &'a [u8],
+    /// Whether the body ends with a batch ([`WalRecord::ExternalPrepare`]).
+    with_batch: bool,
+}
+
+// Every WAL record a commit builds is a `WalRecord`, sized for its largest variant: a variant
+// that grows it costs every commit (#2000's callgrind). A growth fails the build here instead.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<WalRecord<'static>>() == 48);
+
+/// An [`ExternalShare`]'s fields, read from its body.
+struct ShareFields<'a> {
     xid: &'a [u8],
     participants: StreamList<'a>,
     reads: &'a [u8],
@@ -687,25 +701,33 @@ pub struct ExternalRead<'a> {
 }
 
 impl<'a> ExternalShare<'a> {
+    /// The fields, read again from the body [`decode`](Self::decode) checked.
+    fn fields(&self) -> ShareFields<'a> {
+        Self::parse(self.body, self.with_batch).expect("checked by ExternalShare::decode")
+    }
+
     /// The transaction's external id.
     pub fn xid(&self) -> &'a [u8] {
-        self.xid
+        self.fields().xid
     }
 
     /// Every participant stream of the transaction, the coordinator's included.
     pub fn participants(&self) -> StreamList<'a> {
-        self.participants
+        self.fields().participants
     }
 
     /// The batch: `Some` in an [`WalRecord::ExternalPrepare`], `None` in an abort.
     pub fn batch(&self) -> Option<BatchRef<'a>> {
-        self.batch
+        self.fields().batch
     }
 
     /// The reads this participant validated, in order.
     pub fn reads(&self) -> impl Iterator<Item = crate::Result<ExternalRead<'a>>> + 'a {
-        let mut r = Reader::new(self.reads, "wal external read set");
-        (0..self.read_count).map(move |_| {
+        let ShareFields {
+            reads, read_count, ..
+        } = self.fields();
+        let mut r = Reader::new(reads, "wal external read set");
+        (0..read_count).map(move |_| {
             let table = TableId(r.u32()?);
             let family = FamilyId(r.u32()?);
             let row = r.bytes()?;
@@ -771,6 +793,15 @@ impl<'a> ExternalShare<'a> {
     /// Decodes a share's fields from a record body; `with_batch` for an
     /// [`WalRecord::ExternalPrepare`], whose batch is the rest. Never panics.
     pub fn decode(bytes: &'a [u8], with_batch: bool) -> crate::Result<Self> {
+        Self::parse(bytes, with_batch)?;
+        Ok(Self {
+            body: bytes,
+            with_batch,
+        })
+    }
+
+    /// Reads and checks a body's fields.
+    fn parse(bytes: &'a [u8], with_batch: bool) -> crate::Result<ShareFields<'a>> {
         let mut r = Reader::new(bytes, "wal external share");
         let xid = r.bytes()?;
         let list_len = r.u32()? as usize;
@@ -804,8 +835,7 @@ impl<'a> ExternalShare<'a> {
         } else {
             None
         };
-        Ok(Self {
-            body: bytes,
+        Ok(ShareFields {
             xid,
             participants,
             reads,
