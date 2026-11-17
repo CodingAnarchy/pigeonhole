@@ -1,0 +1,2 @@
+### Changed
+- **A `phdb serve` feed connection sending a long backlog gives its network worker back every 128 events at most**, as it did before batched hand-off (#2031, #2027). Since #2012 and #2020, a batch's events didn't count toward Tokio's per-task budget, so one connection could hold a network worker for many batches while puts on that worker waited. Events, their order and their tokens are unchanged.
