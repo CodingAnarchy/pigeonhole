@@ -55,7 +55,7 @@ Every write touches shared rows. So each partition an index is placed on holds a
 - **`Schema.DropTable`** of an index's name removes its placement.
 - **`Vectors.Insert` and `Delete`, `Text.Put` and `Delete`** route to the partition holding the id, by the table the index follows or by its own ranges. They're served there or forwarded, as a single-row call is.
   - **Not in the table routes:** an index's own table isn't routed by its ids. Data calls on it stay as before.
-- **Still `Unsupported` until the later PRs:** `Vectors.Search` (use `Vectors.Nearest`), `Verify` and `BulkLoad`, and `Text.Search`, `Rebuild` and `Verify`. The search refusals are split by kind. (PR 1b serves `Vectors.Search` and both `Verify`s, below.)
+- **Still `Unsupported` after PR 1a:** `Vectors.BulkLoad`, and `Text.Search` and `Rebuild`, with the search refusals split by kind. PR 1b serves `Vectors.Search` and both `Verify`s (below).
 
 **Backups, restores and the rest (the reviews, audit120 and simp724 on #1994):**
 - **A backup** is refused, as for a table, when an index is dropped and created again or placed differently while it runs (`backup::moved`): copies either side would hold two incarnations, and a restore would make the older one's partitions again, empty.
@@ -64,7 +64,7 @@ Every write touches shared rows. So each partition an index is placed on holds a
 - **The writer** refuses a text index whose `source_family` the followed table's placement doesn't list (`InvalidArgument`; a placement with no families can't be checked). It answers `Schema.CreateTable` of an index's name with `TableExists`, as a single node does.
 - **Reconcile records an index before creating it.** A create that fails part way (the text create makes its table, then commits its config) drops the table and the record, and the next reconcile tries again. A recorded index whose table is missing (a crash between the two) is created. One that's there but doesn't open gets an error in `Status` ("drop the index and create it again"), which works because it's recorded. It's never made again automatically, since a full index that stopped opening would come back empty. An unrecorded table of an index's name (made by hand) is adopted only if it opens as that index.
 - **Index creates answer `Empty`,** with no `unreconciled` list: a write right after can answer `TableNotFound` from a partition that hasn't taken the map yet, and the guide says to retry. `ListTables` and `DescribeTable` show the map's tables only, and `GetMap` lists the indexes.
-- **Calls not yet served** (`Vectors.Verify`, `BulkLoad`; `Text.Rebuild`, `Verify`) answer `Unsupported` "isn't supported on a cluster yet", as the searches do.
+- **Calls not yet served** answer `Unsupported` "isn't supported on a cluster yet", as the searches do.
 
 **Tests:**
 - **Through three nodes:**
@@ -91,10 +91,13 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - **The merge:** the entry node keeps the first `k` by `(distance, id)`. `stats` sums `lists_probed` and `lists`. `k` and the query are checked once, at the entry node.
   - **Not a single index's answer:** each partition trained its own centroids, so `nprobe` and `max_probe` are per partition, and recall and cost rise with the partitions. perf287's g108 measured this (the guide quotes it). With every list probed, the search is exact over every row.
   - **Ties at the cut** are each partition's (list, then id). So across partitions they're ordered by id only among the hits returned.
-  - **Unreachable:** a part that fails fails the search (`PartitionUnavailable` for an unreachable node). There's no `allow_partial` in v1.
-- **`Vectors.Verify` and `Text.Verify`:** sent to every partition of the index, with the counts summed. A part that fails fails the call, its message prefixed with the partition's id.
+  - **Unreachable:** a part that fails fails the search (`PartitionUnavailable` for an unreachable node), its message prefixed with the partition's id. There's no `allow_partial` in v1.
+- **`Vectors.Verify` and `Text.Verify`:** sent to every partition of the index, with the counts summed. A part that fails fails the call, its message prefixed with the partition's id. The sums are per-partition counts added up: a term in two partitions counts twice in `terms`, and `lists` is every partition's lists.
 - **The parts:** each is served like a nearest search's (`fanout_part`). The entry node holds the in-flight budget: two default read pages for a search (the reply's charge is then fitted to its size), and a small share for a check. The owner serves its part with no admission of its own, its scope and lease still checked. At most `--fanout-forwards` parts run at once. Parts go to the owner, never to a replica copy (D328).
 - **A forwarded index search or check without `partition`** isn't routed by its content (`unrouted`).
+- **A verify part is a whole index's check on its owner,** run on the owner's blocking pool with no admission there, as a nearest search's part is. The entry node's admission and `--fanout-forwards` bound how many run.
+- **A part is checked by the index's name, not its incarnation** (audit120's S2 on #2016). An index dropped and created again with another placement while one search runs could give an answer that mixes the two incarnations' partitions, or misses some of the new one's. The table fan-outs have the same shape. An index placement never changes in place, so this needs a drop and a create inside one search. Not guarded in v1.
+- **Mixed builds of `main`:** a node built at PR 1a that owns a partition answers a 1b part with `InvalidArgument` ("a forward carries no call"), so the search fails rather than answering short. Neither PR has shipped, and 1.3.0 carries both.
 - **Still `Unsupported`:** `Text.Search` and `Text.Rebuild` (PR 2), and `Vectors.BulkLoad` (PR 3).
 
 **Tests:**
@@ -104,7 +107,9 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - `Vectors.Verify` and `Text.Verify` sum both partitions;
   - an index not in the map answers `TableNotFound`;
   - with 300 seeded vectors over an index's own two ranges and `nprobe` covering every list, the top 10 equal a brute-force L2 ranking;
-  - with one partition's node stopped, a search whose prefix lies in the other partition answers, one without a prefix answers `PartitionUnavailable`, and a check fails naming the stopped partition.
+  - with one partition's node stopped, a search whose prefix lies in the other partition answers, one without a prefix answers `PartitionUnavailable`, and a check fails naming the stopped partition;
+  - one node owning two partitions of an index: searches and checks through it and through both other nodes see each partition once (a mutation serving the wrong named partition fails it).
+- **Not tested here:** `WrongPartition` on a part mid-search. It's `Reach::part`'s map pull and one retry, shared with multi-get and nearest parts.
 - **Unit tests:**
   - `index_partitions` by prefix, with a partition holding two ranges listed once;
   - a named part routes only to a partition the index is on (`WrongPartition` otherwise; `InvalidArgument` for a call that doesn't name one);

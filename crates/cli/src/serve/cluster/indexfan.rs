@@ -6,6 +6,7 @@
 //!   own centroids, so this isn't one index's answer: `nprobe` means "per partition", and
 //!   recall and cost rise with the partitions (perf287's g108). A partition that can't be
 //!   reached fails the search (`PartitionUnavailable`); there's no `allow_partial` in v1.
+//!   A part's error names its partition.
 //! - **`Vectors.Verify` and `Text.Verify`** go to every partition and sum the counts. A
 //!   partition whose check fails fails the call, naming it.
 //!
@@ -120,7 +121,7 @@ impl Router {
             futs,
             self.service.limits().fanout_forwards,
             || self.service.fanout_try_hold(share),
-            |_, answer| match answer?.0 {
+            |i, answer| match answer.map_err(|e| on(&parts[i], e))?.0 {
                 ServiceReply::VectorSearch(a) => {
                     if let Some(s) = a.stats {
                         stats.lists_probed += s.lists_probed;

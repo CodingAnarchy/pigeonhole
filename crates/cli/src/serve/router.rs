@@ -1595,7 +1595,6 @@ pub(crate) fn map_schema_change(op: &ServiceOp) -> bool {
     )
 }
 
-/// The partition holding id `id` of index `index` (#1722).
 /// The partition a fanned-out part of an index search or check names (#1722 PR 1b), if
 /// the map places the op's index on it; else `WrongPartition`, since the sending node's
 /// map placed it there.
@@ -1620,6 +1619,7 @@ fn index_part_route(routes: &Routes, op: &ServiceOp, partition: &str) -> Result<
     }
 }
 
+/// The partition holding id `id` of index `index` (#1722).
 fn index_route(routes: &Routes, index: &str, id: &[u8]) -> Result<String, ApiError> {
     routes
         .index_partition(index, id)

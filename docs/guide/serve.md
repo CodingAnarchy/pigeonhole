@@ -665,8 +665,8 @@ An IVF or BM25 index on a cluster (#1722, ICR 0138) is an **index placement** in
   - **With every list probed,** the search is exact over every row, as on a single node.
   - **Ties at the `k`th distance** are each partition's choice, so across partitions they're ordered by id only among the hits returned.
   - **`stats`** sums the partitions' `lists_probed` and `lists`.
-  - **A partition that can't be reached** fails the search with `PartitionUnavailable`. There's no `allow_partial` for it yet. A search whose `id_prefix` lies in reachable partitions doesn't need the others.
-- **`Vectors.Verify` and `Text.Verify`** check every partition's index and sum the counts. A partition whose check fails, or that can't be reached, fails the call, and the error names it.
+  - **A partition that can't be reached** fails the search with `PartitionUnavailable`, and the error names it. There's no `allow_partial` for it yet. A search whose `id_prefix` lies in reachable partitions doesn't need the others.
+- **`Vectors.Verify` and `Text.Verify`** check every partition's index and sum the counts. A partition whose check fails, or that can't be reached, fails the call, and the error names it. The sums are the partitions' counts added up, so a term found in two partitions counts twice in `terms`.
 - **Not yet:** `Text.Search` and `Text.Rebuild` answer `Unsupported` until #1722 PR 2, and `Vectors.BulkLoad` until #1722 PR 3. Use `Vectors.Insert` meanwhile.
 
 ### Schema through the cluster
