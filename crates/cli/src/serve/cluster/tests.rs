@@ -137,6 +137,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
+        indexes: Vec::new(),
         memory: None,
         nodes: ["a", "b", "c"]
             .iter()
@@ -703,6 +704,10 @@ fn a_forward_from_a_newer_peer_that_cant_give_its_map_writes_nothing() {
             map_version: 99,
             caller: Some(caller),
             fanout_part: false,
+            to_replica: false,
+            replica_max_lag_ms: 0,
+            min_primary_seqno: 0,
+            partition: String::new(),
             op: Some(forward_request::Op::Mutate(super::proto::MutateRequest {
                 writes: Some(put_row("bob", "1")),
                 durability: 0,
@@ -1441,15 +1446,15 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .connect()
             .await
             .unwrap();
-        let e = super::proto::vectors_client::VectorsClient::new(channel)
-            .search(super::proto::VectorSearchRequest {
+        let e = super::proto::text_client::TextClient::new(channel)
+            .search(super::proto::TextSearchRequest {
                 index: "users".into(),
                 ..Default::default()
             })
             .await
             .unwrap_err();
         assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("Vectors.Nearest"), "{e}");
+        assert!(e.message().contains("Text.Search"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {
@@ -4132,6 +4137,7 @@ fn split_nodes(
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
+        indexes: Vec::new(),
         memory: None,
         nodes: ports
             .iter()
@@ -4923,6 +4929,7 @@ mod close;
 mod feed;
 mod fence;
 mod idle;
+mod indexes;
 mod mcp;
 mod memory;
 mod metrics;

@@ -4,6 +4,33 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-11-15
+
+One cluster fix. Upgrade if you run `phdb serve` nodes in a cluster and close partitions with `phdb cluster close`. Only the public crates move to 1.2.3: the internal crates are unchanged and stay at 3.0.2. The file format, the shared-memory layout and the feed token layout are unchanged, so 1.2.x processes work together, and files move freely between them.
+
+### Fixed
+- `phdb cluster close` on a partition that is already closed and whose file hash failed (the way to retry the hash) never returned, and the node could then no longer fence, unfence, open, close or stamp any partition until it was restarted. It now takes the hash again and returns (#1956).
+
+## [1.2.2] - 2026-11-15
+
+Two change feed fixes. Upgrade if you serve change feeds with `phdb serve`, or resume durable feeds from tokens after a power loss. The file format, the shared-memory layout and the feed token layout are unchanged, so 1.2.x processes work together, and files move freely between them.
+
+### Fixed
+- `phdb serve`: a change-feed subscription opened while its tables were being written could receive nothing (only quiet heartbeats, no error) until every subscriber to those tables disconnected. A new fan-out hub's task could stop at its first commit, before the hub was ready; it now starts after the hub is made (#1926).
+- Change feeds: a durable feed resumed from a token after a power loss could expire ("records the feed read were lost") although nothing it had read or delivered was lost. This needed a rare coincidence (the last synced WAL record ending within 12 bytes of a 32 KiB frame's end while a durable subscriber held the next, unsynced record). A token's resume position now never points past where recovery cuts the log (#1937).
+
+## [1.2.1] - 2026-11-14
+
+Change feed and replica fixes for a database rolled back to 1.1.x and changed there, and the release to roll back to from 1.3. Upgrade if you use a feed of every table (`Pigeonhole::feed()`) or `phdb serve --replica-of`, or may move a database back from 1.3 with such a feed. The file format, the shared-memory layout and the feed token layout 1.2.1 writes are unchanged, so 1.2.0 and 1.2.1 processes work together, and files move freely between them.
+
+### Changed
+- A feed of every table checks each commit's tables in the pass that builds the commit, against a cache of the tables it has already found in the catalog. This takes back most of the cost the check for a 1.1.x session's drop added: about 4% fewer instructions a commit (#1874).
+
+### Fixed
+- A feed of every table resumed across a 1.1.x session that dropped a table (after a rollback from 1.2) answers `FeedExpired` when it reaches a commit to the dropped table. Before, it delivered that commit with an empty table name and went on without the drop (#1853).
+- `phdb serve --replica-of`: a replica whose apply is refused because its tables are no longer its primary's bootstraps again. Before, it retried from the same token for ever. This happens after a schema change the primary's feed didn't record, such as one made while the primary ran 1.1.x (#1853).
+- After a rollback from 1.3, a token of a feed of every table that 1.3 took resumes. Before, it was refused with `InvalidArgument`. 1.3 adds the catalog at the token's position to such tokens (version 3, D325); this release reads them and ignores that part (#1853).
+
 ## [1.2.0] - 2026-11-13
 
 Pigeonhole 1.2.0 serves a database over the network. Files stay in format 4; read "Upgrading from 1.1.x" below before upgrading. It adds:
@@ -981,6 +1008,9 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
 [Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.0...HEAD
+[1.2.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.2...v1.2.3
+[1.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.0...v1.2.0
 [1.1.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.1.1...v1.1.2

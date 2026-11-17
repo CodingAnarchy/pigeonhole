@@ -11,10 +11,15 @@ struct SlowSteps {
 }
 
 fn slow_steps() -> SlowSteps {
+    slow_steps_ms(5)
+}
+
+/// As [`slow_steps`], each step waiting `ms`.
+fn slow_steps_ms(ms: u64) -> SlowSteps {
     let held = STEP_DELAY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    crate::serve::texts::STEP_DELAY_MS.store(ms, Ordering::Relaxed);
     SlowSteps { _held: held }
 }
 
@@ -622,4 +627,293 @@ fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
             .is_empty()
     );
     part.part().unwrap().close_users();
+}
+
+// ---- `--text-pack`: the background pack (#1585, ICR 0143) ----
+
+/// `tx`'s check: its postings in blocks, and that it is consistent.
+fn packed_postings(db: &Pigeonhole) -> u64 {
+    let v = pigeonhole_text::Index::open(db, "tx")
+        .unwrap()
+        .verify()
+        .unwrap();
+    assert!(v.is_consistent(), "{v:?}");
+    v.packed
+}
+
+/// Waits (30 s at most) until `tx` has `want` postings in blocks.
+fn packed(db: &Pigeonhole, want: u64) {
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while packed_postings(db) != want {
+        assert!(
+            std::time::Instant::now() < until,
+            "the index was never packed: {} of {want} postings in blocks",
+            packed_postings(db)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The top 10 of a search of `tx` for "meeting".
+fn top_meeting(db: &Pigeonhole) -> Vec<(Vec<u8>, u64)> {
+    pigeonhole_text::Index::open(db, "tx")
+        .unwrap()
+        .search(pigeonhole_text::Query::new().term("meeting"), 10)
+        .run()
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.id, h.score.to_bits()))
+        .collect()
+}
+
+fn metrics_text(s: &Server) -> String {
+    let (_, m) = s.rpc("Admin/Metrics", &json!({}), None);
+    m["text"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_server_without_text_pack_never_packs_an_index() {
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    // As the server's start does, and a promote: neither starts a pack.
+    s.shared.router.service.resume_text_rebuilds();
+    s.shared.router.service.resume_text_rebuilds();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(packed_postings(&db), 0, "packed without --text-pack");
+    let text = metrics_text(&s);
+    assert!(!text.contains("pigeonhole_serve_text_pack"), "{text}");
+}
+
+#[test]
+fn text_pack_packs_the_indexes_in_the_background_and_searches_agree() {
+    let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    let before = top_meeting(&db);
+    assert_eq!(before.len(), 10);
+    // The pack thread starts with the server's start; a later call makes it pass at once.
+    s.shared.router.service.resume_text_rebuilds();
+    s.shared.router.service.resume_text_rebuilds();
+    // Both terms' 400 postings.
+    packed(&db, 800);
+    assert_eq!(top_meeting(&db), before);
+    // A document written since is a cell, found beside the blocks, and packed by the next
+    // pass.
+    let (status, r) = s.rpc(
+        "Text/Put",
+        &json!({"index": "tx", "id": b64(b"doc:9999"), "text": "meeting meeting meeting"}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    let after = top_meeting(&db);
+    assert_eq!(after[0].0, b"doc:9999", "{after:?}");
+    // The counter moves when the pack's call returns, a moment after its last chunk's
+    // commit is visible (a Windows CI run read it in between).
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let text = loop {
+        let text = metrics_text(&s);
+        if text.contains("pigeonhole_serve_text_pack_postings_total 800") {
+            break text;
+        }
+        assert!(std::time::Instant::now() < until, "{text}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        text.contains("pigeonhole_serve_text_pack_refused_total 0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE pigeonhole_serve_text_pack_passes_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pigeonhole_serve_text_pack_conflicts_total 0"),
+        "{text}"
+    );
+}
+
+#[test]
+fn text_pack_leaves_an_index_alone_while_a_reader_process_is_attached() {
+    let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    // A reader that may be a 1.2 build: the first pack is refused while it is attached.
+    let reader =
+        Pigeonhole::open_reader(s.dir.join("t.phdb"), pigeonhole::ReaderOptions::default())
+            .unwrap();
+    s.shared.router.service.resume_text_rebuilds();
+    s.shared.router.service.resume_text_rebuilds();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while metrics_text(&s).contains("pigeonhole_serve_text_pack_refused_total 0") {
+        assert!(
+            std::time::Instant::now() < until,
+            "the pack was never refused"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(packed_postings(&db), 0, "packed under a reader");
+    // Counted once for the index, however many passes find it refused (ai1249 on #2018).
+    s.shared.router.service.resume_text_rebuilds();
+    std::thread::sleep(Duration::from_millis(500));
+    let text = metrics_text(&s);
+    assert!(
+        text.contains("pigeonhole_serve_text_pack_refused_total 1"),
+        "{text}"
+    );
+    assert_eq!(packed_postings(&db), 0, "packed under a reader");
+    drop(reader);
+    s.shared.router.service.resume_text_rebuilds();
+    packed(&db, 800);
+}
+
+#[test]
+fn text_pack_waits_out_a_fence() {
+    let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    gate.fence();
+    // The partition's pack thread starts here, fenced: it writes nothing.
+    let part = gated_part(&s, &gate);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(packed_postings(&db), 0, "packed past a fence");
+    gate.unfence();
+    packed(&db, 800);
+    part.part().unwrap().close_users();
+}
+
+/// A server with `--text-pack` whose pack of `tx` (400 documents, two chunks) has done its
+/// first chunk and waits 1.5 s in its step before the second: the pack holds the node's
+/// slot. The steps' delay is back to 0 on return (only the step in flight still waits), so
+/// what the test runs next isn't slowed.
+///
+/// Also the counts of packs that had yielded, to a client and to a resume, when this took
+/// the steps' lock: hold the `SlowSteps` until the pack's yield is checked against them.
+/// The two tests that make a pack yield both come through here, and each checks its own
+/// reason's count, so one's yield can't pass for the other's (cli692 on #2018).
+fn packing() -> (Server, Pigeonhole, SlowSteps, (usize, usize)) {
+    let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    let slow = slow_steps_ms(1500);
+    let yielded = (
+        crate::serve::texts::PACK_YIELDED_TO_CLIENT.load(Ordering::SeqCst),
+        crate::serve::texts::PACK_YIELDED_TO_RESUME.load(Ordering::SeqCst),
+    );
+    s.shared.router.service.resume_text_rebuilds();
+    s.shared.router.service.resume_text_rebuilds();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while packed_postings(&db) == 0 {
+        assert!(std::time::Instant::now() < until, "the pack never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The pack's step has read its delay by now: it runs right after the chunk's commit.
+    std::thread::sleep(Duration::from_millis(100));
+    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    assert!(packed_postings(&db) < 800, "the pack finished in one chunk");
+    (s, db, slow, yielded)
+}
+
+#[test]
+fn a_clients_text_rebuild_takes_the_slot_from_a_pack() {
+    let (s, db, slow, yielded) = packing();
+    // It waits for the pack to stop at its next chunk, as it does for a resume, rather than
+    // being refused.
+    let r = s.block_on(s.shared.router.service.call(
+        ServiceOp::TextRebuild(proto::TextIndexRequest { index: "tx".into() }),
+        &Caller::anonymous(),
+        None,
+    ));
+    let Ok(service::ServiceReply::TextRebuild(r)) = r else {
+        panic!("{r:?}");
+    };
+    assert_eq!(r.documents, 400, "{r:?}");
+    // The pack stopped for it, rather than finishing first. Only this test and the next make
+    // a pack yield, one at a time, each counting from where it took the lock (`packing`).
+    assert!(
+        crate::serve::texts::PACK_YIELDED_TO_CLIENT.load(Ordering::SeqCst) > yielded.0,
+        "the pack finished instead of yielding the slot"
+    );
+    drop(slow);
+    // The next pass packs the rest.
+    s.shared.router.service.resume_text_rebuilds();
+    packed(&db, 800);
+}
+
+/// cli692's S1 on #2018: a stopped rebuild's resume doesn't wait behind a pack.
+#[test]
+fn a_stopped_rebuilds_resume_takes_the_slot_from_a_pack() {
+    let (s, db, slow, yielded) = packing();
+    // A second index over the same source with a rebuild pending from the top, as a
+    // cluster's create leaves one.
+    let table = db.table("t").unwrap().open().unwrap();
+    drop(
+        pigeonhole_text::Index::create_unfilled(
+            &db,
+            "ty",
+            pigeonhole_text::Source::new(&table, "f", b"body"),
+            pigeonhole_text::IndexOptions::new(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        pigeonhole_text::Index::pending_rebuilds(&db).unwrap(),
+        ["ty"]
+    );
+    // Its resume finds the pack on the slot, and the pack gives way at its next chunk.
+    s.shared.router.service.resume_text_rebuilds();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while !pigeonhole_text::Index::pending_rebuilds(&db)
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "the stopped rebuild never resumed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        crate::serve::texts::PACK_YIELDED_TO_RESUME.load(Ordering::SeqCst) > yielded.1,
+        "the resume waited for the pack to finish"
+    );
+    drop(slow);
+    // The pack carries on once the resume is done, and packs the new index too.
+    packed(&db, 800);
+    let v = pigeonhole_text::Index::open(&db, "ty")
+        .unwrap()
+        .verify()
+        .unwrap();
+    assert!(v.is_consistent(), "{v:?}");
+    assert_eq!(v.documents, 400, "{v:?}");
+}
+
+/// cli692's S2 on #2018: a `--replica-of` replica started with `--text-pack` never packs
+/// (its writes are refused); once promoted it does.
+#[test]
+fn a_replica_with_text_pack_packs_only_once_promoted() {
+    let p = Server::start("", limits());
+    indexed(&p.shared.router.service.part().unwrap().db.clone(), 400);
+    let r = Server::start_replica_custom(
+        test_dir(),
+        &p.url,
+        None,
+        limits(),
+        Options::default(),
+        |s| s.text_pack(true),
+    );
+    wait_replica(&r, "caught up", caught_up(&p, None));
+    let db = r.shared.router.service.part().unwrap().db.clone();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(packed_postings(&db), 0, "a replica packed");
+    let text = metrics_text(&r);
+    assert!(
+        text.contains("pigeonhole_serve_text_pack_passes_total 0"),
+        "{text}"
+    );
+    let (status, body) = r.rpc("Admin/Promote", &json!({}), None);
+    assert_eq!(status, 200, "{body}");
+    packed(&db, 800);
 }

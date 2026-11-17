@@ -352,6 +352,7 @@ fn opened_off_the_others_cores_alone() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        indexes: Vec::new(),
         memory: None,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
@@ -670,6 +671,7 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        indexes: Vec::new(),
         memory: None,
         previous_nodes: Vec::new(),
     };
@@ -787,6 +789,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
+        indexes: Vec::new(),
         memory: None,
         nodes: vec![MapNode {
             id: "a".into(),
@@ -1319,6 +1322,7 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
             created: 0,
         }],
         previous_nodes: Vec::new(),
+        indexes: Vec::new(),
         memory: None,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();

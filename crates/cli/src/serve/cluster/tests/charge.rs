@@ -475,6 +475,10 @@ fn a_client_token_cant_send_a_fan_out_part_past_the_budget() {
             map_version: 1,
             caller: None,
             fanout_part: true,
+            to_replica: false,
+            replica_max_lag_ms: 0,
+            min_primary_seqno: 0,
+            partition: String::new(),
             op: Some(forward_request::Op::MultiGet(MultiGetRequest {
                 table: "users".into(),
                 keys: vec![b"a1".to_vec().into()],

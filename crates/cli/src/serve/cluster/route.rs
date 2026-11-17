@@ -18,6 +18,28 @@ struct Placement {
     partitions: Vec<String>,
 }
 
+impl Placement {
+    /// The partitions holding ids that start with `prefix`, in key order and without
+    /// repeats (an empty prefix: all of them). Range `i` is `[splits[i-1], splits[i])`: it
+    /// holds such an id when it ends past the prefix and starts before the first key past
+    /// every id with it.
+    fn with_prefix(&self, prefix: &[u8]) -> Vec<&str> {
+        let end = prefix_end(prefix);
+        let mut out: Vec<&str> = Vec::new();
+        for (i, partition) in self.partitions.iter().enumerate() {
+            let starts_before_end = match (&end, i.checked_sub(1).map(|j| &self.splits[j])) {
+                (Some(end), Some(lo)) => lo < end,
+                _ => true,
+            };
+            let ends_past_prefix = self.splits.get(i).is_none_or(|hi| hi.as_slice() > prefix);
+            if starts_before_end && ends_past_prefix && !out.contains(&partition.as_str()) {
+                out.push(partition);
+            }
+        }
+        out
+    }
+}
+
 /// One partition's part of a table: its rows in `[start, end)` (`end` `None`: the table's
 /// end).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +72,8 @@ pub(crate) struct Owner {
     /// The epoch P's current history began at (D317 ticket 6): a feed token from an epoch
     /// before it can't resume.
     pub history_epoch: u64,
+    /// P's replicas (D328), in the map's order of preference: each node's id and address.
+    pub replicas: Vec<(String, String)>,
 }
 
 /// The routing view of one map version.
@@ -61,6 +85,10 @@ pub(crate) struct Routes {
     owners: HashMap<String, Owner>,
     /// The memory store's name and its namespaces' placement (#1915), if the map has one.
     memory: Option<(String, Placement)>,
+    /// Each index's ids' placement (#1722): its followed table's, or its own. Apart from
+    /// `tables`: an index's own table holds rows that aren't keyed by its ids, so a data
+    /// call on that table never routes by them.
+    indexes: HashMap<String, Placement>,
 }
 
 impl Routes {
@@ -82,11 +110,19 @@ impl Routes {
                     address: address.to_owned(),
                     epoch: p.epoch,
                     history_epoch: p.history_epoch,
+                    replicas: p
+                        .replicas
+                        .iter()
+                        .map(|r| {
+                            let address = addresses.get(r.as_str()).copied().unwrap_or_default();
+                            (r.clone(), address.to_owned())
+                        })
+                        .collect(),
                 };
                 (p.id.clone(), owner)
             })
             .collect();
-        let tables = map
+        let tables: HashMap<String, Placement> = map
             .tables
             .iter()
             .map(|t| {
@@ -113,13 +149,43 @@ impl Routes {
             };
             (m.store.clone(), placement)
         });
+        let indexes = map
+            .indexes
+            .iter()
+            .map(|i| {
+                let placement = match tables.get(i.follows.as_str()) {
+                    Some(t) if !i.follows.is_empty() => Placement {
+                        splits: t.splits.clone(),
+                        partitions: t.partitions.clone(),
+                    },
+                    _ => Placement {
+                        splits: i
+                            .splits
+                            .iter()
+                            .filter_map(|k| split_key_bytes(k).ok())
+                            .collect(),
+                        partitions: i.partitions.clone(),
+                    },
+                };
+                (i.name.clone(), placement)
+            })
+            .collect();
         Self {
             cluster_id: map.cluster_id.clone(),
             map_version: map.map_version,
             tables,
             owners,
             memory,
+            indexes,
         }
+    }
+
+    /// The partition holding id `id` of index `index` (#1722); `None` for an index the map
+    /// doesn't place.
+    pub(crate) fn index_partition(&self, index: &str, id: &[u8]) -> Option<&str> {
+        let p = self.indexes.get(index)?;
+        let i = p.splits.partition_point(|s| s.as_slice() <= id);
+        p.partitions.get(i).map(String::as_str)
     }
 
     /// The memory store the map places, if any (#1915).
@@ -157,20 +223,15 @@ impl Routes {
     /// doesn't place. Range `i` is `[splits[i-1], splits[i])`: it holds such a row when it
     /// ends past the prefix and starts before the first key past every row with it.
     pub(crate) fn partitions_of_table(&self, table: &str, prefix: &[u8]) -> Option<Vec<&str>> {
-        let p = self.tables.get(table)?;
-        let end = prefix_end(prefix);
-        let mut out: Vec<&str> = Vec::new();
-        for (i, partition) in p.partitions.iter().enumerate() {
-            let starts_before_end = match (&end, i.checked_sub(1).map(|j| &p.splits[j])) {
-                (Some(end), Some(lo)) => lo < end,
-                _ => true,
-            };
-            let ends_past_prefix = p.splits.get(i).is_none_or(|hi| hi.as_slice() > prefix);
-            if starts_before_end && ends_past_prefix && !out.contains(&partition.as_str()) {
-                out.push(partition);
-            }
-        }
-        Some(out)
+        Some(self.tables.get(table)?.with_prefix(prefix))
+    }
+
+    /// The partitions holding ids of index `index` that start with `prefix` (#1722), as
+    /// [`partitions_of_table`](Self::partitions_of_table) gives a table's; `None` for an
+    /// index the map doesn't place. A partition with several of the index's ranges is
+    /// listed once: it holds one index.
+    pub(crate) fn index_partitions(&self, index: &str, prefix: &[u8]) -> Option<Vec<&str>> {
+        Some(self.indexes.get(index)?.with_prefix(prefix))
     }
 
     /// The partition holding `table`'s row `row`; `None` for a table the map doesn't place.
@@ -313,6 +374,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 7,
             previous_nodes: Vec::new(),
+            indexes: Vec::new(),
             memory: None,
             nodes: vec![
                 Node {
@@ -344,6 +406,72 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// #1722: an index's id routes by its followed table's ranges, or by its own; a data call
+    /// on the index's own table never does (it isn't in `tables`).
+    #[test]
+    fn an_index_id_routes_by_the_table_it_follows_or_its_own_ranges() {
+        use crate::serve::proto::IndexPlacement;
+        let mut m = map();
+        m.indexes = vec![
+            IndexPlacement {
+                name: "users_vec".into(),
+                follows: "users".into(),
+                ..Default::default()
+            },
+            IndexPlacement {
+                name: "own".into(),
+                splits: vec![text("k")],
+                partitions: vec!["p3".into(), "p1".into()],
+                ..Default::default()
+            },
+        ];
+        let r = Routes::new(&m);
+        for (id, want) in [(&b"a"[..], "p1"), (b"g", "p2"), (b"m\xff", "p3")] {
+            assert_eq!(r.index_partition("users_vec", id), Some(want));
+            assert_eq!(r.partition("users", id), Some(want));
+        }
+        assert_eq!(r.index_partition("own", b"j"), Some("p3"));
+        assert_eq!(r.index_partition("own", b"k"), Some("p1"));
+        assert_eq!(r.index_partition("nope", b"a"), None);
+        assert_eq!(r.partition("users_vec", b"a"), None);
+    }
+
+    #[test]
+    fn an_index_prefix_narrows_its_partitions_and_lists_each_once() {
+        use crate::serve::proto::IndexPlacement;
+        let mut m = map();
+        m.indexes = vec![
+            IndexPlacement {
+                name: "users_vec".into(),
+                follows: "users".into(),
+                ..Default::default()
+            },
+            // Two ranges on p1, one on p3.
+            IndexPlacement {
+                name: "own".into(),
+                splits: vec![text("f"), text("k")],
+                partitions: vec!["p1".into(), "p3".into(), "p1".into()],
+                ..Default::default()
+            },
+        ];
+        let r = Routes::new(&m);
+        assert_eq!(
+            r.index_partitions("users_vec", b""),
+            Some(vec!["p1", "p2", "p3"])
+        );
+        assert_eq!(r.index_partitions("users_vec", b"h"), Some(vec!["p2"]));
+        assert_eq!(
+            r.index_partitions("users_vec", b"m"),
+            Some(vec!["p2", "p3"])
+        );
+        assert_eq!(r.index_partitions("own", b""), Some(vec!["p1", "p3"]));
+        assert_eq!(r.index_partitions("own", b"g"), Some(vec!["p3"]));
+        assert_eq!(r.index_partitions("own", b"z"), Some(vec!["p1"]));
+        assert_eq!(r.index_partitions("nope", b""), None);
+        // A table's own call never sees an index's placement.
+        assert_eq!(r.partitions_of_table("own", b""), None);
     }
 
     #[test]
@@ -425,6 +553,7 @@ mod tests {
                 address: "127.0.0.1:7002".into(),
                 epoch: 2,
                 history_epoch: 0,
+                replicas: Vec::new(),
             })
         );
         assert_eq!(r.owner("p9"), None);

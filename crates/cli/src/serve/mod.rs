@@ -38,6 +38,7 @@ mod http;
 mod indexes;
 mod lease;
 mod listener;
+mod lite;
 mod mcp;
 mod mcp_backend;
 mod memory;
@@ -530,7 +531,8 @@ pub(crate) fn single<'a>(
     .memory_opt(
         memory(args, &db, replica.is_none(), &placement, stderr)?,
         args.memory_calls.unwrap_or(0),
-    );
+    )
+    .text_pack(args.text_pack);
     if let Some(r) = &replica {
         service = service.replica(Arc::clone(r));
     }
@@ -746,6 +748,10 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
     // runtime, before the database closes under their feeds.
     feed_runtime.shutdown_timeout(Duration::from_secs(5));
     hub_runtime.shutdown_timeout(Duration::from_secs(5));
+    // The light pool's calls (#1880) end before the databases close, as the blocking pool's
+    // do with the runtime; its places are shared node-wide, so one wait covers every
+    // partition.
+    shared.router.service.drain_lite(Duration::from_secs(5));
     // The threads that use each database end before it closes. The front-ends are gone, so a
     // bulk load's input has ended.
     for part in shared.router.parts() {

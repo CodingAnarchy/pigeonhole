@@ -853,6 +853,17 @@ Reads were already equal on both backends (ycsb-c 1.01×, cold get identical).
 - **Depth 2 also bounds the syncs** a shard can pile onto the device.
 - macOS keeps 1, for D207's reason: `F_FULLFSYNC` serializes on the device.
 
+**Reaffirmed 2026-11-16 (owner, closing #1621 as a documented residue).** Depth 2 has a known cost on Linux, and depth 1 a larger one:
+- **The cost of 2:**
+  - Sync N+1's writeback walk (`write_cache_pages`, `WB_SYNC_ALL`) can lock the WAL's tail page cache folio (about 1 MiB on XFS's large folios) and then wait out sync N's writeback of it, holding the lock.
+  - The shard driver's next `pwrite` into that folio waits for the lock, about one I/O completion (~5.85 ms).
+  - g117, g120 and g123 traced it end to end: the driver's wait, the io-wq FSYNC worker as the waker, and the worker blocked 99.8% of the wait. At 55K puts/s on the AX102 it's about 70–85 waits of 5 ms or more per 10 minutes, around p99.99 of puts.
+- **The cost of 1** (g125, 2026-11-16, main 8069e476c):
+  - It removes those waits (80 → 0 per session), but fails D213's gate row in all 3 runs: 2.06–2.07M against 2.36–2.39M ops/s (−13%), p99 214–246 µs against the 200 µs target.
+  - This table's own 16-client row has reversed on today's main (depth 1 now +6%, p99 94–98 against 106–113 µs), but the gate row decides.
+- So the depth stays 2.
+- A depth that adapts to load (1 unless commits queue behind a sync) is the lever left, unplanned, pending #1991 (the late-session p99 ramp, which these waits don't cause).
+
 <a id="d222"></a>
 ## D222 — Scans read 16 data blocks ahead, without merging adjacent fetches; `PIGEONHOLE_READAHEAD` is removed (owner decision, 2026-10-12; engine, #431)
 
@@ -4953,7 +4964,7 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
   - **M1:** the owner serves Follow only under P's lease (D326): a deposed owner's stream ends within L, so it can't feed a replica.
   - **S1:** a partition with replicas needs its owner's change feed on. An owner without one answers the bootstrap and Follow with `FailedPrecondition` naming `--change-feed`, and the copy reports `OWNER_FEED_OFF`.
   - On a break the follower reads the map again and dials P's owner now. A copy move (`move`, `relocate --copy`) keeps P's history, so the token resumes on the new owner. When the map says P's history began after the copy's bootstrap (`history_epoch` > the epoch in the copy's identity row, `e_b`: a relocate without copy, a restore, a promotion), the follower bootstraps again from the new owner instead, since the owner can't tell which partition another database's token was for.
-- **Freshness** is measured on the replica: the time since its owner last said it was caught up (a batch with `caught_up`, sent at least once a second while idle). A stopped stream ages it at once.
+- **Freshness** is measured on the replica: the time since the arrival of the newest owner message whose durable frontier (`primary_seqno`) the copy had applied through. The owner sends one at least once a second while idle, so a stopped stream ages it at once. Amended in PR 2a (simp724's note on #1974, D330's M2): PR 1 counted only messages with `caught_up`, which an owner under sustained writes rarely sends, so a busy partition's replicas would have looked stale.
 - **Status and Info:** `LocalPartition.role` (owner or replica); for a copy, the owner it follows, the applied and primary seqnos, `lag_ms` and `replica_state` (bootstrapping, following, behind, stopped, owner feed off). `Admin.Info` lists each copy with its `ReplicaInfo`, and `/metrics` carries each copy's replica gauges labelled by partition.
 - **Reads (PR 2):** opt in per request with a max-lag bound (`x-pigeonhole-read-replica-max-lag-ms`), checked by the replica on its own clock, falling back to the next replica, then the owner. Read-your-writes per partition with `x-pigeonhole-min-primary-seqno`. A routed scan checks the bound before each page (S2). The response says who served it and at what seqno (Q7). Off by default, no server-wide default (Q9).
 - **Promotion (PR 3):** `phdb cluster promote P --to ID` closes ID's copy and stamps and maps it as relocate does. `--old-unreachable` reports the loss of acknowledged writes, with no extra flag (Q8).

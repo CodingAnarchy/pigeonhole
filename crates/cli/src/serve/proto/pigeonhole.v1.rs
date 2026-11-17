@@ -3958,6 +3958,875 @@ pub mod schema_server {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateTextIndexRequest {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// The column the index follows.
+    #[prost(string, tag = "2")]
+    pub source_table: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub source_family: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub source_qualifier: ::prost::bytes::Bytes,
+    /// Unset options take the library's defaults.
+    #[prost(double, optional, tag = "5")]
+    pub k1: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "6")]
+    pub b: ::core::option::Option<f64>,
+    #[prost(bool, optional, tag = "7")]
+    pub positions: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "8")]
+    pub stop_words: ::core::option::Option<bool>,
+    #[prost(enumeration = "Normalization", tag = "9")]
+    pub normalization: i32,
+    #[prost(uint32, optional, tag = "10")]
+    pub max_terms: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "11")]
+    pub max_term_bytes: ::core::option::Option<u32>,
+    #[prost(bool, tag = "12")]
+    pub if_missing: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextPutRequest {
+    #[prost(string, tag = "1")]
+    pub index: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextDeleteRequest {
+    #[prost(string, tag = "1")]
+    pub index: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextSearchRequest {
+    #[prost(string, tag = "1")]
+    pub index: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "4")]
+    pub k: u32,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub id_prefix: ::prost::bytes::Bytes,
+    /// Return each hit's text with the matches' ranges.
+    #[prost(bool, tag = "6")]
+    pub highlight: bool,
+    #[prost(oneof = "text_search_request::Query", tags = "2, 3")]
+    pub query: ::core::option::Option<text_search_request::Query>,
+}
+/// Nested message and enum types in `TextSearchRequest`.
+pub mod text_search_request {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Query {
+        /// The query syntax (`Query::parse`): terms, "phrases", ~fuzzy terms.
+        #[prost(string, tag = "2")]
+        Syntax(::prost::alloc::string::String),
+        #[prost(message, tag = "3")]
+        Clauses(super::TextQuery),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextQuery {
+    #[prost(message, repeated, tag = "1")]
+    pub clauses: ::prost::alloc::vec::Vec<TextClause>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextClause {
+    #[prost(oneof = "text_clause::Clause", tags = "1, 2, 3, 4")]
+    pub clause: ::core::option::Option<text_clause::Clause>,
+}
+/// Nested message and enum types in `TextClause`.
+pub mod text_clause {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Clause {
+        #[prost(string, tag = "1")]
+        Term(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Phrase(super::Phrase),
+        #[prost(message, tag = "3")]
+        Fuzzy(super::Fuzzy),
+        /// Free text, tokenized as a document is.
+        #[prost(string, tag = "4")]
+        Text(::prost::alloc::string::String),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Phrase {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub slop: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Fuzzy {
+    #[prost(string, tag = "1")]
+    pub term: ::prost::alloc::string::String,
+    #[prost(enumeration = "Fuzziness", tag = "2")]
+    pub fuzziness: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextSearchResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub hits: ::prost::alloc::vec::Vec<TextHit>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextHit {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    #[prost(double, tag = "2")]
+    pub score: f64,
+    /// With `highlight`.
+    #[prost(string, tag = "3")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub matches: ::prost::alloc::vec::Vec<TextMatch>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextMatch {
+    /// The query clause it matched, by index: the request's `clauses` (a repeated clause is
+    /// refused), or with `syntax`, the parsed query's clauses, a repeat counted once.
+    #[prost(uint32, tag = "1")]
+    pub clause: u32,
+    #[prost(uint32, tag = "2")]
+    pub occurrence: u32,
+    /// The match's byte range in `text`.
+    #[prost(uint64, tag = "3")]
+    pub start: u64,
+    #[prost(uint64, tag = "4")]
+    pub end: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextIndexRequest {
+    #[prost(string, tag = "1")]
+    pub index: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextRebuildResponse {
+    #[prost(uint64, tag = "1")]
+    pub documents: u64,
+    #[prost(uint64, tag = "2")]
+    pub changed: u64,
+    #[prost(uint64, tag = "3")]
+    pub invalid_utf8: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextVerifyResponse {
+    #[prost(uint64, tag = "1")]
+    pub documents: u64,
+    #[prost(uint64, tag = "2")]
+    pub terms: u64,
+    #[prost(uint64, tag = "3")]
+    pub postings: u64,
+    #[prost(uint64, tag = "4")]
+    pub forward_mismatch: u64,
+    #[prost(uint64, tag = "5")]
+    pub source_mismatch: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Normalization {
+    Unspecified = 0,
+    Nfc = 1,
+    Nfkc = 2,
+    None = 3,
+}
+impl Normalization {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NORMALIZATION_UNSPECIFIED",
+            Self::Nfc => "NORMALIZATION_NFC",
+            Self::Nfkc => "NORMALIZATION_NFKC",
+            Self::None => "NORMALIZATION_NONE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NORMALIZATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "NORMALIZATION_NFC" => Some(Self::Nfc),
+            "NORMALIZATION_NFKC" => Some(Self::Nfkc),
+            "NORMALIZATION_NONE" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Fuzziness {
+    Unspecified = 0,
+    Auto = 1,
+    One = 2,
+    Two = 3,
+}
+impl Fuzziness {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FUZZINESS_UNSPECIFIED",
+            Self::Auto => "FUZZINESS_AUTO",
+            Self::One => "FUZZINESS_ONE",
+            Self::Two => "FUZZINESS_TWO",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FUZZINESS_UNSPECIFIED" => Some(Self::Unspecified),
+            "FUZZINESS_AUTO" => Some(Self::Auto),
+            "FUZZINESS_ONE" => Some(Self::One),
+            "FUZZINESS_TWO" => Some(Self::Two),
+            _ => None,
+        }
+    }
+}
+/// Generated client implementations.
+pub mod text_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct TextClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl<T> TextClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> TextClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            TextClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn create_index(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateTextIndexRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Text/CreateIndex",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Text", "CreateIndex"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Indexes a document's text (written through the index, in one transaction).
+        pub async fn put(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TextPutRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/pigeonhole.v1.Text/Put");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Put"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TextDeleteRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Text/Delete",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Delete"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn search(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TextSearchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TextSearchResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Text/Search",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Search"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Rebuilds the index from its source column.
+        pub async fn rebuild(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TextIndexRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TextRebuildResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Text/Rebuild",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Text", "Rebuild"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn verify(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TextIndexRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TextVerifyResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Text/Verify",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Verify"));
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod text_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with TextServer.
+    #[async_trait]
+    pub trait Text: std::marker::Send + std::marker::Sync + 'static {
+        async fn create_index(
+            &self,
+            request: tonic::Request<super::CreateTextIndexRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        /// Indexes a document's text (written through the index, in one transaction).
+        async fn put(
+            &self,
+            request: tonic::Request<super::TextPutRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        async fn delete(
+            &self,
+            request: tonic::Request<super::TextDeleteRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        async fn search(
+            &self,
+            request: tonic::Request<super::TextSearchRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TextSearchResponse>,
+            tonic::Status,
+        >;
+        /// Rebuilds the index from its source column.
+        async fn rebuild(
+            &self,
+            request: tonic::Request<super::TextIndexRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TextRebuildResponse>,
+            tonic::Status,
+        >;
+        async fn verify(
+            &self,
+            request: tonic::Request<super::TextIndexRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TextVerifyResponse>,
+            tonic::Status,
+        >;
+    }
+    #[derive(Debug)]
+    pub struct TextServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> TextServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for TextServer<T>
+    where
+        T: Text,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/pigeonhole.v1.Text/CreateIndex" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateIndexSvc<T: Text>(pub Arc<T>);
+                    impl<
+                        T: Text,
+                    > tonic::server::UnaryService<super::CreateTextIndexRequest>
+                    for CreateIndexSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateTextIndexRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Text>::create_index(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateIndexSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Text/Put" => {
+                    #[allow(non_camel_case_types)]
+                    struct PutSvc<T: Text>(pub Arc<T>);
+                    impl<T: Text> tonic::server::UnaryService<super::TextPutRequest>
+                    for PutSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TextPutRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Text>::put(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PutSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Text/Delete" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteSvc<T: Text>(pub Arc<T>);
+                    impl<T: Text> tonic::server::UnaryService<super::TextDeleteRequest>
+                    for DeleteSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TextDeleteRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Text>::delete(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Text/Search" => {
+                    #[allow(non_camel_case_types)]
+                    struct SearchSvc<T: Text>(pub Arc<T>);
+                    impl<T: Text> tonic::server::UnaryService<super::TextSearchRequest>
+                    for SearchSvc<T> {
+                        type Response = super::TextSearchResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TextSearchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Text>::search(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SearchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Text/Rebuild" => {
+                    #[allow(non_camel_case_types)]
+                    struct RebuildSvc<T: Text>(pub Arc<T>);
+                    impl<T: Text> tonic::server::UnaryService<super::TextIndexRequest>
+                    for RebuildSvc<T> {
+                        type Response = super::TextRebuildResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TextIndexRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Text>::rebuild(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RebuildSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Text/Verify" => {
+                    #[allow(non_camel_case_types)]
+                    struct VerifySvc<T: Text>(pub Arc<T>);
+                    impl<T: Text> tonic::server::UnaryService<super::TextIndexRequest>
+                    for VerifySvc<T> {
+                        type Response = super::TextVerifyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TextIndexRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Text>::verify(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = VerifySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for TextServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "pigeonhole.v1.Text";
+    impl<T> tonic::server::NamedService for TextServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BeginRequest {
     /// The commit's durability (unset: the writer default).
@@ -5161,6 +6030,13 @@ pub struct CreateVectorIndexRequest {
     /// With `if_missing`, an existing index is opened instead.
     #[prost(bool, tag = "7")]
     pub if_missing: bool,
+    /// On a cluster (#1722, ICR 0138), where the index's ids are: a placed table whose ranges
+    /// it shares (its ids are that table's row keys), or its own split keys and partitions. A
+    /// cluster refuses a create with neither; a single node refuses either (`InvalidArgument`).
+    #[prost(string, tag = "8")]
+    pub follows: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub placement: ::core::option::Option<TablePlacementRequest>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VectorInsertRequest {
@@ -6064,6 +6940,10 @@ pub struct ClusterMap {
     /// the changes after it, and cleared by the first one once both majorities hold it.
     #[prost(message, repeated, tag = "6")]
     pub previous_nodes: ::prost::alloc::vec::Vec<Node>,
+    /// The vector and text indexes' placements (#1722, ICR 0138): each partition named holds a
+    /// whole index of the ids in its range.
+    #[prost(message, repeated, tag = "7")]
+    pub indexes: ::prost::alloc::vec::Vec<IndexPlacement>,
     /// The agent memory store's placement (#1915, ICR 0139), if the cluster serves one: each
     /// partition named holds a whole store for the namespaces in its range.
     #[prost(message, optional, tag = "8")]
@@ -6147,6 +7027,45 @@ pub struct MemoryPlacement {
     /// `splits.len() + 1` partition ids, one per range, as `TablePlacement.partitions`.
     #[prost(string, repeated, tag = "3")]
     pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Where an index's ids are (#1722, ICR 0138). An index keeps its rows in one table whose keys
+/// aren't its ids (centroids and lists, or postings and counters), so each partition named
+/// holds a whole index of its own over the ids in its range, made with the options the
+/// create sent. Fixed once written; dropped with `Schema.DropTable` of its name.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IndexPlacement {
+    /// The index (and its table's) name: unique among the map's tables, indexes and memory
+    /// store tables.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// A placed table whose ranges and partitions it shares: an id is that table's row key. A
+    /// text index always follows its source table (`Text.Put` writes the source row and the
+    /// postings in one transaction).
+    #[prost(string, tag = "4")]
+    pub follows: ::prost::alloc::string::String,
+    /// Or its own ranges over its ids (a vector index only; empty with `follows`), as
+    /// `TablePlacement.splits` and `partitions`.
+    #[prost(message, repeated, tag = "5")]
+    pub splits: ::prost::alloc::vec::Vec<SplitKey>,
+    #[prost(string, repeated, tag = "6")]
+    pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The map version that created it, as `TablePlacement.created`.
+    #[prost(uint64, tag = "7")]
+    pub created: u64,
+    /// The create request, as the client sent it: what each partition creates its index with.
+    #[prost(oneof = "index_placement::Kind", tags = "2, 3")]
+    pub kind: ::core::option::Option<index_placement::Kind>,
+}
+/// Nested message and enum types in `IndexPlacement`.
+pub mod index_placement {
+    /// The create request, as the client sent it: what each partition creates its index with.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "2")]
+        Vector(super::CreateVectorIndexRequest),
+        #[prost(message, tag = "3")]
+        Text(super::CreateTextIndexRequest),
+    }
 }
 /// A split key, in the map only: `text` for a UTF-8 key an operator writes by hand, `raw`
 /// for any bytes. Both forms of one key are the same key.
@@ -6332,9 +7251,30 @@ pub struct ForwardRequest {
     /// `Cluster.Forward` takes cluster scope. Set on another call, it's ignored.
     #[prost(bool, tag = "21")]
     pub fanout_part: bool,
+    /// A read the entry node chose this node's replica copy of the partition for (D328): it's
+    /// served from the copy, not as the partition's owner, if the copy's freshness is within
+    /// `replica_max_lag_ms`, else `ReplicaBehind`, and the entry node tries the next replica or
+    /// the owner. Only a single-partition read without a snapshot or transaction is sent so.
+    #[prost(bool, tag = "44")]
+    pub to_replica: bool,
+    /// The client's bound (`x-pigeonhole-read-replica-max-lag-ms`), checked on this node's
+    /// clock: now less the copy's freshness. With `to_replica` only.
+    #[prost(uint64, tag = "42")]
+    pub replica_max_lag_ms: u64,
+    /// The client's read-your-writes seqno for the partition (`x-pigeonhole-min-primary-seqno`):
+    /// the copy waits, within the call's deadline, until it has applied the owner's commits
+    /// through it. 0: none. With `to_replica` only.
+    #[prost(uint64, tag = "43")]
+    pub min_primary_seqno: u64,
+    /// The partition a fanned-out part of an index search or check is for (#1722, ICR 0138):
+    /// its request names only the index, and a node can own several of the index's
+    /// partitions. This node serves that partition if it owns it and the index is placed on
+    /// it, else `WrongPartition`. Empty on every other call.
+    #[prost(string, tag = "50")]
+    pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31, 34, 35, 36, 37, 38, 39, 40, 41"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -6388,6 +7328,29 @@ pub mod forward_request {
         CreateTable(super::CreateTableRequest),
         #[prost(message, tag = "20")]
         DropTable(super::DropTableRequest),
+        /// Index calls (#1722, ICR 0138): a create to the map's writer, as a table's; a write to
+        /// the partition holding its id.
+        #[prost(message, tag = "22")]
+        CreateVectorIndex(super::CreateVectorIndexRequest),
+        #[prost(message, tag = "23")]
+        VectorInsert(super::VectorInsertRequest),
+        #[prost(message, tag = "24")]
+        VectorDelete(super::VectorDeleteRequest),
+        /// One partition's part of a search or check across an index's partitions (#1722 PR 1b):
+        /// the client's request as it is, on the partition `partition` names.
+        #[prost(message, tag = "25")]
+        VectorSearch(super::VectorSearchRequest),
+        #[prost(message, tag = "26")]
+        VectorVerify(super::VectorVerifyRequest),
+        #[prost(message, tag = "27")]
+        CreateTextIndex(super::CreateTextIndexRequest),
+        #[prost(message, tag = "28")]
+        TextPut(super::TextPutRequest),
+        #[prost(message, tag = "29")]
+        TextDelete(super::TextDeleteRequest),
+        /// As `vector_verify`.
+        #[prost(message, tag = "31")]
+        TextVerify(super::TextIndexRequest),
         /// Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
         /// that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
         /// or ids are in several partitions never comes here whole.
@@ -6506,9 +7469,14 @@ pub struct ForwardedCaller {
 /// call's own status.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForwardResponse {
+    /// The seqno the serving node read at, in the owner's numbering (D328's
+    /// `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the
+    /// owner's visible seqno after it. Set for a single-partition read; 0 otherwise.
+    #[prost(uint64, tag = "28")]
+    pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 19, 20, 21, 22, 23, 24"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -6544,6 +7512,13 @@ pub mod forward_response {
         /// `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
         #[prost(message, tag = "12")]
         Table(super::TableResponse),
+        /// One partition's part of an index search or check (#1722 PR 1b).
+        #[prost(message, tag = "13")]
+        VectorSearch(super::VectorSearchResponse),
+        #[prost(message, tag = "14")]
+        VectorVerify(super::VectorVerifyResponse),
+        #[prost(message, tag = "16")]
+        TextVerify(super::TextVerifyResponse),
         /// The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
         /// answer `empty`.
         #[prost(message, tag = "19")]
@@ -10238,875 +11213,6 @@ pub mod replication_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "pigeonhole.v1.Replication";
     impl<T> tonic::server::NamedService for ReplicationServer<T> {
-        const NAME: &'static str = SERVICE_NAME;
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreateTextIndexRequest {
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// The column the index follows.
-    #[prost(string, tag = "2")]
-    pub source_table: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub source_family: ::prost::alloc::string::String,
-    #[prost(bytes = "bytes", tag = "4")]
-    pub source_qualifier: ::prost::bytes::Bytes,
-    /// Unset options take the library's defaults.
-    #[prost(double, optional, tag = "5")]
-    pub k1: ::core::option::Option<f64>,
-    #[prost(double, optional, tag = "6")]
-    pub b: ::core::option::Option<f64>,
-    #[prost(bool, optional, tag = "7")]
-    pub positions: ::core::option::Option<bool>,
-    #[prost(bool, optional, tag = "8")]
-    pub stop_words: ::core::option::Option<bool>,
-    #[prost(enumeration = "Normalization", tag = "9")]
-    pub normalization: i32,
-    #[prost(uint32, optional, tag = "10")]
-    pub max_terms: ::core::option::Option<u32>,
-    #[prost(uint32, optional, tag = "11")]
-    pub max_term_bytes: ::core::option::Option<u32>,
-    #[prost(bool, tag = "12")]
-    pub if_missing: bool,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextPutRequest {
-    #[prost(string, tag = "1")]
-    pub index: ::prost::alloc::string::String,
-    #[prost(bytes = "bytes", tag = "2")]
-    pub id: ::prost::bytes::Bytes,
-    #[prost(string, tag = "3")]
-    pub text: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextDeleteRequest {
-    #[prost(string, tag = "1")]
-    pub index: ::prost::alloc::string::String,
-    #[prost(bytes = "bytes", tag = "2")]
-    pub id: ::prost::bytes::Bytes,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TextSearchRequest {
-    #[prost(string, tag = "1")]
-    pub index: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "4")]
-    pub k: u32,
-    #[prost(bytes = "bytes", tag = "5")]
-    pub id_prefix: ::prost::bytes::Bytes,
-    /// Return each hit's text with the matches' ranges.
-    #[prost(bool, tag = "6")]
-    pub highlight: bool,
-    #[prost(oneof = "text_search_request::Query", tags = "2, 3")]
-    pub query: ::core::option::Option<text_search_request::Query>,
-}
-/// Nested message and enum types in `TextSearchRequest`.
-pub mod text_search_request {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Query {
-        /// The query syntax (`Query::parse`): terms, "phrases", ~fuzzy terms.
-        #[prost(string, tag = "2")]
-        Syntax(::prost::alloc::string::String),
-        #[prost(message, tag = "3")]
-        Clauses(super::TextQuery),
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TextQuery {
-    #[prost(message, repeated, tag = "1")]
-    pub clauses: ::prost::alloc::vec::Vec<TextClause>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextClause {
-    #[prost(oneof = "text_clause::Clause", tags = "1, 2, 3, 4")]
-    pub clause: ::core::option::Option<text_clause::Clause>,
-}
-/// Nested message and enum types in `TextClause`.
-pub mod text_clause {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Clause {
-        #[prost(string, tag = "1")]
-        Term(::prost::alloc::string::String),
-        #[prost(message, tag = "2")]
-        Phrase(super::Phrase),
-        #[prost(message, tag = "3")]
-        Fuzzy(super::Fuzzy),
-        /// Free text, tokenized as a document is.
-        #[prost(string, tag = "4")]
-        Text(::prost::alloc::string::String),
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Phrase {
-    #[prost(string, tag = "1")]
-    pub text: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "2")]
-    pub slop: u32,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Fuzzy {
-    #[prost(string, tag = "1")]
-    pub term: ::prost::alloc::string::String,
-    #[prost(enumeration = "Fuzziness", tag = "2")]
-    pub fuzziness: i32,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TextSearchResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub hits: ::prost::alloc::vec::Vec<TextHit>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TextHit {
-    #[prost(bytes = "bytes", tag = "1")]
-    pub id: ::prost::bytes::Bytes,
-    #[prost(double, tag = "2")]
-    pub score: f64,
-    /// With `highlight`.
-    #[prost(string, tag = "3")]
-    pub text: ::prost::alloc::string::String,
-    #[prost(message, repeated, tag = "4")]
-    pub matches: ::prost::alloc::vec::Vec<TextMatch>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextMatch {
-    /// The query clause it matched, by index: the request's `clauses` (a repeated clause is
-    /// refused), or with `syntax`, the parsed query's clauses, a repeat counted once.
-    #[prost(uint32, tag = "1")]
-    pub clause: u32,
-    #[prost(uint32, tag = "2")]
-    pub occurrence: u32,
-    /// The match's byte range in `text`.
-    #[prost(uint64, tag = "3")]
-    pub start: u64,
-    #[prost(uint64, tag = "4")]
-    pub end: u64,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextIndexRequest {
-    #[prost(string, tag = "1")]
-    pub index: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextRebuildResponse {
-    #[prost(uint64, tag = "1")]
-    pub documents: u64,
-    #[prost(uint64, tag = "2")]
-    pub changed: u64,
-    #[prost(uint64, tag = "3")]
-    pub invalid_utf8: u64,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TextVerifyResponse {
-    #[prost(uint64, tag = "1")]
-    pub documents: u64,
-    #[prost(uint64, tag = "2")]
-    pub terms: u64,
-    #[prost(uint64, tag = "3")]
-    pub postings: u64,
-    #[prost(uint64, tag = "4")]
-    pub forward_mismatch: u64,
-    #[prost(uint64, tag = "5")]
-    pub source_mismatch: u64,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum Normalization {
-    Unspecified = 0,
-    Nfc = 1,
-    Nfkc = 2,
-    None = 3,
-}
-impl Normalization {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "NORMALIZATION_UNSPECIFIED",
-            Self::Nfc => "NORMALIZATION_NFC",
-            Self::Nfkc => "NORMALIZATION_NFKC",
-            Self::None => "NORMALIZATION_NONE",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "NORMALIZATION_UNSPECIFIED" => Some(Self::Unspecified),
-            "NORMALIZATION_NFC" => Some(Self::Nfc),
-            "NORMALIZATION_NFKC" => Some(Self::Nfkc),
-            "NORMALIZATION_NONE" => Some(Self::None),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum Fuzziness {
-    Unspecified = 0,
-    Auto = 1,
-    One = 2,
-    Two = 3,
-}
-impl Fuzziness {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "FUZZINESS_UNSPECIFIED",
-            Self::Auto => "FUZZINESS_AUTO",
-            Self::One => "FUZZINESS_ONE",
-            Self::Two => "FUZZINESS_TWO",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "FUZZINESS_UNSPECIFIED" => Some(Self::Unspecified),
-            "FUZZINESS_AUTO" => Some(Self::Auto),
-            "FUZZINESS_ONE" => Some(Self::One),
-            "FUZZINESS_TWO" => Some(Self::Two),
-            _ => None,
-        }
-    }
-}
-/// Generated client implementations.
-pub mod text_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    use tonic::codegen::http::Uri;
-    #[derive(Debug, Clone)]
-    pub struct TextClient<T> {
-        inner: tonic::client::Grpc<T>,
-    }
-    impl<T> TextClient<T>
-    where
-        T: tonic::client::GrpcService<tonic::body::Body>,
-        T::Error: Into<StdError>,
-        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
-        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
-    {
-        pub fn new(inner: T) -> Self {
-            let inner = tonic::client::Grpc::new(inner);
-            Self { inner }
-        }
-        pub fn with_origin(inner: T, origin: Uri) -> Self {
-            let inner = tonic::client::Grpc::with_origin(inner, origin);
-            Self { inner }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> TextClient<InterceptedService<T, F>>
-        where
-            F: tonic::service::Interceptor,
-            T::ResponseBody: Default,
-            T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
-        {
-            TextClient::new(InterceptedService::new(inner, interceptor))
-        }
-        /// Compress requests with the given encoding.
-        ///
-        /// This requires the server to support it otherwise it might respond with an
-        /// error.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.send_compressed(encoding);
-            self
-        }
-        /// Enable decompressing responses.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.inner = self.inner.accept_compressed(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_decoding_message_size(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.inner = self.inner.max_encoding_message_size(limit);
-            self
-        }
-        pub async fn create_index(
-            &mut self,
-            request: impl tonic::IntoRequest<super::CreateTextIndexRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Text/CreateIndex",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Text", "CreateIndex"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Indexes a document's text (written through the index, in one transaction).
-        pub async fn put(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TextPutRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/pigeonhole.v1.Text/Put");
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Put"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn delete(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TextDeleteRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Text/Delete",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Delete"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn search(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TextSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextSearchResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Text/Search",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Search"));
-            self.inner.unary(req, path, codec).await
-        }
-        /// Rebuilds the index from its source column.
-        pub async fn rebuild(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TextIndexRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextRebuildResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Text/Rebuild",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("pigeonhole.v1.Text", "Rebuild"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn verify(
-            &mut self,
-            request: impl tonic::IntoRequest<super::TextIndexRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextVerifyResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/pigeonhole.v1.Text/Verify",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new("pigeonhole.v1.Text", "Verify"));
-            self.inner.unary(req, path, codec).await
-        }
-    }
-}
-/// Generated server implementations.
-pub mod text_server {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value,
-    )]
-    use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with TextServer.
-    #[async_trait]
-    pub trait Text: std::marker::Send + std::marker::Sync + 'static {
-        async fn create_index(
-            &self,
-            request: tonic::Request<super::CreateTextIndexRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        /// Indexes a document's text (written through the index, in one transaction).
-        async fn put(
-            &self,
-            request: tonic::Request<super::TextPutRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        async fn delete(
-            &self,
-            request: tonic::Request<super::TextDeleteRequest>,
-        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
-        async fn search(
-            &self,
-            request: tonic::Request<super::TextSearchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextSearchResponse>,
-            tonic::Status,
-        >;
-        /// Rebuilds the index from its source column.
-        async fn rebuild(
-            &self,
-            request: tonic::Request<super::TextIndexRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextRebuildResponse>,
-            tonic::Status,
-        >;
-        async fn verify(
-            &self,
-            request: tonic::Request<super::TextIndexRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::TextVerifyResponse>,
-            tonic::Status,
-        >;
-    }
-    #[derive(Debug)]
-    pub struct TextServer<T> {
-        inner: Arc<T>,
-        accept_compression_encodings: EnabledCompressionEncodings,
-        send_compression_encodings: EnabledCompressionEncodings,
-        max_decoding_message_size: Option<usize>,
-        max_encoding_message_size: Option<usize>,
-    }
-    impl<T> TextServer<T> {
-        pub fn new(inner: T) -> Self {
-            Self::from_arc(Arc::new(inner))
-        }
-        pub fn from_arc(inner: Arc<T>) -> Self {
-            Self {
-                inner,
-                accept_compression_encodings: Default::default(),
-                send_compression_encodings: Default::default(),
-                max_decoding_message_size: None,
-                max_encoding_message_size: None,
-            }
-        }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
-        where
-            F: tonic::service::Interceptor,
-        {
-            InterceptedService::new(Self::new(inner), interceptor)
-        }
-        /// Enable decompressing requests with the given encoding.
-        #[must_use]
-        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.accept_compression_encodings.enable(encoding);
-            self
-        }
-        /// Compress responses with the given encoding, if the client supports it.
-        #[must_use]
-        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
-            self.send_compression_encodings.enable(encoding);
-            self
-        }
-        /// Limits the maximum size of a decoded message.
-        ///
-        /// Default: `4MB`
-        #[must_use]
-        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-            self.max_decoding_message_size = Some(limit);
-            self
-        }
-        /// Limits the maximum size of an encoded message.
-        ///
-        /// Default: `usize::MAX`
-        #[must_use]
-        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-            self.max_encoding_message_size = Some(limit);
-            self
-        }
-    }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for TextServer<T>
-    where
-        T: Text,
-        B: Body + std::marker::Send + 'static,
-        B::Error: Into<StdError> + std::marker::Send + 'static,
-    {
-        type Response = http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = BoxFuture<Self::Response, Self::Error>;
-        fn poll_ready(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-        fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            match req.uri().path() {
-                "/pigeonhole.v1.Text/CreateIndex" => {
-                    #[allow(non_camel_case_types)]
-                    struct CreateIndexSvc<T: Text>(pub Arc<T>);
-                    impl<
-                        T: Text,
-                    > tonic::server::UnaryService<super::CreateTextIndexRequest>
-                    for CreateIndexSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::CreateTextIndexRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Text>::create_index(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = CreateIndexSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Text/Put" => {
-                    #[allow(non_camel_case_types)]
-                    struct PutSvc<T: Text>(pub Arc<T>);
-                    impl<T: Text> tonic::server::UnaryService<super::TextPutRequest>
-                    for PutSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::TextPutRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Text>::put(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PutSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Text/Delete" => {
-                    #[allow(non_camel_case_types)]
-                    struct DeleteSvc<T: Text>(pub Arc<T>);
-                    impl<T: Text> tonic::server::UnaryService<super::TextDeleteRequest>
-                    for DeleteSvc<T> {
-                        type Response = super::Empty;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::TextDeleteRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Text>::delete(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = DeleteSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Text/Search" => {
-                    #[allow(non_camel_case_types)]
-                    struct SearchSvc<T: Text>(pub Arc<T>);
-                    impl<T: Text> tonic::server::UnaryService<super::TextSearchRequest>
-                    for SearchSvc<T> {
-                        type Response = super::TextSearchResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::TextSearchRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Text>::search(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = SearchSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Text/Rebuild" => {
-                    #[allow(non_camel_case_types)]
-                    struct RebuildSvc<T: Text>(pub Arc<T>);
-                    impl<T: Text> tonic::server::UnaryService<super::TextIndexRequest>
-                    for RebuildSvc<T> {
-                        type Response = super::TextRebuildResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::TextIndexRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Text>::rebuild(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = RebuildSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/pigeonhole.v1.Text/Verify" => {
-                    #[allow(non_camel_case_types)]
-                    struct VerifySvc<T: Text>(pub Arc<T>);
-                    impl<T: Text> tonic::server::UnaryService<super::TextIndexRequest>
-                    for VerifySvc<T> {
-                        type Response = super::TextVerifyResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::TextIndexRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Text>::verify(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = VerifySvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
-            }
-        }
-    }
-    impl<T> Clone for TextServer<T> {
-        fn clone(&self) -> Self {
-            let inner = self.inner.clone();
-            Self {
-                inner,
-                accept_compression_encodings: self.accept_compression_encodings,
-                send_compression_encodings: self.send_compression_encodings,
-                max_decoding_message_size: self.max_decoding_message_size,
-                max_encoding_message_size: self.max_encoding_message_size,
-            }
-        }
-    }
-    /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "pigeonhole.v1.Text";
-    impl<T> tonic::server::NamedService for TextServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

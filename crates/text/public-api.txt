@@ -23,6 +23,7 @@ pub pigeonhole_text::Error::InvalidArgument(alloc::string::String)
 pub pigeonhole_text::Error::InvalidQuery::at: usize
 pub pigeonhole_text::Error::InvalidQuery::reason: pigeonhole_text::QueryErrorKind
 pub pigeonhole_text::Error::Mismatch(alloc::string::String)
+pub pigeonhole_text::Error::PackRefused(alloc::string::String)
 impl pigeonhole_text::Error
 pub fn pigeonhole_text::Error::code(&self) -> pigeonhole::error::ErrorCode
 impl core::convert::From<pigeonhole::error::Error> for pigeonhole_text::Error
@@ -59,15 +60,20 @@ pub pigeonhole_text::Hit::text: core::option::Option<alloc::string::String>
 pub struct pigeonhole_text::Index
 impl pigeonhole_text::Index
 pub fn pigeonhole_text::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::create_unfilled(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::create_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::delete(&self, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &[u8]) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::list(&pigeonhole::db::Pigeonhole) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::open_reader(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
 pub fn pigeonhole_text::Index::open_reader_with_tokenizer(&pigeonhole::db::PigeonholeReader, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
 pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
 pub fn pigeonhole_text::Index::over_table(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
+pub fn pigeonhole_text::Index::pack(&self) -> pigeonhole_text::Result<pigeonhole_text::PackStats>
+pub fn pigeonhole_text::Index::pack_pending(&self) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::pack_with(&self, pigeonhole_text::PackOptions, impl core::ops::function::FnMut(&pigeonhole_text::PackStats) -> core::ops::control_flow::ControlFlow<()>) -> pigeonhole_text::Result<pigeonhole_text::PackStats>
 pub fn pigeonhole_text::Index::pending_rebuilds(&pigeonhole::db::Pigeonhole) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
 pub fn pigeonhole_text::Index::put_in(&self, &mut pigeonhole::write::Transaction, &[u8], &str) -> pigeonhole_text::Result<()>
@@ -105,15 +111,26 @@ pub pigeonhole_text::IndexStats::counter_drift: u64
 pub pigeonhole_text::IndexStats::documents: u64
 pub pigeonhole_text::IndexStats::forward_mismatch: u64
 pub pigeonhole_text::IndexStats::invalid_utf8: u64
+pub pigeonhole_text::IndexStats::packed: u64
 pub pigeonhole_text::IndexStats::postings: u64
 pub pigeonhole_text::IndexStats::source_mismatch: u64
 pub pigeonhole_text::IndexStats::terms: u64
+pub pigeonhole_text::IndexStats::tombstones: u64
 impl pigeonhole_text::IndexStats
 pub fn pigeonhole_text::IndexStats::is_consistent(&self) -> bool
 #[non_exhaustive] pub struct pigeonhole_text::Match
 pub pigeonhole_text::Match::clause: usize
 pub pigeonhole_text::Match::occurrence: u32
 pub pigeonhole_text::Match::range: core::ops::range::Range<usize>
+#[non_exhaustive] pub struct pigeonhole_text::PackOptions
+impl pigeonhole_text::PackOptions
+pub fn pigeonhole_text::PackOptions::new() -> Self
+pub fn pigeonhole_text::PackOptions::with_readers(self, bool) -> Self
+#[non_exhaustive] pub struct pigeonhole_text::PackStats
+pub pigeonhole_text::PackStats::postings: u64
+pub pigeonhole_text::PackStats::stopped: bool
+pub pigeonhole_text::PackStats::terms: u64
+pub pigeonhole_text::PackStats::tombstones: u64
 pub struct pigeonhole_text::Query
 impl pigeonhole_text::Query
 pub fn pigeonhole_text::Query::clauses(&self) -> &[pigeonhole_text::Clause]
@@ -131,6 +148,13 @@ impl core::convert::From<&str> for pigeonhole_text::Query
 pub fn pigeonhole_text::Query::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for pigeonhole_text::Query
 pub fn pigeonhole_text::Query::from(alloc::string::String) -> Self
+pub struct pigeonhole_text::QueryStats(_)
+impl pigeonhole_text::QueryStats
+pub fn pigeonhole_text::QueryStats::cut(&self, usize) -> bool
+pub fn pigeonhole_text::QueryStats::documents(&self) -> u64
+pub fn pigeonhole_text::QueryStats::from_bytes(&[u8]) -> pigeonhole_text::Result<pigeonhole_text::QueryStats>
+pub fn pigeonhole_text::QueryStats::merge(impl core::iter::traits::collect::IntoIterator<Item = pigeonhole_text::QueryStats>) -> pigeonhole_text::Result<pigeonhole_text::QueryStats>
+pub fn pigeonhole_text::QueryStats::to_bytes(&self) -> alloc::vec::Vec<u8>
 pub struct pigeonhole_text::ReadIndex
 impl pigeonhole_text::ReadIndex
 pub fn pigeonhole_text::ReadIndex::options(&self) -> pigeonhole_text::IndexOptions
@@ -150,11 +174,14 @@ pub fn pigeonhole_text::Search<'a>::highlight(self, bool) -> Self
 pub fn pigeonhole_text::Search<'a>::id_prefix(self, impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
 pub fn pigeonhole_text::Search<'a>::max_expansions(self, usize) -> Self
 pub fn pigeonhole_text::Search<'a>::prefix_length(self, usize) -> Self
+pub fn pigeonhole_text::Search<'a>::query_stats(self) -> pigeonhole_text::Result<pigeonhole_text::QueryStats>
+pub async fn pigeonhole_text::Search<'a>::query_stats_async(self) -> pigeonhole_text::Result<pigeonhole_text::QueryStats>
 pub fn pigeonhole_text::Search<'a>::run(self) -> pigeonhole_text::Result<alloc::vec::Vec<pigeonhole_text::Hit>>
 pub async fn pigeonhole_text::Search<'a>::run_async(self) -> pigeonhole_text::Result<alloc::vec::Vec<pigeonhole_text::Hit>>
 pub fn pigeonhole_text::Search<'a>::run_with_stats(self) -> pigeonhole_text::Result<(alloc::vec::Vec<pigeonhole_text::Hit>, pigeonhole_text::SearchStats)>
 pub async fn pigeonhole_text::Search<'a>::run_with_stats_async(self) -> pigeonhole_text::Result<(alloc::vec::Vec<pigeonhole_text::Hit>, pigeonhole_text::SearchStats)>
 pub fn pigeonhole_text::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
+pub fn pigeonhole_text::Search<'a>::stats(self, pigeonhole_text::QueryStats) -> Self
 #[non_exhaustive] pub struct pigeonhole_text::SearchStats
 pub pigeonhole_text::SearchStats::fuzzy: alloc::vec::Vec<pigeonhole_text::FuzzyStats>
 pub pigeonhole_text::SearchStats::stale: u64

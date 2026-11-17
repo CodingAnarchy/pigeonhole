@@ -129,6 +129,15 @@ impl Reach {
                 }) => {
                     let req = ForwardRequest {
                         fanout_part: true,
+                        to_replica: false,
+                        replica_max_lag_ms: 0,
+                        min_primary_seqno: 0,
+                        // An index's part names its partition (#1722): its request doesn't.
+                        partition: if forward::names_partition(&op) {
+                            partition.to_owned()
+                        } else {
+                            String::new()
+                        },
                         map_version,
                         caller: Some(forward::forwarded_caller(caller)?),
                         op: Some(op.clone()),

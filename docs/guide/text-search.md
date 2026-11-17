@@ -154,6 +154,95 @@ See [Async](async.md) for the engine's async API that these build on.
 ## Reader processes
 A reader process opens the index with `Index::open_reader(&reader, name)`. That gives a `ReadIndex`: it searches and verifies at the reader's snapshots, and it can't write. It sees what the writer has committed, as every read in a reader process does. During the writer's `repair`, searches fail with `Busy`.
 
+## Packing an index
+**New in 1.3 (#1585, ICR 0143).** `index.pack()` moves each term's postings from one cell a document into blocks of up to 128 postings. A search of a common word then reads a block where it read 128 cells, which is several times faster. Results and scores don't change.
+
+> **Packing makes an index unreadable by 1.2. Pack only once you won't roll back.** Nothing packs an index unless you call `pack`: an index you never pack stays in the layout every 1.1 and 1.2 release reads.
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_text::{Index, IndexOptions, Source};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let notes = db.table("notes")?.family("body", Family::default()).create_if_missing()?;
+# let index = Index::create(&db, "notes_text", Source::new(&notes, "body", b"text"), IndexOptions::new())?;
+for i in 0..100 {
+    index.put(format!("note:{i}").as_bytes(), "the march meeting notes")?;
+}
+let packed = index.pack()?;
+assert_eq!(packed.postings, 400);
+// Searches, writes and deletes go on as before.
+assert_eq!(index.search("march", 10).run()?.len(), 10);
+index.delete(b"note:7")?;
+let stats = index.verify()?;
+assert!(stats.is_consistent());
+assert_eq!(stats.tombstones, 4, "until the next pack");
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **It runs beside searches and writes.** A pack works a chunk at a time, one transaction a chunk, and every search sees the same postings before, during and after.
+- **Writes after a pack are cells again,** and a delete leaves a small marker over the packed posting (`IndexStats::tombstones`). Searches read both, so nothing is stale. Pack again when they have built up: a pack takes only what was written since the last one. `verify()` reports how many postings are packed (`IndexStats::packed`).
+- **A few postings stay cells.** A term with fewer than 32 new postings and no block near them is left for a later pack, so rare terms aren't cut into tiny blocks.
+- **Stopping and resuming:** `pack_with(options, step)` calls `step` after each chunk, and a `Break` stops it there. `pack_pending()` is then true, and the next `pack` carries on from where it stopped.
+- **With a rebuild:** a pack is refused (`PackRefused`) while a stopped rebuild is pending. A `rebuild` leaves packed postings that are right where they are, and drops a stopped pack's place, so the next pack starts over. `repair` empties the blocks with everything else.
+- **With `phdb serve`:** a server packs only when started with `--text-pack` ([phdb serve](serve.md)), and then on its own, in the background. `Index::list(&db)` names a database's text indexes, for a program that packs them itself.
+
+**Before the first pack of an index:**
+- **Every process that opens the index must run 1.3 or later, for good.** A 1.2 build refuses to open a packed index. One that already had it open fails its searches and writes with `Busy` from then on.
+- **Reader processes:** the first pack is refused (`PackRefused`) while any reader process is attached to the file, since the file records that a reader is attached and not which release it runs. Close them, or pass `PackOptions::new().with_readers(true)` once every reader is 1.3. A reader that exited without closing holds its slot until the writer reclaims it, so the refusal can outlast it for a moment. A reader opened before the pack keeps working: its next search reads the blocks.
+- **The way back** is to drop the index and create it again on the older release. Its source rows aren't touched.
+
+**What else sees a pack:**
+- **A change feed** of the index table carries the pack's commits (blocks written, cells deleted), about as many bytes as the postings it moves. A consumer that only follows your source table sees nothing.
+- **A backup or a replica** of a packed index is a packed index: restore or promote it only where 1.3 runs.
+- **File size:** the cells a pack removes are reclaimed by compaction, as any delete is. A packed index is smaller once it has compacted.
+
+## A collection split across indexes
+**New in 1.3 (#1722, ICR 0138).** BM25 scores depend on the whole collection: its document count, its average length and each term's document frequency. When one collection is split across several indexes (several databases, or a cluster's partitions), each part searched on its own scores with its own numbers. Skewed parts, such as one tenant per part, then rank differently than one index would. `QueryStats` lets the parts score as one index:
+1. **Read each part's statistics:** `index.search(q, k).query_stats()`. Every part is read, including parts that `id_prefix` wouldn't reach, because the statistics are the whole collection's.
+2. **Merge them:** `QueryStats::merge(parts)`. The counts are summed, and each fuzzy term's expansions are joined and cut again to `max_expansions`.
+3. **Search each part with the merged statistics:** `index.search(q, k).stats(merged).run()`. Use the same query and fuzzy options as in step 1, or the search fails with `InvalidArgument`.
+4. **Merge the hits** by score descending, then id ascending, and keep the first `k`.
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_text::{Index, IndexOptions, QueryStats, Source};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let index = |name: &str| -> pigeonhole_text::Result<Index> {
+#     let t = db.table(name)?.family("body", Family::default()).create_if_missing()?;
+#     Index::create(&db, &format!("{name}_text"), Source::new(&t, "body", b"text"), IndexOptions::new())
+# };
+let parts = [index("tenant_a")?, index("tenant_b")?];
+parts[0].put(b"a:1", "the March meeting")?;
+parts[1].put(b"b:1", "meeting notes")?;
+parts[1].put(b"b:2", "notes on the meeting room")?;
+let q = "meeting notes";
+let stats = QueryStats::merge(
+    parts.iter().map(|p| p.search(q, 10).query_stats()).collect::<Result<Vec<_>, _>>()?,
+)?;
+let mut hits = Vec::new();
+for p in &parts {
+    hits.extend(p.search(q, 10).stats(stats.clone()).run()?);
+}
+hits.sort_by(|x, y| y.score.total_cmp(&x.score).then_with(|| x.id.cmp(&y.id)));
+hits.truncate(10);
+assert_eq!(hits[0].id, b"b:1");
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **The scores are one index's,** up to float rounding in the order a document's clauses are added.
+- **A cut fuzzy term can expand differently.** If a fuzzy term had more matches than `max_expansions` in any part, `stats.cut(clause)` is `true`. A part cuts the terms it ranks last, so the merged set can miss a term one index would keep, and keep another in its place: the expansions differ, not only their number. A larger `max_expansions` makes a cut rarer.
+- **Each part's statistics are read at one snapshot,** the search's if it has one. The parts' snapshots are separate, so a write that lands between steps 1 and 3 is counted in one step and not the other. A term first written in between has postings in step 3 and a `df` of 0 in the statistics, so it scores as the rarest term.
+- **To send statistics to another process,** use `stats.to_bytes()` and `QueryStats::from_bytes`. The encoding starts with a version byte, and `from_bytes` refuses a version it doesn't know (`InvalidArgument`).
+- **On one index,** a search already works this way: it reads its own statistics, then ranks with them.
+
 ## Performance
 MaxScore reads only the postings that can still change the top `k`. The result is the same as scoring every document.
 
@@ -195,7 +284,8 @@ The write rate stays flat from the first document to the millionth. A full compa
 | Error | When |
 |---|---|
 | `InvalidQuery { at, reason }` | A query string doesn't parse: an unclosed quote, a bad slop or fuzzy distance, or a fuzzy word inside a phrase. |
-| `InvalidArgument` | A phrase on an index without positions, a document over `max_terms`, a bad option, or a table that isn't an index. |
+| `InvalidArgument` | A phrase on an index without positions, a document over `max_terms`, a bad option, or a table that isn't an index. Also query statistics of another query or other fuzzy options, statistics that don't parse, or a newer version's. |
 | `Busy` | A write or search while `repair` runs: retry after it finishes. |
-| `Mismatch` | `open` with another tokeniser or tokeniser version than the index was made with. |
+| `PackRefused` | `pack` before an index's first pack while reader processes are attached, or while a rebuild is pending. Its message says which. Code `Busy`. |
+| `Mismatch` | `open` with another tokeniser or tokeniser version than the index was made with, or a packed block in a format a later release wrote. |
 | `Db` | The database's own error, passed through. |

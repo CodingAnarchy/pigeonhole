@@ -437,6 +437,19 @@ pub(crate) fn moved(start: &ClusterMap, end: &ClusterMap) -> Option<String> {
             return Some(format!("table {} was placed differently", t.name));
         }
     }
+    // So with an index (#1722): copies taken either side of its drop and create would hold
+    // two incarnations, and a restore would make the older one's partitions again, empty.
+    for i in &start.indexes {
+        let Some(u) = end.indexes.iter().find(|u| u.name == i.name) else {
+            continue;
+        };
+        if u.created != i.created {
+            return Some(format!("index {} was dropped and created again", i.name));
+        }
+        if u.follows != i.follows || u.splits != i.splits || u.partitions != i.partitions {
+            return Some(format!("index {} was placed differently", i.name));
+        }
+    }
     None
 }
 
@@ -482,6 +495,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: version,
             previous_nodes: Vec::new(),
+            indexes: Vec::new(),
             memory: None,
             nodes: vec![Node {
                 id: "n1".into(),
@@ -558,6 +572,54 @@ mod tests {
             moved(&a, &recreated).is_some_and(|w| w.contains("dropped and created again")),
             "{:?}",
             moved(&a, &recreated)
+        );
+    }
+
+    /// #1722: an index dropped and created again, or placed on other ranges, while a backup
+    /// runs refuses it as a table does; one created or dropped meanwhile doesn't.
+    #[test]
+    fn an_index_dropped_and_created_again_meanwhile_refuses_the_backup() {
+        let with = |version: u64, created: u64, splits: &[&str]| {
+            let mut m = map(version, 1, &["m"]);
+            m.indexes.push(proto::IndexPlacement {
+                name: "v".into(),
+                splits: splits
+                    .iter()
+                    .map(|s| proto::SplitKey {
+                        key: Some(proto::split_key::Key::Text((*s).into())),
+                    })
+                    .collect(),
+                partitions: (0..=splits.len()).map(|i| format!("p{}", i + 1)).collect(),
+                created,
+                ..Default::default()
+            });
+            m
+        };
+        let a = with(5, 3, &["k"]);
+        assert_eq!(
+            moved(&a, &with(9, 3, &["k"])),
+            None,
+            "only the version moved"
+        );
+        assert_eq!(
+            moved(&a, &map(9, 1, &["m"])),
+            None,
+            "an index dropped meanwhile"
+        );
+        assert_eq!(
+            moved(&map(5, 1, &["m"]), &a),
+            None,
+            "an index created meanwhile"
+        );
+        let again = moved(&a, &with(9, 8, &["k"]));
+        assert!(
+            again.as_deref() == Some("index v was dropped and created again"),
+            "{again:?}"
+        );
+        let resplit = moved(&a, &with(9, 3, &["q"]));
+        assert!(
+            resplit.as_deref() == Some("index v was placed differently"),
+            "{resplit:?}"
         );
     }
 }

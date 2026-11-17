@@ -869,3 +869,56 @@ How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers
 | Zero-copy clones and branches (#493) | shared extents as a must-understand edit, behind an `incompat` bit (free space is rebuilt from the manifest, D8) |
 | Read replicas, WAL shipping (#493, #176) | the WAL framing frozen in format 4; the per-database salt slot in the segment header |
 | Multi-process readers (#39, #397) | the shared-memory layout version (§11): outside the promise |
+
+## 14. Layouts above the engine: the text index
+
+A full-text index (`pigeonhole-text`, D309) is an ordinary table: the engine stores its cells as any others, and nothing in §1 to §13 knows it. Its rows and values are a format of their own, with their own version, described here so that another build can read them. Integers in values are the engine's typed `u64` and counter values unless a layout is given.
+
+**The version** is `G`/`meta`/`layout` (a `u64`). A build refuses an index whose version it doesn't know, at open. Version 1 is what `Index::create` writes, in every release. Version 2 comes only from `Index::pack` (ICR 0143, 1.3): a 1.2 build refuses it.
+
+### 14.1 Version 1
+
+| Row | Family | Qualifier | Value |
+|---|---|---|---|
+| `P{term}` | `post` | the document id | the posting: frequency in the high 32 bits, the document's length in terms in the low 32 |
+| `P{term}` | `pos` (an index with positions) | the document id | the term's positions in the document, ascending, as unsigned LEB128 deltas (the first from 0) |
+| `P{term}` | `df` (counter) | `n` | the term's document frequency |
+| `P{term}` | `maxtf` (a `max` aggregate), `minlen` (a `min` aggregate) | empty | the largest frequency and the smallest length any posting of the term had: MaxScore's bound, never lowered by a delete |
+| `F{doc}` | `terms` | a term | its frequency in the document |
+| `F{doc}` | `meta` | `present`, `len` | a marker (empty), and the document's length in terms |
+| `S` | `stats` (counter) | `docs`, `len` | the document count and the corpus's length in terms |
+| `G` | `meta` | `layout`, `opts`, `source`, `tokenizer`, `fingerprint`, `normalizer-unicode` | the version; the options (28 bytes: `1`, `k1` and `b` as `f64`, stop words, `max_term_bytes` and `max_terms` as `u32`, positions, normalisation); the source (three length-prefixed strings: table, family, qualifier); the tokeniser's name and fingerprint; the normaliser's Unicode version |
+| `G` | `meta` | `repair` | present (empty) while a repair runs |
+| `G` | `meta` | `rebuild-after` | a stopped rebuild's cursor: the last source row it reconciled, or empty before its first page |
+
+Every family but the counters and aggregates keeps one version.
+
+### 14.2 Version 2
+
+Version 1, and:
+
+- **`G`/`meta`/`layout`** is 2.
+- **`G`/`meta`/`repair`** holds `v2` when no repair runs, and is empty while one does. It is never absent. A version 1 reader takes any value as "a repair runs" and answers `Busy`.
+- **`G`/`meta`/`pack-after`:** a stopped pack's cursor. Empty before the pass's first chunk; else the term's length (`u32`), the term, and the document id of the last posting cell taken.
+- **Tombstones.** A `post` cell with the value 0, and a `pos` cell with an empty value: the document has no posting for the term, whatever a block says. A pack removes them.
+- **A position cell is never without its posting cell** for the same document.
+- **The family `postb`** (one version): in `P{term}`, one cell is one block of the term's postings. The qualifier is the block's last document id. A term's blocks hold ascending, disjoint id ranges.
+- **A term's postings** are its cells over its blocks: a cell wins where both name a document, and a tombstone hides the block's posting.
+
+**A block's value** (varints are §1's, each at most 32 bits here):
+
+| Part | Content |
+|---|---|
+| format | one byte, 1 |
+| count | varint `n`, 1 to 128 |
+| flags | one byte; bit 0: the block has positions |
+| bound | varint `m` (1 to `n`), then `m` pairs of varints (frequency, length): the block's competitive pairs, highest frequency first |
+| ids | `n` document ids in ascending order, each as: varint bytes shared with the id before it (0 for the first), varint suffix length, the suffix |
+| frequencies | `n` varints, each at least 1 |
+| lengths | `n` varints |
+| positions (with the flag) | `n` varint byte lengths, then the `n` lists one after another, each as a version 1 `pos` value |
+
+- **The competitive pairs** are the postings that no other posting in the block matches or beats on both a frequency at least as high and a length at least as short. BM25's frequency factor rises with frequency and falls with length for any corpus statistics, so the block's best score under any statistics is the best over these pairs.
+- **A block is closed** at 128 postings, or once its value reaches 4,096 bytes, whichever comes first. One posting larger than that is a block alone.
+- **Another format byte** is not corruption: a build that doesn't know it answers `Mismatch`.
+- **Bytes past the positions, a count of 0 or over 128, ids out of order, a frequency of 0** are corruption.

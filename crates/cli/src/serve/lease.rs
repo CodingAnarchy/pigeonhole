@@ -34,7 +34,10 @@ pub(crate) trait LeaseHooks {
     /// The stream's own end, if it has one now, without taking its events.
     fn poll_own_end(&mut self, cx: &mut Context<'_>) -> Poll<Option<ApiError>>;
     /// Stamps the stream's take clock: a look while it waits for a first lease counts as a
-    /// take.
+    /// take. Only that: the lease check reads no take. A batch of events the connection
+    /// holds under back-pressure is stamped at its first and last event (and at each while a
+    /// send waits for room), so a stamp at a batch's first event never stands for its rest
+    /// (simp724 on #1737's F3-0).
     fn took(&self);
 }
 

@@ -1042,6 +1042,35 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     }
 }
 
+/// `--text-pack`'s counters (#1585): each partition's background pack.
+fn render_text_packs(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
+    type Read = fn(&super::texts::PackCounters) -> u64;
+    let families: [(&str, Read); 4] = [
+        ("pigeonhole_serve_text_pack_passes_total", |c| {
+            c.passes.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_postings_total", |c| {
+            c.postings.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_refused_total", |c| {
+            c.refused.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_conflicts_total", |c| {
+            c.conflicts.load(Ordering::Relaxed)
+        }),
+    ];
+    for (name, read) in families {
+        render_family(
+            out,
+            name,
+            "counter",
+            parts
+                .iter()
+                .map(|(id, part)| (*id, read(&part.texts.packs))),
+        );
+    }
+}
+
 /// A cluster node's partitions' unpinned engine threads (D317 ticket 8a's pinning check):
 /// shard drivers and compaction threads apart (cli692's note on the 8a plan). A single
 /// node's output doesn't change: they're labelled partitions' only.
@@ -1197,6 +1226,8 @@ pub(crate) struct Service {
     inflight: Arc<Semaphore>,
     /// Blocking-pool calls running at once.
     blocking: Arc<Semaphore>,
+    /// The light pool (#1880): small, bounded sync calls on the network workers' CPUs.
+    lite: Arc<super::lite::Lite>,
     /// `/mcp` messages running at once (`--mcp-blocking`), each on a blocking thread of
     /// its own, outside `blocking`, whose permits its tools' ops take (ICR 0139's PR 3
     /// section).
@@ -1535,6 +1566,7 @@ impl Service {
         Self {
             inflight: Arc::clone(&self.inflight),
             blocking: Arc::clone(&self.blocking),
+            lite: Arc::clone(&self.lite),
             mcp_places: Arc::clone(&self.mcp_places),
             scans: Arc::clone(&self.scans),
             bulk_budget: Arc::clone(&self.bulk_budget),
@@ -1570,7 +1602,18 @@ impl Service {
         }
         if let Some(part) = &self.part {
             part.texts.resume_soon(&self.text_rebuilds);
+            // With `--text-pack`, its indexes are packed in the background too (#1585).
+            part.texts.pack_soon(&self.text_rebuilds);
         }
+    }
+
+    /// `--text-pack` (#1585): this node's partitions pack their text indexes in the
+    /// background. Off unless called: a packed index can't be read by a 1.2 build.
+    pub(crate) fn text_pack(self, on: bool) -> Self {
+        if on {
+            self.text_rebuilds.pack_on();
+        }
+        self
     }
 
     /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
@@ -1602,6 +1645,12 @@ impl Service {
                 limits.inflight_bytes.min(Semaphore::MAX_PERMITS),
             )),
             blocking: Arc::new(Semaphore::new(blocking_threads.max(1))),
+            // Only under the mask, as many places as network workers (simp724's C1 on #1880,
+            // S1 on #1972).
+            lite: Arc::new(match &placement {
+                Some(p) if p.masked() => super::lite::Lite::new(p.io_threads, Some(Arc::clone(p))),
+                _ => super::lite::Lite::off(),
+            }),
             mcp_places: Arc::new(Semaphore::new(limits.mcp_blocking.max(1))),
             scans: Arc::new(Semaphore::new(limits.max_scans.max(1))),
             bulk_budget: super::bulk::budget_pool(limits.bulk_load_bytes),
@@ -1628,6 +1677,10 @@ impl Service {
     /// promoted. The loop is started by the caller once the server runs.
     pub(crate) fn replica(mut self, replica: Arc<super::replica::Replica>) -> Self {
         self.replica = Some(replica);
+        // A cluster replica copy (D328) serves reads under its own freshness bound, which
+        // the router checks per request against the client's, never under a lease: copies
+        // stay out of the lease machinery (S3). Its writes are refused by the engine (R6).
+        self.gate = None;
         // A replica's rebalancer could only fail (its writes are refused, R6): none runs
         // until a promote (cli692's F3 on #1583).
         if let Some(part) = &self.part {
@@ -2462,6 +2515,22 @@ impl Service {
                 .await
                 .map(ServiceReply::Nearest)
                 .map_err(ApiError::for_read),
+            // An index's part (#1722 PR 1b): the partition's own search or check.
+            ServiceOp::VectorSearch(r) => self
+                .vector_search(r)
+                .await
+                .map(ServiceReply::VectorSearch)
+                .map_err(ApiError::for_read),
+            ServiceOp::VectorVerify(r) => self
+                .vector_verify(r)
+                .await
+                .map(ServiceReply::VectorVerify)
+                .map_err(ApiError::for_read),
+            ServiceOp::TextVerify(r) => self
+                .text_verify(r)
+                .await
+                .map(ServiceReply::TextVerify)
+                .map_err(ApiError::for_read),
             ServiceOp::RecallPool(r) => self
                 .recall_pool(r, caller)
                 .await
@@ -2471,7 +2540,8 @@ impl Service {
                 .await
                 .map_err(ApiError::for_read),
             _ => Err(ApiError::internal(
-                "a fan-out's local part is a multi-get, a nearest search or a recall's step",
+                "a fan-out's local part is a multi-get, a nearest search, an index's search or \
+                 check, or a recall's step",
             )),
         }
     }
@@ -2756,6 +2826,9 @@ impl Service {
             let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
         }
         render_bulk(&mut text, parts);
+        if self.text_rebuilds.packs() {
+            render_text_packs(&mut text, parts);
+        }
         render_pinning(&mut text, parts);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
@@ -3108,6 +3181,12 @@ impl Service {
         blocking(&self.blocking, f).await
     }
 
+    /// Waits up to `timeout` for the light pool's running calls (shutdown, before the
+    /// databases close; simp724's S2 on #1972); whether they finished.
+    pub(crate) fn drain_lite(&self, timeout: Duration) -> bool {
+        self.lite.drain(timeout)
+    }
+
     /// A `--max-streams` place, now or `Overloaded`: a feed or watch stream's, or a `/mcp`
     /// `feed_poll`'s for its wait.
     pub(crate) fn stream_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
@@ -3172,7 +3251,7 @@ impl Service {
         drop(pinned);
         Ok(proto::GetResponse {
             cell: cell.map(|c| {
-                let kind = convert::Kinds::new(&table).of(&r.family);
+                let kind = convert::View::of(&table, &r.family);
                 convert::cell(&r.family, &r.qualifier, &c, kind, r.aggregate.as_ref())
             }),
         })
@@ -3392,30 +3471,14 @@ impl Service {
         &self,
         r: proto::CreateVectorIndexRequest,
     ) -> Result<proto::Empty, ApiError> {
-        let spec = r
-            .spec
-            .as_ref()
-            .ok_or_else(|| ApiError::invalid("an index needs a vector spec"))?;
-        let spec = convert::vector_spec_in(spec)?;
-        let mut options = pigeonhole_vector::IndexOptions::new();
-        if let Some(n) = r.target_list_len {
-            options = options.target_list_len(n);
+        // Where the ids are is a cluster's (#1722): a single node holds them all.
+        if !r.follows.is_empty() || r.placement.is_some() {
+            return Err(ApiError::invalid(
+                "an index's follows and placement are for a cluster node: this server is a \
+                 single node, whose index holds every id",
+            ));
         }
-        if let Some(n) = r.nprobe {
-            options = options.nprobe(n);
-        }
-        if let Some(n) = r.reassign_neighbours {
-            options = options.reassign_neighbours(n);
-        }
-        match proto::Rebalance::try_from(r.rebalance).unwrap_or(proto::Rebalance::Unspecified) {
-            proto::Rebalance::Unspecified => {}
-            proto::Rebalance::Inline => {
-                options = options.rebalance(pigeonhole_vector::Rebalance::Inline);
-            }
-            proto::Rebalance::Background => {
-                options = options.rebalance(pigeonhole_vector::Rebalance::Background);
-            }
-        }
+        let (spec, options) = super::indexes::create_args(&r)?;
         let indexes = Arc::clone(&self.part()?.indexes);
         self.blocking(move || indexes.create(&r.name, spec, options, r.if_missing))
             .await?;
@@ -3734,7 +3797,8 @@ impl Service {
     /// A row's selected cells, a page at a time: whole columns, at most `page_bytes` by
     /// D308's measure (perf287's S1) and `page_cells` cells, resumed from `after`. The
     /// first column always comes back, so a page makes progress even when one column is
-    /// larger than the budget. On the blocking pool, since row pages are sync-only (D196).
+    /// larger than the budget. Sync, since row pages are sync-only (D196): a page within the
+    /// default budget on the light pool (#1880), a larger one on the blocking pool.
     /// TODO(#398, #1286): `read_async`-based paging, so a row read holds no blocking thread.
     async fn read_row(
         &self,
@@ -3750,7 +3814,7 @@ impl Service {
             r.page_cells as usize
         };
         // The request comes back with the reply, for a strict path's second read (#1661).
-        self.blocking(move || {
+        let read = move || {
             let reply = (|| -> Result<proto::ReadRowResponse, ApiError> {
                 let at = pinned.as_ref().map(|p| p.snapshot().clone());
                 let select = convert::Select::new(r.selection.as_ref())?.at(at);
@@ -3806,8 +3870,24 @@ impl Service {
                 })
             })()?;
             Ok((reply, r))
-        })
-        .await
+        };
+        // A page within the default budget is a small, bounded read: the light pool, on the
+        // siblings too. A larger one stays off them (perf287's note on #1880). The pool is
+        // tried before any await, so the future holds either the reply or the blocking call,
+        // never the closure twice: held across both, it grew every call's dispatch future,
+        // and moving it cost Get and Mutate about 550 instructions of memcpy a call (x86
+        // callgrind on #1972; boxing it instead cost each ReadRow about 10K).
+        let lite = if budget <= DEFAULT_PAGE_BYTES {
+            self.lite.try_run(read)
+        } else {
+            Err(read)
+        };
+        match lite {
+            Ok(reply) => reply
+                .await
+                .map_err(|_| ApiError::internal("the light pool's call was lost"))?,
+            Err(read) => self.blocking(read).await,
+        }
     }
 
     /// A scan as a stream of pages (ICR 0112): each page is one `read_within` on the
@@ -4277,7 +4357,7 @@ impl Service {
         drop(g);
         Ok(proto::GetResponse {
             cell: cell.map(|c| {
-                let kind = convert::Kinds::new(&table).of(&r.family);
+                let kind = convert::View::of(&table, &r.family);
                 convert::cell(&r.family, &r.qualifier, &c, kind, None)
             }),
         })

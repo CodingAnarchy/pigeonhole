@@ -29,7 +29,10 @@ on:
       - 'crates/bench/examples/writepath.rs'
       - 'crates/bench/examples/ycsb.rs'
       - 'crates/bench/examples/textshapes.rs'
+      - 'crates/bench/examples/textpacked.rs'
       - 'crates/bench/examples/feedshapes.rs'
+      - 'crates/bench/examples/memshapes.rs'
+      - 'crates/memory/**'
       - 'crates/bench/examples/serveshapes.rs'
       - 'crates/cli/src/serve/**'
       # The serve path is mostly third-party code (tonic, axum, hyper, h2): a dependency bump
@@ -89,7 +92,10 @@ env:
   # the default on noise alone. The likely source, untraced: a write awaits the shard thread's
   # commit (not counted), and whether it is done by the task's first poll is timing, so some
   # calls take another poll through the service stack. Tracing it is #1900.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8 serve-mutate=1.0
+  # `commit-incr` gets 1.0% on ubuntu-26.04 (#1795, owner 2026-11-17): identical code counts
+  # 0.77% apart (11029-11114), from #320's cross-thread free of a commit's batch buffer, which
+  # glibc 2.43 serves at a cost varying with the heap's state. The ceilings file says more.
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8 serve-mutate=1.0 commit-incr=1.0
 
 jobs:
   # Valgrind's .debs, cached so the callgrind jobs don't need the Ubuntu archive (down for
@@ -102,7 +108,7 @@ jobs:
   valgrind-debs:
     name: valgrind .debs
     # The measuring jobs' image (below), so the .debs it saves are the ones they install.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
@@ -141,8 +147,8 @@ jobs:
     # valgrind. Identical code on Rust 1.100 counts get-sst 16615 on ubuntu-24.04 (valgrind
     # 3.22) and 16737 on ubuntu-26.04 (valgrind 3.26), and commit-one 8621 against 8479, so a
     # run would pass or fail the ceilings by which image it got. Moving to another image is a
-    # re-baseline of every ceiling in the same PR (#1795).
-    runs-on: ubuntu-24.04
+    # re-baseline of every ceiling in the same PR: ubuntu-24.04 -> ubuntu-26.04 in #1795.
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     # Jobs in parallel (#1575): the read and write shapes; the text-search shapes, which
     # alone took about 20 minutes a side under valgrind and pushed one job to its 60-minute
@@ -174,20 +180,25 @@ jobs:
               scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
               asyncwrites:commit-put-previous-async,commit-if-returning-async
           - name: text search instructions per search (callgrind)
-            # The sync text search's floor (#1560 PR 0, crates/bench/examples/textshapes.rs).
-            examples: textshapes
+            # The sync text search's floor (#1560 PR 0, crates/bench/examples/textshapes.rs),
+            # and the same searches over the index packed (#1585, textpacked.rs).
+            examples: textshapes textpacked
             hotrow: '-'
             shapes: >-
               textshapes:text-term-rare,text-term-hub,text-two-terms,text-five-terms,text-two-terms-k100,text-fuzzy,text-phrase,text-phrase-slop2,text-two-terms-prefix-none,text-fuzzy-prefix-none
-          - name: feed and replication instructions per commit (callgrind)
+              textpacked:text-term-hub-packed,text-two-terms-packed,text-phrase-packed
+          - name: feed, replication and memory instructions per unit (callgrind)
             # The change feed's drain and a replica's apply (#1828,
             # crates/bench/examples/feedshapes.rs): commits written in setup, drained or
             # applied in the measured part. `replicate-apply` last: its setup (a primary and
-            # its feed) is the fullest.
-            examples: feedshapes
+            # its feed) is the fullest. Agent memory's fused recall (#1828,
+            # crates/bench/examples/memshapes.rs): memories written in setup, recalled in the
+            # measured part.
+            examples: feedshapes memshapes
             hotrow: '-'
             shapes: >-
               feedshapes:feed-drain,feed-drain-all,replicate-apply
+              memshapes:memory-recall
           - name: phdb serve instructions per call (callgrind)
             # `phdb serve`'s gRPC calls through its router in process (#1828,
             # crates/bench/examples/serveshapes.rs): the token check, prepay, decode,
@@ -333,6 +344,14 @@ jobs:
               export TEXTSHAPES_INDEX="/tmp/textidx-$side"
             else
               unset TEXTSHAPES_INDEX
+            fi
+            # The packed shapes' index (#1585): that index copied and packed, natively, once
+            # per side that has the example (a base older than it has no such shapes).
+            if [ -x "/tmp/bin-$side/textpacked" ] && [ -n "${TEXTSHAPES_INDEX:-}" ]; then
+              "/tmp/bin-$side/textpacked" build "$TEXTSHAPES_INDEX" "/tmp/textpacked-$side"
+              export TEXTPACKED_INDEX="/tmp/textpacked-$side"
+            else
+              unset TEXTPACKED_INDEX
             fi
             hot="/tmp/bin-$side/$HOTROW"
             [ "$HOTROW" = - ] && hot=-

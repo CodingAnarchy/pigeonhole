@@ -21,17 +21,32 @@ use tokio::sync::OwnedSemaphorePermit;
 use tonic::codegen::http;
 use tonic::{Request, Response, Status};
 
-use super::Shared;
 use super::errors::ApiError;
 use super::feed::Out;
 use super::proto::{self, data_server::Data};
 use super::replica::ReadDeadline;
 use super::service::{ServiceOp, ServiceReply};
+use super::{Shared, auth};
 
 /// The budget `prepay` reserved for a request, for its handler to take. Extensions must be
 /// `Clone`; the permit is taken once.
 #[derive(Clone, Default)]
 struct Prepaid(Arc<Mutex<Option<OwnedSemaphorePermit>>>);
+
+/// The caller `prepay` identified from the request's token, for its handler to take, so a
+/// gRPC call hashes and looks up its token once, not twice (#1828: 168 ns a call). Removed
+/// by [`caller_of`]; extensions must be `Clone`.
+#[derive(Clone)]
+struct Authed(auth::Caller);
+
+/// The caller of a gRPC request: the one [`prepay`] identified, taken from the request's
+/// extensions, or (a route not behind `prepay`) from its token now.
+fn caller_of<T>(shared: &Shared, req: &mut Request<T>) -> Result<auth::Caller, ApiError> {
+    match req.extensions_mut().remove::<Authed>() {
+        Some(Authed(caller)) => Ok(caller),
+        None => shared.caller(auth_header(req)),
+    }
+}
 
 /// When `prepay` (or, over HTTP/1.1, `preread`) saw the request arrive: the start of its one
 /// deadline, which the budget wait and a replica's wait for the client's primary seqno share
@@ -79,9 +94,10 @@ pub(crate) async fn prepay(
         .headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if let Err(e) = shared.caller(token) {
-        return status(e);
-    }
+    let caller = match shared.caller(token) {
+        Ok(caller) => caller,
+        Err(e) => return status(e),
+    };
     let limits = shared.limits;
     let deadline = grpc_timeout(&parts.headers);
     let wait = deadline.map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
@@ -107,11 +123,14 @@ pub(crate) async fn prepay(
         Err(e) => return status(e),
     };
     // The first message's bytes, once their share is reserved; one longer than
-    // `--max-request-bytes` is left for tonic to refuse from its header.
-    if length <= limits.max_request_bytes
-        && let Err(e) = read_to(&mut data, &mut head, 5 + length, until).await
-    {
-        return status(e);
+    // `--max-request-bytes` is left for tonic to refuse from its header. The buffer is sized
+    // from the header once, not grown chunk by chunk (#1828: 1.5 µs at 64 KiB, 0.96 ms at
+    // 16 MiB).
+    if length <= limits.max_request_bytes {
+        head.reserve_exact((5 + length).saturating_sub(head.len()));
+        if let Err(e) = read_to(&mut data, &mut head, 5 + length, until).await {
+            return status(e);
+        }
     }
     let rest = Rest {
         head: Some(Bytes::from(head)),
@@ -138,6 +157,7 @@ pub(crate) async fn prepay(
     req.extensions_mut()
         .insert(Prepaid(Arc::new(Mutex::new(Some(permit)))));
     req.extensions_mut().insert(Arrived(arrived));
+    req.extensions_mut().insert(Authed(caller));
     req.extensions_mut().insert(meter);
     // A unary read's reply charge (#1567) moves into its body here, on the way out.
     super::charge::hold(next.run(req).await, limits.stream_idle)
@@ -363,7 +383,7 @@ impl Stream for Rest {
 }
 
 /// The `grpc-timeout` header: digits and a unit (`H`, `M`, `S`, `m`, `u`, `n`).
-fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
+pub(crate) fn grpc_timeout(headers: &axum::http::HeaderMap) -> Option<Duration> {
     parse_grpc_timeout(headers.get("grpc-timeout")?.to_str().ok()?)
 }
 
@@ -421,13 +441,51 @@ impl DataGrpc {
     }
 }
 
+tokio::task_local! {
+    /// What served a read a replica could have (D328), set by [`call`] on a cluster node
+    /// for [`served_headers`] to put on the response.
+    static SERVED: std::cell::Cell<Option<super::replica::Served>>;
+}
+
+/// A cluster node's `Data` route's middleware (D328): the `served-by` and `served-seqno`
+/// headers of a read a replica could have served. Only a cluster node mounts it, so a
+/// single node's calls are as they were (the serve callgrind shapes, D193).
+pub(crate) async fn served_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    SERVED
+        .scope(std::cell::Cell::new(None), async move {
+            let mut resp = next.run(req).await;
+            if let Some(served) = SERVED.with(std::cell::Cell::get) {
+                for (name, value) in served.headers() {
+                    if let Ok(value) = value.parse() {
+                        resp.headers_mut().insert(name, value);
+                    }
+                }
+            }
+            resp
+        })
+        .await
+}
+
 /// One gRPC call through the router, for every service.
 async fn call<T>(
     shared: &Shared,
-    req: Request<T>,
+    mut req: Request<T>,
     op: impl FnOnce(T) -> ServiceOp,
 ) -> Result<ServiceReply, Status> {
-    let caller = shared.caller(auth_header(&req))?;
+    // A cluster node's calls may carry the replica header (D328): boxed, so a single node's
+    // calls keep the future and the cost they had.
+    if shared.router.is_cluster() {
+        let (reply, served) = Box::pin(call_served(shared, req, op)).await?;
+        if let Some(served) = served {
+            // For [`served_headers`], which wraps a cluster node's `Data` route.
+            let _ = SERVED.try_with(|slot| slot.set(Some(served)));
+        }
+        return Ok(reply);
+    }
+    let caller = caller_of(shared, &mut req)?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
     let started = Instant::now();
     let min_primary_seqno = super::replica::min_primary_seqno(
@@ -450,6 +508,70 @@ async fn call<T>(
         .await;
     shared.count(rpc, started, &reply);
     Ok(reply?)
+}
+
+/// [`call`] on a cluster node, with what served a read a replica could have (D328), for its
+/// headers. A single node's calls never come here, so their cost stays as it was (the
+/// serve callgrind shapes, D193).
+async fn call_served<T>(
+    shared: &Shared,
+    mut req: Request<T>,
+    op: impl FnOnce(T) -> ServiceOp,
+) -> Result<(ServiceReply, Option<super::replica::Served>), Status> {
+    let caller = caller_of(shared, &mut req)?;
+    let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
+    let started = Instant::now();
+    let min_primary_seqno = super::replica::min_primary_seqno(
+        req.metadata()
+            .get(super::replica::MIN_PRIMARY_SEQNO)
+            .map(|v| v.as_bytes()),
+    );
+    // Only a cluster node reads the replica header (D328): a single node's calls keep
+    // their cost (the serve callgrind shapes, D193).
+    let max_lag = if shared.router.is_cluster() {
+        super::replica::read_replica_max_lag(
+            req.metadata()
+                .get(super::replica::READ_REPLICA_MAX_LAG_MS)
+                .map(|v| v.as_bytes()),
+        )
+    } else {
+        Ok(None)
+    };
+    // The request's one deadline, from its arrival (#1577).
+    let arrived = req.extensions().get::<Arrived>().map_or(started, |a| a.0);
+    let deadline = ReadDeadline::new(
+        arrived,
+        shared.limits.request_timeout,
+        grpc_timeout(req.metadata().as_ref()),
+    );
+    let op = op(req.into_inner());
+    let rpc = op.index();
+    // A call without the header goes as it always did; one with it, boxed, so its future
+    // doesn't widen every call's.
+    let (reply, served) = match max_lag {
+        Ok(None) => (
+            shared
+                .router
+                .dispatch_after_primary(op, &caller, prepaid, min_primary_seqno, deadline)
+                .await,
+            None,
+        ),
+        max_lag => match Box::pin(shared.router.dispatch_read(
+            op,
+            &caller,
+            prepaid,
+            min_primary_seqno,
+            max_lag,
+            deadline,
+        ))
+        .await
+        {
+            Ok((reply, served)) => (Ok(reply), served),
+            Err(e) => (Err(e), None),
+        },
+    };
+    shared.count(rpc, started, &reply);
+    Ok((reply?, served))
 }
 
 /// A unary RPC: the call, and its reply's variant.
@@ -756,9 +878,9 @@ impl proto::admin_server::Admin for AdminGrpc {
 
     async fn partition_upload(
         &self,
-        req: Request<tonic::Streaming<proto::PartitionUploadChunk>>,
+        mut req: Request<tonic::Streaming<proto::PartitionUploadChunk>>,
     ) -> Result<Response<proto::PartitionUploadReply>, Status> {
-        let caller = self.0.caller(auth_header(&req))?;
+        let caller = caller_of(&self.0, &mut req)?;
         let reply = self
             .0
             .router
@@ -769,9 +891,9 @@ impl proto::admin_server::Admin for AdminGrpc {
 
     async fn partition_upload_status(
         &self,
-        req: Request<proto::PartitionUploadStatusRequest>,
+        mut req: Request<proto::PartitionUploadStatusRequest>,
     ) -> Result<Response<proto::PartitionUploadStatusReply>, Status> {
-        let caller = self.0.caller(auth_header(&req))?;
+        let caller = caller_of(&self.0, &mut req)?;
         let reply = self.0.router.partition_upload_status(
             &caller,
             &req.get_ref().upload_id,
@@ -858,10 +980,10 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
 
     async fn bulk_load(
         &self,
-        req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
+        mut req: Request<tonic::Streaming<proto::VectorBulkLoadRequest>>,
     ) -> Result<Response<proto::Empty>, Status> {
         let shared = &self.0;
-        let caller = shared.caller(auth_header(&req))?;
+        let caller = caller_of(shared, &mut req)?;
         let first_budget = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
         let meter = req.extensions().get::<Meter>().cloned().unwrap_or_default();
         let limits = shared.limits;

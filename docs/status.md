@@ -1,6 +1,6 @@
 # Status
 
-> **Maturity: 1.x.** [1.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.0) is on [crates.io](https://crates.io/crates/pigeonhole) (after [1.1.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.3), [1.1.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.2), [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1), [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0), [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) and [1.0.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0); [0.3.4](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.4) and [0.2.6](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.6) were the last 0.x releases). The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver ([D282](design/decisions/phase-3.md#d282)), behind a snapshot check (#1050), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). All four phases are complete; the gaps 1.0 ships with are listed under each phase's gate results below. Keep this note in sync with each release.
+> **Maturity: 1.x.** [1.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.3) is on [crates.io](https://crates.io/crates/pigeonhole) (after [1.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.2), [1.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.1), [1.2.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.2.0), [1.1.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.3), [1.1.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.2), [1.1.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.1), [1.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.1.0), [1.0.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1) and [1.0.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0); [0.3.4](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.4) and [0.2.6](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.6) were the last 0.x releases). The public API of `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-vector`, `pigeonhole-text`, `pigeonhole-memory` and `phdb` follows semver ([D282](design/decisions/phase-3.md#d282)), behind a snapshot check (#1050), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). All four phases are complete; the gaps 1.0 ships with are listed under each phase's gate results below. Keep this note in sync with each release.
 
 Live progress against the [build plan](design/spec.md#build-plan). Updated by the coordinator as work lands.
 
@@ -13,6 +13,49 @@ The decision log is a [phase file plus an index](design/decisions/README.md) (`d
 | 3. Foundations — `format`, `io`, `sim` | done ([#2](https://github.com/CodingAnarchy/pigeonhole/pull/2), [#3](https://github.com/CodingAnarchy/pigeonhole/pull/3), [#4](https://github.com/CodingAnarchy/pigeonhole/pull/4)) |
 | 4. Components — `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, then `sst` | done — all seven merged, last [#30](https://github.com/CodingAnarchy/pigeonhole/pull/30) (`sst`) |
 | 5. Assembly — `compaction`, `engine`, `pigeonhole`, `bench`; Phase 1 gate | done. Every crate merged, tablets on by default ([#168](https://github.com/CodingAnarchy/pigeonhole/pull/168)), the pre-gate edge-case review ([#90](https://github.com/CodingAnarchy/pigeonhole/issues/90)) and all its Phase 1 fixes landed. **Phase 1 gate passed on 2026-10-08** at `3abef59`: the milestone was empty and the 1–300 fault-injection sweeps (engine model/crash with tablets on, the fast balancer and in-flight I/O, engine tablets, public model) and full CI were green. Published as [0.1.0](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.1.0) (15 crates). |
+
+## Capabilities
+What the public API does, and the first release with each piece. The [README's list](../README.md#what-you-can-do) links each one to its guide page. "1.0.0" includes everything that 0.x already had. **On `main`, 1.3.0** means merged but not yet released.
+
+| Capability | Calls | State |
+|---|---|---|
+| Single-row reads and atomic writes | `Table::mutate(..).put(..).commit()`, `Table::get`, `Table::row(..).read()` | released, 1.0.0 |
+| Conditional writes | `commit_if(&Condition)` | released, 1.0.0 |
+| | `commit_returning` | released, 1.1.0 |
+| | `commit_if_returning`, `return_previous` | released, 1.2.0 |
+| Batches | `Pigeonhole::write_batch()`, `WriteBatch::commit` | released, 1.0.0 |
+| Optimistic transactions | `Pigeonhole::transaction()`, `transact(&RetryPolicy, ..)` | released, 1.0.0 |
+| Multi-get | `Table::keys(&KeySet).read()` | released, 1.1.0 |
+| Counters | `Family::counter()`, `incr`, `incr_at` | released, 1.0.0 |
+| Aggregates | `Family::aggregate(Aggregation::..)` (min, max, HLL, bitwise, `f64`, histograms, quantiles, bloom, sets), `aggregate`, `aggregate_bytes` | released, 1.1.0 |
+| Versions and TTL | `Family::max_versions`, `Family::ttl`, `put_at`, `versions`, `time_range` | released, 1.0.0 |
+| Scans with filters | `scan`, `scan_prefix`, `scan_bounds`, `value_filter`, `limit` | released, 1.0.0 |
+| Byte budgets | `Scan::read_within`, `KeysRead::read_within`, `Nearest::run_within` | released, 1.1.0 |
+| Wide rows and graph walks | `RowRead::cells`, `pages`, `resume_after`, `Table::traverse` | released, 1.1.0 |
+| | async walks within a row and async key-set cells | released, 1.2.0 |
+| Vectors | `Family::vector`, `nearest_f32`; `pigeonhole-vector`'s IVF `Index` | released, 1.1.0 |
+| Full-text search | `pigeonhole-text`'s `Index` (`put_in`, `search`) | released, 1.1.0 |
+| Agent memory | `pigeonhole-memory`'s `Store` (`remember`, `recall`, `consolidate`) | released, 1.1.0 |
+| | local embeddings, `pigeonhole-embed` (its own 0.N line) | released, 1.2.0 |
+| Change feeds | `Options::change_feed`, `Table::feed()`, `Feed::next`, `FeedToken` | released, 1.1.0 |
+| | a feed of every table, `Pigeonhole::feed()` | released, 1.2.0 |
+| Snapshots, backups, reader processes | `snapshot`, `durable_snapshot`, `backup`, `open_reader` | released, 1.0.0 |
+| | `Options::read_only` (an open that writes nothing to the files) | released, 1.1.0 |
+| | `backup_at`; read-only opens of read-only files (#1348) | released, 1.2.0 |
+| Async | module `nonblocking` | released, 1.0.0 |
+| Arrow export | `pigeonhole-arrow` | released, 1.0.0 |
+| Python and Ruby | `pigeonhole-db` | released, 1.1.0 |
+| Command line | `phdb` | released, 1.0.0 |
+| | `phdb mcp` | released, 1.1.0 |
+| `phdb serve` | gRPC, HTTP/JSON and `/mcp` on one port; tokens, TLS, sessions, the change feed, agent memory, backups, `/metrics` | released, 1.2.0 |
+| | read replicas: `--replica-of`, `phdb promote` | released, 1.2.0 |
+| Metrics | `pigeonhole-otel` (its own 0.N line) | released, 1.2.0 |
+| Clusters | `phdb serve --cluster`, `phdb cluster` | released, 1.2.0 |
+| | read replicas of a partition (#1851) | on `main`, 1.3.0 |
+| | agent memory and `/mcp` on a cluster node (#1915) | on `main`, 1.3.0 |
+| | `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852) | on `main`, 1.3.0 |
+| | vector and text indexes on a cluster: creates, drops and writes routed by id (#1994) | in review, 1.3.0 |
+| | searches across an index's partitions (#1722) | in progress, 1.3.0 |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.

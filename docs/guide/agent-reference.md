@@ -400,6 +400,20 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; unti
 | Errors | On stderr. With json/jsonl: `{"phdb":1,"error":{"code","code_num","message"}}`. `code` is the `ErrorCode` name (`ReadOnly` for a write in a read-only shell). Failures outside the database have `code_num` `null`: `FileNotFound`, `BadInput` (a dump `load` can't read; the message names the line), `Unsupported` (a cell `dump --format arrow` can't hold, such as a timestamp above `i64::MAX`; exit 6), `Export` (the Arrow writer failed otherwise; exit 1), `Usage` (exit 2). A failed dump leaves a prefix on stdout: trust it only on exit 0. Shell and script failures name their line. |
 | Agent recipe | Inspect: `phdb --format json info DB`. Verify: `phdb --format json check DB` (exit 3 and `findings` on damage). Export: `phdb dump DB > db.jsonl`. Query or edit: `phdb --format json shell DB -c 'scan t --prefix user: --limit 10' -c 'put t r f:q v'` (one JSON document per command; the first failure stops with its status). |
 
+## `phdb serve` (1.2.0)
+Full page: [`serve.md`](serve.md); [ICR 0112](../design/icr/0112-network-api.md) is the contract. Install with `cargo install pigeonhole-cli --features serve` (add `embed-local` for `--embed-local`).
+
+| Item | Rule |
+|---|---|
+| Start | `phdb serve FILE [--create] [--listen ADDR:PORT]` (default `127.0.0.1:7448`). Security: `--tls-cert`, `--tls-key`, `--token-file` (`read`, `write` and `admin` tokens, optionally limited to memory namespaces). Change feed: `--change-feed BYTES`. Backups: `--backup-dir`. Agent memory: `--memory NAME`. |
+| Protocols | gRPC (package `pigeonhole.v1`, `proto/pigeonhole/v1/*.proto`) and HTTP/JSON (`POST /v1/<Service>/<Method>`) on one port; remote MCP at `/mcp` (`phdb mcp`'s tools). |
+| Services | `Data` (reads, writes, scans, batches), `Transactions`, `Snapshots`, `Schema`, `Admin` (info, flush, compact, backups), `Feed`, `Graph`, `Vectors` (nearest search and the IVF index), `Text`, `Memory`, `Replication`, `Cluster`. |
+| Retries | Reads may be retried. Retry a write only when its error's `ErrorDetail` says `retry_safe`. |
+| Read replicas | `--replica-of URL` with `--replica-token-file` (an admin token of the primary's); the primary needs `--backup-dir` and its change feed on. A replica refuses writes with `ReadOnly`, naming the primary. `phdb promote FILE` (offline) or `Admin.Promote` turns it into a primary. |
+| Clusters | `phdb serve --cluster DIR --node-id ID`: static key-range partitions in a map that `phdb cluster` manages (`init-partition`, `set-map`, `show-map`, `status`, `fence`, `unfence`, `move`, `relocate`, `close`, `drop-partition`, `backup`, `restore`). Any node routes any call. Transactions and snapshots stay within one partition, and a write across partitions answers `CrossPartition`. |
+| Clusters, on `main` for 1.3.0 | Read replicas of a partition (a map's `replicas`); agent memory with `--memory` on every node, and `/mcp`; `Admin.Info`, `Flush` and `Compact` on a cluster node. Vector and text indexes on a cluster: creates, drops and writes routed by id, and `Vectors.Search` (`nprobe` per partition) and both kinds' `Verify` across an index's partitions. Not on `main` yet: `Text.Search`, `Text.Rebuild` and `Vectors.BulkLoad` across partitions (#1722). |
+| Metrics | Prometheus text at `/metrics` ([`observability.md`](observability.md)). |
+
 ## Arrow export: `pigeonhole-arrow` (#691)
 Full page: [`arrow.md`](arrow.md). Depends on the public crate only; pins arrow-rs 60 and re-exports `arrow_array`, `arrow_buffer`, `arrow_schema`.
 

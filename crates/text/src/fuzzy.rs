@@ -159,7 +159,7 @@ fn found_hit(
 }
 
 /// The expansions in order, at most `max`, and whether `max` cut any.
-fn finish(mut found: Vec<Expansion>, max: usize) -> (Vec<Expansion>, bool) {
+pub(crate) fn finish(mut found: Vec<Expansion>, max: usize) -> (Vec<Expansion>, bool) {
     found.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)

@@ -455,6 +455,15 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::Nearest(r) => Op::Nearest(r),
         ServiceOp::CreateTable(r) => Op::CreateTable(r),
         ServiceOp::DropTable(r) => Op::DropTable(r),
+        ServiceOp::CreateIndex(r) => Op::CreateVectorIndex(r),
+        ServiceOp::VectorInsert(r) => Op::VectorInsert(r),
+        ServiceOp::VectorDelete(r) => Op::VectorDelete(r),
+        ServiceOp::VectorSearch(r) => Op::VectorSearch(r),
+        ServiceOp::VectorVerify(r) => Op::VectorVerify(r),
+        ServiceOp::TextCreateIndex(r) => Op::CreateTextIndex(r),
+        ServiceOp::TextPut(r) => Op::TextPut(r),
+        ServiceOp::TextDelete(r) => Op::TextDelete(r),
+        ServiceOp::TextVerify(r) => Op::TextVerify(r),
         ServiceOp::Remember(r) => Op::Remember(r),
         ServiceOp::Recall(r) => Op::Recall(r),
         ServiceOp::MarkUsed(r) => Op::MarkUsed(r),
@@ -470,6 +479,16 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
             )));
         }
     })
+}
+
+/// Whether a fanned-out part of `op` names its partition in `ForwardRequest.partition`
+/// (#1722): an index search or check, whose request names only the index.
+pub(crate) fn names_partition(op: &forward_request::Op) -> bool {
+    use forward_request::Op;
+    matches!(
+        op,
+        Op::VectorSearch(_) | Op::VectorVerify(_) | Op::TextVerify(_)
+    )
 }
 
 /// A forward's op as the call it carries, on the owner.
@@ -495,6 +514,15 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::Nearest(r) => ServiceOp::Nearest(r),
             Op::CreateTable(r) => ServiceOp::CreateTable(r),
             Op::DropTable(r) => ServiceOp::DropTable(r),
+            Op::CreateVectorIndex(r) => ServiceOp::CreateIndex(r),
+            Op::VectorInsert(r) => ServiceOp::VectorInsert(r),
+            Op::VectorDelete(r) => ServiceOp::VectorDelete(r),
+            Op::VectorSearch(r) => ServiceOp::VectorSearch(r),
+            Op::VectorVerify(r) => ServiceOp::VectorVerify(r),
+            Op::CreateTextIndex(r) => ServiceOp::TextCreateIndex(r),
+            Op::TextPut(r) => ServiceOp::TextPut(r),
+            Op::TextDelete(r) => ServiceOp::TextDelete(r),
+            Op::TextVerify(r) => ServiceOp::TextVerify(r),
             Op::Remember(r) => ServiceOp::Remember(r),
             Op::Recall(r) => ServiceOp::Recall(r),
             Op::MarkUsed(r) => ServiceOp::MarkUsed(r),
@@ -511,6 +539,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
 /// response holds until its body has been written (cli692's F1 on ticket 2).
 pub(crate) fn reply_to_forward(
     reply: ServiceReply,
+    served_seqno: u64,
 ) -> Result<(ForwardResponse, Option<crate::serve::charge::Charge>), ApiError> {
     use forward_response::Reply;
     let (reply, charge) = reply.uncharge();
@@ -527,6 +556,9 @@ pub(crate) fn reply_to_forward(
         ServiceReply::Table(r) => Reply::Table(r),
         ServiceReply::Empty(r) => Reply::Empty(r),
         ServiceReply::Nearest(r) => Reply::Nearest(r),
+        ServiceReply::VectorSearch(r) => Reply::VectorSearch(r),
+        ServiceReply::VectorVerify(r) => Reply::VectorVerify(r),
+        ServiceReply::TextVerify(r) => Reply::TextVerify(r),
         ServiceReply::Remember(r) => Reply::Remember(r),
         ServiceReply::Recall(r) => Reply::Recall(r),
         ServiceReply::MarkUsed(r) => Reply::MarkUsed(r),
@@ -539,7 +571,13 @@ pub(crate) fn reply_to_forward(
             ));
         }
     };
-    Ok((ForwardResponse { reply: Some(reply) }, charge))
+    Ok((
+        ForwardResponse {
+            reply: Some(reply),
+            served_seqno,
+        },
+        charge,
+    ))
 }
 
 /// A forward's reply as the call's own, on the entry node.
@@ -562,6 +600,9 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Table(r) => ServiceReply::Table(r),
             Reply::Empty(r) => ServiceReply::Empty(r),
             Reply::Nearest(r) => ServiceReply::Nearest(r),
+            Reply::VectorSearch(r) => ServiceReply::VectorSearch(r),
+            Reply::VectorVerify(r) => ServiceReply::VectorVerify(r),
+            Reply::TextVerify(r) => ServiceReply::TextVerify(r),
             Reply::Remember(r) => ServiceReply::Remember(r),
             Reply::Recall(r) => ServiceReply::Recall(r),
             Reply::MarkUsed(r) => ServiceReply::MarkUsed(r),
