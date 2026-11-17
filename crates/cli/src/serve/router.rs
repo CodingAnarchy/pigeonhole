@@ -723,6 +723,16 @@ impl Router {
                     };
                 }
                 ServiceOp::Scan(_) => return self.fan_scan(cluster, op, caller, prepaid).await,
+                // A search or check across an index's partitions (#1722 PR 1b).
+                ServiceOp::VectorSearch(_)
+                | ServiceOp::VectorVerify(_)
+                | ServiceOp::TextVerify(_) => {
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    return Box::pin(self.fan_index(cluster, op, caller, prepaid, deadline)).await;
+                }
                 // A memory call across partitions (#1915): a recall in steps, a `MarkUsed`
                 // or `Forget` split.
                 ServiceOp::Recall(_) | ServiceOp::MarkUsed(_) | ServiceOp::Forget(_)
@@ -838,6 +848,7 @@ impl Router {
             to_replica: replica.is_some(),
             replica_max_lag_ms: replica.map_or(0, |r| r.max_lag_ms),
             min_primary_seqno: replica.and_then(|r| r.min_primary_seqno).unwrap_or(0),
+            partition: String::new(),
             op: Some(forward::op_to_forward(op)?),
         };
         // For the rare resend. Cheap: the generated messages hold their bytes as `Bytes`
@@ -986,6 +997,9 @@ impl Router {
     /// one another (perf287's g78). Only peers call this (`Cluster.Forward` takes cluster
     /// scope), and the `Cluster` calls' concurrency limit bounds how many run at once.
     ///
+    /// `partition`: the partition a fanned-out part of an index search or check is for
+    /// (#1722 PR 1b), whose request names only the index; empty otherwise.
+    ///
     /// `replica`: a read the sending node chose this node's replica copy of P for (D328),
     /// with the client's bound and the call's deadline: served from the copy, never as P's
     /// owner. Returns the seqno it was served at, for a single-partition read.
@@ -994,6 +1008,7 @@ impl Router {
         op: ServiceOp,
         caller: &Caller,
         fanout_part: bool,
+        partition: &str,
         replica: Option<(ReplicaRead, ReadDeadline)>,
     ) -> Result<(ServiceReply, u64), ApiError> {
         let Some(cluster) = &self.cluster else {
@@ -1023,12 +1038,22 @@ impl Router {
                     "this node has no cluster map yet",
                 ));
             };
-            let p = route(routes, &op)?;
+            let p = if partition.is_empty() {
+                route(routes, &op)?
+            } else {
+                index_part_route(routes, &op, partition)?
+            };
             cluster.owned_here(routes, &p)?
         };
         let single = matches!(op, ServiceOp::Get(_) | ServiceOp::ReadRow(_));
         let reply = match op {
-            ServiceOp::MultiGet(_) | ServiceOp::Nearest(_) if fanout_part => {
+            ServiceOp::MultiGet(_)
+            | ServiceOp::Nearest(_)
+            | ServiceOp::VectorSearch(_)
+            | ServiceOp::VectorVerify(_)
+            | ServiceOp::TextVerify(_)
+                if fanout_part =>
+            {
                 service.fanout_part(op, caller).await?
             }
             op => service.call(op, caller, None).await?,
@@ -1527,17 +1552,9 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::VectorDelete(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextPut(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextDelete(r) => index_route(routes, &r.index, &r.id),
-        // Searches across an index's partitions come with #1722's next PRs.
-        ServiceOp::VectorSearch(_) => Err(ApiError::unsupported(
-            "Vectors.Search isn't supported on a cluster yet: use Vectors.Nearest, which fans \
-             out across the partitions",
-        )),
+        // Exact text search across an index's partitions comes with #1722 PR 2.
         ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
             "Text.Search isn't supported on a cluster yet",
-        )),
-        // So do the calls over a whole index (#1722's next PRs).
-        ServiceOp::VectorVerify(_) => Err(ApiError::unsupported(
-            "Vectors.Verify isn't supported on a cluster yet",
         )),
         ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
             "Vectors.BulkLoad isn't supported on a cluster yet",
@@ -1545,13 +1562,15 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::TextRebuild(_) => Err(ApiError::unsupported(
             "Text.Rebuild isn't supported on a cluster yet",
         )),
-        ServiceOp::TextVerify(_) => Err(ApiError::unsupported(
-            "Text.Verify isn't supported on a cluster yet",
-        )),
         // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
         // schema change (the map writer's), a schema read, a read that fans out, a
         // subscription and a backup.
         op if map_schema_change(op) => Err(unrouted()),
+        // Fanned out across the index's partitions by `dispatch`, each part naming its
+        // partition (#1722 PR 1b): [`index_part_route`].
+        ServiceOp::VectorSearch(_) | ServiceOp::VectorVerify(_) | ServiceOp::TextVerify(_) => {
+            Err(unrouted())
+        }
         ServiceOp::Traverse(_)
         | ServiceOp::ListTables(_)
         | ServiceOp::DescribeTable(_)
@@ -1574,6 +1593,30 @@ pub(crate) fn map_schema_change(op: &ServiceOp) -> bool {
             | ServiceOp::CreateIndex(_)
             | ServiceOp::TextCreateIndex(_)
     )
+}
+
+/// The partition a fanned-out part of an index search or check names (#1722 PR 1b), if
+/// the map places the op's index on it; else `WrongPartition`, since the sending node's
+/// map placed it there.
+fn index_part_route(routes: &Routes, op: &ServiceOp, partition: &str) -> Result<String, ApiError> {
+    let index = match op {
+        ServiceOp::VectorSearch(r) => &r.index,
+        ServiceOp::VectorVerify(r) => &r.index,
+        ServiceOp::TextVerify(r) => &r.index,
+        _ => {
+            return Err(ApiError::invalid(format!(
+                "a forwarded {} doesn't name a partition",
+                op.name()
+            )));
+        }
+    };
+    match routes.index_partitions(index, b"") {
+        Some(ps) if ps.contains(&partition) => Ok(partition.to_owned()),
+        _ => Err(ApiError::wrong_partition(
+            routes.map_version(),
+            format!("index {index:?} isn't on partition {partition} in this node's map"),
+        )),
+    }
 }
 
 /// The partition holding id `id` of index `index` (#1722).
@@ -1837,6 +1880,63 @@ fn unrouted() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A part of an index's search or check is served on the partition it names, only if
+    /// the map places the index there (#1722 PR 1b); a part of another call never names one.
+    #[test]
+    fn an_index_part_routes_to_the_partition_it_names_if_the_index_is_there() {
+        use super::super::proto::{ClusterMap, IndexPlacement, Partition, TablePlacement};
+        let part = |id: &str| Partition {
+            id: id.into(),
+            node: "a".into(),
+            ..Default::default()
+        };
+        let map = ClusterMap {
+            map_version: 3,
+            partitions: vec![part("p1"), part("p2"), part("p3")],
+            tables: vec![TablePlacement {
+                name: "users".into(),
+                splits: vec![super::super::proto::SplitKey {
+                    key: Some(super::super::proto::split_key::Key::Text("m".into())),
+                }],
+                partitions: vec!["p1".into(), "p2".into()],
+                ..Default::default()
+            }],
+            indexes: vec![IndexPlacement {
+                name: "uv".into(),
+                follows: "users".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let routes = Routes::new(&map);
+        let search = ServiceOp::VectorSearch(super::super::proto::VectorSearchRequest {
+            index: "uv".into(),
+            ..Default::default()
+        });
+        let verify =
+            ServiceOp::TextVerify(super::super::proto::TextIndexRequest { index: "uv".into() });
+        for op in [&search, &verify] {
+            assert_eq!(index_part_route(&routes, op, "p2").unwrap(), "p2");
+            let e = index_part_route(&routes, op, "p3").unwrap_err();
+            assert_eq!(e.code, "WrongPartition", "{}", e.message);
+        }
+        let lost = ServiceOp::VectorSearch(super::super::proto::VectorSearchRequest {
+            index: "nope".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            index_part_route(&routes, &lost, "p1").unwrap_err().code,
+            "WrongPartition"
+        );
+        let get = ServiceOp::Get(Default::default());
+        assert_eq!(
+            index_part_route(&routes, &get, "p1").unwrap_err().code,
+            "InvalidArgument"
+        );
+        // Unnamed, an index's search isn't routed by its content.
+        assert!(route(&routes, &search).is_err());
+    }
 
     /// The size of the future `f` returns, without calling it.
     fn future_size<A, F: Future>(_f: impl FnOnce(A) -> F) -> usize {

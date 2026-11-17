@@ -2475,6 +2475,22 @@ impl Service {
                 .await
                 .map(ServiceReply::Nearest)
                 .map_err(ApiError::for_read),
+            // An index's part (#1722 PR 1b): the partition's own search or check.
+            ServiceOp::VectorSearch(r) => self
+                .vector_search(r)
+                .await
+                .map(ServiceReply::VectorSearch)
+                .map_err(ApiError::for_read),
+            ServiceOp::VectorVerify(r) => self
+                .vector_verify(r)
+                .await
+                .map(ServiceReply::VectorVerify)
+                .map_err(ApiError::for_read),
+            ServiceOp::TextVerify(r) => self
+                .text_verify(r)
+                .await
+                .map(ServiceReply::TextVerify)
+                .map_err(ApiError::for_read),
             ServiceOp::RecallPool(r) => self
                 .recall_pool(r, caller)
                 .await
@@ -2484,7 +2500,8 @@ impl Service {
                 .await
                 .map_err(ApiError::for_read),
             _ => Err(ApiError::internal(
-                "a fan-out's local part is a multi-get, a nearest search or a recall's step",
+                "a fan-out's local part is a multi-get, a nearest search, an index's search or \
+                 check, or a recall's step",
             )),
         }
     }
