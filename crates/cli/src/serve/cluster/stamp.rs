@@ -226,8 +226,18 @@ impl Node {
 /// [`Node::stamp`]'s work on the files, on a blocking thread.
 fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, ApiError> {
     let p = &req.partition;
-    let mut installed = finish_install(dir, p)?.unwrap_or_default();
+    if req.promote && (req.restore || upload::ready_set(dir, p).is_some()) {
+        return Err(ApiError::invalid(
+            "a promotion stamps the replica copy's own file: no restore, and no staged set",
+        ));
+    }
+    let mut installed = if req.promote {
+        Vec::new()
+    } else {
+        finish_install(dir, p)?.unwrap_or_default()
+    };
     if installed.is_empty()
+        && !req.promote
         && let Some((header, staged)) = upload::ready_set(dir, p)
     {
         let want_cluster = if req.restore_from_cluster_id.is_empty() {
@@ -303,7 +313,11 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
         } else {
             id.cluster_id == req.restore_from_cluster_id
         };
-        let epoch_ok = if req.restore {
+        // A promotion's copy records the owner's epoch at its bootstrap, `e_b` (D328's
+        // amendment): the CLI checked `history_epoch <= e_b <= from_epoch`.
+        let epoch_ok = if req.promote {
+            id.epoch == req.replica_epoch && req.replica_epoch <= req.from_epoch
+        } else if req.restore {
             id.epoch <= req.from_epoch
         } else {
             id.epoch == req.from_epoch
@@ -327,6 +341,33 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
                     ""
                 }
             )));
+        }
+        // A replica database takes no local write (R6) until it's a primary: at the last
+        // commit it applied, as `phdb promote` makes one. Once promoted it can't follow
+        // again, so a promote that stops after this is finished or its file moved aside.
+        if req.promote {
+            let following = db
+                .replicated_seqno()
+                .map_err(|e| ApiError::internal(format!("read the copy's state: {e}")))?
+                .is_some();
+            // Already a primary, and not at `to_epoch` (done, above): an earlier promote
+            // stamped it, and the map has moved since (a set-map, relocate or promote), or
+            // it stopped between its promote and its identity. Stamping it again would give
+            // P this file's history over whatever P took since (simp724's M1 on #2007).
+            if !following {
+                return Err(ApiError::failed_precondition(format!(
+                    "{} is already a primary, at epoch {}: an earlier promote stopped after \
+                     promoting it, and the map has moved on (this promote is from epoch {}). \
+                     Stamped again it would replace what {p} took since. Check the map; to \
+                     make this node a replica of {p} again, move the file aside (phdb cluster \
+                     drop-partition {p} on this node)",
+                    main.display(),
+                    id.epoch,
+                    req.from_epoch
+                )));
+            }
+            db.promote()
+                .map_err(|e| ApiError::internal(format!("promote {}: {e}", main.display())))?;
         }
         let id = identity::Identity {
             cluster_id: req.cluster_id.clone(),
@@ -428,6 +469,8 @@ mod tests {
             to_epoch: from + 1,
             restore: false,
             restore_from_cluster_id: String::new(),
+            promote: false,
+            replica_epoch: 0,
         }
     }
 

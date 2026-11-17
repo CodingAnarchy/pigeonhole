@@ -1415,14 +1415,13 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .await
             .unwrap();
         let e = super::proto::text_client::TextClient::new(channel)
-            .search(super::proto::TextSearchRequest {
+            .rebuild(super::proto::TextIndexRequest {
                 index: "users".into(),
-                ..Default::default()
             })
             .await
             .unwrap_err();
         assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("Text.Search"), "{e}");
+        assert!(e.message().contains("Text.Rebuild"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {

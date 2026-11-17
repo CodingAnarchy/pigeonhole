@@ -225,11 +225,20 @@ pub(super) async fn run(
     timeout: Option<Duration>,
 ) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
-    let m = c
+    let mut m = c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
         .await
         .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
         .into_inner();
+    // A node holding P's replica copy (D328) leaves P's replicas and closes its copy before
+    // anything is staged there (S4): the installed set then replaces the copy's file.
+    if super::promote::leave_replicas(args, &m, partition, to).await? {
+        m = c
+            .get_map(request(GetMapRequest {}, token.as_deref())?)
+            .await
+            .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+            .into_inner();
+    }
     let Some(p) = m.partitions.iter().find(|p| p.id == partition).cloned() else {
         return Err(Failure::usage(&format!(
             "the map (version {}) has no partition {partition:?}",
@@ -857,6 +866,8 @@ async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<Partition
             to_epoch: e + 1,
             restore: false,
             restore_from_cluster_id: String::new(),
+            promote: false,
+            replica_epoch: 0,
         },
         new.token.as_deref(),
     )?)

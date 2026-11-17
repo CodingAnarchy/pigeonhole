@@ -123,6 +123,15 @@ message StampRequest {
   bool restore = 5;
   // With `restore`: the cluster the file records, restored into this one as a new cluster.
   string restore_from_cluster_id = 6;
+  // A promotion of this node's replica copy of the partition (D328, `phdb cluster promote`):
+  // the file is a replica database at `replica_epoch` (the owner's epoch at its bootstrap),
+  // not at `from_epoch`. The node makes it a primary at the last commit it applied, then
+  // raises its epoch to `to_epoch`. Refused while the copy is open here. No staged set is
+  // installed.
+  bool promote = 7;
+  // With `promote`: the epoch the CLI found in the copy's identity row, which the file must
+  // still record, so the stamp acts on the copy that was checked.
+  uint64 replica_epoch = 8;
 }
 
 // A partition's state on its node (D317 ticket 6).
@@ -487,6 +496,11 @@ message ForwardRequest {
     TextDeleteRequest text_delete = 29;
     // As `vector_verify`.
     TextIndexRequest text_verify = 31;
+    // The two rounds of a text search across an index's partitions (#1722 PR 2b): each
+    // partition's statistics for the query, then its part of the search scored with the
+    // partitions' merged statistics.
+    TextStatsRequest text_stats = 32;
+    TextSearchPartRequest text_search = 33;
     // Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
     // that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
     // or ids are in several partitions never comes here whole.
@@ -501,6 +515,30 @@ message ForwardRequest {
     RecallPoolRequest recall_pool = 40;
     RecallBodiesRequest recall_bodies = 41;
   }
+}
+
+// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
+// partition's statistics for the query, read at one snapshot. Every partition of the index
+// is asked, whatever `id_prefix` says: a search's statistics cover the whole index.
+message TextStatsRequest {
+  // The client's search, as it is.
+  TextSearchRequest search = 1;
+}
+
+message TextStatsResponse {
+  // `pigeonhole_text::QueryStats`'s versioned bytes. A version the sending node doesn't
+  // read fails the search with `FailedPrecondition`: the nodes' builds differ.
+  bytes stats = 1;
+}
+
+// Round 2 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
+// partition's top `k`, scored with every partition's statistics merged.
+message TextSearchPartRequest {
+  // The client's search, as it is.
+  TextSearchRequest search = 1;
+  // The merged `QueryStats`' versioned bytes. Empty for an index on one partition, whose
+  // own statistics are the whole index's: that part reads them itself, in one round.
+  bytes stats = 2;
 }
 
 // One partition's step of a recall whose namespaces are on several partitions (#1915,
@@ -606,6 +644,9 @@ message ForwardResponse {
     VectorSearchResponse vector_search = 13;
     VectorVerifyResponse vector_verify = 14;
     TextVerifyResponse text_verify = 16;
+    // A text search's two rounds (#1722 PR 2b).
+    TextStatsResponse text_stats = 17;
+    TextSearchResponse text_search = 18;
     // The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
     // answer `empty`.
     RememberResponse remember = 19;

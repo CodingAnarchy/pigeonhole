@@ -25,6 +25,7 @@ pub(crate) mod memwatch;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
+pub(crate) mod promote;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -1212,10 +1213,14 @@ impl Node {
                 lp.replica_applied_seqno = c.applied;
                 lp.replica_primary_seqno = c.primary_seqno;
                 lp.replica_lag_ms = c.lag_ms;
-                lp.epoch = map
-                    .as_ref()
-                    .and_then(|m| m.partitions.iter().find(|p| p.id == named))
-                    .map_or(0, |p| p.epoch);
+                // The copy's identity epoch: its owner's at the bootstrap (`e_b`), which a
+                // promotion checks against P's history (D328 PR 3).
+                lp.epoch = copy
+                    .service
+                    .part()
+                    .ok()
+                    .and_then(|part| identity::read(&part.db).ok().flatten())
+                    .map_or(0, |id| id.epoch);
                 lp.ok = c.state != proto::ReplicaState::Behind
                     && c.state != proto::ReplicaState::OwnerFeedOff;
                 lp.error = if lp.ok { String::new() } else { c.last_error };
