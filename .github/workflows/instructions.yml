@@ -320,6 +320,8 @@ jobs:
           count_side() {
             local side="$1" out="$2" cgdir="$3"
             shift 3
+            # `only` filters the `BINARY:shape,shape` entries of SHAPES by shape name, and
+            # hotrow's states by `states`' names in scripts/instructions-per-cell.sh.
             local only=" $* " g s hot
             local -a groups=() keep=() list=()
             for g in $SHAPES; do
@@ -443,9 +445,12 @@ jobs:
             else
               : > /tmp/base-retry.txt
             fi
-            # The retry's counts replace the first run's for the retried shapes.
+            # The retry's counts replace the first run's for the retried shapes only: a retried
+            # hotrow state reruns all three, and the other two keep their first counts
+            # (simp724's R1 on #2037).
             for side in base head; do
-              awk 'FILENAME == ARGV[1] { r[$1] = $2; next } { print $1, ($1 in r) ? r[$1] : $2 }' \
+              awk -v names=" $retry " 'FILENAME == ARGV[1] { if (index(names, " " $1 " ")) r[$1] = $2; next }
+                   { print $1, ($1 in r) ? r[$1] : $2 }' \
                 "/tmp/$side-retry.txt" "/tmp/$side-first.txt" > "/tmp/$side.txt"
             done
             pairs
