@@ -189,9 +189,9 @@ Every write touches shared rows. So each partition an index is placed on holds a
 
 **Unreachable and filling partitions (T3: strict by default):**
 - **Strict:** a part that fails fails the search, its message naming the partition. Round 1 needs every partition, so a search fails even when `id_prefix` lies in partitions that answered.
-- **A partition whose index is still filling** (PR 1a's background fill: `rebuild_pending`) answers either round with `Unavailable` ("still filling"), since its statistics and hits would be short. On a cluster no client rebuild runs yet, so a pending rebuild is the fill. When PR 2c serves `Text.Rebuild`, a client's rebuild leaves the index whole while it runs, and this check must tell the two apart.
-- **With `allow_partial`:** a part that fails with `PartitionUnavailable` or `Unavailable` is skipped.
-  - Missing from round 1, the search scores with the merge of the parts that answered and sets `partial`. That partition isn't asked for round 2, and its ranges that `id_prefix` meets go in `missing`.
+- **A partition whose index is still filling** (PR 1a's background fill: `rebuild_pending`) answers either round with `Unavailable` ("still filling"), since its statistics and hits would be short. On a cluster no client rebuild runs yet, so a pending rebuild is the fill. A client's `Text.Rebuild` sets `rebuild_pending` too, while its index stays whole, so with this check a strict search would fail during a healthy rebuild. PR 2c, which serves `Text.Rebuild` on a cluster, tells the two apart (the coordinator's call on audit120's nit), and can't land without it.
+- **With `allow_partial`:** a part that fails with `PartitionUnavailable` or `Unavailable` is skipped, and `partial` is set: the answer is short in its statistics, its hits or both (audit120's should on #2029: a client checking `partial` alone never takes a short answer as whole).
+  - Missing from round 1, the search scores with the merge of the parts that answered. That partition isn't asked for round 2, and its ranges that `id_prefix` meets go in `missing`.
   - Missing from round 2, its ranges that `id_prefix` meets go in `missing`.
   - If no partition answers round 1, the reply is empty, with `partial` and every reached range in `missing`.
   - `MissingRange.table` is the index's name, and its range is the partition's id range.

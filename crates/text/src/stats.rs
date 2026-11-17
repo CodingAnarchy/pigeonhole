@@ -318,14 +318,17 @@ impl QueryStats {
                 return Err(unparsed("a fuzzy term has no clause"));
             }
             // A part's expansions and a merge's are cut to `max_expansions`, which also
-            // bounds the check for one listed twice below (audit120 on #2025).
+            // bounds the check for one listed twice below (audit120 on #2025). Both counts
+            // come from the bytes, so nothing is reserved from them: the vector grows as
+            // expansions parse, and bytes that claim more than they hold end early
+            // (audit120's must on #2029).
             let count = r.len()?;
             if count > max_expansions {
                 return Err(unparsed(
                     "a fuzzy term has more expansions than max_expansions",
                 ));
             }
-            let mut expansions: Vec<Expansion> = Vec::with_capacity(count);
+            let mut expansions: Vec<Expansion> = Vec::new();
             for _ in 0..count {
                 let term = r.string()?;
                 let distance = r.u8()?;

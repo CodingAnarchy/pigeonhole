@@ -3785,14 +3785,13 @@ impl Service {
         let r = r
             .search
             .ok_or_else(|| ApiError::invalid("a text search's statistics carry no search"))?;
-        if r.k == 0 || r.k > MAX_NEAREST_K {
-            return Err(ApiError::invalid(format!("k is 1 to {MAX_NEAREST_K}")));
-        }
         let query = super::texts::query(&r)?;
         let index = self.text_index(&r.index).await?;
         self.blocking(move || {
             filled(&index, &r.index)?;
-            let stats = index.search(query, r.k as usize).query_stats()?;
+            // `k` doesn't change the statistics (nor do `id_prefix` or `highlight`), so
+            // the request's isn't checked here: the node called checked it once.
+            let stats = index.search(query, 1).query_stats()?;
             Ok(proto::TextStatsResponse {
                 stats: stats.to_bytes().into(),
             })
@@ -5204,8 +5203,6 @@ fn create_in(
     })
 }
 
-/// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
-/// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
 /// A text index's partition can answer a search's round only once it's filled: a cluster
 /// creates its indexes unfilled, and fills them from the source in the background (#1722
 /// PR 1a). Until then its statistics and hits would be short. `Unavailable`, which an
@@ -5231,6 +5228,8 @@ pub(crate) fn unreadable_stats(
     })
 }
 
+/// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
+/// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
 fn reserved(name: &str) -> Result<(), ApiError> {
     if name.starts_with(super::cluster::map::RESERVED_PREFIX) {
         return Err(ApiError::invalid(format!(

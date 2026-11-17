@@ -734,8 +734,8 @@ fn skewed_corpus() -> Vec<(String, String)> {
 /// inside one range and across both, a term only one partition holds, and a skewed corpus
 /// where each partition's own statistics would score differently. A fuzzy term cut at
 /// `max_expansions` is flagged. An index on one partition answers in one round. With a partition's node stopped, a search fails unless it
-/// has `allow_partial`, which scores with the partitions that answered and names what
-/// it missed.
+/// has `allow_partial`, which scores with the partitions that answered, names what it
+/// missed, and sets `partial` whenever anything is missing.
 #[test]
 fn a_text_search_across_partitions_scores_as_one_index() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -905,6 +905,32 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             assert!(close(g.score, w.score));
         }
 
+        // And one on p2 only, for a search that misses only its one round below.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "solo2".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: Vec::new(),
+                    partitions: vec!["p2".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        TextClient::new(channel(c).await)
+            .create_index(CreateTextIndexRequest {
+                source_table: "solo2".into(),
+                ..text_index("st2")
+            })
+            .await
+            .unwrap();
+        put_text(c, "st2", "x1", "alpha pad").await;
+
         // b (p2, from "m") stops. A search needs every partition's statistics, so even one
         // whose prefix is in p1 fails, unless it allows a partial answer.
         stops.remove(1).send(()).unwrap();
@@ -951,5 +977,25 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             ("p2", "ut", &b"m"[..], &b""[..])
         );
         assert!(got.hits.iter().all(|h| h.id.as_ref() < &b"m"[..]));
+        // Missing only round 2 (an index on one partition has no round 1): `partial` too,
+        // so a client reading it alone never takes a short answer as whole.
+        let solo2 = |allow_partial| crate::serve::proto::TextSearchRequest {
+            index: "st2".into(),
+            allow_partial,
+            ..search("alpha", "")
+        };
+        let e = api.search(solo2(false)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let got = api.search(solo2(true)).await.unwrap().into_inner();
+        assert!(got.hits.is_empty());
+        assert!(got.partial);
+        assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+        assert_eq!(
+            (
+                got.missing[0].partition.as_str(),
+                got.missing[0].table.as_str()
+            ),
+            ("p2", "st2")
+        );
     });
 }

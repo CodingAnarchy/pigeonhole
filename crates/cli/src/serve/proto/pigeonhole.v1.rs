@@ -4077,12 +4077,13 @@ pub struct Fuzzy {
 pub struct TextSearchResponse {
     #[prost(message, repeated, tag = "1")]
     pub hits: ::prost::alloc::vec::Vec<TextHit>,
-    /// With `allow_partial`: some partitions' statistics are missing, so the scores aren't
-    /// the ones the whole index would give.
+    /// With `allow_partial`: some partitions didn't answer, so the answer is short. Either
+    /// their statistics are missing, so the scores aren't the ones the whole index would
+    /// give, or their hits are (`missing`), or both.
     #[prost(bool, tag = "2")]
     pub partial: bool,
     /// With `allow_partial`: the id ranges whose partitions didn't answer, whose hits are
-    /// missing.
+    /// missing. `partial` is set whenever it isn't empty.
     #[prost(message, repeated, tag = "3")]
     pub missing: ::prost::alloc::vec::Vec<MissingRange>,
     /// The fuzzy clauses (indexes into the query's clauses) whose expansions were cut at

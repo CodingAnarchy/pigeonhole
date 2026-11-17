@@ -1606,8 +1606,20 @@ fn index_part_route(routes: &Routes, op: &ServiceOp, partition: &str) -> Result<
         ServiceOp::VectorSearch(r) => &r.index,
         ServiceOp::VectorVerify(r) => &r.index,
         ServiceOp::TextVerify(r) => &r.index,
-        ServiceOp::TextStats(r) => r.search.as_ref().map_or("", |s| s.index.as_str()),
-        ServiceOp::TextSearchPart(r) => r.search.as_ref().map_or("", |s| s.index.as_str()),
+        // A text search's rounds carry the client's search: one without it is malformed,
+        // not a part for another map (simp724's R1 on #2029).
+        ServiceOp::TextStats(super::proto::TextStatsRequest { search, .. })
+        | ServiceOp::TextSearchPart(super::proto::TextSearchPartRequest { search, .. }) => {
+            match search {
+                Some(s) => &s.index,
+                None => {
+                    return Err(ApiError::invalid(format!(
+                        "a forwarded {} carries no search",
+                        op.name()
+                    )));
+                }
+            }
+        }
         _ => {
             return Err(ApiError::invalid(format!(
                 "a forwarded {} doesn't name a partition",
@@ -1921,10 +1933,31 @@ mod tests {
         });
         let verify =
             ServiceOp::TextVerify(super::super::proto::TextIndexRequest { index: "uv".into() });
-        for op in [&search, &verify] {
+        // A text search's two rounds (#1722 PR 2b) name the index inside their search.
+        let text = || super::super::proto::TextSearchRequest {
+            index: "uv".into(),
+            ..Default::default()
+        };
+        let stats = ServiceOp::TextStats(super::super::proto::TextStatsRequest {
+            search: Some(text()),
+        });
+        let part = ServiceOp::TextSearchPart(super::super::proto::TextSearchPartRequest {
+            search: Some(text()),
+            stats: Default::default(),
+        });
+        for op in [&search, &verify, &stats, &part] {
             assert_eq!(index_part_route(&routes, op, "p2").unwrap(), "p2");
             let e = index_part_route(&routes, op, "p3").unwrap_err();
             assert_eq!(e.code, "WrongPartition", "{}", e.message);
+        }
+        // Without its search, a round is malformed, not a part for another map.
+        let bare = [
+            ServiceOp::TextStats(Default::default()),
+            ServiceOp::TextSearchPart(Default::default()),
+        ];
+        for op in &bare {
+            let e = index_part_route(&routes, op, "p2").unwrap_err();
+            assert_eq!(e.code, "InvalidArgument", "{}", e.message);
         }
         let lost = ServiceOp::VectorSearch(super::super::proto::VectorSearchRequest {
             index: "nope".into(),

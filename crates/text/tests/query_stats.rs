@@ -408,6 +408,13 @@ fn bytes_with_numbers_a_search_cannot_score_with_are_refused() {
     QueryStats::from_bytes(&b).unwrap();
     put(&mut b, 17, 1);
     refused(&b, "more expansions than max_expansions");
+    // Counts far past the bytes, within the bound: refused as truncated, never reserved
+    // (audit120's must on #2029). Reserving 2^58 expansions would overflow `isize`, so a
+    // preallocation panics here on every platform rather than only where it can't map.
+    let mut b = fuzzy.clone();
+    put(&mut b, 17, 1 << 60);
+    put(&mut b, 81, 1 << 58);
+    refused(&b, "a count the bytes can't hold");
     let mut b = fuzzy.clone();
     put(&mut b, 65, 0);
     b.drain(73..81);

@@ -15,10 +15,10 @@
 //!   the entry node keeps the first `k` by `(score desc, id asc)`, the library's order.
 //!   An index on one partition skips round 1: its own statistics are the whole index's.
 //!   Strict by default: a partition that can't answer either round fails the search. With
-//!   `allow_partial`, a partition that's unreachable or still filling is skipped: missing
-//!   from round 1, the search scores with the statistics of those that answered and sets
-//!   `partial`; missing from round 2 (or round 1, when `id_prefix` meets it), its ranges
-//!   are named in `missing`.
+//!   `allow_partial`, a partition that's unreachable or still filling is skipped, and
+//!   `partial` is set: missing from round 1, the search scores with the statistics of
+//!   those that answered; missing from round 2 (or round 1, when `id_prefix` meets it),
+//!   its ranges are named in `missing`.
 //! - **`Vectors.Verify` and `Text.Verify`** go to every partition and sum the counts. A
 //!   partition whose check fails fails the call, naming it.
 //!
@@ -41,7 +41,9 @@ use tokio::sync::OwnedSemaphorePermit;
 const VERIFY_SHARE: usize = 1024;
 
 /// What a text search's round 1 answer holds of the in-flight budget: its statistics, a
-/// count per term plus each fuzzy term's expansions (at most `max_expansions`).
+/// count per term plus each fuzzy term's expansions. An estimate: serve searches with the
+/// library's `max_expansions` (50, not a request field), so a fuzzy term's expansions are
+/// a few KiB, and the query's size bounds its terms.
 const STATS_SHARE: usize = 64 * 1024;
 
 /// `index`'s partitions holding ids that start with `prefix`, or `TableNotFound` for an
@@ -344,9 +346,11 @@ impl Router {
             },
         )
         .await?;
+        // Short in either way (audit120's should on #2029): a client checking `partial`
+        // alone never takes a short answer as whole.
         let reply = proto::TextSearchResponse {
             hits,
-            partial: !down.is_empty(),
+            partial: !down.is_empty() || !gone.is_empty(),
             missing: gone,
             cut_clauses: cut.into_iter().collect(),
         };
