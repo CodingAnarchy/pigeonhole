@@ -1977,9 +1977,12 @@ fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or
         metric_until(c, MEMBERS, |n| n == 1).await;
         let mut want = Vec::new();
         write_kib([a, b], "id-", 200, &mut want).await;
+        // The client reads nothing until the member has ended at its idle limit: reading
+        // sooner would keep it going.
+        metric_until(c, "pigeonhole_serve_feed_idle_drops_total", |n| n == 1).await;
         let mut seen = Vec::new();
         // A cluster member's idle end closes its stream (hub.rs `start`: only a failure
-        // sends an error).
+        // sends an error; #2021).
         while let Some(e) = tokio::time::timeout(Duration::from_secs(10), s.message())
             .await
             .expect("the stream ends at its idle limit")
@@ -1987,11 +1990,6 @@ fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or
         {
             seen.extend(seen_of(&e));
         }
-        assert_eq!(
-            metric(c, "pigeonhole_serve_feed_idle_drops_total").await,
-            1,
-            "it ended at its idle limit"
-        );
         assert!(
             !seen.is_empty() && seen.len() < want.len(),
             "{} of {} before the end",
