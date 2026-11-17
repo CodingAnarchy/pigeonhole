@@ -1,0 +1,2 @@
+### Fixed
+- **A `phdb cluster` command's wait no longer gives up on "the node didn't answer" just before its `--timeout`** (#2015). A `move`, `relocate` or `restore` waits for nodes to take a map, hash closed files or serve a partition, polling every 200 ms. A poll late in the wait could leave the node only a few milliseconds to answer. With less than two polls left, the wait now sleeps to the limit, and when it gives up it reports what the node last said.
