@@ -582,6 +582,103 @@ fn clients_falling_off_together_past_the_catch_up_cap_each_deliver_everything() 
     );
 }
 
+/// `behind` clients fall off the ring and are kept off it, while `live` others are drained,
+/// with writes going on: every round, each one behind delivers a commit within 2 s (simp724
+/// on #2012, after g134's 37 s with no rejoin). Once writes stop, every client delivers every
+/// commit once, in order, and each one behind rejoins the ring. No client waits for a
+/// catch-up slot.
+fn catch_up_keeps_moving_while_writes_go_on(behind: usize, live: usize) {
+    let mut l = limits();
+    l.feed_ring_bytes = 2048; // a few entries
+    l.feed_client_bytes = 512;
+    l.max_catch_up = 8;
+    l.stream_idle = Duration::from_secs(600);
+    let s = Server::start("", l);
+    let mut clients: Vec<_> = (0..behind + live)
+        .map(|_| direct_feed(&s, subscribe(&["t"], b"")))
+        .collect();
+    let mut got = vec![Vec::new(); clients.len()];
+    let mut written = Vec::new();
+    let take_live = |clients: &mut [super::feed::FeedEvents], got: &mut [Vec<u64>]| {
+        for (i, c) in clients.iter_mut().enumerate().skip(behind) {
+            got[i].extend(
+                drain(&s, c, Duration::from_millis(20))
+                    .into_iter()
+                    .map(|(n, _, _)| n),
+            );
+        }
+    };
+    // The first `behind` take nothing while 80 commits overrun the ring.
+    for chunk in 0..8 {
+        for i in 0..10 {
+            written.push(write_row(&s, format!("r{chunk}-{i}").as_bytes()));
+        }
+        take_live(&mut clients, &mut got);
+    }
+    let feeds = &s.shared.router.service.part().unwrap().feeds;
+    // Then each round writes 10 and takes at most 4 from each one behind, so none of them
+    // catches up while writes go on: each must still move.
+    for round in 0..30 {
+        for i in 0..10 {
+            written.push(write_row(&s, format!("w{round}-{i}").as_bytes()));
+        }
+        for (i, c) in clients.iter_mut().enumerate().take(behind) {
+            let before = got[i].len();
+            while got[i].len() < before + 4
+                && let Some(e) = next_event(&s, c, Duration::from_secs(2))
+            {
+                got[i].extend(commit_of(&e.unwrap()).map(|(n, _)| n));
+            }
+            assert!(
+                got[i].len() > before,
+                "client {i} delivered nothing for 2 s in round {round} (catching_up {})",
+                feeds.gauges().catching_up
+            );
+        }
+        take_live(&mut clients, &mut got);
+    }
+    assert!(
+        feeds.gauges().catching_up >= behind,
+        "the clients behind read their own streams to the end of the writes"
+    );
+    // Writes stop: take from every client in turn until each has every commit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while got.iter().any(|g| g.len() < written.len()) && std::time::Instant::now() < deadline {
+        for (i, c) in clients.iter_mut().enumerate() {
+            got[i].extend(
+                drain(&s, c, Duration::from_millis(50))
+                    .into_iter()
+                    .map(|(n, _, _)| n),
+            );
+        }
+    }
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(g, &written, "client {i}: every commit, once, in order");
+    }
+    wait_for("every client behind rejoins the ring", || {
+        feeds.gauges().catching_up == 0
+    });
+    let stats = &feeds.stats;
+    assert!(stats.fell_behind.load(Ordering::Relaxed) >= behind as u64);
+    assert!(stats.rejoined.load(Ordering::Relaxed) >= behind as u64);
+    assert_eq!(
+        stats.catch_up_waits.load(Ordering::Relaxed),
+        0,
+        "no client waited for a slot"
+    );
+}
+
+#[test]
+fn clients_kept_behind_while_writes_go_on_keep_moving_and_rejoin() {
+    catch_up_keeps_moving_while_writes_go_on(4, 2);
+}
+
+#[test]
+fn a_lone_client_kept_behind_among_live_ones_keeps_moving_and_rejoins() {
+    // simp724: the path with no other catch-up traffic around it.
+    catch_up_keeps_moving_while_writes_go_on(1, 3);
+}
+
 #[test]
 fn catch_up_streams_past_the_cap_wait_their_turn() {
     // perf287's (2) on ticket 5: at most --max-catch-up clients read their own feed at once;
