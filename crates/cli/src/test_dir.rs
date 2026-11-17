@@ -39,6 +39,8 @@ thread_local! {
 
 /// A new, empty directory under the system temp dir, named `prefix` and a random suffix.
 /// It's removed when the calling thread ends, which for a test is when the test ends.
+/// So call it from the test's own thread: one made on a spawned thread goes when that
+/// thread ends, while the test may still use it (audit120's N4 on #2038).
 pub(crate) fn fresh(prefix: &str) -> PathBuf {
     let dir = tempfile::Builder::new()
         .prefix(prefix)
