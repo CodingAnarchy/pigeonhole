@@ -65,7 +65,7 @@ serve = [
 
 [dependencies]
 # The public crates only: phdb uses no engine internals (#692).
-pigeonhole = { workspace = true }
+pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 # `phdb mcp --memory` (D311 T7).
 pigeonhole-memory = { workspace = true }
 # `--embed-local` (#1345 PR 2).

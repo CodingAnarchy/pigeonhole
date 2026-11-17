@@ -326,7 +326,7 @@ pub(crate) fn served_options(cli: &Cli, args: &ServeArgs) -> Options {
     if let Some(bytes) = args.change_feed {
         options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
     }
-    options
+    options.punch_freed(args.punch_freed)
 }
 
 /// A single node's options: [`served_options`], with `--create`, the shard count and the
@@ -783,6 +783,16 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
                 "phdb serve: stopped; closing the database{}",
                 if n > 1 { "s" } else { "" }
             );
+            // Box-only (g152): the punch counters, one line per database.
+            for db in &dbs {
+                let line: Vec<String> = db
+                    .internal_metrics()
+                    .into_iter()
+                    .filter(|(n, _)| n.starts_with("file_punch"))
+                    .map(|(n, v)| format!("{n}={v}"))
+                    .collect();
+                let _ = writeln!(stderr, "phdb serve: punch {}", line.join(" "));
+            }
             // Every one is closed, and the first failure reported (per partition, cli692's
             // Q1 on 8a).
             dbs.into_iter()
