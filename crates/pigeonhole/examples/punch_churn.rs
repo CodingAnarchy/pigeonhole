@@ -3,7 +3,8 @@
 //!
 //! Phases: `load` (rows of incompressible values), `delete` (the first `--delete-pct`% of the
 //! rows by key, then a full `compact()`), `steady` (paced Buffered puts, half overwrites, and gets:
-//! row 1 measures the sync tail, this one punching's cost to the engine itself), with an idle wait (no flush or compaction for 5 s, at most 600 s) after load and delete.
+//! row 1 measures the sync tail, this one punching's cost to the engine itself), with an idle wait (no flush or compaction, and
+//! the file's allocated blocks unchanged, for 5 s; at most 600 s) after load and delete.
 //!
 //! Every second it prints one line:
 //! `S <epoch_ms> phase=<load|load-idle|delete|delete-idle|steady|done> apparent=<bytes>
@@ -86,13 +87,16 @@ fn fill(buf: &mut [u8], mut s: u64) {
     }
 }
 
-fn wait_idle(db: &Pigeonhole) {
+/// Until no flush or compaction ran and the file's allocated blocks held still (punching
+/// done) for 5 s, at most 600 s.
+fn wait_idle(db: &Pigeonhole, path: &Path) {
     let start = Instant::now();
-    let mut last = (u64::MAX, u64::MAX);
+    let mut last = (u64::MAX, u64::MAX, u64::MAX);
     let mut since = Instant::now();
     while start.elapsed() < Duration::from_secs(600) {
         let m = db.engine_metrics();
-        let now = (m.flushes, m.compactions);
+        let allocated = std::fs::metadata(path).map_or(0, |md| md.blocks());
+        let now = (m.flushes, m.compactions, allocated);
         if now != last {
             last = now;
             since = Instant::now();
@@ -130,7 +134,7 @@ fn main() -> pigeonhole::Result<()> {
     let stop = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| sampler(&db, &path, &phase, &stop));
-        let r = run(&a, &db, &t, &phase);
+        let r = run(&a, &db, &path, &t, &phase);
         *phase.lock().unwrap() = "done";
         std::thread::sleep(Duration::from_millis(1100));
         stop.store(true, Ordering::Relaxed);
@@ -150,12 +154,16 @@ fn sampler(db: &Pigeonhole, path: &Path, phase: &Mutex<&'static str>, stop: &Ato
             now_ms(),
             *phase.lock().unwrap()
         );
-        for (n, v) in db.internal_metrics() {
-            if n.starts_with("file_punch") {
-                line.push_str(&format!(" {n}={v}"));
-            }
-        }
         let m = db.engine_metrics();
+        line.push_str(&format!(
+            " file_punches={} file_punch_nanos={} file_punch_bytes={} file_punched_bytes={} file_punch_passes={} file_punch_refusals={}",
+            m.file_punches,
+            m.file_punch_nanos,
+            m.file_punch_bytes,
+            m.file_punched_bytes,
+            m.file_punch_passes,
+            m.file_punch_refusals
+        ));
         line.push_str(&format!(" flushes={} compactions={}", m.flushes, m.compactions));
         println!("{line}");
         next += Duration::from_secs(1);
@@ -166,6 +174,7 @@ fn sampler(db: &Pigeonhole, path: &Path, phase: &Mutex<&'static str>, stop: &Ato
 fn run(
     a: &Args,
     db: &Pigeonhole,
+    path: &Path,
     t: &pigeonhole::Table,
     phase: &Mutex<&'static str>,
 ) -> pigeonhole::Result<()> {
@@ -192,7 +201,7 @@ fn run(
     end("load", t0);
     set("load-idle");
     t0 = Instant::now();
-    wait_idle(db);
+    wait_idle(db, path);
     end("load-idle", t0);
 
     // Delete the first delete_pct% by key, then compact everything.
@@ -210,7 +219,7 @@ fn run(
     end("delete", t0);
     set("delete-idle");
     t0 = Instant::now();
-    wait_idle(db);
+    wait_idle(db, path);
     end("delete-idle", t0);
 
     // Steady: open loop at `rate` ops/s, alternating put and get over the live rows;

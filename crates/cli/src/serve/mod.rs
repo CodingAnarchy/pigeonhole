@@ -785,13 +785,17 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
             );
             // Box-only (g152): the punch counters, one line per database.
             for db in &dbs {
-                let line: Vec<String> = db
-                    .internal_metrics()
-                    .into_iter()
-                    .filter(|(n, _)| n.starts_with("file_punch"))
-                    .map(|(n, v)| format!("{n}={v}"))
-                    .collect();
-                let _ = writeln!(stderr, "phdb serve: punch {}", line.join(" "));
+                let m = db.engine_metrics();
+                let _ = writeln!(
+                    stderr,
+                    "phdb serve: punch file_punches={} file_punch_nanos={} file_punch_bytes={} file_punched_bytes={} file_punch_passes={} file_punch_refusals={}",
+                    m.file_punches,
+                    m.file_punch_nanos,
+                    m.file_punch_bytes,
+                    m.file_punched_bytes,
+                    m.file_punch_passes,
+                    m.file_punch_refusals
+                );
             }
             // Every one is closed, and the first failure reported (per partition, cli692's
             // Q1 on 8a).
