@@ -526,7 +526,7 @@ impl ShardState {
         wait: OverlapWait,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        let MemberKind::Prepare { coordinator } = m.kind else {
+        let MemberKind::Prepare { coordinator, .. } = m.kind else {
             return;
         };
         let rows = Self::member_row_hashes(&m);
@@ -1032,7 +1032,7 @@ impl ShardState {
         error: PrepareError,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        let MemberKind::Prepare { coordinator } = m.kind else {
+        let MemberKind::Prepare { coordinator, .. } = m.kind else {
             return;
         };
         if let Some(share) = self.prepared.remove(&m.seqno) {
@@ -1125,6 +1125,7 @@ impl ShardState {
                 };
                 let retried = req.retry.map(|r| *r).unwrap_or_default();
                 let creq = CoordinateReq {
+                    external: None,
                     parts,
                     durability: req.durability,
                     reply,
@@ -1600,8 +1601,18 @@ impl ShardState {
         {
             busy = true;
         }
-        if !busy && self.shares_touch_moving() {
-            busy = true;
+        if !busy {
+            match self.shares_touch_moving() {
+                // D329: an external share in doubt waits for its caller's decision, which
+                // may never come soon: the change is given up (`Busy`) rather than held
+                // behind it, and the balancer tries again later.
+                Some(true) => {
+                    self.abort_op(Error::Busy, ctx);
+                    return;
+                }
+                Some(false) => busy = true,
+                None => {}
+            }
         }
         trace!(
             "shard {} tablet change waits: busy={busy} refreeze={refreeze} deferred={} flush_running={}",
@@ -1634,15 +1645,24 @@ impl ShardState {
         self.freeze(false)
     }
 
-    /// Whether a prepared, undecided share writes or reads a tablet being changed.
-    fn shares_touch_moving(&self) -> bool {
-        self.prepared.values().any(|share| {
-            share.bytes.batch().iter().flatten().any(|mu| {
+    /// Whether a prepared, undecided share writes or reads a tablet being changed: `None`
+    /// if none does, `Some(true)` if one is an external share (D329), else `Some(false)`.
+    fn shares_touch_moving(&self) -> Option<bool> {
+        let mut touch = None;
+        for share in self.prepared.values() {
+            let touches = share.bytes.batch().iter().flatten().any(|mu| {
                 self.tablets
                     .route(mu.table, mu.row)
                     .is_some_and(|(t, _)| self.moving.contains(&t))
-            })
-        })
+            });
+            if touches {
+                if share.external.is_some() {
+                    return Some(true);
+                }
+                touch = Some(false);
+            }
+        }
+        touch
     }
 
     fn commit_op(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {

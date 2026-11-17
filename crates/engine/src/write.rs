@@ -1375,6 +1375,45 @@ impl Txn {
             )?
             .wait()
     }
+
+    /// Validates and prepares the transaction as `xid` of an external coordinator (D329,
+    /// ICR 0140): its shares are logged (`durability`, GroupSync at least for the caller's
+    /// atomicity) and hold their rows, and its decision waits for
+    /// [`Engine::decide`](crate::Engine::decide), across a close and a reopen. The answer's
+    /// seqno is the commit's id. `Conflict` as a commit would be; `InvalidArgument` for a
+    /// transaction with no writes (a read-only prepare is a later part of ICR 0140), a value
+    /// over the inline limit, or an `xid` already in doubt here.
+    pub fn prepare(self, xid: &[u8], durability: Durability) -> crate::Result<CommitInfo> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+        } = self;
+        engine.shared.refuse_blocking_on_driver("Txn::prepare")?;
+        engine.prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
+    }
+
+    /// [`prepare`](Self::prepare) without waiting (D329): the [`PendingCommit`] resolves as
+    /// `prepare` returns. It never blocks, so a thread that drives a shard may call it (D88).
+    /// A refused prepare's reservation of `xid` goes once its coordination's last handle
+    /// does, shortly after the answer: a prepare of the same xid straight after may meet
+    /// `InvalidArgument` until then (the blocking form releases it with the answer).
+    pub fn submit_prepare(
+        self,
+        xid: &[u8],
+        durability: Durability,
+    ) -> crate::Result<PendingCommit> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+        } = self;
+        engine
+            .submit_prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
+            .map(|(sub, _)| PendingCommit::from(sub))
+    }
 }
 
 // ---- caller-runs (#1176) -----------------------------------------------------------------

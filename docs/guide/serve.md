@@ -369,7 +369,8 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
     | feed lag p99 | 49–52 s | 0.2–0.36 s |
     | streams that fell behind | 0 | 0 |
 
-    With the raised counts, writes no longer get the rate they ask for. The 8–9 s is a client queue that kept growing. The default keeps writes first. #2014 brings the same batching to cluster subscriptions.
+    With the raised counts, writes no longer get the rate they ask for. The 8–9 s is a client queue that kept growing. The default keeps writes first.
+  - **A cluster subscription's members also hand off each of their hub's ring passes as one batch (#2014).** It cut CPU per put by 16% and network cycles per delivered event by 12% on the same AX102 load, served as a one-node cluster with default counts. It costs a slightly higher put service tail: its p99 was 499–655 µs against 384–608 µs before, a median 16% higher, and its p99.9 a median 14% higher. Each wake writes a larger batch on the network threads that the puts share.
   - Before #1734, the masked server did the opposite: it held writes to about 33K of the 55K puts/s and delivered every event, or switched between the two. The network threads now also run on the shards' SMT siblings (Placement, below), so the writes no longer queue behind delivery for a CPU.
 
   Each stream's framing still runs on its connection's network thread.
@@ -807,7 +808,7 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
   - Going on alone takes a `--max-catch-up` slot, as a single node's catch-up stream does.
   - With no slot free, it waits, delivering nothing, until one is free or the client goes away. `--stream-idle-ms` doesn't end the wait: it counts only events the client left untaken.
   - If its shared merge ends meanwhile, it gives the slot back and goes on alone, joining the request's next shared merge once one runs.
-- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node. Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens: the limit counts how long an event waits untaken, so it ends a client that stopped reading, never one that's waiting for a commit. On a feed with no commits, a client that stopped reading is first left an event by the next quiet progress event (about 10 s), then ended `--stream-idle-ms` after that, as on a single node.
+- **Stalled subscribers:** a subscriber that stops reading ends after `--stream-idle-ms`, as on a single node: it gets the events queued for it, then `DeadlineExceeded`, and resumes from the last event's token (#2021). Its `--max-streams` places, its partitions' streams and its connections between nodes are freed then, and it's counted in `pigeonhole_serve_feed_idle_drops_total`. Until then it holds only its own connections between nodes, never one that forwarded calls or other streams use. A subscriber that keeps reading keeps its subscription however long nothing happens: the limit counts how long an event waits untaken, so it ends a client that stopped reading, never one that's waiting for a commit. On a feed with no commits, a client that stopped reading is first left an event by the next quiet progress event (about 10 s), then ended `--stream-idle-ms` after that, as on a single node.
 
 #### Expiry and what isn't supported
 - **Expired tokens:**
