@@ -53,6 +53,9 @@ pub(super) struct Reach {
     /// A multi-get's: the request's deadline from its arrival, which every forward and map
     /// pull of it shares (simp724's N1 on #1698, as #1686's forwards do).
     deadline: Option<tokio::time::Instant>,
+    /// A read sent with the client's staleness bound (D328 PR 2b): each part goes to its
+    /// partition's replicas first.
+    replica: Option<crate::serve::router::ReplicaRoute>,
 }
 
 impl Reach {
@@ -75,6 +78,7 @@ impl Reach {
             forwarder: Arc::clone(&cluster.forwarder),
             timeout: router.service.request_timeout(),
             deadline: None,
+            replica: None,
         }
     }
 
@@ -114,6 +118,15 @@ impl Reach {
         caller: &Caller,
         op: forward_request::Op,
     ) -> Result<(ServiceReply, bool), ApiError> {
+        if let Some(route) = &self.replica
+            && matches!(
+                op,
+                forward_request::Op::MultiGet(_) | forward_request::Op::Nearest(_)
+            )
+            && let Some(reply) = self.try_replicas(route, partition, caller, &op).await?
+        {
+            return Ok(reply);
+        }
         let mut pulled = false;
         loop {
             let routes = self.routes()?;
@@ -156,6 +169,69 @@ impl Reach {
                 }
             }
         }
+    }
+
+    /// A part from one of `partition`'s replicas fresh within the client's bound (D328 PR
+    /// 2b), in the map's order, skipping one backed off: `None` if none served it, and the
+    /// owner then does. A replica that's behind or unreachable is backed off.
+    async fn try_replicas(
+        &self,
+        route: &crate::serve::router::ReplicaRoute,
+        partition: &str,
+        caller: &Caller,
+        op: &forward_request::Op,
+    ) -> Result<Option<(ServiceReply, bool)>, ApiError> {
+        let routes = self.routes()?;
+        let me = self.node.id().to_owned();
+        for (node, address) in route.candidates(&routes, partition, &[]) {
+            let tried = if node == me {
+                let copy = route.copies.load().get(partition).cloned();
+                match copy {
+                    Some(copy) => {
+                        let read = async {
+                            copy.follower.within(route.read.max_lag_ms)?;
+                            let reply = copy
+                                .service
+                                .fanout_part(forward::op_of(Some(op.clone()))?, caller)
+                                .await?;
+                            copy.follower.within(route.read.max_lag_ms)?;
+                            Ok::<_, ApiError>((reply, false))
+                        };
+                        read.await
+                    }
+                    None => Err(ApiError::partition_unavailable(format!(
+                        "this node holds no replica copy of partition {partition}"
+                    ))),
+                }
+            } else {
+                let req = ForwardRequest {
+                    fanout_part: true,
+                    to_replica: true,
+                    replica_max_lag_ms: route.read.max_lag_ms,
+                    min_primary_seqno: 0,
+                    // As the owner's part above: only an index's part names its partition.
+                    partition: if forward::names_partition(op) {
+                        partition.to_owned()
+                    } else {
+                        String::new()
+                    },
+                    map_version: routes.map_version(),
+                    caller: Some(forward::forwarded_caller(caller)?),
+                    op: Some(op.clone()),
+                };
+                let attempt = crate::serve::router::replica_attempt(self.within()?);
+                match self.forwarder.send(&address, req, attempt, false).await {
+                    Ok(reply) => forward::reply_of(reply).map(|r| (r, true)),
+                    Err(e) => Err(e),
+                }
+            };
+            match tried {
+                Ok(reply) => return Ok(Some(reply)),
+                Err(e) if crate::serve::router::falls_back(&e) => route.back_off(&node, partition),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
     }
 
     /// Pulls the map from the node that said it has a newer one (a `WrongPartition`).
@@ -329,6 +405,7 @@ impl Router {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
         deadline: tokio::time::Instant,
+        read: Option<crate::serve::router::ReplicaRead>,
     ) -> Result<ServiceReply, ApiError> {
         // The caller's scope and the request's size, as for any call. Its bytes go before
         // the read, as a single node's multi-get gives them back (cli692 on #1715's plan).
@@ -347,6 +424,7 @@ impl Router {
         }
         let reach = Reach {
             deadline: Some(deadline),
+            replica: read.map(|read| crate::serve::router::ReplicaRoute::of(cluster, read)),
             ..Reach::of(self, cluster)
         };
         // The request's holding (#1715): its whole budget, taken before any read, so the
@@ -528,12 +606,16 @@ impl Router {
     /// `Data.Scan` on a cluster node (D317 ticket 4a): a stream of the partitions' pages in
     /// key order, holding one `--max-scans` slot for its life, and counted as one
     /// `Data.Scan` when it ends.
+    ///
+    /// `read`: the client's staleness bound (D328 PR 2b), so each partition's pages come
+    /// from its replicas first. Not for a scan at a snapshot, which is its owner's.
     pub(crate) async fn fan_scan(
         &self,
         cluster: &Cluster,
         op: ServiceOp,
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
+        read: Option<crate::serve::router::ReplicaRead>,
     ) -> Result<ServiceReply, ApiError> {
         let request = self.service.admit(&op.admit(), caller, prepaid).await?;
         let ServiceOp::Scan(r) = op else {
@@ -589,6 +671,9 @@ impl Router {
             parts,
             limits: *self.service.limits(),
             inflight: Arc::clone(self.service.inflight()),
+            replica: read
+                .filter(|_| only.is_none())
+                .map(|read| crate::serve::router::ReplicaRoute::of(cluster, read)),
         };
         let metrics = Arc::clone(&self.service.metrics);
         Ok(ServiceReply::Scan(ScanPages::spawn(
@@ -601,15 +686,35 @@ impl Router {
     /// A partition's part of a scan another node fans out (D317 ticket 4a): served only if
     /// this node's map gives it `partition` and it has it open, as
     /// [`serve_forwarded`](Self::serve_forwarded) checks a key.
+    ///
+    /// `max_lag_ms`: the entry node chose this node's replica copy of the partition (D328
+    /// PR 2b), so the pages are the copy's, each within the client's bound.
     pub(crate) async fn serve_forwarded_scan(
         &self,
         partition: &str,
         r: ScanRequest,
         caller: &Caller,
+        max_lag_ms: Option<u64>,
     ) -> Result<ScanPages, ApiError> {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
+        if let Some(max_lag_ms) = max_lag_ms {
+            if crate::serve::router::snapshot_of(r.selection.as_ref()).is_some() {
+                return Err(ApiError::invalid("a scan at a snapshot is its owner's"));
+            }
+            let copy = cluster
+                .replicas
+                .load()
+                .get(partition)
+                .cloned()
+                .ok_or_else(|| {
+                    ApiError::partition_unavailable(format!(
+                        "this node holds no replica copy of partition {partition}"
+                    ))
+                })?;
+            return copy.service.replica_scan(r, caller, max_lag_ms).await;
+        }
         let service = {
             let routes = cluster.node.routes();
             let Some(routes) = routes.as_ref() else {
@@ -830,6 +935,7 @@ impl Router {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
         deadline: tokio::time::Instant,
+        read: Option<crate::serve::router::ReplicaRead>,
     ) -> Result<ServiceReply, ApiError> {
         use proto::nearest_request::Source;
         let request = self.service.admit(&op.admit(), caller, prepaid).await?;
@@ -852,6 +958,7 @@ impl Router {
         }
         let reach = Reach {
             deadline: Some(deadline),
+            replica: read.map(|read| crate::serve::router::ReplicaRoute::of(cluster, read)),
             ..Reach::of(self, cluster)
         };
         let routes = reach.routes()?;
@@ -1034,6 +1141,7 @@ impl Router {
         caller: &Caller,
         prepaid: Option<OwnedSemaphorePermit>,
         deadline: tokio::time::Instant,
+        read: Option<crate::serve::router::ReplicaRead>,
     ) -> Result<ServiceReply, ApiError> {
         let request = self.service.admit(&op.admit(), caller, prepaid).await?;
         drop(request);
@@ -1055,6 +1163,7 @@ impl Router {
         }
         let reach = Reach {
             deadline: Some(deadline),
+            replica: read.map(|read| crate::serve::router::ReplicaRoute::of(cluster, read)),
             ..Reach::of(self, cluster)
         };
         let by_hop = if r.hop_limit == 0 {
@@ -1338,9 +1447,71 @@ struct ScanJob {
     parts: Vec<PartRange>,
     limits: Limits,
     inflight: Arc<Semaphore>,
+    /// A scan sent with the client's staleness bound (D328 PR 2b): each partition's pages
+    /// come from its replicas first.
+    replica: Option<crate::serve::router::ReplicaRoute>,
 }
 
 impl ScanJob {
+    /// One partition's pages from one of its replicas not yet `tried` (and not backed off),
+    /// with the replica's node, else from its owner (`None`). A replica that refuses the
+    /// opening as one that's behind or unreachable is backed off and the next one tried
+    /// (D328 PR 2b).
+    async fn open_for(
+        &self,
+        partition: &str,
+        r: ScanRequest,
+        tried: &mut Vec<String>,
+    ) -> Result<(PartPages, Option<String>), ApiError> {
+        if let Some(route) = &self.replica {
+            let routes = self.reach.routes()?;
+            let me = self.reach.node.id().to_owned();
+            for (node, address) in route.candidates(&routes, partition, tried) {
+                tried.push(node.clone());
+                let opened = if node == me {
+                    let copy = route.copies.load().get(partition).cloned();
+                    match copy {
+                        Some(copy) => copy
+                            .service
+                            .replica_scan(r.clone(), &self.caller, route.read.max_lag_ms)
+                            .await
+                            .map(PartPages::Here),
+                        None => Err(ApiError::partition_unavailable(format!(
+                            "this node holds no replica copy of partition {partition}"
+                        ))),
+                    }
+                } else {
+                    let req = ForwardScanRequest {
+                        map_version: routes.map_version(),
+                        caller: Some(forward::forwarded_caller(&self.caller)?),
+                        partition: partition.to_owned(),
+                        scan: Some(r.clone()),
+                        to_replica: true,
+                        replica_max_lag_ms: route.read.max_lag_ms,
+                        min_primary_seqno: 0,
+                    };
+                    self.reach
+                        .forwarder
+                        .scan(
+                            &address,
+                            req,
+                            crate::serve::router::replica_attempt(self.reach.timeout),
+                        )
+                        .await
+                        .map(|(s, lease)| PartPages::There(Box::new(s), address, lease))
+                };
+                match opened {
+                    Ok(pages) => return Ok((pages, Some(node))),
+                    Err(e) if crate::serve::router::falls_back(&e) => {
+                        route.back_off(&node, partition);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok((self.open(partition, r).await?, None))
+    }
+
     /// One partition's pages, here or on its node (once more after a `WrongPartition`,
     /// with the newer map).
     async fn open(&self, partition: &str, r: ScanRequest) -> Result<PartPages, ApiError> {
@@ -1379,6 +1550,9 @@ impl ScanJob {
                         caller: Some(forward::forwarded_caller(&self.caller)?),
                         partition: partition.to_owned(),
                         scan: Some(r.clone()),
+                        to_replica: false,
+                        replica_max_lag_ms: 0,
+                        min_primary_seqno: 0,
                     };
                     match self
                         .reach
@@ -1445,79 +1619,109 @@ impl ScanJob {
                 .as_deref()
                 .and_then(|b| pigeonhole::ScanPosition::from_bytes(b).ok())
                 .map(|p| p.row().to_vec());
-            let sub = ScanRequest {
-                after: inner.unwrap_or_default().into(),
-                limit: remaining.unwrap_or(0),
-                allow_partial: false,
-                ..self.r.clone()
-            };
-            let mut stream = match self.open(&part.partition, sub).await {
-                Ok(s) => s,
-                Err(e) if allow_partial && skippable(&e) => {
-                    missed.push(missing(&table, part));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
+            // Where the partition's pages go on from: its position, then each page's `next`.
+            // A replica that falls behind partway is left, and the partition's pages continue
+            // from here on the next replica or the owner (D328's S2).
+            let mut resume = inner;
+            let mut tried: Vec<String> = Vec::new();
+            // The newest seqno a page of this partition was sent at: a source that would go
+            // back to an older state is left too (simp724's S1 on #2001). The owner is never
+            // behind a copy, so this ends there.
+            let mut served_at = 0u64;
             let more = i + 1 < self.parts.len();
             let mut from_here = false;
             let mut ended_at: Option<bool> = None;
-            while let Some(page) = stream.next().await {
-                let (page, paid) = match page {
-                    Ok(page) => page,
-                    // Unreachable before any of its pages: skipped. Partway, the stream ends
-                    // with the error, and the last page's `next` resumes it.
-                    Err(e) if allow_partial && skippable(&e) && !from_here => {
-                        missed.push(missing(&table, part));
-                        break;
+            'part: loop {
+                let sub = ScanRequest {
+                    after: resume.clone().unwrap_or_default().into(),
+                    limit: remaining.unwrap_or(0),
+                    allow_partial: false,
+                    ..self.r.clone()
+                };
+                let (mut stream, source) =
+                    match self.open_for(&part.partition, sub, &mut tried).await {
+                        Ok(s) => s,
+                        Err(e) if allow_partial && skippable(&e) && !from_here => {
+                            missed.push(missing(&table, part));
+                            break 'part;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                while let Some(page) = stream.next().await {
+                    let (page, paid) = match page {
+                        Ok(page) => page,
+                        Err(e) if source.is_some() && crate::serve::router::falls_back(&e) => {
+                            if let (Some(route), Some(node)) = (&self.replica, &source) {
+                                route.back_off(node, &part.partition);
+                            }
+                            continue 'part;
+                        }
+                        // Unreachable before any of its pages: skipped. Partway, the stream ends
+                        // with the error, and the last page's `next` resumes it.
+                        Err(e) if allow_partial && skippable(&e) && !from_here => {
+                            missed.push(missing(&table, part));
+                            break 'part;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if let (Some(route), Some(node)) = (&self.replica, &source)
+                        && page.served_seqno < served_at
+                    {
+                        route.back_off(node, &part.partition);
+                        continue 'part;
                     }
-                    Err(e) => return Err(e),
-                };
-                from_here = true;
-                #[cfg(test)]
-                if self.limits.hold_after_part_page {
-                    hold_after_part_page(&self.inflight).await;
+                    served_at = served_at.max(page.served_seqno);
+                    from_here = true;
+                    #[cfg(test)]
+                    if self.limits.hold_after_part_page {
+                        hold_after_part_page(&self.inflight).await;
+                    }
+                    let continued = continues(last_row.as_deref(), &page.rows);
+                    if let Some(n) = remaining.as_mut() {
+                        let new_rows = page.rows.len() as u64 - u64::from(continued);
+                        *n = n.saturating_sub(new_rows);
+                    }
+                    if let Some(last) = page.rows.last() {
+                        last_row = Some(last.key.to_vec());
+                    }
+                    let done_here = page.next.is_empty();
+                    if !done_here {
+                        resume = Some(page.next.to_vec());
+                    }
+                    let next = if !done_here {
+                        Some(Position {
+                            partition: part.partition.clone(),
+                            inner: Some(page.next.to_vec()),
+                        })
+                    } else if more && remaining != Some(0) {
+                        self.parts.get(i + 1).map(|p| Position {
+                            partition: p.partition.clone(),
+                            inner: None,
+                        })
+                    } else {
+                        None
+                    };
+                    // A partition's last page with nothing in it, when another partition
+                    // follows, says nothing the page before didn't: it isn't sent.
+                    let silent = page.rows.is_empty() && done_here && next.is_some();
+                    if !silent || !missed.is_empty() {
+                        send!(
+                            ScanPage {
+                                rows: page.rows,
+                                next: next
+                                    .map(|p| p.to_bytes(Kind::Scan))
+                                    .unwrap_or_default()
+                                    .into(),
+                                bytes: page.bytes,
+                                missing: std::mem::take(&mut missed),
+                                served_seqno: page.served_seqno,
+                            },
+                            paid
+                        );
+                    }
+                    ended_at = Some(done_here);
                 }
-                let continued = continues(last_row.as_deref(), &page.rows);
-                if let Some(n) = remaining.as_mut() {
-                    let new_rows = page.rows.len() as u64 - u64::from(continued);
-                    *n = n.saturating_sub(new_rows);
-                }
-                if let Some(last) = page.rows.last() {
-                    last_row = Some(last.key.to_vec());
-                }
-                let done_here = page.next.is_empty();
-                let next = if !done_here {
-                    Some(Position {
-                        partition: part.partition.clone(),
-                        inner: Some(page.next.to_vec()),
-                    })
-                } else if more && remaining != Some(0) {
-                    self.parts.get(i + 1).map(|p| Position {
-                        partition: p.partition.clone(),
-                        inner: None,
-                    })
-                } else {
-                    None
-                };
-                // A partition's last page with nothing in it, when another partition
-                // follows, says nothing the page before didn't: it isn't sent.
-                let silent = page.rows.is_empty() && done_here && next.is_some();
-                if !silent || !missed.is_empty() {
-                    send!(
-                        ScanPage {
-                            rows: page.rows,
-                            next: next
-                                .map(|p| p.to_bytes(Kind::Scan))
-                                .unwrap_or_default()
-                                .into(),
-                            bytes: page.bytes,
-                            missing: std::mem::take(&mut missed),
-                        },
-                        paid
-                    );
-                }
-                ended_at = Some(done_here);
+                break 'part;
             }
             if ended_at == Some(false) {
                 // The partition's stream ended with a position (a budget too small for
@@ -1534,6 +1738,7 @@ impl ScanJob {
                     next: Default::default(),
                     bytes: 0,
                     missing: missed,
+                    served_seqno: 0,
                 },
                 None
             );

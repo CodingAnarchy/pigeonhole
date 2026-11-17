@@ -764,6 +764,12 @@ pub struct ScanPage {
     /// (D317 §7).
     #[prost(message, repeated, tag = "4")]
     pub missing: ::prost::alloc::vec::Vec<MissingRange>,
+    /// On a cluster scan sent with `x-pigeonhole-read-replica-max-lag-ms` (D328): the seqno
+    /// its partition's page was read at, in the owner's numbering (a replica's applied seqno
+    /// after the page, or the owner's visible seqno after it); 0 otherwise. A scan's pages may
+    /// come from different replicas and partitions, so it's per page.
+    #[prost(uint64, tag = "5")]
+    pub served_seqno: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutateRequest {
@@ -6934,6 +6940,17 @@ pub struct StampRequest {
     /// With `restore`: the cluster the file records, restored into this one as a new cluster.
     #[prost(string, tag = "6")]
     pub restore_from_cluster_id: ::prost::alloc::string::String,
+    /// A promotion of this node's replica copy of the partition (D328, `phdb cluster promote`):
+    /// the file is a replica database at `replica_epoch` (the owner's epoch at its bootstrap),
+    /// not at `from_epoch`. The node makes it a primary at the last commit it applied, then
+    /// raises its epoch to `to_epoch`. Refused while the copy is open here. No staged set is
+    /// installed.
+    #[prost(bool, tag = "7")]
+    pub promote: bool,
+    /// With `promote`: the epoch the CLI found in the copy's identity row, which the file must
+    /// still record, so the stamp acts on the copy that was checked.
+    #[prost(uint64, tag = "8")]
+    pub replica_epoch: u64,
 }
 /// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
 /// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).
@@ -7502,6 +7519,16 @@ pub struct ForwardScanRequest {
     /// The scan, with `after` (if any) this partition's own position and `limit` what's left.
     #[prost(message, optional, tag = "4")]
     pub scan: ::core::option::Option<ScanRequest>,
+    /// As `ForwardRequest`'s (D328): the entry node chose this node's replica copy of the
+    /// partition. Each page is read from the copy only while it's fresh within
+    /// `replica_max_lag_ms`, else the stream ends with `ReplicaBehind` and the entry node
+    /// continues from the last page's position on the next replica or the owner.
+    #[prost(bool, tag = "7")]
+    pub to_replica: bool,
+    #[prost(uint64, tag = "5")]
+    pub replica_max_lag_ms: u64,
+    #[prost(uint64, tag = "6")]
+    pub min_primary_seqno: u64,
 }
 /// The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
 /// forwarded.

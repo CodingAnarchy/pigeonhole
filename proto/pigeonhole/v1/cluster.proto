@@ -123,6 +123,15 @@ message StampRequest {
   bool restore = 5;
   // With `restore`: the cluster the file records, restored into this one as a new cluster.
   string restore_from_cluster_id = 6;
+  // A promotion of this node's replica copy of the partition (D328, `phdb cluster promote`):
+  // the file is a replica database at `replica_epoch` (the owner's epoch at its bootstrap),
+  // not at `from_epoch`. The node makes it a primary at the last commit it applied, then
+  // raises its epoch to `to_epoch`. Refused while the copy is open here. No staged set is
+  // installed.
+  bool promote = 7;
+  // With `promote`: the epoch the CLI found in the copy's identity row, which the file must
+  // still record, so the stamp acts on the copy that was checked.
+  uint64 replica_epoch = 8;
 }
 
 // A partition's state on its node (D317 ticket 6).
@@ -589,6 +598,13 @@ message ForwardScanRequest {
   string partition = 3;
   // The scan, with `after` (if any) this partition's own position and `limit` what's left.
   ScanRequest scan = 4;
+  // As `ForwardRequest`'s (D328): the entry node chose this node's replica copy of the
+  // partition. Each page is read from the copy only while it's fresh within
+  // `replica_max_lag_ms`, else the stream ends with `ReplicaBehind` and the entry node
+  // continues from the last page's position on the next replica or the owner.
+  bool to_replica = 7;
+  uint64 replica_max_lag_ms = 5;
+  uint64 min_primary_seqno = 6;
 }
 
 // The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are

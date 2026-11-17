@@ -1733,3 +1733,302 @@ fn a_planned_move_with_its_release_lost_resumes_on_the_new_node_once_its_lease_s
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|d| *d != t.dirs[0]);
 }
+
+/// A subscription over a connection of its own with 64 KiB HTTP/2 windows, so a client that
+/// stops reading leaves the server's events untaken after a few dozen, not 2 MiB.
+async fn narrow(port: u16, req: SubscribeRequest) -> tonic::Streaming<FeedEvent> {
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .initial_stream_window_size(64 << 10)
+        .initial_connection_window_size(64 << 10)
+        .connect()
+        .await
+        .unwrap();
+    FeedClient::new(channel)
+        .subscribe(req)
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// A commit event as the client saw it, or `None` for another event.
+fn seen_of(e: &FeedEvent) -> Option<Seen> {
+    match &e.event {
+        Some(Event::Commit(c)) => Some(Seen {
+            partition: e.partition.clone(),
+            seqno: c.seqno,
+            rows: c
+                .changes
+                .iter()
+                .map(|ch| String::from_utf8(ch.row.to_vec()).unwrap())
+                .collect(),
+            token: (!e.token.is_empty()).then(|| e.token.clone()),
+        }),
+        _ => None,
+    }
+}
+
+/// The commits that arrive until none does for `quiet`.
+async fn drain_for(s: &mut tonic::Streaming<FeedEvent>, quiet: Duration) -> Vec<Seen> {
+    let mut out = Vec::new();
+    while let Ok(Ok(Some(e))) = tokio::time::timeout(quiet, s.message()).await {
+        out.extend(seen_of(&e));
+    }
+    out
+}
+
+/// Writes `n` commits of 1 KiB values, alternating partitions, and adds their rows to `want`.
+async fn write_kib(ports: [u16; 2], tag: &str, n: usize, want: &mut Vec<String>) {
+    let value = "v".repeat(1024);
+    for (i, row) in rows(tag, n).into_iter().enumerate() {
+        put(ports[i % 2], &row, &value).await;
+        want.push(row);
+    }
+}
+
+const FELL_BEHIND: &str = "pigeonhole_serve_feed_cluster_fell_behind_total";
+const REJOINED: &str = "pigeonhole_serve_feed_cluster_rejoined_total";
+const CATCH_UP_WAITS: &str = "pigeonhole_serve_feed_cluster_catch_up_waits_total";
+
+#[test]
+fn a_hub_members_ring_passes_arrive_in_order_each_with_its_token_and_resume_from_any() {
+    // #2014: a member hands its connection each ring pass as one batch. One that reads
+    // nothing while 120 commits pass holds its buffer full, so each of its next passes takes
+    // many entries. It still gets every commit once, in order, all from the ring, the first a
+    // checkpoint; and a resume from a commit's token gets exactly the rest.
+    let mut l = crate::serve::server_tests::limits();
+    l.feed_client_bytes = 16 << 10;
+    l.stream_idle = Duration::from_secs(600);
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut s = narrow(c, users()).await;
+        metric_until(c, MEMBERS, |n| n == 1).await;
+        let mut want = Vec::new();
+        write_kib([a, b], "bt-", 120, &mut want).await;
+        let (seen, _) = commits(&mut s, want.len()).await;
+        exactly(&seen, &want);
+        assert!(seen[0].token.is_some(), "the first commit is a checkpoint");
+        assert_eq!(
+            metric(c, FELL_BEHIND).await,
+            0,
+            "every commit from the ring"
+        );
+        // A client that handled through commit `k` resumes from its last token, passing over
+        // what it has by its positions (a stream's first checkpoint trails its commit).
+        for k in [0, 37, 81, seen.len() - 2] {
+            let token = seen[..=k]
+                .iter()
+                .rev()
+                .find_map(|x| x.token.clone())
+                .unwrap();
+            let mut last: BTreeMap<String, u64> = BTreeMap::new();
+            for x in &seen[..=k] {
+                last.insert(x.partition.clone(), x.seqno);
+            }
+            let mut r = subscribe(
+                a,
+                SubscribeRequest {
+                    start: Some(Start::Resume(token)),
+                    skip_through: last
+                        .iter()
+                        .map(|(p, &seqno)| PartitionSeqno {
+                            partition: p.clone(),
+                            seqno,
+                        })
+                        .collect(),
+                    ..users()
+                },
+            )
+            .await
+            .unwrap();
+            let rest: Vec<String> = seen[k + 1..].iter().flat_map(|x| x.rows.clone()).collect();
+            let (again, _) = commits(&mut r, rest.len()).await;
+            exactly(&again, &rest);
+        }
+    });
+}
+
+#[test]
+fn a_hub_members_batch_that_waits_while_the_ring_overruns_it_misses_and_repeats_nothing() {
+    // simp724's (2) on #1737's F3-0, for a cluster hub (#2014): with a few-entry ring, a
+    // member's batch waits for room while the ring overruns it. Its entries are held, so the
+    // batch goes whole; it then falls behind, catches up on a merge of its own from its last
+    // checkpoint, and rejoins.
+    let mut l = small_ring();
+    l.feed_client_events = super::super::super::feed::CLIENT_EVENTS;
+    l.feed_client_bytes = 8 << 10;
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut fast = narrow(c, users()).await;
+        let mut slow = narrow(c, users()).await;
+        metric_until(c, MEMBERS, |n| n == 2).await;
+        let mut want = Vec::new();
+        write_kib([a, b], "ov-", 300, &mut want).await;
+        for s in [&mut fast, &mut slow] {
+            let (seen, _) = commits(s, want.len()).await;
+            exactly(&seen, &want);
+        }
+        assert!(metric(c, FELL_BEHIND).await >= 1, "it fell off the ring");
+        metric_until(c, MERGES, |n| n == 1).await;
+        assert!(metric(c, REJOINED).await >= 1);
+    });
+}
+
+/// #1737's per-feed liveness check for a cluster hub's members (#2014, simp724): `behind`
+/// members fall off the ring and are kept off it, `live` others are drained, while writes go
+/// on. Every round, each one behind delivers a commit within 2 s. Once writes stop, every
+/// member delivers every commit once, in order, and each one behind rejoins the ring. None
+/// waits for a catch-up slot.
+fn hub_members_kept_behind_keep_moving(behind: usize, live: usize) {
+    let mut l = crate::serve::server_tests::limits();
+    l.feed_ring_bytes = 4096;
+    l.feed_client_bytes = 4 << 10;
+    l.max_catch_up = 8;
+    l.stream_idle = Duration::from_secs(600);
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    let n = behind + live;
+    t.rt.block_on(async {
+        let mut subs = Vec::new();
+        for _ in 0..n {
+            subs.push(narrow(c, users()).await);
+        }
+        metric_until(c, MEMBERS, |m| m == n as u64).await;
+        let mut want = Vec::new();
+        let mut got: Vec<Vec<Seen>> = vec![Vec::new(); n];
+        // The first `behind` take nothing while 200 commits overrun the ring and their
+        // windows.
+        for chunk in 0..20 {
+            write_kib([a, b], &format!("f{chunk:02}-"), 10, &mut want).await;
+            for i in behind..n {
+                got[i].extend(drain_for(&mut subs[i], Duration::from_millis(20)).await);
+            }
+        }
+        // Then each round writes 10 and takes at most 4 from each one behind, so none of them
+        // catches up while writes go on: each must still move.
+        for round in 0..30 {
+            write_kib([a, b], &format!("w{round:02}-"), 10, &mut want).await;
+            for i in 0..behind {
+                let before = got[i].len();
+                while got[i].len() < before + 4 {
+                    match tokio::time::timeout(Duration::from_secs(2), subs[i].message()).await {
+                        Ok(Ok(Some(e))) => got[i].extend(seen_of(&e)),
+                        _ => break,
+                    }
+                }
+                assert!(
+                    got[i].len() > before,
+                    "member {i} delivered nothing for 2 s in round {round}"
+                );
+            }
+            for i in behind..n {
+                got[i].extend(drain_for(&mut subs[i], Duration::from_millis(20)).await);
+            }
+        }
+        let merges = metric(c, MERGES).await;
+        assert!(
+            merges > behind as u64,
+            "the members behind read merges of their own to the end of the writes: {merges}"
+        );
+        // Writes stop: each member gets the rest.
+        for (i, s) in subs.iter_mut().enumerate() {
+            let (rest, _) = commits(s, want.len() - got[i].len()).await;
+            got[i].extend(rest);
+            exactly(&got[i], &want);
+        }
+        metric_until(c, MERGES, |m| m == 1).await;
+        assert!(metric(c, FELL_BEHIND).await >= behind as u64);
+        assert!(metric(c, REJOINED).await >= behind as u64);
+        assert_eq!(
+            metric(c, CATCH_UP_WAITS).await,
+            0,
+            "no member waited for a slot"
+        );
+    });
+}
+
+#[test]
+fn hub_members_kept_behind_while_writes_go_on_keep_moving_and_rejoin() {
+    hub_members_kept_behind_keep_moving(4, 2);
+}
+
+#[test]
+fn a_lone_hub_member_kept_behind_among_live_ones_keeps_moving_and_rejoins() {
+    // simp724: the path with no other catch-up traffic around it.
+    hub_members_kept_behind_keep_moving(1, 3);
+}
+
+#[test]
+fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or_repeated() {
+    // simp724 on #2014: a pass of 1 KiB events goes out in budget-sized parts (4 KiB), so a
+    // member whose client stops reading can end at its idle limit with part of a pass
+    // queued. That ends the member: what was queued goes out, then the stream ends, and a
+    // resume from the client's last token gets exactly the rest, its first commit a
+    // checkpoint again.
+    let mut l = crate::serve::server_tests::limits();
+    l.feed_client_bytes = 4 << 10;
+    l.stream_idle = Duration::from_millis(500);
+    let t = Three::start_with(l);
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut s = narrow(c, users()).await;
+        metric_until(c, MEMBERS, |n| n == 1).await;
+        let mut want = Vec::new();
+        write_kib([a, b], "id-", 200, &mut want).await;
+        // The client reads nothing until the member has ended at its idle limit: reading
+        // sooner would keep it going.
+        metric_until(c, "pigeonhole_serve_feed_idle_drops_total", |n| n == 1).await;
+        let mut seen = Vec::new();
+        // What was queued, then a single node's `DeadlineExceeded` (#2021).
+        let end = loop {
+            match tokio::time::timeout(Duration::from_secs(10), s.message())
+                .await
+                .expect("the stream ends at its idle limit")
+            {
+                Ok(Some(e)) => seen.extend(seen_of(&e)),
+                Ok(None) => panic!("a clean end, after {} commits", seen.len()),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(end.code(), tonic::Code::DeadlineExceeded, "{end:?}");
+        assert!(end.message().contains("--stream-idle-ms"), "{end:?}");
+        assert!(
+            !seen.is_empty() && seen.len() < want.len(),
+            "{} of {} before the end",
+            seen.len(),
+            want.len()
+        );
+        assert!(seen[0].token.is_some(), "the first commit is a checkpoint");
+        in_order(&seen);
+        let token = seen.iter().rev().find_map(|x| x.token.clone()).unwrap();
+        let mut last: BTreeMap<String, u64> = BTreeMap::new();
+        for x in &seen {
+            last.insert(x.partition.clone(), x.seqno);
+        }
+        let mut r = subscribe(
+            c,
+            SubscribeRequest {
+                start: Some(Start::Resume(token)),
+                skip_through: last
+                    .iter()
+                    .map(|(p, &seqno)| PartitionSeqno {
+                        partition: p.clone(),
+                        seqno,
+                    })
+                    .collect(),
+                ..users()
+            },
+        )
+        .await
+        .unwrap();
+        let (rest, _) = commits(&mut r, want.len() - seen.len()).await;
+        assert!(
+            rest[0].token.is_some(),
+            "the resumed stream's first commit is a checkpoint"
+        );
+        seen.extend(rest);
+        exactly(&seen, &want);
+    });
+}

@@ -4967,11 +4967,11 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **Freshness** is measured on the replica: the time since the arrival of the newest owner message whose durable frontier (`primary_seqno`) the copy had applied through. The owner sends one at least once a second while idle, so a stopped stream ages it at once. Amended in PR 2a (simp724's note on #1974, D330's M2): PR 1 counted only messages with `caught_up`, which an owner under sustained writes rarely sends, so a busy partition's replicas would have looked stale.
 - **Status and Info:** `LocalPartition.role` (owner or replica); for a copy, the owner it follows, the applied and primary seqnos, `lag_ms` and `replica_state` (bootstrapping, following, behind, stopped, owner feed off). `Admin.Info` lists each copy with its `ReplicaInfo`, and `/metrics` carries each copy's replica gauges labelled by partition.
 - **Reads (PR 2):** opt in per request with a max-lag bound (`x-pigeonhole-read-replica-max-lag-ms`), checked by the replica on its own clock, falling back to the next replica, then the owner. Read-your-writes per partition with `x-pigeonhole-min-primary-seqno`. A routed scan checks the bound before each page (S2). The response says who served it and at what seqno (Q7). Off by default, no server-wide default (Q9).
-- **Promotion (PR 3):** `phdb cluster promote P --to ID` closes ID's copy and stamps and maps it as relocate does. `--old-unreachable` reports the loss of acknowledged writes, with no extra flag (Q8).
+- **Promotion (PR 3):** `phdb cluster promote P --to ID` takes ID out of P's replicas (closing its copy), promotes the copy and stamps it from `e_b` to the map's epoch + 1 (`StampRequest.promote`, `.replica_epoch`), then sets the map with P on ID and a new history. `--old-unreachable` reports the loss of acknowledged writes as unknown, with no extra flag (Q8). Making the old owner a replica is the operator's step, not a flag (n3 dropped in PR 3, matching #1484's no-automatic-rejoin call).
 
 **Amendments while building PR 1 (2026-11-15, agreed with simp724).**
 - **The copy's identity epoch isn't kept current.** The design had the follower record the owner's epoch in its copy's identity row on each reconnect, but the engine refuses local writes on a replica database (R6). The copy keeps the owner's epoch from its bootstrap snapshot, `e_b`. Promote (PR 3) accepts the copy when `history_epoch <= e_b <=` the map's epoch, stamps from `e_b`, and checks that the copy's feed position belongs to that history. The same comparison makes the follower bootstrap again after a new history (above).
-- **S4 is a refusal until PR 3.** A `move`, `relocate` or `restore --partition` to a node in `P.replicas` is refused, by the CLI and on the node by `Stamp` while a replica copy of P is open there (an upload only stages; only the stamp installs into `P.phdb`). The steps: set a map without that node in P's replicas, `drop-partition` P on it, run the command again. PR 3 does the drop and close itself, before the stamp, as promote does.
+- **S4 is a refusal until PR 3.** A `move`, `relocate` or `restore --partition` to a node in `P.replicas` is refused, by the CLI and on the node by `Stamp` while a replica copy of P is open there (an upload only stages; only the stamp installs into `P.phdb`). The steps: set a map without that node in P's replicas, `drop-partition` P on it, run the command again. PR 3 does the drop and close itself, before the stamp, as promote does. **Done in PR 3:** the commands now take the node out of `replicas` and wait for its copy to close before the stamp; the node's `Stamp` refusal stays as the safety net.
 
 **What it costs.**
 - A copy is a whole engine on its node: memory, shards and compaction counted as a partition's.
@@ -4982,3 +4982,105 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - *(A), replicas as separate single-node replicas of each partition* (`--replica-of` per partition): nothing records them, so routing and #1484 couldn't find them.
 - *Replicas holding P's lease, or counting in its grants:* a replica serves only bounded-stale reads, which its own freshness covers, and a lease would make a replica a second owner.
 - *Forwarding Follow between nodes:* a long stream would cross two hops; the replica dials P's owner itself.
+
+<a id="d329"></a>
+## D329 — Transactions across partitions on different nodes: two-phase commit with the home partition's decision row as the commit point (simp724, design; owner, 2026-11-16; reviewed by audit120 and cli692; engine, cli, #1483, ICR 0140) · D263, D317, D326, D328
+
+**Problem (#1483).** A cluster refuses a transaction or batch whose rows are in more than one partition (`CrossPartition`, D317). An application whose data doesn't split cleanly then gives up atomicity or keeps everything in one partition. Inside one database the engine already commits across shards with 2PC (D263, D271), but every share is in one file set, so recovery never meets an undecided share.
+
+**Decision.**
+- **Opt-in (owner, Q1).**
+  - `BeginRequest.spans_partitions` and `BatchRequest.spans_partitions`. Without them, `CrossPartition` and today's cost are unchanged.
+  - The map feature `spanning_txns` is checked at `Begin` and again at prepare.
+- **Home and branches.**
+  - The partition a transaction begins on is its home, and the home's owner node coordinates.
+  - Each other partition touched gets a branch: a transaction session on that partition's owner, opened by the home node (`ForwardRequest.branch_begin`) as the client (`ForwardedCaller`).
+  - The transaction id is `<home>:h<history_epoch>-<hex>`, and the engine xid is the same bytes.
+- **Commit.**
+  1. Every branch prepares (`branch_prepare`). It validates its reads and logs an external PREPARE (WAL type 5: the xid, the read set, the batch), durable before it answers, and holds its rows.
+  2. The home then commits its own share together with its decision row (`__phdb_txn_decisions`, xid → `COMMITTED`, the branches, the home's history epoch), having read the row as absent. **That local commit is the commit point.** It passes the home's write gate, so a deposed home can't commit (D326), and the row moves with the partition's files.
+  3. The branches are told the outcome (`branch_decide`): a commit applies under Decision (type 4), an abort logs type 6. Each makes it durable before it acknowledges.
+  - The client's reply waits for the branches up to its deadline, then answers `Committed`, listing any branch not yet applied.
+  - Any refusal before the commit point (a stale read, `PendingOverlap`, an unreachable branch) aborts the transaction, retry-safe. With no waiting on overlaps, there's no distributed deadlock.
+- **Read-only spanning transactions** validate too:
+  - every partition, the home included, validates and holds its reads in memory;
+  - the answer comes only after a release round in which each confirms the same hold, under a lease held continuously since the prepare (a lease-term counter on the gate);
+  - a lost hold answers `Conflict`.
+- **Resolution.**
+  - A branch in doubt past `--txn-resolve-delay`, or found at reopen, asks the home's owner (`resolve_txn`), whose reads and writes of the decision row go through the home's gate:
+    - `COMMITTED` → apply;
+    - `ABORTED` → abort;
+    - absent, with the xid's home epoch current → write `ABORTED` by OCC (it conflicts with a late commit point);
+    - absent, with the home's history changed since → **unknown**: it stays in doubt for `phdb cluster txn decide --force`.
+  - A writing branch's decide needs only a serving gate, whatever lapsed between.
+- **The client's outcome.**
+  - A repeated `Commit` answers from the tombstone.
+  - After that, `Transactions.Outcome` (write scope on the home) answers from the decision row:
+    - "in progress" while the home session lives;
+    - an absent row is settled as the resolver settles it;
+    - "unknown" across a history change.
+  - Rows are kept `--txn-outcome-retention` (24 h, owner Q4) after the last branch's acknowledgement. The retention can't be set below the transaction lifetime plus the request timeout.
+- **Engine.**
+  - `prepare(xid)`, `in_doubt()` and `decide(xid, commit)` sit behind an unstable feature, and `phdb serve` is the one caller.
+  - External shares survive a crash or a close in doubt, with their read and write holds reinstalled before the database admits a write, by every open (serving, `Stamp`'s, `init-partition`'s). A read-only open lists them (`in_doubt`), holds nothing and can't decide them. An open with another shard count, or one whose replay spills, is refused while any is in doubt (decide them first).
+  - A prepare reserves its xid in the engine's registry under the lock that checks for it and the limits, so two prepares of one xid never both log (loom-modelled). A `decide` of a reserved xid answers `Busy`.
+  - They pin their WAL segments, bounded by the in-doubt limits (an engine open option, `--txn-max-in-doubt-wal-bytes` under serve), past which new prepares answer `Busy`.
+  - They hold neither the visible watermark nor the feed's frontier: the apply seqno is reserved at the decision, and an abort (type 6) takes its own seqno, which feeds and replicas pass with no event. A feed holds an in-doubt share outside its read-ahead budget and eviction, so a long hold can't stall delivery; its memory is bounded per subscriber by the in-doubt limit (positions only: #1993, Post-1.0).
+  - Incompat bit 2 is set before the first external PREPARE is durable, and never cleared (sticky, as bit 1; perf2), so a database that used spanning transactions can't be opened by a build before 1.3.
+- **Durability (owner, Q3).** A spanning commit runs at GroupSync at least: prepares, the commit point and the branches' decisions alike. A weaker requested level is raised, and `CommitInfo.durability` says so.
+- **Isolation (owner, Q2).** Committed spanning transactions are serializable over their read sets, as on one node. They differ in four ways:
+  - D1: no single snapshot across partitions, so a transaction can read a state no serial order gives, then fail `Conflict`;
+  - D2: read-only spanning commits validate;
+  - D3: plain reads, fan-out scans, the cluster feed and D328 replicas can see one partition's share before another's (feed events carry the xid, `FeedEvent.xid`, owner Q6);
+  - D4: no phantoms, as on one node.
+- **Blocking (owner, Q7).** While a home is unreachable, its in-doubt branches hold the rows they read and wrote. A write overlapping one is refused at once (a transaction's prepare with `Conflict`, a single write with `Busy`), rather than waiting on a decision that may take hours; serve maps it to `Unavailable` naming the xid. A tablet move touching one is put off. `Status` lists in-doubt shares, the oldest, and the pinned bytes.
+
+**What it costs.**
+- Nothing for a transaction without the flag, or one with it that touches only its home, beyond the flag check and the decision row riding its commit.
+- A spanning commit: about two round trips (prepare, decide), a sync per branch at prepare and at its decision, and one at the commit point.
+
+**Limits, documented in the guide.**
+- A home or branch that takes a new history (relocate without copy, restore, promotion, #1484) can lose a spanning transaction's effect on one side. It's detected (unknown, in doubt) rather than silently resolved.
+- A cluster backup isn't one point in time, so spanning transactions committed while it ran can be partial after a restore.
+- The lost-node recipe must copy every database file, not `P.phdb` alone.
+
+**Rejected.**
+- *Write intents at the serve layer (Percolator-style):* every read and write path changes, which costs single-partition transactions.
+- *A separate coordinator log:* it needs its own storage, fencing and moves, all of which the home partition already has.
+- *Non-blocking commit (3PC, Paxos Commit):* a partition with one owner blocks its own writes when down anyway. Revisit with replica failover (#1484).
+- *A cluster clock for one snapshot:* a large change to timestamps and visibility; later global-snapshot work.
+
+<a id="d334"></a>
+## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
+
+**Decided:**
+- **The SST writer** calls `File::start_writeback` (ICR 0145) for each 1 MiB chunk right after writing it. On Linux that's `sync_file_range(SYNC_FILE_RANGE_WRITE)`; macOS, Windows, the simulator and direct-I/O handles do nothing.
+- **Durability is unchanged:** the pager's root commit still syncs the data file before its superblock. The sync now finds the output mostly written back.
+- **No option.** There's a follow-up for the blob writer's per-value writes.
+
+**Why (#1991, g130–g143 on the AX102):**
+- **The stall:** in g69's sustained GroupSync session at 55K puts/s, put p99.9 climbed through the session to 30–50 ms. The cause was a WAL group sync's small write waiting about 12 ms inside the NVMe drive, behind a burst of the data file's 128 KiB writes. SST output was written buffered and sent to the device all at once by the root commit's `sync_data` of the whole data file.
+- **Ruled out:**
+  - locks (g132);
+  - io-wq queueing (g138);
+  - overlapping syncs (g141);
+  - request tags (g142);
+  - wbt (g140);
+  - the flusher (g140);
+  - compaction thread count (g137);
+  - the XFS journal (g137).
+- **g143, the depth-1 build against this change, one session each:**
+
+  | | d1 | this change |
+  |---|---|---|
+  | row 10–16 put p99 | 6.5–17.3 ms | 0.25–0.26 ms |
+  | p99.9 | 29.5–47.3 ms | 0.41–0.91 ms |
+  | WAL fsyncs ≥ 5 ms | 683 | 19 |
+  | data-file device writes ≥ 5 ms | 35,001 | 0 |
+  | flushes / compactions | 301 / 75 | 303 / 75 |
+  | write MB/s | 151 | 147 |
+  | compaction CPU | 0.10 cores | 0.08 cores |
+  | write stalls | 0 | 0 |
+
+- **Before merge:** a box A/B at main's defaults (group sync depth 2) and across the gate's write rows.
+

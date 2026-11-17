@@ -734,7 +734,8 @@ pub(super) async fn subscribe(s: Subscribe) -> Result<FeedEvents, ApiError> {
 }
 
 /// Runs `member` from `begin` as a task on `runtime` (the feed runtime), or the caller's:
-/// its error, if it fails, goes to `end`, after its last event.
+/// the error it ends with, if any (a failure, or its idle limit's), goes to `end`, after its
+/// last event.
 fn start(
     member: Member,
     begin: Begin,
@@ -742,11 +743,8 @@ fn start(
     runtime: Option<tokio::runtime::Handle>,
 ) -> tokio::task::JoinHandle<()> {
     let run = async move {
-        match member.run(begin).await {
-            Stop::Failed(e) => {
-                let _ = end.send(e);
-            }
-            Stop::Idle | Stop::Gone => {}
+        if let Some(e) = member.run(begin).await {
+            let _ = end.send(e);
         }
     };
     match runtime {
@@ -889,7 +887,7 @@ enum Source {
 enum Stop {
     /// The client went away.
     Gone,
-    /// The client left events untaken for its idle limit (counted and said already).
+    /// The client left events untaken for its idle limit ([`Member::run`] counts it).
     Idle,
     Failed(ApiError),
 }
@@ -933,7 +931,21 @@ enum Woke<T> {
 }
 
 impl Member {
-    async fn run(mut self, begin: Begin) -> Stop {
+    /// Serves the client from `begin` until its stream ends: the error it ends with, if any.
+    /// One that left events untaken for its idle limit is counted and said here, wherever
+    /// it stopped, and ends with a single node's `DeadlineExceeded` (#2021).
+    async fn run(mut self, begin: Begin) -> Option<ApiError> {
+        match self.serve(begin).await {
+            Stop::Gone => None,
+            Stop::Idle => {
+                drop_idle(&self.metrics, &self.partitions, self.started, self.idle);
+                Some(crate::serve::feed::idle_error(self.idle))
+            }
+            Stop::Failed(e) => Some(e),
+        }
+    }
+
+    async fn serve(&mut self, begin: Begin) -> Stop {
         let mut source = match begin {
             Begin::Ring {
                 joined,
@@ -984,10 +996,6 @@ impl Member {
             };
             source = match next {
                 Ok(s) => s,
-                Err(Stop::Idle) => {
-                    drop_idle(&self.metrics, &self.partitions, self.started, self.idle);
-                    return Stop::Idle;
-                }
                 Err(stop) => return stop,
             };
         }
@@ -1026,16 +1034,29 @@ impl Member {
     }
 
     async fn send(&mut self, out: Out, checkpoint: bool) -> Result<(), Stop> {
+        self.before_put();
+        let put = self.sink.put(out).await;
+        self.after_put(put, checkpoint.then(|| self.token.clone()))
+    }
+
+    /// Notes when the client's buffer goes from empty to holding events (#1798 (a)).
+    fn before_put(&mut self) {
         if !self.sink.pending() {
             self.waiting_since = tokio::time::Instant::now();
         }
-        match self.sink.put(out).await {
+    }
+
+    /// After a put: its error as the member's [`Stop`], or `sent` (a checkpoint's token, if
+    /// it carried one) as what the client has.
+    fn after_put(&mut self, put: Result<(), ApiError>, sent: Option<Bytes>) -> Result<(), Stop> {
+        match put {
             Ok(()) => {}
+            // The sink's only `DeadlineExceeded` is its idle limit (`feed::idle_error`).
             Err(e) if e.code == "DeadlineExceeded" => return Err(Stop::Idle),
             Err(_) => return Err(Stop::Gone),
         }
-        if checkpoint {
-            self.sent = self.token.clone();
+        if let Some(token) = sent {
+            self.sent = token;
         }
         self.last_event = tokio::time::Instant::now();
         Ok(())
@@ -1133,6 +1154,11 @@ impl Member {
                 }
                 continue;
             }
+            // The pass's events go to the client as one batch (#2014, as a single node's do
+            // since #2012): one channel place and one charge, not one per event.
+            let mut outs = Vec::with_capacity(batch.len());
+            // The token of the pass's last checkpointed event, if it sends one.
+            let mut sent: Option<Bytes> = None;
             for (k, e) in batch.drain(..).enumerate() {
                 at += 1;
                 let send = match e.commit {
@@ -1143,24 +1169,42 @@ impl Member {
                 if checkpoint {
                     self.token = e.token.clone();
                 }
-                if send && !checkpoint && self.sent.is_empty() {
+                if send && !checkpoint && self.sent.is_empty() && sent.is_none() {
                     // Its first commit carries a checkpoint, as every subscription's does:
                     // its own, never ahead of this commit (so a resume repeats at most).
                     let mut tail = prost::bytes::BytesMut::with_capacity(e.tail.len() + 80);
                     tail.extend_from_slice(&e.tail);
                     super::feed::put_field(&mut tail, super::feed::TOKEN_FIELD, &self.token);
-                    let out = Out::Spliced {
+                    outs.push(Out::Spliced {
                         body: e.body.clone(),
                         tail: tail.freeze(),
-                    };
-                    self.send(out, true).await?;
+                    });
+                    sent = Some(self.token.clone());
                 } else if send {
-                    self.send(Out::Merged(Arc::clone(&e)), checkpoint).await?;
+                    outs.push(Out::Merged(Arc::clone(&e)));
+                    if checkpoint {
+                        sent = Some(self.token.clone());
+                    }
                 }
                 self.cover_to(&after[k * n..(k + 1) * n]);
             }
             after.clear();
+            self.send_all(outs, sent).await?;
         }
+    }
+
+    /// Sends a ring pass's events as one batch ([`Sink::put_all`]); `sent`, the token of its
+    /// last checkpointed event, if any, becomes what the client has. A failure ends the
+    /// member (`run` returns on any [`Stop`]): the events already queued still go out, and
+    /// the client resumes from the last token it received, so nothing here reads `sent`
+    /// again (simp724 on #2014).
+    async fn send_all(&mut self, outs: Vec<Out>, sent: Option<Bytes>) -> Result<(), Stop> {
+        if outs.is_empty() {
+            return Ok(());
+        }
+        self.before_put();
+        let put = self.sink.put_all(outs).await;
+        self.after_put(put, sent)
     }
 
     /// Off the ring's tail: a merge of its own from its last checkpoint, with a
@@ -1656,6 +1700,87 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_joiner_idle_while_its_state_events_wait_is_counted_and_answered() {
+        // simp724 on #2021: a joiner sends its parts' state events before it reads the ring.
+        // A client that takes none of them is ended at the limit there too: counted once,
+        // and answered with `DeadlineExceeded` after what was queued.
+        const LIMIT: Duration = Duration::from_millis(400);
+        paused().block_on(async {
+            let (_p0, events) = fed();
+            let m = merging(vec![Some(events)], QUIET);
+            let plan = plan_of(&m);
+            let node = Arc::clone(&plan.ctx.node);
+            let parts = vec!["p0".to_string()];
+            let hub = Arc::new(ClusterHub::new(
+                RingOf::new(ClusterRing::new(parts.clone())),
+                false,
+                Arc::default(),
+                Arc::clone(&node.feed_hubs.live),
+                Arc::default(),
+            ));
+            // 1 KiB holds one 800-byte state event, so the second waits for room.
+            let limits = crate::serve::feed::FeedLimits {
+                ring_bytes: 1 << 20,
+                max_hubs: 4,
+                max_catch_up: 1,
+                quiet: QUIET,
+                stream_idle: LIMIT,
+                client_events: crate::serve::feed::CLIENT_EVENTS,
+                client_bytes: 1024,
+                solo_after: crate::serve::feed::SOLO_AFTER,
+                coalesce: crate::serve::feed::Coalesce::default(),
+            };
+            let (sink, mut events, end) = Sink::new(&limits);
+            let metrics = Arc::new(Metrics::default());
+            let tracker: Arc<Tracker> = Arc::default();
+            let now = tokio::time::Instant::now();
+            let member = Member {
+                sink,
+                plan,
+                key: test_key(),
+                node: Arc::clone(&node),
+                hub: None,
+                own: Vec::new(),
+                token: Bytes::new(),
+                sent: Bytes::new(),
+                last_event: now,
+                waiting_since: now,
+                quiet: QUIET,
+                idle: LIMIT,
+                catch_up: Arc::new(Semaphore::new(1)),
+                metrics: Arc::clone(&metrics),
+                tracker: Arc::clone(&tracker),
+                partitions: parts,
+                started: std::time::Instant::now(),
+                _slot: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            };
+            let begin = Begin::Ring {
+                joined: Joined::new(&hub, &tracker, &metrics),
+                at: 0,
+                own: vec![0],
+                token: Bytes::new(),
+                out: vec![Bytes::from(vec![0u8; 800]); 3],
+            };
+            let handle = start(member, begin, end, None);
+            tokio::time::sleep(LIMIT / 2).await;
+            assert!(!handle.is_finished(), "not yet: half the limit");
+            tokio::time::sleep(LIMIT).await;
+            assert!(handle.is_finished(), "ended at the limit");
+            assert_eq!(load(&metrics.feed_idle_drops), 1);
+            assert!(matches!(
+                take(&mut events, LIMIT).await,
+                Some(Some(Ok(Out::Spliced { .. })))
+            ));
+            let Some(Some(Err(e))) = take(&mut events, LIMIT).await else {
+                panic!("the stream ends with an error");
+            };
+            assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+            assert!(e.message.contains("--stream-idle-ms (400 ms)"), "{e:?}");
+            assert!(matches!(take(&mut events, LIMIT).await, Some(None)));
+        });
+    }
+
     /// The client's next item, within `d` of virtual time.
     async fn take(e: &mut FeedEvents, d: Duration) -> Option<Option<Result<Out, ApiError>>> {
         tokio::time::timeout(d, std::future::poll_fn(|cx| Pin::new(&mut *e).poll_out(cx)))
@@ -1691,7 +1816,16 @@ mod tests {
                 "its --max-streams place is free"
             );
             assert_eq!(load(&t.metrics.cluster_merges), 0);
-            drop(t.events);
+            // A client that reads again gets its untaken event, then a single node's
+            // `DeadlineExceeded`, not a clean end (#2021).
+            let mut events = t.events;
+            commit_of(take(&mut events, LIMIT).await);
+            let Some(Some(Err(e))) = take(&mut events, LIMIT).await else {
+                panic!("the stream ends with an error");
+            };
+            assert_eq!(e.code, "DeadlineExceeded", "{e:?}");
+            assert!(e.message.contains("--stream-idle-ms (400 ms)"), "{e:?}");
+            assert!(matches!(take(&mut events, LIMIT).await, Some(None)));
 
             // Nothing sent: ten limits later it's still there, never counted.
             let (_p1, events) = fed();

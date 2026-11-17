@@ -493,6 +493,8 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                     to_epoch: job.epoch,
                     restore: true,
                     restore_from_cluster_id: restore_from.clone(),
+                    promote: false,
+                    replica_epoch: 0,
                 },
                 token.as_deref(),
             )?)

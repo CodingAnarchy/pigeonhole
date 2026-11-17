@@ -966,3 +966,290 @@ fn a_one_row_read_never_reads_the_block_after_its_row() {
         "no row ended a block, so the test checks nothing"
     );
 }
+
+/// A file that records [`File::start_writeback`] calls and passes everything else through.
+#[derive(Debug)]
+struct Hinted {
+    inner: pigeonhole_io::FileRef,
+    hints: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// Every write and hint in order, as `(is a hint, offset, length)`.
+    events: std::sync::Mutex<Vec<(bool, u64, u64)>>,
+}
+
+impl Hinted {
+    fn over(inner: pigeonhole_io::FileRef) -> Arc<Hinted> {
+        Arc::new(Hinted {
+            inner,
+            hints: std::sync::Mutex::new(Vec::new()),
+            events: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl pigeonhole_io::File for Hinted {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.inner.read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push((false, offset, buf.len() as u64));
+        self.inner.write_at(buf, offset)
+    }
+    fn submit_read(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_read(buf, offset)
+    }
+    fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> pigeonhole_io::Completion {
+        self.inner.submit_write(buf, offset)
+    }
+    fn start_writeback(&self, offset: u64, len: u64) -> pigeonhole_io::Result<()> {
+        self.hints.lock().unwrap().push((offset, len));
+        self.events.lock().unwrap().push((true, offset, len));
+        self.inner.start_writeback(offset, len)
+    }
+    fn sync_data(&self) -> pigeonhole_io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn submit_sync_data(&self) -> pigeonhole_io::Completion<()> {
+        self.inner.submit_sync_data()
+    }
+    fn sync_all(&self) -> pigeonhole_io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn len(&self) -> pigeonhole_io::Result<u64> {
+        self.inner.len()
+    }
+    fn set_len(&self, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn allocate(&self, offset: u64, len: u64) -> pigeonhole_io::Result<()> {
+        self.inner.allocate(offset, len)
+    }
+    fn lock(&self, byte: u64, mode: pigeonhole_io::LockMode) -> pigeonhole_io::Result<()> {
+        self.inner.lock(byte, mode)
+    }
+    fn unlock(&self, byte: u64) -> pigeonhole_io::Result<()> {
+        self.inner.unlock(byte)
+    }
+    fn identity(&self) -> pigeonhole_io::Result<pigeonhole_io::FileIdentity> {
+        self.inner.identity()
+    }
+    fn is_local(&self) -> pigeonhole_io::Result<bool> {
+        self.inner.is_local()
+    }
+}
+
+/// D334 (#1991): the writer starts each written chunk's writeback as it writes it, so the
+/// root commit's sync doesn't send a whole output to the device at once. The hints cover the
+/// data written, chunk by chunk, from the extent's start, in order and without gaps.
+#[test]
+fn the_writer_starts_each_chunks_writeback_as_it_writes_it() {
+    let (_vfs, file) = sim_file(11, EXTENT);
+    let hinted = Hinted::over(file.clone());
+    let l = Layout {
+        block_size: 4096,
+        restart_interval: 16,
+        compression: pigeonhole_format::compress::Compression::None,
+        compression_level: 3,
+        bloom_bits: 10,
+    };
+    let mut w = SstWriter::new(hinted.clone(), EXTENT, SstId(3), options(&l));
+    let mut key = Vec::new();
+    let value = vec![7u8; 1000];
+    // About 3 MiB of blocks: several 1 MiB chunks and a partial last one.
+    for i in 0u32..3000 {
+        key.clear();
+        encode_key(&mut key, &i.to_be_bytes(), b"q", 1, 1, Kind::Put).unwrap();
+        w.add(&key, &value).unwrap();
+    }
+    let meta = w.finish().unwrap();
+    let hints = hinted.hints.lock().unwrap().clone();
+    assert!(hints.len() >= 3, "{hints:?}");
+    let mut at = EXTENT.offset();
+    for &(offset, len) in &hints {
+        assert_eq!(offset, at, "a hint out of order or with a gap: {hints:?}");
+        assert!(len > 0 && len <= 2 << 20, "{hints:?}");
+        at += len;
+    }
+    // The hinted data reaches the footer's region; the SST still reads back whole.
+    assert!(at > EXTENT.offset() + (2 << 20), "{at}");
+    let r = open(&file, &meta);
+    assert_eq!(
+        scan(&mut r.iter(ScanFilter::all(), ReadOptions::default())).len(),
+        3000
+    );
+}
+
+// ---- blob files start their writeback as they're written (#2023, D334's follow-up) ----
+
+/// A blob file of class 0 extents (64 KiB each) on a file that records its writes and
+/// hints: `values` appended in order, an extent added whenever one is needed, each `step`
+/// pages after the last (16 is adjacent, more leaves a gap in the file).
+fn hinted_blob(
+    values: &[Vec<u8>],
+    step: u64,
+) -> (
+    Arc<Hinted>,
+    Vec<ExtentRef>,
+    Vec<pigeonhole_format::value::BlobPointer>,
+    usize,
+) {
+    use pigeonhole_format::BlobFileId;
+    use pigeonhole_io::{OpenOptions, Vfs};
+    use pigeonhole_sst::BlobWriter;
+    let file = pigeonhole_io::sim::SimVfs::new(2023)
+        .open("/blobs".as_ref(), OpenOptions::read_write_create())
+        .unwrap();
+    let hinted = Hinted::over(file);
+    let mut w = BlobWriter::new(hinted.clone(), BlobFileId(7), 0);
+    let mut page = 16;
+    let mut ptrs = Vec::new();
+    for v in values {
+        while w.needs_extent(v.len()) {
+            w.add_extent(ExtentRef {
+                page,
+                size_class: 0,
+            })
+            .unwrap();
+            page += step;
+        }
+        ptrs.push(w.append(v).unwrap());
+    }
+    let before_finish = hinted.hints.lock().unwrap().len();
+    let (extents, _) = w.finish().unwrap();
+    (hinted, extents, ptrs, before_finish)
+}
+
+/// Replays a file's writes and hints: a hint covers only bytes already written and never a
+/// byte twice, and at the end every written byte was hinted. The hints, in order.
+fn check_hints(file: &Hinted) -> Vec<(u64, u64)> {
+    let events = file.events.lock().unwrap().clone();
+    let end = events.iter().map(|&(_, o, l)| o + l).max().unwrap_or(0) as usize;
+    let (mut written, mut hinted) = (vec![false; end], vec![false; end]);
+    for &(is_hint, offset, len) in &events {
+        let range = offset as usize..(offset + len) as usize;
+        if is_hint {
+            assert!(len > 0, "an empty hint");
+            assert!(
+                written[range.clone()].iter().all(|w| *w),
+                "a hint at {offset}+{len} covers bytes not written yet"
+            );
+            assert!(
+                hinted[range.clone()].iter().all(|h| !*h),
+                "bytes at {offset}+{len} hinted twice"
+            );
+            hinted[range].fill(true);
+        } else {
+            written[range].fill(true);
+        }
+    }
+    assert!(written == hinted, "written bytes left without a hint");
+    file.hints.lock().unwrap().clone()
+}
+
+/// The blobs read back whole through a plain reader.
+fn blobs_read_back(
+    file: &Hinted,
+    extents: Vec<ExtentRef>,
+    ptrs: &[pigeonhole_format::value::BlobPointer],
+    values: &[Vec<u8>],
+) {
+    use pigeonhole_sst::BlobReader;
+    let r = BlobReader::new(
+        file.inner.clone(),
+        pigeonhole_format::BlobFileId(7),
+        extents,
+        Arc::new(pigeonhole_cache::BlockCache::new(1 << 20, 1)),
+    );
+    for (ptr, value) in ptrs.iter().zip(values) {
+        assert!(
+            r.read(ptr).unwrap()[..] == value[..],
+            "a blob read back wrong"
+        );
+    }
+}
+
+/// Many small values: a hint for each megabyte as it fills, then the tail at `finish`.
+/// Adjacent extents make one range, headers included, so a megabyte is one call, not one
+/// per 64 KiB extent.
+#[test]
+fn a_blob_file_starts_each_megabytes_writeback_as_it_fills() {
+    let values: Vec<Vec<u8>> = (0..3300u32).map(|i| vec![(i % 251) as u8; 1000]).collect();
+    let (file, extents, ptrs, before_finish) = hinted_blob(&values, 16);
+    let hints = check_hints(&file);
+    // About 3.3 MiB of records: three full megabytes while writing, the rest at the end.
+    assert_eq!(before_finish, 3, "{hints:?}");
+    assert_eq!(hints.len(), 4, "{hints:?}");
+    for &(_, len) in &hints[..3] {
+        // A megabyte of payload and the headers of the extents it lies in.
+        assert!((1 << 20..=(1 << 20) + 17 * 64).contains(&len), "{hints:?}");
+    }
+    // In file order, each starting where the last ended: nothing between them unhinted.
+    let mut at = extents[0].offset();
+    for &(offset, len) in &hints {
+        assert_eq!(offset, at, "{hints:?}");
+        at += len;
+    }
+    blobs_read_back(&file, extents, &ptrs, &values);
+}
+
+/// One long value is hinted as it is written, a megabyte at a time, not all at its end
+/// (which would send it to the device in the burst the hint is there to avoid).
+#[test]
+fn a_long_blob_starts_its_writeback_while_it_is_still_being_written() {
+    let values = vec![
+        (0..5u32 << 20)
+            .map(|i| (i % 253) as u8)
+            .collect::<Vec<u8>>(),
+    ];
+    let (file, extents, ptrs, before_finish) = hinted_blob(&values, 16);
+    let hints = check_hints(&file);
+    assert_eq!(before_finish, 5, "{hints:?}");
+    let events = file.events.lock().unwrap().clone();
+    let first_hint = events.iter().position(|e| e.0).unwrap();
+    let last_write = events.iter().rposition(|e| !e.0).unwrap();
+    assert!(
+        first_hint < last_write,
+        "no hint before the value's last write"
+    );
+    // Each megabyte's hint comes before the next megabyte's writes: at most a megabyte and
+    // an extent of written bytes is ever waiting for its hint.
+    let (mut written, mut hinted) = (0u64, 0u64);
+    for &(is_hint, _, len) in &events {
+        match is_hint {
+            true => hinted += len,
+            false => written += len,
+        }
+        assert!(
+            written - hinted <= (1 << 20) + (64 << 10),
+            "{written} {hinted}"
+        );
+    }
+    blobs_read_back(&file, extents, &ptrs, &values);
+}
+
+/// simp724's M2 on D334: a megabyte that lies in extents apart in the file is hinted as the
+/// ranges it really wrote, one per extent, each with the extent's header.
+#[test]
+fn a_blob_megabyte_across_separate_extents_is_hinted_extent_by_extent() {
+    let values: Vec<Vec<u8>> = (0..1200u32).map(|i| vec![(i % 249) as u8; 1000]).collect();
+    // An extent's worth of gap after each extent.
+    let (file, extents, ptrs, _) = hinted_blob(&values, 32);
+    let hints = check_hints(&file);
+    for &(offset, len) in &hints {
+        let inside = extents
+            .iter()
+            .any(|e| e.offset() <= offset && offset + len <= e.offset() + (64 << 10));
+        assert!(inside, "a hint at {offset}+{len} runs outside one extent");
+    }
+    // Every extent written from its start is hinted from its header.
+    for e in &extents {
+        assert!(
+            hints.iter().any(|&(offset, _)| offset == e.offset()),
+            "extent at {} has no hint from its header",
+            e.offset()
+        );
+    }
+    blobs_read_back(&file, extents, &ptrs, &values);
+}

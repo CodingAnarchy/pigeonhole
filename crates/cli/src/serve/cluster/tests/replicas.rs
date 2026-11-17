@@ -55,8 +55,22 @@ async fn set_replicas(a: u16, p: &str, replicas: &[&str]) {
     panic!("set the map: {last:?}");
 }
 
-/// Table `r` on p3 alone, through the writer at `port`.
+/// Table `r` on p3 alone, through the writer at `port`: retried while a node that just
+/// started is still taking its peers' maps (the restarted-node rig).
 async fn table_on_p3(port: u16) {
+    for _ in 0..100 {
+        match try_table_on_p3(port).await {
+            Ok(()) => return,
+            Err(e) if e.code() == tonic::Code::Unavailable => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    panic!("table r was never created on p3");
+}
+
+async fn try_table_on_p3(port: u16) -> Result<(), tonic::Status> {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
         .connect()
@@ -77,7 +91,7 @@ async fn table_on_p3(port: u16) {
             }),
         })
         .await
-        .unwrap();
+        .map(|_| ())
 }
 
 /// How many bootstraps the follower of the replica copy in `dir` has finished.
@@ -294,6 +308,8 @@ fn a_stamp_onto_a_node_holding_the_partitions_replica_is_refused() {
                 to_epoch: 2,
                 restore: false,
                 restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
             })
             .await
             .unwrap_err();
@@ -396,7 +412,11 @@ fn a_replica_copy_follows_a_moved_owner_without_bootstrapping_again() {
         .await
         .unwrap();
         let after = put_after_move(ports[0], "r", "k2").await;
-        eventually(
+        // The copy retried its old owner while the partition moved, its pause doubling up
+        // to the follower's MAX_BACKOFF (10 s), and a map change doesn't wake it: a wait
+        // past that, not `eventually`'s 5 s (#2015, a flake under a loaded full run).
+        eventually_within(
+            Duration::from_secs(30),
             "a's replica of p3 to follow b past a write there",
             async || {
                 copy_of(ports[0], "p3").await.is_some_and(|lp| {
@@ -439,7 +459,11 @@ fn a_replica_copy_bootstraps_again_after_a_relocate_without_copy() {
         .unwrap();
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
         let after = put_after_move(ports[0], "r", "k2").await;
-        eventually(
+        // The copy retried its old owner while the partition moved, its pause doubling up
+        // to the follower's MAX_BACKOFF (10 s), and a map change doesn't wake it: a wait
+        // past that, not `eventually`'s 5 s (#2015, a flake under a loaded full run).
+        eventually_within(
+            Duration::from_secs(30),
             "a's replica of p3 to follow b past a write there",
             async || {
                 copy_of(ports[0], "p3").await.is_some_and(|lp| {
@@ -758,4 +782,520 @@ fn an_idle_owners_replica_stays_fresh() {
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
         assert_eq!(by.as_deref(), Some("replica"));
     });
+}
+
+/// The map as node `port` has it: P's node, epoch, history epoch and replicas.
+async fn placed(port: u16, p: &str) -> (String, u64, u64, Vec<String>) {
+    let m = client(port)
+        .await
+        .get_map(GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let q = m.partitions.into_iter().find(|q| q.id == p).unwrap();
+    (q.node, q.epoch, q.history_epoch, q.replicas)
+}
+
+/// D328 PR 3: a planned promotion. With p3 closed on its owner c (which releases its
+/// lease), `phdb cluster promote p3 --to a` makes a's replica the owner at the next epoch
+/// with a new history: the rows c had are there, writes land on a, and nothing is lost.
+#[test]
+fn a_planned_promotion_makes_the_replica_the_owner() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let last = put_in(ports[1], "r", "k2").await;
+        eventually("a's copy to apply k2", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        let (node, epoch, history, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        assert!(replicas.is_empty(), "{replicas:?}");
+        // The rows the owner had, and a write after it, on a.
+        let after = put_after_move(ports[1], "r", "k3").await;
+        assert!(after > 0);
+        for row in ["k1", "k2", "k3"] {
+            let (value, _, _) = read_through(ports[1], row, None, None).await.unwrap();
+            assert_eq!(value.as_deref(), Some(&b"v"[..]), "{row}");
+        }
+        // Run again: done.
+        let again = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+        ))
+        .await
+        .unwrap();
+        assert!(again.document.contains_key("done"), "{:?}", again.document);
+    });
+}
+
+/// A promotion to a node that holds no replica of the partition is refused, and so is one
+/// whose owner still serves it.
+#[test]
+fn a_promotion_needs_a_replica_and_an_owner_that_stopped_serving() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+        ))
+        .await
+        .err()
+        .expect("the owner still serves p3");
+        assert!(
+            e.message().contains("isn't fenced or closed"),
+            "{}",
+            e.message()
+        );
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "b",
+            true,
+        ))
+        .await
+        .err()
+        .expect("b holds no replica of p3");
+        assert!(
+            e.message().contains("answers and serves") || e.message().contains("no copy"),
+            "{}",
+            e.message()
+        );
+    });
+}
+
+/// `--old-unreachable`: c, p3's owner, stops (real 1.5 s leases here). The promotion goes
+/// ahead, reports the loss as unknown, and a serves p3 once c's lease has run out.
+#[test]
+fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (mut stops, ports) = three_leased(&rt, &dirs);
+    rt.block_on(async {
+        table_on_p3(ports[0]).await;
+        let first = put_after_move(ports[1], "r", "k1").await;
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's copy to apply k1", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+    });
+    let _ = stops.remove(2).send(());
+    rt.block_on(async {
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            true,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("unknown")),
+            "{:?}",
+            r.document
+        );
+        let after = put_after_move(ports[1], "r", "k2").await;
+        assert!(after > 0);
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// S4 (D328 PR 3): a move of p3 onto a, which holds p3's replica, takes a out of p3's
+/// replicas and closes its copy first, then moves p3 there as any move does: its rows and
+/// history come along, and the copy's file went aside.
+#[test]
+fn a_move_onto_a_replicas_node_takes_it_out_of_the_replicas_first() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let (_, _, history_before, _) = placed(ports[1], "p3").await;
+        within(super::super::moving::run(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+        let (node, epoch, history, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("a", 2));
+        assert_eq!(history, history_before, "a move keeps p3's history");
+        assert!(replicas.is_empty(), "{replicas:?}");
+        let after = put_after_move(ports[1], "r", "k2").await;
+        assert!(after > 0);
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// A promotion that stopped after its stamp, before its map (a crash there): a's file is
+/// at the next epoch, a primary, out of p3's replicas, and the map still gives p3 to c.
+/// Run again, it finishes: no second stamp, and the map gives a the partition.
+#[test]
+fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1), "the map didn't move");
+        assert!(replicas.is_empty(), "{replicas:?}");
+        let r = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let (node, epoch, history, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        // a opens p3 once it holds the map: until then a read answers Unavailable.
+        eventually("a to serve k1 from the promoted p3", async || {
+            read_through(ports[1], "k1", None, None)
+                .await
+                .is_ok_and(|(value, _, _)| value.as_deref() == Some(&b"v"[..]))
+        })
+        .await;
+    });
+}
+
+/// simp724's M1 on #2007: a promote that stopped after its stamp doesn't overwrite a map
+/// someone changed since. Here a set-map put a back in p3's replicas: the rerun refuses,
+/// says what it found, and the map stays as that set-map left it.
+#[test]
+fn a_promotion_doesnt_overwrite_a_map_changed_since_its_stamp() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        set_replicas(ports[0], "p3", &["a"]).await;
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("the map changed");
+        assert!(e.message().contains("the map changed"), "{}", e.message());
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1));
+        assert_eq!(replicas, vec!["a".to_owned()]);
+    });
+}
+
+/// simp724's M1 on #2007, the rerun's side: a promote stopped after its stamp, then a
+/// set-map moved p3's epoch on (p3 still on c). The rerun reads the new epoch, so a's file
+/// looks like an unstamped copy at it; the stamp refuses a file that's already a primary, and
+/// the map stays as the set-map left it.
+#[test]
+fn a_promotion_rerun_refuses_once_the_map_moved_past_its_stamp() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        // A set-map: p3's epoch 1 -> 2, still on c.
+        let mut m = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let expected = m.map_version;
+        m.map_version += 1;
+        for q in m.partitions.iter_mut().filter(|q| q.id == "p3") {
+            q.epoch += 1;
+        }
+        client(ports[0])
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        eventually("a to hold p3 at epoch 2 in its map", async || {
+            placed(ports[1], "p3").await.1 == 2
+        })
+        .await;
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("a's file is already a primary");
+        assert!(e.message().contains("already a primary"), "{}", e.message());
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 2), "the set-map's map stays");
+        assert!(replicas.is_empty(), "{replicas:?}");
+    });
+}
+
+/// Every row of a scan of `r` through node `port`, with the staleness bound, a page at most
+/// `page_bytes`: the rows' keys in order, and each page's `served_seqno`.
+async fn scan_through(port: u16, max_lag_ms: u64, page_bytes: u64) -> (Vec<Vec<u8>>, Vec<u64>) {
+    let mut req = tonic::Request::new(crate::serve::proto::ScanRequest {
+        table: "r".into(),
+        page_bytes,
+        ..Default::default()
+    });
+    req.metadata_mut().insert(
+        crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+        max_lag_ms.to_string().parse().unwrap(),
+    );
+    let mut stream = data(port).await.scan(req).await.unwrap().into_inner();
+    let (mut keys, mut served) = (Vec::new(), Vec::new());
+    while let Some(page) = stream.message().await.unwrap() {
+        served.push(page.served_seqno);
+        for row in page.rows {
+            if keys.last() != Some(&row.key.to_vec()) {
+                keys.push(row.key.to_vec());
+            }
+        }
+    }
+    (keys, served)
+}
+
+/// D328 PR 2b: a scan sent with the bound reads p3's pages from its replica, each page
+/// with the seqno it was read at; and when the replica falls behind partway (the seam),
+/// the rest of p3 comes from the owner, from the last page's position: every row once, in
+/// order.
+#[test]
+fn a_bounded_scan_reads_a_replica_and_goes_on_at_the_owner_if_it_falls_behind() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let mut last = 0;
+        for i in 0..40 {
+            last = put_in(ports[1], "r", &format!("k{i:03}")).await;
+        }
+        eventually("a's copy to apply the rows", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        let want: Vec<Vec<u8>> = (0..40).map(|i| format!("k{i:03}").into_bytes()).collect();
+        // k1 from `following` sorts first.
+        let want = std::iter::once(b"k1".to_vec())
+            .chain(want)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (keys, served) = scan_through(ports[1], 60_000, 256).await;
+        assert_eq!(keys, want);
+        assert!(served.iter().any(|&s| s >= last), "{served:?}");
+        // The replica falls behind after 2 pages: the rest is the owner's.
+        crate::serve::service::BEHIND_AFTER_PAGES
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), 2));
+        let (keys, _) = scan_through(ports[1], 60_000, 256).await;
+        assert_eq!(keys, want, "every row once, in order");
+    });
+    crate::serve::service::BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != dirs[0]);
+}
+
+/// D328 PR 2b: with p3's owner (c) stopped, reads that allow staleness still answer from
+/// p3's replica on a (fresh within the bound for a while yet): a multi-get's part, a scan's
+/// pages and a get. The same multi-get without the header can't be served.
+#[test]
+fn bounded_reads_answer_from_the_replica_while_the_owner_is_down() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, mut stops, _dbs) = following(&rt);
+    // Fresh first (a bounded read is the replica's), then the owner goes.
+    rt.block_on(eventually("a's copy to be fresh", async || {
+        read_through(ports[1], "k1", Some(60_000), None)
+            .await
+            .is_ok_and(|(_, by, _)| by.as_deref() == Some("replica"))
+    }));
+    let _ = stops.remove(2).send(());
+    rt.block_on(async {
+        let multi_get = |bound: bool| {
+            let mut req = tonic::Request::new(crate::serve::proto::MultiGetRequest {
+                table: "r".into(),
+                keys: vec![b"k1".to_vec().into()],
+                ..Default::default()
+            });
+            if bound {
+                req.metadata_mut().insert(
+                    crate::serve::replica::READ_REPLICA_MAX_LAG_MS,
+                    "60000".parse().unwrap(),
+                );
+            }
+            req
+        };
+        let got = data(ports[1])
+            .await
+            .multi_get(multi_get(true))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.rows.len(), 1, "{got:?}");
+        let (keys, _) = scan_through(ports[1], 60_000, 4096).await;
+        assert_eq!(keys, vec![b"k1".to_vec()]);
+        let (value, by, _) = read_through(ports[1], "k1", Some(60_000), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (value.as_deref(), by.as_deref()),
+            (Some(&b"v"[..]), Some("replica"))
+        );
+        assert!(
+            data(ports[1])
+                .await
+                .multi_get(multi_get(false))
+                .await
+                .is_err(),
+            "without the header it's the stopped owner's"
+        );
+    });
+}
+
+/// simp724's S1 on #2001: a scan never goes back in time across a source change. a and b
+/// both hold p3's replica; b's copy stops applying (a seam: still fresh within the read's
+/// bound), and rows written then are a's only. a falls behind
+/// after 2 pages (the seam): b's first page would be older than what a sent, so b is left
+/// too, and the owner finishes. Every row once, in order, and no page older than one before.
+#[test]
+fn a_scan_never_goes_back_in_time_across_a_source_change() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        set_replicas(ports[0], "p3", &["a", "b"]).await;
+        let first = put_in(ports[2], "r", "k0").await;
+        eventually("b's copy to apply k0", async || {
+            copy_of(ports[1], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+        // Fresh first: an idle owner's heartbeats name the frontier b has applied through.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // b's copy applies nothing from here: rows after it are a's (and c's) only.
+        crate::serve::replica::HOLD_APPLIES
+            .lock()
+            .unwrap()
+            .push(dirs[1].clone());
+        let mut last = 0;
+        for i in 0..40 {
+            last = put_in(ports[2], "r", &format!("k{i:03}")).await;
+        }
+        eventually("a's copy to apply the rows", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        crate::serve::service::BEHIND_AFTER_PAGES
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), 2));
+        let (keys, served) = scan_through(ports[2], 60_000, 256).await;
+        let want: std::collections::BTreeSet<Vec<u8>> = std::iter::once(b"k0".to_vec())
+            .chain(std::iter::once(b"k1".to_vec()))
+            .chain((0..40).map(|i| format!("k{i:03}").into_bytes()))
+            .collect();
+        assert_eq!(keys, want.into_iter().collect::<Vec<_>>());
+        assert!(
+            served.windows(2).all(|w| w[0] <= w[1] || w[1] == 0),
+            "a page older than one before it: {served:?}"
+        );
+    });
+    crate::serve::replica::HOLD_APPLIES
+        .lock()
+        .unwrap()
+        .retain(|d| *d != dirs[1]);
+    crate::serve::service::BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != dirs[0]);
 }

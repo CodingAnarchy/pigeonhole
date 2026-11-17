@@ -133,6 +133,11 @@ message ScanPage {
   // With `allow_partial`, on a cluster node: the partitions skipped since the page before
   // (D317 §7).
   repeated MissingRange missing = 4;
+  // On a cluster scan sent with `x-pigeonhole-read-replica-max-lag-ms` (D328): the seqno
+  // its partition's page was read at, in the owner's numbering (a replica's applied seqno
+  // after the page, or the owner's visible seqno after it); 0 otherwise. A scan's pages may
+  // come from different replicas and partitions, so it's per page.
+  uint64 served_seqno = 5;
 }
 
 message MutateRequest {
