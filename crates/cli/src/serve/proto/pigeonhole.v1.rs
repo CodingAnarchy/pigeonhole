@@ -7311,7 +7311,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7385,6 +7385,11 @@ pub mod forward_request {
         TextPut(super::TextPutRequest),
         #[prost(message, tag = "29")]
         TextDelete(super::TextDeleteRequest),
+        /// One partition's part of a rebuild across an index's partitions (#1722 PR 2c): the
+        /// client's request as it is, on the partition `partition` names. A write, served as
+        /// the partition's own `Text.Rebuild`.
+        #[prost(message, tag = "30")]
+        TextRebuild(super::TextIndexRequest),
         /// As `vector_verify`.
         #[prost(message, tag = "31")]
         TextVerify(super::TextIndexRequest),
@@ -7558,7 +7563,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -7599,6 +7604,9 @@ pub mod forward_response {
         VectorSearch(super::VectorSearchResponse),
         #[prost(message, tag = "14")]
         VectorVerify(super::VectorVerifyResponse),
+        /// A rebuild's part (#1722 PR 2c).
+        #[prost(message, tag = "15")]
+        TextRebuild(super::TextRebuildResponse),
         #[prost(message, tag = "16")]
         TextVerify(super::TextVerifyResponse),
         /// A text search's two rounds (#1722 PR 2b).

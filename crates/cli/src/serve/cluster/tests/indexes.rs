@@ -364,13 +364,9 @@ fn an_index_created_through_any_node_holds_each_partitions_range() {
             .unwrap_err();
         assert_eq!(code(&e), "TableNotFound", "{e}");
 
-        // Rebuilds across partitions come with PR 2.
-        let e = text.rebuild(ut()).await.unwrap_err();
-        assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(
-            e.message().contains("isn't supported on a cluster yet"),
-            "{e}"
-        );
+        // A rebuild runs on every partition, the counts summed (PR 2c): nothing to change.
+        let r = text.rebuild(ut()).await.unwrap().into_inner();
+        assert_eq!((r.documents, r.changed), (2, 0));
 
         // The followed table stays while its indexes do (#1916's rule).
         let mut schema = SchemaClient::new(channel(b).await);
@@ -671,6 +667,10 @@ fn a_node_owning_two_partitions_of_an_index_serves_each_part_on_its_own() {
     });
 }
 
+/// How long a test waits for a new text index's background fill: far longer than a small
+/// source takes, for a loaded runner (audit120 on #2029).
+const FILL: Duration = Duration::from_secs(30);
+
 /// `Text.Put` through `port`, tried again while the partitions are still making the index
 /// at their reconcile.
 async fn put_text(port: u16, index: &str, id: &str, text: &str) {
@@ -743,7 +743,7 @@ fn a_text_search_across_partitions_scores_as_one_index() {
     // A new index fills from its source in the background, and a strict search on a
     // partition still filling answers Unavailable, so each step waits for its fill.
     let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
-        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.rebuild_pending().unwrap())
+        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.fill_pending().unwrap())
     };
     let reference = test_dir();
     let db = pigeonhole::Pigeonhole::open(reference.join("ref.db"), pigeonhole::Options::default())
@@ -791,7 +791,7 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             .create_index(text_index("ut"))
             .await
             .unwrap();
-        eventually("both partitions fill ut", async || {
+        eventually_within(FILL, "both partitions fill ut", async || {
             filled(&p1, "ut") && filled(&p2, "ut")
         })
         .await;
@@ -891,7 +891,7 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             })
             .await
             .unwrap();
-        eventually("p1 fills st", async || filled(&p1, "st")).await;
+        eventually_within(FILL, "p1 fills st", async || filled(&p1, "st")).await;
         for (id, text) in docs.iter().take(30) {
             put_text(c, "st", id, text).await;
         }
@@ -939,7 +939,7 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             })
             .await
             .unwrap();
-        eventually("p2 fills st2", async || filled(&p2, "st2")).await;
+        eventually_within(FILL, "p2 fills st2", async || filled(&p2, "st2")).await;
         put_text(c, "st2", "x1", "alpha pad").await;
 
         // b (p2, from "m") stops. A search needs every partition's statistics, so even one
@@ -1008,5 +1008,125 @@ fn a_text_search_across_partitions_scores_as_one_index() {
             ),
             ("p2", "st2")
         );
+    });
+}
+
+/// #1722 PR 2c: `Text.Rebuild` through any node rebuilds the index on every partition and
+/// sums the counts. The partitions one node serves rebuild in turn (a node's one rebuild
+/// slot refuses a second at once), and a rebuild leaves the index searchable, strictly. A
+/// partition that can't be reached fails the call, naming it.
+#[test]
+fn a_text_rebuild_runs_on_every_partition_of_its_index() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // a serves p1 and p3, b p2; the databases are p1's, p3's and p2's.
+    let (mut stops, dbs, [_a, b, c], _) = nodes(&rt, true);
+    let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.fill_pending().unwrap())
+    };
+    let documents = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index)
+            .unwrap()
+            .verify()
+            .unwrap()
+            .documents
+    };
+    // Source rows written around the index, as a client writing the table directly does:
+    // only a rebuild indexes them.
+    let around = |db: &pigeonhole::Pigeonhole, table: &str, first: char| {
+        let t = db.table(table).unwrap().open().unwrap();
+        for i in 0..20 {
+            t.mutate(format!("{first}{i:02}").as_bytes())
+                .put("f", b"body", b"alpha pad")
+                .commit()
+                .unwrap();
+        }
+    };
+    rt.block_on(async {
+        users_family(c).await;
+        // `two`, split at "m" over p1 and p3: both a's.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "two".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: vec![b"m".to_vec().into()],
+                    partitions: vec!["p1".into(), "p3".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut api = TextClient::new(channel(c).await);
+        api.create_index(text_index("ut")).await.unwrap();
+        api.create_index(CreateTextIndexRequest {
+            source_table: "two".into(),
+            ..text_index("tt")
+        })
+        .await
+        .unwrap();
+        let [p1, p3, p2] = &dbs[..] else {
+            unreachable!()
+        };
+        eventually_within(FILL, "every partition fills ut and tt", async || {
+            filled(p1, "ut") && filled(p2, "ut") && filled(p1, "tt") && filled(p3, "tt")
+        })
+        .await;
+        around(p1, "users", 'a');
+        around(p2, "users", 'n');
+        around(p1, "two", 'a');
+        around(p3, "two", 'n');
+        assert_eq!((documents(p1, "ut"), documents(p2, "ut")), (0, 0));
+
+        // Across a's and b's partitions, through c.
+        let r = api
+            .rebuild(TextIndexRequest { index: "ut".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.documents, r.changed, r.invalid_utf8), (40, 40, 0));
+        assert_eq!((documents(p1, "ut"), documents(p2, "ut")), (20, 20));
+        let hits = api
+            .search(crate::serve::proto::TextSearchRequest {
+                index: "ut".into(),
+                query: Some(crate::serve::proto::text_search_request::Query::Syntax(
+                    "alpha".into(),
+                )),
+                k: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hits.hits.len(), 40);
+        assert!(!hits.partial);
+
+        // Both of tt's partitions on a, in turn, through b. Again, nothing changes.
+        let mut through_b = TextClient::new(channel(b).await);
+        let r = through_b
+            .rebuild(TextIndexRequest { index: "tt".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.documents, r.changed), (40, 40));
+        assert_eq!((documents(p1, "tt"), documents(p3, "tt")), (20, 20));
+        let r = api
+            .rebuild(TextIndexRequest { index: "tt".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.documents, r.changed), (40, 0));
+
+        // b (p2) stops: ut's rebuild fails, naming p2.
+        stops.remove(1).send(()).unwrap();
+        let e = api
+            .rebuild(TextIndexRequest { index: "ut".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("partition p2"), "{e}");
     });
 }

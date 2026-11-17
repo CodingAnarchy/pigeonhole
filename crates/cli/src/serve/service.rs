@@ -2521,6 +2521,11 @@ impl Service {
         op: ServiceOp,
         caller: &Caller,
     ) -> Result<ServiceReply, ApiError> {
+        // A rebuild's part (#1722 PR 2c) is a write: the partition's own `Text.Rebuild`,
+        // admitted, gated and fenced as one.
+        if matches!(op, ServiceOp::TextRebuild(_)) {
+            return Box::pin(self.call(op, caller, None)).await;
+        }
         // The caller's scope, as admission checks it; the budget is the fanning-out node's.
         self.check(&op.admit(), caller)?;
         // Its partition's lease, before the read and again after it took its snapshot
@@ -5311,8 +5316,11 @@ fn create_in(
 /// creates its indexes unfilled, and fills them from the source in the background (#1722
 /// PR 1a). Until then its statistics and hits would be short. `Unavailable`, which an
 /// `allow_partial` search skips as it does an unreachable partition.
+///
+/// The fill only, never a client's `Text.Rebuild` (#1722 PR 2c): a rebuild leaves every
+/// document indexed while it runs, as on a single node, where searches go on throughout.
 fn filled(index: &pigeonhole_text::Index, name: &str) -> Result<(), ApiError> {
-    if index.rebuild_pending()? {
+    if index.fill_pending()? {
         return Err(ApiError::unavailable(format!(
             "text index {name:?} is still filling from its source on this partition"
         )));
@@ -5376,6 +5384,20 @@ mod text_part_tests {
         index
             .resume_rebuild_with(|_| std::ops::ControlFlow::Continue(()))
             .unwrap();
+        filled(&index, "x").unwrap();
+        // A client's rebuild (#1722 PR 2c), here stopped after its first document, leaves
+        // a rebuild pending but every document indexed: the partition still answers.
+        for id in [b"a", b"b"] {
+            table
+                .mutate(id)
+                .put("f", b"body", b"alpha")
+                .commit()
+                .unwrap();
+        }
+        let r = index
+            .rebuild_with(|_| std::ops::ControlFlow::Break(()))
+            .unwrap();
+        assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
         filled(&index, "x").unwrap();
     }
 }

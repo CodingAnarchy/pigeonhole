@@ -6711,6 +6711,9 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::TextDelete(v) => {
                     struct_ser.serialize_field("text_delete", v)?;
                 }
+                forward_request::Op::TextRebuild(v) => {
+                    struct_ser.serialize_field("text_rebuild", v)?;
+                }
                 forward_request::Op::TextVerify(v) => {
                     struct_ser.serialize_field("text_verify", v)?;
                 }
@@ -6813,6 +6816,8 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "textPut",
             "text_delete",
             "textDelete",
+            "text_rebuild",
+            "textRebuild",
             "text_verify",
             "textVerify",
             "text_stats",
@@ -6867,6 +6872,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             CreateTextIndex,
             TextPut,
             TextDelete,
+            TextRebuild,
             TextVerify,
             TextStats,
             TextSearch,
@@ -6932,6 +6938,7 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "createTextIndex" | "create_text_index" => Ok(GeneratedField::CreateTextIndex),
                             "textPut" | "text_put" => Ok(GeneratedField::TextPut),
                             "textDelete" | "text_delete" => Ok(GeneratedField::TextDelete),
+                            "textRebuild" | "text_rebuild" => Ok(GeneratedField::TextRebuild),
                             "textVerify" | "text_verify" => Ok(GeneratedField::TextVerify),
                             "textStats" | "text_stats" => Ok(GeneratedField::TextStats),
                             "textSearch" | "text_search" => Ok(GeneratedField::TextSearch),
@@ -7202,6 +7209,13 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextDelete)
 ;
                         }
+                        GeneratedField::TextRebuild => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textRebuild"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextRebuild)
+;
+                        }
                         GeneratedField::TextVerify => {
                             if op__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("textVerify"));
@@ -7360,6 +7374,9 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::VectorVerify(v) => {
                     struct_ser.serialize_field("vector_verify", v)?;
                 }
+                forward_response::Reply::TextRebuild(v) => {
+                    struct_ser.serialize_field("text_rebuild", v)?;
+                }
                 forward_response::Reply::TextVerify(v) => {
                     struct_ser.serialize_field("text_verify", v)?;
                 }
@@ -7422,6 +7439,8 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "vectorSearch",
             "vector_verify",
             "vectorVerify",
+            "text_rebuild",
+            "textRebuild",
             "text_verify",
             "textVerify",
             "text_stats",
@@ -7456,6 +7475,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             Table,
             VectorSearch,
             VectorVerify,
+            TextRebuild,
             TextVerify,
             TextStats,
             TextSearch,
@@ -7501,6 +7521,7 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "table" => Ok(GeneratedField::Table),
                             "vectorSearch" | "vector_search" => Ok(GeneratedField::VectorSearch),
                             "vectorVerify" | "vector_verify" => Ok(GeneratedField::VectorVerify),
+                            "textRebuild" | "text_rebuild" => Ok(GeneratedField::TextRebuild),
                             "textVerify" | "text_verify" => Ok(GeneratedField::TextVerify),
                             "textStats" | "text_stats" => Ok(GeneratedField::TextStats),
                             "textSearch" | "text_search" => Ok(GeneratedField::TextSearch),
@@ -7637,6 +7658,13 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                                 return Err(serde::de::Error::duplicate_field("vectorVerify"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::VectorVerify)
+;
+                        }
+                        GeneratedField::TextRebuild => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textRebuild"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::TextRebuild)
 ;
                         }
                         GeneratedField::TextVerify => {

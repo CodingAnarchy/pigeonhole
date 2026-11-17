@@ -737,11 +737,13 @@ impl Router {
                 ServiceOp::Scan(_) => {
                     return self.fan_scan(cluster, op, caller, prepaid, None).await;
                 }
-                // A search or check across an index's partitions (#1722 PR 1b).
+                // A search or check across an index's partitions (#1722 PR 1b), and a
+                // text index's rebuild (PR 2c).
                 ServiceOp::VectorSearch(_)
                 | ServiceOp::VectorVerify(_)
                 | ServiceOp::TextVerify(_)
-                | ServiceOp::TextSearch(_) => {
+                | ServiceOp::TextSearch(_)
+                | ServiceOp::TextRebuild(_) => {
                     let deadline = deadline.map_or_else(
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
@@ -1737,19 +1739,17 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
             "Vectors.BulkLoad isn't supported on a cluster yet",
         )),
-        ServiceOp::TextRebuild(_) => Err(ApiError::unsupported(
-            "Text.Rebuild isn't supported on a cluster yet",
-        )),
         // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
         // schema change (the map writer's), a schema read, a read that fans out, a
         // subscription and a backup.
         op if map_schema_change(op) => Err(unrouted()),
         // Fanned out across the index's partitions by `dispatch`, each part naming its
         // partition (#1722 PR 1b): [`index_part_route`].
-        // A text search's two rounds (#1722 PR 2b) too.
+        // A text search's two rounds (#1722 PR 2b) too, and a rebuild (PR 2c).
         ServiceOp::VectorSearch(_)
         | ServiceOp::VectorVerify(_)
         | ServiceOp::TextVerify(_)
+        | ServiceOp::TextRebuild(_)
         | ServiceOp::TextSearch(_)
         | ServiceOp::TextStats(_)
         | ServiceOp::TextSearchPart(_) => Err(unrouted()),
@@ -1784,7 +1784,7 @@ fn index_part_route(routes: &Routes, op: &ServiceOp, partition: &str) -> Result<
     let index: &str = match op {
         ServiceOp::VectorSearch(r) => &r.index,
         ServiceOp::VectorVerify(r) => &r.index,
-        ServiceOp::TextVerify(r) => &r.index,
+        ServiceOp::TextVerify(r) | ServiceOp::TextRebuild(r) => &r.index,
         // A text search's rounds carry the client's search: one without it is malformed,
         // not a part for another map (simp724's R1 on #2029).
         ServiceOp::TextStats(super::proto::TextStatsRequest { search, .. })
@@ -2112,6 +2112,8 @@ mod tests {
         });
         let verify =
             ServiceOp::TextVerify(super::super::proto::TextIndexRequest { index: "uv".into() });
+        let rebuild =
+            ServiceOp::TextRebuild(super::super::proto::TextIndexRequest { index: "uv".into() });
         // A text search's two rounds (#1722 PR 2b) name the index inside their search.
         let text = || super::super::proto::TextSearchRequest {
             index: "uv".into(),
@@ -2124,7 +2126,7 @@ mod tests {
             search: Some(text()),
             stats: Default::default(),
         });
-        for op in [&search, &verify, &stats, &part] {
+        for op in [&search, &verify, &rebuild, &stats, &part] {
             assert_eq!(index_part_route(&routes, op, "p2").unwrap(), "p2");
             let e = index_part_route(&routes, op, "p3").unwrap_err();
             assert_eq!(e.code, "WrongPartition", "{}", e.message);

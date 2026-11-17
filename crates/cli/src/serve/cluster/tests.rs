@@ -1446,7 +1446,8 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
         assert!(keys.contains(&b"alice".to_vec()) && keys.contains(&b"zed".to_vec()));
-        // Calls a later ticket brings are refused, naming it.
+        // A text index's rebuild fans out across the index's partitions (#1722 PR 2c): a
+        // table that isn't an index in the map has none.
         let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))
             .unwrap()
             .connect()
@@ -1458,8 +1459,8 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             })
             .await
             .unwrap_err();
-        assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("Text.Rebuild"), "{e}");
+        assert_eq!(code(&e), "TableNotFound", "{e}");
+        assert!(e.message().contains("isn't in the cluster map"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {
