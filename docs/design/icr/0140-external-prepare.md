@@ -15,7 +15,7 @@ The engine's cross-shard 2PC (D263) does all of that inside one commit call, but
 The feature is hidden from the docs and outside the semver promise, as `__unstable-replication` is. `phdb serve` is its one caller.
 
 - **`Transaction::prepare(self, xid, durability) -> Result<Prepared>`:**
-  - It validates the read set and logs the shares, through the PREPARE path even for one shard, and returns once they meet `durability`. Callers ask for GroupSync at least.
+  - It validates the read set and logs the shares, through the PREPARE path even for one shard, and returns once they meet `durability`. Callers ask for GroupSync at least. `Durability::None` is refused (`InvalidArgument`): a `None` decision writes no record, so a crash could bring a decided share back in doubt. A refused round doesn't retry, as a D263 round does: a retry runs as a plain commit, which would commit the share without its decision. The caller hears `Busy` and prepares again.
   - The share then holds its rows, as an undecided D263 share does, until decided.
   - A transaction with no reads and no writes is `InvalidArgument`.
   - A read-only prepare (reads, no writes) validates and holds its reads in memory and logs nothing. `Prepared::release()` answers whether that hold was still in place (`true`) or lost to a reopen, a close or a limit (`false`).
@@ -39,7 +39,7 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 - **Recovery:**
   - Type 5 is stashed with its reads.
   - A Decision with every participant present applies. An Abort drops.
-  - Neither, with every participant present: the share is in doubt. Its `prepared` entries, `pending_rows`/`pending_reads`, `Coord` and registry entry are reinstalled before any write is admitted, and `needed()` keeps its records.
+  - Neither, with every participant present: the share is in doubt. Its `prepared` entries, `pending_rows`/`pending_reads`, `Coord` and registry entry are reinstalled before any write is admitted, and `needed()` keeps its records. The reinstalled PREPARE records the slots its batch writes, as an appended one does, so once decided its record stays needed until they're flushed. A reinstalled share's decision is logged at GroupSync whatever it was prepared at: the type 5 doesn't record its level, and GroupSync is the floor callers ask for.
   - A participant missing: dropped as aborted. That is only a torn tail below GroupSync, a disk that lies, which the guide states.
   - `log_replayed` no longer aborts an in-doubt type 5. `flush_recovered` checkpoints only to the first in-doubt record. A layout change with shares in doubt is refused at open.
   - `max_seqno` counts type 5's id and type 6's `abort_seqno` (E2).
@@ -50,7 +50,7 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
   - A close doesn't wait for external shares; they stay in the WAL.
   - `nothing_in_flight` ignores them.
   - A tablet change (packing, D217) touching an in-doubt share is given up with `Busy` and retried later. A layout change (shard count) or spill at open with shares in doubt is refused with `Unsupported`.
-  - A PREPARE overlapping an in-doubt share fails at once with `Conflict` (a single write with `Busy`), rather than waiting on a decision that may take hours.
+  - A transaction's PREPARE overlapping an in-doubt share fails at once with `Conflict` (any other write, which validates no reads, with `Busy`), rather than waiting on a decision that may take hours.
 - **Visibility:** an undecided share holds neither the visible watermark nor the feed's WRITTEN/SYNCED. Its id is reserved, never held, and its apply seqno is reserved at the decision.
 - **The abort's seqno (E1),** and its four conditions:
   1. The record is in the WAL before the seqno can be visible.
