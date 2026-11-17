@@ -302,6 +302,9 @@ impl Writer {
         match self.direct {
             None => {
                 self.file.write_at(&self.out, at)?;
+                // SCRATCH (#1991): start this chunk's writeback now, so the root commit's
+                // fdatasync of the data file doesn't send a whole output's bytes at once.
+                let _ = self.file.start_writeback(at, self.out.len() as u64);
                 self.flushed += self.out.len() as u64;
                 self.out.clear();
             }

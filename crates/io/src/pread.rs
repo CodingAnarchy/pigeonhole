@@ -583,6 +583,25 @@ impl File for PreadFile {
         self.inner.direct_align
     }
 
+    #[cfg(target_os = "linux")]
+    fn start_writeback(&self, offset: u64, len: u64) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain syscall on an fd owned by this handle.
+        let r = unsafe {
+            libc::sync_file_range(
+                self.inner.file().as_raw_fd(),
+                offset as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(Error::os("sync_file_range", std::io::Error::last_os_error()))
+        }
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.inner.read_at(buf, offset)
     }

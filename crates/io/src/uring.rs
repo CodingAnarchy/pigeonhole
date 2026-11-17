@@ -505,6 +505,10 @@ impl File for UringFile {
         self.file.direct_align()
     }
 
+    fn start_writeback(&self, offset: u64, len: u64) -> Result<()> {
+        self.file.start_writeback(offset, len)
+    }
+
     /// A slot of the registered pool of the ring this thread submits to (a fixed buffer,
     /// read without pinning its pages), or a plain buffer when none is free.
     fn read_buf(&self, len: usize) -> IoBuf {

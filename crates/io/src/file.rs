@@ -110,6 +110,12 @@ pub trait File: Send + Sync + Debug {
     /// Submits a write of `buf` at `offset` and returns at once.
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion;
 
+    /// SCRATCH (#1991): starts writeback of `[offset, offset + len)` without waiting
+    /// (`sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux); a no-op elsewhere.
+    fn start_writeback(&self, _offset: u64, _len: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Makes written data durable (fdatasync / F_FULLFSYNC / FlushFileBuffers).
     ///
     /// Callers may not rely on it to make a length change durable: after `set_len`,
