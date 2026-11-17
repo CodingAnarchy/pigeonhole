@@ -1042,6 +1042,35 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     }
 }
 
+/// `--text-pack`'s counters (#1585): each partition's background pack.
+fn render_text_packs(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
+    type Read = fn(&super::texts::PackCounters) -> u64;
+    let families: [(&str, Read); 4] = [
+        ("pigeonhole_serve_text_pack_passes_total", |c| {
+            c.passes.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_postings_total", |c| {
+            c.postings.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_refused_total", |c| {
+            c.refused.load(Ordering::Relaxed)
+        }),
+        ("pigeonhole_serve_text_pack_conflicts_total", |c| {
+            c.conflicts.load(Ordering::Relaxed)
+        }),
+    ];
+    for (name, read) in families {
+        render_family(
+            out,
+            name,
+            "counter",
+            parts
+                .iter()
+                .map(|(id, part)| (*id, read(&part.texts.packs))),
+        );
+    }
+}
+
 /// A cluster node's partitions' unpinned engine threads (D317 ticket 8a's pinning check):
 /// shard drivers and compaction threads apart (cli692's note on the 8a plan). A single
 /// node's output doesn't change: they're labelled partitions' only.
@@ -1573,7 +1602,18 @@ impl Service {
         }
         if let Some(part) = &self.part {
             part.texts.resume_soon(&self.text_rebuilds);
+            // With `--text-pack`, its indexes are packed in the background too (#1585).
+            part.texts.pack_soon(&self.text_rebuilds);
         }
+    }
+
+    /// `--text-pack` (#1585): this node's partitions pack their text indexes in the
+    /// background. Off unless called: a packed index can't be read by a 1.2 build.
+    pub(crate) fn text_pack(self, on: bool) -> Self {
+        if on {
+            self.text_rebuilds.pack_on();
+        }
+        self
     }
 
     /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
@@ -2475,6 +2515,22 @@ impl Service {
                 .await
                 .map(ServiceReply::Nearest)
                 .map_err(ApiError::for_read),
+            // An index's part (#1722 PR 1b): the partition's own search or check.
+            ServiceOp::VectorSearch(r) => self
+                .vector_search(r)
+                .await
+                .map(ServiceReply::VectorSearch)
+                .map_err(ApiError::for_read),
+            ServiceOp::VectorVerify(r) => self
+                .vector_verify(r)
+                .await
+                .map(ServiceReply::VectorVerify)
+                .map_err(ApiError::for_read),
+            ServiceOp::TextVerify(r) => self
+                .text_verify(r)
+                .await
+                .map(ServiceReply::TextVerify)
+                .map_err(ApiError::for_read),
             ServiceOp::RecallPool(r) => self
                 .recall_pool(r, caller)
                 .await
@@ -2484,7 +2540,8 @@ impl Service {
                 .await
                 .map_err(ApiError::for_read),
             _ => Err(ApiError::internal(
-                "a fan-out's local part is a multi-get, a nearest search or a recall's step",
+                "a fan-out's local part is a multi-get, a nearest search, an index's search or \
+                 check, or a recall's step",
             )),
         }
     }
@@ -2769,6 +2826,9 @@ impl Service {
             let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
         }
         render_bulk(&mut text, parts);
+        if self.text_rebuilds.packs() {
+            render_text_packs(&mut text, parts);
+        }
         render_pinning(&mut text, parts);
         if let Some(replica) = &self.replica {
             replica.render(&mut text);
@@ -3856,6 +3916,34 @@ impl Service {
         opener.open(r, Some(slot), pinned, Some(Arc::clone(&self.metrics)))
     }
 
+    /// A scan of a cluster replica copy (D328 PR 2b): as [`Service::call`] answers one,
+    /// with each page checked against the client's bound `max_lag_ms` in place of a lease
+    /// (S2). Never at a snapshot: the router sends those to the owner.
+    pub(crate) async fn replica_scan(
+        &self,
+        r: proto::ScanRequest,
+        caller: &Caller,
+        max_lag_ms: u64,
+    ) -> Result<ScanPages, ApiError> {
+        let replica = self
+            .replica
+            .clone()
+            .ok_or_else(|| ApiError::internal("a replica scan on a service that isn't one"))?;
+        let op = ServiceOp::Scan(r);
+        let budget = self.admit(&op.admit(), caller, None).await?;
+        let ServiceOp::Scan(r) = op else {
+            unreachable!("made a scan just above")
+        };
+        let slot = self.scan_slot()?;
+        convert::Select::new(r.selection.as_ref())?;
+        let opener = self
+            .scan_opener(&r.table)
+            .await?
+            .bounded(replica, max_lag_ms);
+        drop(budget);
+        opener.open(r, Some(slot), None, Some(Arc::clone(&self.metrics)))
+    }
+
     /// A `--max-scans` slot, or `Overloaded`.
     pub(crate) fn scan_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         Arc::clone(&self.scans)
@@ -3869,7 +3957,7 @@ impl Service {
     pub(crate) async fn scan_opener(&self, table: &str) -> Result<ScanOpener, ApiError> {
         Ok(ScanOpener {
             table: self.table(table).await?,
-            gate: self.gate.clone(),
+            check: self.gate.clone().map(PageCheck::Lease),
             db: self.part()?.db.clone(),
             pool: Arc::clone(&self.blocking),
             reads: Arc::clone(&self.scan_reads),
@@ -4705,10 +4793,64 @@ async fn hold_after_page(table: &str) {
 }
 
 /// A table's scan, ready to start: see [`Service::scan_opener`].
+/// The tests' seam (D328 PR 2b): a replica copy whose database is under one of these
+/// directories reads this many more scan pages, then answers `ReplicaBehind`, as a copy
+/// that fell behind mid-scan would.
+#[cfg(test)]
+pub(crate) static BEHIND_AFTER_PAGES: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn behind_after_pages(db: &std::path::Path) -> Result<(), ApiError> {
+    let mut seam = BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, left)) = seam.iter_mut().find(|(dir, _)| db.starts_with(dir)) {
+        if *left == 0 {
+            return Err(ApiError::replica_behind(
+                "fell behind mid-scan (a test's seam)",
+            ));
+        }
+        *left -= 1;
+    }
+    Ok(())
+}
+
+/// What each page of a cluster partition's scan checks, before it takes its snapshot and
+/// again before it's sent.
+#[derive(Clone, Debug)]
+pub(crate) enum PageCheck {
+    /// The partition's lease, on its owner (D326).
+    Lease(Arc<super::gate::WriteGate>),
+    /// A replica copy's freshness within the client's bound in ms (D328 PR 2b, S2): a page
+    /// past it ends the stream with `ReplicaBehind`, and the entry node continues from the
+    /// last page's position elsewhere.
+    Replica(Arc<super::replica::Replica>, u64),
+}
+
+impl PageCheck {
+    fn check(&self) -> Result<(), ApiError> {
+        match self {
+            Self::Lease(gate) => gate.serving(),
+            Self::Replica(replica, max_lag_ms) => replica.within(*max_lag_ms),
+        }
+    }
+
+    /// The seqno a page was read at, after it (`ScanPage.served_seqno`): a replica's applied
+    /// seqno, or the owner's visible seqno.
+    fn served_seqno(&self, db: &pigeonhole::Pigeonhole) -> u64 {
+        match self {
+            Self::Lease(_) => db.visible_seqno(),
+            Self::Replica(replica, _) => replica.applied_seqno(),
+        }
+    }
+}
+
 pub(crate) struct ScanOpener {
     table: Table,
-    /// A cluster partition's gate: each page needs its lease (D326).
-    gate: Option<Arc<super::gate::WriteGate>>,
+    /// A cluster partition's per-page check: its lease on its owner (D326), or a replica
+    /// copy's bound (D328).
+    check: Option<PageCheck>,
     /// The partition's database, for a page's snapshot when the request pins none.
     db: pigeonhole::Pigeonhole,
     pool: Arc<Semaphore>,
@@ -4718,6 +4860,17 @@ pub(crate) struct ScanOpener {
 }
 
 impl ScanOpener {
+    /// The opener of a replica copy's scan, each page checked against the client's bound
+    /// (D328 PR 2b) in place of a lease.
+    pub(crate) fn bounded(
+        mut self,
+        replica: Arc<super::replica::Replica>,
+        max_lag_ms: u64,
+    ) -> Self {
+        self.check = Some(PageCheck::Replica(replica, max_lag_ms));
+        self
+    }
+
     /// Starts `r`'s scan: its pages, read one ahead at most by a task of its own, then its
     /// error if it fails. A failure before the first page (a bad position) is returned here.
     /// The scan holds `slot` (a `--max-scans` slot) until its task ends: once the server's
@@ -4741,7 +4894,7 @@ impl ScanOpener {
         let task = |pages| {
             ScanTask {
                 table: self.table.clone(),
-                gate: self.gate.clone(),
+                check: self.check.clone(),
                 db: self.db.clone(),
                 r,
                 after,
@@ -4761,7 +4914,7 @@ impl ScanOpener {
 /// A scan's reading side, run as its own task.
 struct ScanTask {
     table: Table,
-    gate: Option<Arc<super::gate::WriteGate>>,
+    check: Option<PageCheck>,
     db: pigeonhole::Pigeonhole,
     r: proto::ScanRequest,
     after: Option<ScanPosition>,
@@ -4791,7 +4944,7 @@ impl ScanTask {
     async fn run(self) -> Result<(), ApiError> {
         let Self {
             table,
-            gate,
+            check,
             db,
             r,
             mut after,
@@ -4821,10 +4974,12 @@ impl ScanTask {
             // A cluster partition's lease, for each page (D326, audit120's M2): before it
             // takes the page's snapshot, and again once the page is read, before it's sent
             // (S3). A page is a read at a snapshot of its own unless the request pins one.
-            if let Some(g) = &gate {
-                g.serving()?;
+            if let Some(c) = &check {
+                c.check()?;
             }
             let pinned_at = pinned.as_ref().map(|p| p.snapshot().clone());
+            // For the page's served seqno, after it's read: a cluster partition's only.
+            let page_db = check.as_ref().map(|_| db.clone());
             let (table, db, req, pos) = (table.clone(), db.clone(), Arc::clone(&r), after.take());
             let thread = Arc::clone(&reads)
                 .acquire_owned()
@@ -4866,9 +5021,17 @@ impl ScanTask {
             })
             .await?;
             drop(thread);
-            if let Some(g) = &gate {
-                g.serving()?;
+            if let Some(c) = &check {
+                c.check()?;
             }
+            #[cfg(test)]
+            if let (Some(PageCheck::Replica(..)), Some(db)) = (&check, &page_db) {
+                behind_after_pages(db.path())?;
+            }
+            let served_seqno = match (&check, &page_db) {
+                (Some(c), Some(db)) => c.served_seqno(db),
+                _ => 0,
+            };
             let continued = continues(last_row.as_deref(), &rows);
             if let Some(n) = remaining {
                 let new_rows = rows.len() as u64 - u64::from(continued);
@@ -4903,6 +5066,7 @@ impl ScanTask {
                     .map(|p| p.to_bytes().into())
                     .unwrap_or_default(),
                 bytes,
+                served_seqno,
             };
             queued = Some(queue_page(space, page, None, &inflight, &limits).await?);
             #[cfg(test)]

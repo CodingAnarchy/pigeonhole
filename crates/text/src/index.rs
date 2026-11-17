@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, ControlFlow};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use pigeonhole::{
     CellRef, Family, Pigeonhole, PigeonholeReader, ReadTable, RetryPolicy, RowRead, Scan, Snapshot,
@@ -12,8 +12,10 @@ use pigeonhole::{
 };
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick, is_nfkc_quick};
 
+use crate::block::{Block, Builder, MAX_POSTINGS, Posting};
 use crate::error::{Error, Result, corrupt};
 use crate::layout::*;
+use crate::merged::find_block;
 use crate::query::Query;
 use crate::search::Search;
 use crate::tokenizer::{Standard, Tokenizer};
@@ -21,6 +23,13 @@ use crate::tokenizer::{Standard, Tokenizer};
 /// Documents one page of a rebuild reads under one snapshot before their transactions run
 /// (#1514): its view lives for the page's scan only.
 const REBUILD_PAGE: u64 = 256;
+
+/// The most posting cells one chunk of a pack takes: one transaction (#1585).
+const PACK_CHUNK: usize = 512;
+/// The fewest postings a pack makes a block of where the term has no block near them: fewer
+/// stay cells until more have gathered, so a term that grows a few postings between packs
+/// isn't cut into blocks of a few.
+const PACK_MIN_RUN: usize = 32;
 
 /// A full-text index over one source column (D309).
 ///
@@ -56,6 +65,9 @@ pub(crate) struct Inner {
     pub(crate) tok: Box<dyn Tokenizer>,
     /// The built-in tokeniser lowercases again after NFKC (D309 rev 6 §A.2).
     builtin: bool,
+    /// `table` opened again, for a handle older than the index's first pack: a table handle
+    /// knows the families of when it was opened, and the first pack adds [`POSTB`].
+    fresh: OnceLock<Rows>,
 }
 
 /// An [`Index`]'s write handles.
@@ -63,6 +75,8 @@ struct Writer {
     db: Pigeonhole,
     table: Table,
     src: Table,
+    /// `table` with the block family ([`Inner::fresh`]'s write side).
+    fresh: OnceLock<Table>,
 }
 
 /// A database handle for reads: a writer's, or a reader process's.
@@ -200,6 +214,12 @@ pub struct IndexStats {
     pub source_mismatch: u64,
     /// Source cells that aren't valid UTF-8 (skipped).
     pub invalid_utf8: u64,
+    /// Postings held in packed blocks (a version 2 index, [`Index::pack`]); the rest of
+    /// `postings` are cells.
+    pub packed: u64,
+    /// Deleted postings not yet removed by a pack (a version 2 index). Information, not a
+    /// mismatch: they cost a search a step each until the next pack.
+    pub tombstones: u64,
 }
 
 impl IndexStats {
@@ -223,6 +243,76 @@ pub struct RebuildStats {
     /// the walk before its end (#1756). The index is consistent, and a later
     /// [`Index::resume_rebuild_with`] carries on.
     pub stopped: bool,
+}
+
+/// How [`Index::pack_with`] runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PackOptions {
+    with_readers: bool,
+}
+
+impl PackOptions {
+    /// The defaults: an index's first pack is refused while reader processes are attached.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lets an index's first pack run while reader processes are attached to the database
+    /// file. Default off.
+    ///
+    /// The first pack moves the index to layout version 2, which a 1.2 build can't read: one
+    /// that has the index open goes on running and fails its searches with `Busy`. The
+    /// database records that a reader is attached, not which build it is, so the pack
+    /// refuses any ([`Error::PackRefused`]). Set this when every attached reader is 1.3 or
+    /// later.
+    pub fn with_readers(mut self, allow: bool) -> Self {
+        self.with_readers = allow;
+        self
+    }
+}
+
+/// What [`Index::pack`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PackStats {
+    /// Terms it took posting cells of.
+    pub terms: u64,
+    /// Postings it moved from cells into blocks.
+    pub postings: u64,
+    /// Deleted postings it removed (tombstones, with the packed postings they hid).
+    pub tombstones: u64,
+    /// Whether the step of [`Index::pack_with`] stopped it before the end. The index is
+    /// consistent, and the next pack carries on from where it stopped.
+    pub stopped: bool,
+}
+
+/// What a pack's chunk found to do.
+struct PackWork {
+    term: Vec<u8>,
+    /// The term's posting cells past the cursor: id, timestamp, value.
+    cells: Vec<(Vec<u8>, u64, u64)>,
+    /// Their position cells: id to timestamp and value.
+    positions: BTreeMap<Vec<u8>, (u64, Vec<u8>)>,
+    /// The blocks their ids fall among, as read: qualifier and value.
+    blocks: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// A posting a pack holds between reading and writing.
+struct Packed {
+    tf: u32,
+    len: u32,
+    positions: Vec<u8>,
+}
+
+/// Whether the index is version 2, from its state cell's value ([`REPAIR`]): `Busy` while a
+/// repair runs.
+pub(crate) fn packed_state(value: &[u8]) -> Result<bool> {
+    if value == PACKED {
+        Ok(true)
+    } else {
+        Err(Error::Busy)
+    }
 }
 
 /// Which walk [`Index::rebuild_inner`] makes.
@@ -383,11 +473,13 @@ impl Index {
                     db: db.clone(),
                     table,
                     src,
+                    fresh: OnceLock::new(),
                 }),
                 source,
                 opts,
                 tok,
                 builtin,
+                fresh: OnceLock::new(),
             }),
         };
         if fill {
@@ -485,11 +577,13 @@ impl Index {
                     db: db.clone(),
                     table,
                     src,
+                    fresh: OnceLock::new(),
                 }),
                 source,
                 opts,
                 tok,
                 builtin,
+                fresh: OnceLock::new(),
             }),
         })
     }
@@ -517,6 +611,53 @@ impl Index {
             .writer
             .as_ref()
             .expect("an Index is built with its write handles")
+    }
+
+    /// The index's table for reads: with the block family in a version 2 index, which a
+    /// handle opened before the first pack gets by opening the table again, once.
+    #[inline]
+    pub(crate) fn rows(&self, packed: bool) -> Result<&Rows> {
+        if !packed {
+            return Ok(&self.inner.table);
+        }
+        self.rows_packed()
+    }
+
+    /// [`rows`](Self::rows) for a version 2 index, out of line.
+    #[inline(never)]
+    fn rows_packed(&self) -> Result<&Rows> {
+        let inn = &*self.inner;
+        if inn.table.family_info(POSTB).is_some() {
+            return Ok(&inn.table);
+        }
+        if let Some(rows) = inn.fresh.get() {
+            return Ok(rows);
+        }
+        let rows = match &inn.db {
+            Handle::W(db) => Rows::W(db.table(inn.table.name())?.open()?),
+            Handle::R(db) => Rows::R(db.table(inn.table.name())?),
+        };
+        if rows.family_info(POSTB).is_none() {
+            return Err(corrupt("a version 2 index has no block family"));
+        }
+        Ok(inn.fresh.get_or_init(|| rows))
+    }
+
+    /// The index's table for writes of blocks, and reads of them in a transaction: the block
+    /// family is added if the table lacks it (a pack's first step).
+    fn block_table(&self) -> Result<&Table> {
+        let w = self.w();
+        if w.table.family_info(POSTB).is_some() {
+            return Ok(&w.table);
+        }
+        if let Some(t) = w.fresh.get() {
+            return Ok(t);
+        }
+        let t =
+            w.db.table(w.table.name())?
+                .family(POSTB, Family::default().max_versions(1))
+                .open()?;
+        Ok(w.fresh.get_or_init(|| t))
     }
 
     /// The index's options.
@@ -547,7 +688,7 @@ impl Index {
     /// written. It fails with `Busy` while a [`repair`](Self::repair) runs: retry after it
     /// finishes.
     pub fn put_in(&self, txn: &mut Transaction, doc: &[u8], text: &str) -> Result<()> {
-        self.check_not_repairing(txn)?;
+        let packed = self.state_in(txn)?;
         let inn = &*self.inner;
         let w = self.w();
         let stored = txn
@@ -565,7 +706,7 @@ impl Index {
             &inn.source.qualifier,
             text.as_bytes(),
         );
-        self.apply(txn, doc, &old, &new, Mode::Put)?;
+        self.apply(txn, doc, &old, &new, Mode::Put, packed)?;
         Ok(())
     }
 
@@ -574,7 +715,7 @@ impl Index {
     /// cell is deleted either way. It fails with `Busy` while a [`repair`](Self::repair) runs:
     /// retry after it finishes.
     pub fn delete_in(&self, txn: &mut Transaction, doc: &[u8]) -> Result<bool> {
-        self.check_not_repairing(txn)?;
+        let packed = self.state_in(txn)?;
         let inn = &*self.inner;
         let w = self.w();
         let old = self.read_forward(txn, doc)?;
@@ -587,10 +728,7 @@ impl Index {
         let t = &w.table;
         for term in old.terms.keys() {
             let row = [POST_PREFIX, term].concat();
-            txn.delete_column(t, &row, POST, doc);
-            if inn.opts.get_positions() {
-                txn.delete_column(t, &row, POS, doc);
-            }
+            Self::unpost(txn, t, &row, doc, inn.opts.get_positions(), packed);
             txn.incr(t, &row, DF, N, -1);
         }
         txn.delete_row(t, &fwd_row(doc))
@@ -664,10 +802,13 @@ impl Index {
         &self,
         step: impl FnMut(&RebuildStats) -> ControlFlow<()>,
     ) -> Result<RebuildStats> {
+        // A stopped pack's cursor goes too: the rebuild writes cells behind it, and the next
+        // pack starts over (#1585).
         self.w()
             .table
             .mutate(GLOBAL)
             .put(META, REBUILD_AFTER, b"")
+            .delete_column(META, PACK_AFTER)
             .commit()?;
         self.rebuild_inner(Walk::Rebuild { from: None }, step)
     }
@@ -691,10 +832,18 @@ impl Index {
         self.rebuild_inner(Walk::Rebuild { from }, step)
     }
 
-    /// The text indexes in `db` with a stopped rebuild pending (#1756): for a server to
-    /// resume them. A point read per table with the index's families; a table dropped since
-    /// the catalog was listed is passed over.
-    pub fn pending_rebuilds(db: &Pigeonhole) -> Result<Vec<String>> {
+    /// The text indexes in `db`, by name (#1585): for a server that packs them in the
+    /// background. A catalog listing: each table with the index's families, none of them
+    /// opened as an index. A table dropped since the catalog was listed is passed over.
+    pub fn list(db: &Pigeonhole) -> Result<Vec<String>> {
+        Ok(Self::index_tables(db)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
+    }
+
+    /// The tables of `db` that have a text index's families, with their names.
+    fn index_tables(db: &Pigeonhole) -> Result<Vec<(String, Table)>> {
         let mut out = Vec::new();
         for name in db.tables() {
             let t = match db.table(&name).and_then(|b| b.open()) {
@@ -705,10 +854,20 @@ impl Index {
             let families = t.families();
             if [POST, DF, TERMS, META, STATS]
                 .iter()
-                .any(|f| !families.contains(f))
+                .all(|f| families.contains(f))
             {
-                continue;
+                out.push((name, t));
             }
+        }
+        Ok(out)
+    }
+
+    /// The text indexes in `db` with a stopped rebuild pending (#1756): for a server to
+    /// resume them. A point read per table with the index's families; a table dropped since
+    /// the catalog was listed is passed over.
+    pub fn pending_rebuilds(db: &Pigeonhole) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (name, t) in Self::index_tables(db)? {
             if t.get(GLOBAL, META, REBUILD_AFTER)?.is_some() {
                 out.push(name);
             }
@@ -729,6 +888,348 @@ impl Index {
             .map(|c| c.value().to_vec()))
     }
 
+    /// Packs the index's postings into blocks (#1585, ICR 0143): each term's posting cells,
+    /// one a document, are moved into blocks of up to 128 postings under them, which a
+    /// search of a common word reads several times faster. Searches and writes go on while
+    /// it runs, and see the same postings throughout.
+    ///
+    /// **Nothing else packs an index.** The first pack moves the index to layout version 2,
+    /// which a 1.2 build can't open: pack only once you won't roll back to 1.2. A 1.2
+    /// build that already has the index open fails its searches and writes with `Busy`
+    /// from then on. So the first pack is refused ([`Error::PackRefused`]) while reader
+    /// processes are attached to the file, unless [`PackOptions::with_readers`] allows it.
+    ///
+    /// **What it does.** Chunk by chunk (a transaction each), it takes a term's posting
+    /// cells, merges them with the blocks their ids fall among, writes the blocks again, and
+    /// removes the cells it read (each only if it is still as read, so a write that lands
+    /// meanwhile stays, and wins). Deleted postings ([`IndexStats::tombstones`]) are removed
+    /// with what they hid. A few postings with no block near them stay cells until more have
+    /// gathered. Writes after a pack are cells again, until the next one.
+    ///
+    /// It carries on from where a stopped pack left off ([`pack_with`](Self::pack_with)),
+    /// and otherwise starts at the first term. `PackRefused` while a rebuild is pending
+    /// ([`rebuild_pending`](Self::rebuild_pending)): finish the rebuild first. `Busy` while
+    /// a repair runs.
+    pub fn pack(&self) -> Result<PackStats> {
+        self.pack_with(PackOptions::new(), |_| ControlFlow::Continue(()))
+    }
+
+    /// [`pack`](Self::pack) with `options`, calling `step` after each chunk with the counts
+    /// so far. A `Break` stops it there: the index is consistent, the result has `stopped`
+    /// set, [`pack_pending`](Self::pack_pending) is true, and the next pack carries on from
+    /// the cursor it keeps in the index.
+    pub fn pack_with(
+        &self,
+        options: PackOptions,
+        mut step: impl FnMut(&PackStats) -> ControlFlow<()>,
+    ) -> Result<PackStats> {
+        self.pack_begin(options)?;
+        let mut stats = PackStats::default();
+        let (mut term, mut at) = (None, None);
+        while self.pack_chunk(&mut stats, &mut term, &mut at)? {
+            if step(&stats).is_break() {
+                stats.stopped = true;
+                break;
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Whether a stopped pack is pending (a cursor is kept): one point read.
+    pub fn pack_pending(&self) -> Result<bool> {
+        Ok(self.w().table.get(GLOBAL, META, PACK_AFTER)?.is_some())
+    }
+
+    /// A pack's first commit: the index becomes version 2 if it wasn't, and a pass's cursor
+    /// is put (empty: from the top) unless a stopped pack left one.
+    fn pack_begin(&self, options: PackOptions) -> Result<()> {
+        let w = self.w();
+        if w.table.get(GLOBAL, META, REPAIR)?.is_none() && !options.with_readers {
+            // Version 1 still. The check and the commit below aren't one step: a reader that
+            // attaches between them isn't seen (the guide's rule covers that, not this).
+            let readers = w.db.engine_metrics().reader_slots_active;
+            if readers > 0 {
+                return Err(Error::PackRefused(format!(
+                    "{readers} reader process(es) are attached to the database file, and the \
+                     first pack moves the index to a layout a 1.2 build can't read. Close \
+                     them (a reader that exited without closing holds its slot until the \
+                     writer reclaims it), or allow it with PackOptions::with_readers once \
+                     every reader is 1.3 or later"
+                )));
+            }
+        }
+        // The block family, before anything can name it.
+        self.block_table()?;
+        let t = &w.table;
+        w.db.transact(&RetryPolicy::default(), |tx| {
+            if tx.get(t, GLOBAL, META, REBUILD_AFTER)?.is_some() {
+                return Err(Tx::Fail(Error::PackRefused(
+                    "a rebuild is pending: finish it first".into(),
+                )));
+            }
+            if !self.state_in(tx)? {
+                tx.put_u64(t, GLOBAL, META, LAYOUT, LAYOUT_PACKED)
+                    .put(t, GLOBAL, META, REPAIR, PACKED);
+            }
+            if tx.get(t, GLOBAL, META, PACK_AFTER)?.is_none() {
+                tx.put(t, GLOBAL, META, PACK_AFTER, b"");
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// One chunk of a pack: `false` once the pass is done (or another pack finished it).
+    /// `term` is the term the last chunk was in, for the count of terms.
+    ///
+    /// `at` is how far the pass has read past the stored cursor (with that cursor): chunks
+    /// with nothing to write, which are most terms of a real vocabulary (a few postings
+    /// each, left as cells), commit nothing, the cursor included. A pass that stops there
+    /// reads them again. After 64 such chunks it returns, so the caller's step still runs.
+    fn pack_chunk(
+        &self,
+        stats: &mut PackStats,
+        term: &mut Option<Vec<u8>>,
+        at: &mut Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<bool> {
+        let w = self.w();
+        let t = self.block_table()?;
+        let rows = self.rows(true)?;
+        let positions = self.inner.opts.get_positions();
+        // The most cells the chunk takes: cut when its transaction runs out of retries, so
+        // a pack beside steady writers of the same documents still gets through.
+        let mut limit = PACK_CHUNK;
+        let mut idle = 0;
+        loop {
+            let Some(cursor) = t.get(GLOBAL, META, PACK_AFTER)?.map(|c| c.value().to_vec()) else {
+                return Ok(false);
+            };
+            let from = match at {
+                Some((stored, read)) if *stored == cursor => read.clone(),
+                _ => cursor.clone(),
+            };
+            // The chunk's cells and blocks at one snapshot, dropped before the transaction
+            // (#1514).
+            let work = {
+                let s = w.db.snapshot()?;
+                self.pack_read(rows, &s, &from, limit)?
+            };
+            let Some(work) = work else {
+                // The pass is done: the cursor goes, unless it moved (another pack's).
+                w.db.transact(&RetryPolicy::default(), |tx| {
+                    let same = tx
+                        .get(t, GLOBAL, META, PACK_AFTER)?
+                        .is_some_and(|c| c.value() == cursor.as_slice());
+                    if same {
+                        tx.delete_column(t, GLOBAL, META, PACK_AFTER);
+                    }
+                    Ok::<_, Tx>(())
+                })?;
+                return Ok(false);
+            };
+            let plan = pack_plan(&work, positions, limit)?;
+            let row = [POST_PREFIX, &work.term[..]].concat();
+            let last = &work.cells.last().expect("a chunk has cells").0;
+            let next = pack_cursor(&work.term, last);
+            if plan.posts.is_empty() && plan.positions.is_empty() && plan.blocks == work.blocks {
+                *at = Some((cursor, next));
+                idle += 1;
+                if idle == 64 {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let done = w.db.transact(&RetryPolicy::default(), |tx| {
+                if !self.state_in(tx)? {
+                    return Err(Tx::Fail(corrupt("a pack met a version 1 index")));
+                }
+                if tx.get(t, GLOBAL, META, REBUILD_AFTER)?.is_some() {
+                    return Err(Tx::Fail(Error::PackRefused(
+                        "a rebuild is pending: finish it first".into(),
+                    )));
+                }
+                // The cursor and the blocks read are read again here (ai1249's C1): only a
+                // pack and a rebuild's reset write them, so two packs, or a pack and a
+                // reset, can't leave overlapping blocks. An ordinary write never conflicts
+                // on them.
+                let same = tx
+                    .get(t, GLOBAL, META, PACK_AFTER)?
+                    .is_some_and(|c| c.value() == cursor.as_slice());
+                if !same {
+                    return Ok(false);
+                }
+                for (q, v) in &work.blocks {
+                    let same = tx
+                        .get(t, &row, POSTB, q)?
+                        .is_some_and(|c| c.value() == v.as_slice());
+                    if !same {
+                        return Ok(false);
+                    }
+                }
+                for (q, _) in &work.blocks {
+                    if !plan.blocks.iter().any(|(nq, _)| nq == q) {
+                        tx.delete_column(t, &row, POSTB, q);
+                    }
+                }
+                for (q, v) in &plan.blocks {
+                    if !work.blocks.iter().any(|(oq, ov)| oq == q && ov == v) {
+                        tx.put(t, &row, POSTB, q, v);
+                    }
+                }
+                // Each cell is read again here and deleted only if it is still the version
+                // the chunk read. One written since stays, and hides the block's posting,
+                // which is then the older one; one written before this commits makes it
+                // conflict and run again. (Not a delete of the version read, by timestamp:
+                // that uncovers the column's older versions, a posting the tombstone or the
+                // overwrite had replaced.)
+                for (family, cells) in [(POST, &plan.posts), (POS, &plan.positions)] {
+                    for (id, ts) in cells {
+                        let same = tx
+                            .get(t, &row, family, id)?
+                            .is_some_and(|c| c.timestamp() == *ts);
+                        if same {
+                            tx.delete_column(t, &row, family, id);
+                        }
+                    }
+                }
+                tx.put(t, GLOBAL, META, PACK_AFTER, &next);
+                Ok::<_, Tx>(true)
+            });
+            let done = match done.map_err(Error::from) {
+                Ok((done, _)) => done,
+                Err(e) if e.code() == pigeonhole::ErrorCode::Conflict && limit > 8 => {
+                    limit = (limit / 8).max(8);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            *at = None;
+            if done {
+                if term.as_deref() != Some(&work.term[..]) {
+                    stats.terms += 1;
+                    *term = Some(work.term);
+                }
+                stats.postings += plan.packed;
+                stats.tombstones += plan.tombstones;
+                return Ok(true);
+            }
+        }
+    }
+
+    /// The next chunk after `cursor`, at `s`: the next term with posting cells, up to
+    /// `limit` of them, their position cells, and the blocks their ids fall among.
+    /// `None` when no posting cell is left.
+    fn pack_read(
+        &self,
+        rows: &Rows,
+        s: &Snapshot,
+        cursor: &[u8],
+        limit: usize,
+    ) -> Result<Option<PackWork>> {
+        let cells_of = |term: &[u8], after: Option<&[u8]>| -> Result<Vec<(Vec<u8>, u64, u64)>> {
+            let row = [POST_PREFIX, term].concat();
+            let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+            let mut cells = rows
+                .row(&row)
+                .family(POST)
+                .qualifier_bounds(start, Bound::Unbounded)
+                .snapshot(s)
+                .cells()?;
+            let mut out = Vec::new();
+            while out.len() < limit {
+                let Some(e) = cells.next()? else {
+                    break;
+                };
+                let v = e
+                    .cell
+                    .as_u64()
+                    .ok_or_else(|| corrupt("a posting isn't a u64"))?;
+                out.push((e.qualifier.to_vec(), e.cell.timestamp(), v));
+            }
+            Ok(out)
+        };
+        let at = unpack_cursor(cursor)?;
+        let mut found = None;
+        if let Some((term, doc)) = at {
+            let cells = cells_of(term, Some(doc))?;
+            if !cells.is_empty() {
+                found = Some((term.to_vec(), cells));
+            }
+        }
+        if found.is_none() {
+            // The next term's row with a posting cell.
+            let after = at.map(|(term, _)| [POST_PREFIX, term].concat());
+            let start = match &after {
+                Some(row) => Bound::Excluded(row.as_slice()),
+                None => Bound::Included(POST_PREFIX),
+            };
+            let end = [POST_PREFIX[0] + 1];
+            let next = {
+                let mut scan = rows
+                    .scan_bounds(start, Bound::Excluded(&end))
+                    .family(POST)
+                    .snapshot(s)
+                    .limit(1)
+                    .iter()?;
+                match scan.next() {
+                    Some(row) => Some(row?.key()[POST_PREFIX.len()..].to_vec()),
+                    None => None,
+                }
+            };
+            let Some(term) = next else {
+                return Ok(None);
+            };
+            let cells = cells_of(&term, None)?;
+            if cells.is_empty() {
+                return Err(corrupt(
+                    "a term's row lost its posting cells within a snapshot",
+                ));
+            }
+            found = Some((term, cells));
+        }
+        let (term, cells) = found.expect("set above");
+        let row = [POST_PREFIX, &term[..]].concat();
+        let (first, last) = (&cells[0].0, &cells[cells.len() - 1].0);
+        let mut positions = BTreeMap::new();
+        if self.inner.opts.get_positions() {
+            let mut read = rows
+                .row(&row)
+                .family(POS)
+                .qualifier_bounds(Bound::Included(first), Bound::Included(last))
+                .snapshot(s)
+                .cells()?;
+            while let Some(e) = read.next()? {
+                positions.insert(
+                    e.qualifier.to_vec(),
+                    (e.cell.timestamp(), e.cell.value().to_vec()),
+                );
+            }
+        }
+        // A block is named by its last id: from the first one that can hold `first`, while
+        // a block starts at or before `last`.
+        let mut blocks = Vec::new();
+        let mut block = Block::default();
+        let mut read = rows
+            .row(&row)
+            .family(POSTB)
+            .qualifier_bounds(Bound::Included(first), Bound::Unbounded)
+            .snapshot(s)
+            .cells()?;
+        while let Some(e) = read.next()? {
+            block.decode(e.cell.value())?;
+            if block.id(0) > last.as_slice() {
+                break;
+            }
+            blocks.push((e.qualifier.to_vec(), e.cell.value().to_vec()));
+        }
+        Ok(Some(PackWork {
+            term,
+            cells,
+            positions,
+            blocks,
+        }))
+    }
+
     /// Rebuilds the index from an emptied table (D309 §3, M2): drops every index row, then
     /// [`rebuild`](Self::rebuild)s. Writes through the index and searches of it fail
     /// with `Busy` until it finishes. If it's interrupted (a crash), the index stays `Busy` until
@@ -739,9 +1240,13 @@ impl Index {
         // The flag first: every write in flight read it, so they conflict and retry into Busy.
         // A stopped rebuild's cursor goes with it: the repair walks the whole source, and a
         // resume after it would skip rows of the emptied index (ai1249 on #1756).
+        // A version 2 index stays one: its emptied rows have no blocks, and its state cell
+        // says so again at the end. A pack's cursor goes with the rebuild's.
+        let packed = t.get(GLOBAL, META, LAYOUT)?.and_then(|c| c.as_u64()) == Some(LAYOUT_PACKED);
         t.mutate(GLOBAL)
             .put(META, REPAIR, b"")
             .delete_column(META, REBUILD_AFTER)
+            .delete_column(META, PACK_AFTER)
             .commit()?;
         for prefix in [POST_PREFIX, FWD_PREFIX, STATS_ROW] {
             // The keys first, under a snapshot and an iterator dropped before anything below
@@ -765,7 +1270,11 @@ impl Index {
             }
         }
         let stats = self.rebuild_inner(Walk::Repair, |_| ControlFlow::Continue(()))?;
-        t.mutate(GLOBAL).delete_column(META, REPAIR).commit()?;
+        if packed {
+            t.mutate(GLOBAL).put(META, REPAIR, PACKED).commit()?;
+        } else {
+            t.mutate(GLOBAL).delete_column(META, REPAIR).commit()?;
+        }
         Ok(stats)
     }
 
@@ -861,9 +1370,8 @@ impl Index {
         for doc in docs {
             stats.documents += 1;
             let ((changed, bad), _) = w.db.transact(&RetryPolicy::default(), |tx| {
-                if !repairing {
-                    self.check_not_repairing(tx)?;
-                }
+                // A repair's rows were emptied, blocks included: it writes as version 1 does.
+                let packed = !repairing && self.state_in(tx)?;
                 // The current text, not the snapshot's: a put since the scan wins.
                 let text = match tx.get(&w.src, doc, &inn.source.family, q)? {
                     None => return Ok((false, false)),
@@ -874,7 +1382,7 @@ impl Index {
                 };
                 let old = self.read_forward(tx, doc)?;
                 let new = self.analyse(&text)?;
-                let changed = self.apply(tx, doc, &old, &new, Mode::Rebuild)?;
+                let changed = self.apply(tx, doc, &old, &new, Mode::Rebuild, packed)?;
                 if changed && !repairing {
                     tx.put(&w.table, GLOBAL, META, REBUILD_AFTER, doc);
                 }
@@ -890,11 +1398,68 @@ impl Index {
         Ok(Paged::Done { cursor_at_last })
     }
 
-    fn check_not_repairing(&self, txn: &mut Transaction) -> Result<()> {
+    /// The index's state, read in the transaction ([`REPAIR`]): whether it is version 2, or
+    /// `Busy` while a repair runs. Every write through the index reads it, so a repair's
+    /// start and an index's first pack both make the writes in flight conflict and run
+    /// again under the new state.
+    fn state_in(&self, txn: &mut Transaction) -> Result<bool> {
         match txn.get(&self.w().table, GLOBAL, META, REPAIR)? {
-            Some(_) => Err(Error::Busy),
-            None => Ok(()),
+            Some(c) => packed_state(c.value()),
+            None => Ok(false),
         }
+    }
+
+    /// Removes `doc`'s posting from `row`. In a version 1 index its cells are deleted. In a
+    /// version 2 index they are overwritten with tombstones, since a packed block may hold
+    /// the posting too: a blind write, as the delete is (the writer doesn't look).
+    fn unpost(
+        txn: &mut Transaction,
+        t: &Table,
+        row: &[u8],
+        doc: &[u8],
+        positions: bool,
+        packed: bool,
+    ) {
+        if packed {
+            txn.put_u64(t, row, POST, doc, TOMBSTONE);
+            if positions {
+                txn.put(t, row, POS, doc, b"");
+            }
+        } else {
+            txn.delete_column(t, row, POST, doc);
+            if positions {
+                txn.delete_column(t, row, POS, doc);
+            }
+        }
+    }
+
+    /// `doc`'s posting in `row`'s packed blocks, for a rebuild's compare: its value and its
+    /// encoded positions. The block is found by a read outside the transaction (a
+    /// transaction reads single cells) and then read inside it: `None` unless the two agree,
+    /// so a pack that rewrites the block before this transaction commits makes it conflict,
+    /// and one that already has makes the rebuild write the posting as a cell, which is
+    /// right either way.
+    fn stored_in_block(
+        &self,
+        tx: &mut Transaction,
+        row: &[u8],
+        doc: &[u8],
+        block: &mut Block,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        let Some(found) = find_block(self.rows(true)?, None, row, doc, block)? else {
+            return Ok(None);
+        };
+        let Some(at) = found.at else {
+            return Ok(None);
+        };
+        let same = tx
+            .get(self.block_table()?, row, POSTB, &found.qualifier)?
+            .is_some_and(|c| c.value() == found.value.as_slice());
+        if !same {
+            return Ok(None);
+        }
+        let (tf, len) = block.posting(at);
+        Ok(Some((posting(tf, len), block.positions(at).to_vec())))
     }
 
     fn read_forward(&self, txn: &mut Transaction, doc: &[u8]) -> Result<Forward> {
@@ -925,6 +1490,7 @@ impl Index {
         old: &Forward,
         new: &Analysed,
         mode: Mode,
+        packed: bool,
     ) -> Result<bool> {
         let inn = &*self.inner;
         let w = self.w();
@@ -933,37 +1499,58 @@ impl Index {
         let fwd = fwd_row(doc);
         let mut changed = false;
         let mut buf = Vec::new();
+        let mut block = Block::default();
         let len_changed = !old.present || old.len != new.len;
         for (term, ps) in &new.terms {
             let row = post_row(term);
             let tf = u32::try_from(ps.len()).unwrap_or(u32::MAX);
             let old_tf = old.terms.get(term.as_bytes()).copied();
             let value = posting(tf, new.len);
-            let write_post = match mode {
-                Mode::Put => old_tf != Some(tf) || len_changed,
+            let enc = positions.then(|| encode_positions(ps));
+            let (mut write_post, write_pos) = match mode {
+                Mode::Put => (old_tf != Some(tf) || len_changed, positions),
                 Mode::Rebuild => {
-                    tx.get(t, &row, POST, doc)?.and_then(|c| c.as_u64()) != Some(value)
+                    let post = tx.get(t, &row, POST, doc)?.map(|c| c.as_u64());
+                    let pos = match positions {
+                        true => tx.get(t, &row, POS, doc)?.map(|c| c.value().to_vec()),
+                        false => None,
+                    };
+                    // What the cells don't say, the blocks may (a version 2 index): a
+                    // posting that is right there is left there.
+                    let below = match packed && (post.is_none() || (positions && pos.is_none())) {
+                        true => self.stored_in_block(tx, &row, doc, &mut block)?,
+                        false => None,
+                    };
+                    let post = match post {
+                        Some(v) => v,
+                        None => below.as_ref().map(|(v, _)| *v),
+                    };
+                    let pos = pos.or(below.map(|(_, ps)| ps));
+                    let pos_wrong = positions
+                        && match pos {
+                            // An empty list is a tombstone.
+                            Some(b) if !b.is_empty() => {
+                                decode_positions(&b, &mut buf).is_err() || buf != *ps
+                            }
+                            _ => true,
+                        };
+                    (post != Some(value), pos_wrong)
                 }
             };
+            // In a version 2 index a position cell never stands without its posting cell,
+            // so a pack, which walks the posting cells, meets every cell there is.
+            if packed && write_pos {
+                write_post = true;
+            }
             if write_post {
                 tx.put_u64(t, &row, POST, doc, value)
                     .aggregate(t, &row, MAXTF, BOUND, i64::from(tf))
                     .aggregate(t, &row, MINLEN, BOUND, i64::from(new.len));
                 changed = true;
             }
-            if positions {
-                let enc = encode_positions(ps);
-                let write_pos = match mode {
-                    Mode::Put => true,
-                    Mode::Rebuild => match tx.get(t, &row, POS, doc)? {
-                        Some(c) => decode_positions(c.value(), &mut buf).is_err() || buf != *ps,
-                        None => true,
-                    },
-                };
-                if write_pos {
-                    tx.put(t, &row, POS, doc, &enc);
-                    changed = true;
-                }
+            if write_pos {
+                tx.put(t, &row, POS, doc, enc.as_deref().expect("positions are on"));
+                changed = true;
             }
             if old_tf.is_none() {
                 tx.incr(t, &row, DF, N, 1);
@@ -981,10 +1568,7 @@ impl Index {
                 continue;
             }
             let row = post_row(term);
-            tx.delete_column(t, &row, POST, doc);
-            if positions {
-                tx.delete_column(t, &row, POS, doc);
-            }
+            Self::unpost(tx, t, &row, doc, positions, packed);
             tx.incr(t, &row, DF, N, -1)
                 .delete_column(t, &fwd, TERMS, term.as_bytes());
             changed = true;
@@ -1086,8 +1670,13 @@ impl Index {
     /// `Corruption` only if a row doesn't parse.
     pub fn verify(&self) -> Result<IndexStats> {
         let inn = &*self.inner;
-        let t = &inn.table;
         let s = inn.db.snapshot()?;
+        // A repair running isn't an error here: its rows are checked as they stand.
+        let packed = inn
+            .table
+            .get_at(&s, GLOBAL, META, REPAIR)?
+            .is_some_and(|c| c.value() == PACKED);
+        let t = self.rows(packed)?;
         let mut st = IndexStats::default();
         // Forward rows.
         let mut fwd: BTreeMap<Vec<u8>, Forward> = BTreeMap::new();
@@ -1122,7 +1711,11 @@ impl Index {
         if inn.opts.get_positions() {
             fams.push(POS);
         }
+        if packed {
+            fams.push(POSTB);
+        }
         let mut buf = Vec::new();
+        let mut block = Block::default();
         for row in t
             .scan_prefix(POST_PREFIX)
             .families(fams)
@@ -1132,35 +1725,65 @@ impl Index {
             let row = row?;
             let term = row.key()[POST_PREFIX.len()..].to_vec();
             let (mut df, mut maxtf, mut minlen) = (0i64, i64::MIN, i64::MAX);
-            let (mut max_seen, mut min_seen) = (0i64, i64::MAX);
-            let mut post_docs: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+            // The merged view (a version 2 index): the blocks' postings, then the cells
+            // over them, a tombstone removing what it hides.
+            let mut post_docs: BTreeMap<Vec<u8>, (u32, u32)> = BTreeMap::new();
             let mut pos_docs: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+            let mut last: Option<Vec<u8>> = None;
+            for e in row.view().iter().filter(|e| e.family == POSTB) {
+                block.decode(e.cell.value())?;
+                if block.id(block.len() - 1) != e.qualifier
+                    || last.as_deref().is_some_and(|l| l >= block.id(0))
+                {
+                    return Err(corrupt("a term's posting blocks overlap or are misnamed"));
+                }
+                last = Some(e.qualifier.to_vec());
+                st.packed += block.len() as u64;
+                for i in 0..block.len() {
+                    post_docs.insert(block.id(i).to_vec(), block.posting(i));
+                    if inn.opts.get_positions() {
+                        decode_positions(block.positions(i), &mut buf)?;
+                        pos_docs.insert(block.id(i).to_vec(), buf.len() as u32);
+                    }
+                }
+            }
             for e in row.view().iter() {
                 match e.family {
                     POST => {
-                        let (tf, len) = unposting(
-                            e.cell
-                                .as_u64()
-                                .ok_or_else(|| corrupt("a posting isn't a u64"))?,
-                        );
-                        max_seen = max_seen.max(i64::from(tf));
-                        min_seen = min_seen.min(i64::from(len));
-                        post_docs.insert(e.qualifier.to_vec(), tf);
-                        *seen.entry(e.qualifier.to_vec()).or_default() += 1;
-                        let f = fwd.get(e.qualifier);
-                        if f.map(|f| (f.terms.get(&term).copied(), f.len)) != Some((Some(tf), len))
-                        {
-                            st.forward_mismatch += 1;
+                        let v = e
+                            .cell
+                            .as_u64()
+                            .ok_or_else(|| corrupt("a posting isn't a u64"))?;
+                        if packed && v == TOMBSTONE {
+                            st.tombstones += 1;
+                            st.packed -= u64::from(post_docs.remove(e.qualifier).is_some());
+                        } else {
+                            let under = post_docs.insert(e.qualifier.to_vec(), unposting(v));
+                            st.packed -= u64::from(under.is_some());
                         }
                     }
                     POS => {
-                        decode_positions(e.cell.value(), &mut buf)?;
-                        pos_docs.insert(e.qualifier.to_vec(), buf.len() as u32);
+                        if packed && e.cell.value().is_empty() {
+                            pos_docs.remove(e.qualifier);
+                        } else {
+                            decode_positions(e.cell.value(), &mut buf)?;
+                            pos_docs.insert(e.qualifier.to_vec(), buf.len() as u32);
+                        }
                     }
                     DF => df = e.cell.as_i64().unwrap_or(0),
                     MAXTF => maxtf = e.cell.as_i64().unwrap_or(i64::MIN),
                     MINLEN => minlen = e.cell.as_i64().unwrap_or(i64::MAX),
                     _ => {}
+                }
+            }
+            let (mut max_seen, mut min_seen) = (0i64, i64::MAX);
+            for (doc, &(tf, len)) in &post_docs {
+                max_seen = max_seen.max(i64::from(tf));
+                min_seen = min_seen.min(i64::from(len));
+                *seen.entry(doc.clone()).or_default() += 1;
+                let f = fwd.get(doc);
+                if f.map(|f| (f.terms.get(&term).copied(), f.len)) != Some((Some(tf), len)) {
+                    st.forward_mismatch += 1;
                 }
             }
             let n = post_docs.len() as i64;
@@ -1175,7 +1798,12 @@ impl Index {
                 st.counter_drift += 1;
             }
             // Each posting has its positions, as many as its frequency, and no more.
-            if inn.opts.get_positions() && pos_docs != post_docs {
+            if inn.opts.get_positions()
+                && (pos_docs.len() != post_docs.len()
+                    || pos_docs
+                        .iter()
+                        .any(|(d, n)| post_docs.get(d).map(|p| p.0) != Some(*n)))
+            {
                 st.forward_mismatch += 1;
             }
         }
@@ -1204,12 +1832,14 @@ impl Index {
             st.counter_drift += 1;
         }
         // The source column against the forward rows (and positions, by re-tokenising).
-        self.verify_source(&s, &fwd, &mut st)?;
+        self.verify_source(t, packed, &s, &fwd, &mut st)?;
         Ok(st)
     }
 
     fn verify_source(
         &self,
+        t: &Rows,
+        packed: bool,
         s: &Snapshot,
         fwd: &BTreeMap<Vec<u8>, Forward>,
         st: &mut IndexStats,
@@ -1218,6 +1848,7 @@ impl Index {
         let q = inn.source.qualifier.as_slice();
         let mut sourced = BTreeSet::new();
         let mut buf = Vec::new();
+        let mut block = Block::default();
         for row in inn
             .src
             .scan_prefix(b"")
@@ -1256,9 +1887,16 @@ impl Index {
             }
             if inn.opts.get_positions() {
                 for (term, ps) in &a.terms {
-                    let stored = inn.table.get_at(s, &post_row(term), POS, &doc)?;
-                    let ok = match stored {
+                    let row = post_row(term);
+                    let ok = match t.get_at(s, &row, POS, &doc)? {
                         Some(c) => decode_positions(c.value(), &mut buf).is_ok() && buf == *ps,
+                        // Without a cell, the block's (a version 2 index).
+                        None if packed => find_block(t, Some(s), &row, &doc, &mut block)?
+                            .and_then(|f| f.at)
+                            .is_some_and(|at| {
+                                decode_positions(block.positions(at), &mut buf).is_ok()
+                                    && buf == *ps
+                            }),
                         None => false,
                     };
                     if !ok {
@@ -1274,6 +1912,108 @@ impl Index {
             .count() as u64;
         Ok(())
     }
+}
+
+/// What a pack's chunk writes: the blocks that replace the ones it read, and the cells it
+/// consumed, each with the timestamp it was read at.
+struct PackPlan {
+    blocks: Vec<(Vec<u8>, Vec<u8>)>,
+    posts: Vec<(Vec<u8>, u64)>,
+    positions: Vec<(Vec<u8>, u64)>,
+    /// Postings moved from cells into blocks, and tombstones removed.
+    packed: u64,
+    tombstones: u64,
+}
+
+/// Merges a chunk's cells into the blocks they fall among, and cuts the result into blocks
+/// again. A cell replaces the block's posting for its document; a tombstone removes it.
+fn pack_plan(work: &PackWork, with_positions: bool, limit: usize) -> Result<PackPlan> {
+    let mut run: BTreeMap<Vec<u8>, Packed> = BTreeMap::new();
+    let mut block = Block::default();
+    let mut last: Option<Vec<u8>> = None;
+    for (_, value) in &work.blocks {
+        block.decode(value)?;
+        if last.as_deref().is_some_and(|l| l >= block.id(0)) {
+            return Err(corrupt("a term's posting blocks overlap"));
+        }
+        last = Some(block.id(block.len() - 1).to_vec());
+        for i in 0..block.len() {
+            let (tf, len) = block.posting(i);
+            run.insert(
+                block.id(i).to_vec(),
+                Packed {
+                    tf,
+                    len,
+                    positions: block.positions(i).to_vec(),
+                },
+            );
+        }
+    }
+    let mut plan = PackPlan {
+        blocks: Vec::new(),
+        posts: Vec::new(),
+        positions: Vec::new(),
+        packed: 0,
+        tombstones: 0,
+    };
+    // A few postings with no block among them wait as cells for more. A full chunk never
+    // waits: its term has more than a block's worth.
+    let live = work
+        .cells
+        .iter()
+        .filter(|(_, _, v)| *v != TOMBSTONE)
+        .count();
+    let wait = work.blocks.is_empty() && live < PACK_MIN_RUN && work.cells.len() < limit;
+    for (id, ts, value) in &work.cells {
+        let pos = work.positions.get(id);
+        if *value == TOMBSTONE {
+            run.remove(id);
+            plan.posts.push((id.clone(), *ts));
+            if let Some((pts, _)) = pos {
+                plan.positions.push((id.clone(), *pts));
+            }
+            plan.tombstones += 1;
+            continue;
+        }
+        if wait {
+            continue;
+        }
+        let (tf, len) = unposting(*value);
+        // Its positions: its cell's, else what the block held for it. A posting with
+        // neither (drift, which `verify` reports) stays a cell.
+        let positions = match pos {
+            Some((_, b)) if !b.is_empty() => b.clone(),
+            _ if !with_positions => Vec::new(),
+            _ => match run.get(id) {
+                Some(p) if pos.is_none() => p.positions.clone(),
+                _ => continue,
+            },
+        };
+        run.insert(id.clone(), Packed { tf, len, positions });
+        plan.posts.push((id.clone(), *ts));
+        if let Some((pts, _)) = pos {
+            plan.positions.push((id.clone(), *pts));
+        }
+        plan.packed += 1;
+    }
+    // Even blocks: as many as the postings need, each with its share, so none is left
+    // under half full beside a full one. A block still closes early at its byte cap.
+    let n = run.len();
+    let share = n.div_ceil(n.div_ceil(MAX_POSTINGS).max(1)).max(1);
+    let mut builder = Builder::new(with_positions);
+    for (id, p) in &run {
+        builder.push(Posting {
+            id,
+            tf: p.tf,
+            len: p.len,
+            positions: &p.positions,
+        });
+        if builder.len() >= share || builder.full() {
+            plan.blocks.extend(builder.finish());
+        }
+    }
+    plan.blocks.extend(builder.finish());
+    Ok(plan)
 }
 
 /// Reads an index's `G` row and checks it: its source, options, and the tokeniser to use
@@ -1298,7 +2038,7 @@ fn load(
             .map(|c| c.map(|c| c.value().to_vec()))
     };
     match rows.get(GLOBAL, META, LAYOUT)?.and_then(|c| c.as_u64()) {
-        Some(LAYOUT_VERSION) => {}
+        Some(LAYOUT_VERSION | LAYOUT_PACKED) => {}
         Some(v) => return Err(not(&format!("layout version {v} is unknown"))),
         None => return Err(not("it has no layout")),
     }
@@ -1378,6 +2118,7 @@ impl ReadIndex {
                     opts,
                     tok,
                     builtin,
+                    fresh: OnceLock::new(),
                 }),
             },
         })

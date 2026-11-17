@@ -673,6 +673,9 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
         let mut rendered = names(&server.shared.router.metrics_text(), prefix);
         if prefix == "pigeonhole_serve_" {
             rendered.extend(names(&cluster, prefix));
+            // `--text-pack`'s families (#1585), rendered only with the flag.
+            let packing = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
+            rendered.extend(names(&packing.shared.router.metrics_text(), prefix));
         }
         assert!(!rendered.is_empty(), "{prefix}");
         assert_eq!(

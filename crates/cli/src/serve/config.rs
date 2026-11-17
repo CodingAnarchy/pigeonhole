@@ -232,6 +232,12 @@ pub(crate) struct ServeArgs {
     /// Memory calls at once (default: half the blocking threads, at least 1).
     #[arg(long, value_name = "N", requires = "memory")]
     pub memory_calls: Option<usize>,
+    /// Pack the text indexes in the background (ICR 0143): searches of common words read
+    /// several times less. Off by default: a packed index can't be opened by a 1.2 build,
+    /// so turn it on only once you won't roll back to 1.2. On a cluster, a node packs the
+    /// partitions it serves.
+    #[arg(long)]
+    pub text_pack: bool,
     /// Where `Admin.Backup` writes, and (in `.phdb-serve-downloads`, the server's own, mode
     /// 0700) where `Admin.BackupDownload` keeps its copies for resumes. It must exist.
     /// Without it the server takes no backups. Put it on a disk with room for a copy or two

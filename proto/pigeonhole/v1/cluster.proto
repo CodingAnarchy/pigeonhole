@@ -439,6 +439,11 @@ message ForwardRequest {
   // the copy waits, within the call's deadline, until it has applied the owner's commits
   // through it. 0: none. With `to_replica` only.
   uint64 min_primary_seqno = 43;
+  // The partition a fanned-out part of an index search or check is for (#1722, ICR 0138):
+  // its request names only the index, and a node can own several of the index's
+  // partitions. This node serves that partition if it owns it and the index is placed on
+  // it, else `WrongPartition`. Empty on every other call.
+  string partition = 50;
   oneof op {
     GetRequest get = 3;
     ReadRowRequest read_row = 4;
@@ -473,9 +478,15 @@ message ForwardRequest {
     CreateVectorIndexRequest create_vector_index = 22;
     VectorInsertRequest vector_insert = 23;
     VectorDeleteRequest vector_delete = 24;
+    // One partition's part of a search or check across an index's partitions (#1722 PR 1b):
+    // the client's request as it is, on the partition `partition` names.
+    VectorSearchRequest vector_search = 25;
+    VectorVerifyRequest vector_verify = 26;
     CreateTextIndexRequest create_text_index = 27;
     TextPutRequest text_put = 28;
     TextDeleteRequest text_delete = 29;
+    // As `vector_verify`.
+    TextIndexRequest text_verify = 31;
     // Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
     // that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
     // or ids are in several partitions never comes here whole.
@@ -549,6 +560,13 @@ message ForwardScanRequest {
   string partition = 3;
   // The scan, with `after` (if any) this partition's own position and `limit` what's left.
   ScanRequest scan = 4;
+  // As `ForwardRequest`'s (D328): the entry node chose this node's replica copy of the
+  // partition. Each page is read from the copy only while it's fresh within
+  // `replica_max_lag_ms`, else the stream ends with `ReplicaBehind` and the entry node
+  // continues from the last page's position on the next replica or the owner.
+  bool to_replica = 7;
+  uint64 replica_max_lag_ms = 5;
+  uint64 min_primary_seqno = 6;
 }
 
 // The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
@@ -584,6 +602,10 @@ message ForwardResponse {
     NearestResponse nearest = 11;
     // `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
     TableResponse table = 12;
+    // One partition's part of an index search or check (#1722 PR 1b).
+    VectorSearchResponse vector_search = 13;
+    VectorVerifyResponse vector_verify = 14;
+    TextVerifyResponse text_verify = 16;
     // The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
     // answer `empty`.
     RememberResponse remember = 19;

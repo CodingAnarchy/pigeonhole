@@ -18,6 +18,28 @@ struct Placement {
     partitions: Vec<String>,
 }
 
+impl Placement {
+    /// The partitions holding ids that start with `prefix`, in key order and without
+    /// repeats (an empty prefix: all of them). Range `i` is `[splits[i-1], splits[i])`: it
+    /// holds such an id when it ends past the prefix and starts before the first key past
+    /// every id with it.
+    fn with_prefix(&self, prefix: &[u8]) -> Vec<&str> {
+        let end = prefix_end(prefix);
+        let mut out: Vec<&str> = Vec::new();
+        for (i, partition) in self.partitions.iter().enumerate() {
+            let starts_before_end = match (&end, i.checked_sub(1).map(|j| &self.splits[j])) {
+                (Some(end), Some(lo)) => lo < end,
+                _ => true,
+            };
+            let ends_past_prefix = self.splits.get(i).is_none_or(|hi| hi.as_slice() > prefix);
+            if starts_before_end && ends_past_prefix && !out.contains(&partition.as_str()) {
+                out.push(partition);
+            }
+        }
+        out
+    }
+}
+
 /// One partition's part of a table: its rows in `[start, end)` (`end` `None`: the table's
 /// end).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,20 +223,15 @@ impl Routes {
     /// doesn't place. Range `i` is `[splits[i-1], splits[i])`: it holds such a row when it
     /// ends past the prefix and starts before the first key past every row with it.
     pub(crate) fn partitions_of_table(&self, table: &str, prefix: &[u8]) -> Option<Vec<&str>> {
-        let p = self.tables.get(table)?;
-        let end = prefix_end(prefix);
-        let mut out: Vec<&str> = Vec::new();
-        for (i, partition) in p.partitions.iter().enumerate() {
-            let starts_before_end = match (&end, i.checked_sub(1).map(|j| &p.splits[j])) {
-                (Some(end), Some(lo)) => lo < end,
-                _ => true,
-            };
-            let ends_past_prefix = p.splits.get(i).is_none_or(|hi| hi.as_slice() > prefix);
-            if starts_before_end && ends_past_prefix && !out.contains(&partition.as_str()) {
-                out.push(partition);
-            }
-        }
-        Some(out)
+        Some(self.tables.get(table)?.with_prefix(prefix))
+    }
+
+    /// The partitions holding ids of index `index` that start with `prefix` (#1722), as
+    /// [`partitions_of_table`](Self::partitions_of_table) gives a table's; `None` for an
+    /// index the map doesn't place. A partition with several of the index's ranges is
+    /// listed once: it holds one index.
+    pub(crate) fn index_partitions(&self, index: &str, prefix: &[u8]) -> Option<Vec<&str>> {
+        Some(self.indexes.get(index)?.with_prefix(prefix))
     }
 
     /// The partition holding `table`'s row `row`; `None` for a table the map doesn't place.
@@ -419,6 +436,42 @@ mod tests {
         assert_eq!(r.index_partition("own", b"k"), Some("p1"));
         assert_eq!(r.index_partition("nope", b"a"), None);
         assert_eq!(r.partition("users_vec", b"a"), None);
+    }
+
+    #[test]
+    fn an_index_prefix_narrows_its_partitions_and_lists_each_once() {
+        use crate::serve::proto::IndexPlacement;
+        let mut m = map();
+        m.indexes = vec![
+            IndexPlacement {
+                name: "users_vec".into(),
+                follows: "users".into(),
+                ..Default::default()
+            },
+            // Two ranges on p1, one on p3.
+            IndexPlacement {
+                name: "own".into(),
+                splits: vec![text("f"), text("k")],
+                partitions: vec!["p1".into(), "p3".into(), "p1".into()],
+                ..Default::default()
+            },
+        ];
+        let r = Routes::new(&m);
+        assert_eq!(
+            r.index_partitions("users_vec", b""),
+            Some(vec!["p1", "p2", "p3"])
+        );
+        assert_eq!(r.index_partitions("users_vec", b"h"), Some(vec!["p2"]));
+        assert_eq!(
+            r.index_partitions("users_vec", b"m"),
+            Some(vec!["p2", "p3"])
+        );
+        assert_eq!(r.index_partitions("own", b""), Some(vec!["p1", "p3"]));
+        assert_eq!(r.index_partitions("own", b"g"), Some(vec!["p3"]));
+        assert_eq!(r.index_partitions("own", b"z"), Some(vec!["p1"]));
+        assert_eq!(r.index_partitions("nope", b""), None);
+        // A table's own call never sees an index's placement.
+        assert_eq!(r.partitions_of_table("own", b""), None);
     }
 
     #[test]

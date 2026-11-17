@@ -583,6 +583,15 @@ impl File for PreadFile {
         self.inner.direct_align
     }
 
+    #[cfg(target_os = "linux")]
+    fn start_writeback(&self, offset: u64, len: u64) -> Result<()> {
+        // A direct handle has no page cache to write back.
+        if self.inner.direct_align.is_some() || len == 0 {
+            return Ok(());
+        }
+        os::start_writeback(self.inner.file(), offset, len)
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.inner.read_at(buf, offset)
     }

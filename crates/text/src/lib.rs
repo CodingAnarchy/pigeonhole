@@ -46,23 +46,27 @@
 
 #![forbid(unsafe_code)]
 
+mod block;
 mod error;
 mod fuzzy;
 mod highlight;
 mod index;
 mod layout;
 mod maxscore;
+mod merged;
 mod query;
 mod search;
 mod sloppy;
+mod stats;
 mod tokenizer;
 
 pub use error::{Error, QueryErrorKind, Result};
 pub use highlight::{Match, Snippet, snippet};
-pub use index::{Index, IndexStats, ReadIndex, RebuildStats};
+pub use index::{Index, IndexStats, PackOptions, PackStats, ReadIndex, RebuildStats};
 pub use layout::{IndexOptions, Normalization, Source};
 pub use query::{Clause, Fuzziness, Query};
 pub use search::{FuzzyStats, Hit, Search, SearchStats};
+pub use stats::QueryStats;
 pub use tokenizer::{Token, Tokenizer};
 
 /// The user guide's text-search page and the crate README, compiled and run as doctests.

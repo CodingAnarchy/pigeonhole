@@ -567,6 +567,12 @@ pub(crate) struct Replica {
 #[cfg(test)]
 pub(crate) static FAIL_PROMOTE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// The tests' seam (simp724's S1 on #2001): a replica copy whose database is under one of
+/// these directories applies nothing while it's listed, though it still hears its owner,
+/// as a copy that fell behind would: still fresh as of its last apply, until the bound.
+#[cfg(test)]
+pub(crate) static HOLD_APPLIES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// The tests' inspection seam: the served database's path for each bootstrap that swapped
 /// its copy in (a failed attempt isn't one), so a test can tell a follower that resumed from
 /// one that bootstrapped again (D328).
@@ -1340,6 +1346,15 @@ impl Replica {
         let Some(last) = run.events.last() else {
             return Ok(());
         };
+        #[cfg(test)]
+        while HOLD_APPLIES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|d| db.path().starts_with(d))
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let applied = last.primary_seqno();
         let events = std::mem::take(&mut run.events);
         run.bytes = 0;

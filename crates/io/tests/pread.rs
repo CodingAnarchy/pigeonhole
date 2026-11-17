@@ -430,3 +430,28 @@ fn rename_replaces_a_file_held_open_and_locked() {
     reopened.read_at(&mut buf, 0).unwrap();
     assert_eq!(&buf, b"new!", "the path now names the new file");
 }
+
+/// D334 (ICR 0145): starting writeback is a hint that never fails a writer and never changes
+/// what reads back. Linux asks the kernel to write the range back; elsewhere it does
+/// nothing. An empty range, a range past the written bytes and a written range all succeed,
+/// and the bytes read back as written, before and after the sync.
+#[test]
+fn start_writeback_is_a_harmless_hint() {
+    let dir = TempDir::new("start-writeback");
+    let vfs = PreadVfs::new(1);
+    let file = vfs
+        .open(&dir.0.join(unique("wb")), OpenOptions::read_write_create())
+        .unwrap();
+    let data = vec![0x5au8; 3 << 20];
+    file.write_at(&data, 4096).unwrap();
+    file.start_writeback(4096, 1 << 20).unwrap();
+    file.start_writeback(4096 + (1 << 20), 2 << 20).unwrap();
+    file.start_writeback(0, 0).unwrap();
+    file.start_writeback(64 << 20, 1 << 20).unwrap();
+    let mut back = vec![0u8; data.len()];
+    file.read_at(&mut back, 4096).unwrap();
+    assert_eq!(back, data);
+    file.sync_data().unwrap();
+    file.read_at(&mut back, 4096).unwrap();
+    assert_eq!(back, data);
+}
