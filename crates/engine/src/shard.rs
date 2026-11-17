@@ -8083,6 +8083,11 @@ impl ShardState {
                         kind: match &m.kind {
                             MemberKind::Single => AppendedKind::Batch,
                             MemberKind::Prepare { .. } => AppendedKind::Prepare,
+                            MemberKind::CommitRecord { .. }
+                                if matches!(m.bytes, Bytes::ExternalAbort(_)) =>
+                            {
+                                AppendedKind::Abort
+                            }
                             MemberKind::CommitRecord { .. } => AppendedKind::Commit,
                         },
                         durability: m.durability,
