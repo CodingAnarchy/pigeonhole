@@ -787,8 +787,13 @@ fn external_pins(
                 } => {
                     decided.insert((stream, seqno), participants.iter().collect());
                 }
-                WalRecord::ExternalAbort { seqno, .. } => {
+                WalRecord::ExternalAbort { seqno, share, .. } => {
                     aborted.insert((stream, seqno));
+                    // Its shares are settled: drop the rows of those read already (perf2's
+                    // nit), so the pass keeps rows of undecided shares only.
+                    for p in share.participants().iter() {
+                        shares.remove(&(p, seqno));
+                    }
                 }
                 _ => {}
             }
@@ -1332,18 +1337,31 @@ impl Engine {
         //    chunk size shrinks when they do not (#104). Off, tablets stay where `shard_for`
         //    puts them, and the chunks are sized the same way for the slots that gives (#283).
         let arena_len = shm.arena(0).2;
+        // In-doubt external shares hold their tablets on the shard that logged them (D329,
+        // perf2's M1 on #2000). Whether tablet changes are on is this open's choice, and an
+        // earlier open's may have moved a tablet, so the pre-pass runs whenever the file may
+        // hold external PREPAREs; a read-only open holds nothing, and skips it.
+        let pins = if !no_writes
+            && pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0
+        {
+            external_pins(&vfs, path, db_id, &catalog, shards)?
+        } else {
+            HashMap::new()
+        };
+        if !options.tablet_changes
+            && pins
+                .iter()
+                .any(|(&tablet, &shard)| crate::catalog::shard_for(tablet, shards) != shard)
+        {
+            // Off, every tablet goes to `shard_for`'s shard: one an in-doubt share holds
+            // elsewhere (moved by an earlier open) can't be placed there.
+            return Err(Error::Unsupported(
+                "an in-doubt external transaction holds a tablet a tablet change moved: open \
+                 with tablet changes on, and decide it first",
+            ));
+        }
         let chunk = if options.tablet_changes {
             let base = arena_chunk_size(arena_len, 0);
-            // In-doubt external shares hold their tablets on the shard that logged them
-            // (D329): those are placed there first.
-            let pins = if pager.features().incompat
-                & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE
-                != 0
-            {
-                external_pins(&vfs, path, db_id, &catalog, shards)?
-            } else {
-                HashMap::new()
-            };
             let placed = catalog.place(shards, max_slots(arena_len, base), &pins);
             arena_chunk_size(arena_len, placed)
         } else {

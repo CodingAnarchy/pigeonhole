@@ -541,3 +541,35 @@ fn the_non_blocking_forms_resolve_and_a_dropped_refusal_releases_its_xid() {
     db.decide(b"again", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
+
+/// perf2's M1 re-review on #2000: tablet changes are each open's choice. A tablet moved by
+/// an earlier open and held by an in-doubt share can't go back to `shard_for`'s shard, so
+/// an open with tablet changes off is refused; one with them on places it on its share's
+/// shard, and decides it.
+#[test]
+fn an_open_without_tablet_changes_is_refused_while_a_moved_tablet_is_held() {
+    let vfs = SimVfs::new(34);
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let to = 1 - db.shard_of(t.id, b"r").expect("routed");
+        finish(db.move_tablet_pending(t.id, b"r", to as u16).unwrap()).unwrap();
+        txn(&db, &t, b"r", &[b"r"], b"held")
+            .prepare(b"off", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+    }
+    let mut off = owned(Arc::clone(&vfs), 2);
+    off.tablet_changes = false;
+    assert!(matches!(
+        Engine::open(Path::new(DB), off),
+        Err(Error::Unsupported(_))
+    ));
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    db.decide(b"off", true).unwrap().expect("in doubt");
+    assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"held"[..]));
+    db.close().unwrap();
+}
