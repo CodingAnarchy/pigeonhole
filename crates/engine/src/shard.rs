@@ -1527,8 +1527,6 @@ impl RetryWait {
 /// A participant's share of a cross-shard commit.
 #[derive(Debug)]
 pub(crate) struct PrepareReq {
-    /// [`CoordinateReq::external`]: the share is logged as an external PREPARE (type 5).
-    pub external: Option<Arc<ExternalReq>>,
     /// Version of the tablet map the share was routed with.
     pub map_version: u64,
     pub seqno: Seqno,
@@ -1678,6 +1676,10 @@ pub(crate) enum ShardMsg {
     /// Boxed, so a queued message is sized for a single-shard commit.
     Coordinate(Box<CoordinateReq>),
     Prepare(PrepareReq),
+    /// An external share (D329, [`CoordinateReq::external`]), logged as an external PREPARE
+    /// (type 5). Boxed, and apart from `Prepare`: a field on `PrepareReq` grew every message
+    /// by 8 bytes, which every commit paid in its inbox (#2000's callgrind).
+    PrepareExternal(Box<(PrepareReq, Arc<ExternalReq>)>),
     /// `Engine::decide` of an externally prepared transaction (D329), to its coordinator:
     /// commit or abort the commit with id `id`. `reply` answers the commit's outcome; seqno
     /// 0 (never a commit's) when it isn't awaiting a decision here (decided already, or
@@ -1900,6 +1902,11 @@ pub fn group_sync_depth() -> u32 {
 // fails the build here instead; to take one deliberately, measure the commit shapes.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Member>() == 232);
+// Every commit is moved through a shard's inbox as a `ShardMsg`, sized for its largest
+// variant: the same holds for it (#2000's callgrind: 8 bytes were about 75 instructions a
+// commit on x86).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ShardMsg>() == 96);
 
 #[derive(Debug)]
 struct Member {
@@ -9755,8 +9762,7 @@ impl ShardState {
             }
         }
         for (shard, bytes) in req.parts {
-            let msg = ShardMsg::Prepare(PrepareReq {
-                external: req.external.clone(),
+            let share = PrepareReq {
                 map_version: req.map_version,
                 seqno,
                 coordinator: self.id,
@@ -9766,7 +9772,11 @@ impl ShardState {
                 participants: shards.clone(),
                 priority,
                 submitted_at: req.submitted_at,
-            });
+            };
+            let msg = match &req.external {
+                None => ShardMsg::Prepare(share),
+                Some(ext) => ShardMsg::PrepareExternal(Box::new((share, Arc::clone(ext)))),
+            };
             #[cfg(feature = "test-hooks")]
             if shard != self.id && self.shared.hooks.faults.on(crate::Fault::HoldPrepares) {
                 self.shared
@@ -9847,7 +9857,13 @@ impl ShardState {
         Ok(body)
     }
 
-    fn on_prepare(&mut self, req: PrepareReq, ctx: &mut ShardContext<'_, ShardMsg>) {
+    /// A participant's share, with its external transaction (D329) when it is one.
+    fn on_prepare(
+        &mut self,
+        req: PrepareReq,
+        external: Option<Arc<ExternalReq>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
         if self.closing || self.poisoned {
             let error = Some(if self.closing {
                 PrepareError::Closed
@@ -9868,7 +9884,7 @@ impl ShardState {
         self.prepared.insert(
             req.seqno,
             PreparedShare {
-                external: req.external.clone(),
+                external,
                 bytes: Arc::clone(&req.bytes),
                 // A lower bound set at admission; the decision's timestamp lands later.
                 commit_ts: 0,
@@ -12440,7 +12456,11 @@ impl ShardState {
                 }
             }
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
-            ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
+            ShardMsg::Prepare(req) => self.on_prepare(req, None, ctx),
+            ShardMsg::PrepareExternal(b) => {
+                let (req, ext) = *b;
+                self.on_prepare(req, Some(ext), ctx);
+            }
             ShardMsg::ExternalDecide { id, commit, reply } => {
                 // Refused while closing, as a commit is (perf2's S2 on #2000): the decision
                 // would remove the registry entry with no record written, and the close
