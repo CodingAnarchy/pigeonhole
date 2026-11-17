@@ -377,9 +377,15 @@ commit-async 8770 0.3
 # itself counts 12703, 3 under the old ceiling, and identical commit-path code reads a few apart
 # from run to run (#1804's head 12707: its change is on the open path, not the commit path;
 # run 43327505525, ubuntu-24.04). Base times 1.005.
-commit-incr 12767 0.3
-commit-incr-returning 17519 0.3
-commit-incr-returning-spread 34610 0.5
+# Lowered by D195 (#1990, #1795; coordinator 2026-11-16): a counter write that combines with
+# nothing is copied through with its timestamp, with no map, list or regrown batch. Head counts
+# on 4639bf4c9, d183adbb9 and the merge with main 7f4e25c03 (runs 43958715716, 43964740795,
+# 43982811128, ubuntu-24.04): commit-incr 11365-11371 (from 12707, -10.5%), commit-incr-returning
+# 16003-16018 (from 17507, -8.5%), commit-incr-returning-spread 32956-32961 (from 34443,
+# -4.3%). Each is the highest of those counts times (1 + its headroom).
+commit-incr 11406 0.3
+commit-incr-returning 16067 0.3
+commit-incr-returning-spread 33126 0.5
 # D314 amendment 1 (#1445): get-and-set, commit-overwrite plus a point read per commit.
 # From runs 41956036295 and 41959886002 on main b0cdbf36 (21600, 21603): the highest times 1.003.
 # Raised by D195 (#1566, D314 amendment 2): 21668 -> 21731 (+0.29%). 21606 -> 21666 (+60,
