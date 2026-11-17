@@ -45,6 +45,7 @@ pub struct Options {
     compaction_cores: Option<usize>,
     compaction_cpu_set: Option<Vec<usize>>,
     pin_threads: bool,
+    in_doubt_limits: (usize, u64),
     wal_preallocate: bool,
     memtable_budget: u64,
     block_cache: Option<usize>,
@@ -283,6 +284,7 @@ impl Default for Options {
             compaction_cores: None,
             compaction_cpu_set: None,
             pin_threads: true,
+            in_doubt_limits: (0, 0),
             wal_preallocate: false,
             memtable_budget: 64 << 20,
             block_cache: None,
@@ -454,6 +456,17 @@ impl Options {
     /// ```
     pub fn pin_threads(mut self, yes: bool) -> Self {
         self.pin_threads = yes;
+        self
+    }
+
+    /// The in-doubt limits for transactions prepared for an external coordinator (D329,
+    /// ICR 0140): past `max_shares` in doubt or `max_bytes` of their batches, a new
+    /// `Transaction::prepare` answers `Busy`. 0: no limit (the default). Hidden: not part
+    /// of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn in_doubt_limits(mut self, max_shares: usize, max_bytes: u64) -> Self {
+        self.in_doubt_limits = (max_shares, max_bytes);
         self
     }
 
@@ -1912,6 +1925,7 @@ impl Options {
             },
         };
         o.pin_threads = self.pin_threads;
+        o.in_doubt_limits = self.in_doubt_limits;
         o.wal_preallocate = self.wal_preallocate;
         o.shard_threads = budget.drivers;
         // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,

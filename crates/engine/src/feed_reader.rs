@@ -329,6 +329,8 @@ enum Item {
     Prepare {
         id: Seqno,
         changes: Raws,
+        /// An external share (D329): see [`Held::external`].
+        external: bool,
     },
     Decision {
         id: Seqno,
@@ -340,6 +342,11 @@ enum Item {
     Skipped,
     /// A Decision past the cutoff: its round is passed over, its shares too.
     SkippedRound {
+        id: Seqno,
+    },
+    /// An external transaction's abort (D329, type 6): its held shares go, and nothing is
+    /// delivered at its own seqno.
+    Abort {
         id: Seqno,
     },
     Other,
@@ -387,6 +394,11 @@ struct Held {
     changes: Raws,
     /// Read in a segment outside the feed's history (the mark rule): delivering it expires.
     outside: bool,
+    /// An external share (D329), which may be held as long as its caller takes to decide:
+    /// outside the read-ahead budget and never what trimming evicts, so a long hold can't
+    /// lower the cutoff and stall delivery (perf2's E3 on ICR 0140). Bounded instead by the
+    /// writer's in-doubt limits.
+    external: bool,
 }
 
 /// One stream's reading state.
@@ -1086,6 +1098,9 @@ fn pending_bytes(p: &Pending) -> u64 {
 
 /// The read-ahead bytes a held share counts for, as for [`pending_bytes`].
 fn held_bytes(h: &Held) -> u64 {
+    if h.external {
+        return 0;
+    }
     HELD_ENTRY + h.changes.memory()
 }
 
@@ -1965,9 +1980,12 @@ impl FeedReader {
         // (#1448: an idle reader process spent 1-1.7 ms of CPU per poll there). Not while a
         // PREPARE is held: a checkpoint or floor can move without a commit (a flush), and
         // `drop_aborted` (rule C) must see it, or the commits behind an aborted round wait
-        // for an unrelated one (feed1248's P1 on #1449). A writer restart since the stale
-        // check above is seen here, as after the reads below.
-        if self.read_through == Some(frontier) && self.held.is_empty() {
+        // for an unrelated one (feed1248's P1 on #1449). An external share (D329) is settled
+        // here: it ends only by a record of its own (its Decision, or its abort's type 6),
+        // whose seqno moves the frontier, so it never needs rule C, and a share in doubt for
+        // hours keeps the shortcut (ICR 0140's E3). A writer restart since the stale check
+        // above is seen here, as after the reads below.
+        if self.read_through == Some(frontier) && self.held.values().all(|h| h.external) {
             if self.shm.is_stale() {
                 return Err(Error::SnapshotExpired);
             }
@@ -2102,7 +2120,8 @@ impl FeedReader {
         let top_held = self
             .held
             .range((self.delivered, 0)..)
-            .next_back()
+            .rev()
+            .find(|(_, h)| !h.external)
             .map(|(&(id, _), _)| id.saturating_add(1));
         (top_ready, top_held)
     }
@@ -2355,13 +2374,18 @@ impl FeedReader {
                     self.evict_round(id);
                     continue;
                 }
-                Item::Prepare { id, changes } => {
+                Item::Prepare {
+                    id,
+                    changes,
+                    external,
+                } => {
                     let h = Held {
                         stream: s,
                         start,
                         end,
                         changes,
                         outside: !inside,
+                        external,
                     };
                     self.starts.add(s, start);
                     self.ahead.bytes += held_bytes(&h);
@@ -2404,6 +2428,11 @@ impl FeedReader {
                             session,
                         },
                     );
+                }
+                Item::Abort { id } => {
+                    // Its shares are never delivered; the abort's own seqno holds nothing, so
+                    // the frontier passes it as any seqno with no event (ICR 0140's E1).
+                    self.remove_held(id);
                 }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
@@ -2463,15 +2492,16 @@ impl FeedReader {
         let key = match &record {
             _ if !INDEXING => 0,
             WalRecord::Batch { seqno, .. } => *seqno,
-            WalRecord::Prepare { seqno, .. } | WalRecord::Decision { seqno, .. } => {
-                seqno.saturating_add(1)
-            }
+            WalRecord::Prepare { seqno, .. }
+            | WalRecord::Decision { seqno, .. }
+            | WalRecord::ExternalPrepare { seqno, .. }
+            | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
             // Its round's apply seqno is above its id.
-            WalRecord::Prepare { seqno, .. }
+            WalRecord::Prepare { seqno, .. } | WalRecord::ExternalPrepare { seqno, .. }
                 if seqno >= cutoff || skipped_rounds.contains(&seqno) =>
             {
                 Item::Skipped
@@ -2493,7 +2523,19 @@ impl FeedReader {
             WalRecord::Prepare { seqno, batch, .. } => Item::Prepare {
                 id: seqno,
                 changes: filter(batch)?,
+                external: false,
             },
+            // D329: an external share is held as a D263 one is, delivered at its Decision's
+            // apply seqno, or dropped by its abort.
+            WalRecord::ExternalPrepare { seqno, share, .. } => match share.batch() {
+                Some(batch) => Item::Prepare {
+                    id: seqno,
+                    changes: filter(batch)?,
+                    external: true,
+                },
+                None => Item::Other,
+            },
+            WalRecord::ExternalAbort { seqno, .. } => Item::Abort { id: seqno },
             WalRecord::Decision {
                 seqno,
                 apply_seqno,
@@ -2998,10 +3040,14 @@ impl FeedReader {
                     }) if of == session => match record {
                         WalRecord::Batch { seqno, .. }
                         | WalRecord::Prepare { seqno, .. }
-                        | WalRecord::Commit { seqno, .. } => seqno,
+                        | WalRecord::Commit { seqno, .. }
+                        | WalRecord::ExternalPrepare { seqno, .. } => seqno,
                         WalRecord::Decision {
                             seqno, apply_seqno, ..
                         } => seqno.min(apply_seqno),
+                        WalRecord::ExternalAbort {
+                            seqno, abort_seqno, ..
+                        } => seqno.min(abort_seqno),
                         // A kind this build can't key: the session can't be started in.
                         _ => continue 'sessions,
                     },
@@ -3736,6 +3782,7 @@ mod tests {
             end: Lsn::new(epoch, 128),
             changes: Raws::default(),
             outside: false,
+            external: false,
         }
     }
 

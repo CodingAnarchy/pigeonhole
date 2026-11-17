@@ -1498,6 +1498,31 @@ impl Pigeonhole {
             .retry_closed(|| self.engine().flush().map_err(Error::from))
     }
 
+    /// Decides the transaction prepared as `xid` ([`Transaction::prepare`], D329, ICR 0140):
+    /// `commit` applies it, and answers its commit's seqno; otherwise it is dropped, and the
+    /// answer's seqno is its id. `None` when `xid` isn't in doubt here: decided already, or
+    /// never prepared. Idempotent. Hidden: not part of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<crate::CommitInfo>> {
+        self.engine()
+            .decide(xid, commit)
+            .map(|c| c.map(crate::CommitInfo::from_engine))
+            .map_err(Error::from)
+    }
+
+    /// The transactions prepared here and still in doubt (D329): each xid, with how long
+    /// ago it was prepared. Hidden, as [`Pigeonhole::decide`].
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn in_doubt(&self) -> Vec<(Vec<u8>, std::time::Duration)> {
+        self.engine()
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, ns)| (xid, std::time::Duration::from_nanos(ns)))
+            .collect()
+    }
+
     /// Compacts every table fully: flushes, then merges every level into the last one.
     /// Versions beyond a family's `max_versions`, expired cells and tombstones that no
     /// snapshot can still need are dropped. Compaction otherwise runs in the background;
