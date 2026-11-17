@@ -3191,7 +3191,7 @@ impl Service {
         drop(pinned);
         Ok(proto::GetResponse {
             cell: cell.map(|c| {
-                let kind = convert::Kinds::new(&table).of(&r.family);
+                let kind = convert::View::of(&table, &r.family);
                 convert::cell(&r.family, &r.qualifier, &c, kind, r.aggregate.as_ref())
             }),
         })
@@ -4341,7 +4341,7 @@ impl Service {
         drop(g);
         Ok(proto::GetResponse {
             cell: cell.map(|c| {
-                let kind = convert::Kinds::new(&table).of(&r.family);
+                let kind = convert::View::of(&table, &r.family);
                 convert::cell(&r.family, &r.qualifier, &c, kind, None)
             }),
         })
