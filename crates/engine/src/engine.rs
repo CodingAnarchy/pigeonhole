@@ -5634,13 +5634,15 @@ impl Inner {
         }
         // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
         // one xid can't both log, nor concurrent ones pass a limit together.
-        self.shared
+        let token = self
+            .shared
             .external
             .reserve(xid, builder.batch().as_bytes().len() as u64)?;
         let prepared = self.submit_external(&view, &builder, &shards, durability, validate, xid);
         // Unless every share was logged (the coordinator replaced the reservation with the
-        // xid's entry before it answered), the reservation goes.
-        self.shared.external.unreserve(xid);
+        // xid's entry before it answered), this prepare's reservation goes; a later
+        // prepare's of the same xid has its own token and stays (perf2's S3).
+        self.shared.external.unreserve(xid, token);
         prepared
     }
 

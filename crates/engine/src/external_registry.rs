@@ -52,26 +52,36 @@ pub(crate) enum Lookup {
     InDoubt(ExternalEntry),
 }
 
-/// A slot: a prepare's reservation (its bytes), or an entry in doubt.
+/// A slot: a prepare's reservation (its bytes, and the token that prepare holds), or an
+/// entry in doubt.
 #[derive(Debug, Clone, Copy)]
 enum Slot {
-    Reserved { bytes: u64 },
+    Reserved { bytes: u64, token: u64 },
     InDoubt(ExternalEntry),
 }
 
 impl Slot {
     fn bytes(&self) -> u64 {
         match self {
-            Slot::Reserved { bytes } => *bytes,
+            Slot::Reserved { bytes, .. } => *bytes,
             Slot::InDoubt(e) => e.bytes,
         }
     }
 }
 
+/// The registry's state, under its one lock.
+#[derive(Debug, Default)]
+struct Table {
+    slots: BTreeMap<Vec<u8>, Slot>,
+    /// The last reservation's token: each one is new, so a prepare's late `unreserve` can't
+    /// drop a later prepare's reservation of the same xid (perf2's S3 on #2000).
+    last_token: u64,
+}
+
 /// See the module documentation.
 #[derive(Debug)]
 pub(crate) struct ExternalRegistry {
-    entries: Mutex<BTreeMap<Vec<u8>, Slot>>,
+    entries: Mutex<Table>,
     /// The most xids reserved or in doubt, and the most bytes of their batches; 0 for none
     /// (`EngineOptions::in_doubt_limits`, fixed at open).
     limits: (usize, u64),
@@ -87,12 +97,12 @@ impl ExternalRegistry {
     /// An empty registry with the in-doubt `limits` (`EngineOptions::in_doubt_limits`).
     pub(crate) fn new(limits: (usize, u64)) -> Self {
         Self {
-            entries: Mutex::new(BTreeMap::new()),
+            entries: Mutex::new(Table::default()),
             limits,
         }
     }
 
-    fn entries(&self) -> impl std::ops::DerefMut<Target = BTreeMap<Vec<u8>, Slot>> + '_ {
+    fn table(&self) -> impl std::ops::DerefMut<Target = Table> + '_ {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -101,8 +111,10 @@ impl ExternalRegistry {
     /// this prepare's own bytes, so nothing reserved or in doubt passes it, except that a
     /// prepare alone is always admitted: one larger than the limit could otherwise never
     /// prepare (perf2's N2 on #2000).
-    pub(crate) fn reserve(&self, xid: &[u8], bytes: u64) -> Result<()> {
-        let mut entries = self.entries();
+    /// The answer is the reservation's token, for [`unreserve`](Self::unreserve).
+    pub(crate) fn reserve(&self, xid: &[u8], bytes: u64) -> Result<u64> {
+        let mut table = self.table();
+        let entries = &mut table.slots;
         if entries.contains_key(xid) {
             return Err(Error::InvalidArgument(
                 "this xid is prepared here already: decide it first".to_owned(),
@@ -114,33 +126,40 @@ impl ExternalRegistry {
         if (max_shares > 0 && entries.len() >= max_shares) || over_bytes {
             return Err(Error::Busy);
         }
-        entries.insert(xid.to_vec(), Slot::Reserved { bytes });
-        Ok(())
+        table.last_token += 1;
+        let token = table.last_token;
+        table
+            .slots
+            .insert(xid.to_vec(), Slot::Reserved { bytes, token });
+        Ok(token)
     }
 
-    /// Drops `xid`'s reservation, if it is still one: a prepare that logged every share
-    /// left its entry in its place.
-    pub(crate) fn unreserve(&self, xid: &[u8]) {
-        let mut entries = self.entries();
-        if matches!(entries.get(xid), Some(Slot::Reserved { .. })) {
-            entries.remove(xid);
+    /// Drops `xid`'s reservation `token`, if it is still that one: a prepare that logged
+    /// every share left its entry in its place, and a later prepare's reservation of the
+    /// same xid has a token of its own.
+    pub(crate) fn unreserve(&self, xid: &[u8], token: u64) {
+        let mut table = self.table();
+        if matches!(table.slots.get(xid), Some(Slot::Reserved { token: t, .. }) if *t == token) {
+            table.slots.remove(xid);
         }
     }
 
     /// Records `xid` in doubt (the coordinator, every share logged; recovery's reinstall),
     /// in place of its reservation if any.
     pub(crate) fn install(&self, xid: &[u8], entry: ExternalEntry) {
-        self.entries().insert(xid.to_vec(), Slot::InDoubt(entry));
+        self.table()
+            .slots
+            .insert(xid.to_vec(), Slot::InDoubt(entry));
     }
 
     /// Forgets `xid` once decided.
     pub(crate) fn remove(&self, xid: &[u8]) {
-        self.entries().remove(xid);
+        self.table().slots.remove(xid);
     }
 
     /// What is known of `xid` here.
     pub(crate) fn lookup(&self, xid: &[u8]) -> Lookup {
-        match self.entries().get(xid) {
+        match self.table().slots.get(xid) {
             None => Lookup::Absent,
             Some(Slot::Reserved { .. }) => Lookup::Reserved,
             Some(Slot::InDoubt(e)) => Lookup::InDoubt(*e),
@@ -149,7 +168,8 @@ impl ExternalRegistry {
 
     /// Every xid in doubt, with its entry (reservations aren't).
     pub(crate) fn in_doubt(&self) -> Vec<(Vec<u8>, ExternalEntry)> {
-        self.entries()
+        self.table()
+            .slots
             .iter()
             .filter_map(|(xid, s)| match s {
                 Slot::InDoubt(e) => Some((xid.clone(), *e)),
@@ -160,7 +180,8 @@ impl ExternalRegistry {
 
     /// Whether any xid is in doubt.
     pub(crate) fn any_in_doubt(&self) -> bool {
-        self.entries()
+        self.table()
+            .slots
             .values()
             .any(|s| matches!(s, Slot::InDoubt(_)))
     }
@@ -177,7 +198,9 @@ mod tests {
         let r = ExternalRegistry::new((0, 10));
         r.reserve(b"big", 25).unwrap();
         assert!(matches!(r.reserve(b"small", 1), Err(Error::Busy)));
-        r.unreserve(b"big");
+        let big = r.lookup(b"big");
+        assert_eq!(big, super::Lookup::Reserved);
+        r.remove(b"big");
         r.reserve(b"a", 6).unwrap();
         assert!(
             matches!(r.reserve(b"b", 5), Err(Error::Busy)),
@@ -208,11 +231,11 @@ mod loom_tests {
     /// (every share logged) the coordinator installs the entry, then the reservation is
     /// dropped if still one. `Ok(true)` if it prepared.
     fn prepare(r: &ExternalRegistry, xid: &[u8], id: u64, logs: bool) -> Result<bool, Error> {
-        r.reserve(xid, 1)?;
+        let token = r.reserve(xid, 1)?;
         if logs {
             r.install(xid, entry(id));
         }
-        r.unreserve(xid);
+        r.unreserve(xid, token);
         Ok(logs)
     }
 
@@ -301,6 +324,30 @@ mod loom_tests {
             d1.join().unwrap();
             d2.join().unwrap();
             assert!(!r.any_in_doubt());
+        });
+    }
+
+    #[test]
+    fn loom_a_late_unreserve_never_drops_a_later_prepares_reservation() {
+        // perf2's S3 on #2000. Prepare A of "x" logged (its entry installed) but hasn't run
+        // its `unreserve` yet; meanwhile "x" is decided (removed) and prepare B reserves it.
+        // A's late `unreserve` must leave B's reservation, so a third prepare of "x" is still
+        // refused while B is in flight.
+        loom::model(|| {
+            let r = Arc::new(ExternalRegistry::default());
+            let a = r.reserve(b"x", 1).unwrap();
+            r.install(b"x", entry(1));
+            let late = {
+                let r = Arc::clone(&r);
+                thread::spawn(move || r.unreserve(b"x", a))
+            };
+            r.remove(b"x");
+            let b = r.reserve(b"x", 1);
+            late.join().unwrap();
+            if b.is_ok() {
+                assert_eq!(r.lookup(b"x"), Lookup::Reserved, "B's reservation stands");
+                assert!(matches!(r.reserve(b"x", 1), Err(Error::InvalidArgument(_))));
+            }
         });
     }
 
