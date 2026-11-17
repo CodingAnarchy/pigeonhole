@@ -419,26 +419,34 @@ impl DataGrpc {
     ) -> Result<ServiceReply, Status> {
         call(&self.0, req, op).await
     }
+}
 
-    /// A read a replica may serve, on a cluster node (D328): its reply, with the
-    /// `served-by` and `served-seqno` headers when the client asked for a replica.
-    async fn read<T, R>(
-        &self,
-        req: Request<T>,
-        op: impl FnOnce(T) -> ServiceOp,
-        pick: impl FnOnce(ServiceReply) -> Option<R>,
-    ) -> Result<Response<R>, Status> {
-        let (reply, served) = call_served(&self.0, req, op).await?;
-        let mut resp = respond(reply, pick)?;
-        if let Some(served) = served {
-            for (name, value) in served.headers() {
-                if let Ok(value) = value.parse() {
-                    resp.metadata_mut().insert(name, value);
+tokio::task_local! {
+    /// What served a read a replica could have (D328), set by [`call`] on a cluster node
+    /// for [`served_headers`] to put on the response.
+    static SERVED: std::cell::Cell<Option<super::replica::Served>>;
+}
+
+/// A cluster node's `Data` route's middleware (D328): the `served-by` and `served-seqno`
+/// headers of a read a replica could have served. Only a cluster node mounts it, so a
+/// single node's calls are as they were (the serve callgrind shapes, D193).
+pub(crate) async fn served_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    SERVED
+        .scope(std::cell::Cell::new(None), async move {
+            let mut resp = next.run(req).await;
+            if let Some(served) = SERVED.with(std::cell::Cell::get) {
+                for (name, value) in served.headers() {
+                    if let Ok(value) = value.parse() {
+                        resp.headers_mut().insert(name, value);
+                    }
                 }
             }
-        }
-        Ok(resp)
-    }
+            resp
+        })
+        .await
 }
 
 /// One gRPC call through the router, for every service.
@@ -450,9 +458,12 @@ async fn call<T>(
     // A cluster node's calls may carry the replica header (D328): boxed, so a single node's
     // calls keep the future and the cost they had.
     if shared.router.is_cluster() {
-        return Box::pin(call_served(shared, req, op))
-            .await
-            .map(|(reply, _)| reply);
+        let (reply, served) = Box::pin(call_served(shared, req, op)).await?;
+        if let Some(served) = served {
+            // For [`served_headers`], which wraps a cluster node's `Data` route.
+            let _ = SERVED.try_with(|slot| slot.set(Some(served)));
+        }
+        return Ok(reply);
     }
     let caller = shared.caller(auth_header(&req))?;
     let prepaid = req.extensions().get::<Prepaid>().and_then(Prepaid::take);
@@ -480,8 +491,8 @@ async fn call<T>(
 }
 
 /// [`call`] on a cluster node, with what served a read a replica could have (D328), for its
-/// headers. A single node's calls take [`call`] itself, unchanged, so their cost stays as
-/// it was (the serve callgrind shapes, D193).
+/// headers. A single node's calls never come here, so their cost stays as it was (the
+/// serve callgrind shapes, D193).
 async fn call_served<T>(
     shared: &Shared,
     req: Request<T>,
@@ -1194,16 +1205,10 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::GetRequest>,
     ) -> Result<Response<proto::GetResponse>, Status> {
-        let pick = |r| match r {
+        respond(self.call(req, ServiceOp::Get).await?, |r| match r {
             ServiceReply::Get(r) => Some(r),
             _ => None,
-        };
-        // A single node's read as it always went; a cluster node's, boxed, may be a
-        // replica's and says so (D328).
-        if !self.0.router.is_cluster() {
-            return respond(self.call(req, ServiceOp::Get).await?, pick);
-        }
-        Box::pin(self.read(req, ServiceOp::Get, pick)).await
+        })
     }
 
     async fn multi_get(
@@ -1220,16 +1225,10 @@ impl Data for DataGrpc {
         &self,
         req: Request<proto::ReadRowRequest>,
     ) -> Result<Response<proto::ReadRowResponse>, Status> {
-        let pick = |r| match r {
+        respond(self.call(req, ServiceOp::ReadRow).await?, |r| match r {
             ServiceReply::ReadRow(r) => Some(r),
             _ => None,
-        };
-        // A single node's read as it always went; a cluster node's, boxed, may be a
-        // replica's and says so (D328).
-        if !self.0.router.is_cluster() {
-            return respond(self.call(req, ServiceOp::ReadRow).await?, pick);
-        }
-        Box::pin(self.read(req, ServiceOp::ReadRow, pick)).await
+        })
     }
 
     type ScanStream =

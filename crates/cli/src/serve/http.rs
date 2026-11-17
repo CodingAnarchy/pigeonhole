@@ -88,12 +88,24 @@ pub(crate) fn router(shared: Arc<Shared>) -> axum::Router {
         ))
         .service(admin.clone());
     let shed = Arc::clone(&shared);
-    let limited = axum::Router::new()
-        .route("/v1/{service}/{method}", post(call))
-        .route_service(
+    let limited = axum::Router::new().route("/v1/{service}/{method}", post(call));
+    // A cluster node's reads may be a replica's, and say so in their headers (D328): only
+    // there is the middleware mounted, so a single node's `Data` calls are as they were.
+    let limited = if shared.router.is_cluster() {
+        limited.route_service(
+            "/pigeonhole.v1.Data/{*method}",
+            tower::ServiceBuilder::new()
+                .layer(axum::middleware::from_fn(super::grpc::served_headers))
+                .layer(prepay())
+                .service(data),
+        )
+    } else {
+        limited.route_service(
             "/pigeonhole.v1.Data/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(data),
         )
+    };
+    let limited = limited
         .route_service(
             "/pigeonhole.v1.Transactions/{*method}",
             tower::ServiceBuilder::new().layer(prepay()).service(txns),
