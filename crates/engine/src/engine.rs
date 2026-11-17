@@ -709,8 +709,6 @@ fn block_cache(bytes: usize, _shards: usize) -> Arc<BlockCache> {
 /// The `(tablet, family)` slots one record writes on one shard.
 type Slots = Vec<(TabletId, FamilyId)>;
 
-/// A replayed record of one stream, kept until every stream is read and the cross-shard
-/// decisions are resolved.
 /// An external PREPARE's fields at replay (D329): what reinstalling it needs beside its batch.
 struct ExternalStash {
     xid: Arc<[u8]>,
@@ -719,6 +717,122 @@ struct ExternalStash {
     read: Vec<(TableId, Vec<u8>)>,
 }
 
+/// The tablets in-doubt external shares hold, each with the shard whose stream logged the
+/// share (D329, perf2's M1 on #2000). Tablet owners aren't persisted: a reopen places every
+/// tablet again, so a tablet that moved before a prepare would land on another shard than
+/// the share's holds, and its writes would pass them. Open pins these tablets to the
+/// logging shard before it places the rest. A read-only pre-pass over the WAL with
+/// recovery's own in-doubt rule, run only when tablet changes are on and the file has
+/// `incompat` bit 2. `Unsupported` if two in-doubt shares from different streams touch one
+/// tablet, which no run of this build leaves (a tablet change touching an in-doubt share
+/// is given up).
+fn external_pins(
+    vfs: &VfsRef,
+    path: &Path,
+    db_id: [u8; 16],
+    catalog: &Catalog,
+    shards: usize,
+) -> Result<HashMap<TabletId, ShardId>> {
+    // Each external PREPARE: (stream, id) -> (coordinator, participants, rows).
+    #[allow(clippy::type_complexity)]
+    let mut shares: HashMap<
+        (StreamId, Seqno),
+        (StreamId, Vec<StreamId>, Vec<(TableId, Vec<u8>)>),
+    > = HashMap::new();
+    let mut prepared: HashSet<(StreamId, Seqno)> = HashSet::new();
+    let mut decided: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
+    let mut aborted: HashSet<(StreamId, Seqno)> = HashSet::new();
+    for stream in discover_streams(vfs, path)? {
+        let checkpoint = catalog
+            .checkpoints
+            .get(&stream)
+            .copied()
+            .unwrap_or_default();
+        let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
+        while let Some((_, record)) = rec.next_record()? {
+            match record {
+                WalRecord::Prepare { seqno, .. } => {
+                    prepared.insert((stream, seqno));
+                }
+                WalRecord::ExternalPrepare {
+                    seqno,
+                    coordinator,
+                    share,
+                } => {
+                    prepared.insert((stream, seqno));
+                    let mut rows = Vec::new();
+                    if let Some(batch) = share.batch() {
+                        for m in batch.iter() {
+                            let m = m?;
+                            rows.push((m.table, m.row.to_vec()));
+                        }
+                    }
+                    for r in share.reads() {
+                        let r = r?;
+                        rows.push((r.table, r.row.to_vec()));
+                    }
+                    shares.insert(
+                        (stream, seqno),
+                        (coordinator, share.participants().iter().collect(), rows),
+                    );
+                }
+                WalRecord::Commit {
+                    seqno,
+                    participants,
+                }
+                | WalRecord::Decision {
+                    seqno,
+                    participants,
+                    ..
+                } => {
+                    decided.insert((stream, seqno), participants.iter().collect());
+                }
+                WalRecord::ExternalAbort { seqno, .. } => {
+                    aborted.insert((stream, seqno));
+                }
+                _ => {}
+            }
+        }
+    }
+    let map = TabletMap::build(1, &catalog.tablets());
+    let mut pins: HashMap<TabletId, ShardId> = HashMap::new();
+    for ((stream, seqno), (coordinator, participants, rows)) in &shares {
+        // Recovery's rule: in doubt when every participant's PREPARE is here and neither a
+        // complete decision nor an abort is.
+        let complete = decided
+            .get(&(*coordinator, *seqno))
+            .is_some_and(|ps| ps.iter().all(|p| prepared.contains(&(*p, *seqno))));
+        let in_doubt = !complete
+            && !aborted.contains(&(*coordinator, *seqno))
+            && participants
+                .iter()
+                .all(|p| prepared.contains(&(*p, *seqno)));
+        // A stream past the shard count is a layout change, which open refuses later.
+        if !in_doubt || stream.0 as usize >= shards {
+            continue;
+        }
+        let shard = ShardId(stream.0 as u16);
+        for (table, row) in rows {
+            let Some((tablet, _)) = map.route(*table, row) else {
+                continue;
+            };
+            match pins.insert(tablet, shard) {
+                Some(other) if other != shard => {
+                    return Err(Error::Unsupported(
+                        "in-doubt external transactions logged by two shards touch one tablet, \
+                         which this build never leaves: decide them with the build that \
+                         prepared them",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(pins)
+}
+
+/// A replayed record of one stream, kept until every stream is read and the cross-shard
+/// decisions are resolved.
 struct ReplayedRecord {
     end: Lsn,
     seqno: Seqno,
@@ -1220,7 +1334,17 @@ impl Engine {
         let arena_len = shm.arena(0).2;
         let chunk = if options.tablet_changes {
             let base = arena_chunk_size(arena_len, 0);
-            let placed = catalog.place(shards, max_slots(arena_len, base));
+            // In-doubt external shares hold their tablets on the shard that logged them
+            // (D329): those are placed there first.
+            let pins = if pager.features().incompat
+                & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE
+                != 0
+            {
+                external_pins(&vfs, path, db_id, &catalog, shards)?
+            } else {
+                HashMap::new()
+            };
+            let placed = catalog.place(shards, max_slots(arena_len, base), &pins);
             arena_chunk_size(arena_len, placed)
         } else {
             arena_chunk_size(arena_len, catalog.max_slots_per_shard(shards))
