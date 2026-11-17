@@ -551,6 +551,9 @@ pub struct Stats {
     /// Armed power losses that fired on background I/O and surfaced as a later step's error.
     pub background_crashes: usize,
     pub busy: usize,
+    /// D329: plain commits that gave up with `Busy` while no external share in doubt (or
+    /// maybe in doubt) held one of their rows: on a fault-free run nothing else explains one.
+    pub busy_unheld: usize,
     pub flushes: u64,
     pub compactions: u64,
     pub purges: usize,
@@ -4553,7 +4556,18 @@ impl World {
                 }
             }
             Outcome::Commit(Err(Error::Busy)) | Outcome::Cas(Err(Error::Busy)) => {
+                // A decide of a share in doubt applies a decision already held: nothing may
+                // refuse it, and a refused one would stay `deciding` for good (perf2 on #2000).
+                if let Kind::External { xid, .. } = &inf.commit.kind {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!("decide commit of {}: Busy", text(xid)),
+                    );
+                }
                 self.stats.busy += 1;
+                if !self.overlaps_external(&inf.commit) {
+                    self.stats.busy_unheld += 1;
+                }
                 self.trace.push("  -> busy (arena full)".into());
                 self.aborted.push(inf.commit);
             }
@@ -5917,6 +5931,19 @@ impl World {
                     text(x),
                     e.commit.durability
                 ));
+                // Recovery rebuilt the model from the surviving commits only, so the lost
+                // decision's commit is withdrawn: a later abort must find nothing of it.
+                if self.history.values().any(|c| {
+                    matches!(&c.kind, Kind::External { xid, phase: ExternalPhase::Commit } if xid == x)
+                }) {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "external {}'s lost decision is still in the model",
+                            text(x)
+                        ),
+                    );
+                }
                 self.external.insert(x.clone(), e);
             }
         }

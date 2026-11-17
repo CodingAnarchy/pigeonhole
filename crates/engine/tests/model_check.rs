@@ -115,8 +115,8 @@ fn settled_commits_trimmed_by_participants_survive_crashes() {
 /// D329 (ICR 0140): transactions prepared for an external coordinator, decided some steps
 /// later (commit or abort) or left in doubt across crashes and closes, beside the usual
 /// workload, faults, crashes and tablet changes. A share in doubt holds its rows, so a
-/// write to them answers `Busy` (a single) or `Conflict` (a PREPARE): the quiet runs skip
-/// `check`'s no-`Busy` assertion.
+/// write to them answers `Busy` (a single) or `Conflict` (a PREPARE): the quiet runs assert
+/// instead that every plain commit's `Busy` met such a share.
 #[test]
 fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
     let (mut prepared, mut committed, mut aborted, mut adopted) = (0, 0, 0, 0);
@@ -136,6 +136,15 @@ fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
                 match run(seed, cfg) {
                     Ok(stats) => {
                         eprintln!("shards {shards} seed {seed}: {stats:?}");
+                        // As `check`: on a fault-free run a plain commit's `Busy` has one
+                        // cause, a share in doubt holding its row (perf2 on #2000).
+                        if fault_free(cfg) {
+                            assert_eq!(
+                                stats.busy_unheld, 0,
+                                "shards {shards} seed {seed}: a plain commit gave up with Busy \
+                                 over no share in doubt on a fault-free run: {stats:?}"
+                            );
+                        }
                         prepared += stats.external_in_doubt;
                         committed += stats.external_committed;
                         aborted += stats.external_aborted;
