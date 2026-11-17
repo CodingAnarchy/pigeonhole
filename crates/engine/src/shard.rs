@@ -1103,11 +1103,12 @@ impl Shared {
         // checkpoint passed, so the files stay and the close isn't marked clean (a clean mark
         // would let a reader's last-one-out remove them); the next open replays and
         // reinstalls them.
-        let in_doubt = !self
+        let in_doubt = self
             .external
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_empty();
+            .values()
+            .any(|e| e.id != 0);
         let keep_wal = self.feed.is_some() || in_doubt;
         if clean.is_ok() && last && !keep_wal {
             // The WAL files go away with this close: the streams the next open creates
@@ -1553,10 +1554,12 @@ pub(crate) struct PrepareReq {
     pub submitted_at: u64,
 }
 
-/// [`Shared::external`]'s entry for an xid in doubt.
+/// [`Shared::external`]'s entry for an xid in doubt, or reserved by a prepare in flight.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExternalEntry {
-    /// The commit's id.
+    /// The commit's id; 0 while a prepare of the xid is in flight (`Inner::prepare_external`
+    /// reserved it, and the coordinator replaces it once every share is logged), so a
+    /// second prepare of the xid is refused and both count against the limits.
     pub id: Seqno,
     /// The shard that holds its decision.
     pub coordinator: ShardId,
@@ -1858,6 +1861,10 @@ enum MemberKind {
         /// An external PREPARE's encoded share (D329: xid, participants, reads, then the
         /// batch, FORMAT §10.3), its record's body; `None` for a D263 PREPARE. Boxed, so the
         /// variant (and every member) keeps its size.
+        #[allow(
+            clippy::box_collection,
+            reason = "one pointer, not a slice's two words: every member keeps its size"
+        )]
         external: Option<Box<Vec<u8>>>,
     },
     /// `apply_seqno`: the seqno reserved at the decision, which the commit applies at
@@ -1869,6 +1876,10 @@ enum MemberKind {
         /// the record is an External Abort (type 6), `apply_seqno` the abort's own seqno,
         /// held until it is written and then released with nothing applied (ICR 0140's E1).
         /// `None` for a DECISION.
+        #[allow(
+            clippy::box_collection,
+            reason = "one pointer, not a slice's two words: every member keeps its size"
+        )]
         external_abort: Option<Box<Vec<u8>>>,
     },
 }
