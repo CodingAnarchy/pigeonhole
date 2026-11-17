@@ -12,7 +12,9 @@
 //! Only free space is punched: what no recoverable root and no live view names, which
 //! the allocator would overwrite anyway. A filesystem that cannot punch (`Unsupported`)
 //! stops punching until the next open; any other error ends the pass and counts as a
-//! refusal, and the next trigger tries again.
+//! refusal, and the next pass waits for a trigger's worth of new free space, as after an
+//! empty one (simp724's S1 on #2034). A poisoned pager (a failed root commit) punches
+//! nothing: the failed root may be the one recovery opens (simp724's M1).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,7 +75,7 @@ pub(crate) struct Punch {
     idle_at: AtomicU64,
     /// Passes started.
     pub passes: AtomicU64,
-    /// Punches that failed (the `Unsupported` one included).
+    /// Punches that failed, the `Unsupported` one included.
     pub refusals: AtomicU64,
 }
 
@@ -104,7 +106,10 @@ impl Punch {
     /// Whether to start a pass now; if so, marks one running (the caller spawns it, or
     /// calls [`Punch::finished`] if it cannot).
     pub(crate) fn should_start(&self, shared: &Shared) -> bool {
-        if self.unsupported.load(Ordering::Relaxed) || self.running.load(Ordering::Relaxed) {
+        if self.unsupported.load(Ordering::Relaxed)
+            || self.running.load(Ordering::Relaxed)
+            || shared.pager_poisoned.load(Ordering::Acquire)
+        {
             return false;
         }
         let s = shared.pager.stats();
@@ -181,7 +186,11 @@ impl Task for PunchPass {
         let Some(punch) = self.shared.punch.as_ref() else {
             return TaskPoll::Done;
         };
-        if self.shared.closed.load(Ordering::Acquire) || self.punched >= punch.tuning.pass_bytes {
+        // The pager refuses a poisoned punch itself (M1); this only stops the pass early.
+        if self.shared.closed.load(Ordering::Acquire)
+            || self.shared.pager_poisoned.load(Ordering::Acquire)
+            || self.punched >= punch.tuning.pass_bytes
+        {
             return TaskPoll::Done;
         }
         let simulated = self.shared.vfs.clock_is_simulated();
@@ -214,6 +223,9 @@ impl Task for PunchPass {
                 {
                     punch.unsupported.store(true, Ordering::Relaxed);
                 }
+                // A refusal that persists (EIO, EPERM) would otherwise fail once per manifest
+                // commit: wait for new free space, as after an empty pass (simp724's S1).
+                punch.ended(0, unpunched_free(&self.shared.pager.stats()));
                 TaskPoll::Done
             }
         }

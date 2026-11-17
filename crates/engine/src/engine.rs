@@ -203,8 +203,9 @@ pub struct Metrics {
     /// Gauge: free bytes that are holes now. The file's length less this is about what it
     /// occupies on disk.
     pub file_punched_bytes: u64,
-    /// Punch passes started, and punches that failed (a filesystem that cannot punch
-    /// fails once, and punching then stops until the next open).
+    /// Punch passes started, and punches that failed. A filesystem that cannot punch fails
+    /// once, and punching stops until the next open; any other failure ends its pass, and the
+    /// next waits for new free space.
     pub file_punch_passes: (u64, u64),
     /// File reads made synchronously inside async reads: a separated value too large to
     /// cache (D196, #398), a block the cache could not keep, or a read that missed too
