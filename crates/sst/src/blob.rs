@@ -66,6 +66,10 @@ fn for_each_piece(
     Ok(())
 }
 
+/// How many written bytes a blob file gathers before it starts their writeback (#2023): the
+/// SST writer's chunk (D334).
+const HINT_BYTES: u64 = 1 << 20;
+
 pub(crate) struct Writer {
     file: FileRef,
     blob_file: BlobFileId,
@@ -74,6 +78,12 @@ pub(crate) struct Writer {
     extents: Vec<ExtentRef>,
     /// Logical bytes appended.
     pos: u64,
+    /// Logical bytes whose writeback was started ([`Writer::hint_to`]).
+    hinted: u64,
+    /// Whether writes go through the page cache: a direct-I/O handle has no writeback to
+    /// start, and its writes aren't cut into chunks (each cut would cost it an aligned
+    /// read-modify-write).
+    buffered: bool,
 }
 
 impl std::fmt::Debug for Writer {
@@ -89,13 +99,61 @@ impl std::fmt::Debug for Writer {
 impl Writer {
     pub(crate) fn new(file: FileRef, blob_file: BlobFileId, size_class: u8) -> Self {
         Self {
-            file,
             blob_file,
             size_class,
             payload: payload_len(size_class),
             extents: Vec::new(),
             pos: 0,
+            hinted: 0,
+            buffered: file.direct_align().is_none(),
+            file,
         }
+    }
+
+    /// Starts the writeback of the logical bytes from `hinted` to `end`, all written (D334,
+    /// #2023), so the root commit's sync of the data file finds a blob file mostly written
+    /// back instead of sending all of it to the device at once, where a WAL commit's small
+    /// write would wait behind it (#1991).
+    ///
+    /// One call per run of file bytes: a piece that starts an extent's payload takes the
+    /// extent's header with it (written by [`add_extent`](Self::add_extent)), and pieces in
+    /// adjacent extents are one range. A hint, as the SST writer's: a failure leaves the
+    /// sync to do the work, and the sync is still what makes the bytes durable.
+    fn hint_to(&mut self, end: u64) {
+        if !self.buffered || end <= self.hinted {
+            self.hinted = self.hinted.max(end);
+            return;
+        }
+        let header = BLOB_EXTENT_HEADER_LEN as u64;
+        let (file, extents) = (&self.file, &self.extents);
+        let mut run: Option<(u64, u64)> = None;
+        let mut at = self.hinted;
+        // In steps a `usize` holds: a tail is under `HINT_BYTES`, but `end` is a file size.
+        while at < end {
+            let n = (end - at).min(HINT_BYTES) as usize;
+            let walked = for_each_piece(extents, self.payload, at, n, |i, abs, r| {
+                let payload_start = extents[i].offset() + header;
+                let (start, len) = match abs == payload_start {
+                    true => (extents[i].offset(), r.len() as u64 + header),
+                    false => (abs, r.len() as u64),
+                };
+                match &mut run {
+                    Some((from, run_len)) if *from + *run_len == start => *run_len += len,
+                    _ => {
+                        if let Some((from, run_len)) = run.replace((start, len)) {
+                            let _ = file.start_writeback(from, run_len);
+                        }
+                    }
+                }
+                Ok(())
+            });
+            debug_assert!(walked.is_ok(), "hinted bytes lie in the writer's extents");
+            at += n as u64;
+        }
+        if let Some((from, run_len)) = run {
+            let _ = file.start_writeback(from, run_len);
+        }
+        self.hinted = end;
     }
 
     fn capacity(&self) -> u64 {
@@ -138,12 +196,27 @@ impl Writer {
         }
         let offset = self.pos;
         let header = encode_record_header(value);
-        for (at, bytes) in [(offset, &header[..]), (offset + header.len() as u64, value)] {
-            for_each_piece(&self.extents, self.payload, at, bytes.len(), |_, abs, r| {
-                crate::reader::write_any(&self.file, &bytes[r], abs)
-            })?;
+        let mut at = offset;
+        for mut bytes in [&header[..], value] {
+            while !bytes.is_empty() {
+                // Up to the next megabyte since the last hint, so a long value's writeback
+                // starts as it is written, a chunk at a time, and not all at its end.
+                let n = match self.buffered {
+                    true => (HINT_BYTES - (at - self.hinted)).min(bytes.len() as u64) as usize,
+                    false => bytes.len(),
+                };
+                let (now, rest) = bytes.split_at(n);
+                for_each_piece(&self.extents, self.payload, at, n, |_, abs, r| {
+                    crate::reader::write_any(&self.file, &now[r], abs)
+                })?;
+                at += n as u64;
+                bytes = rest;
+                if at - self.hinted >= HINT_BYTES {
+                    self.hint_to(at);
+                }
+            }
         }
-        self.pos += (BLOB_RECORD_HEADER_LEN + value.len()) as u64;
+        self.pos = at;
         Ok(BlobPointer {
             blob_file: self.blob_file,
             len,
@@ -151,7 +224,9 @@ impl Writer {
         })
     }
 
-    pub(crate) fn finish(self) -> (Vec<ExtentRef>, u64) {
+    pub(crate) fn finish(mut self) -> (Vec<ExtentRef>, u64) {
+        // The last, partial megabyte.
+        self.hint_to(self.pos);
         (self.extents, self.pos)
     }
 }

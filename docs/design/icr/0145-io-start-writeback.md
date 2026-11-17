@@ -35,6 +35,7 @@ pub trait File {
 ## Semantics
 
 - **A hint only:** `sync_data` and `sync_all` still decide durability. A caller may ignore the result, and the SST writer does.
+- **Callers:** the SST writer, per 1 MiB chunk (D334), and since #2023 the blob writer: each megabyte of a blob file as it fills (a long value's megabytes as they are written), the last partial one when the file is finished, one call per run of file bytes with the extents' headers.
 - **Bounded:** the range need not be written yet, or inside the file; the call still succeeds and affects nothing it doesn't cover.
 - **Not ordered against later writes** to the range: they dirty the pages again, and the next sync writes them.
 
