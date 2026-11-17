@@ -137,6 +137,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
+        indexes: Vec::new(),
         memory: None,
         nodes: ["a", "b", "c"]
             .iter()
@@ -4135,6 +4136,7 @@ fn split_nodes(
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
+        indexes: Vec::new(),
         memory: None,
         nodes: ports
             .iter()
@@ -4926,6 +4928,7 @@ mod close;
 mod feed;
 mod fence;
 mod idle;
+mod indexes;
 mod mcp;
 mod memory;
 mod metrics;

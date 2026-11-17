@@ -75,6 +75,11 @@ message CreateVectorIndexRequest {
   Rebalance rebalance = 6;
   // With `if_missing`, an existing index is opened instead.
   bool if_missing = 7;
+  // On a cluster (#1722, ICR 0138), where the index's ids are: a placed table whose ranges
+  // it shares (its ids are that table's row keys), or its own split keys and partitions. A
+  // cluster refuses a create with neither; a single node refuses either (`InvalidArgument`).
+  string follows = 8;
+  TablePlacementRequest placement = 9;
 }
 
 enum Rebalance {

@@ -63,6 +63,7 @@ use crate::exit::Failure;
 /// section): [`NEAREST_QUALIFIERS_FEATURE`] and [`MEMORY_TOOL_FIELDS_FEATURE`].
 pub(crate) const MAP_FEATURES: &[&str] = &[
     MEMORY_FEATURE,
+    INDEXES_FEATURE,
     NEAREST_QUALIFIERS_FEATURE,
     MEMORY_TOOL_FIELDS_FEATURE,
     REPLICAS_FEATURE,
@@ -70,6 +71,10 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
 pub(crate) const MEMORY_FEATURE: &str = "memory";
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.indexes` (#1722, ICR 0138): a node without it
+/// would drop the field from the map it stores, and read as divergent.
+pub(crate) const INDEXES_FEATURE: &str = "indexes";
 
 /// [`MAP_FEATURES`]' name for a build that applies `NearestRequest.qualifiers` (#1915 PR 3):
 /// a node without it would rank every qualifier.
@@ -177,6 +182,11 @@ pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Ve
 /// by cluster directory: their `Status` leaves the feature out.
 #[cfg(test)]
 pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before `ClusterMap.indexes` (#1722), by
+/// cluster directory: their `Status` leaves `indexes` out.
+#[cfg(test)]
+pub(crate) static OLD_INDEXES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// A hold seam (tests): nodes whose `Status` doesn't answer while their cluster directory
 /// is listed, as a stalled peer's wouldn't.
@@ -687,6 +697,11 @@ impl Node {
                 self.every_node_keeps(&map, REPLICAS_FEATURE, "a read replica")
                     .await?;
             }
+            // So does the first index placement (#1722).
+            if current.indexes.is_empty() && !map.indexes.is_empty() {
+                self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -707,6 +722,10 @@ impl Node {
             }
             if has_replicas(&map) {
                 self.every_node_keeps(&map, REPLICAS_FEATURE, "a read replica")
+                    .await?;
+            }
+            if !map.indexes.is_empty() {
+                self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
                     .await?;
             }
             map.previous_nodes.clear();
@@ -1326,6 +1345,16 @@ impl Node {
                         return false;
                     }
                     #[cfg(test)]
+                    if f == INDEXES_FEATURE
+                        && OLD_INDEXES
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .any(|d| self.dir.starts_with(d))
+                    {
+                        return false;
+                    }
+                    #[cfg(test)]
                     if f == MEMORY_TOOL_FIELDS_FEATURE
                         && OLD_MEMORY
                             .lock()
@@ -1804,12 +1833,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
         // node's own token entry (D317 amendment 1).
-        let caller = match op {
-            crate::serve::service::ServiceOp::CreateTable(_)
-            | crate::serve::service::ServiceOp::DropTable(_) => {
-                forward::schema_caller_of(msg.caller, &self.0.tokens)?
-            }
-            _ => forward::caller_of(msg.caller, &self.0.tokens)?,
+        let caller = if crate::serve::router::map_schema_change(&op) {
+            forward::schema_caller_of(msg.caller, &self.0.tokens)?
+        } else {
+            forward::caller_of(msg.caller, &self.0.tokens)?
         };
         // A read the entry node chose this node's replica copy for (D328).
         let replica = msg.to_replica.then_some(crate::serve::router::ReplicaRead {

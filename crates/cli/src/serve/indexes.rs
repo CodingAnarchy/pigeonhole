@@ -276,6 +276,35 @@ impl super::gated::Slices for Counted {
     }
 }
 
+/// The vector spec and index options a `Vectors.CreateIndex` asks for (ICR 0100): what a
+/// single node creates its index with, and each cluster partition its own (#1722).
+pub(crate) fn create_args(
+    r: &crate::serve::proto::CreateVectorIndexRequest,
+) -> Result<(pigeonhole::VectorSpec, IndexOptions), ApiError> {
+    use crate::serve::proto;
+    let spec = r
+        .spec
+        .as_ref()
+        .ok_or_else(|| ApiError::invalid("an index needs a vector spec"))?;
+    let spec = crate::serve::convert::vector_spec_in(spec)?;
+    let mut options = IndexOptions::new();
+    if let Some(n) = r.target_list_len {
+        options = options.target_list_len(n);
+    }
+    if let Some(n) = r.nprobe {
+        options = options.nprobe(n);
+    }
+    if let Some(n) = r.reassign_neighbours {
+        options = options.reassign_neighbours(n);
+    }
+    match proto::Rebalance::try_from(r.rebalance).unwrap_or(proto::Rebalance::Unspecified) {
+        proto::Rebalance::Unspecified => {}
+        proto::Rebalance::Inline => options = options.rebalance(Rebalance::Inline),
+        proto::Rebalance::Background => options = options.rebalance(Rebalance::Background),
+    }
+    Ok((spec, options))
+}
+
 #[cfg(test)]
 mod tests {
     use super::Indexes;

@@ -689,13 +689,9 @@ impl Router {
         }
         if let Some(cluster) = &self.cluster {
             // The schema is the map's (ticket 5).
-            if matches!(
-                op,
-                ServiceOp::ListTables(_)
-                    | ServiceOp::DescribeTable(_)
-                    | ServiceOp::CreateTable(_)
-                    | ServiceOp::DropTable(_)
-            ) {
+            if map_schema_change(&op)
+                || matches!(op, ServiceOp::ListTables(_) | ServiceOp::DescribeTable(_))
+            {
                 let deadline = deadline.map_or_else(
                     || tokio::time::Instant::now() + self.service.request_timeout(),
                     tokio::time::Instant::from_std,
@@ -1017,7 +1013,7 @@ impl Router {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
-        if matches!(op, ServiceOp::CreateTable(_) | ServiceOp::DropTable(_)) {
+        if map_schema_change(&op) {
             return Ok((self.serve_forwarded_schema(cluster, op, caller).await?, 0));
         }
         if let Some((read, deadline)) = replica {
@@ -1695,18 +1691,40 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::MemoryWatch(_) => Err(ApiError::internal(
             "Memory.Watch is merged across partitions, not routed",
         )),
-        // An index lives in one partition's file, and no D317 ticket routes a search to it
-        // (#1722, 1.3.0).
-        ServiceOp::VectorSearch(_) | ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
-            "indexed vector and text search isn't supported on a cluster in this release: use \
-             Vectors.Nearest, which fans out across the partitions",
+        // An index write (#1722): to the partition holding its id, by the table the index
+        // follows or by its own ranges. A text document's id is its source row's key, so its
+        // postings land beside it.
+        ServiceOp::VectorInsert(r) => index_route(routes, &r.index, &r.id),
+        ServiceOp::VectorDelete(r) => index_route(routes, &r.index, &r.id),
+        ServiceOp::TextPut(r) => index_route(routes, &r.index, &r.id),
+        ServiceOp::TextDelete(r) => index_route(routes, &r.index, &r.id),
+        // Searches across an index's partitions come with #1722's next PRs.
+        ServiceOp::VectorSearch(_) => Err(ApiError::unsupported(
+            "Vectors.Search isn't supported on a cluster yet: use Vectors.Nearest, which fans \
+             out across the partitions",
+        )),
+        ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
+            "Text.Search isn't supported on a cluster yet",
+        )),
+        // So do the calls over a whole index (#1722's next PRs).
+        ServiceOp::VectorVerify(_) => Err(ApiError::unsupported(
+            "Vectors.Verify isn't supported on a cluster yet",
+        )),
+        ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
+            "Vectors.BulkLoad isn't supported on a cluster yet",
+        )),
+        ServiceOp::TextRebuild(_) => Err(ApiError::unsupported(
+            "Text.Rebuild isn't supported on a cluster yet",
+        )),
+        ServiceOp::TextVerify(_) => Err(ApiError::unsupported(
+            "Text.Verify isn't supported on a cluster yet",
         )),
         // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
-        // read that fans out, a schema call (the map's), a subscription and a backup.
+        // schema change (the map writer's), a schema read, a read that fans out, a
+        // subscription and a backup.
+        op if map_schema_change(op) => Err(unrouted()),
         ServiceOp::Traverse(_)
         | ServiceOp::ListTables(_)
-        | ServiceOp::CreateTable(_)
-        | ServiceOp::DropTable(_)
         | ServiceOp::DescribeTable(_)
         | ServiceOp::Subscribe(_)
         | ServiceOp::Backup(_)
@@ -1715,6 +1733,31 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
             "this call isn't served by a cluster node (D317)",
         )),
     }
+}
+
+/// Whether `op` is a schema change the map's writer makes (D317 ticket 5): a table's create or
+/// drop, or an index's create (#1722; its drop is a `DropTable`).
+pub(crate) fn map_schema_change(op: &ServiceOp) -> bool {
+    matches!(
+        op,
+        ServiceOp::CreateTable(_)
+            | ServiceOp::DropTable(_)
+            | ServiceOp::CreateIndex(_)
+            | ServiceOp::TextCreateIndex(_)
+    )
+}
+
+/// The partition holding id `id` of index `index` (#1722).
+fn index_route(routes: &Routes, index: &str, id: &[u8]) -> Result<String, ApiError> {
+    routes
+        .index_partition(index, id)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ApiError::from_code(
+                pigeonhole::ErrorCode::TableNotFound,
+                &format!("index {index:?} isn't in the cluster map"),
+            )
+        })
 }
 
 /// The partition holding every namespace a memory call names (#1915): `what`'s. A call
