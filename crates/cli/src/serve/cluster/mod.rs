@@ -2235,7 +2235,8 @@ pub(crate) fn run(
         Arc::clone(&metrics),
         Some(Arc::clone(&placement)),
     )
-    .memory_opt(None, args.memory_calls.unwrap_or(0));
+    .memory_opt(None, args.memory_calls.unwrap_or(0))
+    .text_pack(args.text_pack);
     // `--memory` (#1915): each partition the map places the store on opens its own, with
     // this node's embedder and options, when a reconcile finds it placed. The map may place
     // it later; it can't place another store.

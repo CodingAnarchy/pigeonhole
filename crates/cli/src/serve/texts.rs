@@ -9,12 +9,17 @@
 //!   index, and resumes on its own once the partition takes writes again
 //!   ([`Texts::resume_soon`]): at the partition's open, after a restart or a move, and after
 //!   the stop. A client's `Text.Rebuild` always starts over (ai1249 on #1756).
+//! - **`--text-pack` packs the indexes in the background** (#1585, ICR 0143): off by default,
+//!   since a packed index can't be read by a 1.2 build. With it, a thread per partition
+//!   ([`Texts::pack_soon`]) packs each index a chunk at a time, under the write gate and the
+//!   node's rebuild slot as a resume is: a fence stops it at its next chunk, and it yields
+//!   to a client's `Text.Rebuild`.
 //! - **Clauses map by field name** (ICR 0105's amendment for 7c): a `term` field is matched as
 //!   given (`Query::term`, `Query::fuzzy`); a `text` field is tokenised as documents are
 //!   (`Query::text`, and a phrase's text as `Query::quoted_phrase`, the syntax's `"..."~N`).
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -22,7 +27,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use pigeonhole::Pigeonhole;
-use pigeonhole_text::{Fuzziness, Index, IndexOptions, Normalization, Query, Source};
+use pigeonhole_text::{Fuzziness, Index, IndexOptions, Normalization, PackOptions, Query, Source};
 
 use super::errors::ApiError;
 use super::proto;
@@ -46,7 +51,26 @@ pub(crate) struct Texts {
     /// to under the partition's `schema` lock, so a `DropTable` holding it sees every create
     /// that could still write an index's source after the drop's check.
     creating: Mutex<Vec<String>>,
+    /// The pack thread ([`Texts::pack_soon`]), with `--text-pack`.
+    pack: Mutex<Resume>,
+    /// The pack thread's counters, for `/metrics`.
+    pub(crate) packs: PackCounters,
 }
+
+/// What a partition's background pack has done (`--text-pack`), for `/metrics`.
+#[derive(Debug, Default)]
+pub(crate) struct PackCounters {
+    /// Passes over the partition's indexes that ran to their end.
+    pub(crate) passes: AtomicU64,
+    /// Postings moved into blocks.
+    pub(crate) postings: AtomicU64,
+    /// Packs refused or failed: a first pack with reader processes attached, or an error.
+    pub(crate) refused: AtomicU64,
+}
+
+/// How long the pack thread waits between passes. A pass over indexes with nothing new
+/// reads their few unpacked cells and writes nothing.
+const PACK_EVERY: Duration = Duration::from_secs(60);
 
 /// The resume thread's state, under [`Texts::resume`]'s lock.
 #[derive(Debug, Default)]
@@ -81,6 +105,8 @@ enum Pass {
 #[derive(Debug)]
 pub(crate) struct RebuildSlot {
     place: Arc<Semaphore>,
+    /// `--text-pack`: the node's partitions pack their text indexes in the background.
+    pack: AtomicBool,
     /// A resume holds the place.
     resuming: AtomicBool,
     /// Clients waiting for the place: a resume stops for them.
@@ -91,9 +117,20 @@ impl RebuildSlot {
     pub(crate) fn new() -> Self {
         Self {
             place: Arc::new(Semaphore::new(1)),
+            pack: AtomicBool::new(false),
             resuming: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
         }
+    }
+
+    /// Turns the background pack on (`--text-pack`), for every partition sharing the slot.
+    pub(crate) fn pack_on(&self) {
+        self.pack.store(true, Ordering::Release);
+    }
+
+    /// Whether the node packs its text indexes in the background.
+    pub(crate) fn packs(&self) -> bool {
+        self.pack.load(Ordering::Acquire)
     }
 
     /// A client's place: now; or, while a resume holds it, once the resume has stopped at its
@@ -213,7 +250,7 @@ impl Steps {
         if let Some(h) = self.held.take()
             && let Err(e) = h.committed()
         {
-            eprintln!("phdb serve: a text index rebuild: {}", e.message);
+            eprintln!("phdb serve: a text index rebuild or pack: {}", e.message);
         }
         if self.texts.closed.load(Ordering::Acquire) {
             return self.stopped(Stop::Closed);
@@ -240,7 +277,7 @@ impl Steps {
         if let Some(h) = self.held.take()
             && let Err(e) = h.committed()
         {
-            eprintln!("phdb serve: a text index rebuild: {}", e.message);
+            eprintln!("phdb serve: a text index rebuild or pack: {}", e.message);
         }
         self.stop.take()
     }
@@ -305,6 +342,8 @@ impl Texts {
             placement,
             resume: Mutex::new(Resume::default()),
             creating: Mutex::new(Vec::new()),
+            pack: Mutex::new(Resume::default()),
+            packs: PackCounters::default(),
         }
     }
 
@@ -393,15 +432,170 @@ impl Texts {
                 Pass::Wait => super::gated::IDLE,
                 Pass::Failed => RESUME_RETRY,
             };
-            // In steps, so a close isn't kept waiting.
-            let until = std::time::Instant::now() + wait;
-            while std::time::Instant::now() < until {
-                if self.closed.load(Ordering::Acquire) {
-                    break;
+            self.idle(wait, |_| false);
+        }
+    }
+
+    /// Waits `wait` in steps, so a close isn't kept waiting; ends early once `woken` says
+    /// so.
+    fn idle(&self, wait: Duration, woken: impl Fn(&Self) -> bool) {
+        let until = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < until {
+            if self.closed.load(Ordering::Acquire) || woken(self) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50).min(wait));
+        }
+    }
+
+    /// Starts this partition's pack thread (`phdb-serve-text-pack`, #1585) if the node runs
+    /// with `--text-pack`, once: it packs the partition's text indexes, then again every
+    /// [`PACK_EVERY`], until the texts close. Called where [`resume_soon`](Self::resume_soon)
+    /// is. A call while it runs makes it pass again at once (a promote: the partition takes
+    /// writes now).
+    pub(crate) fn pack_soon(self: &Arc<Self>, slot: &Arc<RebuildSlot>) {
+        if !slot.packs() {
+            return;
+        }
+        let mut p = self.pack.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if p.running {
+            p.again = true;
+            return;
+        }
+        let me = Arc::clone(self);
+        let slot = Arc::clone(slot);
+        let spawned = std::thread::Builder::new()
+            .name("phdb-serve-text-pack".into())
+            .spawn(move || me.pack_loop(&slot));
+        match spawned {
+            Ok(h) => {
+                p.running = true;
+                p.again = false;
+                p.thread = Some(h);
+            }
+            Err(e) => eprintln!("phdb serve: no thread to pack text indexes: {e}"),
+        }
+    }
+
+    fn pack_loop(self: Arc<Self>, slot: &Arc<RebuildSlot>) {
+        if let Some(p) = &self.placement {
+            p.enter();
+        }
+        // Indexes whose pack was refused or failed, logged once each: a later pass tries
+        // them again without saying so again, and says when one goes through.
+        let mut refused = std::collections::HashSet::new();
+        loop {
+            self.pack
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .again = false;
+            let wait = match self.pack_pass(slot, &mut refused) {
+                Pass::Closed => {
+                    self.pack
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .running = false;
+                    return;
                 }
-                std::thread::sleep(Duration::from_millis(50).min(wait));
+                Pass::Done => {
+                    self.packs.passes.fetch_add(1, Ordering::Relaxed);
+                    PACK_EVERY
+                }
+                Pass::Wait => super::gated::IDLE,
+                Pass::Failed => RESUME_RETRY,
+            };
+            self.idle(wait, |me| {
+                me.pack.lock().unwrap_or_else(PoisonError::into_inner).again
+            });
+        }
+    }
+
+    /// One pass over the partition's text indexes: each packed in turn, a chunk at a time
+    /// under the gate and the slot. An index with a rebuild pending is left to the resume
+    /// thread, and packed by a later pass.
+    fn pack_pass(
+        self: &Arc<Self>,
+        slot: &Arc<RebuildSlot>,
+        refused: &mut std::collections::HashSet<String>,
+    ) -> Pass {
+        if self.closed.load(Ordering::Acquire) {
+            return Pass::Closed;
+        }
+        // Writes first: a fenced partition (or one without its lease) waits.
+        if let Some(gate) = &self.gate
+            && gate.fenced().is_some()
+        {
+            return Pass::Wait;
+        }
+        let names = match Index::list(&self.db) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("phdb serve: listing the text indexes to pack: {e}");
+                return Pass::Failed;
+            }
+        };
+        if names.is_empty() {
+            return Pass::Done;
+        }
+        let Some(_hold) = slot.resume() else {
+            return Pass::Wait;
+        };
+        for name in names {
+            let fail = |refused: &mut std::collections::HashSet<String>, why: String| {
+                self.packs.refused.fetch_add(1, Ordering::Relaxed);
+                if refused.insert(name.clone()) {
+                    eprintln!(
+                        "phdb serve: text index {name}: not packed, and tried again each                          pass: {why}"
+                    );
+                }
+            };
+            let index = match self.get(&name) {
+                Ok(i) => i,
+                Err(e) => {
+                    fail(refused, e.message);
+                    continue;
+                }
+            };
+            match index.rebuild_pending() {
+                Ok(false) => {}
+                // The resume thread's, or a client's: packed once it is done.
+                Ok(true) => continue,
+                Err(e) => {
+                    fail(refused, e.to_string());
+                    continue;
+                }
+            }
+            let held = match self.gate.as_ref().map(super::gate::WriteGate::enter) {
+                Some(Err(_)) => return Pass::Wait,
+                Some(Ok(h)) => Some(h),
+                None => None,
+            };
+            let mut steps = Steps::new(Arc::clone(self), held, Some(Arc::clone(slot)));
+            let done = index.pack_with(PackOptions::new(), |_| steps.step());
+            let stop = steps.finish();
+            match done {
+                // A chunk that kept conflicting with writers: the cursor stays, and the next
+                // pass carries on from it (ai1249's S2 on #2009). Not a failure.
+                Err(e) if e.code() == pigeonhole::ErrorCode::Conflict => {}
+                Err(e) => fail(refused, e.to_string()),
+                Ok(s) => {
+                    self.packs.postings.fetch_add(s.postings, Ordering::Relaxed);
+                    if refused.remove(&name) {
+                        eprintln!("phdb serve: text index {name}: packed now");
+                    }
+                    if s.stopped {
+                        return match stop {
+                            Some(Stop::Closed) => Pass::Closed,
+                            _ => Pass::Wait,
+                        };
+                    }
+                }
             }
         }
+        Pass::Done
     }
 
     /// One look at the pending rebuilds: each resumed in turn, under the gate and the slot.
@@ -543,7 +737,13 @@ impl Texts {
             .unwrap_or_else(PoisonError::into_inner)
             .thread
             .take();
-        for t in [thread, resume].into_iter().flatten() {
+        let pack = self
+            .pack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .thread
+            .take();
+        for t in [thread, resume, pack].into_iter().flatten() {
             let _ = t.join();
         }
     }
