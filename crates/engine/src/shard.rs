@@ -7854,6 +7854,36 @@ impl ShardState {
                     self.track_share_rows(bytes.batch(), true);
                     self.track_share_reads(&reads, true);
                 }
+                // An external share's record body (D329, FORMAT §10.3): the xid, every
+                // participant's stream, the reads this shard validates, then the batch. Built
+                // here, with the tablet map this group validated by.
+                if let MemberKind::Prepare { external, .. } = &m.kind
+                    && external.is_none()
+                    && let Some(share) = self.prepared.get(&m.seqno)
+                    && let Some(ext) = &share.external
+                {
+                    match self.external_share(
+                        &ext.xid,
+                        &share.participants,
+                        m.validate.as_deref(),
+                        share.bytes.batch(),
+                    ) {
+                        Ok(body) => {
+                            if let MemberKind::Prepare { external, .. } = &mut m.kind {
+                                *external = Some(Box::new(body));
+                            }
+                        }
+                        Err(e) => {
+                            trace!(
+                                "shard {} external prepare {} refused: {e}",
+                                self.id.0, m.seqno
+                            );
+                            m.failed = Some(e);
+                            self.settle(m, Ok(()), ctx);
+                            continue;
+                        }
+                    }
+                }
             }
             admitted.push(m);
         }
@@ -9710,19 +9740,26 @@ impl ShardState {
         );
     }
 
-    /// An external PREPARE's record body (D329): `ext`'s xid, the streams of `req`'s
-    /// participants, the reads this shard owns (as [`conflicts`](Self::conflicts) filters
-    /// them, so the logged reads are the ones it validates), and the batch.
-    fn external_share(&self, ext: &ExternalReq, req: &PrepareReq) -> Result<Vec<u8>> {
+    /// An external PREPARE's record body (D329): `xid`, the streams of the `participants`,
+    /// the reads this shard owns (as [`conflicts`](Self::conflicts) filters them, so the
+    /// logged reads are the ones it validates), and the batch. Built at the member's
+    /// admission, with the tablet map the group's validation routes by: at the message's
+    /// arrival that map may not have a new table or a moved tablet yet, and the record would
+    /// lose the reads its reopen holds (#2000).
+    fn external_share(
+        &self,
+        xid: &[u8],
+        participants: &[ShardId],
+        validate: Option<&Validate>,
+        batch: BatchRef<'_>,
+    ) -> Result<Vec<u8>> {
         use pigeonhole_format::wal::{ExternalRead, ExternalShare};
-        let streams: Vec<StreamId> = req
-            .participants
+        let streams: Vec<StreamId> = participants
             .iter()
             .map(|s| StreamId(u32::from(s.0)))
             .collect();
-        let reads: Vec<ExternalRead<'_>> = req
-            .validate
-            .iter()
+        let reads: Vec<ExternalRead<'_>> = validate
+            .into_iter()
             .flat_map(|v| v.reads.iter())
             .filter(|r| {
                 self.tablets
@@ -9737,13 +9774,7 @@ impl ShardState {
             })
             .collect();
         let mut body = Vec::new();
-        ExternalShare::encode(
-            &ext.xid,
-            &streams,
-            reads.into_iter(),
-            Some(req.bytes.batch()),
-            &mut body,
-        )?;
+        ExternalShare::encode(xid, &streams, reads.into_iter(), Some(batch), &mut body)?;
         Ok(body)
     }
 
@@ -9765,30 +9796,6 @@ impl ShardState {
             );
             return;
         }
-        // An external share's record body (D329, FORMAT §10.3): the xid, every participant's
-        // stream, the reads this shard validates, then the batch. Built once, here: a rare path.
-        let external = match &req.external {
-            None => None,
-            Some(ext) => match self.external_share(ext, &req) {
-                Ok(body) => Some(Box::new(body)),
-                Err(e) => {
-                    trace!(
-                        "shard {} external prepare {} refused: {e}",
-                        self.id.0, req.seqno
-                    );
-                    self.send(
-                        req.coordinator,
-                        ShardMsg::Prepared {
-                            seqno: req.seqno,
-                            from: self.id,
-                            error: Some(PrepareError::Io),
-                        },
-                        ctx,
-                    );
-                    return;
-                }
-            },
-        };
         self.prepared.insert(
             req.seqno,
             PreparedShare {
@@ -9808,9 +9815,10 @@ impl ShardState {
             },
         );
         self.pending.push(Member {
+            // An external share's record body is built at its admission (`run_group`).
             kind: MemberKind::Prepare {
                 coordinator: req.coordinator,
-                external,
+                external: None,
             },
             durability: req.durability,
             seqno: req.seqno,

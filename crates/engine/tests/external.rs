@@ -394,3 +394,94 @@ fn a_decide_after_the_close_is_refused_and_the_share_stays_in_doubt() {
     db.decide(b"s2", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
+
+/// Polls a maintenance future to its end; the engine's own threads do the work.
+fn finish(mut m: pigeonhole_engine::PendingMaintenance) -> pigeonhole_engine::Result<()> {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut m).poll(&mut cx) {
+            return r;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the maintenance never finished"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// perf2's M1 on #2000: tablet owners aren't persisted, so a tablet moved before a prepare
+/// would be placed elsewhere at the reopen than the share's holds. The open pins it to the
+/// shard that logged the share: a write to its row is still refused while the share is in
+/// doubt, and the decide applies there.
+#[test]
+fn a_reopen_keeps_an_in_doubt_shares_moved_tablet_on_its_shard() {
+    let vfs = SimVfs::new(30);
+    let moved_to = {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let from = db.shard_of(t.id, b"r").expect("routed");
+        let to = 1 - from;
+        finish(db.move_tablet_pending(t.id, b"r", to as u16).unwrap()).unwrap();
+        assert_eq!(db.shard_of(t.id, b"r"), Some(to));
+        txn(&db, &t, b"r", &[b"r"], b"held")
+            .prepare(b"m1", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+        to
+    };
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    assert_eq!(
+        db.shard_of(t.id, b"r"),
+        Some(moved_to),
+        "the tablet is placed on the shard that logged the share"
+    );
+    // The holds are on the tablet's owner: a write to the row is refused while in doubt.
+    let f = t.family("f").unwrap().id;
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"other"))
+        .unwrap();
+    let w = db.commit(wb, Some(Durability::GroupSync));
+    assert!(matches!(w, Err(Error::Busy)), "{w:?}");
+    db.decide(b"m1", true).unwrap().expect("in doubt");
+    assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"held"[..]));
+    db.close().unwrap();
+}
+
+/// The read holds survive a reopen: a share logs the reads its shard validates, routed by
+/// the tablet map its group validated with. Before #2000's fix the share was encoded on the
+/// message's arrival, whose map hadn't the just-created table yet, so it logged no reads
+/// and, after the reopen, a write to a row it read was admitted.
+#[test]
+fn a_shares_read_holds_survive_a_reopen() {
+    let vfs = SimVfs::new(32);
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &t, b"read", &[b"written"], b"v")
+            .prepare(b"rh", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+    }
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    let f = t.family("f").unwrap().id;
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"read", b"q", None, ValueRef::Bytes(b"x"))
+        .unwrap();
+    let w = db.commit(wb, Some(Durability::GroupSync));
+    assert!(
+        matches!(w, Err(Error::Busy)),
+        "a write to a row it read: {w:?}"
+    );
+    db.decide(b"rh", false).unwrap().expect("in doubt");
+    db.close().unwrap();
+}
