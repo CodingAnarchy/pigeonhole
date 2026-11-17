@@ -21,4 +21,8 @@ ignore = [
   # candle, pigeonhole-embed only) pulls in. Owner, 2026-11-05: D318 Q3. Drop this once gemm
   # no longer depends on it.
   { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro via gemm (pigeonhole-embed); D318 Q3" },
+  # `chrono` is unmaintained, with no vulnerability and no safe upgrade: `arrow-array` 60
+  # pulls it in (pigeonhole-arrow, and pigeonhole-cli's arrow-ipc), and nothing of ours calls
+  # it. Coordinator, 2026-11-17. Drop this once arrow no longer depends on chrono.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vulnerability; transitive via arrow-array (pigeonhole-arrow, pigeonhole-cli)" },
 ]
