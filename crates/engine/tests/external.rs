@@ -128,6 +128,12 @@ fn a_prepare_that_read_a_row_since_written_conflicts() {
         Err(Error::Conflict)
     ));
     assert!(db.in_doubt().is_empty());
+    // The refused prepare left no reservation: the xid prepares again (a leaked one would
+    // answer `InvalidArgument`), and `decide` finds it.
+    txn(&db, &t, b"acct", &[b"other"], b"v")
+        .prepare(b"x3", Durability::GroupSync)
+        .unwrap();
+    db.decide(b"x3", false).unwrap().expect("in doubt");
     db.close().unwrap();
 }
 
