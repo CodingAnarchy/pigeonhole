@@ -97,7 +97,10 @@ impl ExternalRegistry {
     }
 
     /// Reserves `xid` for a prepare of `bytes`. `InvalidArgument` if it is reserved or in
-    /// doubt already; `Busy` past a limit (prepares in flight count).
+    /// doubt already; `Busy` past a limit (prepares in flight count). The byte limit counts
+    /// this prepare's own bytes, so nothing reserved or in doubt passes it, except that a
+    /// prepare alone is always admitted: one larger than the limit could otherwise never
+    /// prepare (perf2's N2 on #2000).
     pub(crate) fn reserve(&self, xid: &[u8], bytes: u64) -> Result<()> {
         let mut entries = self.entries();
         if entries.contains_key(xid) {
@@ -107,7 +110,8 @@ impl ExternalRegistry {
         }
         let (max_shares, max_bytes) = self.limits;
         let held: u64 = entries.values().map(Slot::bytes).sum();
-        if (max_shares > 0 && entries.len() >= max_shares) || (max_bytes > 0 && held >= max_bytes) {
+        let over_bytes = max_bytes > 0 && !entries.is_empty() && held + bytes > max_bytes;
+        if (max_shares > 0 && entries.len() >= max_shares) || over_bytes {
             return Err(Error::Busy);
         }
         entries.insert(xid.to_vec(), Slot::Reserved { bytes });
@@ -159,6 +163,27 @@ impl ExternalRegistry {
         self.entries()
             .values()
             .any(|s| matches!(s, Slot::InDoubt(_)))
+    }
+}
+
+#[cfg(all(test, not(engine_loom)))]
+mod tests {
+    use super::ExternalRegistry;
+    use crate::error::Error;
+
+    #[test]
+    fn the_byte_limit_counts_the_prepares_own_bytes_and_admits_one_alone() {
+        // perf2's N2 on #2000.
+        let r = ExternalRegistry::new((0, 10));
+        r.reserve(b"big", 25).unwrap();
+        assert!(matches!(r.reserve(b"small", 1), Err(Error::Busy)));
+        r.unreserve(b"big");
+        r.reserve(b"a", 6).unwrap();
+        assert!(
+            matches!(r.reserve(b"b", 5), Err(Error::Busy)),
+            "6 + 5 is over 10"
+        );
+        r.reserve(b"c", 4).unwrap();
     }
 }
 
