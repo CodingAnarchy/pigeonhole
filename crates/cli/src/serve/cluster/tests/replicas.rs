@@ -998,8 +998,13 @@ fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
         let (node, epoch, history, _) = placed(ports[1], "p3").await;
         assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
-        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
-        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        // a opens p3 once it holds the map: until then a read answers Unavailable.
+        eventually("a to serve k1 from the promoted p3", async || {
+            read_through(ports[1], "k1", None, None)
+                .await
+                .is_ok_and(|(value, _, _)| value.as_deref() == Some(&b"v"[..]))
+        })
+        .await;
     });
 }
 
