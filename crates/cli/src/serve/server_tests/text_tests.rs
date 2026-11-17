@@ -742,6 +742,15 @@ fn text_pack_leaves_an_index_alone_while_a_reader_process_is_attached() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(packed_postings(&db), 0, "packed under a reader");
+    // Counted once for the index, however many passes find it refused (ai1249 on #2018).
+    s.shared.router.service.resume_text_rebuilds();
+    std::thread::sleep(Duration::from_millis(500));
+    let text = metrics_text(&s);
+    assert!(
+        text.contains("pigeonhole_serve_text_pack_refused_total 1"),
+        "{text}"
+    );
+    assert_eq!(packed_postings(&db), 0, "packed under a reader");
     drop(reader);
     s.shared.router.service.resume_text_rebuilds();
     packed(&db, 800);

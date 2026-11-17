@@ -64,7 +64,8 @@ pub(crate) struct PackCounters {
     pub(crate) passes: AtomicU64,
     /// Postings moved into blocks.
     pub(crate) postings: AtomicU64,
-    /// Packs refused or failed: a first pack with reader processes attached, or an error.
+    /// Indexes whose pack was refused or failed (a first pack with reader processes
+    /// attached, or an error): one for an index each time it starts failing, not one a pass.
     pub(crate) refused: AtomicU64,
     /// Packs that stopped because a chunk kept conflicting with writers: the next pass
     /// carries on. One that grows every pass is a pack that never gets through (ai1249).
@@ -548,10 +549,14 @@ impl Texts {
         };
         for name in names {
             let fail = |refused: &mut std::collections::HashSet<String>, why: String| {
-                self.packs.refused.fetch_add(1, Ordering::Relaxed);
+                // Once for the index, until a pack of it goes through: a pass comes every
+                // minute, and a table that never packs would otherwise count for ever
+                // (ai1249 on #2018).
                 if refused.insert(name.clone()) {
+                    self.packs.refused.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
-                        "phdb serve: text index {name}: not packed, and tried again each                          pass: {why}"
+                        "phdb serve: text index {name}: not packed, and tried again each \
+                         pass: {why}"
                     );
                 }
             };
