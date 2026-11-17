@@ -398,6 +398,23 @@ fn bytes_with_numbers_a_search_cannot_score_with_are_refused() {
     let expansion = fuzzy[89..120].to_vec();
     b.extend_from_slice(&expansion);
     refused(&b, "an expansion listed twice");
+    // Two distinct expansions read under the default max_expansions, and not under 1
+    // (audit120 on #2025: the count is bounded before the duplicate check walks it).
+    let mut b = fuzzy.clone();
+    put(&mut b, 81, 2);
+    let mut other = expansion.clone();
+    other[13] = b'z';
+    b.extend_from_slice(&other);
+    QueryStats::from_bytes(&b).unwrap();
+    put(&mut b, 17, 1);
+    refused(&b, "more expansions than max_expansions");
+    // Counts far past the bytes, within the bound: refused as truncated, never reserved
+    // (audit120's must on #2029). Reserving 2^58 expansions would overflow `isize`, so a
+    // preallocation panics here on every platform rather than only where it can't map.
+    let mut b = fuzzy.clone();
+    put(&mut b, 17, 1 << 60);
+    put(&mut b, 81, 1 << 58);
+    refused(&b, "a count the bytes can't hold");
     let mut b = fuzzy.clone();
     put(&mut b, 65, 0);
     b.drain(73..81);

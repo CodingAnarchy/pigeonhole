@@ -222,6 +222,7 @@ fn an_unfilled_index_is_filled_by_resuming_its_pending_rebuild() {
     let index =
         Index::create_unfilled(&db, "docs_text", source(&docs), IndexOptions::new()).unwrap();
     assert!(index.rebuild_pending().unwrap());
+    assert!(index.fill_pending().unwrap());
     assert_eq!(index.verify().unwrap().documents, 0);
     // A write through the index is there before the fill.
     index.put(b"new", "memory agent store").unwrap();
@@ -238,11 +239,58 @@ fn an_unfilled_index_is_filled_by_resuming_its_pending_rebuild() {
         })
         .unwrap();
     assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
+    // Still unfilled, and so when opened again (#1722 PR 2c).
+    assert!(
+        Index::open(&db, "docs_text")
+            .unwrap()
+            .fill_pending()
+            .unwrap()
+    );
     let r = index
         .resume_rebuild_with(|_| ControlFlow::Continue(()))
         .unwrap();
     assert!(!r.stopped, "{r:?}");
     assert!(!index.rebuild_pending().unwrap());
+    assert!(!index.fill_pending().unwrap());
     matches(&index, &model, "filled");
+    db.close().unwrap();
+}
+
+/// #1722 PR 2c: only an unfilled index's fill is pending a fill. A client's rebuild of a
+/// filled index, stopped part way, leaves a rebuild pending and no fill; a client's rebuild
+/// that finishes, or a repair, fills an unfilled index.
+#[test]
+fn only_an_unfilled_index_is_pending_a_fill() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let docs = docs(&db);
+    bypassed(&docs, 2029);
+    let stop = |s: &pigeonhole_text::RebuildStats| {
+        if s.documents >= 100 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let filled = Index::create(&db, "filled", source(&docs), IndexOptions::new()).unwrap();
+    assert!(!filled.fill_pending().unwrap());
+    let r = filled.rebuild_with(stop).unwrap();
+    assert!(r.stopped && filled.rebuild_pending().unwrap(), "{r:?}");
+    assert!(!filled.fill_pending().unwrap());
+
+    // A client's rebuild started during a fill starts over, and fills it once it finishes.
+    let rebuilt =
+        Index::create_unfilled(&db, "rebuilt", source(&docs), IndexOptions::new()).unwrap();
+    let r = rebuilt.rebuild_with(stop).unwrap();
+    assert!(r.stopped && rebuilt.fill_pending().unwrap(), "{r:?}");
+    let r = rebuilt.rebuild_with(|_| ControlFlow::Continue(())).unwrap();
+    assert!(!r.stopped, "{r:?}");
+    assert!(!rebuilt.rebuild_pending().unwrap() && !rebuilt.fill_pending().unwrap());
+
+    // A repair walks the whole source too.
+    let repaired =
+        Index::create_unfilled(&db, "repaired", source(&docs), IndexOptions::new()).unwrap();
+    repaired.repair().unwrap();
+    assert!(!repaired.rebuild_pending().unwrap() && !repaired.fill_pending().unwrap());
     db.close().unwrap();
 }

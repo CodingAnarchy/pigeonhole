@@ -64,6 +64,7 @@ pub fn pigeonhole_text::Index::create_unfilled(&pigeonhole::db::Pigeonhole, &str
 pub fn pigeonhole_text::Index::create_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::delete(&self, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &[u8]) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::fill_pending(&self) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::list(&pigeonhole::db::Pigeonhole) -> pigeonhole_text::Result<alloc::vec::Vec<alloc::string::String>>
 pub fn pigeonhole_text::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::open_reader(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>

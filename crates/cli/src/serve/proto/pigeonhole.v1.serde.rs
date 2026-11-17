@@ -6711,8 +6711,17 @@ impl serde::Serialize for ForwardRequest {
                 forward_request::Op::TextDelete(v) => {
                     struct_ser.serialize_field("text_delete", v)?;
                 }
+                forward_request::Op::TextRebuild(v) => {
+                    struct_ser.serialize_field("text_rebuild", v)?;
+                }
                 forward_request::Op::TextVerify(v) => {
                     struct_ser.serialize_field("text_verify", v)?;
+                }
+                forward_request::Op::TextStats(v) => {
+                    struct_ser.serialize_field("text_stats", v)?;
+                }
+                forward_request::Op::TextSearch(v) => {
+                    struct_ser.serialize_field("text_search", v)?;
                 }
                 forward_request::Op::Remember(v) => {
                     struct_ser.serialize_field("remember", v)?;
@@ -6807,8 +6816,14 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             "textPut",
             "text_delete",
             "textDelete",
+            "text_rebuild",
+            "textRebuild",
             "text_verify",
             "textVerify",
+            "text_stats",
+            "textStats",
+            "text_search",
+            "textSearch",
             "remember",
             "recall",
             "mark_used",
@@ -6857,7 +6872,10 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
             CreateTextIndex,
             TextPut,
             TextDelete,
+            TextRebuild,
             TextVerify,
+            TextStats,
+            TextSearch,
             Remember,
             Recall,
             MarkUsed,
@@ -6920,7 +6938,10 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             "createTextIndex" | "create_text_index" => Ok(GeneratedField::CreateTextIndex),
                             "textPut" | "text_put" => Ok(GeneratedField::TextPut),
                             "textDelete" | "text_delete" => Ok(GeneratedField::TextDelete),
+                            "textRebuild" | "text_rebuild" => Ok(GeneratedField::TextRebuild),
                             "textVerify" | "text_verify" => Ok(GeneratedField::TextVerify),
+                            "textStats" | "text_stats" => Ok(GeneratedField::TextStats),
+                            "textSearch" | "text_search" => Ok(GeneratedField::TextSearch),
                             "remember" => Ok(GeneratedField::Remember),
                             "recall" => Ok(GeneratedField::Recall),
                             "markUsed" | "mark_used" => Ok(GeneratedField::MarkUsed),
@@ -7188,11 +7209,32 @@ impl<'de> serde::Deserialize<'de> for ForwardRequest {
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextDelete)
 ;
                         }
+                        GeneratedField::TextRebuild => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textRebuild"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextRebuild)
+;
+                        }
                         GeneratedField::TextVerify => {
                             if op__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("textVerify"));
                             }
                             op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextVerify)
+;
+                        }
+                        GeneratedField::TextStats => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textStats"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextStats)
+;
+                        }
+                        GeneratedField::TextSearch => {
+                            if op__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textSearch"));
+                            }
+                            op__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_request::Op::TextSearch)
 ;
                         }
                         GeneratedField::Remember => {
@@ -7332,8 +7374,17 @@ impl serde::Serialize for ForwardResponse {
                 forward_response::Reply::VectorVerify(v) => {
                     struct_ser.serialize_field("vector_verify", v)?;
                 }
+                forward_response::Reply::TextRebuild(v) => {
+                    struct_ser.serialize_field("text_rebuild", v)?;
+                }
                 forward_response::Reply::TextVerify(v) => {
                     struct_ser.serialize_field("text_verify", v)?;
+                }
+                forward_response::Reply::TextStats(v) => {
+                    struct_ser.serialize_field("text_stats", v)?;
+                }
+                forward_response::Reply::TextSearch(v) => {
+                    struct_ser.serialize_field("text_search", v)?;
                 }
                 forward_response::Reply::Remember(v) => {
                     struct_ser.serialize_field("remember", v)?;
@@ -7388,8 +7439,14 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             "vectorSearch",
             "vector_verify",
             "vectorVerify",
+            "text_rebuild",
+            "textRebuild",
             "text_verify",
             "textVerify",
+            "text_stats",
+            "textStats",
+            "text_search",
+            "textSearch",
             "remember",
             "recall",
             "mark_used",
@@ -7418,7 +7475,10 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
             Table,
             VectorSearch,
             VectorVerify,
+            TextRebuild,
             TextVerify,
+            TextStats,
+            TextSearch,
             Remember,
             Recall,
             MarkUsed,
@@ -7461,7 +7521,10 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             "table" => Ok(GeneratedField::Table),
                             "vectorSearch" | "vector_search" => Ok(GeneratedField::VectorSearch),
                             "vectorVerify" | "vector_verify" => Ok(GeneratedField::VectorVerify),
+                            "textRebuild" | "text_rebuild" => Ok(GeneratedField::TextRebuild),
                             "textVerify" | "text_verify" => Ok(GeneratedField::TextVerify),
+                            "textStats" | "text_stats" => Ok(GeneratedField::TextStats),
+                            "textSearch" | "text_search" => Ok(GeneratedField::TextSearch),
                             "remember" => Ok(GeneratedField::Remember),
                             "recall" => Ok(GeneratedField::Recall),
                             "markUsed" | "mark_used" => Ok(GeneratedField::MarkUsed),
@@ -7597,11 +7660,32 @@ impl<'de> serde::Deserialize<'de> for ForwardResponse {
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::VectorVerify)
 ;
                         }
+                        GeneratedField::TextRebuild => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textRebuild"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::TextRebuild)
+;
+                        }
                         GeneratedField::TextVerify => {
                             if reply__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("textVerify"));
                             }
                             reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::TextVerify)
+;
+                        }
+                        GeneratedField::TextStats => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textStats"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::TextStats)
+;
+                        }
+                        GeneratedField::TextSearch => {
+                            if reply__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("textSearch"));
+                            }
+                            reply__ = map_.next_value::<::std::option::Option<_>>()?.map(forward_response::Reply::TextSearch)
 ;
                         }
                         GeneratedField::Remember => {
@@ -24217,6 +24301,118 @@ impl<'de> serde::Deserialize<'de> for TextRebuildResponse {
         deserializer.deserialize_struct("pigeonhole.v1.TextRebuildResponse", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for TextSearchPartRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.search.is_some() {
+            len += 1;
+        }
+        if !self.stats.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TextSearchPartRequest", len)?;
+        if let Some(v) = self.search.as_ref() {
+            struct_ser.serialize_field("search", v)?;
+        }
+        if !self.stats.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("stats", pbjson::private::base64::encode(&self.stats).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for TextSearchPartRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "search",
+            "stats",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Search,
+            Stats,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "search" => Ok(GeneratedField::Search),
+                            "stats" => Ok(GeneratedField::Stats),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = TextSearchPartRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.TextSearchPartRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<TextSearchPartRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut search__ = None;
+                let mut stats__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Search => {
+                            if search__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("search"));
+                            }
+                            search__ = map_.next_value()?;
+                        }
+                        GeneratedField::Stats => {
+                            if stats__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("stats"));
+                            }
+                            stats__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(TextSearchPartRequest {
+                    search: search__,
+                    stats: stats__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.TextSearchPartRequest", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for TextSearchRequest {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -24237,6 +24433,9 @@ impl serde::Serialize for TextSearchRequest {
         if self.highlight {
             len += 1;
         }
+        if self.allow_partial {
+            len += 1;
+        }
         if self.query.is_some() {
             len += 1;
         }
@@ -24254,6 +24453,9 @@ impl serde::Serialize for TextSearchRequest {
         }
         if self.highlight {
             struct_ser.serialize_field("highlight", &self.highlight)?;
+        }
+        if self.allow_partial {
+            struct_ser.serialize_field("allow_partial", &self.allow_partial)?;
         }
         if let Some(v) = self.query.as_ref() {
             match v {
@@ -24280,6 +24482,8 @@ impl<'de> serde::Deserialize<'de> for TextSearchRequest {
             "id_prefix",
             "idPrefix",
             "highlight",
+            "allow_partial",
+            "allowPartial",
             "syntax",
             "clauses",
         ];
@@ -24290,6 +24494,7 @@ impl<'de> serde::Deserialize<'de> for TextSearchRequest {
             K,
             IdPrefix,
             Highlight,
+            AllowPartial,
             Syntax,
             Clauses,
         }
@@ -24317,6 +24522,7 @@ impl<'de> serde::Deserialize<'de> for TextSearchRequest {
                             "k" => Ok(GeneratedField::K),
                             "idPrefix" | "id_prefix" => Ok(GeneratedField::IdPrefix),
                             "highlight" => Ok(GeneratedField::Highlight),
+                            "allowPartial" | "allow_partial" => Ok(GeneratedField::AllowPartial),
                             "syntax" => Ok(GeneratedField::Syntax),
                             "clauses" => Ok(GeneratedField::Clauses),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
@@ -24342,6 +24548,7 @@ impl<'de> serde::Deserialize<'de> for TextSearchRequest {
                 let mut k__ = None;
                 let mut id_prefix__ = None;
                 let mut highlight__ = None;
+                let mut allow_partial__ = None;
                 let mut query__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
@@ -24373,6 +24580,12 @@ impl<'de> serde::Deserialize<'de> for TextSearchRequest {
                             }
                             highlight__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::AllowPartial => {
+                            if allow_partial__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("allowPartial"));
+                            }
+                            allow_partial__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::Syntax => {
                             if query__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("syntax"));
@@ -24393,6 +24606,7 @@ impl<'de> serde::Deserialize<'de> for TextSearchRequest {
                     k: k__.unwrap_or_default(),
                     id_prefix: id_prefix__.unwrap_or_default(),
                     highlight: highlight__.unwrap_or_default(),
+                    allow_partial: allow_partial__.unwrap_or_default(),
                     query: query__,
                 })
             }
@@ -24411,9 +24625,27 @@ impl serde::Serialize for TextSearchResponse {
         if !self.hits.is_empty() {
             len += 1;
         }
+        if self.partial {
+            len += 1;
+        }
+        if !self.missing.is_empty() {
+            len += 1;
+        }
+        if !self.cut_clauses.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TextSearchResponse", len)?;
         if !self.hits.is_empty() {
             struct_ser.serialize_field("hits", &self.hits)?;
+        }
+        if self.partial {
+            struct_ser.serialize_field("partial", &self.partial)?;
+        }
+        if !self.missing.is_empty() {
+            struct_ser.serialize_field("missing", &self.missing)?;
+        }
+        if !self.cut_clauses.is_empty() {
+            struct_ser.serialize_field("cut_clauses", &self.cut_clauses)?;
         }
         struct_ser.end()
     }
@@ -24426,11 +24658,18 @@ impl<'de> serde::Deserialize<'de> for TextSearchResponse {
     {
         const FIELDS: &[&str] = &[
             "hits",
+            "partial",
+            "missing",
+            "cut_clauses",
+            "cutClauses",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Hits,
+            Partial,
+            Missing,
+            CutClauses,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -24453,6 +24692,9 @@ impl<'de> serde::Deserialize<'de> for TextSearchResponse {
                     {
                         match value {
                             "hits" => Ok(GeneratedField::Hits),
+                            "partial" => Ok(GeneratedField::Partial),
+                            "missing" => Ok(GeneratedField::Missing),
+                            "cutClauses" | "cut_clauses" => Ok(GeneratedField::CutClauses),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -24473,6 +24715,9 @@ impl<'de> serde::Deserialize<'de> for TextSearchResponse {
                     V: serde::de::MapAccess<'de>,
             {
                 let mut hits__ = None;
+                let mut partial__ = None;
+                let mut missing__ = None;
+                let mut cut_clauses__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Hits => {
@@ -24481,14 +24726,224 @@ impl<'de> serde::Deserialize<'de> for TextSearchResponse {
                             }
                             hits__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Partial => {
+                            if partial__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partial"));
+                            }
+                            partial__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Missing => {
+                            if missing__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("missing"));
+                            }
+                            missing__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::CutClauses => {
+                            if cut_clauses__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("cutClauses"));
+                            }
+                            cut_clauses__ = 
+                                Some(map_.next_value::<Vec<::pbjson::private::NumberDeserialize<_>>>()?
+                                    .into_iter().map(|x| x.0).collect())
+                            ;
+                        }
                     }
                 }
                 Ok(TextSearchResponse {
                     hits: hits__.unwrap_or_default(),
+                    partial: partial__.unwrap_or_default(),
+                    missing: missing__.unwrap_or_default(),
+                    cut_clauses: cut_clauses__.unwrap_or_default(),
                 })
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.TextSearchResponse", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for TextStatsRequest {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.search.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TextStatsRequest", len)?;
+        if let Some(v) = self.search.as_ref() {
+            struct_ser.serialize_field("search", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for TextStatsRequest {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "search",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Search,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "search" => Ok(GeneratedField::Search),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = TextStatsRequest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.TextStatsRequest")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<TextStatsRequest, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut search__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Search => {
+                            if search__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("search"));
+                            }
+                            search__ = map_.next_value()?;
+                        }
+                    }
+                }
+                Ok(TextStatsRequest {
+                    search: search__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.TextStatsRequest", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for TextStatsResponse {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.stats.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.TextStatsResponse", len)?;
+        if !self.stats.is_empty() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("stats", pbjson::private::base64::encode(&self.stats).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for TextStatsResponse {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "stats",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Stats,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "stats" => Ok(GeneratedField::Stats),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = TextStatsResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.TextStatsResponse")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<TextStatsResponse, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut stats__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Stats => {
+                            if stats__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("stats"));
+                            }
+                            stats__ = 
+                                Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(TextStatsResponse {
+                    stats: stats__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.TextStatsResponse", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for TextVerifyResponse {

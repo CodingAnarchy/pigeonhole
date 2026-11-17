@@ -532,6 +532,10 @@ async fn call(
         Ok(ServiceReply::RecallPool(_) | ServiceReply::RecallBodies(_)) => {
             ApiError::internal("a recall's step on the HTTP API").into_response()
         }
+        // So is a text search's round 1 (#1722 PR 2b).
+        Ok(ServiceReply::TextStats(_)) => {
+            ApiError::internal("a text search's statistics on the HTTP API").into_response()
+        }
         Err(e) => e.into_response(),
     };
     let mut resp = resp;

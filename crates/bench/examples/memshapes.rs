@@ -70,9 +70,50 @@ fn main() {
             let queries: Vec<(String, Vec<f32>)> = (0..PER_ITERATION * iters)
                 .map(|_| (sentence(&mut rng, &words, 3), embedding(&mut rng)))
                 .collect();
+            // The measured queries once, outside the count. A recall reads counters: the
+            // namespace's (`stats:embedded`, D311 T8, 2,000 setup increments) and the text
+            // index's per-term ones. Its first fold of a long chain sends the shard a D291
+            // checkpoint, applied on the shard's thread; until then, every recall re-folds the
+            // chain. Measured, how many did depended on the host's thread scheduling: +3% to
+            // +6% on some runners (#2007, #2029, #2033; #2040 for what this costs an app).
+            for (text, e) in &queries {
+                std::hint::black_box(
+                    store
+                        .recall(&[NS])
+                        .text(text.as_str())
+                        .embedding(e.clone())
+                        .k(10)
+                        .now_us(NOW_US)
+                        .run()
+                        .unwrap(),
+                );
+            }
+            // Then wait, still outside the count, until the shard has applied them: the
+            // checkpoint count holds still for 100 ms.
+            let (mut seen, mut still) = (checkpoints(&db), std::time::Instant::now());
+            let t0 = std::time::Instant::now();
+            while still.elapsed() < std::time::Duration::from_millis(100) {
+                assert!(
+                    t0.elapsed() < std::time::Duration::from_secs(60),
+                    "counter checkpoints still landing after 60 s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let now = checkpoints(&db);
+                if now != seen {
+                    (seen, still) = (now, std::time::Instant::now());
+                }
+            }
             let mut recalled = 0;
             if !setup_only {
+                let before = checkpoints(&db);
                 shards.measure(&mut || recalled = shape_memory_recall(&store, &queries));
+                // simp724: a measured recall that folds a long counter chain again (its
+                // checkpoint not in place before the count) fails the shape, not drifts it.
+                assert_eq!(
+                    checkpoints(&db),
+                    before,
+                    "a counter checkpoint landed inside the measured recalls"
+                );
                 assert_eq!(recalled, queries.len());
             }
             drop(store);
@@ -152,4 +193,19 @@ fn shape_memory_recall(store: &Store, queries: &[(String, Vec<f32>)]) -> usize {
         n += 1;
     }
     n
+}
+
+/// D291 counter checkpoints the shard has taken since open, kept and dropped: a fold that
+/// sends one costs the recall either way (simp724's S1 on #2042). A test hook.
+fn checkpoints(db: &pigeonhole::Pigeonhole) -> u64 {
+    db.internal_metrics()
+        .into_iter()
+        .filter(|(n, _)| {
+            matches!(
+                *n,
+                "counter_checkpoints_kept" | "counter_checkpoints_dropped"
+            )
+        })
+        .map(|(_, v)| v)
+        .sum()
 }

@@ -737,10 +737,13 @@ impl Router {
                 ServiceOp::Scan(_) => {
                     return self.fan_scan(cluster, op, caller, prepaid, None).await;
                 }
-                // A search or check across an index's partitions (#1722 PR 1b).
+                // A search or check across an index's partitions (#1722 PR 1b), and a
+                // text index's rebuild (PR 2c).
                 ServiceOp::VectorSearch(_)
                 | ServiceOp::VectorVerify(_)
-                | ServiceOp::TextVerify(_) => {
+                | ServiceOp::TextVerify(_)
+                | ServiceOp::TextSearch(_)
+                | ServiceOp::TextRebuild(_) => {
                     let deadline = deadline.map_or_else(
                         || tokio::time::Instant::now() + self.service.request_timeout(),
                         tokio::time::Instant::from_std,
@@ -1077,6 +1080,8 @@ impl Router {
             | ServiceOp::VectorSearch(_)
             | ServiceOp::VectorVerify(_)
             | ServiceOp::TextVerify(_)
+            | ServiceOp::TextStats(_)
+            | ServiceOp::TextSearchPart(_)
                 if fanout_part =>
             {
                 service.fanout_part(op, caller).await?
@@ -1731,15 +1736,8 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::VectorDelete(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextPut(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextDelete(r) => index_route(routes, &r.index, &r.id),
-        // Exact text search across an index's partitions comes with #1722 PR 2.
-        ServiceOp::TextSearch(_) => Err(ApiError::unsupported(
-            "Text.Search isn't supported on a cluster yet",
-        )),
         ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
             "Vectors.BulkLoad isn't supported on a cluster yet",
-        )),
-        ServiceOp::TextRebuild(_) => Err(ApiError::unsupported(
-            "Text.Rebuild isn't supported on a cluster yet",
         )),
         // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
         // schema change (the map writer's), a schema read, a read that fans out, a
@@ -1747,9 +1745,14 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         op if map_schema_change(op) => Err(unrouted()),
         // Fanned out across the index's partitions by `dispatch`, each part naming its
         // partition (#1722 PR 1b): [`index_part_route`].
-        ServiceOp::VectorSearch(_) | ServiceOp::VectorVerify(_) | ServiceOp::TextVerify(_) => {
-            Err(unrouted())
-        }
+        // A text search's two rounds (#1722 PR 2b) too, and a rebuild (PR 2c).
+        ServiceOp::VectorSearch(_)
+        | ServiceOp::VectorVerify(_)
+        | ServiceOp::TextVerify(_)
+        | ServiceOp::TextRebuild(_)
+        | ServiceOp::TextSearch(_)
+        | ServiceOp::TextStats(_)
+        | ServiceOp::TextSearchPart(_) => Err(unrouted()),
         ServiceOp::Traverse(_)
         | ServiceOp::ListTables(_)
         | ServiceOp::DescribeTable(_)
@@ -1778,10 +1781,24 @@ pub(crate) fn map_schema_change(op: &ServiceOp) -> bool {
 /// the map places the op's index on it; else `WrongPartition`, since the sending node's
 /// map placed it there.
 fn index_part_route(routes: &Routes, op: &ServiceOp, partition: &str) -> Result<String, ApiError> {
-    let index = match op {
+    let index: &str = match op {
         ServiceOp::VectorSearch(r) => &r.index,
         ServiceOp::VectorVerify(r) => &r.index,
-        ServiceOp::TextVerify(r) => &r.index,
+        ServiceOp::TextVerify(r) | ServiceOp::TextRebuild(r) => &r.index,
+        // A text search's rounds carry the client's search: one without it is malformed,
+        // not a part for another map (simp724's R1 on #2029).
+        ServiceOp::TextStats(super::proto::TextStatsRequest { search, .. })
+        | ServiceOp::TextSearchPart(super::proto::TextSearchPartRequest { search, .. }) => {
+            match search {
+                Some(s) => &s.index,
+                None => {
+                    return Err(ApiError::invalid(format!(
+                        "a forwarded {} carries no search",
+                        op.name()
+                    )));
+                }
+            }
+        }
         _ => {
             return Err(ApiError::invalid(format!(
                 "a forwarded {} doesn't name a partition",
@@ -2095,10 +2112,33 @@ mod tests {
         });
         let verify =
             ServiceOp::TextVerify(super::super::proto::TextIndexRequest { index: "uv".into() });
-        for op in [&search, &verify] {
+        let rebuild =
+            ServiceOp::TextRebuild(super::super::proto::TextIndexRequest { index: "uv".into() });
+        // A text search's two rounds (#1722 PR 2b) name the index inside their search.
+        let text = || super::super::proto::TextSearchRequest {
+            index: "uv".into(),
+            ..Default::default()
+        };
+        let stats = ServiceOp::TextStats(super::super::proto::TextStatsRequest {
+            search: Some(text()),
+        });
+        let part = ServiceOp::TextSearchPart(super::super::proto::TextSearchPartRequest {
+            search: Some(text()),
+            stats: Default::default(),
+        });
+        for op in [&search, &verify, &rebuild, &stats, &part] {
             assert_eq!(index_part_route(&routes, op, "p2").unwrap(), "p2");
             let e = index_part_route(&routes, op, "p3").unwrap_err();
             assert_eq!(e.code, "WrongPartition", "{}", e.message);
+        }
+        // Without its search, a round is malformed, not a part for another map.
+        let bare = [
+            ServiceOp::TextStats(Default::default()),
+            ServiceOp::TextSearchPart(Default::default()),
+        ];
+        for op in &bare {
+            let e = index_part_route(&routes, op, "p2").unwrap_err();
+            assert_eq!(e.code, "InvalidArgument", "{}", e.message);
         }
         let lost = ServiceOp::VectorSearch(super::super::proto::VectorSearchRequest {
             index: "nope".into(),
