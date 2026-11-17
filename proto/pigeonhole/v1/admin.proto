@@ -115,6 +115,9 @@ message PartitionInfo {
   // As `Cluster.Status`'s `LocalPartition.lease_remaining_ms` (D326): the time left on the
   // partition's lease here; 0 when it holds none.
   uint64 lease_remaining_ms = 8;
+  // Set for a replica copy of P on this node (D328): its follower, as a single node's
+  // replica reports in `InfoResponse` (`primary` is the owner node's address).
+  ReplicaInfo replica = 9;
 }
 
 // `Admin.Flush` and `Admin.Compact`'s request. On a cluster node (ICR 0117, #1852): empty

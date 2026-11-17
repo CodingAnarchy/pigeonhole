@@ -7,7 +7,7 @@ use super::*;
 // scopes, the service's table rules, and a session's request limit.
 
 /// One `POST /mcp`'s answer.
-struct Answer {
+pub(crate) struct Answer {
     status: u16,
     session: Option<String>,
     sse: bool,
@@ -17,7 +17,7 @@ struct Answer {
 
 impl Answer {
     /// The reply (the message with an `id`).
-    fn reply(&self) -> &Json {
+    pub(crate) fn reply(&self) -> &Json {
         self.messages
             .iter()
             .find(|m| m.get("id").is_some())
@@ -25,7 +25,7 @@ impl Answer {
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         // A request that hangs fails the test rather than hanging it.
@@ -42,8 +42,19 @@ fn mcp(
     version: Option<&str>,
     body: &Json,
 ) -> Answer {
+    mcp_at(&s.url, token, session, version, body)
+}
+
+/// [`mcp`] to the server at `url` (a cluster node's, say).
+pub(crate) fn mcp_at(
+    url: &str,
+    token: Option<&str>,
+    session: Option<&str>,
+    version: Option<&str>,
+    body: &Json,
+) -> Answer {
     let mut req = agent()
-        .post(format!("{}/mcp", s.url))
+        .post(format!("{url}/mcp"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
     if let Some(t) = token {
@@ -87,8 +98,13 @@ fn mcp(
 
 /// A new session for `token`, initialized: its id.
 fn session(s: &Server, token: Option<&str>) -> String {
-    let init = mcp(
-        s,
+    session_at(&s.url, token)
+}
+
+/// [`session`] on the server at `url`.
+pub(crate) fn session_at(url: &str, token: Option<&str>) -> String {
+    let init = mcp_at(
+        url,
         token,
         None,
         None,
@@ -98,8 +114,8 @@ fn session(s: &Server, token: Option<&str>) -> String {
     assert_eq!(init.status, 200, "{:?}", init.messages);
     assert_eq!(init.reply()["result"]["protocolVersion"], "2025-06-18");
     let id = init.session.expect("initialize names the session");
-    let note = mcp(
-        s,
+    let note = mcp_at(
+        url,
         token,
         Some(&id),
         Some("2025-06-18"),
@@ -109,14 +125,25 @@ fn session(s: &Server, token: Option<&str>) -> String {
     id
 }
 
-fn request(method: &str, params: Json) -> Json {
+pub(crate) fn request(method: &str, params: Json) -> Json {
     json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 }
 
 /// `tools/call`: the result's structured content, and whether it's an error.
 fn call(s: &Server, token: Option<&str>, id: &str, tool: &str, args: Json) -> (Json, bool) {
-    let a = mcp(
-        s,
+    call_at(&s.url, token, id, tool, args)
+}
+
+/// [`call`] on the server at `url`.
+pub(crate) fn call_at(
+    url: &str,
+    token: Option<&str>,
+    id: &str,
+    tool: &str,
+    args: Json,
+) -> (Json, bool) {
+    let a = mcp_at(
+        url,
         token,
         Some(id),
         Some("2025-06-18"),
@@ -932,40 +959,68 @@ fn a_memory_tool_racing_a_memory_rpc_takes_the_memory_place_first() {
     }
 }
 
+/// The memory place's nested wait (M6), which #1915 PR 3b rules out: as many `/mcp`
+/// `memory_recall` messages as memory places (2, half of 4 blocking threads), each held in
+/// flight until all are, then each one's op taking a memory place. Had each message taken a
+/// memory place before its thread, as before PR 3b, every op would wait for one until the
+/// request timeout (`Overloaded`); with the op taking its own, every recall answers. The
+/// recall's own place is what makes the test bite: an op that stopped taking one would pass
+/// without the fix too.
 #[test]
-fn a_memory_tool_spelled_with_escapes_still_takes_a_memory_place() {
-    // ai1249's R1 on #1679: `post` spots memory tool calls cheaply, so a name spelled with
-    // JSON escapes gets past it; the call itself then takes a place without waiting, or is
-    // refused. With the one place held elsewhere, it must not run.
-    let s = memory_mcp("");
-    let id = session(&s, None);
-    let held = s.block_on(s.shared.router.service.memory_place()).unwrap();
-    let raw = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"\u006demory_recall","arguments":{"namespace":"a","text":"x"}}}"#;
-    assert!(!raw.contains("\"memory_"));
-    let mut resp = agent()
-        .post(format!("{}/mcp", s.url))
-        .header("content-type", "application/json")
-        .header("mcp-session-id", id.as_str())
-        .send(raw)
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-    let reply: Json = resp.body_mut().read_json().unwrap();
-    let result = &reply["result"];
-    assert_eq!(result["isError"], true, "{reply}");
-    assert_eq!(
-        result["structuredContent"]["error"]["code"], "Overloaded",
-        "{reply}"
+fn mcp_memory_calls_as_many_as_the_memory_places_still_reach_them() {
+    blocking_threads(4);
+    let s = super::memory_tests::memory_server_with(
+        "",
+        Limits {
+            mcp_blocking: 2,
+            request_timeout: Duration::from_secs(5),
+            ..limits()
+        },
     );
-    // The place back, the same call runs.
-    drop(held);
-    let mut resp = agent()
-        .post(format!("{}/mcp", s.url))
-        .header("content-type", "application/json")
-        .header("mcp-session-id", id.as_str())
-        .send(raw)
-        .unwrap();
-    let reply: Json = resp.body_mut().read_json().unwrap();
-    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let path = s
+        .shared
+        .router
+        .service
+        .part()
+        .unwrap()
+        .db
+        .path()
+        .to_path_buf();
+    let ids: Vec<String> = (0..2).map(|_| session(&s, None)).collect();
+    super::super::mcp_backend::HOLD
+        .lock()
+        .unwrap()
+        .push((path.clone(), Arc::new(std::sync::Barrier::new(2))));
+    let url = s.url.clone();
+    let started = std::time::Instant::now();
+    let recalls: Vec<_> = ids
+        .into_iter()
+        .map(|id| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                call_at(
+                    &url,
+                    None,
+                    &id,
+                    "memory_recall",
+                    json!({"namespace": "a", "text": "anything"}),
+                )
+            })
+        })
+        .collect();
+    let answers: Vec<_> = recalls.into_iter().map(|r| r.join().unwrap()).collect();
+    super::super::mcp_backend::HOLD
+        .lock()
+        .unwrap()
+        .retain(|(p, _)| *p != path);
+    for (out, err) in answers {
+        assert!(!err, "{out}");
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the recalls waited out the request timeout: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

@@ -43,25 +43,154 @@ const DEFAULT_NAMESPACE: &str = "default";
 /// The guide served as `memory://guide`, and the MCP guide's memory section.
 pub(super) const GUIDE: &str = include_str!("memory_guide.md");
 
-/// Where a [`Memory`]'s store core comes from.
-pub(crate) trait Store: Send + Sync {
-    /// The core, opening the store if need be (it can block: a blocking thread's call).
-    fn core(&self) -> Result<Arc<MemCore>, Failure>;
-    /// The core if it's open now, without opening it: for what the tools' descriptions say
-    /// about the store's model.
-    fn cached(&self) -> Option<Arc<MemCore>>;
+/// One recalled memory, as the tool answers it.
+pub(crate) struct Hit {
+    pub(crate) id: MemoryId,
+    pub(crate) text: String,
+    pub(crate) kind: Kind,
+    pub(crate) importance: f64,
+    pub(crate) created_us: u64,
+    pub(crate) score: f64,
+    pub(crate) superseded_by: Option<MemoryId>,
 }
 
-/// `phdb mcp`'s store: the core it opened at start.
+/// A recall's hits, and whether its byte budget cut hits that would have ranked.
+pub(crate) struct Recalled {
+    pub(crate) hits: Vec<Hit>,
+    pub(crate) truncated: bool,
+}
+
+/// A stored memory: its id, how it was stored (`new`, `merged`, `similar`), and, when it
+/// superseded another, that step's failure, if it failed (the new memory stands).
+pub(crate) struct Stored {
+    pub(crate) id: MemoryId,
+    pub(crate) outcome: &'static str,
+    pub(crate) supersede_error: Option<Failure>,
+}
+
+/// A mark-used's count, and the ids the store doesn't hold.
+pub(crate) struct Marked {
+    pub(crate) marked: u64,
+    pub(crate) missing: Vec<MemoryId>,
+}
+
+/// A forget's deletes, the ids the store didn't hold, and the failure that stopped it with
+/// the ids from the one it failed on (`phdb mcp`'s only: a server answers the failure).
+pub(crate) struct Forgotten {
+    pub(crate) deleted: u64,
+    pub(crate) missing: Vec<MemoryId>,
+    pub(crate) failed: Option<(Failure, Vec<MemoryId>)>,
+}
+
+/// The memory tools' store: its operations, each a blocking thread's call (#1915 PR 3b).
+/// `phdb mcp` runs them on the store it opened; `phdb serve`'s `/mcp` makes each a `Memory`
+/// op through the router, as the session's token, so on a cluster they reach every
+/// partition.
+pub(crate) trait Store: Send + Sync {
+    /// The store's pinned model, as known now, without opening the store: for what the
+    /// tools' descriptions say.
+    fn model(&self) -> Option<EmbeddingModel>;
+    /// The store's pinned model, for a call: the store opened if need be.
+    fn call_model(&self) -> Result<Option<EmbeddingModel>, Failure>;
+    /// Stores `r`; with `supersedes`, near dedup against what the store holds is skipped
+    /// (exact dedup stays), then that memory is superseded by the new one.
+    fn remember(&self, r: Remember, supersedes: Option<MemoryId>) -> Result<Stored, Failure>;
+    fn recall(&self, a: RecallArgs) -> Result<Recalled, Failure>;
+    fn mark_used(&self, ids: &[MemoryId]) -> Result<Marked, Failure>;
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<(), Failure>;
+    fn link(
+        &self,
+        from: &MemoryId,
+        to: &MemoryId,
+        ty: LinkType,
+        weight: f32,
+    ) -> Result<(), Failure>;
+    fn forget(&self, ids: &[MemoryId]) -> Result<Forgotten, Failure>;
+}
+
+/// `phdb mcp`'s store: the core it opened at start, every namespace in reach.
 struct Opened(Arc<MemCore>);
 
 impl Store for Opened {
-    fn core(&self) -> Result<Arc<MemCore>, Failure> {
-        Ok(Arc::clone(&self.0))
+    fn model(&self) -> Option<EmbeddingModel> {
+        self.0.model().cloned()
     }
 
-    fn cached(&self) -> Option<Arc<MemCore>> {
-        Some(Arc::clone(&self.0))
+    fn call_model(&self) -> Result<Option<EmbeddingModel>, Failure> {
+        Ok(self.0.model().cloned())
+    }
+
+    fn remember(&self, r: Remember, supersedes: Option<MemoryId>) -> Result<Stored, Failure> {
+        // A correction is near what it corrects, so with `supersedes` the core skips near
+        // dedup (simp724's S1 on #1389), keeping exact dedup; the supersede is a second
+        // transaction whose failure comes back with the stored id (simp724's S2).
+        let (done, supersede_error) = self
+            .0
+            .remember(Scope(None), r, supersedes)
+            .map_err(mem_failure)?;
+        let outcome = match &done {
+            Remembered::New(_) => "new",
+            Remembered::Merged(_) => "merged",
+            Remembered::Similar(_) => "similar",
+            _ => "other",
+        };
+        Ok(Stored {
+            id: done.id().clone(),
+            outcome,
+            supersede_error: supersede_error.map(mem_failure),
+        })
+    }
+
+    fn recall(&self, a: RecallArgs) -> Result<Recalled, Failure> {
+        let (hits, stats) = self.0.recall(Scope(None), a).map_err(mem_failure)?;
+        Ok(Recalled {
+            hits: hits
+                .into_iter()
+                .map(|h| Hit {
+                    id: h.id,
+                    text: h.text,
+                    kind: h.kind,
+                    importance: h.importance,
+                    created_us: h.created_us,
+                    score: h.score,
+                    superseded_by: h.superseded_by,
+                })
+                .collect(),
+            truncated: stats.truncated,
+        })
+    }
+
+    fn mark_used(&self, ids: &[MemoryId]) -> Result<Marked, Failure> {
+        let m = self.0.mark_used(Scope(None), ids).map_err(mem_failure)?;
+        Ok(Marked {
+            marked: m.marked as u64,
+            missing: m.missing,
+        })
+    }
+
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<(), Failure> {
+        self.0.supersede(Scope(None), old, new).map_err(mem_failure)
+    }
+
+    fn link(
+        &self,
+        from: &MemoryId,
+        to: &MemoryId,
+        ty: LinkType,
+        weight: f32,
+    ) -> Result<(), Failure> {
+        self.0
+            .link(Scope(None), from, to, ty, weight)
+            .map_err(mem_failure)
+    }
+
+    fn forget(&self, ids: &[MemoryId]) -> Result<Forgotten, Failure> {
+        let done = self.0.forget(Scope(None), ids).map_err(mem_failure)?;
+        Ok(Forgotten {
+            deleted: done.deleted,
+            missing: done.missing,
+            failed: done.failed.map(|(e, left)| (mem_failure(e), left)),
+        })
     }
 }
 
@@ -70,12 +199,9 @@ impl Store for Opened {
 /// (D313 ticket 8b).
 pub(crate) struct Memory {
     name: String,
-    /// Where the store's core comes from: the one `phdb mcp` opened, or `phdb serve`'s
-    /// served store (8c-3b), which can be opened again under a session.
+    /// The store's operations: on the store `phdb mcp` opened, or `phdb serve`'s ops as the
+    /// session's token, which limits them to its namespaces (M4).
     store: Box<dyn Store>,
-    /// The namespaces calls may touch: `None`, every one (`phdb mcp`); on `phdb serve`, the
-    /// caller's token's (M4).
-    scope: Option<Vec<String>>,
     /// Whether writes can succeed.
     writable: bool,
     /// `--embed-url`: the server embeds text itself.
@@ -171,7 +297,6 @@ impl Memory {
         Ok(Some(Self {
             name,
             store: Box::new(Opened(Arc::new(core))),
-            scope: None,
             writable,
             embeds,
             result_bytes,
@@ -179,13 +304,12 @@ impl Memory {
         }))
     }
 
-    /// The memory tools over a store a server serves (`phdb serve`'s `/mcp`, 8c-3b), for a
-    /// caller limited to `scope`'s namespaces (`None`: every one).
+    /// The memory tools over a store a server serves (`phdb serve`'s `/mcp`, 8c-3b), its
+    /// calls the server's ops.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn served(
         name: &str,
         store: Box<dyn Store>,
-        scope: Option<Vec<String>>,
         writable: bool,
         embeds: bool,
         result_bytes: usize,
@@ -194,7 +318,6 @@ impl Memory {
         Self {
             name: name.to_owned(),
             store,
-            scope,
             writable,
             embeds,
             result_bytes,
@@ -221,24 +344,14 @@ impl Memory {
         schema
     }
 
-    /// The store's pinned model, if the store is open now.
+    /// The store's pinned model, as known now.
     fn model(&self) -> Option<EmbeddingModel> {
-        self.store.cached().and_then(|c| c.model().cloned())
+        self.store.model()
     }
 
     /// The store's pinned model, for a call: the store opened if need be.
     fn call_model(&self) -> Result<Option<EmbeddingModel>, Failure> {
-        Ok(self.core()?.model().cloned())
-    }
-
-    /// The store's core, for a call.
-    fn core(&self) -> Result<Arc<MemCore>, Failure> {
-        self.store.core()
-    }
-
-    /// The namespaces a call may touch.
-    fn scope(&self) -> Scope<'_> {
-        Scope(self.scope.as_deref())
+        self.store.call_model()
     }
 
     fn writer(&self) -> Result<(), Failure> {
@@ -431,26 +544,15 @@ impl Memory {
             pinned: a.bool_or("pinned", false)?,
             links,
         };
-        // A correction is near what it corrects, so with `supersedes` the core skips near
-        // dedup (simp724's S1 on #1389), keeping exact dedup; the supersede is a second
-        // transaction whose failure comes back with the stored id (simp724's S2).
-        let (done, supersede_error) = self
-            .core()?
-            .remember(self.scope(), r, supersedes.clone())
-            .map_err(mem_failure)?;
-        let (outcome, id) = match &done {
-            Remembered::New(id) => ("new", id),
-            Remembered::Merged(id) => ("merged", id),
-            Remembered::Similar(id) => ("similar", id),
-            _ => ("other", done.id()),
-        };
+        let done = self.store.remember(r, supersedes.clone())?;
+        let id = &done.id;
         let mut out = Map::new();
         out.insert("id".into(), json!(id.to_string()));
-        out.insert("outcome".into(), json!(outcome));
+        out.insert("outcome".into(), json!(done.outcome));
         if let Some(old) = supersedes {
-            let superseded = old != *id && supersede_error.is_none();
-            if let Some(e) = supersede_error {
-                out.insert("supersede_error".into(), mem_failure(e).json());
+            let superseded = old != *id && done.supersede_error.is_none();
+            if let Some(e) = done.supersede_error {
+                out.insert("supersede_error".into(), e.json());
             }
             out.insert("superseded".into(), json!(superseded));
         }
@@ -487,26 +589,21 @@ impl Memory {
             MIN_RECALL_BYTES,
             self.max_recall,
         )?;
-        let (hits, stats) = self
-            .core()?
-            .recall(
-                self.scope(),
-                RecallArgs {
-                    namespaces,
-                    text: text.map(str::to_owned),
-                    embedding,
-                    k: k as usize,
-                    byte_budget: max_bytes,
-                    expand_hops: 0,
-                    exact: false,
-                    include_superseded: a.bool_or("include_superseded", false)?,
-                    session: a.opt_str("session")?.map(str::to_owned),
-                    with_embeddings: false,
-                    with_signals: false,
-                },
-            )
-            .map_err(mem_failure)?;
-        let hits: Vec<Value> = hits
+        let recalled = self.store.recall(RecallArgs {
+            namespaces,
+            text: text.map(str::to_owned),
+            embedding,
+            k: k as usize,
+            byte_budget: max_bytes,
+            expand_hops: 0,
+            exact: false,
+            include_superseded: a.bool_or("include_superseded", false)?,
+            session: a.opt_str("session")?.map(str::to_owned),
+            with_embeddings: false,
+            with_signals: false,
+        })?;
+        let hits: Vec<Value> = recalled
+            .hits
             .into_iter()
             .map(|h| {
                 let mut o = json!({
@@ -524,7 +621,7 @@ impl Memory {
             })
             .collect();
         Ok(super::tools::object(
-            json!({"hits": hits, "truncated": stats.truncated}),
+            json!({"hits": hits, "truncated": recalled.truncated}),
         ))
     }
 
@@ -532,10 +629,7 @@ impl Memory {
         a.only(&["ids"])?;
         self.writer()?;
         let ids = ids(&a, "ids")?;
-        let m = self
-            .core()?
-            .mark_used(self.scope(), &ids)
-            .map_err(mem_failure)?;
+        let m = self.store.mark_used(&ids)?;
         let missing: Vec<String> = m.missing.iter().map(ToString::to_string).collect();
         Ok(super::tools::object(
             json!({"marked": m.marked, "missing": missing}),
@@ -547,9 +641,7 @@ impl Memory {
         self.writer()?;
         let old = memory_id(a.str("old")?)?;
         let new = memory_id(a.str("new")?)?;
-        self.core()?
-            .supersede(self.scope(), &old, &new)
-            .map_err(mem_failure)?;
+        self.store.supersede(&old, &new)?;
         Ok(Map::new())
     }
 
@@ -558,9 +650,7 @@ impl Memory {
         self.writer()?;
         let from = memory_id(a.str("from")?)?;
         let to = memory_id(a.str("to")?)?;
-        self.core()?
-            .link(self.scope(), &from, &to, link_type(&a)?, weight(&a)?)
-            .map_err(mem_failure)?;
+        self.store.link(&from, &to, link_type(&a)?, weight(&a)?)?;
         Ok(Map::new())
     }
 
@@ -568,10 +658,7 @@ impl Memory {
         a.only(&["ids"])?;
         self.writer()?;
         let ids = ids(&a, "ids")?;
-        let done = self
-            .core()?
-            .forget(self.scope(), &ids)
-            .map_err(mem_failure)?;
+        let done = self.store.forget(&ids)?;
         let missing: Vec<String> = done.missing.iter().map(ToString::to_string).collect();
         if let Some((e, left)) = done.failed {
             // The deletes before it stand: report them, the error, and what's left
@@ -580,7 +667,7 @@ impl Memory {
             return Ok(super::tools::object(json!({
                 "deleted": done.deleted,
                 "missing": missing,
-                "error": mem_failure(e).json(),
+                "error": e.json(),
                 "not_deleted": left,
             })));
         }

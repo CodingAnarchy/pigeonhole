@@ -154,6 +154,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
                 node: (*node).into(),
                 epoch: 1,
                 memory_bytes: 0,
+                replicas: Vec::new(),
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -702,6 +703,9 @@ fn a_forward_from_a_newer_peer_that_cant_give_its_map_writes_nothing() {
             map_version: 99,
             caller: Some(caller),
             fanout_part: false,
+            to_replica: false,
+            replica_max_lag_ms: 0,
+            min_primary_seqno: 0,
             op: Some(forward_request::Op::Mutate(super::proto::MutateRequest {
                 writes: Some(put_row("bob", "1")),
                 durability: 0,
@@ -1259,6 +1263,7 @@ fn data_node_served(
             engine_memory,
             change_feed,
             reserved: None,
+            replica_run: 256,
         },
     );
     // A restart with a map: the node takes its peers' newer maps, as `run` has it.
@@ -4146,6 +4151,7 @@ fn split_nodes(
                 node: format!("n{i}"),
                 epoch: 1,
                 memory_bytes: 0,
+                replicas: Vec::new(),
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -4920,10 +4926,12 @@ mod close;
 mod feed;
 mod fence;
 mod idle;
+mod mcp;
 mod memory;
 mod metrics;
 mod moving;
 mod open;
+mod replicas;
 mod restore;
 mod several;
 mod stamp;

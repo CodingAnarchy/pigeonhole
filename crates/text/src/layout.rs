@@ -46,6 +46,10 @@ pub(crate) const FINGERPRINT: &[u8] = b"fingerprint";
 pub(crate) const NORMALIZER_UNICODE: &[u8] = b"normalizer-unicode";
 /// Present while [`Index::repair`](crate::Index::repair) runs.
 pub(crate) const REPAIR: &[u8] = b"repair";
+/// A stopped rebuild's cursor (#1756): the last source row it reconciled, which
+/// [`Index::resume_rebuild_with`](crate::Index::resume_rebuild_with) continues after. Absent
+/// when no rebuild is pending.
+pub(crate) const REBUILD_AFTER: &[u8] = b"rebuild-after";
 
 pub(crate) const LAYOUT_VERSION: u64 = 1;
 

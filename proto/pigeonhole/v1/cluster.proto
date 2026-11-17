@@ -199,6 +199,11 @@ message Partition {
   // resumes only while `history_epoch <= e`. Derived where a map is set; 0 in maps from
   // before ticket 6, when no epoch had moved.
   uint64 history_epoch = 5;
+  // The nodes holding a read replica of P (D328, #1851), in order of preference: each a
+  // `Node.id`, none P's `node`, none twice. A replica copy follows P's owner's change feed
+  // (which must be on) and serves reads that allow a bounded staleness; it never takes a
+  // write or P's lease. A change to this alone is no move: P's epoch stays. (6 is unused.)
+  repeated string replicas = 7;
 }
 
 message TablePlacement {
@@ -339,6 +344,46 @@ message LocalPartition {
   // D326: the time left on the partition's lease here, in milliseconds; 0 when it holds none
   // (`awaiting_peers` is then true). A partition serves only while it holds one.
   uint64 lease_remaining_ms = 14;
+  // D328: whether this node holds P as its owner or as one of `Partition.replicas`.
+  PartitionRole role = 15;
+  // For a replica copy (D328): the node it follows, P's owner in this node's map.
+  string replica_of = 16;
+  // For a replica copy: the owner's seqno of P it applied through.
+  uint64 replica_applied_seqno = 17;
+  // For a replica copy: the owner's durable frontier of P, as its last message said.
+  uint64 replica_primary_seqno = 18;
+  // For a replica copy: milliseconds since it last heard it was caught up, on its own
+  // clock (the owner sends a caught-up message at least once a second while idle). It
+  // grows from the moment the owner's stream stops.
+  uint64 replica_lag_ms = 19;
+  // For a replica copy: where its follower is.
+  ReplicaState replica_state = 20;
+}
+
+// D328: how a node holds a partition.
+enum PartitionRole {
+  PARTITION_ROLE_UNSPECIFIED = 0;
+  // The map's `Partition.node`: it takes writes and holds P's lease.
+  PARTITION_ROLE_OWNER = 1;
+  // One of `Partition.replicas`: a read-only copy following the owner.
+  PARTITION_ROLE_REPLICA = 2;
+}
+
+// D328: a replica copy's follower.
+enum ReplicaState {
+  REPLICA_STATE_UNSPECIFIED = 0;
+  // Downloading and installing a copy of P from its owner (the first, or again after its
+  // position expired: the old copy serves meanwhile).
+  REPLICA_STATE_BOOTSTRAPPING = 1;
+  // Following the owner's feed.
+  REPLICA_STATE_FOLLOWING = 2;
+  // Not following, after an error (`LocalPartition.error` says which): it retries.
+  REPLICA_STATE_BEHIND = 3;
+  // Not following: the copy is closing, or the node is stopping.
+  REPLICA_STATE_STOPPED = 4;
+  // The owner's change feed for P is off, so there is nothing to follow: start the owner's
+  // node with `--change-feed`. It asks again every 30 s.
+  REPLICA_STATE_OWNER_FEED_OFF = 5;
 }
 
 // A forwarded single-key call (D317 ticket 2).
@@ -353,6 +398,18 @@ message ForwardRequest {
   // admission and no reply charge, its scope still checked. Only a peer sends it:
   // `Cluster.Forward` takes cluster scope. Set on another call, it's ignored.
   bool fanout_part = 21;
+  // A read the entry node chose this node's replica copy of the partition for (D328): it's
+  // served from the copy, not as the partition's owner, if the copy's freshness is within
+  // `replica_max_lag_ms`, else `ReplicaBehind`, and the entry node tries the next replica or
+  // the owner. Only a single-partition read without a snapshot or transaction is sent so.
+  bool to_replica = 44;
+  // The client's bound (`x-pigeonhole-read-replica-max-lag-ms`), checked on this node's
+  // clock: now less the copy's freshness. With `to_replica` only.
+  uint64 replica_max_lag_ms = 42;
+  // The client's read-your-writes seqno for the partition (`x-pigeonhole-min-primary-seqno`):
+  // the copy waits, within the call's deadline, until it has applied the owner's commits
+  // through it. 0: none. With `to_replica` only.
+  uint64 min_primary_seqno = 43;
   oneof op {
     GetRequest get = 3;
     ReadRowRequest read_row = 4;
@@ -499,6 +556,10 @@ message ForwardResponse {
     RecallPoolResponse recall_pool = 23;
     RecallBodiesResponse recall_bodies = 24;
   }
+  // The seqno the serving node read at, in the owner's numbering (D328's
+  // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the
+  // owner's visible seqno after it. Set for a single-partition read; 0 otherwise.
+  uint64 served_seqno = 28;
 }
 
 message ForwardSubscribeRequest {

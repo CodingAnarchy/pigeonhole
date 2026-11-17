@@ -37,6 +37,7 @@ index.delete(b"note:2")?;
   - A search skips a hit whose source text is gone, and counts it in `SearchStats::stale`.
   - `verify()` reports the mismatches, and `repair()` rebuilds the index from an emptied table.
 - **`rebuild()`** re-indexes every document online, and changes nothing for documents already right.
+- **Drop the index before its source table.** `Pigeonhole::drop_table` doesn't know about text indexes, so dropping the source first leaves the index behind: it can't write, rebuild or find its documents, and a new table of the same name becomes its source. `Index::over_table(&db, "notes")` lists the indexes whose source column is in a table. `phdb serve` refuses such a drop (`FailedPrecondition`, naming them).
 
 ## Queries
 `index.search(query, k).run()` returns the top `k` hits by BM25 score (Lucene's idf, `k1` 1.2, `b` 0.75), with ties broken by id. A query is an OR of clauses.

@@ -92,6 +92,16 @@ const QUERIES: &[&str] = &[
     "\"the memory\"",
     "\"memory the\"~2",
     "\"the store\" agent~",
+    // A repeated word: one stream of positions for both of its terms (#1586).
+    "\"the the\"",
+    "\"the memory the\"~2",
+    "\"memory the memory\"",
+    // A rare lead beside the hub term: the hub's positions come by point reads, and the
+    // lead's lengths by point reads and then its walk (ai1249's S2 on #1997). The phrases
+    // above take the hub's walk from the start.
+    "\"term the\"",
+    "\"the term\"~2",
+    "\"rank the term\"~3",
 ];
 
 #[test]

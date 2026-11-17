@@ -405,6 +405,13 @@ impl Node {
                 "partition {id:?} is open here: close it first (phdb cluster close)"
             )));
         }
+        // A replica copy (D328) closes when a map drops it here.
+        if self.replica_open(id) {
+            return Err(ApiError::failed_precondition(format!(
+                "this node holds a replica of partition {id:?}, still open: set a map without \
+                 this node in its replicas first (phdb cluster set-map)"
+            )));
+        }
         let dir = self.dir.clone();
         let part = id.to_owned();
         let lp = tokio::task::spawn_blocking(move || move_aside(&dir, &part)).await??;

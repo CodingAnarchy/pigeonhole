@@ -117,4 +117,27 @@ Design: `.coord/ai1249-1915-pr3-mcp.md`, reviewed by simp724 (`.coord/simp724-re
 
 **A lifted refusal (the coordinator's call):** `Data.Batch` takes what `Mutate` takes. Before, it refused `u64` and vector puts and aggregate inputs, a limit from serve's skeleton (#1501) from before the library's `WriteBatch` had them. `/mcp`'s `write` tool commits through `Batch`, and stdio `phdb mcp`'s takes all three. Vectors are checked against the family's spec first, as `Mutate` checks them. On a cluster, a peer still on the older build refuses them with `InvalidArgument` during an upgrade.
 
-**Still refused in PR 3a:** `/mcp` on a cluster node (PR 3b).
+**PR 3b: `/mcp` on a cluster node.** The refusal is lifted. `/mcp` is served by every node that holds a partition (one that only routes answers `Unsupported`), and its tools are the router's calls, so they reach every partition.
+
+**The memory tools as `Memory` calls** (moved from 3a, the coordinator's call):
+- The tools' store (`mcp::memory::Store`) is op-level: `remember`, `recall`, `mark_used`, `supersede`, `link`, `forget`. Stdio `phdb mcp` runs them on its store; serve makes each a `Memory` op through `Router::dispatch_by` as the session's token.
+- **The memory place (M6) moves into the ops.** `post` no longer takes one before the message's thread; the op takes it as the RPC does. With every memory place held by `/mcp` messages, their ops would otherwise have waited for one until the request timeout.
+- **S5:** the tools are listed on a node started with `--memory` only. A recall across partitions runs with the called node's memory flags.
+- **Forget:** a forget that fails part-way answers the error, as `Memory.Forget` does (on a cluster, #1939's `OutcomeUnknown` naming the partitions whose outcome isn't known), not stdio's partial `deleted` / `not_deleted` list.
+
+**proto (`memory.proto`, additive, this amendment; numbers from the coordinator, recorded in `.coord/numbers.md`):** the tools answer more than the RPCs did, so the RPCs carry it:
+- `RememberRequest.supersedes = 3` (bytes): the memory the new one corrects, in its namespace. Near dedup against the store is skipped (exact dedup stays), then the old memory is superseded.
+- `RememberResponse.supersede_error = 3` (`ErrorDetail`): set when that last step failed. The reply is a success, `id` is the stored memory, and the old one is still live: retry with `Supersede`.
+- `RecallResponse.truncated = 2`: the byte budget cut hits that would have ranked. On a cluster it's the entry node's, from the merged ranking (the parts send pools and bodies, never cut answers). A recall on one partition is forwarded whole and carries the owner's.
+- `MemoryHit.superseded_by = 10` (bytes).
+- `MarkUsedResponse.missing = 2` and `ForgetResponse.missing = 2` (repeated bytes): the ids the store doesn't hold. A split call concatenates its parts'.
+
+**Mixed versions (the coordinator's call; simp724's points):**
+- An older node ignores `supersedes` and leaves the reply fields empty. In proto3 an empty field can't be told from none, so each is a wrong answer, not a short one.
+- The feature string `memory_tool_fields` joins `map_features`. Checked as `nearest_qualifiers` is (30 s per-peer cache, a no-answer cached 5 s):
+  - every `/mcp` memory call that reads the fields (`memory_recall`, `memory_mark_used`, `memory_forget`, and `memory_remember` with `supersedes`) asks each node owning a partition it reaches;
+  - a `Remember` with `supersedes` from any client is checked in its forward to the owner (an owner that is the entry node has the feature);
+  - a node that answers without the feature refuses the call with `FailedPrecondition` naming it; one that doesn't answer is unavailable (`PartitionUnavailable`).
+- **Plain RPC replies aren't gated** (option (ii)): the proto comments and serve.md say that until every node has the feature, an empty `truncated`, `superseded_by` or `missing` doesn't mean none.
+
+**Tests (3b):** every table tool through any node; a write across partitions refused; a `feed_poll` ending between checkpoints and resumed through another node (M1); every memory tool across partitions, a recall equal to the gRPC one; the gate (an older build, a node that doesn't answer); a node without `--memory`; a namespace-scoped token; the memory variant of the deadlock test (as many held `memory_recall`s as memory places), and the forwarded variant (two full nodes forwarding to each other). Each deadlock test fails with the old place.

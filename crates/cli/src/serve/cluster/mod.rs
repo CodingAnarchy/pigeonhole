@@ -60,8 +60,13 @@ use crate::exit::Failure;
 /// ICR 0138 and 0139). A map's writer adds such a field only once every node reports it: a
 /// node that drops it would store a different map at the same version, and read as divergent.
 /// Request features its peers may rely on are listed here too (#1915 PR 3, ICR 0139's PR 3
-/// section): [`NEAREST_QUALIFIERS_FEATURE`].
-pub(crate) const MAP_FEATURES: &[&str] = &[MEMORY_FEATURE, NEAREST_QUALIFIERS_FEATURE];
+/// section): [`NEAREST_QUALIFIERS_FEATURE`] and [`MEMORY_TOOL_FIELDS_FEATURE`].
+pub(crate) const MAP_FEATURES: &[&str] = &[
+    MEMORY_FEATURE,
+    NEAREST_QUALIFIERS_FEATURE,
+    MEMORY_TOOL_FIELDS_FEATURE,
+    REPLICAS_FEATURE,
+];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
 pub(crate) const MEMORY_FEATURE: &str = "memory";
@@ -69,6 +74,13 @@ pub(crate) const MEMORY_FEATURE: &str = "memory";
 /// [`MAP_FEATURES`]' name for a build that applies `NearestRequest.qualifiers` (#1915 PR 3):
 /// a node without it would rank every qualifier.
 pub(crate) const NEAREST_QUALIFIERS_FEATURE: &str = "nearest_qualifiers";
+
+/// [`MAP_FEATURES`]' name for a build that serves the memory calls' fields for `/mcp`'s
+/// memory tools (#1915 PR 3b): `RememberRequest.supersedes`, `RememberResponse.
+/// supersede_error`, `RecallResponse.truncated`, `MemoryHit.superseded_by` and the
+/// `missing` ids of `MarkUsed` and `Forget`. A node without it would ignore `supersedes`
+/// and leave the rest empty.
+pub(crate) const MEMORY_TOOL_FIELDS_FEATURE: &str = "memory_tool_fields";
 
 /// How long a peer's answered features ([`Node::owners_keep`]) are taken as its own: a
 /// node's build changes only when it restarts.
@@ -89,6 +101,14 @@ pub(crate) enum PeerFeature {
     Lacks,
     /// It didn't answer (in time): why.
     NoAnswer(String),
+}
+
+/// [`MAP_FEATURES`]' name for `Partition.replicas` (D328, #1851).
+pub(crate) const REPLICAS_FEATURE: &str = "replicas";
+
+/// Whether `map` places a read replica of any partition (D328).
+pub(crate) fn has_replicas(map: &ClusterMap) -> bool {
+    map.partitions.iter().any(|p| !p.replicas.is_empty())
 }
 
 /// The map file in a node's directory.
@@ -152,6 +172,16 @@ pub(crate) static CUT_OFF: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new()
 /// `status` false, a peer that changed build within the entry node's features cache).
 #[cfg(test)]
 pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before `memory_tool_fields` (#1915 PR 3b),
+/// by cluster directory: their `Status` leaves the feature out.
+#[cfg(test)]
+pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A hold seam (tests): nodes whose `Status` doesn't answer while their cluster directory
+/// is listed, as a stalled peer's wouldn't.
+#[cfg(test)]
+pub(crate) static HOLD_STATUS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// How [`OLD_NEAREST`] has a node act.
 #[cfg(test)]
@@ -652,6 +682,11 @@ impl Node {
                 self.every_node_keeps(&map, MEMORY_FEATURE, "a memory store")
                     .await?;
             }
+            // So do read replicas (D328).
+            if !has_replicas(&current) && has_replicas(&map) {
+                self.every_node_keeps(&map, REPLICAS_FEATURE, "a read replica")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -668,6 +703,10 @@ impl Node {
             // The node's first map: its nodes keep a memory store too, or none goes in.
             if map.memory.is_some() {
                 self.every_node_keeps(&map, MEMORY_FEATURE, "a memory store")
+                    .await?;
+            }
+            if has_replicas(&map) {
+                self.every_node_keeps(&map, REPLICAS_FEATURE, "a read replica")
                     .await?;
             }
             map.previous_nodes.clear();
@@ -1114,6 +1153,18 @@ impl Node {
             .and_then(|o| o.shared.upgrade())
             .map(|shared| shared.router.partitions().into_iter().collect())
             .unwrap_or_default();
+        let copies = self
+            .server
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .and_then(|shared| {
+                shared
+                    .router
+                    .cluster
+                    .as_ref()
+                    .map(|c| c.replicas.load_full())
+            })
+            .unwrap_or_default();
         for path in files {
             let file = path
                 .file_name()
@@ -1131,6 +1182,26 @@ impl Node {
                 error: String::new(),
                 ..Default::default()
             };
+            // This node's replica copy (D328): its follower says how it is. Its file is held
+            // open, and its identity row is its owner's, so it isn't read here.
+            if let Some(copy) = copies.get(&named) {
+                let c = copy.follower.copy_status();
+                lp.role = proto::PartitionRole::Replica as i32;
+                lp.set_replica_state(c.state);
+                lp.replica_of = c.owner;
+                lp.replica_applied_seqno = c.applied;
+                lp.replica_primary_seqno = c.primary_seqno;
+                lp.replica_lag_ms = c.lag_ms;
+                lp.epoch = map
+                    .as_ref()
+                    .and_then(|m| m.partitions.iter().find(|p| p.id == named))
+                    .map_or(0, |p| p.epoch);
+                lp.ok = c.state != proto::ReplicaState::Behind
+                    && c.state != proto::ReplicaState::OwnerFeedOff;
+                lp.error = if lp.ok { String::new() } else { c.last_error };
+                partitions.push(lp);
+                continue;
+            }
             // A partition being opened: no read of its file, whose read-only open would refuse
             // the node's own open (#1770). It shows as opening.
             if self.fences.is_opening(&named) {
@@ -1212,6 +1283,18 @@ impl Node {
                 }
             }
         }
+        // An owner's file (D328): the map gives the partition to this node.
+        for lp in &mut partitions {
+            if lp.role == 0
+                && map.as_ref().is_some_and(|m| {
+                    m.partitions
+                        .iter()
+                        .any(|p| p.id == lp.id && p.node == self.id)
+                })
+            {
+                lp.role = proto::PartitionRole::Owner as i32;
+            }
+        }
         // Each open partition's state, and a closed one's files (D317 ticket 6).
         for lp in &mut partitions {
             // One read (simp724's S1 on #1964): a reopen or a close between two would show
@@ -1242,6 +1325,16 @@ impl Node {
                     {
                         return false;
                     }
+                    #[cfg(test)]
+                    if f == MEMORY_TOOL_FIELDS_FEATURE
+                        && OLD_MEMORY
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .any(|d| self.dir.starts_with(d))
+                    {
+                        return false;
+                    }
                     let _ = f;
                     true
                 })
@@ -1265,6 +1358,56 @@ impl Node {
             .await
             .map_err(|e| format!("connecting to {address}: {e}"))?;
         Ok(forward::peer_client(channel))
+    }
+
+    /// A channel to the peer at `address` (the map's `host:port`), as [`Node::client`] dials
+    /// it: for a call other than `Cluster`'s, a replica copy's follower's (D328).
+    pub(crate) async fn peer_channel(
+        &self,
+        address: &str,
+    ) -> Result<tonic::transport::Channel, String> {
+        #[cfg(test)]
+        if cut_off(&self.dir, address) {
+            return Err(format!("connecting to {address}: cut off (a test's seam)"));
+        }
+        self.endpoint(address)?
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .connect()
+            .await
+            .map_err(|e| format!("connecting to {address}: {e}"))
+    }
+
+    /// The epoch partition `id`'s current history began at, as this node's map has it
+    /// (`Partition.history_epoch`): `None` without a map or the partition.
+    pub(crate) fn history_epoch(&self, id: &str) -> Option<u64> {
+        let map = self.get_map().ok()?;
+        map.partitions
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.history_epoch)
+    }
+
+    /// Partition `id`'s owner in this node's map and its address, for a replica copy's
+    /// follower (D328): an error when the map has no such partition, or names this node.
+    pub(crate) fn owner_of(&self, id: &str) -> Result<(String, String), String> {
+        let map = self.get_map().map_err(|e| e.message)?;
+        let p =
+            map.partitions.iter().find(|p| p.id == id).ok_or_else(|| {
+                format!("partition {id} isn't in map version {}", map.map_version)
+            })?;
+        if p.node == self.id {
+            return Err(format!(
+                "map version {} gives partition {id} to this node: it isn't a replica here",
+                map.map_version
+            ));
+        }
+        let address = map
+            .nodes
+            .iter()
+            .find(|n| n.id == p.node)
+            .map(|n| n.address.clone())
+            .ok_or_else(|| format!("partition {id}'s node {} isn't in the map", p.node))?;
+        Ok((p.node.clone(), address))
     }
 
     /// How this node dials the peer at `address` (the map's `host:port`): its TLS settings,
@@ -1623,6 +1766,14 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<StatusRequest>,
     ) -> Result<tonic::Response<NodeStatus>, Status> {
         self.caller(&req, READERS, "read the cluster status")?;
+        #[cfg(test)]
+        while HOLD_STATUS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&self.0.dir)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let node = Arc::clone(&self.0);
         let status = tokio::task::spawn_blocking(move || node.status())
             .await
@@ -1642,6 +1793,13 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             return Err(ApiError::unsupported("this node doesn't serve data").into());
         };
         self.0.catch_up(&peer, req.metadata()).await?;
+        // The sender's deadline for the call (it sends what's left of its client's), for a
+        // replica copy's read-your-writes wait (D328).
+        let deadline = crate::serve::replica::ReadDeadline::new(
+            std::time::Instant::now(),
+            shared.limits.request_timeout,
+            crate::serve::grpc::grpc_timeout(req.metadata().as_ref()),
+        );
         let msg = req.into_inner();
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
@@ -1653,11 +1811,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             }
             _ => forward::caller_of(msg.caller, &self.0.tokens)?,
         };
-        let reply = shared
+        // A read the entry node chose this node's replica copy for (D328).
+        let replica = msg.to_replica.then_some(crate::serve::router::ReplicaRead {
+            max_lag_ms: msg.replica_max_lag_ms,
+            min_primary_seqno: (msg.min_primary_seqno > 0).then_some(msg.min_primary_seqno),
+        });
+        let (reply, served) = shared
             .router
-            .serve_forwarded(op, &caller, msg.fanout_part)
+            .serve_forwarded(op, &caller, msg.fanout_part, replica.map(|r| (r, deadline)))
             .await?;
-        let (reply, charge) = forward::reply_to_forward(reply)?;
+        let (reply, charge) = forward::reply_to_forward(reply, served)?;
         let mut resp = tonic::Response::new(reply);
         // A read's charge lasts until the reply's body is written: `routes` holds it there.
         if let Some(c) = charge {
@@ -1992,6 +2155,7 @@ pub(crate) fn run(
         dir,
         cluster_id.as_deref(),
         &mine,
+        false,
         Budget {
             shares: &shares,
             reserved: reserved.as_deref(),
@@ -2073,6 +2237,9 @@ pub(crate) fn run(
                 engine_memory: Some(o.memory),
             };
             let part = service.for_partition(o.db.clone(), &o.id, gate, config);
+            // A text index rebuild a fence or a shutdown stopped carries on once the
+            // partition takes writes (#1756).
+            part.resume_text_rebuilds();
             (o.id.clone(), part)
         })
         .collect();
@@ -2133,6 +2300,7 @@ pub(crate) fn run(
             engine_memory: args.engine_memory,
             change_feed: args.change_feed,
             reserved: reserved.clone(),
+            replica_run: args.replica_run.max(1),
         },
     );
     // A node that restarts with a map takes a newer one from its peers, then pushes.
@@ -2223,6 +2391,7 @@ fn open_partitions(
     dir: &Path,
     cluster_id: Option<&str>,
     mine: &[(String, u64)],
+    replica: bool,
     budget: Budget<'_>,
     options: impl Fn(super::placement::Share, Option<super::placement::Memory>) -> pigeonhole::Options,
     stderr: &mut dyn std::io::Write,
@@ -2259,7 +2428,11 @@ fn open_partitions(
                 }
                 None => {}
             }
-            open_partition(dir, cluster_id, id, *epoch, o)
+            if replica {
+                open_replica_copy(dir, cluster_id, id, o).map(Some)
+            } else {
+                open_partition(dir, cluster_id, id, *epoch, o)
+            }
         };
         let mut db = match open(planned, &compaction_cpus) {
             Ok(Some(db)) => db,
@@ -2377,6 +2550,9 @@ pub(crate) fn start_sync(node: &Arc<Node>, version: u64) -> Option<Box<dyn FnOnc
         Box::new(move || {
             tokio::spawn(async move {
                 n.sync_on_start().await;
+                // Its replica copies (D328) open as a running node opens them, now that it
+                // serves and holds its peers' newest map.
+                n.open_missing().await;
             });
         }) as Box<dyn FnOnce() + Send>
     })
@@ -2417,6 +2593,58 @@ pub(crate) fn open_retrying(
             opened => return opened,
         }
     }
+}
+
+/// Opens this node's replica copy of `partition` in `dir` (D328): `DIR/P.phdb`, created
+/// empty when missing, for its follower's bootstrap to fill. A file that's this cluster's
+/// and partition's at any epoch (a copy keeps the epoch it bootstrapped at until its
+/// follower records the owner's), or has no identity row yet, is the copy. One of another
+/// cluster or partition is refused, and so is one that isn't a replica's and has tables: a
+/// moved-away owner's file, which a bootstrap would replace, so `drop-partition` must move
+/// it aside first (a single node's `--replica-of` refuses one so too).
+fn open_replica_copy(
+    dir: &Path,
+    cluster_id: &str,
+    partition: &str,
+    options: pigeonhole::Options,
+) -> Result<pigeonhole::Pigeonhole, Failure> {
+    stamp::finish_install(dir, partition).map_err(|e| Failure::usage(&e.message))?;
+    let path = dir.join(format!("{partition}.phdb"));
+    let db = open_retrying(&path, &options)
+        .map_err(|e| Failure::db("open the partition's replica copy", &e))?;
+    let refuse = |db: pigeonhole::Pigeonhole, why: String| {
+        let _ = db.close();
+        Err(Failure::usage(&format!(
+            "{} can't be this node's replica of partition {partition:?}: {why}",
+            path.display()
+        )))
+    };
+    match identity::read(&db) {
+        Ok(Some(id)) if id.cluster_id != cluster_id || id.partition_id != partition => {
+            return refuse(
+                db,
+                format!(
+                    "it's partition {:?} of cluster {:?}",
+                    id.partition_id, id.cluster_id
+                ),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => return refuse(db, e),
+    }
+    let is_replica = match db.replicated_seqno() {
+        Ok(applied) => applied.is_some(),
+        Err(e) => return refuse(db, format!("reading its replica state: {e}")),
+    };
+    if !is_replica && !db.tables().is_empty() {
+        return refuse(
+            db,
+            "it isn't a replica's copy and has tables (an owner's file, kept after the \
+             partition moved away): move it aside with phdb cluster drop-partition first"
+                .to_owned(),
+        );
+    }
+    Ok(db)
 }
 
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:

@@ -1166,3 +1166,442 @@ fn a_node_the_newest_map_removed_doesnt_count_toward_its_majority() {
         .await;
     });
 }
+
+/// A TCP proxy in front of a node, for a node that keeps its connection up and stops
+/// reading or sending (#1950): each direction forwards until its flag is set.
+struct Proxy {
+    /// `host:port`, as a map's address.
+    address: String,
+    /// Set: nothing more reaches the node.
+    to_node: Arc<std::sync::atomic::AtomicBool>,
+    /// Set: nothing more comes back from the node.
+    from_node: Arc<std::sync::atomic::AtomicBool>,
+    /// Not 0: `from_node` is set once this many bytes have gone to the node, before the
+    /// byte that reaches it is forwarded. So a reply the node gives only after it took
+    /// more than this never comes back.
+    mute_after: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Proxy {
+    fn to(port: u16) -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let flags: [Arc<std::sync::atomic::AtomicBool>; 3] = Default::default();
+        let [to_node, from_node, stop] = flags.clone();
+        let mute_after = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mute = (Arc::clone(&mute_after), Arc::clone(&from_node));
+        std::thread::spawn(move || {
+            let [to_node, from_node, stop] = flags;
+            // `mute`: the count that sets a flag (`mute_after`), on the way to the node.
+            type Mute = Option<(
+                Arc<std::sync::atomic::AtomicU64>,
+                Arc<std::sync::atomic::AtomicBool>,
+            )>;
+            let pump = |mut from: std::net::TcpStream,
+                        mut to: std::net::TcpStream,
+                        stalled: Arc<std::sync::atomic::AtomicBool>,
+                        stop: Arc<std::sync::atomic::AtomicBool>,
+                        mute: Mute| {
+                from.set_read_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16 << 10];
+                    let mut forwarded = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        if stalled.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        let read = from.read(&mut buf);
+                        // Held, not dropped, when the flag was set during the read: what
+                        // was read before it goes on only once the flag clears.
+                        while stalled.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        if let (Ok(n), Some((after, flag))) = (&read, &mute) {
+                            forwarded += *n as u64;
+                            let after = after.load(Ordering::Relaxed);
+                            if after != 0 && forwarded >= after {
+                                flag.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        match read {
+                            Ok(0) => break,
+                            Ok(n) if to.write_all(&buf[..n]).is_err() => break,
+                            Ok(_) => {}
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) => {}
+                            Err(_) => break,
+                        }
+                    }
+                });
+            };
+            while !stop.load(Ordering::Relaxed) {
+                let Ok((client, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                client.set_nonblocking(false).unwrap();
+                let node = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                pump(
+                    client.try_clone().unwrap(),
+                    node.try_clone().unwrap(),
+                    Arc::clone(&to_node),
+                    Arc::clone(&stop),
+                    Some(mute.clone()),
+                );
+                pump(
+                    node,
+                    client,
+                    Arc::clone(&from_node),
+                    Arc::clone(&stop),
+                    None,
+                );
+            }
+        });
+        Self {
+            address,
+            to_node,
+            from_node,
+            mute_after,
+            stop,
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Fences and closes p1 on a by hand, as a move's first step does, and returns its closed
+/// set once hashed.
+async fn close_p1(t: &Cluster) -> Vec<crate::serve::proto::PartitionFile> {
+    let a = t.ports[0];
+    let p1 = || crate::serve::proto::PartitionRequest {
+        partition: "p1".into(),
+        ..Default::default()
+    };
+    client(a).await.fence(p1()).await.unwrap();
+    client(a).await.close(p1()).await.unwrap();
+    let old = at(t, "a", &format!("127.0.0.1:{a}")).await;
+    super::super::moving::closed_files(&old, "p1", Some(Duration::from_secs(20)))
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message()))
+}
+
+/// The move's channel to node `id` at `address` (`host:port`).
+async fn at(t: &Cluster, id: &str, address: &str) -> super::super::moving::At {
+    super::super::moving::At::new(&t.args, id, address)
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message()))
+}
+
+/// Text that doesn't compress to nothing, `bytes` long.
+fn noise(seed: u64, bytes: usize) -> String {
+    let mut x = seed | 1;
+    (0..bytes)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        })
+        .collect()
+}
+
+#[test]
+fn a_copy_the_new_node_refuses_part_way_fails_with_the_nodes_reason() {
+    // #1950, 1: the new node ends the upload while the old one still sends. The download
+    // stops, and the move's error is the new node's answer, not the download's. The refusal
+    // here: the set claims the file is 1 byte long, so c refuses its first chunk, with
+    // megabytes of it still to come from a.
+    use super::super::moving::{Set, copy_file};
+    let t = Cluster::start();
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        for i in 0..40 {
+            put(b, &format!("big{i:02}"), &noise(i, 400 << 10)).await;
+        }
+        let files = close_p1(&t).await;
+        let f = files.iter().max_by_key(|f| f.bytes).unwrap();
+        assert!(
+            f.bytes > 12 << 20,
+            "the test needs a file many chunks long: {files:?}"
+        );
+        let short = crate::serve::proto::PartitionFile {
+            bytes: 1,
+            ..f.clone()
+        };
+        let lied: Vec<_> = files
+            .iter()
+            .map(|g| if g.name == f.name { &short } else { g }.clone())
+            .collect();
+        let set = Set {
+            cluster: "c1",
+            p: "p1",
+            e: 1,
+            files: &lied,
+        };
+        let (old, new) = (
+            at(&t, "a", &format!("127.0.0.1:{a}")).await,
+            at(&t, "c", &format!("127.0.0.1:{c}")).await,
+        );
+        let stall = crate::serve::download::STALL;
+        let e = within(copy_file(&old, &new, &set, &short, stall))
+            .await
+            .expect_err("c takes 1 byte of it at most");
+        assert!(
+            e.message().contains("more bytes than the file's 1"),
+            "{}",
+            e.message()
+        );
+    });
+}
+
+#[test]
+fn a_copy_gives_up_on_a_node_that_goes_quiet_and_a_rerun_finishes_the_move() {
+    // #1950, 2 and 4: either node of a copy can keep its connection up and stop. The old
+    // one sending nothing was bounded (60 s in a move, 300 ms here); the new one taking
+    // nothing wasn't, and the move waited for ever. Both now fail the copy, saying which
+    // node and to run the move again, and the rerun finishes it.
+    use super::super::moving::{Set, copy_file};
+    let t = Cluster::start();
+    let [a, b, c] = t.ports;
+    let wait = Some(Duration::from_secs(20));
+    t.rt.block_on(async {
+        let files = close_p1(&t).await;
+        let set = Set {
+            cluster: "c1",
+            p: "p1",
+            e: 1,
+            files: &files,
+        };
+        let stall = Duration::from_millis(300);
+        let direct = |port: u16| format!("127.0.0.1:{port}");
+
+        let quiet_a = Proxy::to(a);
+        let (old, new) = (
+            at(&t, "a", &quiet_a.address).await,
+            at(&t, "c", &direct(c)).await,
+        );
+        quiet_a.from_node.store(true, Ordering::Relaxed);
+        let e = within(copy_file(&old, &new, &set, &files[0], stall))
+            .await
+            .expect_err("a sends nothing");
+        assert!(
+            e.message().contains("node \"a\" sent nothing of")
+                && e.message().contains("run the move again to resume"),
+            "{}",
+            e.message()
+        );
+
+        let deaf_c = Proxy::to(c);
+        let (old, new) = (
+            at(&t, "a", &direct(a)).await,
+            at(&t, "c", &deaf_c.address).await,
+        );
+        deaf_c.to_node.store(true, Ordering::Relaxed);
+        let e = within(copy_file(&old, &new, &set, &files[0], stall))
+            .await
+            .expect_err("c takes nothing");
+        assert!(
+            e.message().contains("node \"c\" took nothing of")
+                && e.message().contains("run the move again to resume"),
+            "{}",
+            e.message()
+        );
+
+        within(super::super::moving::run(&t.args, "p1", "c", false, wait))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun failed: {}", e.message()));
+        assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+}
+
+#[test]
+fn an_upload_whose_node_stops_reading_mid_file_ends_stalled_without_its_answer() {
+    // #1950, 4: the node answers the status call, then takes nothing more with the
+    // connection up. The feed's messages fill what the connection buffers, one then waits
+    // the stall bound, and the pass ends there: it doesn't wait for an answer the node
+    // may never give.
+    use super::super::transfer::{Stopped, upload_file};
+    let t = Cluster::start();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        let files = close_p1(&t).await;
+        let deaf_c = Proxy::to(c);
+        let url = format!("http://{}", deaf_c.address);
+        let (channel, token) = super::super::cli::channel(&t.args, &url)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message()));
+        let mut admin = crate::serve::proto::admin_client::AdminClient::new(channel);
+        let header = crate::serve::proto::PartitionUploadHeader {
+            partition: "p1".into(),
+            cluster_id: "c1".into(),
+            epoch: 1,
+            upload_id: "00112233445566778899aabbccddeeff".into(),
+            purpose: crate::serve::proto::PartitionUploadPurpose::Relocate as i32,
+            file: Some(files[0].clone()),
+            manifest: files.clone(),
+        };
+        let stops = Arc::clone(&deaf_c.to_node);
+        let pass = within(upload_file(
+            &mut admin,
+            token.as_deref(),
+            header,
+            Duration::from_millis(300),
+            |_, mut feed| async move {
+                stops.store(true, Ordering::Relaxed);
+                let chunk = prost::bytes::Bytes::from(vec![0u8; feed.max()]);
+                while feed.send(chunk.clone()).await.is_ok() {}
+                Ok::<(), std::convert::Infallible>(())
+            },
+        ))
+        .await;
+        assert!(matches!(pass, Err(Stopped::Stalled)));
+    });
+}
+
+#[test]
+fn an_upload_whose_node_never_answers_after_the_last_byte_ends_unanswered() {
+    // #1983: the node answers the status call and takes what is sent, then nothing comes
+    // back from it with the connection up. The source is done, so only the wait for the
+    // node's reply is left, and it ends at its bound: the stall, plus the file's size at
+    // the floor rate.
+    use super::super::transfer::{Stopped, upload_file};
+    let t = Cluster::start();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        let files = close_p1(&t).await;
+        let mute_c = Proxy::to(c);
+        let url = format!("http://{}", mute_c.address);
+        let (channel, token) = super::super::cli::channel(&t.args, &url)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message()));
+        let mut admin = crate::serve::proto::admin_client::AdminClient::new(channel);
+        let header = crate::serve::proto::PartitionUploadHeader {
+            partition: "p1".into(),
+            cluster_id: "c1".into(),
+            epoch: 1,
+            upload_id: "ffeeddccbbaa99887766554433221100".into(),
+            purpose: crate::serve::proto::PartitionUploadPurpose::Relocate as i32,
+            file: Some(files[0].clone()),
+            manifest: files.clone(),
+        };
+        let stops = Arc::clone(&mute_c.from_node);
+        let pass = within(upload_file(
+            &mut admin,
+            token.as_deref(),
+            header,
+            Duration::from_millis(300),
+            |_, mut feed| async move {
+                stops.store(true, Ordering::Relaxed);
+                // One small chunk: it fits what the connection buffers, so the feed
+                // itself never stalls.
+                let chunk = prost::bytes::Bytes::from(vec![0u8; 1 << 10]);
+                assert!(feed.send(chunk).await.is_ok());
+                Ok::<(), std::convert::Infallible>(())
+            },
+        ))
+        .await;
+        // 300 ms, plus the file's size at the floor rate.
+        let Err(Stopped::Unanswered(bound)) = pass else {
+            panic!("the pass didn't end unanswered");
+        };
+        assert!(bound >= Duration::from_millis(300), "{bound:?}");
+    });
+}
+
+#[test]
+fn a_restores_upload_a_node_never_answers_fails_once_and_says_to_run_it_again() {
+    // #1983, in a restore: the node takes the whole copy and never answers. That is
+    // final, after one bound: a resume would send nothing and wait as long again. A dead
+    // node is another case (it fails the status call); this is a hung hash or sync.
+    use super::super::restore::{Copy, Job, upload};
+    use sha2::Digest;
+    let t = Cluster::start();
+    let c = t.ports[2];
+    t.rt.block_on(async {
+        // 32 KiB: more than the status call's bytes by far, and within what a connection
+        // takes with nothing coming back. So the proxy's count is passed in the upload,
+        // after the status call's answer and before the upload's.
+        let data = noise(7, 32 << 10);
+        let path = t.dirs[0].join("a-copy");
+        std::fs::write(&path, &data).unwrap();
+        let mute_c = Proxy::to(c);
+        mute_c.mute_after.store(8 << 10, Ordering::Relaxed);
+        let job = Job {
+            copy: Copy {
+                partition: "p1".into(),
+                path,
+                epoch: 1,
+                bytes: data.len() as u64,
+                sha256: sha2::Sha256::digest(data.as_bytes()).into(),
+            },
+            node: "c".into(),
+            url: format!("http://{}", mute_c.address),
+            epoch: 2,
+            earlier: false,
+        };
+        let e = within(upload(
+            &t.args,
+            None,
+            "c1",
+            &job,
+            Duration::from_millis(300),
+        ))
+        .await
+        .expect_err("c never answers");
+        assert!(
+            e.message()
+                .contains("the node took the file and gave no answer for")
+                && e.message().contains("run the restore again"),
+            "final after one bound, where a break would resume and end without this text: {}",
+            e.message()
+        );
+    });
+}
+
+#[test]
+fn a_move_copies_a_closed_set_that_holds_an_empty_file() {
+    // #1950, 3: a crash can leave a 0-byte WAL stream file in a set. Its only chunk
+    // carries the hash and no data, the new node finishes it from a header alone, and the
+    // move goes through.
+    let t = Cluster::start();
+    let [a, b, _] = t.ports;
+    let wait = Some(Duration::from_secs(20));
+    t.rt.block_on(async {
+        let p1 = || crate::serve::proto::PartitionRequest {
+            partition: "p1".into(),
+            ..Default::default()
+        };
+        client(a).await.fence(p1()).await.unwrap();
+        let next = std::fs::read_dir(&t.dirs[0])
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_prefix("p1.phdb-wal-")?.parse::<u64>().ok()
+            })
+            .max()
+            .map_or(0, |n| n + 1);
+        std::fs::write(t.dirs[0].join(format!("p1.phdb-wal-{next}")), b"").unwrap();
+        let files = close_p1(&t).await;
+        assert!(
+            files.iter().any(|f| f.bytes == 0),
+            "the closed set lists the empty file: {files:?}"
+        );
+        within(super::super::moving::run(&t.args, "p1", "c", false, wait))
+            .await
+            .unwrap_or_else(|e| panic!("the move failed: {}", e.message()));
+        assert_eq!(get_row(b, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+}

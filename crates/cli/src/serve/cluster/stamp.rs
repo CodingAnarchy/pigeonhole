@@ -192,6 +192,16 @@ impl Node {
                 "partition {p:?} is open here: fence and close it first (phdb cluster close)"
             )));
         }
+        // A replica copy of P here holds `P.phdb`, which this would stamp or replace with an
+        // uploaded set (the one place a set is installed): refused on the node too, whatever
+        // map the caller read (D328, simp724's S4 condition on PR 1).
+        if self.replica_open(&p) {
+            return Err(ApiError::failed_precondition(format!(
+                "this node holds an open replica copy of partition {p:?}: set a map without \
+                 this node in {p}'s replicas, move the copy aside (phdb cluster \
+                 drop-partition {p} here), then run the move, relocate or restore again"
+            )));
+        }
         let dir = self.dir.clone();
         let restore = req.restore;
         let installed = tokio::task::spawn_blocking(move || stamp_files(&dir, &req)).await??;

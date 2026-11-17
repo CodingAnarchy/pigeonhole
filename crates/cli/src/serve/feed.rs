@@ -2971,21 +2971,39 @@ mod tests {
 
     /// #1901 (B): a caught-up hub waits `Coalesce::hub` after a small batch, never before one.
     /// After a quiet gap a lone commit is delivered at once; two commits made during the wait
-    /// after it are read together when it ends, one batch and one notify.
+    /// after it are read together when it ends, one batch and one notify. The wait is 2 s and
+    /// the lone commit's bound half of it, so a hub that waited before it fails by a wide
+    /// margin while a slow runner doesn't (#1970's Windows CI took 1.27 s with a disk sync
+    /// inside the old 280 ms bound).
     #[test]
     fn a_caught_up_hub_waits_after_a_small_batch_but_never_before_one() {
         let (_, db, dir) = commits("hubcoalesce", 0);
         let (requests, delivery, hubs) = server_runtimes(1);
         let t = db.table("t").unwrap().open().unwrap();
         let mut limits = limits_solo_after(Duration::from_secs(60));
-        limits.coalesce.hub = Duration::from_millis(300);
+        const WAIT: Duration = Duration::from_secs(2);
+        limits.coalesce.hub = WAIT;
         let feeds = Feeds::new(db.clone(), limits, &FeedShared::new(1));
         feeds.run_on(delivery.handle().clone(), hubs.handle().clone());
         let slots = Arc::new(Semaphore::new(8));
         requests.block_on(async {
-            let put = |row: &[u8]| t.mutate(row).put("f", b"q", b"v").commit().unwrap().seqno;
+            // The visible feed and Buffered commits: no disk sync inside the timed windows. On
+            // the durable feed a commit's group sync counted toward the hub's wait, and a slow
+            // Windows runner's took 1.27 s (#1970's CI).
+            let put = |row: &[u8]| {
+                t.mutate(row)
+                    .put("f", b"q", b"v")
+                    .durability(pigeonhole::Durability::Buffered)
+                    .commit()
+                    .unwrap()
+                    .seqno
+            };
             let slot = Arc::clone(&slots).try_acquire_owned().unwrap();
-            let mut a = feeds.subscribe(now_spec(&t), slot, |_| {}).unwrap();
+            let spec = Spec {
+                visible: true,
+                ..now_spec(&t)
+            };
+            let mut a = feeds.subscribe(spec, slot, |_| {}).unwrap();
             let hub = feeds
                 .hubs
                 .lock()
@@ -2993,21 +3011,35 @@ mod tests {
                 .values()
                 .find_map(Weak::upgrade)
                 .unwrap();
-            // A quiet gap longer than the wait: the next commit is read at once.
+            // No batch yet, so no wait: the first commit is read at once.
             tokio::time::sleep(Duration::from_millis(400)).await;
-            let t0 = Instant::now();
             let s1 = put(b"r1");
+            let t0 = Instant::now();
             assert_eq!(seqnos(&mut a, Duration::from_millis(100)).await, [s1]);
             let first = t0.elapsed();
             assert!(
-                first < Duration::from_millis(280),
+                first < WAIT / 2,
                 "a lone commit waited: {first:?} (its 100 ms quiet included)"
             );
-            // The hub is in its 300 ms wait after that batch of one: both are read after it.
+            // The hub is in its wait after that batch of one: both are read after it. Apart by
+            // a tenth of the wait, so a hub that didn't wait would read r2 alone.
             let notified = hub.notifies.load(Ordering::Relaxed);
             let s2 = put(b"r2");
+            tokio::time::sleep(WAIT / 10).await;
             let s3 = put(b"r3");
-            assert_eq!(seqnos(&mut a, Duration::from_millis(600)).await, [s2, s3]);
+            let mut got = Vec::new();
+            while got.len() < 2 {
+                let e = tokio::time::timeout(
+                    WAIT * 2,
+                    std::future::poll_fn(|cx| Pin::new(&mut a).poll_next(cx)),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("r2 and r3 not read within twice the wait: {got:?}"));
+                if let Some(proto::feed_event::Event::Commit(c)) = e.unwrap().unwrap().event {
+                    got.push(c.seqno);
+                }
+            }
+            assert_eq!(got, [s2, s3]);
             assert_eq!(
                 hub.notifies.load(Ordering::Relaxed) - notified,
                 1,
