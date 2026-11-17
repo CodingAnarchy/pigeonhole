@@ -133,6 +133,7 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - **The layout:** version byte `1`, then little-endian fixed-width fields. Terms are sorted, so equal statistics give equal bytes.
   - **Refusals:** `from_bytes` refuses another version ("query statistics of version N; this build reads version 1"), bytes that end early or run on, and out-of-range fields. Each is an `InvalidArgument`.
   - **Allocation:** nothing is preallocated from a count read off the wire.
+  - **Ranges (audit120's S1 on #2025):** `docs` and `len` must be ≥ 0, each `df` (a term's or an expansion's) must be in `0..=docs`, a boost must be in (0, 1], and no term or expansion may be listed twice. A `df` above the documents makes `idf` the log of a number at or under 0, so such bytes are refused rather than ranked with NaN. A fuzzy term with no clause is refused too.
 
 **One code path:** `run` and `run_with_stats` (and their async forms) gather the index's statistics into the same struct `query_stats` returns, then rank with it. A search given statistics replaces the gather with them, and reads only its own postings counts: each term's, each phrase term's and each given expansion's `df` here.
 
@@ -143,6 +144,8 @@ Every write touches shared rows. So each partition an index is placed on holds a
 - On one index the two numbers are the same map (`Dfs::both` looks a term up once).
 
 **Cost on one index:** the move adds no reads. The order is unchanged: `REPAIR`, the `S` counters, each term's `df`, the fuzzy walks, then the phrases. One read moved: an empty index used to return before reading `len` and the `df`s, and now reads them. The text callgrind shapes are the check, and the PR quotes them.
+
+**Rounds at different snapshots (audit120's S2 on #2025):** a term first written between round 1 and round 2 has postings in round 2 and a merged `df` of 0, so it scores with `idf(0)`, the largest, and `n` leaves the new documents out. The ranking is consistent with itself, but it isn't one index's at either moment. PR 2b either pins each partition's round 2 to its round 1 snapshot or keeps this as the stated limit (the design note's "the rounds run at different snapshots"). `Search::stats`'s doc and the guide state it.
 
 **Tests (`crates/text/tests/query_stats.rs`):**
 - **A split matches one index:**
@@ -156,7 +159,8 @@ Every write touches shared rows. So each partition an index is placed on holds a
 - **The encoding:**
   - `to_bytes` round-trips, and the search gives the same answer with the decoded statistics;
   - a newer version is refused with its number;
-  - every truncation, and a trailing byte, is refused.
+  - every truncation, and a trailing byte, is refused;
+  - out-of-range numbers are refused: a negative count, a `df` above the documents, a boost outside (0, 1], and a repeated expansion.
 - **Refusals:** statistics of another term, of a missing fuzzy term, under other fuzzy options or with other edits; a merge of different queries; and a merge of nothing.
 - **Mutations, all caught:**
   - a term or a phrase scored with this part's `df`;

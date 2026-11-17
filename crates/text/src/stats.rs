@@ -222,6 +222,8 @@ impl QueryStats {
     }
 
     /// A versioned encoding, for sending to another process: its first byte is the version.
+    /// [`from_bytes`](Self::from_bytes) checks what a search's scores depend on, so bytes
+    /// from another process can't make a search rank with NaN.
     pub fn to_bytes(&self) -> Vec<u8> {
         let s = &self.0;
         let mut out = vec![VERSION];
@@ -260,7 +262,8 @@ impl QueryStats {
     ///
     /// # Errors
     /// `InvalidArgument` for a version this build doesn't read (a newer build's), or bytes
-    /// that don't parse.
+    /// that don't parse. That includes numbers out of range: a negative count, a `df` above
+    /// the documents, a boost outside (0, 1], or a term or expansion listed twice.
     pub fn from_bytes(bytes: &[u8]) -> Result<QueryStats> {
         let mut r = Reader(bytes);
         let version = r.u8()?;
@@ -276,10 +279,21 @@ impl QueryStats {
         if max_expansions == 0 {
             return Err(unparsed("max_expansions is 0"));
         }
+        // The ranges a search's scores need (audit120's S1 on #2025): `idf` is the log of
+        // a number at or under 0 for a `df` above the documents, so such bytes are refused
+        // rather than ranked with NaN.
+        if docs < 0 || len < 0 {
+            return Err(unparsed("a count is negative"));
+        }
+        let df_in_range = |df: i64| (0..=docs).contains(&df);
         let mut df = HashMap::new();
         for _ in 0..r.len()? {
             let term = r.string()?;
-            if df.insert(term, r.i64()?).is_some() {
+            let n = r.i64()?;
+            if !df_in_range(n) {
+                return Err(unparsed("a df is negative or above the documents"));
+            }
+            if df.insert(term, n).is_some() {
                 return Err(unparsed("a term is listed twice"));
             }
         }
@@ -299,14 +313,23 @@ impl QueryStats {
             for _ in 0..r.len()? {
                 clauses.push(r.len()?);
             }
-            let mut expansions = Vec::new();
+            if clauses.is_empty() {
+                return Err(unparsed("a fuzzy term has no clause"));
+            }
+            let mut expansions: Vec<Expansion> = Vec::new();
             for _ in 0..r.len()? {
                 let term = r.string()?;
                 let distance = r.u8()?;
                 let df = r.i64()?;
                 let boost = f64::from_bits(r.u64()?);
-                if distance > edits || !boost.is_finite() {
-                    return Err(unparsed("an expansion's distance or boost is out of range"));
+                // A boost is `1 − distance / shorter`, kept only above 0 (`fuzzy::boost`).
+                if distance > edits || !(boost > 0.0 && boost <= 1.0) || !df_in_range(df) {
+                    return Err(unparsed(
+                        "an expansion's distance, boost or df is out of range",
+                    ));
+                }
+                if expansions.iter().any(|e| e.term == term) {
+                    return Err(unparsed("an expansion is listed twice"));
                 }
                 expansions.push(Expansion {
                     term,

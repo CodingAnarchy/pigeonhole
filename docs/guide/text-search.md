@@ -237,8 +237,8 @@ assert_eq!(hits[0].id, b"b:1");
 ```
 
 - **The scores are one index's,** up to float rounding in the order a document's clauses are added.
-- **A cut fuzzy term can differ.** If a fuzzy term had more matches than `max_expansions` in any part, `stats.cut(clause)` is `true`. A part cuts the terms it ranks last, so the merged set can miss a term that one index would keep. A larger `max_expansions` makes a cut rarer.
-- **Each part's statistics are read at one snapshot,** the search's if it has one. The parts' snapshots are separate, so a write that lands between steps 1 and 3 is counted in one step and not the other.
+- **A cut fuzzy term can expand differently.** If a fuzzy term had more matches than `max_expansions` in any part, `stats.cut(clause)` is `true`. A part cuts the terms it ranks last, so the merged set can miss a term one index would keep, and keep another in its place: the expansions differ, not only their number. A larger `max_expansions` makes a cut rarer.
+- **Each part's statistics are read at one snapshot,** the search's if it has one. The parts' snapshots are separate, so a write that lands between steps 1 and 3 is counted in one step and not the other. A term first written in between has postings in step 3 and a `df` of 0 in the statistics, so it scores as the rarest term.
 - **To send statistics to another process,** use `stats.to_bytes()` and `QueryStats::from_bytes`. The encoding starts with a version byte, and `from_bytes` refuses a version it doesn't know (`InvalidArgument`).
 - **On one index,** a search already works this way: it reads its own statistics, then ranks with them.
 

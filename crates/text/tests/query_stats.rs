@@ -338,3 +338,71 @@ fn statistics_of_another_query_are_refused() {
     // A search with nothing to match reads nothing, given statistics or not.
     assert!(index.search("", 10).stats(memory).run().unwrap().is_empty());
 }
+
+#[test]
+fn bytes_with_numbers_a_search_cannot_score_with_are_refused() {
+    // audit120's S1 on #2025: a `df` above the documents would make an idf the log of a
+    // number at or under 0. The fields are patched at their places in version 1's layout.
+    let docs = corpus(13, 60);
+    let split = Split::new(&docs, |_| 0);
+    let index = &split.parts[0];
+    let refused = |bytes: &[u8], what: &str| {
+        assert!(
+            matches!(
+                QueryStats::from_bytes(bytes),
+                Err(Error::InvalidArgument(_))
+            ),
+            "{what}"
+        );
+    };
+    let put = |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    let get = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    // Version, docs, len, max_expansions, prefix_length, then the terms: "memory" and its df.
+    let term = index.search("memory", 10).query_stats().unwrap().to_bytes();
+    assert_eq!(&term[49..55], b"memory");
+    let n = get(&term, 1);
+    let mut b = term.clone();
+    put(&mut b, 1, -1i64 as u64);
+    refused(&b, "negative documents");
+    let mut b = term.clone();
+    put(&mut b, 9, -1i64 as u64);
+    refused(&b, "negative length");
+    let mut b = term.clone();
+    put(&mut b, 55, n + 1);
+    refused(&b, "a df above the documents");
+    let mut b = term.clone();
+    put(&mut b, 55, -1i64 as u64);
+    refused(&b, "a negative df");
+    // A fuzzy term alone: its expansion `memory` (term, distance, df, boost) from byte 89.
+    let fuzzy = index
+        .search("memroy~1", 10)
+        .query_stats()
+        .unwrap()
+        .to_bytes();
+    assert_eq!(get(&fuzzy, 81), 1, "one expansion");
+    assert_eq!(&fuzzy[97..103], b"memory");
+    for (boost, what) in [
+        (0.0f64, "a boost of 0"),
+        (1.5, "a boost above 1"),
+        (-0.5, "a negative boost"),
+    ] {
+        let mut b = fuzzy.clone();
+        put(&mut b, 112, boost.to_bits());
+        refused(&b, what);
+    }
+    let mut b = fuzzy.clone();
+    put(&mut b, 104, n + 1);
+    refused(&b, "an expansion's df above the documents");
+    let mut b = fuzzy.clone();
+    put(&mut b, 81, 2);
+    let expansion = fuzzy[89..120].to_vec();
+    b.extend_from_slice(&expansion);
+    refused(&b, "an expansion listed twice");
+    let mut b = fuzzy.clone();
+    put(&mut b, 65, 0);
+    b.drain(73..81);
+    refused(&b, "a fuzzy term with no clause");
+    // The unpatched bytes still read.
+    QueryStats::from_bytes(&term).unwrap();
+    QueryStats::from_bytes(&fuzzy).unwrap();
+}

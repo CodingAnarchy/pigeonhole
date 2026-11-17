@@ -289,9 +289,16 @@ impl<'a> Search<'a> {
     /// are the whole collection's ([`QueryStats`] has the steps). Each fuzzy term expands
     /// to the terms `stats` kept, whatever this index's own walk would keep.
     ///
-    /// The statistics must be of this search's query, read with the same
-    /// [`max_expansions`](Self::max_expansions) and [`prefix_length`](Self::prefix_length),
-    /// or the search fails with `InvalidArgument`.
+    /// The statistics must be of this search's terms, phrase terms and fuzzy terms, read
+    /// with the same [`max_expansions`](Self::max_expansions) and
+    /// [`prefix_length`](Self::prefix_length), or the search fails with `InvalidArgument`.
+    /// A query that resolves to the same terms passes (a phrase's statistics serve its
+    /// words as terms), since the numbers are the same.
+    ///
+    /// The statistics are as of when they were read. A term whose documents were written
+    /// since has postings here and a `df` of 0 in them, so it scores as the rarest term, and
+    /// the document count leaves the new documents out: a consistent ranking, though not
+    /// one index's at either moment.
     pub fn stats(mut self, stats: QueryStats) -> Self {
         self.given = Some(stats);
         self
