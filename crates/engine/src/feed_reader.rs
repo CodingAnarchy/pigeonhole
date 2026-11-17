@@ -1980,9 +1980,12 @@ impl FeedReader {
         // (#1448: an idle reader process spent 1-1.7 ms of CPU per poll there). Not while a
         // PREPARE is held: a checkpoint or floor can move without a commit (a flush), and
         // `drop_aborted` (rule C) must see it, or the commits behind an aborted round wait
-        // for an unrelated one (feed1248's P1 on #1449). A writer restart since the stale
-        // check above is seen here, as after the reads below.
-        if self.read_through == Some(frontier) && self.held.is_empty() {
+        // for an unrelated one (feed1248's P1 on #1449). An external share (D329) is settled
+        // here: it ends only by a record of its own (its Decision, or its abort's type 6),
+        // whose seqno moves the frontier, so it never needs rule C, and a share in doubt for
+        // hours keeps the shortcut (ICR 0140's E3). A writer restart since the stale check
+        // above is seen here, as after the reads below.
+        if self.read_through == Some(frontier) && self.held.values().all(|h| h.external) {
             if self.shm.is_stale() {
                 return Err(Error::SnapshotExpired);
             }

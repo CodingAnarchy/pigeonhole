@@ -1630,6 +1630,30 @@ impl Engine {
             // as they are for the next writable open to replay.
             drop(replayed);
             drop(recoveries);
+            // D329: its shares in doubt are listed (`in_doubt`), for an operator to see; no
+            // share is held, and `decide` is refused (`ReadOnly`), so nothing else is.
+            let now = shared.vfs.monotonic_nanos();
+            for (stream, seqno, coordinator) in &in_doubt {
+                if stream != coordinator {
+                    continue;
+                }
+                if let (Some(e), Some((.., bytes))) = (
+                    external.get(&(*stream, *seqno)),
+                    stashed
+                        .iter()
+                        .find(|(s, id, ..)| s == stream && id == seqno),
+                ) {
+                    shared.external.install(
+                        &e.xid,
+                        crate::shard::ExternalEntry {
+                            id: *seqno,
+                            coordinator: ShardId(coordinator.0 as u16),
+                            prepared_at: now,
+                            bytes: bytes.len() as u64,
+                        },
+                    );
+                }
+            }
         } else if same_layout {
             for ((stream, records), (_, rec)) in replayed.into_iter().zip(&recoveries) {
                 let i = stream.0 as usize;

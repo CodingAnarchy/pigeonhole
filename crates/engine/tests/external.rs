@@ -239,3 +239,67 @@ fn past_the_in_doubt_limits_a_prepare_is_busy() {
     db.decide(b"l3", true).unwrap();
     db.close().unwrap();
 }
+
+/// perf2's E2 on ICR 0140: recovery counts a type-6 abort's own seqno (and a type-5 id), so
+/// a reopen after an abort that was the last record hands out seqnos above it.
+#[test]
+fn a_reopen_after_an_abort_hands_out_seqnos_above_it() {
+    let vfs = SimVfs::new(26);
+    let abort = {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &t, b"a", &[b"a", b"z"], b"v")
+            .prepare(b"e2", Durability::GroupSync)
+            .unwrap();
+        let abort = db.decide(b"e2", false).unwrap().expect("in doubt").seqno;
+        // Dropped without a clean close: the reopen replays the WAL.
+        drop(db);
+        abort
+    };
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    assert!(db.in_doubt().is_empty());
+    assert_eq!(get_bytes(&db, &t, b"a"), None, "the abort applied nothing");
+    let mut wb = WriteBatch::new();
+    let f = t.family("f").unwrap().id;
+    wb.put(t.id, f, b"a", b"q", None, ValueRef::Bytes(b"after"))
+        .unwrap();
+    let next = db.commit(wb, Some(Durability::GroupSync)).unwrap().seqno;
+    assert!(next > abort, "{next} after the abort's {abort}");
+    db.close().unwrap();
+}
+
+/// A read-only open of a database with a share in doubt: the share stays invisible, it is
+/// listed, and deciding it is refused (`ReadOnly`); the writer's next open decides it.
+#[test]
+fn a_read_only_open_lists_a_share_in_doubt_and_cannot_decide_it() {
+    let vfs = SimVfs::new(27);
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        txn(&db, &t, b"r", &[b"r"], b"v")
+            .prepare(b"ro", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+    }
+    {
+        let mut o = owned(Arc::clone(&vfs), 2);
+        o.read_only = true;
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let t = db.table("t").expect("table t");
+        assert_eq!(get_bytes(&db, &t, b"r"), None);
+        let doubt: Vec<Vec<u8>> = db.in_doubt().into_iter().map(|(x, _)| x).collect();
+        assert_eq!(doubt, [b"ro".to_vec()]);
+        assert!(matches!(db.decide(b"ro", true), Err(Error::ReadOnly)));
+        db.close().unwrap();
+    }
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    db.decide(b"ro", true).unwrap().expect("in doubt");
+    assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"v"[..]));
+    db.close().unwrap();
+}
