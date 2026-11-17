@@ -89,7 +89,10 @@ env:
   # the default on noise alone. The likely source, untraced: a write awaits the shard thread's
   # commit (not counted), and whether it is done by the task's first poll is timing, so some
   # calls take another poll through the service stack. Tracing it is #1900.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8 serve-mutate=1.0
+  # `commit-incr` gets 1.0% on ubuntu-26.04 (#1795, owner 2026-11-17): identical code counts
+  # 0.77% apart (11029-11114), from #320's cross-thread free of a commit's batch buffer, which
+  # glibc 2.43 serves at a cost varying with the heap's state. The ceilings file says more.
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8 serve-mutate=1.0 commit-incr=1.0
 
 jobs:
   # Valgrind's .debs, cached so the callgrind jobs don't need the Ubuntu archive (down for
