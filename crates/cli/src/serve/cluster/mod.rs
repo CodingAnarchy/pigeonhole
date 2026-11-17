@@ -1926,7 +1926,12 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .ok_or_else(|| ApiError::invalid("a forwarded scan carries no scan"))?;
         let pages = shared
             .router
-            .serve_forwarded_scan(&msg.partition, scan, &caller)
+            .serve_forwarded_scan(
+                &msg.partition,
+                scan,
+                &caller,
+                msg.to_replica.then_some(msg.replica_max_lag_ms),
+            )
             .await?;
         Ok(tonic::Response::new(Box::pin(super::grpc::GrpcStream(
             pages,
