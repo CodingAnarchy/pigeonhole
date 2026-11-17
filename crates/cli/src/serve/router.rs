@@ -39,6 +39,13 @@ pub(crate) struct Cluster {
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>>,
 }
 
+/// The most of what's left of a read's time one replica's attempt takes (simp724's S2 on
+/// #2001): half, so a replica that is slow, rather than one that refuses, leaves the next
+/// one or the owner the other half.
+pub(crate) fn replica_attempt(left: std::time::Duration) -> std::time::Duration {
+    left / 2
+}
+
 /// How long a routed read skips a replica it found behind or unreachable (D328).
 const REPLICA_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -1157,6 +1164,11 @@ impl Router {
             let Some(again) = read_again(&op) else {
                 break;
             };
+            // At most half of what's left (simp724's S2 on #2001).
+            let left = deadline
+                .at
+                .saturating_duration_since(std::time::Instant::now());
+            let attempt = std::time::Instant::now() + replica_attempt(left);
             let tried = if node == me {
                 Self::serve_copy(
                     cluster,
@@ -1165,7 +1177,10 @@ impl Router {
                     caller,
                     prepaid.take(),
                     read,
-                    deadline,
+                    ReadDeadline {
+                        at: attempt,
+                        ..deadline
+                    },
                 )
                 .await
             } else {
@@ -1180,7 +1195,7 @@ impl Router {
                     caller,
                     prepaid.take(),
                     Fwd::Replica(target, read),
-                    tokio::time::Instant::from_std(deadline.at),
+                    tokio::time::Instant::from_std(attempt),
                 ))
                 .await
             };
@@ -1411,6 +1426,24 @@ impl ReplicaRoute {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(node.to_owned(), partition.to_owned()))
             .is_some_and(|at| at.elapsed() < REPLICA_BACKOFF)
+    }
+
+    /// `partition`'s replicas a read may try now, in the map's order: not backed off, and
+    /// not in `tried` (the ones this read tried already). Each node's id and address
+    /// (simp724's N1 on #2001: one walk for every fanned-out read).
+    pub(crate) fn candidates(
+        &self,
+        routes: &super::cluster::route::Routes,
+        partition: &str,
+        tried: &[String],
+    ) -> Vec<(String, String)> {
+        routes
+            .owner(partition)
+            .map(|o| o.replicas.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(node, _)| !tried.contains(node) && !self.backed_off(node, partition))
+            .collect()
     }
 
     /// Records `node`'s replica of `partition` as behind or unreachable now.

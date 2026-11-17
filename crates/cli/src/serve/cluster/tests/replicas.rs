@@ -883,3 +883,63 @@ fn bounded_reads_answer_from_the_replica_while_the_owner_is_down() {
         );
     });
 }
+
+/// simp724's S1 on #2001: a scan never goes back in time across a source change. a and b
+/// both hold p3's replica; b's copy stops applying (a seam: still fresh within the read's
+/// bound), and rows written then are a's only. a falls behind
+/// after 2 pages (the seam): b's first page would be older than what a sent, so b is left
+/// too, and the owner finishes. Every row once, in order, and no page older than one before.
+#[test]
+fn a_scan_never_goes_back_in_time_across_a_source_change() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        set_replicas(ports[0], "p3", &["a", "b"]).await;
+        let first = put_in(ports[2], "r", "k0").await;
+        eventually("b's copy to apply k0", async || {
+            copy_of(ports[1], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+        // Fresh first: an idle owner's heartbeats name the frontier b has applied through.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // b's copy applies nothing from here: rows after it are a's (and c's) only.
+        crate::serve::replica::HOLD_APPLIES
+            .lock()
+            .unwrap()
+            .push(dirs[1].clone());
+        let mut last = 0;
+        for i in 0..40 {
+            last = put_in(ports[2], "r", &format!("k{i:03}")).await;
+        }
+        eventually("a's copy to apply the rows", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        crate::serve::service::BEHIND_AFTER_PAGES
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), 2));
+        let (keys, served) = scan_through(ports[2], 60_000, 256).await;
+        let want: std::collections::BTreeSet<Vec<u8>> = std::iter::once(b"k0".to_vec())
+            .chain(std::iter::once(b"k1".to_vec()))
+            .chain((0..40).map(|i| format!("k{i:03}").into_bytes()))
+            .collect();
+        assert_eq!(keys, want.into_iter().collect::<Vec<_>>());
+        assert!(
+            served.windows(2).all(|w| w[0] <= w[1] || w[1] == 0),
+            "a page older than one before it: {served:?}"
+        );
+    });
+    crate::serve::replica::HOLD_APPLIES
+        .lock()
+        .unwrap()
+        .retain(|d| *d != dirs[1]);
+    crate::serve::service::BEHIND_AFTER_PAGES
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| *d != dirs[0]);
+}

@@ -176,15 +176,8 @@ impl Reach {
         op: &forward_request::Op,
     ) -> Result<Option<(ServiceReply, bool)>, ApiError> {
         let routes = self.routes()?;
-        let replicas = routes
-            .owner(partition)
-            .map(|o| o.replicas.clone())
-            .unwrap_or_default();
         let me = self.node.id().to_owned();
-        for (node, address) in replicas {
-            if route.backed_off(&node, partition) {
-                continue;
-            }
+        for (node, address) in route.candidates(&routes, partition, &[]) {
             let tried = if node == me {
                 let copy = route.copies.load().get(partition).cloned();
                 match copy {
@@ -214,11 +207,8 @@ impl Reach {
                     caller: Some(forward::forwarded_caller(caller)?),
                     op: Some(op.clone()),
                 };
-                match self
-                    .forwarder
-                    .send(&address, req, self.within()?, false)
-                    .await
-                {
+                let attempt = crate::serve::router::replica_attempt(self.within()?);
+                match self.forwarder.send(&address, req, attempt, false).await {
                     Ok(reply) => forward::reply_of(reply).map(|r| (r, true)),
                     Err(e) => Err(e),
                 }
@@ -1463,15 +1453,8 @@ impl ScanJob {
     ) -> Result<(PartPages, Option<String>), ApiError> {
         if let Some(route) = &self.replica {
             let routes = self.reach.routes()?;
-            let replicas = routes
-                .owner(partition)
-                .map(|o| o.replicas.clone())
-                .unwrap_or_default();
             let me = self.reach.node.id().to_owned();
-            for (node, address) in replicas {
-                if tried.contains(&node) || route.backed_off(&node, partition) {
-                    continue;
-                }
+            for (node, address) in route.candidates(&routes, partition, tried) {
                 tried.push(node.clone());
                 let opened = if node == me {
                     let copy = route.copies.load().get(partition).cloned();
@@ -1497,7 +1480,11 @@ impl ScanJob {
                     };
                     self.reach
                         .forwarder
-                        .scan(&address, req, self.reach.timeout)
+                        .scan(
+                            &address,
+                            req,
+                            crate::serve::router::replica_attempt(self.reach.timeout),
+                        )
                         .await
                         .map(|(s, lease)| PartPages::There(Box::new(s), address, lease))
                 };
@@ -1625,6 +1612,10 @@ impl ScanJob {
             // from here on the next replica or the owner (D328's S2).
             let mut resume = inner;
             let mut tried: Vec<String> = Vec::new();
+            // The newest seqno a page of this partition was sent at: a source that would go
+            // back to an older state is left too (simp724's S1 on #2001). The owner is never
+            // behind a copy, so this ends there.
+            let mut served_at = 0u64;
             let more = i + 1 < self.parts.len();
             let mut from_here = false;
             let mut ended_at: Option<bool> = None;
@@ -1661,6 +1652,13 @@ impl ScanJob {
                         }
                         Err(e) => return Err(e),
                     };
+                    if let (Some(route), Some(node)) = (&self.replica, &source)
+                        && page.served_seqno < served_at
+                    {
+                        route.back_off(node, &part.partition);
+                        continue 'part;
+                    }
+                    served_at = served_at.max(page.served_seqno);
                     from_here = true;
                     #[cfg(test)]
                     if self.limits.hold_after_part_page {
