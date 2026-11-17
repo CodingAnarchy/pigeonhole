@@ -14,10 +14,12 @@ use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{self, GetMapRequest, StatusRequest};
 
-/// A test's fault seam: the next promote through this `--node` URL stops after its stamp,
-/// before its map, as a crash there would leave it.
+/// A test's fault seam: the next promote through each of these `--node` URLs stops after
+/// its stamp, before its map, as a crash there would leave it. Keyed by the URL, so tests
+/// running at once don't take each other's.
 #[cfg(test)]
-pub(crate) static STOP_AFTER_STAMP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) static STOP_AFTER_STAMP: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// How long the promote waits for ID to close its copy after the map dropped it.
 const CLOSE_WAIT: Duration = Duration::from_secs(60);
@@ -70,11 +72,18 @@ pub(crate) async fn leave_replicas(
         q.replicas.retain(|r| r != to);
     }
     set_map(args, m1, false, Vec::new()).await?;
+    wait_closed(args, &url, partition, to).await?;
+    Ok(true)
+}
+
+/// Waits for node `to` (at `url`) to close its replica copy of `partition`, which a map
+/// without it in P's replicas closes.
+async fn wait_closed(args: &NodeArgs, url: &str, partition: &str, to: &str) -> Result<(), Failure> {
     let deadline = tokio::time::Instant::now() + CLOSE_WAIT;
     loop {
-        let now = row_on(args, &url, partition).await?;
+        let now = row_on(args, url, partition).await?;
         if now.is_none_or(|lp| lp.role() != proto::PartitionRole::Replica) {
-            return Ok(true);
+            return Ok(());
         }
         if tokio::time::Instant::now() > deadline {
             return Err(Failure::usage(&format!(
@@ -172,12 +181,6 @@ pub(crate) async fn promote(
         ))
     })?;
     let replica = row.role() == proto::PartitionRole::Replica;
-    if replica && !p.replicas.iter().any(|r| r == to) {
-        return Err(Failure::usage(&format!(
-            "node {to:?} isn't in {partition}'s replicas in map version {}",
-            m.map_version
-        )));
-    }
     let stamped = !replica && row.epoch == p.epoch + 1;
     // The copy's identity epoch, the owner's at its bootstrap (`e_b`, D328's amendment): its
     // history began at or before it, and the map's epoch is at or past it.
@@ -192,8 +195,10 @@ pub(crate) async fn promote(
     }
     let (applied, primary) = (row.replica_applied_seqno, row.replica_primary_seqno);
     // 1. ID leaves P's replicas, so it closes its copy (D328 PR 1's sync).
-    if replica {
-        leave_replicas(args, &m, partition, to).await?;
+    // A copy still open while `to` is out of P's replicas is an earlier run's, closing
+    // (simp724's S1 on #2007): it's waited for, not left again.
+    if replica && !leave_replicas(args, &m, partition, to).await? {
+        wait_closed(args, &new_url, partition, to).await?;
     }
     // 2. The copy, promoted and stamped at the map's epoch + 1.
     if !stamped {
@@ -219,14 +224,37 @@ pub(crate) async fn promote(
         let mut armed = STOP_AFTER_STAMP
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if armed.as_deref() == Some(args.node.as_str()) {
-            armed.take();
+        if let Some(i) = armed.iter().position(|n| *n == args.node) {
+            armed.swap_remove(i);
             return Err(Failure::usage("the test's fault after the promote's stamp"));
         }
     }
     // 3. The map: P on ID at the next epoch, with a new history (no `copies`), from the map
     // as it is now (step 1 changed it).
     let mut m2 = map_of(args).await?;
+    // The map as this promote read it: P still on its owner at its epoch, and `to` not back in
+    // its replicas. Anything else (a set-map, relocate or promote since) is not overwritten
+    // (simp724's M1 on #2007).
+    let Some(now) = m2.partitions.iter().find(|q| q.id == partition) else {
+        return Err(Failure::usage(&format!(
+            "the map (version {}) no longer has partition {partition}",
+            m2.map_version
+        )));
+    };
+    if now.node != p.node || now.epoch != p.epoch || now.replicas.iter().any(|r| r == to) {
+        return Err(Failure::usage(&format!(
+            "the map changed during the promote: {partition} is on node {:?} at epoch {} in \
+             map version {} (this promote read node {:?} at epoch {}), and node {to:?}'s copy is \
+             stamped at epoch {}. Check the map, then run the promote again or move that file \
+             aside (phdb cluster drop-partition {partition} on node {to:?})",
+            now.node,
+            now.epoch,
+            m2.map_version,
+            p.node,
+            p.epoch,
+            p.epoch + 1
+        )));
+    }
     m2.map_version += 1;
     for q in m2.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
@@ -254,6 +282,15 @@ pub(crate) async fn promote(
             ("applied_seqno", json!(applied)),
             ("owner_durable_seqno", json!(primary)),
             ("lost_commits", lost),
+            (
+                "lost_commits_counted",
+                json!(if old_unreachable {
+                    "not counted: the old owner couldn't be asked"
+                } else {
+                    "from the owner's durable seqno as the copy last heard it, with the owner \
+                     fenced or closed, so it took no commit since"
+                }),
+            ),
             (
                 "map_version",
                 set.document

@@ -55,8 +55,22 @@ async fn set_replicas(a: u16, p: &str, replicas: &[&str]) {
     panic!("set the map: {last:?}");
 }
 
-/// Table `r` on p3 alone, through the writer at `port`.
+/// Table `r` on p3 alone, through the writer at `port`: retried while a node that just
+/// started is still taking its peers' maps (the restarted-node rig).
 async fn table_on_p3(port: u16) {
+    for _ in 0..100 {
+        match try_table_on_p3(port).await {
+            Ok(()) => return,
+            Err(e) if e.code() == tonic::Code::Unavailable => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    panic!("table r was never created on p3");
+}
+
+async fn try_table_on_p3(port: u16) -> Result<(), tonic::Status> {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
         .connect()
@@ -77,7 +91,7 @@ async fn table_on_p3(port: u16) {
             }),
         })
         .await
-        .unwrap();
+        .map(|_| ())
 }
 
 /// How many bootstraps the follower of the replica copy in `dir` has finished.
@@ -954,7 +968,10 @@ fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
         client(ports[2]).await.fence(req()).await.unwrap();
         client(ports[2]).await.close(req()).await.unwrap();
         let args = args_at(ports[0]);
-        *super::super::promote::STOP_AFTER_STAMP.lock().unwrap() = Some(args.node.clone());
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
         let e = within(super::super::promote::promote(&args, "p3", "a", false))
             .await
             .err()
@@ -975,5 +992,46 @@ fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
         assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
         let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// simp724's M1 on #2007: a promote that stopped after its stamp doesn't overwrite a map
+/// someone changed since. Here a set-map put a back in p3's replicas: the rerun refuses,
+/// says what it found, and the map stays as that set-map left it.
+#[test]
+fn a_promotion_doesnt_overwrite_a_map_changed_since_its_stamp() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        set_replicas(ports[0], "p3", &["a"]).await;
+        let e = within(super::super::promote::promote(&args, "p3", "a", false))
+            .await
+            .err()
+            .expect("the map changed");
+        assert!(e.message().contains("the map changed"), "{}", e.message());
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1));
+        assert_eq!(replicas, vec!["a".to_owned()]);
     });
 }
