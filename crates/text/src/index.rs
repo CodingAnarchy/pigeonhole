@@ -832,10 +832,18 @@ impl Index {
         self.rebuild_inner(Walk::Rebuild { from }, step)
     }
 
-    /// The text indexes in `db` with a stopped rebuild pending (#1756): for a server to
-    /// resume them. A point read per table with the index's families; a table dropped since
-    /// the catalog was listed is passed over.
-    pub fn pending_rebuilds(db: &Pigeonhole) -> Result<Vec<String>> {
+    /// The text indexes in `db`, by name (#1585): for a server that packs them in the
+    /// background. A catalog listing: each table with the index's families, none of them
+    /// opened as an index. A table dropped since the catalog was listed is passed over.
+    pub fn list(db: &Pigeonhole) -> Result<Vec<String>> {
+        Ok(Self::index_tables(db)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
+    }
+
+    /// The tables of `db` that have a text index's families, with their names.
+    fn index_tables(db: &Pigeonhole) -> Result<Vec<(String, Table)>> {
         let mut out = Vec::new();
         for name in db.tables() {
             let t = match db.table(&name).and_then(|b| b.open()) {
@@ -846,10 +854,20 @@ impl Index {
             let families = t.families();
             if [POST, DF, TERMS, META, STATS]
                 .iter()
-                .any(|f| !families.contains(f))
+                .all(|f| families.contains(f))
             {
-                continue;
+                out.push((name, t));
             }
+        }
+        Ok(out)
+    }
+
+    /// The text indexes in `db` with a stopped rebuild pending (#1756): for a server to
+    /// resume them. A point read per table with the index's families; a table dropped since
+    /// the catalog was listed is passed over.
+    pub fn pending_rebuilds(db: &Pigeonhole) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (name, t) in Self::index_tables(db)? {
             if t.get(GLOBAL, META, REBUILD_AFTER)?.is_some() {
                 out.push(name);
             }

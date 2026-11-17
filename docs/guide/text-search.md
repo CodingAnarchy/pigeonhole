@@ -188,6 +188,7 @@ assert_eq!(stats.tombstones, 4, "until the next pack");
 - **A few postings stay cells.** A term with fewer than 32 new postings and no block near them is left for a later pack, so rare terms aren't cut into tiny blocks.
 - **Stopping and resuming:** `pack_with(options, step)` calls `step` after each chunk, and a `Break` stops it there. `pack_pending()` is then true, and the next `pack` carries on from where it stopped.
 - **With a rebuild:** a pack is refused (`PackRefused`) while a stopped rebuild is pending. A `rebuild` leaves packed postings that are right where they are, and drops a stopped pack's place, so the next pack starts over. `repair` empties the blocks with everything else.
+- **With `phdb serve`:** a server packs only when started with `--text-pack` ([phdb serve](serve.md)), and then on its own, in the background. `Index::list(&db)` names a database's text indexes, for a program that packs them itself.
 
 **Before the first pack of an index:**
 - **Every process that opens the index must run 1.3 or later, for good.** A 1.2 build refuses to open a packed index. One that already had it open fails its searches and writes with `Busy` from then on.
