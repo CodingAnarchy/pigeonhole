@@ -1336,6 +1336,8 @@ pub struct WalRead {
     pub commits: BTreeMap<(u32, Seqno), Vec<u32>>,
     /// D263: each DECISION's id, with the seqno and timestamp it applies at.
     pub decisions: BTreeMap<Seqno, (Seqno, Timestamp)>,
+    /// D329: each external PREPARE's id, with its participants and the streams holding it.
+    pub external: BTreeMap<Seqno, (Vec<u32>, BTreeSet<u32>)>,
 }
 
 /// A commit's records as the WAL holds them.
@@ -1433,6 +1435,9 @@ pub fn read_wal(
                 // it); its abort names no commit.
                 WalRecord::ExternalPrepare { seqno, share, .. } => {
                     list.push((seqno, RecKind::Prepare));
+                    let e = out.external.entry(seqno).or_default();
+                    e.0 = share.participants().iter().map(|p| p.0).collect();
+                    e.1.insert(stream.0);
                     if let Some(batch) = share.batch() {
                         out.batches
                             .entry(seqno)
@@ -2988,13 +2993,52 @@ impl World {
         let lost: Vec<(Seqno, Seqno)> = self
             .decided_ids
             .iter()
-            .filter(|(_, (s, _))| *s >= next)
+            .filter(|(id, (s, _))| {
+                *s >= next
+                    // D329: an external share whose every participant still holds its
+                    // PREPARE, with no DECISION: the crash took the DECISION the engine
+                    // appended, and recovery has the share in doubt again (keyed by its id),
+                    // though later seqnos survived. A DECISION checkpointed away leaves some
+                    // participant without its PREPARE too: that share stays decided.
+                    || (self.external_ids.contains(id)
+                        && !raw_wal.decisions.contains_key(id)
+                        && raw_wal
+                            .external
+                            .get(id)
+                            .is_some_and(|(ps, held)| ps.iter().all(|p| held.contains(p))))
+            })
             .map(|(id, (s, _))| (*id, *s))
             .collect();
         if !lost.is_empty() && self.revert_aliases {
             self.stats.aliases_reverted += lost.len();
             for (id, s) in &lost {
                 self.decided_ids.remove(id);
+                // D329: an external share's lost DECISION withdraws its commit, acknowledged
+                // or not: the share is in doubt again and will be decided again. Only a
+                // `Buffered` decision may be lost once acknowledged.
+                if self.external_ids.contains(id) {
+                    if let Some(c) = self.history.remove(s) {
+                        if matches!(c.durability, Durability::GroupSync | Durability::Sync) {
+                            return fail(
+                                FailureClass::LostAckedCommit,
+                                format!(
+                                    "external commit {s} (id {id}) was acknowledged at {:?}, \
+                                     but its DECISION did not survive",
+                                    c.durability
+                                ),
+                            );
+                        }
+                        self.aborted.push(c);
+                    }
+                    for list in self.stream_records.values_mut() {
+                        for (q, _) in list.iter_mut() {
+                            if *q == *s {
+                                *q = *id;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // An acknowledged commit (its level allowed the loss) is now known by its id.
                 if let Some(mut c) = self.history.remove(s) {
                     c.seqno = Some(*id);
@@ -3544,6 +3588,21 @@ impl World {
             self.engine_seqnos.push(seqno);
             c.acked = true;
             self.history.insert(seqno, c);
+        }
+        // D329: a share in doubt after the reopen has no commit in the model: a decision a
+        // crash took (a `Buffered` one may go even once acknowledged) is withdrawn, so a
+        // later abort finds nothing of it (perf2 on #2000).
+        if let Some(c) = self.history.values().find(|c| {
+            matches!(&c.kind, Kind::External { xid, phase: ExternalPhase::Commit }
+                if self.external.contains_key(xid))
+        }) {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "{:?}: in doubt after the reopen, but its commit is in the model",
+                    c.kind
+                ),
+            );
         }
         self.model = model;
         // Each stream goes on from the last record the WAL kept: what came after it is
@@ -5931,19 +5990,6 @@ impl World {
                     text(x),
                     e.commit.durability
                 ));
-                // Recovery rebuilt the model from the surviving commits only, so the lost
-                // decision's commit is withdrawn: a later abort must find nothing of it.
-                if self.history.values().any(|c| {
-                    matches!(&c.kind, Kind::External { xid, phase: ExternalPhase::Commit } if xid == x)
-                }) {
-                    return fail(
-                        FailureClass::Protocol,
-                        format!(
-                            "external {}'s lost decision is still in the model",
-                            text(x)
-                        ),
-                    );
-                }
                 self.external.insert(x.clone(), e);
             }
         }
