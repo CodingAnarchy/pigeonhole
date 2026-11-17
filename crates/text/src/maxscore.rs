@@ -140,8 +140,8 @@ pub(crate) trait Reads {
     /// #1560: `cells.next()?` with nothing between it and the posting's use. Through
     /// [`Reads::next`] the entry came back wrapped in `Poll` and was copied on every posting
     /// (`memcpy`, #1560's profile).
-    fn skip_while<'t>(
-        w: &mut Walk<'t, Self>,
+    fn skip_while<'t, L: Layout>(
+        w: &mut Walk<'t, Self, L>,
         bm: &Bm25,
         cx: &mut Self::Cx<'_, '_>,
         floor: f64,
@@ -159,7 +159,7 @@ pub(crate) trait Reads {
             match e {
                 Some(e) if skip(e.qualifier) => continue,
                 e => {
-                    if let Err(e) = Walk::<Self>::hold(&mut w.cur, w.weight, bm, e) {
+                    if let Err(e) = Walk::<Self, L>::hold(&mut w.cur, w.weight, bm, e) {
                         return Poll::Ready(Err(e));
                     }
                     // A posting under the walk's floor can't matter ([`Walk::floor`]).
@@ -222,8 +222,8 @@ impl Reads for Blocking {
     }
 
     #[inline(always)]
-    fn skip_while<'t>(
-        w: &mut Walk<'t, Self>,
+    fn skip_while<'t, L: Layout>(
+        w: &mut Walk<'t, Self, L>,
         bm: &Bm25,
         (): &mut (),
         floor: f64,
@@ -448,7 +448,68 @@ impl Cur {
     }
 }
 
-pub(crate) struct Walk<'t, R: Reads> {
+/// Which index layout a search's walks read (#1585), as a type: the walk, the clauses and
+/// the document loop are compiled once for each, so a version 1 index's search is the code
+/// it was before version 2 existed, with no test of the layout anywhere in it (a test per
+/// lookup cost the fuzzy shape 0.7% in callgrind).
+pub(crate) trait Layout {
+    /// Whether the walk merges blocks under its cells.
+    const MERGED: bool;
+    /// The walk's block tier: nothing in a version 1 index.
+    type Blocks<'t>: Send;
+
+    /// Opens `row`'s block tier, for ids starting with `prefix`.
+    fn open<'t>(
+        t: &'t Rows,
+        s: &Snapshot,
+        row: &[u8],
+        prefix: Option<&[u8]>,
+    ) -> Result<Self::Blocks<'t>>;
+
+    /// The merged stream. Only called where [`MERGED`](Self::MERGED) is true.
+    fn merged<'a, 't: 'a>(blocks: &'a mut Self::Blocks<'t>) -> &'a mut Merged<'t>;
+}
+
+/// Layout version 1: a posting is a cell.
+pub(crate) struct Cells;
+
+impl Layout for Cells {
+    const MERGED: bool = false;
+    type Blocks<'t> = ();
+
+    #[inline(always)]
+    fn open(_: &Rows, _: &Snapshot, _: &[u8], _: Option<&[u8]>) -> Result<()> {
+        Ok(())
+    }
+
+    fn merged<'a, 't: 'a>((): &'a mut ()) -> &'a mut Merged<'t> {
+        unreachable!("a version 1 walk has no blocks")
+    }
+}
+
+/// Layout version 2: cells over packed blocks ([`Merged`]).
+pub(crate) struct Packed;
+
+impl Layout for Packed {
+    const MERGED: bool = true;
+    type Blocks<'t> = Box<Merged<'t>>;
+
+    fn open<'t>(
+        t: &'t Rows,
+        s: &Snapshot,
+        row: &[u8],
+        prefix: Option<&[u8]>,
+    ) -> Result<Box<Merged<'t>>> {
+        Ok(Box::new(Merged::new(t, s, row, POST, prefix)?))
+    }
+
+    #[inline(always)]
+    fn merged<'a, 't: 'a>(blocks: &'a mut Box<Merged<'t>>) -> &'a mut Merged<'t> {
+        blocks
+    }
+}
+
+pub(crate) struct Walk<'t, R: Reads, L: Layout> {
     row: Vec<u8>,
     weight: f64,
     /// `weight · tf_factor(maxtf, minlen)`: the most it adds to a document.
@@ -483,9 +544,9 @@ pub(crate) struct Walk<'t, R: Reads> {
     advancing: bool,
     /// A point lookup in flight (async only).
     get: R::Get,
-    /// In a version 2 index (#1585): the row's packed blocks, merged under `cells`. `None`
+    /// In a version 2 index (#1585): the row's packed blocks, merged under `cells`. Nothing
     /// in a version 1 index, whose walk is the code it was.
-    packed: Option<Box<Merged<'t>>>,
+    packed: L::Blocks<'t>,
 }
 
 /// MaxScore's bound factor for a term (M1): the largest frequency at the shortest length any
@@ -499,10 +560,9 @@ pub(crate) fn bound_factor(bm: &Bm25, maxtf: Option<i64>, minlen: Option<i64>) -
     }
 }
 
-impl<'t> Walk<'t, Blocking> {
+impl<'t, L: Layout> Walk<'t, Blocking, L> {
     /// The walk over `term`'s postings (restricted to doc ids starting with `prefix`), and
     /// its bound: `weight · tf_factor(maxtf, minlen)`. `postings` is the term's `df`.
-    #[allow(clippy::too_many_arguments)]
     fn new(
         t: &'t Rows,
         s: &Snapshot,
@@ -511,7 +571,6 @@ impl<'t> Walk<'t, Blocking> {
         weight: f64,
         postings: u64,
         prefix: Option<&[u8]>,
-        packed: bool,
     ) -> Result<(Self, f64)> {
         let row = post_row(term);
         let agg = |family: &str| -> Result<Option<i64>> {
@@ -522,14 +581,8 @@ impl<'t> Walk<'t, Blocking> {
         if let Some(p) = prefix {
             read = read.qualifier_prefix(p);
         }
-        let merged = match packed {
-            true => Some(Merged::new(t, s, &row, POST, prefix)?),
-            false => None,
-        };
-        let mut w = Walk::opened(row, weight, factor, read.cells()?, postings);
-        if let Some(m) = merged {
-            w = w.merged(m);
-        }
+        let blocks = L::open(t, s, &row, prefix)?;
+        let mut w = Walk::opened(row, weight, factor, read.cells()?, postings, blocks);
         match w.step(bm, &mut ()) {
             Poll::Ready(r) => r?,
             Poll::Pending => unreachable!("sync reads are always ready"),
@@ -542,8 +595,7 @@ impl<'t> Walk<'t, Blocking> {
 /// [`Walk::new`] as a future (#1560): the bound's aggregates read with point-read futures,
 /// and the walk stepped onto its first posting without blocking.
 #[cfg(feature = "async")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn walk_async<'t>(
+pub(crate) async fn walk_async<'t, L: Layout>(
     t: &'t Rows,
     s: &Snapshot,
     bm: &Bm25,
@@ -551,8 +603,7 @@ pub(crate) async fn walk_async<'t>(
     weight: f64,
     postings: u64,
     prefix: Option<&[u8]>,
-    packed: bool,
-) -> Result<Walk<'t, Nonblocking>> {
+) -> Result<Walk<'t, Nonblocking, L>> {
     let row = post_row(term);
     let maxtf = t.get_at_async(s, &row, MAXTF, BOUND).await?;
     let minlen = t.get_at_async(s, &row, MINLEN, BOUND).await?;
@@ -565,19 +616,13 @@ pub(crate) async fn walk_async<'t>(
     if let Some(p) = prefix {
         read = read.qualifier_prefix(p);
     }
-    let merged = match packed {
-        true => Some(Merged::new(t, s, &row, POST, prefix)?),
-        false => None,
-    };
-    let mut w = Walk::opened(row, weight, factor, read.cells()?, postings);
-    if let Some(m) = merged {
-        w = w.merged(m);
-    }
+    let blocks = L::open(t, s, &row, prefix)?;
+    let mut w = Walk::opened(row, weight, factor, read.cells()?, postings, blocks);
     std::future::poll_fn(|cx| w.step(bm, &mut Polling::new(cx))).await?;
     Ok(w)
 }
 
-impl<'t, R: Reads> Walk<'t, R> {
+impl<'t, R: Reads, L: Layout> Walk<'t, R, L> {
     /// A walk over `row`'s postings in `cells`, not yet on its first (call `step`).
     pub(crate) fn opened(
         row: Vec<u8>,
@@ -585,6 +630,7 @@ impl<'t, R: Reads> Walk<'t, R> {
         factor: f64,
         cells: RowCells<'t>,
         postings: u64,
+        blocks: L::Blocks<'t>,
     ) -> Self {
         Walk {
             row,
@@ -598,14 +644,8 @@ impl<'t, R: Reads> Walk<'t, R> {
             lookups: 0,
             advancing: false,
             get: R::Get::default(),
-            packed: None,
+            packed: blocks,
         }
-    }
-
-    /// The walk over a version 2 index's row: `cells` merged over the row's blocks.
-    pub(crate) fn merged(mut self, merged: Merged<'t>) -> Self {
-        self.packed = Some(Box::new(merged));
-        self
     }
 
     fn doc(&self) -> Option<&[u8]> {
@@ -616,7 +656,7 @@ impl<'t, R: Reads> Walk<'t, R> {
     /// inlined into `TopK::run`, it doubled the loop's own cost on the text shapes.
     #[inline(never)]
     pub(crate) fn step(&mut self, bm: &Bm25, cx: &mut R::Cx<'_, '_>) -> Poll<Result<()>> {
-        if self.packed.is_some() {
+        if L::MERGED {
             return self.step_merged(bm, cx);
         }
         R::skip_while(self, bm, cx, self.floor, |_| false)
@@ -639,7 +679,7 @@ impl<'t, R: Reads> Walk<'t, R> {
             stepped,
             ..
         } = self;
-        let m = packed.as_deref_mut().expect("a merged walk");
+        let m = L::merged(packed);
         if let Some(doc) = cur.doc() {
             m.pass(doc);
         }
@@ -688,7 +728,7 @@ impl<'t, R: Reads> Walk<'t, R> {
             stepped,
             ..
         } = self;
-        let m = packed.as_deref_mut().expect("a merged walk");
+        let m = L::merged(packed);
         if R::spend(cx, 1) {
             return Poll::Pending;
         }
@@ -738,7 +778,7 @@ impl<'t, R: Reads> Walk<'t, R> {
         };
         if !R::get_pending(&self.get) {
             if !self.advancing {
-                let m = self.packed.as_deref_mut().expect("a merged walk");
+                let m = L::merged(&mut self.packed);
                 ready!(m.blocks_to::<R>(cx, doc));
                 match m.cell_side(doc) {
                     Side::Absent => {
@@ -782,7 +822,7 @@ impl<'t, R: Reads> Walk<'t, R> {
                 }))
             }
             None => {
-                let m = self.packed.as_deref().expect("a merged walk");
+                let m = L::merged(&mut self.packed);
                 Poll::Ready(match m.block_has(doc) {
                     true => m.post(Tier::Block).map(|v| score(self.weight, v)),
                     false => Ok(0.0),
@@ -838,7 +878,7 @@ impl<'t, R: Reads> Walk<'t, R> {
         doc: &[u8],
         past: bool,
     ) -> Poll<Result<()>> {
-        if self.packed.is_some() {
+        if L::MERGED {
             return self.advance_merged(bm, cx, doc, past);
         }
         if !R::ASYNC {
@@ -887,7 +927,7 @@ impl<'t, R: Reads> Walk<'t, R> {
         cx: &mut R::Cx<'_, '_>,
         doc: &[u8],
     ) -> Poll<Result<f64>> {
-        if self.packed.is_some() {
+        if L::MERGED {
             return self.lookup_merged(t, s, bm, cx, doc);
         }
         if !R::get_pending(&self.get) {
@@ -920,15 +960,15 @@ impl<'t, R: Reads> Walk<'t, R> {
 }
 
 /// A clause as MaxScore runs it.
-pub(crate) enum Clause<'t, R: Reads> {
+pub(crate) enum Clause<'t, R: Reads, L: Layout> {
     /// A term's posting row.
-    Term(Walk<'t, R>),
+    Term(Walk<'t, R, L>),
     /// A fuzzy term's expansions (D309 §4.4): a document's contribution is the largest of
     /// theirs, not their sum.
     Fuzzy {
         /// The expansions still in play, largest bound first. One whose bound falls below
         /// what a document would need from it is dropped ([`Scored::drop_below`], #1333).
-        walks: Vec<Walk<'t, R>>,
+        walks: Vec<Walk<'t, R, L>>,
         /// How many of `walks` are walked (#1363): the rest can't bring a document in on
         /// their own, and are only looked up ([`Scored::set_solo`]).
         solo: usize,
@@ -944,8 +984,8 @@ pub(crate) enum Clause<'t, R: Reads> {
 }
 
 /// One clause: what it is, and its bound.
-pub(crate) struct Scored<'t, R: Reads> {
-    pub(crate) clause: Clause<'t, R>,
+pub(crate) struct Scored<'t, R: Reads, L: Layout> {
+    pub(crate) clause: Clause<'t, R, L>,
     pub(crate) bound: f64,
 }
 
@@ -957,7 +997,7 @@ struct Progress {
     best: f64,
 }
 
-impl<'t> Scored<'t, Blocking> {
+impl<'t, L: Layout> Scored<'t, Blocking, L> {
     /// A term clause over its posting row (restricted to doc ids starting with `prefix`).
     pub(crate) fn term(
         t: &'t Rows,
@@ -966,9 +1006,8 @@ impl<'t> Scored<'t, Blocking> {
         term: &str,
         df: i64,
         prefix: Option<&[u8]>,
-        packed: bool,
     ) -> Result<Self> {
-        let (walk, _) = Walk::new(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix, packed)?;
+        let (walk, _) = Walk::new(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix)?;
         Ok(Scored::of_term(walk))
     }
 
@@ -981,21 +1020,19 @@ impl<'t> Scored<'t, Blocking> {
         bm: &Bm25,
         expansions: &[(&str, i64, u64, f64)],
         prefix: Option<&[u8]>,
-        packed: bool,
     ) -> Result<Self> {
         let mut walks = Vec::with_capacity(expansions.len());
         for &(term, df, postings, boost) in expansions {
-            let (walk, _) =
-                Walk::new(t, s, bm, term, boost * bm.idf(df), postings, prefix, packed)?;
+            let (walk, _) = Walk::new(t, s, bm, term, boost * bm.idf(df), postings, prefix)?;
             walks.push(walk);
         }
         Ok(Scored::of_fuzzy(walks))
     }
 }
 
-impl<'t, R: Reads> Scored<'t, R> {
+impl<'t, R: Reads, L: Layout> Scored<'t, R, L> {
     /// A term clause over its walk, which stands on its first posting.
-    pub(crate) fn of_term(walk: Walk<'t, R>) -> Self {
+    pub(crate) fn of_term(walk: Walk<'t, R, L>) -> Self {
         let bound = walk.bound;
         Scored {
             clause: Clause::Term(walk),
@@ -1004,7 +1041,7 @@ impl<'t, R: Reads> Scored<'t, R> {
     }
 
     /// A fuzzy clause over its expansions' walks, each on its first posting.
-    pub(crate) fn of_fuzzy(mut walks: Vec<Walk<'t, R>>) -> Self {
+    pub(crate) fn of_fuzzy(mut walks: Vec<Walk<'t, R, L>>) -> Self {
         let bound = walks.iter().map(|w| w.bound).fold(0.0f64, f64::max);
         walks.sort_by(|a, b| b.bound.total_cmp(&a.bound));
         let solo = walks.len();
@@ -1114,7 +1151,7 @@ impl<'t, R: Reads> Scored<'t, R> {
 
     /// The largest of `walks`' contributions to `doc`, resuming at `at`.
     fn lookup_each(
-        walks: &mut [Walk<'t, R>],
+        walks: &mut [Walk<'t, R, L>],
         t: &Rows,
         s: &Snapshot,
         bm: &Bm25,
@@ -1299,8 +1336,8 @@ enum At {
 /// expansions ([`Scored`]). Only the loop's control flow is written twice, and
 /// `tests/search_async.rs` checks the two give the same hits and stats on random queries.
 #[cfg(feature = "async")]
-pub(crate) struct TopK<'t, R: Reads> {
-    clauses: Vec<Scored<'t, R>>,
+pub(crate) struct TopK<'t, R: Reads, L: Layout> {
+    clauses: Vec<Scored<'t, R, L>>,
     k: usize,
     /// Clause indexes by ascending bound; `prefix[i]` sums the first `i` bounds in that order.
     by_bound: Vec<usize>,
@@ -1327,8 +1364,8 @@ pub(crate) struct TopK<'t, R: Reads> {
 }
 
 #[cfg(feature = "async")]
-impl<'t, R: Reads> TopK<'t, R> {
-    pub(crate) fn new(clauses: Vec<Scored<'t, R>>, k: usize) -> Self {
+impl<'t, R: Reads, L: Layout> TopK<'t, R, L> {
+    pub(crate) fn new(clauses: Vec<Scored<'t, R, L>>, k: usize) -> Self {
         debug_assert!(k > 0, "the search returns before MaxScore at k = 0");
         let n = clauses.len();
         let mut by_bound: Vec<usize> = (0..n).collect();
@@ -1621,11 +1658,11 @@ impl<'t, R: Reads> TopK<'t, R> {
 /// each posting (text-term-hub +3.6%, two-terms +3.0% in callgrind), which the text shapes'
 /// ceilings don't allow. The rules both loops apply are shared ([`Walk`], [`Scored`],
 /// [`Reads`]); `tests/search_async.rs` checks the two agree.
-pub(crate) fn top_k(
+pub(crate) fn top_k<L: Layout>(
     t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
-    mut clauses: Vec<Scored<'_, Blocking>>,
+    mut clauses: Vec<Scored<'_, Blocking, L>>,
     k: usize,
 ) -> Result<Vec<(Vec<u8>, f64)>> {
     debug_assert!(k > 0, "the search returns before MaxScore at k = 0");

@@ -9,7 +9,7 @@ use crate::fuzzy::{Expansion, edits, expand};
 use crate::highlight::{Match, Want, find};
 use crate::index::{Index, Rows};
 use crate::layout::*;
-use crate::maxscore::{Blocking, Bm25, Scored, sync};
+use crate::maxscore::{Blocking, Bm25, Cells, Layout, Packed, Scored, sync};
 use crate::merged::{Merged, Side, Tier};
 use crate::query::{Clause, Fuzziness, Query};
 
@@ -272,31 +272,32 @@ impl<'a> Search<'a> {
         // its place, so a run that met stale hits runs again for that many more.
         let mut want = self.k;
         loop {
-            let mut clauses = Vec::with_capacity(r.terms.len() + r.phrases.len());
-            for term in &r.terms {
-                let df = df_of[term];
-                if df > 0 {
-                    clauses.push(Scored::term(t, s, &bm, term, df, prefix, packed)?);
-                }
-            }
-            for exps in &expanded {
-                if !exps.is_empty() {
-                    // Lucene's blended statistics (TopTermsBlendedFreqScoringRewrite): every
-                    // kept expansion scores with the largest df among them, so a rare
-                    // misspelling's idf no longer lifts it above the common word it misspells
-                    // (term frequency and length still count).
-                    let df = exps.iter().map(|e| e.df).max().expect("not empty");
-                    let e: Vec<(&str, i64, u64, f64)> = exps
-                        .iter()
-                        .map(|e| (e.term.as_str(), df, e.df.max(0) as u64, e.boost))
-                        .collect();
-                    clauses.push(Scored::fuzzy(t, s, &bm, &e, prefix, packed)?);
-                }
-            }
-            for ps in &phrase_scores {
-                clauses.push(Scored::phrase(ps.clone()));
-            }
-            let ranked = crate::maxscore::top_k(t, s, &bm, clauses, want)?;
+            // One document loop per layout ([`Layout`]): a version 1 index's is the code it
+            // was.
+            let ranked = match packed {
+                true => rank::<Packed>(
+                    t,
+                    s,
+                    &bm,
+                    &r.terms,
+                    &df_of,
+                    &expanded,
+                    &phrase_scores,
+                    prefix,
+                    want,
+                )?,
+                false => rank::<Cells>(
+                    t,
+                    s,
+                    &bm,
+                    &r.terms,
+                    &df_of,
+                    &expanded,
+                    &phrase_scores,
+                    prefix,
+                    want,
+                )?,
+            };
             let complete = ranked.len() < want;
             let mut hits = Vec::with_capacity(self.k);
             let mut stats = SearchStats {
@@ -375,7 +376,6 @@ impl<'a> Search<'a> {
     /// As [`run`](Self::run).
     #[cfg(feature = "async")]
     pub async fn run_with_stats_async(self) -> Result<(Vec<Hit>, SearchStats)> {
-        use crate::maxscore::{Nonblocking, Polling, TopK};
         self.query.check()?;
         if self.max_expansions == 0 {
             return Err(Error::InvalidArgument(
@@ -483,54 +483,36 @@ impl<'a> Search<'a> {
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
         let mut want = self.k;
         loop {
-            let mut clauses: Vec<Scored<'_, Nonblocking>> =
-                Vec::with_capacity(r.terms.len() + r.phrases.len());
-            for term in &r.terms {
-                let df = df_of[term];
-                if df > 0 {
-                    let w = crate::maxscore::walk_async(
+            let ranked = match packed {
+                true => {
+                    rank_async::<Packed>(
                         t,
                         s,
                         &bm,
-                        term,
-                        bm.idf(df),
-                        df.max(0) as u64,
+                        &r.terms,
+                        &df_of,
+                        &expanded,
+                        &phrase_scores,
                         prefix,
-                        packed,
+                        want,
                     )
-                    .await?;
-                    clauses.push(Scored::of_term(w));
+                    .await?
                 }
-            }
-            for exps in &expanded {
-                if !exps.is_empty() {
-                    // Lucene's blended statistics, as `run_with_stats`.
-                    let df = exps.iter().map(|e| e.df).max().expect("not empty");
-                    let mut walks = Vec::with_capacity(exps.len());
-                    for e in exps {
-                        walks.push(
-                            crate::maxscore::walk_async(
-                                t,
-                                s,
-                                &bm,
-                                &e.term,
-                                e.boost * bm.idf(df),
-                                e.df.max(0) as u64,
-                                prefix,
-                                packed,
-                            )
-                            .await?,
-                        );
-                    }
-                    clauses.push(Scored::of_fuzzy(walks));
+                false => {
+                    rank_async::<Cells>(
+                        t,
+                        s,
+                        &bm,
+                        &r.terms,
+                        &df_of,
+                        &expanded,
+                        &phrase_scores,
+                        prefix,
+                        want,
+                    )
+                    .await?
                 }
-            }
-            for ps in &phrase_scores {
-                clauses.push(Scored::phrase(ps.clone()));
-            }
-            let mut run = TopK::new(clauses, want);
-            std::future::poll_fn(|cx| run.run(t, s, &bm, &mut Polling::new(cx))).await?;
-            let ranked = run.finish();
+            };
             let complete = ranked.len() < want;
             let mut hits = Vec::with_capacity(self.k);
             let mut stats = SearchStats {
@@ -670,6 +652,103 @@ impl<'a> Search<'a> {
     }
 }
 
+/// The top `want` documents of the query's clauses, by MaxScore, over the layout `L`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn rank<L: Layout>(
+    t: &Rows,
+    s: &Snapshot,
+    bm: &Bm25,
+    terms: &BTreeSet<String>,
+    df_of: &HashMap<String, i64>,
+    expanded: &[Vec<Expansion>],
+    phrase_scores: &[BTreeMap<Vec<u8>, f64>],
+    prefix: Option<&[u8]>,
+    want: usize,
+) -> Result<Vec<(Vec<u8>, f64)>> {
+    let mut clauses = Vec::with_capacity(terms.len() + phrase_scores.len());
+    for term in terms {
+        let df = df_of[term];
+        if df > 0 {
+            clauses.push(Scored::<Blocking, L>::term(t, s, bm, term, df, prefix)?);
+        }
+    }
+    for exps in expanded {
+        if !exps.is_empty() {
+            // Lucene's blended statistics (TopTermsBlendedFreqScoringRewrite): every
+            // kept expansion scores with the largest df among them, so a rare
+            // misspelling's idf no longer lifts it above the common word it misspells
+            // (term frequency and length still count).
+            let df = exps.iter().map(|e| e.df).max().expect("not empty");
+            let e: Vec<(&str, i64, u64, f64)> = exps
+                .iter()
+                .map(|e| (e.term.as_str(), df, e.df.max(0) as u64, e.boost))
+                .collect();
+            clauses.push(Scored::fuzzy(t, s, bm, &e, prefix)?);
+        }
+    }
+    for ps in phrase_scores {
+        clauses.push(Scored::phrase(ps.clone()));
+    }
+    crate::maxscore::top_k(t, s, bm, clauses, want)
+}
+
+/// [`rank`] as a future (#1560).
+#[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
+async fn rank_async<L: Layout>(
+    t: &Rows,
+    s: &Snapshot,
+    bm: &Bm25,
+    terms: &BTreeSet<String>,
+    df_of: &HashMap<String, i64>,
+    expanded: &[Vec<Expansion>],
+    phrase_scores: &[BTreeMap<Vec<u8>, f64>],
+    prefix: Option<&[u8]>,
+    want: usize,
+) -> Result<Vec<(Vec<u8>, f64)>> {
+    use crate::maxscore::{Nonblocking, Polling, TopK};
+    let mut clauses: Vec<Scored<'_, Nonblocking, L>> =
+        Vec::with_capacity(terms.len() + phrase_scores.len());
+    for term in terms {
+        let df = df_of[term];
+        if df > 0 {
+            let w =
+                crate::maxscore::walk_async(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix)
+                    .await?;
+            clauses.push(Scored::of_term(w));
+        }
+    }
+    for exps in expanded {
+        if !exps.is_empty() {
+            // Lucene's blended statistics, as `rank`.
+            let df = exps.iter().map(|e| e.df).max().expect("not empty");
+            let mut walks = Vec::with_capacity(exps.len());
+            for e in exps {
+                walks.push(
+                    crate::maxscore::walk_async(
+                        t,
+                        s,
+                        bm,
+                        &e.term,
+                        e.boost * bm.idf(df),
+                        e.df.max(0) as u64,
+                        prefix,
+                    )
+                    .await?,
+                );
+            }
+            clauses.push(Scored::of_fuzzy(walks));
+        }
+    }
+    for ps in phrase_scores {
+        clauses.push(Scored::phrase(ps.clone()));
+    }
+    let mut run = TopK::new(clauses, want);
+    std::future::poll_fn(|cx| run.run(t, s, bm, &mut Polling::new(cx))).await?;
+    Ok(run.finish())
+}
+
 impl Phrase {
     /// What highlighting looks for: a one-term phrase is that term.
     fn want(&self) -> Option<Want> {
@@ -708,9 +787,9 @@ fn score_phrase(
     let cells = cells_of(t, s, &row, POS, prefix).cells()?;
     if packed {
         let lead = MergedLead::new(t, s, &row, cells, prefix)?;
-        join(t, s, bm, df_of, phrase, prefix, &plan, lead, packed)
+        join::<Packed>(t, s, bm, df_of, phrase, prefix, &plan, lead)
     } else {
-        join(t, s, bm, df_of, phrase, prefix, &plan, cells, packed)
+        join::<Cells>(t, s, bm, df_of, phrase, prefix, &plan, cells)
     }
 }
 
@@ -832,7 +911,7 @@ impl MergedLead<'_> {
 
 /// [`score_phrase`]'s join, over the lead's stream.
 #[allow(clippy::too_many_arguments)]
-fn join(
+fn join<L: Layout>(
     t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
@@ -841,13 +920,12 @@ fn join(
     prefix: Option<&[u8]>,
     plan: &PhrasePlan,
     mut lead: impl Lead,
-    packed: bool,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
     let lead_term = phrase.terms[plan.lead].0.as_str();
-    let mut others = plan.others(df_of, phrase, prefix, packed);
+    let mut others = plan.others::<L>(df_of, phrase, prefix);
     // The lead's postings, for the length of each document the phrase is in.
-    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix, packed);
+    let mut lens = Joined::<L>::new(lead_term, POST, df_of[lead_term], None, prefix);
     let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
     'docs: while let Some(e) = lead.next()? {
         let doc = e.doc();
@@ -888,11 +966,13 @@ async fn score_phrase_async(
     };
     let row = post_row(&phrase.terms[plan.lead].0);
     let cells = cells_of(t, s, &row, POS, prefix).cells()?;
-    let lead = match packed {
-        true => AsyncLead::Merged(MergedLead::new(t, s, &row, cells, prefix)?),
-        false => AsyncLead::Cells(cells),
-    };
-    join_async(t, s, bm, df_of, phrase, prefix, &plan, lead, packed, budget).await
+    if packed {
+        let lead = AsyncLead::Merged(MergedLead::new(t, s, &row, cells, prefix)?);
+        join_async::<Packed>(t, s, bm, df_of, phrase, prefix, &plan, lead, budget).await
+    } else {
+        let lead = AsyncLead::Cells(cells);
+        join_async::<Cells>(t, s, bm, df_of, phrase, prefix, &plan, lead, budget).await
+    }
 }
 
 /// The async join's lead: a [`Lead`] by a match. A trait's async method with a lent item
@@ -943,7 +1023,7 @@ impl AsyncAt<'_> {
 /// [`join`] as a future.
 #[cfg(feature = "async")]
 #[allow(clippy::too_many_arguments)]
-async fn join_async<'t>(
+async fn join_async<'t, L: Layout>(
     t: &'t Rows,
     s: &Snapshot,
     bm: &Bm25,
@@ -952,13 +1032,12 @@ async fn join_async<'t>(
     prefix: Option<&[u8]>,
     plan: &PhrasePlan,
     mut lead: AsyncLead<'t>,
-    packed: bool,
     budget: &mut crate::maxscore::Budget,
 ) -> Result<BTreeMap<Vec<u8>, f64>> {
     let mut scores = BTreeMap::new();
     let lead_term = phrase.terms[plan.lead].0.as_str();
-    let mut others = plan.others(df_of, phrase, prefix, packed);
-    let mut lens = Joined::new(lead_term, POST, df_of[lead_term], None, prefix, packed);
+    let mut others = plan.others::<L>(df_of, phrase, prefix);
+    let mut lens = Joined::<L>::new(lead_term, POST, df_of[lead_term], None, prefix);
     let mut lists: Vec<Vec<u32>> = vec![Vec::new(); others.len() + 1];
     'docs: loop {
         budget.spend(1).await;
@@ -1016,7 +1095,7 @@ fn cells_of<'t>(
 ///   by MaxScore's rule for a non-essential clause (`Walk::lookup`, ski-rental): point reads
 ///   until they'd cost more than stepping through what's left of the row, then the walk for
 ///   good.
-struct Joined<'t> {
+struct Joined<'t, L: Layout> {
     row: Vec<u8>,
     family: &'static str,
     prefix: Option<Vec<u8>>,
@@ -1038,11 +1117,12 @@ struct Joined<'t> {
     advancing: bool,
     /// In a version 2 index: the row's blocks under its cells, opened at the first document
     /// asked for.
-    packed: bool,
     merged: Option<Box<Merged<'t>>>,
+    /// The layout, as a type ([`Layout`]): a version 1 join is the code it was.
+    layout: std::marker::PhantomData<L>,
 }
 
-impl<'t> Joined<'t> {
+impl<'t, L: Layout> Joined<'t, L> {
     /// `asked` is how many documents the join will ask for, where that's known: the
     /// lead's `df`, for another term's positions. Then the choice between point reads and
     /// the walk is made here, once, and the walk isn't paid for after point reads already
@@ -1058,7 +1138,6 @@ impl<'t> Joined<'t> {
         postings: i64,
         asked: Option<i64>,
         prefix: Option<&[u8]>,
-        packed: bool,
     ) -> Self {
         let postings = postings.max(0) as u64;
         let advancing = asked.is_some_and(|n| {
@@ -1077,8 +1156,8 @@ impl<'t> Joined<'t> {
             stepped: 0,
             lookups: 0,
             advancing,
-            packed,
             merged: None,
+            layout: std::marker::PhantomData,
         }
     }
 
@@ -1125,6 +1204,10 @@ impl<'t> Joined<'t> {
     /// [`at`](Self::at) in a version 2 index. The block tier always advances to `doc` (a
     /// block passed costs a key compare); the cell tier is reached by point reads or by its
     /// walk, by the rule it had. The cell wins, and a tombstone means no posting.
+    ///
+    /// So in point-read mode the block tier still steps: through a hub term's blocks, one
+    /// key compare each and no decode. That is the cheap side, and not a thing to turn
+    /// into point reads (ai1249 on #2009).
     fn at_merged(&mut self, t: &'t Rows, s: &Snapshot, doc: &[u8]) -> Result<bool> {
         self.open_merged(t, s)?;
         let m = self.merged.as_mut().expect("opened above");
@@ -1263,7 +1346,7 @@ impl<'t> Joined<'t> {
     /// Whether the term has a cell for `doc`, kept in `value` and `number` if so. `doc`s
     /// ascend.
     fn at(&mut self, t: &'t Rows, s: &Snapshot, doc: &[u8]) -> Result<bool> {
-        if self.packed {
+        if L::MERGED {
             return self.at_merged(t, s, doc);
         }
         if !self.walks() {
@@ -1312,7 +1395,7 @@ impl<'t> Joined<'t> {
         doc: &[u8],
         budget: &mut crate::maxscore::Budget,
     ) -> Result<bool> {
-        if self.packed {
+        if L::MERGED {
             return self.at_merged_async(t, s, doc, budget).await;
         }
         if !self.walks() {
@@ -1400,18 +1483,17 @@ impl PhrasePlan {
     }
 
     /// The join's other terms: the distinct terms besides the lead, in `slots`' order.
-    fn others<'t>(
+    fn others<'t, L: Layout>(
         &self,
         df_of: &HashMap<String, i64>,
         phrase: &Phrase,
         prefix: Option<&[u8]>,
-        packed: bool,
-    ) -> Vec<Joined<'t>> {
-        let mut others: Vec<Joined<'t>> = Vec::new();
+    ) -> Vec<Joined<'t, L>> {
+        let mut others: Vec<Joined<'t, L>> = Vec::new();
         for ((term, _), &slot) in phrase.terms.iter().zip(&self.slots) {
             if slot == others.len() + 1 {
                 let asked = Some(df_of[&phrase.terms[self.lead].0]);
-                others.push(Joined::new(term, POS, df_of[term], asked, prefix, packed));
+                others.push(Joined::new(term, POS, df_of[term], asked, prefix));
             }
         }
         others
