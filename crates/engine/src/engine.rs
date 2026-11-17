@@ -5819,7 +5819,7 @@ impl Inner {
             .reserve(xid, builder.batch().as_bytes().len() as u64)?;
         let ext = Arc::new(crate::shard::ExternalReq {
             xid: xid.into(),
-            reservation: Some((Arc::downgrade(&self.shared), token)),
+            reservation: Some((Arc::downgrade(&self.shared.external), token)),
         });
         self.flag_external()?;
         let parts = split_by_shard(&view, &builder, &shards)?;
@@ -7694,7 +7694,9 @@ impl Shared {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             external_flagged: AtomicBool::new(false),
-            external: crate::external_registry::ExternalRegistry::new(options.in_doubt_limits),
+            external: Arc::new(crate::external_registry::ExternalRegistry::new(
+                options.in_doubt_limits,
+            )),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,

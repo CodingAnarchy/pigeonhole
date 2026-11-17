@@ -539,7 +539,7 @@ pub(crate) struct Shared {
     /// prepared (before it answers the caller, so a `decide` after `prepare` returned
     /// always finds it), removed by the coordinator once decided, read by `Engine::decide`
     /// and `Engine::in_doubt`.
-    pub external: crate::external_registry::ExternalRegistry,
+    pub external: Arc<crate::external_registry::ExternalRegistry>,
     /// What became of the closed instance's memtable arenas (`release_memory`, D265):
     /// `ARENAS_PENDING` until the discard ran (`ARENAS_DISCARDED`) or the OS refused it
     /// (`ARENAS_REFUSED`: the pages stay until the last mapping goes).
@@ -1558,16 +1558,21 @@ pub(crate) struct ExternalReq {
     /// its shares hold one, so however the coordination ends (an answer, a refusal, a
     /// dropped reply, a close) the reservation goes with it. A no-op once the coordinator
     /// installed the xid's entry, or once a later prepare reserved the xid (its token
-    /// differs). `None` for a share recovery reinstalled.
-    pub reservation: Option<(std::sync::Weak<Shared>, u64)>,
+    /// differs). `None` for a share recovery reinstalled. A handle on the registry alone,
+    /// not on `Shared`: `Shared`'s inboxes carry this request, and that cycle overflowed the
+    /// `Send` check of crates awaiting the engine's futures (pigeonhole-memory).
+    pub reservation: Option<(
+        std::sync::Weak<crate::external_registry::ExternalRegistry>,
+        u64,
+    )>,
 }
 
 impl Drop for ExternalReq {
     fn drop(&mut self) {
-        if let Some((shared, token)) = &self.reservation
-            && let Some(shared) = shared.upgrade()
+        if let Some((registry, token)) = &self.reservation
+            && let Some(registry) = registry.upgrade()
         {
-            shared.external.unreserve(&self.xid, *token);
+            registry.unreserve(&self.xid, *token);
         }
     }
 }
