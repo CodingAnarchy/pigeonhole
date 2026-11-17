@@ -199,15 +199,21 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("the move or relocation finishes within 2 minutes")
 }
 
-/// Waits for `cond` (a node's state settling after a background push or pull).
-async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
-    for _ in 0..100 {
+/// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
+async fn eventually(what: &str, cond: impl AsyncFnMut() -> bool) {
+    eventually_within(Duration::from_secs(5), what, cond).await;
+}
+
+/// [`eventually`], waiting up to `limit`.
+async fn eventually_within(limit: Duration, what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    let until = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < until {
         if cond().await {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("{what}: never happened");
+    panic!("{what}: never happened within {limit:?}");
 }
 
 /// Runs `test` on a thread of its own and fails if it isn't done within `limit`, so a test
@@ -707,6 +713,7 @@ fn a_forward_from_a_newer_peer_that_cant_give_its_map_writes_nothing() {
             to_replica: false,
             replica_max_lag_ms: 0,
             min_primary_seqno: 0,
+            partition: String::new(),
             op: Some(forward_request::Op::Mutate(super::proto::MutateRequest {
                 writes: Some(put_row("bob", "1")),
                 durability: 0,
@@ -1445,15 +1452,15 @@ fn a_cluster_routes_and_forwards_single_key_calls_to_the_partition_that_holds_th
             .connect()
             .await
             .unwrap();
-        let e = super::proto::vectors_client::VectorsClient::new(channel)
-            .search(super::proto::VectorSearchRequest {
+        let e = super::proto::text_client::TextClient::new(channel)
+            .search(super::proto::TextSearchRequest {
                 index: "users".into(),
                 ..Default::default()
             })
             .await
             .unwrap_err();
         assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(e.message().contains("Vectors.Nearest"), "{e}");
+        assert!(e.message().contains("Text.Search"), "{e}");
     });
     // Each row is in its partition's file, and only there.
     let cell = |db: &pigeonhole::Pigeonhole, row: &str| {

@@ -462,6 +462,15 @@ text-phrase-slop2 32085657 0.3
 # counts times 1.003. New shapes; no existing line changed (coordinator 2026-11-15).
 text-two-terms-prefix-none 126007 0.3
 text-fuzzy-prefix-none 4222924 0.3
+# #1585 PR 3b (#2009): the hub, two-term and phrase searches on a packed index (layout version
+# 2, ICR 0143), in crates/bench/examples/textpacked.rs. From the instructions run 44030799563
+# on 1227b02aa (ubuntu-26.04, rustc 1.100.0), head counts times 1.003: 3898721, 14620012 and
+# 16675984. textpacked builds its index natively, outside valgrind, by copying the textshapes
+# index and packing it, as textshapes builds its own. In that run text-term-hub counted
+# 53370070, 13.7 times text-term-hub-packed. New shapes; no existing line changed (D195).
+text-term-hub-packed 3910418 0.3
+text-two-terms-packed 14663873 0.3
+text-phrase-packed 16726012 0.3
 # #1828 PR 1 (#1860): the 1.2.0 hot paths with no shape before. From the head 00b583445 (main
 # a300d48f5, which has #1857's every-table feed check: feed-drain-all 6132 -> 6396 with it), three
 # identical-code runs, 43529901169, 43529907499 and 43533968513 (ubuntu-24.04). The highest count of
@@ -488,6 +497,11 @@ commit-if-returning-async 27864 0.3
 feed-drain 5763 0.3
 feed-drain-all 5778 0.3
 replicate-apply 6366 0.3
+# #1828 (#2024): agent memory's fused recall (memshapes.rs), per recall. From head 9152b788c on
+# ubuntu-26.04, two runs, base and head of identical engine code each (runs 44085631301 and
+# 44085642059): 11293924, 11295466, 11308932, 11297931 (0.13% spread; a memory's id carries
+# random bytes, so fusion ties may fall differently). The highest times 1.003.
+memory-recall 11342859 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
 # and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
@@ -511,7 +525,11 @@ replicate-apply 6366 0.3
 # 63675-64082, 27-47 under the old ceilings, so test-only PRs went red on noise (#1977); main
 # after #1970/#1971/#1974/#1977 counted serve-get 68524 and serve-mutate 64059 (run
 # 43943584393). The highest main count times 1.003. serve-mutate's spread (0.64%) is #1900's.
-serve-get 62889 0.3
-serve-read-row 583699 0.3
+# Lowered by D195 (#2011 follow-up, coordinator 2026-11-17): a gRPC call's token is checked once
+# (#2011). From main 7163a413b with #2011, run 44039764770 (ubuntu-26.04), base and head of
+# identical code: serve-get 58560 / 58547, serve-read-row 578061 / 577936. The highest of each
+# times 1.003. serve-mutate stays: identical code read 54350 / 54607 there (0.47%, #1900).
+serve-get 58736 0.3
+serve-read-row 579796 0.3
 serve-mutate 58700 0.3
 serve-scan 6766417 0.3

@@ -607,6 +607,20 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **A replica copy's reads** don't take P's lease (S3). Its writes stay refused.
 - **Never routed to a replica:** writes, transactions, snapshots, `Subscribe`, schema and admin calls, and (until PR 2b) reads across partitions.
 
+## D328 PR 2b: reads across partitions from replicas (1.3.0)
+**A multi-get, scan, nearest search or traversal sent with `x-pigeonhole-read-replica-max-lag-ms` takes each partition's part from its replicas first** (D328 §3, S2). Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ForwardScanRequest.replica_max_lag_ms = 5`, `.min_primary_seqno = 6`, `.to_replica = 7`: the entry node chose this node's replica copy for the partition's pages.
+- `ScanPage.served_seqno = 5`: the seqno a page was read at (the replica's applied seqno, or the owner's visible seqno, after the page); 0 on a scan sent without the bound.
+- A multi-get's or nearest search's part to a replica is `ForwardRequest` with `fanout_part` and `to_replica` (PR 2a's fields). It holds no budget on the replica, as an owner's part holds none.
+
+**Behaviour:**
+- **Parts:** the entry node tries the partition's replicas in the map's order, skipping one backed off, then the owner. A traversal's hops are multi-get parts.
+- **Scans (S2):** each page checks the copy's freshness before its snapshot and again before it's sent. Past the bound the stream ends with `ReplicaBehind`, and the entry node reopens the partition from the last page's position on the next replica or the owner: rows aren't skipped or repeated, and the row limit carries over.
+- **A scan, nearest search or traversal at a snapshot, or a multi-get at one,** stays the owner's. Read-your-writes with a read across partitions stays refused (PR 2a).
+- **The response headers** `served-by` and `served-seqno` aren't set on reads across partitions, whose parts can come from different places. A scan's pages carry `served_seqno` instead.
+
 ## D328 PR 3: promotion, and moves onto a replica's node (1.3.0)
 **`phdb cluster promote P --to ID` makes a node holding P's replica P's owner** (D328 §6). Additive on the wire.
 

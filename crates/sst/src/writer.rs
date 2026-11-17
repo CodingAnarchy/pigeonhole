@@ -302,6 +302,11 @@ impl Writer {
         match self.direct {
             None => {
                 self.file.write_at(&self.out, at)?;
+                // Start this chunk's writeback now (D334, #1991): the root commit's sync of
+                // the data file then finds the output mostly written back, instead of sending
+                // all of it to the device at once, where a WAL commit's small write would
+                // wait behind it. A hint: a failure leaves the sync to do the work.
+                let _ = self.file.start_writeback(at, self.out.len() as u64);
                 self.flushed += self.out.len() as u64;
                 self.out.clear();
             }

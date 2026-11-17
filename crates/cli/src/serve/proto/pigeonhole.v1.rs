@@ -764,6 +764,12 @@ pub struct ScanPage {
     /// (D317 §7).
     #[prost(message, repeated, tag = "4")]
     pub missing: ::prost::alloc::vec::Vec<MissingRange>,
+    /// On a cluster scan sent with `x-pigeonhole-read-replica-max-lag-ms` (D328): the seqno
+    /// its partition's page was read at, in the owner's numbering (a replica's applied seqno
+    /// after the page, or the owner's visible seqno after it); 0 otherwise. A scan's pages may
+    /// come from different replicas and partitions, so it's per page.
+    #[prost(uint64, tag = "5")]
+    pub served_seqno: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MutateRequest {
@@ -7277,9 +7283,15 @@ pub struct ForwardRequest {
     /// through it. 0: none. With `to_replica` only.
     #[prost(uint64, tag = "43")]
     pub min_primary_seqno: u64,
+    /// The partition a fanned-out part of an index search or check is for (#1722, ICR 0138):
+    /// its request names only the index, and a node can own several of the index's
+    /// partitions. This node serves that partition if it owns it and the index is placed on
+    /// it, else `WrongPartition`. Empty on every other call.
+    #[prost(string, tag = "50")]
+    pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 27, 28, 29, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 31, 34, 35, 36, 37, 38, 39, 40, 41"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7341,12 +7353,21 @@ pub mod forward_request {
         VectorInsert(super::VectorInsertRequest),
         #[prost(message, tag = "24")]
         VectorDelete(super::VectorDeleteRequest),
+        /// One partition's part of a search or check across an index's partitions (#1722 PR 1b):
+        /// the client's request as it is, on the partition `partition` names.
+        #[prost(message, tag = "25")]
+        VectorSearch(super::VectorSearchRequest),
+        #[prost(message, tag = "26")]
+        VectorVerify(super::VectorVerifyRequest),
         #[prost(message, tag = "27")]
         CreateTextIndex(super::CreateTextIndexRequest),
         #[prost(message, tag = "28")]
         TextPut(super::TextPutRequest),
         #[prost(message, tag = "29")]
         TextDelete(super::TextDeleteRequest),
+        /// As `vector_verify`.
+        #[prost(message, tag = "31")]
+        TextVerify(super::TextIndexRequest),
         /// Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
         /// that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
         /// or ids are in several partitions never comes here whole.
@@ -7443,6 +7464,16 @@ pub struct ForwardScanRequest {
     /// The scan, with `after` (if any) this partition's own position and `limit` what's left.
     #[prost(message, optional, tag = "4")]
     pub scan: ::core::option::Option<ScanRequest>,
+    /// As `ForwardRequest`'s (D328): the entry node chose this node's replica copy of the
+    /// partition. Each page is read from the copy only while it's fresh within
+    /// `replica_max_lag_ms`, else the stream ends with `ReplicaBehind` and the entry node
+    /// continues from the last page's position on the next replica or the owner.
+    #[prost(bool, tag = "7")]
+    pub to_replica: bool,
+    #[prost(uint64, tag = "5")]
+    pub replica_max_lag_ms: u64,
+    #[prost(uint64, tag = "6")]
+    pub min_primary_seqno: u64,
 }
 /// The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
 /// forwarded.
@@ -7472,7 +7503,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 19, 20, 21, 22, 23, 24"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -7508,6 +7539,13 @@ pub mod forward_response {
         /// `create_table`'s; `drop_table` answers `empty`. 11 is ticket 4b's `nearest`.
         #[prost(message, tag = "12")]
         Table(super::TableResponse),
+        /// One partition's part of an index search or check (#1722 PR 1b).
+        #[prost(message, tag = "13")]
+        VectorSearch(super::VectorSearchResponse),
+        #[prost(message, tag = "14")]
+        VectorVerify(super::VectorVerifyResponse),
+        #[prost(message, tag = "16")]
+        TextVerify(super::TextVerifyResponse),
         /// The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
         /// answer `empty`.
         #[prost(message, tag = "19")]
