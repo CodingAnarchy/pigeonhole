@@ -10086,6 +10086,12 @@ impl ShardState {
         };
         let priority = c.priority;
         if let Err(e) = result {
+            // The type 6's fate is unknown and the registry entry is gone: treat it as a
+            // failed group's write, a shard's death (perf2's S1 on #2000). The close is
+            // unclean, and the next open finds the share in doubt or aborted from what
+            // reached the disk; a retried `decide` in this process gets `Closed`.
+            self.poison(crate::health::FailureCause::Io);
+            self.shared.shard_died();
             if let Some(reply) = reply {
                 reply.notify(Err(e));
             }
