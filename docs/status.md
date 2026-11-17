@@ -35,10 +35,17 @@ What the public API does, and the first release with each piece. The [README's l
 | | async walks within a row and async key-set cells | released, 1.2.0 |
 | Vectors | `Family::vector`, `nearest_f32`; `pigeonhole-vector`'s IVF `Index` | released, 1.1.0 |
 | Full-text search | `pigeonhole-text`'s `Index` (`put_in`, `search`) | released, 1.1.0 |
+| | `Index::rebuild_with` and `resume_rebuild_with`: a rebuild that stops and resumes (#1756) | on `main`, 1.3.0 |
+| | faster phrase and common-word searches, results unchanged (#1586, #1585) | on `main`, 1.3.0 |
+| | packed indexes: `Index::pack`, `pack_with`, `PackOptions`; `Index::list` (#1585, ICR 0143) | on `main`, 1.3.0 |
+| | a collection split across indexes: `Search::query_stats`, `QueryStats::merge`, `Search::stats` (#1722, ICR 0138) | on `main`, 1.3.0 |
 | Agent memory | `pigeonhole-memory`'s `Store` (`remember`, `recall`, `consolidate`) | released, 1.1.0 |
 | | local embeddings, `pigeonhole-embed` (its own 0.N line) | released, 1.2.0 |
 | Change feeds | `Options::change_feed`, `Table::feed()`, `Feed::next`, `FeedToken` | released, 1.1.0 |
 | | a feed of every table, `Pigeonhole::feed()` | released, 1.2.0 |
+| Durability | `Durability::{None, Buffered, GroupSync, Sync}`, `commit_with`, `Options::durability` | released, 1.0.0 |
+| | SST output starts its writeback as it is written, so `GroupSync` put latency holds through a long session (D334, #1991) | on `main`, 1.3.0 |
+| | blob files' output too (#2023) | in merge, 1.3.0 |
 | Snapshots, backups, reader processes | `snapshot`, `durable_snapshot`, `backup`, `open_reader` | released, 1.0.0 |
 | | `Options::read_only` (an open that writes nothing to the files) | released, 1.1.0 |
 | | `backup_at`; read-only opens of read-only files (#1348) | released, 1.2.0 |
@@ -49,13 +56,28 @@ What the public API does, and the first release with each piece. The [README's l
 | | `phdb mcp` | released, 1.1.0 |
 | `phdb serve` | gRPC, HTTP/JSON and `/mcp` on one port; tokens, TLS, sessions, the change feed, agent memory, backups, `/metrics` | released, 1.2.0 |
 | | read replicas: `--replica-of`, `phdb promote` | released, 1.2.0 |
+| | `--text-pack`: the text indexes packed in the background, off by default (#1585) | on `main`, 1.3.0 |
+| | feed subscribers' events handed over in batches (#1737) | on `main`, 1.3.0 |
+| | `Text.Rebuild` stops at a shutdown or a fence and resumes on its own (#1756) | on `main`, 1.3.0 |
 | Metrics | `pigeonhole-otel` (its own 0.N line) | released, 1.2.0 |
 | Clusters | `phdb serve --cluster`, `phdb cluster` | released, 1.2.0 |
-| | read replicas of a partition (#1851) | on `main`, 1.3.0 |
-| | agent memory and `/mcp` on a cluster node (#1915) | on `main`, 1.3.0 |
+| | read replicas of a partition: copies in the map's `replicas` (D328, #1851) | on `main`, 1.3.0 |
+| | reads from a replica within a staleness bound: `Get`, `ReadRow`, `MultiGet`, `Scan`, `Vectors.Nearest`, `Graph.Traverse` (`x-pigeonhole-read-replica-max-lag-ms`) | on `main`, 1.3.0 |
+| | promoting a replica: `phdb cluster promote` (#2007) | in review, 1.3.0 |
+| | a partition serves only under a majority's lease: `--cluster-lease-ms` (D326) | on `main`, 1.3.0 |
+| | agent memory on a cluster node: `--memory`, a `memory` placement; `Recall`, `Watch`, `MarkUsed`, `Forget` across partitions (#1915, ICR 0139) | on `main`, 1.3.0 |
+| | `/mcp` on a cluster node (#1915) | on `main`, 1.3.0 |
 | | `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852) | on `main`, 1.3.0 |
-| | vector and text indexes on a cluster: creates, drops and writes routed by id (#1994) | in review, 1.3.0 |
-| | searches across an index's partitions (#1722) | in progress, 1.3.0 |
+| | `phdb cluster restore --partition`: one partition back from a cluster backup (#1832) | on `main`, 1.3.0 |
+| | vector and text indexes on a cluster: `Vectors.CreateIndex`, `Text.CreateIndex`, writes routed by id (#1994, ICR 0138) | on `main`, 1.3.0 |
+| | `Vectors.Search`, `Vectors.Verify` and `Text.Verify` across an index's partitions (#2016) | on `main`, 1.3.0 |
+| | `Text.Search` across an index's partitions, scored as one index (#2029) | in review, 1.3.0 |
+| | `Text.Rebuild` and `Vectors.BulkLoad` across partitions (#1722) | to come, 1.3.0 |
+| | feed subscriptions' events handed over in batches on a cluster too (#2014) | on `main`, 1.3.0 |
+| | transactions across partitions: `BeginRequest.spans_partitions`, two-phase commit (D329, #1483; the engine's part is #2000) | in review, 1.3.0 |
+| | automatic failover, off by default (D330, #1484) | planned, 1.3.0 |
+| | online split and range move (D331, #1499) | planned, 1.3.0 |
+| | a balancer, off by default (D332, #1485) | planned, 1.3.0 |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
