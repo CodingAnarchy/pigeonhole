@@ -264,10 +264,14 @@ pub(crate) enum Stop {
 pub(crate) static STEP_DELAY_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// An inspection counter (tests): packs that stopped for a client's `Text.Rebuild` or for a
-/// resume, so a test can tell a pack that yielded the slot from one that finished.
+/// Inspection counters (tests): packs that stopped for a client's `Text.Rebuild`, and packs
+/// that stopped for a resume, so a test can tell a pack that yielded the slot from one that
+/// finished, and to whom (cli692 on #2018: one count would let either test pass on the
+/// other's yield).
 #[cfg(test)]
-pub(crate) static PACK_YIELDED: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static PACK_YIELDED_TO_CLIENT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static PACK_YIELDED_TO_RESUME: AtomicUsize = AtomicUsize::new(0);
 
 /// An inspection counter (tests): resumes that stopped for a client's `Text.Rebuild`, so a
 /// test can tell a resume that yielded the slot from one that finished (#1995).
@@ -336,12 +340,19 @@ impl Steps {
         if self.texts.closed.load(Ordering::Acquire) {
             return self.stopped(Stop::Closed);
         }
-        if self
-            .slot
-            .as_ref()
-            .is_some_and(|s| s.wanted() || (self.pack && s.resume_wants()))
-        {
-            return self.stopped(Stop::Yielded);
+        if let Some(slot) = &self.slot {
+            if slot.wanted() {
+                #[cfg(test)]
+                if self.pack {
+                    PACK_YIELDED_TO_CLIENT.fetch_add(1, Ordering::SeqCst);
+                }
+                return self.stopped(Stop::Yielded);
+            }
+            if self.pack && slot.resume_wants() {
+                #[cfg(test)]
+                PACK_YIELDED_TO_RESUME.fetch_add(1, Ordering::SeqCst);
+                return self.stopped(Stop::Yielded);
+            }
         }
         if let Some(gate) = &self.texts.gate {
             match gate.enter() {
@@ -678,10 +689,6 @@ impl Texts {
                         eprintln!("phdb serve: text index {name}: packed now");
                     }
                     if s.stopped {
-                        #[cfg(test)]
-                        if matches!(stop, Some(Stop::Yielded)) {
-                            PACK_YIELDED.fetch_add(1, Ordering::SeqCst);
-                        }
                         return match stop {
                             Some(Stop::Closed) => Pass::Closed,
                             _ => Pass::Wait,

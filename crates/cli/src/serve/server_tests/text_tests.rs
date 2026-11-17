@@ -789,16 +789,19 @@ fn text_pack_waits_out_a_fence() {
 /// slot. The steps' delay is back to 0 on return (only the step in flight still waits), so
 /// what the test runs next isn't slowed.
 ///
-/// Also the count of packs that had yielded when this took the steps' lock: hold the
-/// `SlowSteps` until the pack's yield is checked against it. The two tests that make a pack
-/// yield both come through here, so one's yield can't pass for the other's (cli692 on
-/// #2018).
-fn packing() -> (Server, Pigeonhole, SlowSteps, usize) {
+/// Also the counts of packs that had yielded, to a client and to a resume, when this took
+/// the steps' lock: hold the `SlowSteps` until the pack's yield is checked against them.
+/// The two tests that make a pack yield both come through here, and each checks its own
+/// reason's count, so one's yield can't pass for the other's (cli692 on #2018).
+fn packing() -> (Server, Pigeonhole, SlowSteps, (usize, usize)) {
     let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
     let db = s.shared.router.service.part().unwrap().db.clone();
     indexed(&db, 400);
     let slow = slow_steps_ms(1500);
-    let yielded = crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst);
+    let yielded = (
+        crate::serve::texts::PACK_YIELDED_TO_CLIENT.load(Ordering::SeqCst),
+        crate::serve::texts::PACK_YIELDED_TO_RESUME.load(Ordering::SeqCst),
+    );
     s.shared.router.service.resume_text_rebuilds();
     s.shared.router.service.resume_text_rebuilds();
     let until = std::time::Instant::now() + Duration::from_secs(30);
@@ -830,7 +833,7 @@ fn a_clients_text_rebuild_takes_the_slot_from_a_pack() {
     // The pack stopped for it, rather than finishing first. Only this test and the next make
     // a pack yield, one at a time, each counting from where it took the lock (`packing`).
     assert!(
-        crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst) > yielded,
+        crate::serve::texts::PACK_YIELDED_TO_CLIENT.load(Ordering::SeqCst) > yielded.0,
         "the pack finished instead of yielding the slot"
     );
     drop(slow);
@@ -873,7 +876,7 @@ fn a_stopped_rebuilds_resume_takes_the_slot_from_a_pack() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst) > yielded,
+        crate::serve::texts::PACK_YIELDED_TO_RESUME.load(Ordering::SeqCst) > yielded.1,
         "the resume waited for the pack to finish"
     );
     drop(slow);
