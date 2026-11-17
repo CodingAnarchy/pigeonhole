@@ -364,7 +364,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
     | feed lag p99 | 49–52 s | 0.2–0.36 s |
     | streams that fell behind | 0 | 0 |
 
-    With the raised counts, writes no longer get the rate they ask for. The 8–9 s is a client queue that kept growing. The default keeps writes first. #2014 brings the same batching to cluster subscriptions.
+    With the raised counts, writes no longer get the rate they ask for. The 8–9 s is a client queue that kept growing. The default keeps writes first. A cluster subscription's members hand off their hub's ring passes in batches too (#2014).
   - Before #1734, the masked server did the opposite: it held writes to about 33K of the 55K puts/s and delivered every event, or switched between the two. The network threads now also run on the shards' SMT siblings (Placement, below), so the writes no longer queue behind delivery for a CPU.
 
   Each stream's framing still runs on its connection's network thread.
