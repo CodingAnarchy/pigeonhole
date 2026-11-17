@@ -21,6 +21,12 @@
 //!   its ranges are named in `missing`.
 //! - **`Vectors.Verify` and `Text.Verify`** go to every partition and sum the counts. A
 //!   partition whose check fails fails the call, naming it.
+//! - **`Text.Rebuild`** (#1722 PR 2c) goes to every partition, each rebuilding its own
+//!   part of the index as a single node does, and sums the counts. A node rebuilds one
+//!   text index at a time, so the partitions one node serves go one after another, and the
+//!   nodes at once. A partition whose rebuild fails fails the call, naming it; the
+//!   partitions rebuilt by then stand, and a rebuild already running goes on (a write
+//!   finishes if its caller goes away). Rebuilding again is safe.
 //!
 //! Each part names its partition (`ForwardRequest.partition`): the request names only the
 //! index, and one node can own several of its partitions.
@@ -58,6 +64,19 @@ fn partitions(routes: &Routes, index: &str, prefix: &[u8]) -> Result<Vec<String>
                 &format!("index {index:?} isn't in the cluster map"),
             )
         })
+}
+
+/// `e`, its message naming the partitions of a node's rebuild left after it, which never
+/// started (simp724's N1 on #2041).
+fn unstarted(mut e: ApiError, rest: &[String]) -> ApiError {
+    if !rest.is_empty() {
+        e.message = format!(
+            "{}; not started on its node: {}",
+            e.message,
+            rest.join(", ")
+        );
+    }
+    e
 }
 
 /// `e`, its message naming `partition`.
@@ -119,6 +138,7 @@ impl Router {
         match op {
             ServiceOp::VectorSearch(r) => self.fan_vector_search(&reach, r, caller).await,
             ServiceOp::TextSearch(r) => Box::pin(self.fan_text_search(&reach, r, caller)).await,
+            ServiceOp::TextRebuild(r) => Box::pin(self.fan_text_rebuild(&reach, r, caller)).await,
             op => self.fan_verify(&reach, op, caller).await,
         }
     }
@@ -364,6 +384,92 @@ impl Router {
             .await
     }
 
+    /// `Text.Rebuild` on every partition of the index, the counts summed (#1722 PR 2c). A
+    /// node's one rebuild slot answers a second client's rebuild `Overloaded`, so each
+    /// node's partitions go in turn, in the map's order, and the nodes at once.
+    async fn fan_text_rebuild(
+        &self,
+        reach: &Reach,
+        r: proto::TextIndexRequest,
+        caller: &Caller,
+    ) -> Result<ServiceReply, ApiError> {
+        let routes = reach.routes()?;
+        let mut nodes: Vec<(&str, Vec<String>)> = Vec::new();
+        for p in partitions(&routes, &r.index, b"")? {
+            // A partition the map doesn't serve goes on its own: its part fails, naming it.
+            let node = routes.owner(&p).map_or("", |o| o.node.as_str());
+            match nodes.iter_mut().find(|(n, _)| !n.is_empty() && *n == node) {
+                Some((_, ps)) => ps.push(p),
+                None => nodes.push((node, vec![p])),
+            }
+        }
+        let holding = self
+            .service
+            .fanout_hold(VERIFY_SHARE.saturating_mul(2), reach.within()?)
+            .await?;
+        let op = forward_request::Op::TextRebuild(r);
+        let futs: Vec<Boxed<'_, Result<proto::TextRebuildResponse, ApiError>>> = nodes
+            .iter()
+            .map(|(_, ps)| {
+                let op = &op;
+                Box::pin(async move {
+                    let mut sum = proto::TextRebuildResponse::default();
+                    for (i, p) in ps.iter().enumerate() {
+                        // Past the deadline before it starts, this part and the rest don't.
+                        let left = reach.within().map_err(|e| unstarted(e, &ps[i..]))?;
+                        let named = |e| unstarted(on(p, e), &ps[i + 1..]);
+                        // The same deadline for a part served here as for a forwarded one,
+                        // whose rebuild is detached and goes on as a remote one does
+                        // (simp724's S1 on #2041).
+                        let answer = tokio::time::timeout(left, reach.part(p, caller, op.clone()))
+                            .await
+                            .map_err(|_| {
+                                named(ApiError::outcome_unknown(
+                                    "no answer within the request's deadline; the rebuild goes on",
+                                ))
+                            })?
+                            .map_err(named)?;
+                        match answer.0 {
+                            ServiceReply::TextRebuild(a) => {
+                                sum.documents += a.documents;
+                                sum.changed += a.changed;
+                                sum.invalid_utf8 += a.invalid_utf8;
+                            }
+                            _ => {
+                                return Err(ApiError::internal(
+                                    "a text index's rebuild answered another reply",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(sum)
+                }) as Boxed<'_, _>
+            })
+            .collect();
+        let mut total = proto::TextRebuildResponse::default();
+        bounded(
+            futs,
+            self.service.limits().fanout_forwards,
+            || self.service.fanout_try_hold(VERIFY_SHARE),
+            |_, answer| {
+                let a = answer?;
+                total.documents += a.documents;
+                total.changed += a.changed;
+                total.invalid_utf8 += a.invalid_utf8;
+                Ok(())
+            },
+        )
+        .await?;
+        self.service
+            .fanout_reply(
+                caller,
+                ServiceReply::TextRebuild(total),
+                holding,
+                reach.within()?,
+            )
+            .await
+    }
+
     /// `Vectors.Verify` or `Text.Verify` on every partition of the index, the counts summed.
     async fn fan_verify(
         &self,
@@ -376,7 +482,7 @@ impl Router {
             ServiceOp::TextVerify(r) => (r.index.clone(), forward_request::Op::TextVerify(r)),
             _ => {
                 return Err(ApiError::internal(
-                    "fan_index takes an index's search or check",
+                    "fan_index takes an index's search, check or rebuild",
                 ));
             }
         };

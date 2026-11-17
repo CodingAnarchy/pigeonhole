@@ -890,6 +890,7 @@ A full-text index (`pigeonhole-text`, D309) is an ordinary table: the engine sto
 | `G` | `meta` | `layout`, `opts`, `source`, `tokenizer`, `fingerprint`, `normalizer-unicode` | the version; the options (28 bytes: `1`, `k1` and `b` as `f64`, stop words, `max_term_bytes` and `max_terms` as `u32`, positions, normalisation); the source (three length-prefixed strings: table, family, qualifier); the tokeniser's name and fingerprint; the normaliser's Unicode version |
 | `G` | `meta` | `repair` | present (empty) while a repair runs |
 | `G` | `meta` | `rebuild-after` | a stopped rebuild's cursor: the last source row it reconciled, or empty before its first page |
+| `G` | `meta` | `unfilled` | empty; present from `create_unfilled` until a walk of the whole source (its fill's resume, a rebuild or a repair) finishes, cleared at the walk's end: in the commit that clears `rebuild-after` for a rebuild, in a commit of its own for a repair, which removed the cursor at its start (#1722 PR 2c). A client's rebuild never writes it. Absent in an index made by `create`, or by a build before 1.3's PR 2c |
 
 Every family but the counters and aggregates keeps one version.
 
