@@ -52,6 +52,7 @@ parity!(
     shared_memory_in_a_directory,
     clocks_and_processes,
     direct_io,
+    punch_hole,
 );
 
 fn open_modes(b: &Backend) {
@@ -491,4 +492,38 @@ fn direct_io(b: &Backend) {
     misaligned(f.write_at(&page[..4096], 512 + 1).unwrap_err());
     misaligned(f.submit_read(IoBuf::zeroed(100), 0).wait().unwrap_err());
     misaligned(f.submit_write(IoBuf::zeroed(4096), 7).wait().unwrap_err());
+}
+
+/// D333 (ICR 0144): a punched range reads back as zeros, the rest and the length are kept,
+/// and a range past the end changes nothing. A filesystem that cannot punch says so with
+/// `Unsupported` (the test then has nothing more to check).
+fn punch_hole(b: &Backend) {
+    const U: u64 = 64 << 10;
+    let f = b.create("f");
+    f.write_at(&vec![9u8; 3 * U as usize], 0).unwrap();
+    f.sync_all().unwrap();
+    match f.punch_hole(U, U) {
+        Ok(()) => {}
+        Err(e) if e.kind == ErrorKind::Unsupported => return,
+        Err(e) => panic!("{}: {e:?}", b.name),
+    }
+    let mut buf = vec![1u8; 3 * U as usize];
+    f.read_at(&mut buf, 0).unwrap();
+    let (head, rest) = buf.split_at(U as usize);
+    let (hole, tail) = rest.split_at(U as usize);
+    assert!(head.iter().all(|&x| x == 9), "{}", b.name);
+    assert!(hole.iter().all(|&x| x == 0), "{}", b.name);
+    assert!(tail.iter().all(|&x| x == 9), "{}", b.name);
+    assert_eq!(f.len().unwrap(), 3 * U, "{}", b.name);
+    f.punch_hole(0, 0).unwrap();
+    f.punch_hole(8 * U, U).unwrap();
+    assert_eq!(f.len().unwrap(), 3 * U, "{}: nothing past the end", b.name);
+    // A write into the hole fills it again.
+    f.write_at(&vec![7u8; U as usize], U).unwrap();
+    f.read_at(&mut buf, 0).unwrap();
+    assert!(
+        buf[U as usize..2 * U as usize].iter().all(|&x| x == 7),
+        "{}",
+        b.name
+    );
 }
