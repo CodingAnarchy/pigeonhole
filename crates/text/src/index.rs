@@ -887,10 +887,11 @@ impl Index {
     /// and no walk of its whole source has finished since (#1722 PR 2c): one point read.
     /// Until then it lacks source rows written before its create, so a search's answer is
     /// short. [`rebuild_pending`](Self::rebuild_pending) is true then too, but also while
-    /// a client's [`rebuild`](Self::rebuild) runs or is stopped part way, when every
-    /// document is indexed, some perhaps with postings the rebuild hasn't reconciled yet.
+    /// a client's [`rebuild`](Self::rebuild) runs or is stopped part way, when the index
+    /// is as it was before the rebuild except for the documents it has reconciled: whole,
+    /// unless rows were written around it.
     pub fn fill_pending(&self) -> Result<bool> {
-        Ok(self.inner.table.get(GLOBAL, META, UNFILLED)?.is_some())
+        Ok(self.w().table.get(GLOBAL, META, UNFILLED)?.is_some())
     }
 
     fn rebuild_cursor(&self) -> Result<Option<Vec<u8>>> {

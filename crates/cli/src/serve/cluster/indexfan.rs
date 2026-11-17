@@ -66,6 +66,19 @@ fn partitions(routes: &Routes, index: &str, prefix: &[u8]) -> Result<Vec<String>
         })
 }
 
+/// `e`, its message naming the partitions of a node's rebuild left after it, which never
+/// started (simp724's N1 on #2041).
+fn unstarted(mut e: ApiError, rest: &[String]) -> ApiError {
+    if !rest.is_empty() {
+        e.message = format!(
+            "{}; not started on its node: {}",
+            e.message,
+            rest.join(", ")
+        );
+    }
+    e
+}
+
 /// `e`, its message naming `partition`.
 fn on(partition: &str, mut e: ApiError) -> ApiError {
     e.message = format!("partition {partition}: {}", e.message);
@@ -401,13 +414,22 @@ impl Router {
                 let op = &op;
                 Box::pin(async move {
                     let mut sum = proto::TextRebuildResponse::default();
-                    for p in ps {
-                        match reach
-                            .part(p, caller, op.clone())
+                    for (i, p) in ps.iter().enumerate() {
+                        // Past the deadline before it starts, this part and the rest don't.
+                        let left = reach.within().map_err(|e| unstarted(e, &ps[i..]))?;
+                        let named = |e| unstarted(on(p, e), &ps[i + 1..]);
+                        // The same deadline for a part served here as for a forwarded one,
+                        // whose rebuild is detached and goes on as a remote one does
+                        // (simp724's S1 on #2041).
+                        let answer = tokio::time::timeout(left, reach.part(p, caller, op.clone()))
                             .await
-                            .map_err(|e| on(p, e))?
-                            .0
-                        {
+                            .map_err(|_| {
+                                named(ApiError::outcome_unknown(
+                                    "no answer within the request's deadline; the rebuild goes on",
+                                ))
+                            })?
+                            .map_err(named)?;
+                        match answer.0 {
                             ServiceReply::TextRebuild(a) => {
                                 sum.documents += a.documents;
                                 sum.changed += a.changed;

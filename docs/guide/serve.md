@@ -699,7 +699,9 @@ An IVF or BM25 index on a cluster (#1722, ICR 0138) is an **index placement** in
 - **`Text.Rebuild`** goes through any node to every partition of the index. Each partition rebuilds its own index as a single node does, and the counts are summed.
   - **One at a time per node:** a node rebuilds one text index at a time, so the partitions one node serves rebuild in turn, and different nodes' at once.
   - **A partition that fails or can't be reached** fails the call, naming it. The partitions rebuilt by then stand, and a rebuild already running on another node goes on. Rebuilding again is safe.
-  - **A long rebuild:** a part on another node that runs past the request's deadline (`--request-timeout-ms`) answers `OutcomeUnknown`, naming its partition, and its rebuild goes on there.
+  - **A rebuild that outlives the deadline keeps running.** A part that runs past the request's deadline (`--request-timeout-ms`), on the node you called or another, answers `OutcomeUnknown`, naming its partition and any of that node's partitions that hadn't started yet, and its rebuild goes on. The forward doesn't wait longer: an unbounded one would hold the client and a connection for as long as the rebuild takes.
+    - **To tell when it's done:** call `Text.Rebuild` again. While that node is still rebuilding, its partition answers `Overloaded` ("already rebuilding"), and the call retries it after the `RetryInfo` delay. Once that node is free, the call rebuilds again and answers the counts. `Text.Verify` shows the progress without rebuilding: its `source_mismatch` falls to 0 once every source row is indexed as it stands.
+    - **A retry is safe:** a rebuild reads the source and rewrites the index to match it, so running it again changes nothing that's already right. It does reread the whole source.
   - **Searches go on during a rebuild,** strict ones included: the index stays whole while it's rebuilt. Only a new index's background fill answers `Unavailable`.
 - **Not yet:** `Vectors.BulkLoad` answers `Unsupported` until #1722 PR 3. Use `Vectors.Insert` meanwhile.
 
