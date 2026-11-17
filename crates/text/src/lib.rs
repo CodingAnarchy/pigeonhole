@@ -57,6 +57,7 @@ mod merged;
 mod query;
 mod search;
 mod sloppy;
+mod stats;
 mod tokenizer;
 
 pub use error::{Error, QueryErrorKind, Result};
@@ -65,6 +66,7 @@ pub use index::{Index, IndexStats, PackOptions, PackStats, ReadIndex, RebuildSta
 pub use layout::{IndexOptions, Normalization, Source};
 pub use query::{Clause, Fuzziness, Query};
 pub use search::{FuzzyStats, Hit, Search, SearchStats};
+pub use stats::QueryStats;
 pub use tokenizer::{Token, Tokenizer};
 
 /// The user guide's text-search page and the crate README, compiled and run as doctests.

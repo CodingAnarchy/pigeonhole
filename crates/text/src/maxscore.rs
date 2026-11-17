@@ -1017,16 +1017,19 @@ struct Progress {
 }
 
 impl<'t, L: Layout> Scored<'t, Blocking, L> {
-    /// A term clause over its posting row (restricted to doc ids starting with `prefix`).
+    /// A term clause over its posting row (restricted to doc ids starting with `prefix`):
+    /// `df` the one its idf scores with, `postings` the row's own (ICR 0138: they differ
+    /// for a search given another index's statistics).
     pub(crate) fn term(
         t: &'t Rows,
         s: &Snapshot,
         bm: &Bm25,
         term: &str,
         df: i64,
+        postings: u64,
         prefix: Option<&[u8]>,
     ) -> Result<Self> {
-        let (walk, _) = Walk::new(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix)?;
+        let (walk, _) = Walk::new(t, s, bm, term, bm.idf(df), postings, prefix)?;
         Ok(Scored::of_term(walk))
     }
 
