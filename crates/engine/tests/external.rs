@@ -636,6 +636,87 @@ fn a_plain_cross_shard_commit_over_a_held_row_is_busy_not_conflict() {
     db.close().unwrap();
 }
 
+/// A refused external round never retries (a retry runs as a plain commit, and would commit
+/// it with no decision; found by the model-check harness). A plain cross-shard commit whose
+/// DECISION is held keeps its shares undecided, so an external prepare reading one of its
+/// rows is refused for the overlap: it answers `Busy` at once, nothing in doubt, nothing
+/// written.
+#[test]
+fn a_refused_external_prepare_answers_busy_and_never_commits_on_a_retry() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let vfs = SimVfs::new(37);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"held").expect("routed");
+    if db.shard_of(u.id, b"other") == Some(here) {
+        finish(
+            db.move_tablet_pending(u.id, b"other", (1 - here) as u16)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    db.inject(Fault::HoldDecisionRecords, true);
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"held", b"q", None, ValueRef::Bytes(b"a"))
+        .unwrap();
+    wb.put(u.id, uf, b"other", b"q", None, ValueRef::Bytes(b"a"))
+        .unwrap();
+    let mut a = db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut n = 0;
+    loop {
+        n += 1;
+        let xid = format!("r{n}");
+        let mut p = txn(&db, &t, b"held", &[b"zz"], b"v")
+            .submit_prepare(xid.as_bytes(), Durability::GroupSync)
+            .unwrap();
+        let answer = loop {
+            if let Poll::Ready(r) = std::pin::Pin::new(&mut p).poll(&mut cx) {
+                break r;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Release the held DECISION first, so the engine can drop.
+                db.release_held_decisions();
+                panic!("the refused prepare waited to retry behind the overlap");
+            }
+            std::thread::yield_now();
+        };
+        match answer {
+            // Before the commit's shares were held: not refused; let it go and try again.
+            Ok(_) => {
+                db.decide(xid.as_bytes(), false).unwrap().expect("in doubt");
+                assert!(std::time::Instant::now() < deadline, "never refused");
+                std::thread::yield_now();
+            }
+            Err(Error::Busy) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(db.in_doubt().is_empty());
+    db.release_held_decisions();
+    loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut a).poll(&mut cx) {
+            r.unwrap();
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        get_bytes(&db, &t, b"zz"),
+        None,
+        "the refused prepare wrote nothing"
+    );
+    db.close().unwrap();
+}
+
 /// A share reinstalled at a reopen and then decided commit keeps its PREPARE needed until
 /// its writes are flushed (found by the model-check harness): its replayed record had no
 /// slots, so another slot's flush let the checkpoint pass it with the writes still in a

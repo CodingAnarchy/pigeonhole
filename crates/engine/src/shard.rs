@@ -9989,8 +9989,13 @@ impl ShardState {
             // the participants whether this was its last attempt, and the retry (once every
             // participant has answered, `on_applied`) follows the same decision.
             let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
+            // An external round (D329) never retries: a retry runs as a plain commit
+            // (`retry`), which would commit it without its decision. Refused, it gives up,
+            // and its caller hears `Busy` and prepares again (found by the model-check
+            // harness: a refused external prepare committed on its retry).
             c.gives_up = c.failed.is_none()
-                && refusal_gives_up(waited, self.shared.write_stall_timeout_nanos);
+                && (c.external.is_some()
+                    || refusal_gives_up(waited, self.shared.write_stall_timeout_nanos));
             let last = c.failed.is_some() || c.gives_up;
             let priority = c.priority;
             let shards = c.shards.clone();
