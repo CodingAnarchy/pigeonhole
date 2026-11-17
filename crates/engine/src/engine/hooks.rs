@@ -446,6 +446,9 @@ pub enum AppendedKind {
     Batch,
     Prepare,
     Commit,
+    /// An external transaction's abort (D329, WAL type 6): its `seqno` is the commit's id,
+    /// `apply_seqno` the abort's own seqno, which applies nothing.
+    Abort,
 }
 
 /// One raw entry of a table (a test hook).

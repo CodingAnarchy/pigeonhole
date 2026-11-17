@@ -134,7 +134,7 @@ fn a_client_that_stops_reading_loses_its_subscription_and_slot_at_the_idle_limit
     let (_stops, ports, _dbs) = nodes(&rt);
     let [a, _, c] = ports;
     rt.block_on(async {
-        let stuck = subscribe(c).await.unwrap();
+        let mut stuck = subscribe(c).await.unwrap();
         // c's one place is taken.
         let Err(e) = subscribe(c).await else {
             panic!("no place left");
@@ -151,6 +151,25 @@ fn a_client_that_stops_reading_loses_its_subscription_and_slot_at_the_idle_limit
         // Its place is free: a new subscription gets it.
         let fresh = subscribe(c).await;
         assert!(fresh.is_ok(), "{:?}", fresh.err());
-        drop(stuck);
+        // Read again, the stuck stream gives what was queued for it, then ends with a single
+        // node's `DeadlineExceeded` (`stalled_feed`'s), so its client knows to resume rather
+        // than take it for a real end (#2021).
+        let mut commits = 0;
+        let end = loop {
+            match tokio::time::timeout(Duration::from_secs(10), stuck.message())
+                .await
+                .expect("the stuck stream ends")
+            {
+                Ok(Some(e)) => commits += usize::from(matches!(e.event, Some(Event::Commit(_)))),
+                Ok(None) => panic!("a clean end, after {commits} commits"),
+                Err(status) => break status,
+            }
+        };
+        assert!(commits > 0 && commits < 600, "{commits} commits queued");
+        assert_eq!(end.code(), tonic::Code::DeadlineExceeded, "{end:?}");
+        assert!(
+            end.message().contains("--stream-idle-ms (400 ms)"),
+            "{end:?}"
+        );
     });
 }

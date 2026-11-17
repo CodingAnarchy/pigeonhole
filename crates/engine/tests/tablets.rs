@@ -4423,7 +4423,8 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
             .filter_map(|r| match r.kind {
                 pigeonhole_engine::AppendedKind::Batch => Some((r.seqno, r.commit_ts)),
                 pigeonhole_engine::AppendedKind::Prepare => committed.get(&r.seqno).copied(),
-                pigeonhole_engine::AppendedKind::Commit => None,
+                pigeonhole_engine::AppendedKind::Commit
+                | pigeonhole_engine::AppendedKind::Abort => None,
             })
             .collect();
         shares += records
@@ -4451,7 +4452,9 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
         .filter_map(|r| match r.kind {
             pigeonhole_engine::AppendedKind::Batch => Some((r.seqno, r.commit_ts)),
             pigeonhole_engine::AppendedKind::Prepare => committed.get(&r.seqno).copied(),
-            pigeonhole_engine::AppendedKind::Commit => None,
+            pigeonhole_engine::AppendedKind::Commit | pigeonhole_engine::AppendedKind::Abort => {
+                None
+            }
         })
         .collect();
     all.sort_unstable();

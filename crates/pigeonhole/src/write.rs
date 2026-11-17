@@ -2320,6 +2320,25 @@ impl Transaction {
         result
     }
 
+    /// Validates and prepares the transaction as `xid` of an external coordinator (D329,
+    /// ICR 0140): its writes are logged at `durability` and hold their rows, as do its
+    /// reads, until [`Pigeonhole::decide`] commits or aborts it, across a close and a reopen.
+    /// The answer's seqno is the commit's id. Hidden: not part of the API, outside the semver
+    /// promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn prepare(self, xid: &[u8], durability: Durability) -> Result<CommitInfo> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        self.db.check_generation(self.generation)?;
+        let (largest, max) = (self.largest_value, self.db.max_value);
+        self.txn
+            .prepare(xid, durability.engine())
+            .map(CommitInfo::from_engine)
+            .map_err(|e| commit_error(e, largest, max))
+    }
+
     /// The sequence number of the snapshot the transaction reads at (ICR 0118): every read
     /// sees the commits up to it and none after. It's the same number
     /// [`Snapshot::seqno`](crate::Snapshot::seqno) gives for a snapshot taken at that
