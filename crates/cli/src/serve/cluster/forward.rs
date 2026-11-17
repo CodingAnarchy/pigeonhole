@@ -511,6 +511,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
 /// response holds until its body has been written (cli692's F1 on ticket 2).
 pub(crate) fn reply_to_forward(
     reply: ServiceReply,
+    served_seqno: u64,
 ) -> Result<(ForwardResponse, Option<crate::serve::charge::Charge>), ApiError> {
     use forward_response::Reply;
     let (reply, charge) = reply.uncharge();
@@ -539,7 +540,13 @@ pub(crate) fn reply_to_forward(
             ));
         }
     };
-    Ok((ForwardResponse { reply: Some(reply) }, charge))
+    Ok((
+        ForwardResponse {
+            reply: Some(reply),
+            served_seqno,
+        },
+        charge,
+    ))
 }
 
 /// A forward's reply as the call's own, on the entry node.

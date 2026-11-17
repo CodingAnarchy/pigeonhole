@@ -43,7 +43,8 @@
 - **`Hit`** (`#[non_exhaustive]`): `id: Vec<u8>`, `score: f64`.
 - **`SearchStats`** (`#[non_exhaustive]`): `stale`.
 - **`IndexStats`** (`#[non_exhaustive]`): `documents`, `terms`, `postings`, `counter_drift`, `forward_mismatch`, `source_mismatch`, `invalid_utf8`, and `is_consistent()`.
-- **`RebuildStats`** (`#[non_exhaustive]`): `documents`, `changed`, `invalid_utf8`.
+- **`RebuildStats`** (`#[non_exhaustive]`): `documents`, `changed`, `invalid_utf8`, and `stopped` (#1756).
+- **Amendment (#1756): a rebuild that can stop.** `rebuild_with(step)` calls `step` after each document's transaction, and a `Break` stops it with `stopped` set. A cursor in `G`'s `meta` family (`rebuild-after`) records how far it got: written empty at the start, once a page, and in the transaction of any document that writes anyway, so an index already right costs one commit a page. `resume_rebuild_with(step)` continues after it, `rebuild_pending()` reads it (one point read), and `Index::pending_rebuilds(db)` lists the indexes with one. `rebuild` and `rebuild_with` start from the top and replace it; `repair` drops it and never reads it, since its walk starts from an emptied table (ai1249's review). A resume misses a write around the index to a row before the cursor, as one rebuild that had passed the row would: `rebuild` or `repair` after such writes.
 - **`Query`** (`Clone + Default + PartialEq`):
   - **Building:** `new()`, `parse(&str) -> Result<Query>`, `term`, `phrase`, `phrase_with_slop(words, u16)`, `text`, `fuzzy(term, Fuzziness)`, and `clauses() -> &[Clause]`.
   - **From strings:** `From<&str>`, `From<String>` and `From<&String>` parse the string, and a parse error comes back when the search runs.
@@ -150,6 +151,11 @@ No API change.
 - **Why:** `phdb serve`'s `Text.Search` maps the proto's clauses by field name: `term` fields as given (`term`, `fuzzy`), `text` fields tokenised (`text`, and a phrase's `text`). Without the builder, a phrase clause could only be split into exact words, which a lowercased index never matches, or parsed into a query that can't be merged with built clauses in the request's order.
 - **No generic `Query::clause(Clause)`:** it would let callers build clauses the docs don't describe (ai1249). `FuzzyText`'s builder waits until a front end needs it.
 - **Test:** the builder and the parsed `"..."~N` form give the same clauses and the same hits and scores, for stop words, slop, reversed order, a phrase of only stop words or of nothing, and escaped quotes.
+
+## Amendment: `Index::over_table` (#1916)
+- **`Index::over_table(db: &Pigeonhole, table: &str) -> Result<Vec<String>>`** is additive: the names of the text indexes whose source column is in `table`, sorted. A table without the index's families is skipped without a read. One with them is read for its stored source, whatever its tokeniser, so an index made with a custom tokeniser counts.
+- **Why:** dropping a source table left its indexes unable to write, rebuild or find their documents, and a new table of that name became their source. The coordinator chose to refuse the drop (option (a)). `phdb serve`'s `Schema.DropTable` asks this first and answers `FailedPrecondition`, naming them, and refuses too while a `Text.CreateIndex` over the table is building. The library's `Pigeonhole::drop_table` doesn't know about text indexes, so the guide says to drop the index first.
+- **Test:** two indexes over a table, one with a custom tokeniser, and one over another table: `over_table` names exactly the first table's, and nothing for an index's own table or a missing one.
 
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.

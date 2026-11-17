@@ -157,6 +157,7 @@ fn memories_are_remembered_recalled_marked_linked_superseded_and_forgotten() {
                     text: "over gRPC".into(),
                     ..Default::default()
                 }),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1024,4 +1025,93 @@ fn a_namespace_scoped_token_reaches_nothing_but_the_memory_calls() {
     assert_eq!(remember(&s, "a", "kept", Some("scoped")).0, 200);
     let (status, body) = s.rpc("Data/Get", &cell, Some("all"));
     assert_eq!(status, 200, "{body}");
+}
+
+/// The fields `/mcp`'s memory tools answer with (#1915 PR 3b, ICR 0139), over `/v1` and
+/// gRPC: `supersedes` on a remember (and its step's failure in `supersede_error`, the new
+/// memory stored), `superseded_by` on a kept hit, `truncated` on a recall its budget cut,
+/// and the `missing` ids of a mark-used and a forget.
+#[test]
+fn the_memory_tool_fields_answer_over_v1_and_grpc() {
+    let s = memory_server("");
+    let (_, r) = remember(&s, "a", "the deploy key rotates on Fridays", None);
+    let old = r["id"].as_str().unwrap().to_owned();
+    let (status, r) = s.rpc(
+        "Memory/Remember",
+        &json!({"namespace": "a", "memory": {"text": "the deploy key rotates on Mondays"},
+                "supersedes": old}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    assert!(r.get("supersede_error").is_none(), "{r}");
+    let new = r["id"].as_str().unwrap().to_owned();
+    let (_, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": "deploy key", "k": 5, "include_superseded": true}),
+        None,
+    );
+    let kept = r["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == old.as_str())
+        .unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(kept["superseded_by"].as_str(), Some(new.as_str()), "{r}");
+    assert!(r.get("truncated").is_none_or(|t| t == false), "{r}");
+    // A memory that's gone: its id missing from a mark-used and a forget, and a remember
+    // that supersedes it stores the new memory and says the step failed.
+    let (_, r) = remember(&s, "a", "soon forgotten", None);
+    let gone = r["id"].as_str().unwrap().to_owned();
+    let (status, e) = s.rpc("Memory/Forget", &json!({"ids": [gone]}), None);
+    assert_eq!(status, 200, "{e}");
+    let (_, r) = s.rpc("Memory/MarkUsed", &json!({"ids": [new, gone]}), None);
+    assert_eq!(r["marked"].as_str(), Some("1"), "{r}");
+    assert_eq!(r["missing"], json!([gone]), "{r}");
+    let (_, r) = s.rpc("Memory/Forget", &json!({"ids": [old, gone]}), None);
+    assert_eq!(r["forgotten"].as_str(), Some("1"), "{r}");
+    assert_eq!(r["missing"], json!([gone]), "{r}");
+    let (status, r) = s.rpc(
+        "Memory/Remember",
+        &json!({"namespace": "a", "memory": {"text": "a correction of nothing"},
+                "supersedes": gone}),
+        None,
+    );
+    assert_eq!(status, 200, "{r}");
+    assert!(r["supersede_error"]["code"].is_string(), "{r}");
+    let stored = r["id"].as_str().unwrap().to_owned();
+    let (_, r) = s.rpc(
+        "Memory/Recall",
+        &json!({"namespaces": ["a"], "text": "correction", "k": 5}),
+        None,
+    );
+    assert_eq!(r["hits"][0]["id"].as_str(), Some(stored.as_str()), "{r}");
+    // Over gRPC, a budget smaller than the hits: cut, and said so.
+    for i in 0..4 {
+        remember(
+            &s,
+            "a",
+            &format!("{} {i}", "deploy notes ".repeat(30)),
+            None,
+        );
+    }
+    let r = s.block_on(async {
+        let channel = tonic::transport::Channel::from_shared(s.url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        proto::memory_client::MemoryClient::new(channel)
+            .recall(proto::RecallRequest {
+                namespaces: vec!["a".into()],
+                text: "deploy notes".into(),
+                k: 10,
+                byte_budget: 600,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    assert!(r.truncated, "{r:?}");
+    assert!(!r.hits.is_empty() && r.hits.len() < 4, "{r:?}");
 }

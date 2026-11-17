@@ -347,6 +347,8 @@ impl ServiceOp {
                     | Self::RecallPool(_)
                     | Self::RecallBodies(_)
             ),
+            peer: matches!(self, Self::Follow(_))
+                || matches!(self, Self::BackupDownload(r) if r.replica && !r.partition.is_empty()),
         }
     }
 
@@ -532,6 +534,11 @@ pub(crate) struct Admit {
     /// A memory call (`Memory`'s RPCs, `/mcp`'s memory tools): the only calls a token
     /// limited to namespaces may make (audit120's F5).
     pub memory: bool,
+    /// A call one cluster node makes of another for a replica copy (D328): `Follow`, and a
+    /// replica's bootstrap download of a partition. On a cluster node, the node's cluster
+    /// token may make it as well as an admin token; a single node's router refuses a cluster
+    /// token's (simp724's S1 on #1974).
+    pub peer: bool,
 }
 
 /// `PermissionDenied` for a call other than a memory call by a token limited to namespaces
@@ -1211,7 +1218,7 @@ pub(crate) struct Service {
     /// `--max-concurrent` slot, as a scan does.
     streams: Arc<Semaphore>,
     /// `Text.Rebuild`s at once: one, on a thread of its own.
-    text_rebuilds: Arc<Semaphore>,
+    text_rebuilds: Arc<super::texts::RebuildSlot>,
     /// Memory calls at once: a sub-limit of the blocking pool, so a slow embedding endpoint
     /// can't take every blocking thread (ai1249's M6 on D313 §7).
     memory_calls: Arc<Semaphore>,
@@ -1313,7 +1320,7 @@ pub(crate) struct Partition {
     /// it, and again after the catalog or the engine changes (#1618). Set once: at start on
     /// a single node, and on a cluster partition when the map first places the store on it
     /// (#1915), which it then does for good.
-    memory: std::sync::OnceLock<Arc<super::memslot::MemSlot>>,
+    pub(crate) memory: std::sync::OnceLock<Arc<super::memslot::MemSlot>>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     ///
@@ -1418,6 +1425,7 @@ impl Partition {
         if let Some(p) = &config.placement {
             config.backups.place(p);
         }
+        let text_placement = config.placement.clone();
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: config.pinning,
@@ -1429,7 +1437,11 @@ impl Partition {
                 gate.cloned(),
             )),
             bulk: super::bulk::BulkLoads::new(config.placement),
-            texts: Arc::new(super::texts::Texts::new(db.clone())),
+            texts: Arc::new(super::texts::Texts::new(
+                db.clone(),
+                gate.cloned(),
+                text_placement,
+            )),
             memory: std::sync::OnceLock::new(),
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
@@ -1551,6 +1563,19 @@ impl Service {
         }
     }
 
+    /// Resumes the partition's stopped text index rebuilds once it takes writes (#1756): at
+    /// its open (an owner's: the callers that open one call it, after the service is whole,
+    /// never `for_partition`, which a replica copy is built with too), and after a promote.
+    /// Not on a replica, whose writes are refused.
+    pub(crate) fn resume_text_rebuilds(&self) {
+        if self.replica.as_ref().is_some_and(|r| r.refuses_writes()) {
+            return;
+        }
+        if let Some(part) = &self.part {
+            part.texts.resume_soon(&self.text_rebuilds);
+        }
+    }
+
     /// A cluster node the map gives no partition: it only routes (D317 ticket 2). Its
     /// threads run on `placement`'s CPUs, as [`PartitionConfig::placement`] says.
     pub(crate) fn routing_only(
@@ -1596,7 +1621,7 @@ impl Service {
             ),
             session_caps,
             streams: Arc::new(Semaphore::new(limits.max_streams.max(1))),
-            text_rebuilds: Arc::new(Semaphore::new(1)),
+            text_rebuilds: Arc::new(super::texts::RebuildSlot::new()),
             memory_calls: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             scan_reads: Arc::new(Semaphore::new((blocking_threads / 2).max(1))),
             limits,
@@ -1612,6 +1637,10 @@ impl Service {
     /// promoted. The loop is started by the caller once the server runs.
     pub(crate) fn replica(mut self, replica: Arc<super::replica::Replica>) -> Self {
         self.replica = Some(replica);
+        // A cluster replica copy (D328) serves reads under its own freshness bound, which
+        // the router checks per request against the client's, never under a lease: copies
+        // stay out of the lease machinery (S3). Its writes are refused by the engine (R6).
+        self.gate = None;
         // A replica's rebalancer could only fail (its writes are refused, R6): none runs
         // until a promote (cli692's F3 on #1583).
         if let Some(part) = &self.part {
@@ -1829,7 +1858,7 @@ impl Service {
         match (reply, self.replica.as_ref().filter(|r| r.refuses_writes())) {
             // A transaction's Commit with writes: the engine's gate (R6) refused it.
             (Err(e), Some(replica)) if e.code == "ReadOnly" => {
-                Err(ApiError::replica_read_only(replica.primary()))
+                Err(ApiError::replica_read_only(&replica.primary()))
             }
             // A cluster partition closed under the call (D317 ticket 6's close, S5): the
             // partition is unavailable here, and the client routes again.
@@ -1892,9 +1921,10 @@ impl Service {
             && call.writes
             && caller.scope.allows(call.scope)
         {
-            return Err(ApiError::replica_read_only(replica.primary()));
+            return Err(ApiError::replica_read_only(&replica.primary()));
         }
-        if !caller.scope.allows(call.scope) {
+        let peer = call.peer && caller.scope == Scope::Cluster;
+        if !caller.scope.allows(call.scope) && !peer {
             return Err(ApiError::permission_denied(&format!("call {}", call.what)));
         }
         if call.size > self.limits.max_request_bytes {
@@ -2077,6 +2107,8 @@ impl Service {
                 // afresh (cli692's F3 on #1583).
                 self.part()?.indexes.forget();
                 self.part()?.indexes.pause_rebalancing(false);
+                // And a text index rebuild stopped on the primary, then copied, resumes here.
+                self.resume_text_rebuilds();
                 // The memory store opens as the writer now, at once, created if missing
                 // (cli692's D3 on #1618). Its failure doesn't fail the promote (the database
                 // is what's promoted): it's the replica's last error, and memory calls answer
@@ -2172,9 +2204,13 @@ impl Service {
                     .map(ServiceReply::TextSearch)
                     .map_err(ApiError::for_read)
             }
+            // Boxed: its slot wait and the rebuild's state would otherwise widen the future
+            // every call moves (serve-mutate's ceiling on #1975).
             ServiceOp::TextRebuild(r) => {
                 drop(budget);
-                self.text_rebuild(r).await.map(ServiceReply::TextRebuild)
+                Box::pin(self.text_rebuild(r))
+                    .await
+                    .map(ServiceReply::TextRebuild)
             }
             ServiceOp::TextVerify(r) => {
                 drop(budget);
@@ -2203,6 +2239,7 @@ impl Service {
                     let m = core.mark_used(scope, &ids)?;
                     Ok(proto::MarkUsedResponse {
                         marked: m.marked as u64,
+                        missing: m.missing.iter().map(|id| id.to_bytes().into()).collect(),
                     })
                 })
                 .await
@@ -2238,6 +2275,7 @@ impl Service {
                     }
                     Ok(proto::ForgetResponse {
                         forgotten: done.deleted,
+                        missing: done.missing.iter().map(|id| id.to_bytes().into()).collect(),
                     })
                 })
                 .await
@@ -2672,7 +2710,33 @@ impl Service {
         let place = pool_place(&self.blocking).await?;
         let _schema = self.part()?.schema.lock().await;
         let db = self.part()?.db.clone();
-        let dropped = held(place, move || Ok(db.drop_table(&name)?)).await;
+        let texts = Arc::clone(&self.part()?.texts);
+        let dropped = held(place, move || {
+            // A text index reading the table would be left behind, unable to write, rebuild
+            // or find its documents, and a new table of the name would become its source
+            // (#1916, the coordinator's option (a)). Checked under `schema`, which a text
+            // index's create takes too, so none appears between the check and the drop.
+            if texts.creating_over(&name) {
+                return Err(ApiError::failed_precondition(format!(
+                    "a text index over table {name:?} is being created: once it's built, drop \
+                     the index before the table"
+                )));
+            }
+            let over = pigeonhole_text::Index::over_table(&db, &name)?;
+            if !over.is_empty() {
+                return Err(ApiError::failed_precondition(format!(
+                    "table {name:?} is the source of the text index{} {}: drop {} first",
+                    if over.len() == 1 { "" } else { "es" },
+                    over.iter()
+                        .map(|i| format!("{i:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if over.len() == 1 { "it" } else { "them" },
+                )));
+            }
+            Ok(db.drop_table(&name)?)
+        })
+        .await;
         // Whatever the outcome, the next use resolves every name again: the table's handle,
         // and a vector or text index's if it was one, with its rebalancer (#1588). Every
         // cached handle goes, not only the name's: drops are rare, and an open of the name
@@ -2724,6 +2788,22 @@ impl Service {
         self.part.iter().map(|p| (None, p)).collect()
     }
 
+    /// A cluster partition's replicas follow its feed (D328's S1), which is on only with
+    /// `--change-feed` on its owner's node: refused, naming that, for their `Follow` and
+    /// their bootstrap, which would otherwise fail on the engine's own error. `partition` is
+    /// the cluster partition's id; `None` on a single node, whose replicas need no check.
+    fn feed_on_for_replicas(partition: Option<&str>, db: &Pigeonhole) -> Result<(), ApiError> {
+        if let (Some(partition), Ok(info)) = (partition, db.info())
+            && info.feed.is_none()
+        {
+            return Err(ApiError::failed_precondition(format!(
+                "partition {partition}'s change feed is off on this node, so its replicas have \
+                 nothing to follow: start the node with --change-feed"
+            )));
+        }
+        Ok(())
+    }
+
     /// `Replication.Follow` (#1436): under a `--max-streams` slot, on a thread of its own.
     fn follow(&self, r: proto::FollowRequest) -> Result<super::replica::FollowBatches, ApiError> {
         if self.replica_info().is_some() {
@@ -2732,15 +2812,22 @@ impl Service {
                 "a replica can't be followed: follow its primary",
             ));
         }
+        let part = self.part()?;
+        Self::feed_on_for_replicas(self.gate.as_ref().map(|g| g.partition()), &part.db)?;
         let slot = self.stream_slot()?;
-        super::replica::follow(
-            &self.part()?.db,
+        let batches = super::replica::follow(
+            &part.db,
             r.token.to_vec(),
             slot,
             self.limits.stream_idle,
             Arc::clone(&self.metrics),
             self.placement.clone(),
-        )
+        )?;
+        // A cluster partition's, under its lease (D328's M1).
+        match &self.gate {
+            Some(gate) => batches.leased(Arc::clone(gate)),
+            None => Ok(batches),
+        }
     }
 
     /// `Admin.Backup` of `part`: on a thread of its own, one backup at a time (perf287's D1
@@ -2795,6 +2882,10 @@ impl Service {
                 "a replica can't be a bootstrap source: bootstrap from its primary",
             ));
         }
+        // A cluster node's download runs on the node's service, with the partition named.
+        if r.replica && map_version.is_some() {
+            Self::feed_on_for_replicas(Some(&r.partition), &part.db)?;
+        }
         let (id, copy) = if r.backup_id.is_empty() {
             let (db, durable, replica) = (part.db.clone(), r.durable, r.replica);
             // The backup and its hash run on a thread of their own, never the blocking pool
@@ -2803,7 +2894,9 @@ impl Service {
                 if let Some(map_version) = map_version {
                     // A cluster node's copy: one snapshot for the copy and the identity it
                     // names, so the last chunk says exactly what the file holds.
-                    let snap = if durable {
+                    // A replica copy's bootstrap (D328): durable, with the token of a feed
+                    // of every table from the same snapshot, as a single node's.
+                    let snap = if durable || replica {
                         db.durable_snapshot()?
                     } else {
                         db.snapshot()?
@@ -2813,9 +2906,17 @@ impl Service {
                         .ok_or_else(|| {
                             ApiError::internal("the partition's file has no identity row")
                         })?;
+                    let feed_token = if replica {
+                        let token = db.feed().from_snapshot(&snap).open()?.token();
+                        let token = token.as_bytes().to_vec();
+                        started(token.clone());
+                        token
+                    } else {
+                        Vec::new()
+                    };
                     db.backup_at(&snap, p)?;
                     return Ok(Taken {
-                        feed_token: Vec::new(),
+                        feed_token,
                         identity: Some(CopyIdentity {
                             partition: id.partition_id,
                             cluster_id: id.cluster_id,
@@ -3463,8 +3564,21 @@ impl Service {
         let table = self.table(&r.source_table).await?;
         let source = pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
         let texts = Arc::clone(&self.part()?.texts);
-        self.blocking(move || texts.create(&r.name, source, options, r.if_missing))
-            .await?;
+        // Noted under `schema`, where a drop of the source checks for its indexes (#1916),
+        // and held until the index (its source stored first) is built: a drop then refuses
+        // it, and one that checked first has dropped the source, which the create can't
+        // open. The build itself runs without `schema`, which it could hold for minutes.
+        // The pool place first (its lock order).
+        let place = pool_place(&self.blocking).await?;
+        let creating = {
+            let _schema = self.part()?.schema.lock().await;
+            texts.creating(&r.source_table)
+        };
+        held(place, move || {
+            let _creating = creating;
+            texts.create(&r.name, source, options, r.if_missing)
+        })
+        .await?;
         Ok(proto::Empty {})
     }
 
@@ -3534,34 +3648,65 @@ impl Service {
     /// `Text.Rebuild`: rewrites the index from its source column. One at a time, on a
     /// thread of its own off the shards' cores, never the blocking pool (perf287's D1: a
     /// rebuild reads the whole source). A write: it finishes if the client goes away.
+    ///
+    /// It starts from the first row, whatever a stopped rebuild left (ai1249 on #1756), and
+    /// runs a document at a time under the partition's gate: a fence stops it at the next
+    /// document, answering `Fenced` with what it did, and it resumes on its own once the
+    /// partition takes writes again. A resume holding the node's rebuild slot gives it up at
+    /// its next document for this call.
     async fn text_rebuild(
         &self,
         r: proto::TextIndexRequest,
     ) -> Result<proto::TextRebuildResponse, ApiError> {
         let index = self.text_index(&r.index).await?;
-        let Ok(slot) = Arc::clone(&self.text_rebuilds).try_acquire_owned() else {
-            return Err(ApiError::overloaded(
-                "the server is already rebuilding a text index",
-            ));
-        };
-        let placement = self.part()?.bulk.placement.clone();
+        let slot = self
+            .text_rebuilds
+            .client(self.limits.request_timeout)
+            .await?;
+        let part = self.part()?;
+        let placement = part.bulk.placement.clone();
+        let texts = Arc::clone(&part.texts);
         let (tx, rx) = oneshot::channel();
-        // One library call that rewrites the whole index: a fence waits for it to end
-        // (within its deadline), since it can't stop part way.
+        // The first document runs under the request's admission; each later one enters the
+        // gate itself (`Steps`), so a fence's drain waits for one document.
         let held = self.gate.as_ref().map(super::gate::WriteGate::extend);
-        self.part()?.texts.spawn_rebuild(move || {
+        let steps_texts = Arc::clone(&texts);
+        texts.spawn_rebuild(move || {
             if let Some(p) = placement {
                 p.enter();
             }
-            let r = index.rebuild();
+            let mut steps = super::texts::Steps::new(steps_texts, held, None);
+            let r = index.rebuild_with(|_| steps.step());
+            let stop = steps.finish();
             drop(index);
-            drop(held);
             drop(slot);
-            let _ = tx.send(r);
+            let _ = tx.send((r, stop));
         })?;
-        let stats = rx
+        let (done, stop) = rx
             .await
-            .map_err(|_| ApiError::internal("the rebuild's thread ended early"))??;
+            .map_err(|_| ApiError::internal("the rebuild's thread ended early"))?;
+        let stats = done?;
+        if stats.stopped {
+            let did = format!(
+                "the rebuild of text index {:?} stopped after {} documents ({} changed), which \
+                 stand",
+                r.index, stats.documents, stats.changed
+            );
+            return Err(match stop {
+                Some(super::texts::Stop::Fenced(e)) => {
+                    texts.resume_soon(&self.text_rebuilds);
+                    let why = e.message.trim_end_matches("; nothing was written");
+                    ApiError::fenced(format!(
+                        "{did}: {why}. It resumes on its own once the partition takes writes \
+                         again"
+                    ))
+                }
+                _ => ApiError::from_code(
+                    pigeonhole::ErrorCode::Closed,
+                    &format!("{did}: the server is shutting down. It resumes when it serves again"),
+                ),
+            });
+        }
         Ok(proto::TextRebuildResponse {
             documents: stats.documents,
             changed: stats.changed,
@@ -3788,15 +3933,6 @@ impl Service {
         self.entry_core(&slot, entry)
     }
 
-    /// [`memory_core`](Self::memory_core) on a blocking thread that already holds a memory
-    /// place (M6) and a pool place: a `/mcp` memory tool's (8c-3b). It opens the store here
-    /// if need be.
-    pub(crate) fn memory_core_blocking(&self) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        let slot = self.part()?.memory.get().ok_or_else(|| self.no_memory())?;
-        let entry = slot.get()?;
-        self.entry_core(slot, entry)
-    }
-
     /// The core a slot's entry holds, or why there's none.
     fn entry_core(
         &self,
@@ -3835,20 +3971,12 @@ impl Service {
     }
 
     /// A place under the memory sub-limit (M6), waited for within the request timeout. Taken
-    /// before a blocking-pool place, always: `/mcp` takes it before its request's pool thread
-    /// too, so the two are never waited for in the other order.
+    /// before a blocking-pool place, always, so the two are never waited for in the other
+    /// order. A `/mcp` memory tool's op takes it as the RPC does (#1915 PR 3b): the message
+    /// holds only its `/mcp` place.
     pub(crate) async fn memory_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         budget_within(&self.memory_calls, 1, self.limits.request_timeout)
             .await
-            .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
-    }
-
-    /// A place under the memory sub-limit now, or `Overloaded`: for a call already on a
-    /// blocking-pool thread, which mustn't wait for one (`/mcp`'s fallback, ai1249's R1 on
-    /// #1679).
-    pub(crate) fn memory_try_place(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        Arc::clone(&self.memory_calls)
-            .try_acquire_owned()
             .map_err(|_| ApiError::overloaded("the server's memory calls are all busy"))
     }
 
@@ -3890,10 +4018,10 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<proto::RememberResponse, ApiError> {
-        let m = super::memory::remember(r)?;
+        let (m, supersedes) = super::memory::remember(r)?;
         self.memory_write("Memory.Remember", caller, budget, move |core, scope| {
-            let (done, _) = core.remember(scope, m, None)?;
-            Ok(super::memory::remembered(&done))
+            let (done, supersede_error) = core.remember(scope, m, supersedes)?;
+            Ok(super::memory::remembered(&done, supersede_error))
         })
         .await
     }
@@ -3919,10 +4047,10 @@ impl Service {
         let namespaces = caller.namespaces.clone();
         let reply = self
             .memory_blocking(move || {
-                let (hits, _stats) =
-                    core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
+                let (hits, stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
                 Ok(proto::RecallResponse {
                     hits: hits.into_iter().map(super::memory::hit).collect(),
+                    truncated: stats.truncated,
                 })
             })
             .await?;

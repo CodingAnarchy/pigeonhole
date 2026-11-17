@@ -385,7 +385,7 @@
   - **Either fence** needs the peers' word too: every peer is asked at the call, and the newest map among those that answer (taken, if newer) must be at least as new as the node's own and name it at the file's epoch, or `force`. The first peer to agree isn't enough: one that missed the same move holds the same stale map (simp724's S1 on #1826). The node's own map may be stale. A cluster of one confirms on its own map. (Until audit120's P2-F1, 2026-11-13, only a start fence asked. A move fences its old node as the operator, and that node's map is the one left behind when it misses the move's map: an unfence there lifted the fence on the stale map alone and gave the partition two writers.)
   - **The accepted risk (1.2.0):** auto-unfence at start trusted one peer's map at least as new as the node's, and a peer that missed the same move held the same stale version. **1.3.0 (#1760, D317 amendment 3):** a partition is confirmed only when a majority of the map's nodes hold the newest map and it names the node; a round brings peers that are behind up to it before counting them, every open (a move's new owner too) starts unconfirmed, a map that changes the nodes can't also move a partition, and a move waits for a majority to hold its map.
 - **Start:** every partition opens fenced. A peer's map at least as new as the node's own, naming the node at the file's epoch, unfences it. The sources are `sync_on_start`, a push from a peer, and a retry loop (250 ms up to 5 s). A one-node cluster unfences on its own map. An operator's fence stays.
-- **Not stopped by a fence:** a text index rebuild runs to its end, since the library rebuilds an index in one call. The fence's drain waits for it within its deadline. A per-batch hook in pigeonhole-text is a 1.3.0 follow-up.
+- **A text index rebuild stops at a fence** (#1756): it runs a document at a time under the gate, so the fence's drain waits for one document. The stopped rebuild answers `Fenced`, keeps its cursor in the index, and resumes on its own once the partition takes writes again (an unfence, a lease back, an open after a move or a restart). Until #1722 a cluster node refuses `Text.Rebuild`, so today this covers a shutdown's close; the gate path is in place for #1722.
 
 **Opening on a running node:** `Parts` is an `ArcSwap` of id to service, swapped under the node's open lock.
 - **When:**
@@ -571,3 +571,38 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **A node change:** the writer takes no further change until `L·(1+ρ)` after it saw a majority of both node sets hold the change (audit120's L1); `SetMap` waits that out before it answers.
 - **Two nodes:** a majority is both, so with one down the other stops serving within L.
 
+
+## D328 PR 1: read replicas in the map (1.3.0)
+**A node the map lists in `Partition.replicas` holds a replica copy of the partition, which follows the partition's owner** (D328, #1851). Additive on the wire. Routed reads are PR 2, `phdb cluster promote` PR 3.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`, 2026-11-14):
+- **`Partition.replicas = 7`** (`repeated string`): node ids, in order of preference. Each a map node, none P's `node`, none twice; a map that removes a node must drop it from every list (`InvalidArgument` otherwise). A change to it alone isn't a move. The writer adds the first replicas only once every node reports the map feature `replicas` (`NodeStatus.map_features`).
+- **`LocalPartition.role = 15`** (`PartitionRole`: `PARTITION_ROLE_OWNER`, `PARTITION_ROLE_REPLICA`) and, for a replica copy: **`replica_of = 16`** (the owner node it last dialled), **`replica_applied_seqno = 17`**, **`replica_primary_seqno = 18`**, **`replica_lag_ms = 19`** (since the owner last said it was caught up, on the copy's clock) and **`replica_state = 20`** (`ReplicaState`: `BOOTSTRAPPING`, `FOLLOWING`, `BEHIND`, `STOPPED`, `OWNER_FEED_OFF`). A copy's `error` is its follower's last error while it isn't following.
+- **`PartitionInfo.replica = 9`** (admin.proto, the existing `ReplicaInfo`): set on each replica copy `Admin.Info` lists, beside the partitions the node owns; `primary` is the owner's address. Its `state` is unset.
+- **`/metrics`:** each copy's `pigeonhole_replica_*` gauges, as a single node's replica has them, labelled `pigeonhole_partition`.
+
+**Behaviour:**
+- **The owner's side.** `Replication.Follow` on a cluster node serves the open partition it owns whose database the token names; none gives `WrongPartition` with the node's map version. The stream runs under P's lease (D326): it waits for one and ends with `PartitionUnavailable` when it lapses. `Admin.BackupDownload { partition, replica }` on a cluster node takes a durable snapshot and sends the feed token to follow from.
+- **The owner's change feed must be on (S1).** Without it, both answer `FailedPrecondition` naming `--change-feed`, and the copy reports `OWNER_FEED_OFF`.
+- **Cluster scope.** A cluster-scope token may make `Follow` and a `BackupDownload` with `replica` and a `partition` (the nodes' own calls to each other); every other call keeps its scope.
+- **A new history bootstraps again.** When the map's `history_epoch` for P is above the epoch in the copy's identity row (a relocate without `--copy`, a restore), the copy bootstraps again from the owner rather than resuming. A copy move resumes.
+- **A move onto a replica's node is refused (S4, until PR 3).** `phdb cluster move`, `relocate` and `restore --partition` with `--to` a node in `P.replicas`; and on that node, `Cluster.Stamp` for P while its replica copy is open (`FailedPrecondition`, naming the copy). `drop-partition` refuses while the copy is open. The steps: set a map without the node in P's replicas, `drop-partition` P there, run the command again.
+- **Outside the lease machinery (S3).** A replica copy is never asked for, confirmed or lapsed, and `Fence`, `Unfence` and `Close` don't act on it (it isn't a partition they find).
+
+## D328 PR 2a: single-partition reads from replicas (1.3.0)
+**A `Get` or `ReadRow` sent with `x-pigeonhole-read-replica-max-lag-ms` may be served by a replica of its partition** (D328 §3). Additive on the wire.
+
+**Headers** (not proto; an ICR line each):
+- **`x-pigeonhole-read-replica-max-lag-ms: N`** (request): the staleness the read accepts. On a single node it's ignored.
+- **`x-pigeonhole-min-primary-seqno: S`** (request, now also on cluster nodes): read-your-writes for the read's partition. On a read across partitions, together with the first header, it's `InvalidArgument`.
+- **`x-pigeonhole-served-by: owner|replica`** and **`x-pigeonhole-served-seqno`** (response): set on a read sent with the first header.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ForwardRequest.to_replica = 44`, `.replica_max_lag_ms = 42`, `.min_primary_seqno = 43`: the entry node chose this node's replica copy. The read is served from the copy, never as owner, else `ReplicaBehind` or `PartitionUnavailable`, and the entry node tries the next replica or the owner.
+- `ForwardResponse.served_seqno = 28`: the seqno the serving node read at, for a single-partition read.
+
+**Behaviour:**
+- **Freshness** is the copy's own clock since the newest owner message whose durable frontier it had applied through (D330's M2: this keeps moving under sustained writes). A copy that's bootstrapping its first copy, or stopped, serves nothing.
+- **Order:** the entry node tries P's replicas in the map's order, skipping one found behind or unreachable in the last 2 s, then the owner, within one deadline from the request's arrival.
+- **A replica copy's reads** don't take P's lease (S3). Its writes stay refused.
+- **Never routed to a replica:** writes, transactions, snapshots, `Subscribe`, schema and admin calls, and (until PR 2b) reads across partitions.

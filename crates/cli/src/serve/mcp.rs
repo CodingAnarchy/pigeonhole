@@ -22,8 +22,8 @@
 //!   a call (this session's, or another's: the service's catalog generation) changed the
 //!   tools the client last listed.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -37,14 +37,12 @@ use tokio::sync::Semaphore;
 use super::Shared;
 use super::auth::{Caller, Scope};
 use super::errors::ApiError;
-use super::mcp_backend::{ServeBackend, ServeFeed, failure};
+use super::mcp_backend::{ServeBackend, ServeFeed, ServeMemory, failure};
 use super::service::Admit;
-use crate::exit::Failure;
 use crate::mcp::backend::FeedSource;
-use crate::mcp::memory::{Memory, Store as MemStore};
+use crate::mcp::memory::Memory;
 use crate::mcp::protocol::{self, Core, Host, Transport};
 use crate::mcp::tools::{Outcome, Tools};
-use crate::memcore::MemCore;
 
 /// The session's header (Streamable HTTP, 2025-03-26).
 const SESSION: &str = "mcp-session-id";
@@ -74,15 +72,17 @@ impl McpSession {
             writable,
             replica: service.replica.is_some(),
         };
-        // The memory tools over the served store (8c-3b), limited to the caller's namespaces
-        // (M4), as `Memory`'s RPCs are.
-        let memory = service.memory_slot().map(|slot| {
+        // The memory tools over the served store (8c-3b): `Memory` ops as the session's token,
+        // so limited to its namespaces (M4) and, on a cluster, reaching every partition (#1915
+        // PR 3b). Listed with `--memory` only: its flags (the embedder, the budgets) are the
+        // node's, and a recall across partitions needs them on the node called (S5).
+        let memory = shared.router.memory_slot().map(|slot| {
             Memory::served(
                 slot.name(),
-                Box::new(ServeStore {
-                    shared: Arc::downgrade(shared),
+                Box::new(ServeMemory {
+                    backend: backend.clone(),
+                    slot: Arc::clone(&slot),
                 }),
-                caller.namespaces.clone(),
                 writable,
                 slot.embeds(),
                 shared.limits.mcp.result_bytes,
@@ -112,43 +112,11 @@ fn refuses_writes(shared: &Shared) -> bool {
         .is_some_and(|r| r.refuses_writes())
 }
 
-/// The served memory store, as the memory tools reach it: through the service's own slot,
-/// which a catalog change or a replica's re-bootstrap opens again.
-struct ServeStore {
-    /// Weak, as [`ServeBackend`]'s.
-    shared: Weak<Shared>,
-}
-
-impl MemStore for ServeStore {
-    fn core(&self) -> Result<Arc<MemCore>, Failure> {
-        let shared = self
-            .shared
-            .upgrade()
-            .ok_or_else(|| failure(ApiError::unavailable("the server is shutting down")))?;
-        // On the request's pool thread, under the memory place `post` took first.
-        shared
-            .router
-            .service
-            .memory_core_blocking()
-            .map_err(failure)
-    }
-
-    fn cached(&self) -> Option<Arc<MemCore>> {
-        let shared = self.shared.upgrade()?;
-        match shared.router.service.memory_slot()?.cached()? {
-            super::memslot::Entry::Core(core) => Some(core),
-            _ => None,
-        }
-    }
-}
-
 /// What one `/mcp` request's messages reach: the session's tools, each call admitted first.
 struct Gate<'a> {
     session: &'a McpSession,
     shared: &'a Shared,
     caller: &'a Caller,
-    /// Whether `post` took a memory place (M6) for this message, before its pool thread.
-    memory_place: bool,
     /// The feed a `feed_poll` message's poll reads: opened and waited on by `post` before
     /// its `/mcp` place (simp724's M2).
     feed: std::sync::Mutex<Option<ServeFeed>>,
@@ -194,24 +162,12 @@ impl Host for Gate<'_> {
             // The request's bytes are the POST's, reserved before its body was read.
             size: 0,
             memory: what.starts_with("memory_"),
+            peer: false,
         };
         // The checks only: the request's bytes are its POST's, already reserved (ai1249's S1).
         if let Err(e) = service.check(&admit, self.caller) {
             return Some(Err(failure(e)));
         }
-        // A memory tool runs under a memory place (M6). `post` takes it before the pool
-        // thread for a message it sees calling one. One it didn't see (a tool name spelled
-        // with JSON escapes) fails closed: a place now, without waiting (a wait here, holding
-        // the pool thread, is the order the RPCs never take), else `Overloaded` (ai1249's R1
-        // on #1679).
-        let _memory = if name.starts_with("memory_") && !self.memory_place {
-            match service.memory_try_place() {
-                Ok(p) => Some(p),
-                Err(e) => return Some(Err(failure(e))),
-            }
-        } else {
-            None
-        };
         // A poll is a subscription, whose op holds its `--max-streams` place (simp724's S2).
         // It never waits here, holding the `/mcp` place: `post` waited for its first commit
         // before taking it (the audit's F7, simp724's M2), so the call takes what's ready.
@@ -246,17 +202,14 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Ok(n) => n,
         Err(e) => return e.into_response(),
     };
-    // A cluster node's tools would see only its own partition: refused until a D317 ticket
-    // routes them (cli692's 4 on ticket 2).
-    if shared.router.cluster_node().is_some() {
-        return ApiError::unsupported("/mcp on a cluster node comes with a later D317 ticket")
-            .into_response();
-    }
     let service = &shared.router.service;
-    // `/mcp` serves one database's tools: a node that only routes has none (D317 ticket 2).
-    let db = match service.part() {
-        Ok(p) => p.db.clone(),
-        Err(_) => {
+    // The tools are service calls through the router (#1915 PR 3), so on a cluster they
+    // reach every partition; the session keeps one database of its own, the node's first
+    // partition's, for whether the change feed is on. A node that only routes has none
+    // (D317 ticket 2).
+    let db = match shared.router.parts().first() {
+        Some(p) => p.db.clone(),
+        None => {
             return ApiError::unsupported("/mcp needs a node that serves a database")
                 .into_response();
         }
@@ -368,17 +321,6 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
         Some(args) => poll_wait(&shared, &caller, &session, &args, until).await,
         None => None,
     };
-    // A memory tool runs under the memory sub-limit (M6), whose place is taken before the
-    // pool's, as the RPCs take it: never the other way round (see `Service::memory_place`).
-    let _memory = if calls_memory(&text) {
-        match service.memory_place().await {
-            Ok(p) => Some(p),
-            Err(e) => return e.into_response(),
-        }
-    } else {
-        None
-    };
-    let memory_place = _memory.is_some();
     let caller_owned = caller.clone();
     let shared_owned = Arc::clone(&shared);
     // On a blocking thread under a `/mcp` place, outside `--blocking-threads` (ICR 0139's
@@ -389,7 +331,6 @@ pub(crate) async fn post(State(shared): State<Arc<Shared>>, req: Request) -> Res
                 session: &session,
                 shared: &shared_owned,
                 caller: &caller_owned,
-                memory_place,
                 feed: std::sync::Mutex::new(feed),
             };
             super::mcp_backend::within(until, || {
@@ -479,26 +420,6 @@ pub(crate) async fn delete(State(shared): State<Arc<Shared>>, headers: HeaderMap
     }
 }
 
-/// Whether `text` (a message or a batch) calls a memory tool.
-fn calls_memory(text: &str) -> bool {
-    // Most messages name no memory tool: skip the parse (ai1249's N3 on #1679). One whose
-    // name is spelled with JSON escapes gets past this; `Gate::call` catches it (R1).
-    if !text.contains("\"memory_") {
-        return false;
-    }
-    let call = |m: &Value| {
-        m.get("method").and_then(Value::as_str) == Some("tools/call")
-            && m["params"]["name"]
-                .as_str()
-                .is_some_and(|n| n.starts_with("memory_"))
-    };
-    match serde_json::from_str::<Value>(text) {
-        Ok(Value::Array(batch)) => batch.iter().any(call),
-        Ok(m) => call(&m),
-        Err(_) => false,
-    }
-}
-
 /// The arguments of a `feed_poll` that waits (`wait_ms` above 0), if `text` is one: a single
 /// message, not a batch, whose calls then don't wait (`Gate::call` takes what's ready).
 fn feed_wait(text: &str) -> Option<Map<String, Value>> {
@@ -532,6 +453,7 @@ async fn poll_wait(
         writes: false,
         size: 0,
         memory: false,
+        peer: false,
     };
     shared.router.service.check(&admit, caller).ok()?;
     let p = session.tools.feed_poll_args(args).ok()?;

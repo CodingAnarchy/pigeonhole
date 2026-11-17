@@ -77,6 +77,23 @@ fn searches_equal_a_brute_force_bm25_through_puts_overwrites_and_deletes() {
                 &bm.scores(&[], std::slice::from_ref(&phrase)),
                 &ctx(&format!("phrase {phrase:?}")),
             );
+            // Phrases that repeat a word (#1586): its terms read one stream of positions in
+            // the join, as the lead or beside it.
+            for repeated in [
+                vec!["the", "the"],
+                vec![phrase[0], phrase[1], phrase[0]],
+                vec![phrase[1], phrase[0], phrase[0]],
+            ] {
+                let got = index
+                    .search(Query::new().phrase(repeated.clone()), 1000)
+                    .run()
+                    .unwrap();
+                same_scores(
+                    &got,
+                    &bm.scores(&[], std::slice::from_ref(&repeated)),
+                    &ctx(&format!("phrase {repeated:?}")),
+                );
+            }
             let syntax = format!("{} \"{}\"", terms[0], phrase.join(" "));
             let got = index.search(syntax.as_str(), 1000).run().unwrap();
             same_scores(
@@ -203,6 +220,44 @@ fn a_bypass_then_the_same_text_stays_stale_until_repair() {
     db.close().unwrap();
 }
 
+/// #1916: `over_table` names the indexes whose source column is in a table, sorted, and
+/// nothing for a table no index reads, an index's own table, or a table that only looks
+/// like an index by name.
+#[test]
+fn over_table_names_the_indexes_a_table_is_the_source_of() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let t = docs(&db);
+    let other = db
+        .table("notes")
+        .unwrap()
+        .family("body", pigeonhole::Family::default())
+        .create()
+        .unwrap();
+    for name in ["z_text", "a_text"] {
+        Index::create(&db, name, source(&t), IndexOptions::new()).unwrap();
+    }
+    Index::create(&db, "notes_text", source(&other), IndexOptions::new()).unwrap();
+    // A custom tokeniser's index counts too: `over_table` reads the source, not the
+    // tokeniser.
+    Index::create_with_tokenizer(
+        &db,
+        "custom_text",
+        source(&t),
+        IndexOptions::new(),
+        Box::new(Spaces(1)),
+    )
+    .unwrap();
+    assert_eq!(
+        Index::over_table(&db, "docs").unwrap(),
+        ["a_text", "custom_text", "z_text"]
+    );
+    assert_eq!(Index::over_table(&db, "notes").unwrap(), ["notes_text"]);
+    assert!(Index::over_table(&db, "a_text").unwrap().is_empty());
+    assert!(Index::over_table(&db, "missing").unwrap().is_empty());
+    db.close().unwrap();
+}
+
 #[test]
 fn create_backfills_a_source_column_and_rebuild_then_changes_nothing() {
     let dir = pigeonhole::doc_support::temp_dir();
@@ -321,6 +376,75 @@ fn writes_and_searches_wait_out_a_repair() {
         ids(&index.search("postgres", 10).run().unwrap()),
         [&b"a"[..]]
     );
+    db.close().unwrap();
+}
+
+/// #1586 (ai1249's S2 on #1997): a phrase's join reaches another term by point reads or by
+/// that term's walk, chosen from the lead's `df`, and reads the lead's lengths by point
+/// reads until walking is cheaper. Each way, and the switch part way through, gives the
+/// brute-force scores, with and without an id prefix.
+#[test]
+fn a_phrase_scores_the_same_by_point_reads_by_walking_and_across_the_switch() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    let mut model: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for i in 0..600u32 {
+        // "store" is in every document; "agent" in one of 3 (200); "vector" in one of 100
+        // (6). A third of each word's documents have the words another way round, so a
+        // phrase isn't in all of them.
+        let mut words = vec!["memory"; (i % 7) as usize];
+        match (i % 100 == 0, i % 3 == 0, i % 9 == 0) {
+            (true, _, false) => words.extend(["vector", "store"]),
+            (true, _, true) => words.extend(["store", "vector"]),
+            (false, true, false) => words.extend(["agent", "store"]),
+            (false, true, true) => words.extend(["store", "agent", "store"]),
+            (false, false, _) => words.extend(["store", "the"]),
+        }
+        let id = format!("{}{i:04}", if i % 2 == 0 { "a" } else { "b" }).into_bytes();
+        let text = words.join(" ");
+        index.put(&id, &text).unwrap();
+        model.insert(id, text);
+    }
+    db.flush().unwrap();
+    let bm = Bm25::new(&model);
+    for phrase in [
+        // The lead in 6 documents beside one in 600: 6 × 14 point reads cost less than
+        // walking 600 postings. Its lengths switch to the walk at the first lookup (14 is
+        // more than the 6 postings left); the phrases below cover their point reads.
+        vec!["vector", "store"],
+        // The lead in 200 beside one in 600: the walk from the start. Its lengths: point
+        // reads for the first matches, then the walk.
+        vec!["agent", "store"],
+        vec!["store", "agent"],
+        // Three terms, one repeated.
+        vec!["store", "agent", "store"],
+    ] {
+        let want = bm.scores(&[], std::slice::from_ref(&phrase));
+        assert!(want.len() > 2, "{phrase:?} is in some documents: {want:?}");
+        let got = index
+            .search(Query::new().phrase(phrase.clone()), 1000)
+            .run()
+            .unwrap();
+        same_scores(&got, &want, &format!("phrase {phrase:?}"));
+        for prefix in [&b"a"[..], b"b"] {
+            let want: BTreeMap<Vec<u8>, f64> = want
+                .iter()
+                .filter(|(d, _)| d.starts_with(prefix))
+                .map(|(d, s)| (d.clone(), *s))
+                .collect();
+            let got = index
+                .search(Query::new().phrase(phrase.clone()), 1000)
+                .id_prefix(prefix)
+                .run()
+                .unwrap();
+            same_scores(
+                &got,
+                &want,
+                &format!("phrase {phrase:?}, prefix {prefix:?}"),
+            );
+        }
+    }
     db.close().unwrap();
 }
 

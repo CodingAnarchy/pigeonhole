@@ -5355,17 +5355,7 @@ impl Inner {
             if meta.options.kind.is_aggregate() {
                 fixed_ts |= check_counter_write(&m, meta, catalog)?;
                 counter_writes += usize::from(matches!(m.kind, Kind::Put | Kind::Merge));
-                converts |= match (meta.options.kind, m.kind) {
-                    (FamilyKind::Hll | FamilyKind::Bloom, Kind::Merge) => true,
-                    (
-                        FamilyKind::SumF64
-                        | FamilyKind::MeanVar
-                        | FamilyKind::Histogram
-                        | FamilyKind::Quantiles,
-                        Kind::Put,
-                    ) => m.value.first() == Some(&(ValueTag::F64 as u8)),
-                    _ => false,
-                };
+                converts |= counter_write_converts(meta.options.kind, &m);
             } else if m.kind == Kind::Put
                 && (meta.options.kind == FamilyKind::Vector
                     || m.value.first() == Some(&(ValueTag::Vector as u8)))
@@ -5411,7 +5401,11 @@ impl Inner {
             }
         }
         if fixed_ts || counter_writes > 1 || converts {
-            return Ok((prepare_counter_writes(&batch.builder, catalog)?, shards));
+            let combines = counter_writes > 1 || converts;
+            return Ok((
+                prepare_counter_writes(&batch.builder, catalog, combines)?,
+                shards,
+            ));
         }
         Ok((batch.builder, shards))
     }
@@ -6489,6 +6483,24 @@ fn family_name(catalog: &Catalog, table: TableId, family: FamilyId) -> String {
     }
 }
 
+/// Whether a counter-family write is rewritten before the WAL (D294, D298): an HLL or bloom
+/// input (an element, written as its one-element state), or an `f64` put into a state kind
+/// (the state of that one input). [`prepare_counter_writes`]' pass-through path relies on
+/// there being none.
+fn counter_write_converts(kind: FamilyKind, m: &Mutation<'_>) -> bool {
+    match (kind, m.kind) {
+        (FamilyKind::Hll | FamilyKind::Bloom, Kind::Merge) => true,
+        (
+            FamilyKind::SumF64
+            | FamilyKind::MeanVar
+            | FamilyKind::Histogram
+            | FamilyKind::Quantiles,
+            Kind::Put,
+        ) => m.value.first() == Some(&(ValueTag::F64 as u8)),
+        _ => false,
+    }
+}
+
 /// `(table, family, row, qualifier, timestamp)` of a cell in a batch.
 type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 
@@ -6498,7 +6510,38 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// combines into that write with the family's aggregation (a sum, min or max), in write
 /// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
 /// the last write.
-fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<BatchBuilder> {
+///
+/// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
+/// one, the only change is the fixed timestamp, and the batch is copied straight through: no
+/// map, no list of writes, and the copy sized once (#1795: a lone `incr`'s rebuilt batch grew
+/// from `BatchBuilder::new`'s 4 bytes, a calloc and a realloc per commit that glibc 2.43 served
+/// at a cost varying run to run with the heap's state).
+fn prepare_counter_writes(
+    batch: &BatchBuilder,
+    catalog: &Catalog,
+    combines: bool,
+) -> Result<BatchBuilder> {
+    // Each write may gain an 8-byte timestamp.
+    let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
+    if !combines {
+        for m in batch.batch().iter() {
+            let mut m = m?;
+            let aggregate = catalog
+                .family(m.family)
+                .is_some_and(|f| f.options.kind.is_aggregate());
+            if aggregate && matches!(m.kind, Kind::Put | Kind::Merge) {
+                m.ts.get_or_insert(COUNTER_TS);
+            }
+            debug_assert!(
+                !catalog
+                    .family(m.family)
+                    .is_some_and(|f| counter_write_converts(f.options.kind, &m)),
+                "a write to convert reached the pass-through path"
+            );
+            out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
+        }
+        return Ok(out);
+    }
     struct Write<'a> {
         m: Mutation<'a>,
         /// The value of a combined write, replacing `m.value`.
@@ -6597,7 +6640,6 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         latest.insert(key, writes.len());
         writes.push(Write { m, value: own });
     }
-    let mut out = BatchBuilder::new();
     for w in &writes {
         let m = &w.m;
         let value = w.value.as_deref().unwrap_or(m.value);

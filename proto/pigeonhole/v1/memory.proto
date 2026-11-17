@@ -66,11 +66,20 @@ message NewMemory {
 message RememberRequest {
   string namespace = 1;
   NewMemory memory = 2;
+  // The memory this one corrects, in the same namespace (#1915, ICR 0139): the store skips
+  // near dedup against what it holds (a correction is near what it corrects; exact dedup
+  // stays), then supersedes this memory with the new one. On a cluster, a call that sets
+  // it needs every owner to have the `memory_tool_fields` feature (`FailedPrecondition`
+  // naming the node otherwise), since an older node would ignore it.
+  bytes supersedes = 3;
 }
 
 message RememberResponse {
   bytes id = 1;
   RememberOutcome outcome = 2;
+  // With `supersedes`: set when the new memory is stored (`id`) but superseding the old
+  // one failed, so the old memory is still live. Retry that step with `Supersede` (#1915).
+  ErrorDetail supersede_error = 3;
 }
 
 enum RememberOutcome {
@@ -101,6 +110,11 @@ message RecallRequest {
 
 message RecallResponse {
   repeated MemoryHit hits = 1;
+  // Whether the byte budget cut hits that would have ranked (#1915). On a cluster, the
+  // entry node's, from its merged ranking.
+  // On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+  // empty (ICR 0139): until every node has it, empty doesn't mean none.
+  bool truncated = 2;
 }
 
 message MemoryHit {
@@ -116,6 +130,10 @@ message MemoryHit {
   // With `with_signals`: each ranking signal's score, by name (`vector`, `keyword`,
   // `recency`, `graph`).
   map<string, double> signals = 9;
+  // The memory that supersedes this one, when `superseded` (#1915).
+  // On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+  // empty (ICR 0139): until every node has it, empty doesn't mean none.
+  bytes superseded_by = 10;
 }
 
 message MarkUsedRequest {
@@ -124,6 +142,10 @@ message MarkUsedRequest {
 
 message MarkUsedResponse {
   uint64 marked = 1;
+  // The ids the store doesn't hold (#1915).
+  // On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+  // empty (ICR 0139): until every node has it, empty doesn't mean none.
+  repeated bytes missing = 2;
 }
 
 message SupersedeRequest {
@@ -144,6 +166,10 @@ message ForgetRequest {
 
 message ForgetResponse {
   uint64 forgotten = 1;
+  // The ids the store didn't hold (#1915).
+  // On a cluster mid-upgrade, a node without the `memory_tool_fields` feature leaves this
+  // empty (ICR 0139): until every node has it, empty doesn't mean none.
+  repeated bytes missing = 2;
 }
 
 message MemoryWatchRequest {

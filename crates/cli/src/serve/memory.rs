@@ -51,7 +51,7 @@ pub(crate) fn ids(list: &[prost::bytes::Bytes]) -> Result<Vec<MemoryId>, ApiErro
     list.iter().map(|b| id(b)).collect()
 }
 
-fn kind_in(k: i32) -> Result<Option<Kind>, ApiError> {
+pub(crate) fn kind_in(k: i32) -> Result<Option<Kind>, ApiError> {
     Ok(match proto::MemoryKind::try_from(k) {
         Ok(proto::MemoryKind::Unspecified) => None,
         Ok(proto::MemoryKind::Episodic) => Some(Kind::Episodic),
@@ -61,7 +61,7 @@ fn kind_in(k: i32) -> Result<Option<Kind>, ApiError> {
     })
 }
 
-fn kind_out(k: Kind) -> i32 {
+pub(crate) fn kind_out(k: Kind) -> i32 {
     (match k {
         Kind::Episodic => proto::MemoryKind::Episodic,
         Kind::Semantic => proto::MemoryKind::Semantic,
@@ -98,6 +98,19 @@ pub(crate) fn link_type(t: Option<&proto::LinkType>) -> Result<LinkType, ApiErro
     }
 }
 
+/// A link's type as the proto gives it: the built-in ones by name, the rest by number.
+pub(crate) fn link_type_out(t: LinkType) -> proto::LinkType {
+    use proto::link_type::Kind as K;
+    let kind = if t == LinkType::DERIVED_FROM {
+        K::Builtin(proto::BuiltinLink::DerivedFrom as i32)
+    } else if t == LinkType::SIMILAR_TO {
+        K::Builtin(proto::BuiltinLink::SimilarTo as i32)
+    } else {
+        K::Custom(u32::from(t.get()))
+    };
+    proto::LinkType { kind: Some(kind) }
+}
+
 /// An embedding as `f32`s: `f32` as it is, `f16` and `bf16` widened.
 fn embedding(v: Option<&proto::Vector>) -> Result<Option<Vec<f32>>, ApiError> {
     let Some(v) = v else { return Ok(None) };
@@ -132,7 +145,15 @@ pub(crate) fn vector_out(v: &[f32]) -> proto::Vector {
     }
 }
 
-pub(crate) fn remember(r: proto::RememberRequest) -> Result<Remember, ApiError> {
+/// A `Remember`'s memory, and the memory it supersedes, if any (#1915).
+pub(crate) fn remember(
+    r: proto::RememberRequest,
+) -> Result<(Remember, Option<MemoryId>), ApiError> {
+    let supersedes = if r.supersedes.is_empty() {
+        None
+    } else {
+        Some(id(&r.supersedes)?)
+    };
     let m = r
         .memory
         .ok_or_else(|| ApiError::invalid("Remember needs a memory"))?;
@@ -141,20 +162,28 @@ pub(crate) fn remember(r: proto::RememberRequest) -> Result<Remember, ApiError> 
         .iter()
         .map(|l| Ok((id(&l.to)?, link_type(l.link_type.as_ref())?, l.weight)))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(Remember {
-        namespace: r.namespace,
-        embedding: embedding(m.embedding.as_ref())?,
-        text: m.text,
-        kind: kind_in(m.kind)?,
-        importance: m.importance,
-        source: Some(m.source).filter(|s| !s.is_empty()),
-        session: Some(m.session).filter(|s| !s.is_empty()),
-        pinned: m.pinned,
-        links,
-    })
+    Ok((
+        Remember {
+            namespace: r.namespace,
+            embedding: embedding(m.embedding.as_ref())?,
+            text: m.text,
+            kind: kind_in(m.kind)?,
+            importance: m.importance,
+            source: Some(m.source).filter(|s| !s.is_empty()),
+            session: Some(m.session).filter(|s| !s.is_empty()),
+            pinned: m.pinned,
+            links,
+        },
+        supersedes,
+    ))
 }
 
-pub(crate) fn remembered(r: &pigeonhole_memory::Remembered) -> proto::RememberResponse {
+/// A `Remember`'s reply: its memory, and the supersede step's failure, if it had one and
+/// it failed (the new memory stands; the old one is still live).
+pub(crate) fn remembered(
+    r: &pigeonhole_memory::Remembered,
+    supersede_error: Option<MemError>,
+) -> proto::RememberResponse {
     use pigeonhole_memory::Remembered as R;
     let outcome = match r {
         R::New(_) => proto::RememberOutcome::New,
@@ -165,6 +194,7 @@ pub(crate) fn remembered(r: &pigeonhole_memory::Remembered) -> proto::RememberRe
     proto::RememberResponse {
         id: r.id().to_bytes().into(),
         outcome: outcome as i32,
+        supersede_error: supersede_error.map(|e| ApiError::from(e).detail()),
     }
 }
 
@@ -206,6 +236,10 @@ pub(crate) fn hit(h: RecallHit) -> proto::MemoryHit {
         importance: h.importance,
         created: h.created_us,
         superseded: h.superseded_by.is_some(),
+        superseded_by: h
+            .superseded_by
+            .map(|by| by.to_bytes().into())
+            .unwrap_or_default(),
         score: h.score,
         embedding: h.embedding.as_deref().map(vector_out),
         signals,

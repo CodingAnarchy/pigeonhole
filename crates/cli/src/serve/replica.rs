@@ -31,7 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 use super::Shared;
 use super::errors::ApiError;
 use super::proto;
-use super::service::{FOLLOW, Metrics};
+use super::service::{FOLLOW, Metrics, Service};
 
 /// A `Follow` message's events, at most.
 const FOLLOW_EVENTS: usize = 256;
@@ -99,6 +99,61 @@ pub(crate) fn min_primary_seqno(value: Option<&[u8]>) -> Result<Option<u64>, Api
         })
 }
 
+/// The request header a client sends with a read on a cluster node to let a replica of the
+/// partition serve it (D328): the most staleness it accepts, in milliseconds (decimal). A
+/// replica serves it only if it heard from the owner, and had applied everything the owner
+/// had then made durable, at most that long ago on its own clock; otherwise the next
+/// replica or the owner does. Without it, every read is the owner's.
+pub(crate) const READ_REPLICA_MAX_LAG_MS: &str = "x-pigeonhole-read-replica-max-lag-ms";
+
+/// The response header naming what served a read sent with [`READ_REPLICA_MAX_LAG_MS`]:
+/// `owner` or `replica` (D328's Q7).
+pub(crate) const SERVED_BY: &str = "x-pigeonhole-served-by";
+
+/// The response header with the seqno such a read was served at, in the owner's numbering:
+/// a replica's applied seqno after the read, or the owner's visible seqno after it. Sent
+/// back as [`MIN_PRIMARY_SEQNO`], it makes the next read at least as new (monotonic reads,
+/// D328's Q7).
+pub(crate) const SERVED_SEQNO: &str = "x-pigeonhole-served-seqno";
+
+/// [`READ_REPLICA_MAX_LAG_MS`]'s value: none without the header, `InvalidArgument` unless
+/// it's a decimal `u64`.
+pub(crate) fn read_replica_max_lag(value: Option<&[u8]>) -> Result<Option<u64>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::invalid(format!(
+                "{READ_REPLICA_MAX_LAG_MS} is the staleness a read accepts, in milliseconds"
+            ))
+        })
+}
+
+/// What served a read that a replica could have (D328): the response's [`SERVED_BY`] and
+/// [`SERVED_SEQNO`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Served {
+    pub(crate) replica: bool,
+    pub(crate) seqno: u64,
+}
+
+impl Served {
+    /// The two response headers' values.
+    pub(crate) fn headers(self) -> [(&'static str, String); 2] {
+        [
+            (
+                SERVED_BY,
+                if self.replica { "replica" } else { "owner" }.to_owned(),
+            ),
+            (SERVED_SEQNO, self.seqno.to_string()),
+        ]
+    }
+}
+
 /// The longest pause between a replica's attempts after an error.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
@@ -144,16 +199,60 @@ fn applying(what: &str, e: &pigeonhole::Error) -> Halt {
 
 /// A `Follow` stream: batches as the follower's thread reads them, then its error if it
 /// failed.
-#[derive(Debug)]
 pub(crate) struct FollowBatches {
     rx: mpsc::Receiver<Result<proto::ReplicationBatch, ApiError>>,
+    /// A cluster partition's: delivered only while it holds its lease (D328's M1, D326), so
+    /// a deposed owner, cut off from the cluster but not from its replica, stops feeding it.
+    lease: Option<super::lease::DeliveryLease>,
+}
+
+impl std::fmt::Debug for FollowBatches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FollowBatches")
+            .field("leased", &self.lease.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FollowBatches {
+    /// These batches, delivered only while cluster partition `gate`'s lease holds (D328's
+    /// M1): they wait while it has had none since it opened, and end with
+    /// `PartitionUnavailable` once it lapses or the node can't reach a majority (refused at
+    /// once then), as a feed component's events do. The replica takes that as a break: it
+    /// reads the map again, and follows P's owner then.
+    pub(crate) fn leased(mut self, gate: Arc<super::gate::WriteGate>) -> Result<Self, ApiError> {
+        self.lease = Some(super::lease::DeliveryLease::new(gate)?);
+        Ok(self)
+    }
+}
+
+/// The follower's thread ends the stream itself (its error is its last item), so the lease
+/// check has no separate end to wait for, and no take clock: the thread's own idle limit
+/// counts from the replica's last take of a message.
+struct NoHooks;
+
+impl super::lease::LeaseHooks for NoHooks {
+    fn poll_own_end(&mut self, _: &mut Context<'_>) -> Poll<Option<ApiError>> {
+        Poll::Pending
+    }
+
+    fn took(&self) {}
 }
 
 impl Stream for FollowBatches {
     type Item = Result<proto::ReplicationBatch, ApiError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        if let Some(lease) = self.lease.as_mut()
+            && let Some(answer) = lease.before(cx, &mut NoHooks)
+        {
+            return answer;
+        }
+        let next = self.rx.poll_recv(cx);
+        if let Some(lease) = self.lease.as_mut() {
+            lease.after(next.is_pending(), cx);
+        }
+        next
     }
 }
 
@@ -205,7 +304,7 @@ pub(crate) fn follow(
             drop(slot);
         })
         .map_err(|e| ApiError::internal(format!("starting a follower's thread: {e}")))?;
-    Ok(FollowBatches { rx })
+    Ok(FollowBatches { rx, lease: None })
 }
 
 /// The follower's loop: a message per batch of events, or per [`QUIET`] with none.
@@ -311,6 +410,18 @@ impl std::fmt::Debug for ReplicaConfig {
     }
 }
 
+/// Where a replica follows from.
+#[derive(Debug)]
+enum Upstream {
+    /// A single node's `--replica-of` URL, with its token ([`ReplicaConfig`]).
+    Url,
+    /// A cluster partition's owner, as the node's map names it (D328).
+    Owner {
+        node: std::sync::Weak<super::cluster::Node>,
+        partition: String,
+    },
+}
+
 /// Where a replica's loop is, as `ReplicaInfo.state` names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -359,12 +470,78 @@ struct Status {
     /// that stops says where).
     bootstrap_phase: &'static str,
     bootstrap_bytes: u64,
+    /// A cluster replica copy's freshness (D328), on its own clock: the arrival of the
+    /// newest message whose `primary_seqno` (the owner's durable frontier at its send) the
+    /// copy has applied through. So the copy then held every commit the owner had made
+    /// durable when that message left, whether or not it said `caught_up`, and under
+    /// sustained writes it keeps moving (simp724's note on #1974, D330's M2). The owner
+    /// sends a message at least once a second while idle, so it ages from the moment the
+    /// stream stops.
+    fresh_at: Option<Instant>,
+    /// Messages not yet applied through: each one's `primary_seqno` and arrival, oldest
+    /// first, at most [`PENDING_FRESH`] (an older one dropped only makes `fresh_at` later).
+    pending_fresh: std::collections::VecDeque<(u64, Instant)>,
 }
+
+/// How many messages' frontiers [`Status::pending_fresh`] keeps.
+const PENDING_FRESH: usize = 1024;
+
+impl Status {
+    /// A message with the owner's durable frontier `primary_seqno` arrived at `at`.
+    fn heard(&mut self, primary_seqno: u64, at: Instant) {
+        match self.pending_fresh.back_mut() {
+            // The same frontier again (an idle owner's heartbeat): once applied through, the
+            // copy is fresh as of this later message (simp724's M1 on #1989).
+            Some((seqno, arrived)) if *seqno == primary_seqno => *arrived = at,
+            Some(&mut (seqno, _)) if primary_seqno < seqno => {}
+            _ => {
+                if self.pending_fresh.len() == PENDING_FRESH {
+                    self.pending_fresh.pop_front();
+                }
+                self.pending_fresh.push_back((primary_seqno, at));
+            }
+        }
+        self.settle_fresh();
+    }
+
+    /// Moves `fresh_at` to the newest message the copy has applied through.
+    fn settle_fresh(&mut self) {
+        while let Some(&(seqno, at)) = self.pending_fresh.front() {
+            if self.applied < seqno {
+                break;
+            }
+            self.fresh_at = Some(self.fresh_at.map_or(at, |f| f.max(at)));
+            self.pending_fresh.pop_front();
+        }
+    }
+}
+
+/// A cluster node's replica copy's follower, as `Cluster.Status` reports it (D328).
+#[derive(Debug, Clone)]
+pub(crate) struct CopyStatus {
+    pub(crate) state: proto::ReplicaState,
+    /// The owner it follows, as last dialled ("" before the first).
+    pub(crate) owner: String,
+    pub(crate) applied: u64,
+    pub(crate) primary_seqno: u64,
+    /// Since `fresh_at`; since the follower started before its first.
+    pub(crate) lag_ms: u64,
+    pub(crate) last_error: String,
+}
+
+/// What a replica copy's last error says when its owner's feed is off (S1).
+pub(crate) const OWNER_FEED_OFF: &str = "change feed is off";
 
 /// A replica server's loop and its state.
 #[derive(Debug)]
 pub(crate) struct Replica {
     config: ReplicaConfig,
+    /// Where it follows from.
+    upstream: Upstream,
+    /// A replica copy's owner as last dialled, its id and address (empty before the first).
+    now: Mutex<(String, String)>,
+    /// When it was made: a copy's lag counts from here until it's first fresh.
+    started: Instant,
     status: Mutex<Status>,
     /// Set once `Admin.Promote` made the database a primary: writes are taken, and the
     /// replica reports nothing.
@@ -390,11 +567,25 @@ pub(crate) struct Replica {
 #[cfg(test)]
 pub(crate) static FAIL_PROMOTE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// The tests' inspection seam: the served database's path for each bootstrap that swapped
+/// its copy in (a failed attempt isn't one), so a test can tell a follower that resumed from
+/// one that bootstrapped again (D328).
+#[cfg(test)]
+pub(crate) static BOOTSTRAPS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// `Admin.Promote`'s answer before the first bootstrap has finished.
 fn not_bootstrapped() -> ApiError {
     ApiError::failed_precondition(
         "the replica hasn't finished its bootstrap: there is nothing to promote",
     )
+}
+
+/// What a replica's loop serves through: the service whose database it follows into (a
+/// single node's, or a cluster node's replica copy, D328), and the idle limit its streams
+/// take (`--stream-idle-ms`).
+struct On<'a> {
+    service: &'a Service,
+    idle: Duration,
 }
 
 /// Why following stopped.
@@ -410,8 +601,36 @@ enum Halt {
 
 impl Replica {
     pub(crate) fn new(config: ReplicaConfig) -> Arc<Self> {
+        Self::with_upstream(config, Upstream::Url)
+    }
+
+    /// A cluster node's replica copy of `partition` (D328): it follows the partition's owner
+    /// as `node`'s map names it, with the node's cluster token.
+    pub(crate) fn of_partition(
+        node: &Arc<super::cluster::Node>,
+        partition: &str,
+        run_events: usize,
+    ) -> Arc<Self> {
+        let config = ReplicaConfig {
+            primary: String::new(),
+            token: None,
+            run_events,
+        };
+        Self::with_upstream(
+            config,
+            Upstream::Owner {
+                node: Arc::downgrade(node),
+                partition: partition.to_owned(),
+            },
+        )
+    }
+
+    fn with_upstream(config: ReplicaConfig, upstream: Upstream) -> Arc<Self> {
         Arc::new(Self {
             config,
+            upstream,
+            now: Mutex::new((String::new(), String::new())),
+            started: Instant::now(),
             status: Mutex::new(Status {
                 state: State::Starting,
                 applied: 0,
@@ -421,6 +640,8 @@ impl Replica {
                 last_error: String::new(),
                 bootstrap_phase: "",
                 bootstrap_bytes: 0,
+                fresh_at: None,
+                pending_fresh: std::collections::VecDeque::new(),
             }),
             promoted: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
@@ -432,8 +653,18 @@ impl Replica {
     }
 
     /// The primary's URL.
-    pub(crate) fn primary(&self) -> &str {
-        &self.config.primary
+    pub(crate) fn primary(&self) -> String {
+        match &self.upstream {
+            Upstream::Url => self.config.primary.clone(),
+            Upstream::Owner { partition, .. } => {
+                let now = self.now.lock().unwrap_or_else(PoisonError::into_inner);
+                if now.0.is_empty() {
+                    format!("partition {partition}'s owner")
+                } else {
+                    format!("node {} at {}", now.0, now.1)
+                }
+            }
+        }
     }
 
     /// The replica's state while its copy is still arriving or being swapped
@@ -487,7 +718,10 @@ impl Replica {
     /// a `None` commit's and a cross-shard transaction's included (cli692's Q1 on #1594;
     /// the server tests check both), so the value reaches it without a later commit.
     fn set_applied(&self, applied: u64) {
-        self.status().applied = applied;
+        let mut s = self.status();
+        s.applied = applied;
+        s.settle_fresh();
+        drop(s);
         self.applied.send_replace(applied);
     }
 
@@ -537,20 +771,134 @@ impl Replica {
         }
         let s = self.status();
         Some(proto::ReplicaInfo {
-            primary: self.config.primary.clone(),
+            primary: self.primary(),
             state: s.state.as_str().to_owned(),
             applied_primary_seqno: s.applied,
             primary_seqno: s.primary_seqno,
             lag_commits: s.primary_seqno.saturating_sub(s.applied),
-            lag_ms: if s.caught_up {
-                0
-            } else {
-                u64::try_from(s.behind_since.elapsed().as_millis()).unwrap_or(u64::MAX)
-            },
+            lag_ms: self.lag_ms(&s),
             last_error: s.last_error.clone(),
             bootstrap_phase: s.bootstrap_phase.to_owned(),
             bootstrap_bytes: s.bootstrap_bytes,
         })
+    }
+
+    /// How far behind it is, in milliseconds. A single node's replica: since it was last
+    /// caught up, 0 while it is. A cluster replica copy (D328): since its owner last said it
+    /// was caught up (`fresh_at`, since the follower started before the first), so it ages
+    /// from the moment its stream stops, as a read's bound needs.
+    fn lag_ms(&self, s: &Status) -> u64 {
+        let since = match self.upstream {
+            Upstream::Owner { .. } => s.fresh_at.unwrap_or(self.started),
+            Upstream::Url => {
+                if s.caught_up {
+                    return 0;
+                }
+                s.behind_since
+            }
+        };
+        u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// A cluster node's replica copies' `/metrics` gauges (D328), as a single node's replica
+    /// reports them, each labelled by its partition.
+    pub(crate) fn render_copies(copies: &[(&str, &Self)], out: &mut String) {
+        use std::fmt::Write;
+        let infos: Vec<(&str, proto::ReplicaInfo)> = copies
+            .iter()
+            .filter_map(|(id, r)| r.info().map(|i| (*id, i)))
+            .collect();
+        if infos.is_empty() {
+            return;
+        }
+        type Gauge = fn(&proto::ReplicaInfo) -> String;
+        let gauges: [(&str, Gauge); 4] = [
+            ("pigeonhole_replica_following", |i| {
+                u8::from(i.state == "following").to_string()
+            }),
+            ("pigeonhole_replica_applied_primary_seqno", |i| {
+                i.applied_primary_seqno.to_string()
+            }),
+            ("pigeonhole_replica_lag_commits", |i| {
+                i.lag_commits.to_string()
+            }),
+            ("pigeonhole_replica_lag_seconds", |i| {
+                (i.lag_ms as f64 / 1000.0).to_string()
+            }),
+        ];
+        for (name, value) in gauges {
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            for (id, info) in &infos {
+                let _ = writeln!(
+                    out,
+                    "{name}{{pigeonhole_partition=\"{id}\"}} {}",
+                    value(info)
+                );
+            }
+        }
+    }
+
+    /// A cluster replica copy's check of a read's bound (D328): `ReplicaBehind` unless the
+    /// copy is fresh within `max_lag_ms` on its own clock, and is following (a copy that
+    /// stopped, or is bootstrapping a first copy, serves nothing).
+    pub(crate) fn within(&self, max_lag_ms: u64) -> Result<(), ApiError> {
+        let s = self.status();
+        let lag = self.lag_ms(&s);
+        // Not while it bootstraps again: after a new history (a relocate without copy, a
+        // restore) the old copy may hold writes the new owner never had, so it isn't a
+        // stale prefix of P's history (simp724's M2 on #1989).
+        let serves = matches!(s.state, State::Following | State::Retrying) && s.fresh_at.is_some();
+        if serves && lag <= max_lag_ms {
+            return Ok(());
+        }
+        Err(ApiError::replica_behind(format!(
+            "this replica of partition {} is {lag} ms behind its owner ({}), more than the \
+             {max_lag_ms} ms the read allows: the next replica or the owner serves it",
+            self.partition().unwrap_or_default(),
+            s.state.as_str()
+        )))
+    }
+
+    /// The owner's seqno this copy has applied through, for [`SERVED_SEQNO`].
+    pub(crate) fn applied_seqno(&self) -> u64 {
+        *self.applied.borrow()
+    }
+
+    /// The partition a cluster replica copy follows, `None` for a single node's replica.
+    fn partition(&self) -> Option<&str> {
+        match &self.upstream {
+            Upstream::Owner { partition, .. } => Some(partition),
+            Upstream::Url => None,
+        }
+    }
+
+    /// A cluster replica copy's follower for `Cluster.Status` (D328).
+    pub(crate) fn copy_status(&self) -> CopyStatus {
+        let s = self.status();
+        let state = match s.state {
+            State::Starting | State::Bootstrapping | State::ReBootstrapping => {
+                proto::ReplicaState::Bootstrapping
+            }
+            State::Following => proto::ReplicaState::Following,
+            State::Retrying if s.last_error.contains(OWNER_FEED_OFF) => {
+                proto::ReplicaState::OwnerFeedOff
+            }
+            State::Retrying => proto::ReplicaState::Behind,
+            State::Stopped | State::Promoted => proto::ReplicaState::Stopped,
+        };
+        CopyStatus {
+            state,
+            owner: self
+                .now
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .0
+                .clone(),
+            applied: s.applied,
+            primary_seqno: s.primary_seqno,
+            lag_ms: self.lag_ms(&s),
+            last_error: s.last_error.clone(),
+        }
     }
 
     /// The `/metrics` gauges.
@@ -579,7 +927,27 @@ impl Replica {
     /// Starts the loop on the current runtime.
     pub(crate) fn spawn(self: &Arc<Self>, shared: Arc<Shared>) {
         let me = Arc::clone(self);
-        let task = tokio::spawn(async move { me.run(&shared).await });
+        let task = tokio::spawn(async move {
+            let on = On {
+                service: &shared.router.service,
+                idle: shared.limits.stream_idle,
+            };
+            me.run(&on).await;
+        });
+        *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+    }
+
+    /// Starts the loop on the current runtime for a cluster node's replica copy (D328):
+    /// `service` is the copy's, and `idle` the node's `--stream-idle-ms`.
+    pub(crate) fn spawn_on(self: &Arc<Self>, service: Arc<Service>, idle: Duration) {
+        let me = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let on = On {
+                service: &service,
+                idle,
+            };
+            me.run(&on).await;
+        });
         *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
     }
 
@@ -673,14 +1041,14 @@ impl Replica {
     /// from the stored token; on an expiry, bootstrap again. The pause resets once a follow
     /// has run for [`STEADY`], so an expiry right after a bootstrap (a primary that can't
     /// serve the token it just gave) pauses too rather than downloading back to back.
-    async fn run(&self, shared: &Shared) {
+    async fn run(&self, on: &On<'_>) {
         let mut stop = self.stop.subscribe();
         let mut backoff = Duration::from_millis(100);
         // A side copy a process left when it died mid-bootstrap goes now (#1752): a replica
         // that restarts with a stored token follows from it, so no bootstrap would clear it
         // until the next one. Its failure only leaves the files (every bootstrap clears
         // them first, #1748): Info says why.
-        if let Ok(part) = shared.router.service.part()
+        if let Ok(part) = on.service.part()
             && let Err(e) = clear_side(&side_path(part.db.path())).await
         {
             self.status().last_error = e;
@@ -690,7 +1058,7 @@ impl Replica {
                 return;
             }
             let began = Instant::now();
-            let halt = self.follow(shared, &mut stop).await;
+            let halt = self.follow(on, &mut stop).await;
             if began.elapsed() >= STEADY {
                 backoff = Duration::from_millis(100);
             }
@@ -698,7 +1066,7 @@ impl Replica {
                 Halt::Stopped => return,
                 Halt::Expired(why) => {
                     self.fail(State::ReBootstrapping, why);
-                    match self.bootstrap(shared, &mut stop).await {
+                    match self.bootstrap(on, &mut stop).await {
                         Ok(()) => None,
                         Err(Halt::Stopped) => return,
                         Err(Halt::Expired(e) | Halt::Failed(e)) => Some(e),
@@ -717,8 +1085,18 @@ impl Replica {
         }
     }
 
-    /// A channel to the primary.
+    /// A channel to the primary. A cluster node's replica copy (D328) looks its partition's
+    /// owner up in the node's map each time, so a break after a move or relocate finds the
+    /// new owner, and dials it as the node dials its peers.
     async fn connect(&self) -> Result<tonic::transport::Channel, String> {
+        if let Upstream::Owner { node, partition } = &self.upstream {
+            let node = node
+                .upgrade()
+                .ok_or_else(|| "the node is stopping".to_owned())?;
+            let (owner, address) = node.owner_of(partition)?;
+            *self.now.lock().unwrap_or_else(PoisonError::into_inner) = (owner, address.clone());
+            return node.peer_channel(&address).await;
+        }
         let mut endpoint = tonic::transport::Endpoint::from_shared(self.config.primary.clone())
             .map_err(|e| format!("--replica-of {}: {e}", self.config.primary))?
             .connect_timeout(Duration::from_secs(10))
@@ -734,8 +1112,41 @@ impl Replica {
             .map_err(|e| format!("connecting to {}: {e}", self.config.primary))
     }
 
-    /// `req` with the replica's bearer token.
+    /// For a replica copy (D328): why its token can't resume, when the map says partition P's
+    /// history began after the copy's bootstrap. The copy's identity row is the owner's at
+    /// the bootstrap snapshot, at epoch `e_b`, and a feed token taken at `e_b` resumes only
+    /// while P's `history_epoch <= e_b` (D317 ticket 6). A copy move keeps `history_epoch`;
+    /// a relocate without copy, a restore or a promotion sets it to the new epoch. `None`
+    /// for a single node's replica, or when either can't be read (the follow then tries).
+    async fn history_moved(&self, db: &pigeonhole::Pigeonhole) -> Option<String> {
+        let Upstream::Owner { node, partition } = &self.upstream else {
+            return None;
+        };
+        let history = node.upgrade()?.history_epoch(partition)?;
+        let db = db.clone();
+        let copy = tokio::task::spawn_blocking(move || crate::serve::cluster::identity::read(&db))
+            .await
+            .ok()?
+            .ok()??
+            .epoch;
+        (history > copy).then(|| {
+            format!(
+                "partition {partition}'s history began again at epoch {history}, after this \
+                 copy's bootstrap at epoch {copy} (a relocate without copy, or a restore): it \
+                 bootstraps again"
+            )
+        })
+    }
+
+    /// `req` with the replica's bearer token: a cluster node's own (its cluster token, id and
+    /// map version) for a replica copy (D328).
     fn request<T>(&self, message: T) -> Result<tonic::Request<T>, String> {
+        if let Upstream::Owner { node, .. } = &self.upstream {
+            let node = node
+                .upgrade()
+                .ok_or_else(|| "the node is stopping".to_owned())?;
+            return node.request(message);
+        }
         let mut req = tonic::Request::new(message);
         if let Some(token) = &self.config.token {
             let value = format!("Bearer {token}")
@@ -748,9 +1159,10 @@ impl Replica {
 
     /// Follows the primary from the stored token (bootstrapping first if there is none)
     /// until it stops.
-    async fn follow(&self, shared: &Shared, stop: &mut watch::Receiver<bool>) -> Halt {
-        // A replica is a single node's mode: its service always serves the database.
-        let db = match shared.router.service.part() {
+    async fn follow(&self, on: &On<'_>, stop: &mut watch::Receiver<bool>) -> Halt {
+        // The replica's service (a single node's, or a cluster node's replica copy) always
+        // serves its database.
+        let db = match on.service.part() {
             Ok(p) => p.db.clone(),
             Err(e) => return Halt::Failed(e.message),
         };
@@ -773,7 +1185,7 @@ impl Replica {
                 // `phdb serve` checked at start that the file was empty or a replica's.
                 Ok(Ok(_)) => {
                     self.set_state(State::Bootstrapping);
-                    if let Err(halt) = self.bootstrap(shared, stop).await {
+                    if let Err(halt) = self.bootstrap(on, stop).await {
                         return halt;
                     }
                 }
@@ -781,6 +1193,17 @@ impl Replica {
                 Err(e) => return Halt::Failed(format!("reading the replica's state: {e}")),
             }
         };
+        // A replica copy whose partition began another history since its bootstrap (a
+        // relocate without copy, a restore): its token can't resume there, and the owner
+        // can't say so, as it can't tell which partition another database's token was for.
+        if let Some(why) = self.history_moved(&db).await {
+            // Its freshness was of the old history's: none until the new copy is followed.
+            let mut s = self.status();
+            s.fresh_at = None;
+            s.pending_fresh.clear();
+            drop(s);
+            return Halt::Expired(why);
+        }
         let channel = match self.connect().await {
             Ok(c) => c,
             Err(e) => return Halt::Failed(e),
@@ -821,13 +1244,14 @@ impl Replica {
             let batch = match next {
                 Ok(Some(b)) => b,
                 Ok(None) => {
-                    return Halt::Failed(format!("{} ended the stream", self.config.primary));
+                    return Halt::Failed(format!("{} ended the stream", self.primary()));
                 }
                 Err(status) => return halt_of(&status),
             };
             {
                 let mut s = self.status();
                 s.primary_seqno = s.primary_seqno.max(batch.primary_seqno);
+                s.heard(batch.primary_seqno, Instant::now());
             }
             let quiet = batch.events.is_empty();
             for bytes in &batch.events {
@@ -840,7 +1264,7 @@ impl Replica {
                     if let Err(halt) = self.apply_run(&db, &mut run).await {
                         return halt;
                     }
-                    if let Err(halt) = self.apply_catalog(shared, event).await {
+                    if let Err(halt) = self.apply_catalog(on, event).await {
                         return halt;
                     }
                     continue;
@@ -936,10 +1360,9 @@ impl Replica {
 
     /// Applies a catalog change, then drops the service's cached table handles: a table
     /// dropped (or dropped and made again) on the primary must not serve from its old one.
-    async fn apply_catalog(&self, shared: &Shared, event: ReplicatedEvent) -> Result<(), Halt> {
+    async fn apply_catalog(&self, on: &On<'_>, event: ReplicatedEvent) -> Result<(), Halt> {
         let applied = event.primary_seqno();
-        let db = shared
-            .router
+        let db = on
             .service
             .part()
             .map_err(|e| Halt::Failed(e.message))?
@@ -948,7 +1371,7 @@ impl Replica {
         let outcome = tokio::task::spawn_blocking(move || db.apply_catalog(&event, event.token()))
             .await
             .map_err(|e| Halt::Failed(format!("applying a catalog change: {e}")));
-        shared.router.service.tables_changed();
+        on.service.tables_changed();
         outcome?.map_err(|e| applying("applying a catalog change", &e))?;
         let applied = applied.max(self.status().applied);
         self.set_applied(applied);
@@ -957,12 +1380,8 @@ impl Replica {
 
     /// Downloads a bootstrap copy into a side file, makes it a replica at the copy's token,
     /// and swaps it in for the served database. The old copy serves until the swap.
-    async fn bootstrap(
-        &self,
-        shared: &Shared,
-        stop: &mut watch::Receiver<bool>,
-    ) -> Result<(), Halt> {
-        let service = &shared.router.service;
+    async fn bootstrap(&self, on: &On<'_>, stop: &mut watch::Receiver<bool>) -> Result<(), Halt> {
+        let service = on.service;
         let db = service
             .part()
             .map_err(|e| Halt::Failed(e.message))?
@@ -976,7 +1395,7 @@ impl Replica {
         // stop mid-download leaves a partial side file, which this removes too.
         clear_side(&side).await.map_err(Halt::Failed)?;
         let token = tokio::select! {
-            r = self.download(&side, shared.limits.stream_idle) => r.map_err(Halt::Failed)?,
+            r = self.download(&side, on.idle) => r.map_err(Halt::Failed)?,
             _ = stop.changed() => return Err(Halt::Stopped),
         };
         // From here the served engine may be the new copy, whose applied seqno can be below
@@ -984,6 +1403,8 @@ impl Replica {
         // the value never exceeds what the served engine applied (simp724's N1 on #1594).
         // The follow after the swap reads the copy's own from its stored state.
         self.set_applied(0);
+        // Another copy, maybe of another history: the old frontiers name its seqnos.
+        self.status().pending_fresh.clear();
         let swap_side = side.clone();
         self.set_bootstrap_phase("opening the copy");
         let opened = tokio::task::spawn_blocking(move || {
@@ -1023,6 +1444,15 @@ impl Replica {
         // nothing cached of the old one may serve again.
         service.engine_replaced();
         swapped.map_err(|e| Halt::Failed(format!("bootstrap: {e}")))?;
+        #[cfg(test)]
+        BOOTSTRAPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                service
+                    .part()
+                    .map_or_else(|_| PathBuf::new(), |p| p.db.path().to_path_buf()),
+            );
         self.unconfirmed.store(true, Ordering::Relaxed);
         let mut s = self.status();
         s.caught_up = false;
@@ -1039,7 +1469,7 @@ impl Replica {
     /// copy's feed token.
     async fn download(&self, side: &Path, idle: Duration) -> Result<Vec<u8>, String> {
         use super::download::{Break, Failed, Step, Waits, admin, download};
-        let primary = &self.config.primary;
+        let primary = &self.primary();
         self.set_bootstrap("connecting", 0);
         let first = admin(self.connect().await?);
         let mut sink = SideFile::create(side).await?;
@@ -1088,7 +1518,11 @@ impl Replica {
                 backup_id: String::new(),
                 offset: 0,
                 replica: true,
-                partition: String::new(),
+                // A replica copy's: the partition, at its owner (D328).
+                partition: match &self.upstream {
+                    Upstream::Url => String::new(),
+                    Upstream::Owner { partition, .. } => partition.clone(),
+                },
             },
             &mut sink,
             waits,
@@ -1221,6 +1655,62 @@ fn side_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn status() -> Status {
+        Status {
+            state: State::Following,
+            applied: 0,
+            primary_seqno: 0,
+            caught_up: false,
+            behind_since: Instant::now(),
+            last_error: String::new(),
+            bootstrap_phase: "",
+            bootstrap_bytes: 0,
+            fresh_at: None,
+            pending_fresh: std::collections::VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn a_copy_under_sustained_writes_is_fresh_as_of_the_message_it_applied_through() {
+        // D330's M2 (simp724's note on #1974): an owner under load rarely sends
+        // `caught_up`, but each message names its durable frontier. Once the copy has
+        // applied through a message's frontier, it's fresh as of that message's arrival.
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut s = status();
+        s.heard(100, at(0));
+        s.heard(250, at(10));
+        assert_eq!(s.fresh_at, None, "nothing applied yet");
+        s.applied = 120;
+        s.settle_fresh();
+        assert_eq!(
+            s.fresh_at,
+            Some(at(0)),
+            "through the first message's frontier"
+        );
+        s.heard(400, at(20));
+        s.applied = 260;
+        s.settle_fresh();
+        assert_eq!(s.fresh_at, Some(at(10)));
+        // The same frontier again moves the pending message's arrival to the later one, and
+        // an idle owner's message, whose frontier the copy already holds, makes it fresh as
+        // of that message's arrival at once (simp724's M1 on #1989).
+        s.heard(400, at(25));
+        assert_eq!(s.pending_fresh.len(), 1);
+        s.applied = 400;
+        s.heard(400, at(30));
+        assert_eq!(s.fresh_at, Some(at(30)), "the latest message naming 400");
+        s.heard(400, at(35));
+        assert_eq!(s.fresh_at, Some(at(35)), "an idle owner's heartbeat");
+        s.heard(401, at(40));
+        s.applied = 401;
+        s.settle_fresh();
+        assert_eq!(s.fresh_at, Some(at(40)));
+        assert!(s.pending_fresh.is_empty());
+    }
+
     #[test]
     fn a_replica_config_never_formats_its_token() {
         let c = super::ReplicaConfig {

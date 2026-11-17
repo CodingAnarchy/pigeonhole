@@ -71,6 +71,58 @@ impl Router {
         Ok((parts.len() > 1).then_some(parts))
     }
 
+    /// The `memory_tool_fields` gate (#1915 PR 3b, the coordinator's call): a memory call
+    /// that relies on those fields needs every node owning a partition it touches to have
+    /// the feature. One that answers without it refuses the call (`FailedPrecondition`
+    /// naming it), since an older build would ignore `supersedes` or leave a reply field
+    /// empty, a wrong answer rather than a thinner one; one that doesn't answer is
+    /// unavailable (`PartitionUnavailable`), as for any call to it. `Ok` on a single node.
+    /// The peers are asked within the call's `deadline` (`DeadlineExceeded` past it), so a
+    /// `/mcp` message still holds its place for its deadline and one op at most.
+    pub(crate) async fn memory_fields(
+        &self,
+        op: &ServiceOp,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ApiError> {
+        let Some(cluster) = &self.cluster else {
+            return Ok(());
+        };
+        let routes = cluster.node.routes();
+        let Some(routes) = routes.as_ref() else {
+            return Ok(());
+        };
+        let (namespaces, what): (Vec<String>, &str) = match op {
+            ServiceOp::Remember(r) => (vec![r.namespace.clone()], "a remember with `supersedes`"),
+            ServiceOp::Recall(r) => (r.namespaces.clone(), "this recall"),
+            ServiceOp::MarkUsed(r) => (id_namespaces(&r.ids)?, "this mark-used"),
+            ServiceOp::Forget(r) => (id_namespaces(&r.ids)?, "this forget"),
+            _ => return Ok(()),
+        };
+        let parts = memory_partitions(routes, namespaces.iter().map(String::as_str))?;
+        let owners: Vec<(String, String)> = parts
+            .keys()
+            .filter_map(|p| routes.owner(p).map(|o| (o.node.clone(), o.address.clone())))
+            .collect();
+        let down = tokio::time::timeout_at(
+            deadline,
+            cluster
+                .node
+                .owners_keep(owners.into_iter(), super::MEMORY_TOOL_FIELDS_FEATURE, what),
+        )
+        .await
+        .map_err(|_| ApiError::deadline_exceeded())??;
+        if let Some(node) = down.first() {
+            let p = parts
+                .keys()
+                .find(|p| routes.owner(p).is_some_and(|o| o.node == *node))
+                .map_or("", String::as_str);
+            return Err(ApiError::partition_unavailable(format!(
+                "partition {p} isn't reachable: its node {node} didn't answer"
+            )));
+        }
+        Ok(())
+    }
+
     /// A memory call across partitions (#1915): a recall in steps, or a `MarkUsed` or
     /// `Forget` split by partition.
     pub(crate) async fn fan_memory(
@@ -244,10 +296,13 @@ impl Router {
                 )),
             })
             .await?;
-        let (hits, _stats) =
+        // `truncated` is this node's: the merged ranking's budget cut, not a part's (the
+        // parts send pools and bodies, never cut answers).
+        let (hits, stats) =
             ranking.finish(RecallBodies::merge(bodies), k, Some(budget), r.with_signals);
         let reply = proto::RecallResponse {
             hits: hits.into_iter().map(crate::serve::memory::hit).collect(),
+            truncated: stats.truncated,
         };
         self.service
             .fanout_reply(
@@ -345,6 +400,7 @@ impl Router {
         });
         let answers = join_all(calls).await;
         let mut total = 0u64;
+        let mut missing = Vec::new();
         let mut applied = Vec::new();
         let mut unknown = Vec::new();
         let mut failed = None;
@@ -352,10 +408,12 @@ impl Router {
             match answer {
                 Ok(ServiceReply::Forget(f)) => {
                     total += f.forgotten;
+                    missing.extend(f.missing);
                     applied.push(format!("{p} ({})", f.forgotten));
                 }
                 Ok(ServiceReply::MarkUsed(m)) => {
                     total += m.marked;
+                    missing.extend(m.missing);
                     applied.push(format!("{p} ({})", m.marked));
                 }
                 Ok(_) => return Err(ApiError::internal("a memory write answered another reply")),
@@ -387,9 +445,15 @@ impl Router {
             return Err(e);
         }
         Ok(if forget {
-            ServiceReply::Forget(proto::ForgetResponse { forgotten: total })
+            ServiceReply::Forget(proto::ForgetResponse {
+                forgotten: total,
+                missing,
+            })
         } else {
-            ServiceReply::MarkUsed(proto::MarkUsedResponse { marked: total })
+            ServiceReply::MarkUsed(proto::MarkUsedResponse {
+                marked: total,
+                missing,
+            })
         })
     }
 

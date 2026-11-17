@@ -1,0 +1,2 @@
+### Changed
+- Text search: a phrase search reads its terms' positions as one join in document order. It no longer loads the rarest word's positions into memory or walks a common word's whole row when the phrase's other word is rare. On a 100,000-document index, a phrase of one common and one rare word went from 7.9 ms to 0.6 ms, and two common words from 57 ms to 23 ms (one laptop). Results and scores are unchanged (#1586).

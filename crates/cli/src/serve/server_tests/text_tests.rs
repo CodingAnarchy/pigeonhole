@@ -1,5 +1,30 @@
 use super::*;
 
+/// `texts::STEP_DELAY_MS` is process-wide: a test that slows rebuilds holds this from setting
+/// it until it resets it, so another test's reset can't speed its rebuild past its fence or
+/// close (#1995).
+static STEP_DELAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Rebuilds wait 5 ms after each document until this is dropped.
+struct SlowSteps {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+fn slow_steps() -> SlowSteps {
+    let held = STEP_DELAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    SlowSteps { _held: held }
+}
+
+impl Drop for SlowSteps {
+    // Before the lock is released: the field drops after this.
+    fn drop(&mut self) {
+        crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    }
+}
+
 // ---- Text (D313 ticket 7c, D309, ICR 0105) ----
 
 fn text_hits(r: &Json) -> Vec<String> {
@@ -212,6 +237,91 @@ fn a_text_index_is_created_written_searched_rebuilt_and_verified() {
     assert_eq!(&hits[0].id[..], b"doc:1");
 }
 
+/// #1916 (the coordinator's option (a)): a table a text index reads can't be dropped
+/// while the index is there. The refusal names every such index; once they're dropped, the
+/// table drops. Another table, and the index's own table, drop as before.
+#[test]
+fn a_text_index_s_source_table_is_refused_a_drop_naming_the_index() {
+    let s = Server::start("", limits());
+    for name in ["tx", "ty"] {
+        let spec = json!({"name": name, "source_table": "t", "source_family": "f",
+                          "source_qualifier": b64(b"body")});
+        assert_eq!(s.rpc("Text/CreateIndex", &spec, None).0, 200);
+    }
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (409, Some("FailedPrecondition")),
+        "{e}"
+    );
+    let message = e["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("\"tx\"") && message.contains("\"ty\""),
+        "{e}"
+    );
+    // Nothing was dropped: the index still writes through to its source.
+    let (status, e) = s.rpc(
+        "Text/Put",
+        &json!({"index": "tx", "id": b64(b"doc"), "text": "still here"}),
+        None,
+    );
+    assert_eq!(status, 200, "{e}");
+    for name in ["tx", "ty"] {
+        let (status, e) = s.rpc("Schema/DropTable", &json!({"name": name}), None);
+        assert_eq!(status, 200, "{name}: {e}");
+    }
+    let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+    assert_eq!(status, 200, "{e}");
+}
+
+/// #1916: a drop of a table that a `Text.CreateIndex` in flight reads is refused too, so the
+/// create can't finish over a dropped (or re-made) source.
+#[test]
+fn a_drop_of_a_source_table_while_an_index_over_it_is_created_is_refused() {
+    let s = Server::start("", limits());
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    crate::serve::texts::HOLD_CREATE.lock().unwrap().push((
+        "tx_1916_held".into(),
+        Arc::clone(&reached),
+        Arc::clone(&release),
+    ));
+    std::thread::scope(|scope| {
+        let creating = scope.spawn(|| {
+            let spec = json!({"name": "tx_1916_held", "source_table": "t",
+                              "source_family": "f", "source_qualifier": b64(b"body")});
+            s.rpc("Text/CreateIndex", &spec, None)
+        });
+        reached.wait();
+        let (status, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+        release.wait();
+        crate::serve::texts::HOLD_CREATE
+            .lock()
+            .unwrap()
+            .retain(|(n, _, _)| n != "tx_1916_held");
+        assert_eq!(
+            (status, e["code"].as_str()),
+            (409, Some("FailedPrecondition")),
+            "{e}"
+        );
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("being created"),
+            "{e}"
+        );
+        let (status, e) = creating.join().unwrap();
+        assert_eq!(status, 200, "{e}");
+    });
+    // Built, it's named by the refusal as any index is.
+    let (_, e) = s.rpc("Schema/DropTable", &json!({"name": "t"}), None);
+    assert!(
+        e["message"].as_str().unwrap_or("").contains("tx_1916_held"),
+        "{e}"
+    );
+}
+
 /// #1588: dropping a text index's table evicts its cached handle. A search then answers
 /// `TableNotFound`, and a new index made under the name (with `if_missing`, which a cached
 /// handle used to answer at once) is the one served.
@@ -257,4 +367,259 @@ fn dropping_a_text_index_s_table_evicts_its_handle() {
     put(b"new", "the new meeting");
     let (status, r) = search();
     assert_eq!((status, text_hits(&r)), (200, vec![b64(b"new")]), "{r}");
+}
+
+// ---- A rebuild a fence stops, and its resume (#1756) ----
+
+/// The database's source table `t` (family `f`, column `body`) with `n` documents, and the
+/// text index `tx` over it (its backfill indexes them, so a rebuild visits each and changes
+/// nothing).
+fn indexed(db: &Pigeonhole, n: usize) {
+    let table = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..n {
+        table
+            .mutate(format!("doc:{i:04}").as_bytes())
+            .put("f", b"body", b"meeting notes")
+            .commit()
+            .unwrap();
+    }
+    drop(
+        pigeonhole_text::Index::create(
+            db,
+            "tx",
+            pigeonhole_text::Source::new(&table, "f", b"body"),
+            pigeonhole_text::IndexOptions::new(),
+        )
+        .unwrap(),
+    );
+}
+
+/// A partition service on `s`'s database behind `gate`, as a cluster node's partition is
+/// (its own texts, the node's rebuild slot), resuming a pending rebuild as an open does.
+fn gated_part(s: &Server, gate: &Arc<crate::serve::gate::WriteGate>) -> Service {
+    let service = &s.shared.router.service;
+    let part = service.for_partition(
+        service.part().unwrap().db.clone(),
+        "p1",
+        Arc::clone(gate),
+        PartitionConfig::new(crate::serve::backup::Backups::new(None, 1).unwrap()),
+    );
+    // As a node's open does.
+    part.resume_text_rebuilds();
+    part
+}
+
+/// Waits (30 s at most) until no rebuild of `tx` is pending.
+fn resumed(db: &Pigeonhole) {
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while !pigeonhole_text::Index::pending_rebuilds(db)
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < until,
+            "the stopped rebuild never resumed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let v = pigeonhole_text::Index::open(db, "tx")
+        .unwrap()
+        .verify()
+        .unwrap();
+    assert!(v.is_consistent(), "{v:?}");
+}
+
+#[test]
+fn a_fence_stops_a_text_rebuild_at_its_next_document_and_it_resumes_once_unfenced() {
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    let part = gated_part(&s, &gate);
+    let slow = slow_steps();
+    // The fence lands mid-rebuild (400 documents at 5 ms each).
+    let fenced_at = {
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            gate.fence();
+            std::time::Instant::now()
+        })
+    };
+    let e = s
+        .block_on(part.call(
+            ServiceOp::TextRebuild(proto::TextIndexRequest { index: "tx".into() }),
+            &Caller::anonymous(),
+            None,
+        ))
+        .unwrap_err();
+    let answered = std::time::Instant::now();
+    let fenced_at = fenced_at.join().unwrap();
+    drop(slow);
+    // Within a document or two of the fence, not the whole rebuild (or the fence's drain).
+    assert!(
+        answered.saturating_duration_since(fenced_at) < Duration::from_secs(1),
+        "{:?} after the fence",
+        answered.saturating_duration_since(fenced_at)
+    );
+    assert_eq!(e.code, "Fenced", "{e:?}");
+    assert!(e.message.contains("stopped after"), "{e:?}");
+    assert!(e.message.contains("resumes on its own"), "{e:?}");
+    assert_eq!(
+        pigeonhole_text::Index::pending_rebuilds(&db).unwrap(),
+        ["tx"],
+        "the cursor stays"
+    );
+    // Still fenced: nothing resumes (a resume would write past the fence).
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        pigeonhole_text::Index::pending_rebuilds(&db).unwrap(),
+        ["tx"]
+    );
+    gate.unfence();
+    resumed(&db);
+    part.part().unwrap().close_users();
+}
+
+#[test]
+fn a_close_stops_a_text_rebuild_and_the_next_open_resumes_it() {
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    let part = gated_part(&s, &gate);
+    let slow = slow_steps();
+    let texts = Arc::clone(&part.part().unwrap().texts);
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let at = std::time::Instant::now();
+        texts.close();
+        at.elapsed()
+    });
+    let e = s
+        .block_on(part.call(
+            ServiceOp::TextRebuild(proto::TextIndexRequest { index: "tx".into() }),
+            &Caller::anonymous(),
+            None,
+        ))
+        .unwrap_err();
+    let took = closer.join().unwrap();
+    drop(slow);
+    // The close no longer waits for the whole rebuild.
+    assert!(took < Duration::from_secs(1), "the close took {took:?}");
+    // A cluster partition's close answers `PartitionUnavailable` (D317 ticket 6), carrying
+    // what the rebuild did.
+    assert_eq!(e.code, "PartitionUnavailable", "{e:?}");
+    assert!(e.message.contains("stopped after"), "{e:?}");
+    assert_eq!(
+        pigeonhole_text::Index::pending_rebuilds(&db).unwrap(),
+        ["tx"]
+    );
+    // The partition opened again (a restart, or a move's open): its pending rebuild resumes.
+    let again = gated_part(&s, &gate);
+    resumed(&db);
+    again.part().unwrap().close_users();
+}
+
+/// Leaves a rebuild of index `name` (over `t`) stopped at once: an empty cursor, pending.
+fn stopped(db: &Pigeonhole, name: &str) {
+    let index = pigeonhole_text::Index::open(db, name).unwrap();
+    let r = index
+        .rebuild_with(|_| std::ops::ControlFlow::Break(()))
+        .unwrap();
+    assert!(r.stopped);
+}
+
+#[test]
+fn a_pending_rebuild_that_cant_resume_doesnt_hold_back_the_others() {
+    // ai1249's must on #1975: a pending index whose resume fails (here, a repair a crash left:
+    // `Busy`) is passed over by the run, and the next one still resumes.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 50);
+    let t = db.table("t").unwrap().open().unwrap();
+    for name in ["ta", "tb"] {
+        drop(
+            pigeonhole_text::Index::create(
+                &db,
+                name,
+                pigeonhole_text::Source::new(&t, "f", b"body"),
+                pigeonhole_text::IndexOptions::new(),
+            )
+            .unwrap(),
+        );
+        stopped(&db, name);
+    }
+    // `ta` (first by name) has its repair flag set, as a crashed repair leaves it.
+    db.table("ta")
+        .unwrap()
+        .open()
+        .unwrap()
+        .mutate(b"G")
+        .put("meta", b"repair", b"")
+        .commit()
+        .unwrap();
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    let part = gated_part(&s, &gate);
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let pending = pigeonhole_text::Index::pending_rebuilds(&db).unwrap();
+        if pending == ["ta"] {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "tb never resumed: {pending:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    part.part().unwrap().close_users();
+}
+
+#[test]
+fn a_clients_rebuild_takes_the_slot_from_a_resume_and_starts_over() {
+    // ai1249's should 2 on #1975: a client's `Text.Rebuild` while a resume holds the node's
+    // rebuild slot waits for the resume to stop at its next document, then rebuilds from the
+    // top (all 400 documents), instead of `Overloaded`.
+    let s = Server::start("", limits());
+    let db = s.shared.router.service.part().unwrap().db.clone();
+    indexed(&db, 400);
+    stopped(&db, "tx");
+    let slow = slow_steps();
+    let gate = crate::serve::gate::WriteGate::opened("p1", false, Default::default());
+    gate.renew(u64::MAX);
+    let part = gated_part(&s, &gate);
+    // The resume is under way (400 documents at 5 ms each).
+    std::thread::sleep(Duration::from_millis(300));
+    let yielded = crate::serve::texts::YIELDED.load(Ordering::SeqCst);
+    let r = s.block_on(part.call(
+        ServiceOp::TextRebuild(proto::TextIndexRequest { index: "tx".into() }),
+        &Caller::anonymous(),
+        None,
+    ));
+    drop(slow);
+    let Ok(service::ServiceReply::TextRebuild(r)) = r else {
+        panic!("{r:?}");
+    };
+    assert_eq!(r.documents, 400, "{r:?}");
+    // The resume stopped for it, rather than finishing first (ai1249's S1 on #1996: a time
+    // bound barely told the two apart). Only this test makes a resume yield.
+    assert!(
+        crate::serve::texts::YIELDED.load(Ordering::SeqCst) > yielded,
+        "the resume finished instead of yielding the slot"
+    );
+    assert!(
+        pigeonhole_text::Index::pending_rebuilds(&db)
+            .unwrap()
+            .is_empty()
+    );
+    part.part().unwrap().close_users();
 }
