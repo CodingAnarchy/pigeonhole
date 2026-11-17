@@ -9895,6 +9895,19 @@ impl ShardState {
         if c.refused.is_some() {
             cross.refused_rounds.fetch_add(1, Ordering::Relaxed);
         }
+        if gave_up && c.failed.is_none() && c.refused.is_none() && c.external.is_some() {
+            // An external transaction whose every share logged its PREPARE (D329), as the
+            // close gives up: it is in doubt, and the next open finds it so. An abort here
+            // would write no type 6 (the instance is going), so the caller would hear `Closed`
+            // for a share that comes back in doubt (perf2's S4 on #2000). The caller hears
+            // `OutcomeUnknown` instead, and decides it after the reopen; nothing is sent, and
+            // the coordination ends here.
+            if let Some(reply) = c.reply.take() {
+                reply.notify(Err(Error::OutcomeUnknown));
+            }
+            self.coord.remove(&seqno);
+            return;
+        }
         if gave_up && c.failed.is_none() {
             // The close gave up (a shard died) or reported: decide abort, so a commit whose
             // caller hears `Closed` from such a close is never committed (no COMMIT record is
