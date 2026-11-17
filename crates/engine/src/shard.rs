@@ -10072,6 +10072,10 @@ impl ShardState {
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         self.shared.clock.release(abort_seqno, &self.shared.shm);
+        // As every release site does (`complete`, `finish_applied`): a commit right behind
+        // the abort waits for this seqno to pass, and on an idle database nothing else
+        // would wake it (perf2's M2 on #2000; E1's condition 3).
+        self.shared.wake_visible();
         let Some(c) = self.coord.get_mut(&id) else {
             return;
         };
