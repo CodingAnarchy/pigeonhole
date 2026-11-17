@@ -787,12 +787,18 @@ fn text_pack_waits_out_a_fence() {
 /// A server with `--text-pack` whose pack of `tx` (400 documents, two chunks) has done its
 /// first chunk and waits 1.5 s in its step before the second: the pack holds the node's
 /// slot. The steps' delay is back to 0 on return (only the step in flight still waits), so
-/// what the test runs next isn't slowed. Hold `_slow` until the pack's yield is checked.
-fn packing() -> (Server, Pigeonhole, SlowSteps) {
+/// what the test runs next isn't slowed.
+///
+/// Also the count of packs that had yielded when this took the steps' lock: hold the
+/// `SlowSteps` until the pack's yield is checked against it. The two tests that make a pack
+/// yield both come through here, so one's yield can't pass for the other's (cli692 on
+/// #2018).
+fn packing() -> (Server, Pigeonhole, SlowSteps, usize) {
     let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
     let db = s.shared.router.service.part().unwrap().db.clone();
     indexed(&db, 400);
     let slow = slow_steps_ms(1500);
+    let yielded = crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst);
     s.shared.router.service.resume_text_rebuilds();
     s.shared.router.service.resume_text_rebuilds();
     let until = std::time::Instant::now() + Duration::from_secs(30);
@@ -804,13 +810,12 @@ fn packing() -> (Server, Pigeonhole, SlowSteps) {
     std::thread::sleep(Duration::from_millis(100));
     crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
     assert!(packed_postings(&db) < 800, "the pack finished in one chunk");
-    (s, db, slow)
+    (s, db, slow, yielded)
 }
 
 #[test]
 fn a_clients_text_rebuild_takes_the_slot_from_a_pack() {
-    let yielded = crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst);
-    let (s, db, slow) = packing();
+    let (s, db, slow, yielded) = packing();
     // It waits for the pack to stop at its next chunk, as it does for a resume, rather than
     // being refused.
     let r = s.block_on(s.shared.router.service.call(
@@ -823,7 +828,7 @@ fn a_clients_text_rebuild_takes_the_slot_from_a_pack() {
     };
     assert_eq!(r.documents, 400, "{r:?}");
     // The pack stopped for it, rather than finishing first. Only this test and the next make
-    // a pack yield, and they run one at a time (`slow`).
+    // a pack yield, one at a time, each counting from where it took the lock (`packing`).
     assert!(
         crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst) > yielded,
         "the pack finished instead of yielding the slot"
@@ -837,8 +842,7 @@ fn a_clients_text_rebuild_takes_the_slot_from_a_pack() {
 /// cli692's S1 on #2018: a stopped rebuild's resume doesn't wait behind a pack.
 #[test]
 fn a_stopped_rebuilds_resume_takes_the_slot_from_a_pack() {
-    let yielded = crate::serve::texts::PACK_YIELDED.load(Ordering::SeqCst);
-    let (s, db, slow) = packing();
+    let (s, db, slow, yielded) = packing();
     // A second index over the same source with a rebuild pending from the top, as a
     // cluster's create leaves one.
     let table = db.table("t").unwrap().open().unwrap();
