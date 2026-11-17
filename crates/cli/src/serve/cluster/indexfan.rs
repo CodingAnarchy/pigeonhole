@@ -99,6 +99,8 @@ impl Router {
         }
         let routes = reach.routes()?;
         let parts = partitions(&routes, &r.index, &r.id_prefix)?;
+        // A placement lists its partitions (validated), and a prefix meets at least one.
+        debug_assert!(!parts.is_empty(), "index {:?} has no partitions", r.index);
         // The request's holding (#1715): the reply, and one part's answer, each at most `k`
         // hits, estimated as a default read page (the reply's charge is then fitted to its
         // size). Each further concurrent part runs on a spare share.
@@ -166,6 +168,9 @@ impl Router {
         };
         let routes = reach.routes()?;
         let parts = partitions(&routes, &index, b"")?;
+        // A placement lists its partitions (validated), so every check has a part.
+        debug_assert!(!parts.is_empty(), "index {index:?} has no partitions");
+        let vector_kind = matches!(part, forward_request::Op::VectorVerify(_));
         let holding = self
             .service
             .fanout_hold(VERIFY_SHARE.saturating_mul(2), reach.within()?)
@@ -181,12 +186,13 @@ impl Router {
             self.service.limits().fanout_forwards,
             || self.service.fanout_try_hold(VERIFY_SHARE),
             |i, answer| match answer.map_err(|e| on(&parts[i], e))?.0 {
-                ServiceReply::VectorVerify(a) => {
+                // Each part answers the kind asked, or the call fails (simp724's N1 on #2016).
+                ServiceReply::VectorVerify(a) if vector_kind => {
                     vector.vectors += a.vectors;
                     vector.lists += a.lists;
                     Ok(())
                 }
-                ServiceReply::TextVerify(a) => {
+                ServiceReply::TextVerify(a) if !vector_kind => {
                     text.documents += a.documents;
                     text.terms += a.terms;
                     text.postings += a.postings;
@@ -198,9 +204,10 @@ impl Router {
             },
         )
         .await?;
-        let reply = match part {
-            forward_request::Op::VectorVerify(_) => ServiceReply::VectorVerify(vector),
-            _ => ServiceReply::TextVerify(text),
+        let reply = if vector_kind {
+            ServiceReply::VectorVerify(vector)
+        } else {
+            ServiceReply::TextVerify(text)
         };
         self.service
             .fanout_reply(caller, reply, holding, reach.within()?)
