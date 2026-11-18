@@ -239,8 +239,11 @@ pub(crate) fn move_range(m: &RangeMove) -> Result<(Vec<u8>, Option<Vec<u8>>), Re
     Ok((start.unwrap_or_default(), end))
 }
 
-/// A table's ranges in key order, each `(start, end, partition)`: `end` `None` for the last.
-pub(crate) fn table_ranges(t: &TablePlacement) -> Vec<(Vec<u8>, Option<Vec<u8>>, &str)> {
+/// One range of a table, `(start, end, partition)`: `end` `None` for the last.
+pub(crate) type PlacedRange<'t> = (Vec<u8>, Option<Vec<u8>>, &'t str);
+
+/// A table's ranges in key order.
+pub(crate) fn table_ranges(t: &TablePlacement) -> Vec<PlacedRange<'_>> {
     let keys: Vec<Vec<u8>> = t
         .splits
         .iter()

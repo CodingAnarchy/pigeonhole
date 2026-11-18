@@ -697,3 +697,45 @@ Its steps:
 **`phdb cluster status`** adds `writer`, `writer_term`, `writer_lease_remaining_ms` (the writer's own) and `failover`.
 
 **Not yet:** partition failover, its events and metrics (D330 PR 2), and the guide's failure model and timeline (PR 3).
+
+## D331 PR 2: range moves in the map, and the range gates (1.3.0, #1499)
+**The map records each range move in flight, and every partition a move names gates the range's calls.** No data moves yet: the copy is PR 4, and the driver and CLI are PR 5. Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ClusterMap.moves = 14`, repeated `RangeMove`: `{ id, kind, table, start, end, from, to, phase, snapshot_seqno, final_seqno, handed_over_version, handed_over_term }`. `start` and `end` are `SplitKey`s; an absent start is the table's first key, and an absent end is the table's end.
+- `MoveKind`: `RANGE = 1`, `PARTITION = 2` (a split), `NODE = 3` (D332's whole-partition relocation, refused until D332 validates it). `MERGE = 4` comes with PR 6.
+- `MovePhase`: `COPYING = 1`, `CATCHING_UP = 2`, `HANDING_OVER = 3`, `HANDED_OVER = 4`, `CLEANING = 5`.
+- `FenceReason.FENCE_REASON_RANGE_MOVING = 4`: a write to a range being handed over. It's reported per move (`MoveStatus.fenced`), never as the partition's `fence_reason`.
+- `LocalPartition.moves = 27` (repeated `MoveStatus { id, table, phase, source, fenced, serving }`) and `.move_follower_lag_ms = 28` (0 until PR 4's follower).
+- **Map feature `range_moves`:** a map gets its first move only once every node reports it.
+
+**Validation** (`map::validate`, every map, forced ones included):
+- a move names a placed table, not in a co-location group;
+- **no index follows the table**: a text index's postings and a vector index's lists hold ids from both sides of any range (coordinator, 2026-11-18; #2066 lifts it);
+- two listed, different partitions, and a non-empty range;
+- before HANDED_OVER the range lies inside one range of its source, and from HANDED_OVER inside one of its target;
+- **a partition is in at most one move**, as source or target;
+- `final_seqno` is set only from HANDING_OVER on, and the hand-over pair only from HANDED_OVER on, never after the map itself.
+
+**Changes** (`map::validate_change`, at the writer):
+- A move appears at COPYING, keeps its table, range, partitions and kind, and goes forward one phase per map. It may be removed before HANDED_OVER (an abort) and from CLEANING (done), never at HANDED_OVER.
+- **The HANDING_OVER → HANDED_OVER step is the one reshape a table placement takes:** the range's ends become split keys where they aren't, and the range goes to the target. The same map:
+  - names itself as the hand-over (`handed_over_term`, `handed_over_version` = its own `(writer_term, map_version)`);
+  - raises the source's epoch by one on the same node, keeping its `history_epoch`, so its replica copies and feed tokens go on.
+
+**The range gate** (a partition's state beside its `WriteGate`, derived at every map install and at open):
+- One load per call while no move names the partition. Otherwise a cold walk of the keys the call names (`ServiceOp::touches`).
+- **The source, at HANDING_OVER:** a write touching the range answers `Fenced`, retry-safe (unlike the operator's fence). Reads go on.
+- **The source, from HANDED_OVER:** any call touching the range answers `WrongPartition` at the node's map version, whoever sent it, and the sender pulls the newer map.
+- **The target, until CLEANING:** any call touching the range answers `PartitionUnavailable`, retry-safe. The writer sets CLEANING only once the never-both rule holds (PR 5).
+- **Transactions on the source:** a commit that writes, of a transaction whose snapshot is below the fence's seqno or the latest hand-over's, answers `Fenced` or `Conflict`, retry-safe, whatever it read. Serve doesn't see a transaction's read set. A read-only commit passes, since its snapshot is consistent on its own.
+
+**The source's hand-over** (on the node holding it, at the HANDED_OVER map's install):
+1. It ends its lease: a lapse, so D329 read holds under the old term are lost.
+2. It records the range in its file: `__phdb_cluster`, family `moved`, row `moved/<move id>`, with the table, range, hand-over pair and its visible seqno. The row is a plain logged write, so its replica copies carry it.
+3. It writes the new epoch into its identity row (until D331 only `Stamp` raised an epoch).
+4. It asks for its lease at the new epoch at once.
+
+A partition that opens gates its moved ranges from those rows before it serves. A row outlives the move record and is pruned by PR 5's writer, at the later of two bounds: every node holds a map at or after the hand-over, and the transaction lifetime plus the request timeout has passed. A later move giving the range back ungates it.
+
+**Not yet:** the copy and the range follower (PR 4); the driver, the drain and `final_seqno`, the never-both decision, cleanup and the CLI (PR 5); refusing D329 prepares and read holds on a fenced range (with D329 PR 2a); the cluster feed's hold, clipping and backups (PR 3).
