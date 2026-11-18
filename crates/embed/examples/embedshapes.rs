@@ -14,7 +14,8 @@
 //! (`LoadOptions::threads`), not on the caller's thread, and callgrind's collection toggle
 //! (`support/measure.rs`) counts one thread. So the pool has one thread, and
 //! `shape_pool_thread`, its start hook, turns counting on for that thread's whole life: it
-//! runs nothing but the measured calls. The caller only waits. A setup-only run
+//! runs nothing but the measured calls. The caller only waits. candle's own barrier pool is
+//! one thread too (`CANDLE_NUM_THREADS=1`, set first thing), so it runs inline there. A setup-only run
 //! (`SHAPE_SETUP_ONLY=1`) installs no hook and makes no call, so it counts nothing.
 //! `DIR` is unused (the harness passes it to every shape binary).
 #[allow(
@@ -53,6 +54,14 @@ fn shape_pool_thread() {
 }
 
 fn main() {
+    // candle (0.11) also splits large operations over a process-wide `BarrierPool` of its
+    // own, sized by `CANDLE_NUM_THREADS` (every core by default), not by
+    // `LoadOptions::threads`: its workers' share went uncounted and the measured thread spun
+    // in `BarrierGuard::drop` for a timing-dependent while (#2060's first run: 344M to 370M
+    // on identical code). One thread runs those operations inline, so every instruction is
+    // on the measured thread.
+    // SAFETY: first thing in `main`, before any other thread exists or reads the variable.
+    unsafe { std::env::set_var("CANDLE_NUM_THREADS", "1") };
     measure::fix_hash_seeds();
     let mut args = std::env::args().skip(1);
     let usage = "usage: embedshapes SHAPE ITERATIONS DIR";
