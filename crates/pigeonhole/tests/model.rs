@@ -3122,10 +3122,54 @@ impl Run {
     }
 }
 
+/// The step a seed's run is on, for the watchdog in [`check`]: what it is, when it began,
+/// and how many steps came before it, so a hang report can tell a seed stuck on one step
+/// from one still moving, only slowly (#2044).
+struct Progress {
+    step: String,
+    since: Instant,
+    steps: u64,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            step: String::new(),
+            since: Instant::now(),
+            steps: 0,
+        }
+    }
+}
+
+/// Model tests running in this process now ([`check`] counts itself in and out): the load a
+/// hang report's seed ran beside.
+static RUNNING_CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a [`check`] as running until it drops, however the check ends.
+struct RunningCheck;
+
+impl RunningCheck {
+    fn enter() -> Self {
+        RUNNING_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for RunningCheck {
+    fn drop(&mut self) {
+        RUNNING_CHECKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Runs `seed` under `cfg`, keeping `progress` at the step under way (for the watchdog in
 /// [`check`]).
-fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, String> {
-    let at = |what: String| *progress.lock().unwrap_or_else(PoisonError::into_inner) = what;
+fn run(seed: u64, cfg: &Config, progress: &Mutex<Progress>) -> Result<Stats, String> {
+    let at = |what: String| {
+        let mut p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+        p.step = what;
+        p.since = Instant::now();
+        p.steps += 1;
+    };
     at("open".into());
     let mut run = Run::new(seed, cfg.clone())?;
     let mut rng = Rng::new(seed ^ 0xa11ce);
@@ -3391,6 +3435,7 @@ fn hang_deadline() {
 /// on, and the process aborts, so a hang fails fast and names itself instead of eating the
 /// job's timeout (#244, #209).
 fn check(cfg: &Config) -> Vec<Stats> {
+    let _running = RunningCheck::enter();
     let test = std::thread::current().name().unwrap_or("?").to_owned();
     let limit = seed_timeout();
     // Row cache hits over every seed: a crash-heavy seed may hit none (each crash empties
@@ -3403,7 +3448,7 @@ fn check(cfg: &Config) -> Vec<Stats> {
         let started = Instant::now();
         let blob = blob_vectors(&test, seed);
         let placed = vector_placement(blob);
-        let progress = Arc::new(Mutex::new(String::new()));
+        let progress = Arc::new(Mutex::new(Progress::new()));
         let (tx, rx) = mpsc::channel();
         let worker = {
             let (cfg, progress) = (cfg.clone(), Arc::clone(&progress));
@@ -3443,14 +3488,18 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 // #1906's job then sat 29 minutes past this point until the job's limit), and
                 // the process must end regardless.
                 hang_deadline();
-                let at = progress
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
+                let (at, step_secs, steps) = {
+                    let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                    (p.step.clone(), p.since.elapsed().as_secs_f64(), p.steps)
+                };
+                // Counted now, before this check ends: itself and every other model test
+                // still running in the process.
+                let running = RUNNING_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
                 // Straight to stderr: the test harness's capture would lose an `eprintln!`.
                 let hung = format!(
                     "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
-                     {placed}) did not finish in {limit:?}; it was at {at}",
+                     {placed}) did not finish in {limit:?}; it was at {at}, for {step_secs:.1}s; \
+                     model tests running in this process: {running}",
                     cfg.shards, cfg.tablet_changes, cfg.deferred_io
                 );
                 let _ = writeln!(std::io::stderr(), "{hung}");
@@ -3468,9 +3517,31 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 pigeonhole_engine::set_tracing(true);
                 std::thread::sleep(Duration::from_secs(5));
                 let _ = writeln!(std::io::stderr(), "HUNG: end of the trace after the hang");
+                // Stuck or slow (#2044): whether the seed moved past the step it was on at the
+                // deadline, while the stacks and the trace were taken.
+                let verdict = match rx.try_recv() {
+                    Ok(Ok(_)) => "slow: the seed finished after the deadline".to_owned(),
+                    Ok(Err(e)) => format!("slow: the seed failed after the deadline: {e}"),
+                    Err(_) => {
+                        let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                        if p.steps == steps {
+                            format!(
+                                "stuck: still at the same step, for {:.1}s",
+                                p.since.elapsed().as_secs_f64()
+                            )
+                        } else {
+                            format!(
+                                "slow: {} more steps since the deadline; now at {}",
+                                p.steps - steps,
+                                p.step
+                            )
+                        }
+                    }
+                };
+                let _ = writeln!(std::io::stderr(), "HUNG: {verdict}");
                 // The failure log last: it is a file write (a sweep sets
                 // `PIGEONHOLE_FAIL_LOG`), and a stalled disk there must not cost the stacks.
-                log_failure(&hung);
+                log_failure(&format!("{hung}; {verdict}"));
                 std::process::abort();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
