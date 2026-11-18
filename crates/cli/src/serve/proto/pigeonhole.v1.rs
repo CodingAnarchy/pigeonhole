@@ -4862,6 +4862,14 @@ pub struct BeginRequest {
     /// start. A single-node server ignores it.
     #[prost(message, optional, tag = "2")]
     pub route: ::core::option::Option<RoutingKey>,
+    /// Lets the transaction read and write rows of other partitions (D329, ICR 0140): its
+    /// partition (`route`) is its home, and every other partition it touches is a branch,
+    /// committed with it atomically by two-phase commit. Without it, a row outside the home is
+    /// `CrossPartition`. Every node must keep the `spanning_txns` map feature. A commit that
+    /// writes runs at `GroupSync` or stronger. A single-node server accepts it and changes
+    /// nothing.
+    #[prost(bool, tag = "3")]
+    pub spans_partitions: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BeginResponse {
@@ -4912,10 +4920,26 @@ pub struct TxnCommitRequest {
     #[prost(message, repeated, tag = "2")]
     pub rows: ::prost::alloc::vec::Vec<RowWrites>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnCommitResponse {
+    /// A spanning transaction's (`BeginRequest.spans_partitions`): its home partition's commit.
     #[prost(message, optional, tag = "1")]
     pub commit: ::core::option::Option<CommitInfo>,
+    /// A spanning transaction that wrote: each partition it touched, the home first. A part not
+    /// yet `applied` is committed and is applied by its partition's resolver.
+    #[prost(message, repeated, tag = "2")]
+    pub parts: ::prost::alloc::vec::Vec<TxnPart>,
+}
+/// One partition's share of a spanning transaction's commit (D329).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnPart {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The share's commit seqno on that partition, once applied (0 before).
+    #[prost(uint64, tag = "2")]
+    pub seqno: u64,
+    #[prost(bool, tag = "3")]
+    pub applied: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TxnAbortRequest {
@@ -7311,7 +7335,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7421,6 +7445,15 @@ pub mod forward_request {
         RecallPool(super::RecallPoolRequest),
         #[prost(message, tag = "41")]
         RecallBodies(super::RecallBodiesRequest),
+        /// D329 (ICR 0140): a spanning transaction's home node, the coordinator, to a branch's
+        /// partition owner (`partition` names it). `branch_begin` carries the client as `caller`;
+        /// `branch_prepare` and `branch_decide` are the node's own, cluster scope only.
+        #[prost(message, tag = "45")]
+        BranchBegin(super::BranchBegin),
+        #[prost(message, tag = "46")]
+        BranchPrepare(super::BranchPrepare),
+        #[prost(message, tag = "47")]
+        BranchDecide(super::BranchDecide),
     }
 }
 /// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
@@ -7570,6 +7603,45 @@ pub struct ForwardedCaller {
 }
 /// A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 /// call's own status.
+/// Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
+/// transaction's id (its xid), at that partition's snapshot now.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchBegin {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+}
+/// Prepares a branch (D329): a writing transaction's durably (its reads and writes held until
+/// `BranchDecide`), or with `read_only` a hold of its reads in memory, released by a
+/// `BranchDecide` that names the hold.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchPrepare {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub read_only: bool,
+}
+/// Decides a prepared branch (D329): commit or abort, synced before the answer. With `hold`
+/// (non-zero), the release of a read-only branch's hold instead, which answers only if the
+/// hold lasted and the partition's lease term is still `term`; otherwise `Conflict`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchDecide {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub commit: bool,
+    #[prost(uint64, tag = "3")]
+    pub hold: u64,
+    #[prost(uint64, tag = "4")]
+    pub term: u64,
+}
+/// A prepared branch (D329): for a read-only one, its hold and the lease term it was taken in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchPrepared {
+    #[prost(uint64, tag = "1")]
+    pub hold: u64,
+    #[prost(uint64, tag = "2")]
+    pub term: u64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForwardResponse {
     /// The seqno the serving node read at, in the owner's numbering (D328's
@@ -7579,7 +7651,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -7644,6 +7716,8 @@ pub mod forward_response {
         RecallPool(super::RecallPoolResponse),
         #[prost(message, tag = "24")]
         RecallBodies(super::RecallBodiesResponse),
+        #[prost(message, tag = "25")]
+        BranchPrepare(super::BranchPrepared),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -138,6 +138,11 @@ pub(crate) struct ServeArgs {
     /// The longest a transaction lives, in milliseconds, however busy.
     #[arg(long, value_name = "MS", default_value_t = 300_000)]
     pub txn_lifetime_ms: u64,
+    /// The most partitions a transaction begun with `spans_partitions` may touch besides
+    /// its home (D329): a call that would open one more branch is refused
+    /// (`FailedPrecondition`), and the transaction stays usable.
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    pub txn_max_branches: usize,
     /// How long a pinned snapshot may sit idle, in milliseconds: each read at it renews it.
     #[arg(long, value_name = "MS", default_value_t = 60_000)]
     pub snapshot_idle_ms: u64,
@@ -396,6 +401,8 @@ pub(crate) struct Limits {
     pub feed_client_events: usize,
     pub feed_client_bytes: usize,
     pub request_timeout: Duration,
+    /// `--txn-max-branches` (D329).
+    pub txn_max_branches: usize,
     pub stream_idle: Duration,
     /// A test's hold seam (#1753): a fanned-out scan's entry waits after each partition's
     /// page until the partition's next page has taken its share.
@@ -437,6 +444,7 @@ impl ServeArgs {
             feed_client_events: super::feed::CLIENT_EVENTS,
             feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
+            txn_max_branches: self.txn_max_branches.max(1),
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
             #[cfg(test)]
             hold_after_part_page: false,

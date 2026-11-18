@@ -1678,6 +1678,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                     .begin(super::proto::BeginRequest {
                         durability: 0,
                         route: route_row(&home),
+                        spans_partitions: false,
                     })
                     .await
                     .unwrap_or_else(|e| panic!("{at}: begin at {home}: {e}"))
@@ -2174,6 +2175,7 @@ async fn begin(port: u16, row: &str, token: Option<&str>) -> Result<String, toni
     let r = super::proto::BeginRequest {
         durability: 0,
         route: route_row(row),
+        spans_partitions: false,
     };
     Ok(txns(port)
         .await
@@ -4906,5 +4908,6 @@ mod open;
 mod replicas;
 mod restore;
 mod several;
+mod spanning;
 mod stamp;
 mod upload;

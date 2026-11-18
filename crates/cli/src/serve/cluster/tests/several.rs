@@ -717,3 +717,62 @@ fn reserve_after_the_shares_alone() {
         &order[..3]
     );
 }
+
+#[test]
+fn a_spanning_transactions_branch_on_its_homes_node_is_a_local_call() {
+    // D329: home p3 on node a, with a branch on p1 (node a too: a local call) and one on p2
+    // (node b), committed together; then a node-limited --txn-max-branches is refused at
+    // the branch past it, the transaction still usable.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_max_branches = 1;
+    let t = Several::start(limits);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        let begin = |port: u16| async move {
+            txns(port)
+                .await
+                .begin(crate::serve::proto::BeginRequest {
+                    durability: 0,
+                    route: route_row("zed"),
+                    spans_partitions: true,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .txn_id
+        };
+        let id = begin(b).await;
+        assert!(id.starts_with("p3:h"), "{id}");
+        // p1's row (a local branch on a) is fine; p2's would be the second branch.
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let e = txn_write(c, &id, vec![put_row("hank", "1")], None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        let reply = txns(a)
+            .await
+            .commit(crate::serve::proto::TxnCommitRequest {
+                txn_id: id.clone(),
+                rows: Vec::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let parts: Vec<(&str, bool)> = reply
+            .parts
+            .iter()
+            .map(|p| (p.partition.as_str(), p.applied))
+            .collect();
+        assert_eq!(parts, [("p3", true), ("p1", true)], "{reply:?}");
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "hank").await.unwrap(), None);
+    });
+}

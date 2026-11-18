@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::auth::Caller;
 use super::cluster::forward::{self, Forwarder};
 use super::cluster::route::{Routes, prefix_end};
+use super::cluster::spanning;
 use super::errors::ApiError;
 use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection, routing_key};
 use super::replica::ReadDeadline;
@@ -37,6 +38,46 @@ pub(crate) struct Cluster {
     /// when: skipped for [`REPLICA_BACKOFF`] after, so reads don't each pay for the miss.
     pub(crate) replica_backoff:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>>,
+    /// The spanning transactions this node coordinates, and the read-only holds its
+    /// partitions keep for others' (D329).
+    pub(crate) spanning: Arc<spanning::Spanning>,
+}
+
+impl Cluster {
+    /// A spanning transaction's coordinator for `op` at its home, `home` (D329): the call's
+    /// transaction, client and deadline, with handles to reach its branches.
+    pub(crate) fn driver(
+        &self,
+        home_service: &Service,
+        op: &ServiceOp,
+        caller: &Caller,
+        deadline: tokio::time::Instant,
+    ) -> Result<spanning::Driver, ApiError> {
+        let home = home_service
+            .gate()
+            .map(|g| g.partition().to_owned())
+            .ok_or_else(|| ApiError::internal("a spanning transaction off a cluster"))?;
+        let xid = match op {
+            ServiceOp::TxnGet(r) => r.txn_id.as_str(),
+            ServiceOp::TxnGetRow(r) => r.txn_id.as_str(),
+            ServiceOp::TxnWrite(r) => r.txn_id.as_str(),
+            ServiceOp::Commit(r) => r.txn_id.as_str(),
+            ServiceOp::Abort(r) => r.txn_id.as_str(),
+            _ => "",
+        };
+        Ok(spanning::Driver {
+            node: Arc::clone(&self.node),
+            parts: Arc::clone(&self.parts),
+            forwarder: Arc::clone(&self.forwarder),
+            spanning: Arc::clone(&self.spanning),
+            xid: xid.into(),
+            home: home.into(),
+            caller: caller.clone(),
+            deadline,
+            renew_after: home_service.txn_idle() / 2,
+            max_branches: home_service.txn_max_branches(),
+        })
+    }
 }
 
 /// The most of what's left of a read's time one replica's attempt takes (simp724's S2 on
@@ -199,6 +240,7 @@ impl Router {
                 memory: None,
                 replicas: Arc::default(),
                 replica_backoff: Arc::default(),
+                spanning: spanning::Spanning::new(),
             }),
         }
     }
@@ -804,6 +846,15 @@ impl Router {
                 _ => {}
             }
             return match cluster.target(&op)? {
+                // A spanning transaction's call at its home's owner (D329).
+                Place::Here(service) if spanning::spanning_call(&op) => {
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    let driver = cluster.driver(&service, &op, caller, deadline)?;
+                    Box::pin(spanning::serve_home(driver, service, op, caller, prepaid)).await
+                }
                 Place::Here(service) => service.call(op, caller, prepaid).await,
                 Place::There(owner) => {
                     let deadline = deadline.map_or_else(
@@ -1089,6 +1140,20 @@ impl Router {
                 if fanout_part =>
             {
                 service.fanout_part(op, caller).await?
+            }
+            // A spanning transaction's call at its home's owner (D329), forwarded by the
+            // node the client called.
+            op if spanning::spanning_call(&op) => {
+                let deadline = tokio::time::Instant::now() + self.service.request_timeout();
+                let driver = cluster.driver(&service, &op, caller, deadline)?;
+                Box::pin(spanning::serve_home(
+                    driver,
+                    Arc::clone(&service),
+                    op,
+                    caller,
+                    None,
+                ))
+                .await?
             }
             op => service.call(op, caller, None).await?,
         };
@@ -1543,6 +1608,7 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
     };
     // A session's partition, from its id; a row of `table` must be in it.
     let session = |id: &str, what: &str| session_partition(routes, id, what);
+    let spanning = |id: &str| super::sessions::spanning_parts(id).is_some();
     let within = |p: String, what: &str, table: &str, row: &[u8]| {
         let q = one(table, row)?;
         if q == p {
@@ -1607,6 +1673,12 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         }
         ServiceOp::Begin(r) => begins(routes, r.route.as_ref(), "a transaction"),
         ServiceOp::OpenSnapshot(r) => begins(routes, r.route.as_ref(), "a snapshot"),
+        // A spanning transaction's call goes to its home, whatever rows it names: the home's
+        // owner sends each row of another partition on to that partition's branch (D329).
+        ServiceOp::TxnGet(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
+        ServiceOp::TxnGetRow(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
+        ServiceOp::TxnWrite(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
+        ServiceOp::Commit(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
         ServiceOp::TxnGet(r) => {
             let p = session(&r.txn_id, "transaction")?;
             within(p, "the transaction", &r.table, &r.row)

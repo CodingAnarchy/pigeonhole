@@ -20,7 +20,9 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
   - A transaction with no reads and no writes is `InvalidArgument`.
   - **Reads and no writes (amendment 1, D329 PR 2a):** logged like any other prepare, as a type 5 with the read set and an empty batch. It holds its reads until decided and is in doubt across a reopen; a commit decision applies nothing. This is a writing spanning transaction's read-only branch.
 - **`Transaction::hold_reads(self) -> Result<ReadHold>` (amendment 1, D329 PR 2a):** a wholly read-only spanning transaction's hold. It validates the transaction's reads and holds them in memory, logging nothing; it is never in doubt. While it holds, a write to a held row is refused at once, as over a share in doubt (a transaction's prepare `Conflict`, any other write `Busy`).
-  - `ReadHold::release(self) -> bool` answers whether the hold was still in place (`true`) or lost to a close or a recovery (`false`). Dropping it releases it.
+  - `ReadHold::release(self) -> Result<bool>` answers whether the hold was still in place (`true`) or lost to a close or a recovery (`false`): `false` only ever means lost. It waits for the shards' answers, so on a thread that drives a shard (application-owned mode) it's refused (`InvalidArgument`), and the hold is released as it's dropped (perf2's S2 on #2062). Dropping it releases it.
+  - Releasing a hold wakes the commits refused over its rows, as a share's decision does (perf2's S1 on #2062).
+  - A read whose table was dropped since it was read can't be held: `Conflict`.
   - A transaction with writes, or with no reads, is `InvalidArgument`. A read conflicting since the snapshot is `Conflict`.
   - Live holds count against `in_doubt_limits`' share count: past it, `hold_reads` answers `Busy`. A hold is never evicted.
 - **`Pigeonhole::decide(xid, commit) -> Result<Option<Commit>>`:**
@@ -76,4 +78,9 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 - Not supported, and refused with `InvalidArgument`: values large enough to be stored apart (the share's batch must be whole in its record). PR 1 also refused prepares with no writes; amendment 1 (D329 PR 2a) lifts that: see `prepare` and `hold_reads` above.
 
 ## Callers
-`phdb serve` (D329 PR 2) only. Single-partition commits are unchanged. The only new branch on a commit path is `external.is_some()` in `on_prepared`.
+`phdb serve` (D329 PR 2) only. In PR 2a:
+- **A writing spanning transaction:**
+  - Each branch prepares at GroupSync, with the transaction's id as its xid.
+  - The home doesn't prepare: its own share commits at the commit point, together with its decision row.
+  - Each branch is then decided.
+- **A read-only one:** each partition's reads are held with `hold_reads` and kept for a release round. The hold is taken under the partition gate's lease term, and its release confirms the same term. Single-partition commits are unchanged. The only new branch on a commit path is `external.is_some()` in `on_prepared`.
