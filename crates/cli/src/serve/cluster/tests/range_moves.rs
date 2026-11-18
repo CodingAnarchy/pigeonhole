@@ -361,6 +361,27 @@ fn a_restored_file_is_clipped_to_the_maps_ranges_and_a_rerun_finds_it_done() {
         ),
         ("mv0~0", &b"m"[..], Some(&b"q"[..]))
     );
+    // Its hand-over pair is reset (cli692): a move back in the restored cluster, whose
+    // serving row carries any pair of its own, counts as newer, so p1 serves the range.
+    assert_eq!((moved[0].term, moved[0].version), (0, 0));
+    let mut back = map.clone();
+    back.tables[0].splits = vec![text("q")];
+    let gate = crate::serve::ranges::RangeGate::default();
+    gate.load_rows(
+        moved.clone(),
+        vec![crate::serve::ranges::Moved {
+            id: "mv9".into(),
+            table: "users".into(),
+            start: b"m".to_vec(),
+            end: Some(b"q".to_vec()),
+            term: 0,
+            version: 1,
+            seqno: 5,
+            at_ms: 0,
+        }],
+    );
+    gate.update(&back, "p1", 6);
+    assert!(gate.load().is_none(), "the move back serves `[m, q)` on p1");
     assert!(!crate::serve::ranges::clip_pending(&db).unwrap());
     // A rerun (a clip that stopped before its marker went) finds nothing to do.
     crate::serve::ranges::mark_clip(&db).unwrap();

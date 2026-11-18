@@ -296,7 +296,9 @@ const CLIP_BATCH: usize = 256;
 ///   history here nor anyone's to deliver), except a row a D329 share in doubt holds
 ///   (`Busy`): left and counted, for the operator (simp724's C3);
 /// - moved-away rows covering a range the map gives it back are cut to the rest (the
-///   restore asserts the map; a backup's hand-over pairs are another cluster's numbering);
+///   restore asserts the map), and every one left drops its hand-over pair to (0, 0): a
+///   backup's pairs are another cluster's numbering, so any later move back must count as
+///   newer (cli692);
 /// - its timestamp floor rises to the newest timestamp it kept (M1: a move's copied rows
 ///   carry the source's timestamps).
 ///
@@ -362,7 +364,22 @@ pub(super) fn clip_restored(
                 .flat_map(|piece| ranges::subtract(&piece, h))
                 .collect();
         }
-        if left.len() == 1 && left[0] == (r.start.clone(), r.end.clone()) {
+        // What's left keeps no hand-over pair (cli692): a backup's pairs are another
+        // cluster's numbering, or older than anything after the restore, so every serving row
+        // the restored cluster writes (a move back) must count as newer.
+        let whole = left.len() == 1 && left[0] == (r.start.clone(), r.end.clone());
+        if whole && (r.term, r.version) == (0, 0) {
+            continue;
+        }
+        if whole {
+            ranges::write_moved(
+                db,
+                &Moved {
+                    term: 0,
+                    version: 0,
+                    ..r.clone()
+                },
+            )?;
             continue;
         }
         let pieces: Vec<Moved> = left
@@ -372,6 +389,8 @@ pub(super) fn clip_restored(
                 id: format!("{}~{i}", r.id),
                 start,
                 end,
+                term: 0,
+                version: 0,
                 ..r.clone()
             })
             .collect();
