@@ -1182,6 +1182,7 @@ mod tests {
                 version: 5,
                 seqno: 9,
                 at_ms: 0,
+                ..Default::default()
             }],
         );
         g.update(&done, "p2", 12);
