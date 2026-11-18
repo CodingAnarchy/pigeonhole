@@ -3261,8 +3261,10 @@ const STACKS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long its second pass, the frames' locals, may take: slow on a large debug binary.
 const GDB_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Every thread's stack, then the innermost frames' locals (`shard_main`'s hold the
-/// `ShardState`: its close stage, what it waits for), from gdb attached to this process,
+/// Every thread's stack, then the locals of each thread's six innermost frames (frames 0–5:
+/// where a thread waits, and the frame `level 5` alone used to show, often `shard_main`,
+/// whose locals hold the `ShardState`: its close stage, what it waits for; simp724's N1 on
+/// #2046), from gdb attached to this process,
 /// straight to this process's stdout and stderr as gdb writes them (#838, #2044).
 ///
 /// - **Two passes:** the stacks alone first, so they're out before the slow locals pass
@@ -3299,8 +3301,8 @@ fn dump_stacks() {
             "frame locals",
             GDB_TIMEOUT,
             &[
-                "thread apply all -s frame apply level 5 info frame",
-                "thread apply all -s frame apply level 5 info locals",
+                "thread apply all -s frame apply 6 -s info frame",
+                "thread apply all -s frame apply 6 -s info locals",
             ],
         ),
     ];
@@ -3336,7 +3338,7 @@ fn dump_stacks() {
 /// Starts the hang report's deadlines, before the report does anything that can block: once
 /// the report ([`dump_stacks`]' two gdb passes, then 5 s of trace) has had time to finish,
 /// the process ends, whatever the report is blocked on. A stalled disk then ends the job
-/// about [`seed_timeout`] plus 2 minutes after the seed started, not at the job's limit.
+/// about [`seed_timeout`] plus 135 s after the seed started, not at the job's limit.
 ///
 /// Two of them:
 /// - a thread of this process that writes a note and aborts, at 125 s;
