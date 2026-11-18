@@ -676,6 +676,10 @@ fn the_serve_guide_lists_every_metric_serve_renders() {
             // `--text-pack`'s families (#1585), rendered only with the flag.
             let packing = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
             rendered.extend(names(&packing.shared.router.metrics_text(), prefix));
+            // `--embed-local`'s gauge (#2061), rendered only with the flag (its on bit).
+            let mut embed = String::new();
+            crate::serve::service::render_candle(&mut embed, 0x80);
+            rendered.extend(names(&embed, prefix));
         }
         assert!(!rendered.is_empty(), "{prefix}");
         assert_eq!(
