@@ -5085,7 +5085,7 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **Before merge:** a box A/B at main's defaults (group sync depth 2) and across the gate's write rows.
 
 <a id="d333"></a>
-## D333 — Punch the data file's free space, off by default (coordinator, 2026-11-17; engine/pager/io, #2013; ICR 0144)
+## D333 — Punch the data file's free space, on by default (coordinator, 2026-11-17; engine/pager/io, #2013; ICR 0144)
 
 **Decided:**
 - **What's punched:** free space only, past a reserve of the lowest free space, one block at a time, largest first. That's space no recoverable root names (`reclaim` clamps to the durable root, D61) and no live view or reader-process pin reaches: what the allocator would already reuse and overwrite.
@@ -5097,7 +5097,11 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
   - reserve = min(max(64 MiB, 2 × memtable budget × shards), about ¼ of the file);
   - at most 256 MiB a pass;
   - at most 64 MiB/s across passes.
-- **Off by default** (`Options::punch_freed`) until a box A/B (g69's session, ycsb-a/f and the D213 group-commit row, with D334 in both arms) shows no regression and reports the file's size on disk against its apparent size.
+- **On by default** (`Options::punch_freed(false)` turns it off; the coordinator, 2026-11-17, under the owner's rule of no measurable regression). The PR first shipped it off until a box A/B decided. Two runs on the AX102, with D334 in both arms, did:
+  - **g152, #1991's serve session (ABBA):** p99 medians level (0.285/0.286 against 0.284/0.288 ms), write stalls 0, no ≥ 5 ms device requests, flushes, compactions and throughput equal.
+  - **g153, an 8 GiB store with 75% deleted and compacted:** an idle store's allocated fell 9.1 → 3.6 GB in 88 s, within 3% of live + reserve + one block. Off stayed at 9.4 GB.
+  - **Steady p99:** split across two runs per arm. The higher on run punched for 0.74 ms in its 300 s steady phase, so the split is noise.
+  - **g152 found that a pass stopped at its cap and waited for a manifest commit,** so an idle store stopped after 256 MiB. A capped pass now starts the next while the gate passes.
 - **WAL slots are not punched:** the WAL's preallocation (#1621) keeps them written.
 
 **Why (#2013):** the data file keeps its high-water size. Compaction's freed space is reused but never given back, and `truncate_tail` returns only a free tail. After a large delete or TTL expiry, the file can hold several times its live data on disk.
