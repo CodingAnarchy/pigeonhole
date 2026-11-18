@@ -4685,25 +4685,41 @@ impl Service {
         })
     }
 
-    /// Opens (or renews) spanning transaction `xid`'s branch on this partition (D329), at its
-    /// snapshot now, for the client the home forwarded.
-    pub(crate) fn begin_branch(&self, xid: &str, caller: &Caller) -> Result<(), ApiError> {
+    /// Takes transaction `id` for `caller`'s call (D329's coordinator: a spanning
+    /// transaction's home session, with its span).
+    pub(crate) fn take_txn(&self, id: &str, caller: &Caller) -> Result<Taken, ApiError> {
+        self.sessions.take(id, caller.principal)
+    }
+
+    /// Opens spanning transaction `xid`'s branch on this partition (D329), at its snapshot
+    /// now, for the client the home forwarded; with `renew`, renews the open one.
+    pub(crate) fn begin_branch(
+        &self,
+        xid: &str,
+        caller: &Caller,
+        renew: bool,
+    ) -> Result<(), ApiError> {
         if let Some(gate) = &self.gate {
             gate.serving()?;
         }
-        self.sessions
-            .begin_branch(caller.principal, || Ok(self.part()?.db.transaction()?), xid)
+        self.sessions.begin_branch(
+            caller.principal,
+            || Ok(self.part()?.db.transaction()?),
+            xid,
+            renew,
+        )
     }
 
     /// Prepares branch `xid` (D329) for its home's commit. A writing transaction's branch
     /// prepares durably, at `GroupSync`, through the gate (a write: its reads and writes
     /// held until its decide). A read-only one holds its reads in memory, under the lease
-    /// term it was taken in, kept in `spanning` for the release.
+    /// term it was taken in, kept in `spanning` for the release (for twice the request
+    /// timeout at most: its release round is one call).
     pub(crate) async fn prepare_branch(
         &self,
         xid: &str,
         read_only: bool,
-        spanning: &super::cluster::spanning::Spanning,
+        spanning: &Arc<super::cluster::spanning::Spanning>,
         partition: &str,
     ) -> Result<proto::BranchPrepared, ApiError> {
         let gate = self
@@ -4714,6 +4730,8 @@ impl Service {
             Taken::Open(g) => g,
             Taken::Done(outcome) => return Err(ApiError::transaction_finished(&outcome)),
         };
+        // A prepared branch's tombstone: its outcome is its home's to give.
+        let prepared_mark = || ApiError::invalid("the branch is prepared: its home decides it");
         if read_only {
             let term = gate.serving_term()?;
             let (txn, _, ticket) = g.commit();
@@ -4725,15 +4743,16 @@ impl Service {
                 Ok(t) if t == term => Ok(h),
                 _ => Err(lost_hold(partition)),
             });
+            let ttl = self.request_timeout() * 2;
             let prepared = held.map(|h| proto::BranchPrepared {
-                hold: spanning.keep_hold(h, partition, term),
+                hold: spanning.keep_hold(h, partition, term, ttl),
                 term,
             });
-            ticket.finish(
-                prepared
-                    .clone()
-                    .and_then(|_| Err(ApiError::invalid("the branch is prepared"))),
-            );
+            ticket.finish(Err(prepared
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(prepared_mark)));
             return prepared;
         }
         let held = gate.enter()?;
@@ -4747,10 +4766,11 @@ impl Service {
             .await
             .and_then(|c| held.committed().map(|()| c));
         drop(held);
-        ticket.finish(prepared.clone().map(|c| proto::TxnCommitResponse {
-            commit: Some(convert::commit_info(c)),
-            parts: Vec::new(),
-        }));
+        ticket.finish(Err(prepared
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(prepared_mark)));
         prepared.map(|_| proto::BranchPrepared { hold: 0, term: 0 })
     }
 
@@ -4798,51 +4818,43 @@ impl Service {
         decided
     }
 
-    /// The home's commit of spanning transaction `r.txn_id` (D329), with `driver` reaching
-    /// its branches: prepares, the commit point (the decision row in the home's own commit)
-    /// and the decides when anything was written anywhere; holds and their release round
-    /// when nothing was. Detached from the request, as [`commit`](Self::commit) is: the
-    /// whole round runs in its own task, so a client that goes away never leaves branches
+    /// The home's commit of spanning transaction `r.txn_id` (D329), its session `g` already
+    /// taken by the coordinator (its tombstone answered a repeated `Commit` there), with
+    /// `driver` reaching its branches: prepares, the commit point (the decision row in the
+    /// home's own commit) and the decides when anything was written anywhere; holds and
+    /// their release round when nothing was.
+    ///
+    /// Until the session turns to `Committing`, a refusal puts it back as it was, its span
+    /// and branches untouched, so a retried `Commit` commits the whole transaction (audit120's
+    /// M1 on #2062). From then the round runs detached, in its own task, as
+    /// [`commit`](Self::commit)'s does: a client that goes away never leaves branches
     /// prepared past the commit point undecided by this node.
     pub(crate) async fn commit_spanning(
         self: &Arc<Self>,
+        mut g: super::sessions::TxnGuard,
         r: proto::TxnCommitRequest,
         caller: &Caller,
         budget: OwnedSemaphorePermit,
         driver: super::cluster::spanning::Driver,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
-        let wrote_here = !r.rows.is_empty();
-        if wrote_here && !caller.scope.allows(Scope::Write) {
-            return Err(ApiError::permission_denied("commit writes"));
-        }
-        let rows = self.txn_rows(&r.rows).await?;
-        let mut g = match self.sessions.take(&r.txn_id, caller.principal)? {
-            Taken::Open(g) => g,
-            Taken::Done(outcome) => return outcome,
-        };
+        use super::cluster::spanning::SpanView;
         let gate = Arc::clone(
             self.gate
                 .as_ref()
                 .ok_or_else(|| ApiError::internal("a spanning commit off a cluster"))?,
         );
-        let touched = driver.finish();
         let home = driver.home.to_string();
-        let branches = touched.branches(&home);
-        let writes = touched.wrote() || wrote_here || g.wrote();
+        let span = g
+            .span()
+            .cloned()
+            .ok_or_else(|| ApiError::internal("a spanning id on a plain session"))?;
+        let writes = span.wrote() || !r.rows.is_empty() || g.wrote();
         if writes && !caller.scope.allows(Scope::Write) {
-            drop(g);
-            driver.abort(&branches).await;
             return Err(ApiError::permission_denied("commit writes"));
         }
+        let rows = self.txn_rows(&r.rows).await?;
         let decisions = if writes {
-            match self.decisions_table().await {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    drop(g);
-                    driver.abort(&branches).await;
-                    return Err(e);
-                }
-            }
+            Some(self.decisions_table().await?)
         } else {
             None
         };
@@ -4850,12 +4862,19 @@ impl Service {
             convert::txn_apply(g.txn(), table, row, ops);
         }
         drop(rows);
-        let home_read = touched.read(&home);
+        let branches = span.branches(&home);
+        let idle = span.idle(&home);
+        let home_read = span.read(&home);
         let (txn, durability, ticket) = g.commit();
         let me = Arc::clone(self);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
+            // Branches opened that did nothing aren't prepared (they'd refuse): their
+            // sessions end (audit120's S3).
+            if !idle.is_empty() {
+                driver.for_round().abort(&idle).await;
+            }
             let outcome = match decisions {
                 Some(decisions) => {
                     me.spanning_write(txn, durability, &decisions, &gate, &driver, &branches)
@@ -4879,21 +4898,37 @@ impl Service {
         })
     }
 
-    /// The home's decision table (D329), created the first time a spanning commit writes.
+    /// The home's decision table (D329). Created through the gate if it's missing (a write
+    /// to the file: never past a fence's drain), the first time a spanning transaction
+    /// begins on the partition.
     async fn decisions_table(&self) -> Result<Table, ApiError> {
         use super::cluster::spanning::{DECISION_FAMILY, DECISIONS};
         let db = self.part()?.db.clone();
-        self.blocking(move || {
-            Ok(db
-                .table(DECISIONS)?
-                .family(DECISION_FAMILY, pigeonhole::Family::default())
-                .create_if_missing()?)
-        })
-        .await
+        if let Ok(t) = db.table(DECISIONS).and_then(|t| t.open()) {
+            return Ok(t);
+        }
+        let held = match &self.gate {
+            Some(gate) => Some(gate.enter()?),
+            None => None,
+        };
+        let table = self
+            .blocking(move || {
+                Ok(db
+                    .table(DECISIONS)?
+                    .family(DECISION_FAMILY, pigeonhole::Family::default())
+                    .create_if_missing()?)
+            })
+            .await;
+        drop(held);
+        table
     }
 
     /// A spanning commit that wrote: every branch prepares, then the commit point, then the
-    /// decides.
+    /// decides. Aborts and decides run on a budget of their own ([`Driver::for_round`]),
+    /// since the prepare round may have used the client's (audit120's S1); the answer waits
+    /// for the decides only until the client's deadline.
+    ///
+    /// [`Driver::for_round`]: super::cluster::spanning::Driver::for_round
     async fn spanning_write(
         &self,
         mut txn: pigeonhole::Transaction,
@@ -4905,19 +4940,20 @@ impl Service {
     ) -> super::sessions::Outcome {
         use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, committed_value};
         let conflict = |why: String| ApiError::from_code(pigeonhole::ErrorCode::Conflict, &why);
+        let abort = || async { driver.for_round().abort(branches).await };
         if let Err(e) = driver.check_feature().await {
-            driver.abort(branches).await;
+            abort().await;
             return Err(e);
         }
-        let (prepared, refused) = driver.prepare(branches, false).await;
+        let (_, refused) = driver.prepare(branches, false).await;
         if let Some(e) = refused {
-            let names: Vec<String> = prepared.into_iter().map(|p| p.partition).collect();
-            driver.abort(branches).await;
-            drop(names);
-            return Err(match e.code.as_str() {
-                "OutcomeUnknown" | "DeadlineExceeded" => e,
-                _ => conflict(format!("a branch refused its prepare: {}", e.message)),
-            });
+            abort().await;
+            // Never committed: the commit point wasn't reached, so any refusal, a timeout
+            // too, is safe to retry.
+            return Err(conflict(format!(
+                "a branch refused its prepare ({}): {}",
+                e.code, e.message
+            )));
         }
         #[cfg(test)]
         {
@@ -4938,12 +4974,12 @@ impl Service {
         {
             Ok(m) => m,
             Err(e) => {
-                driver.abort(branches).await;
+                abort().await;
                 return Err(e.into());
             }
         };
         if marker.is_some() {
-            driver.abort(branches).await;
+            abort().await;
             return Err(conflict(
                 "the transaction was decided without its home (an abort marker)".into(),
             ));
@@ -4958,7 +4994,7 @@ impl Service {
         let held = match gate.enter() {
             Ok(h) => h,
             Err(e) => {
-                driver.abort(branches).await;
+                abort().await;
                 return Err(e);
             }
         };
@@ -4979,7 +5015,7 @@ impl Service {
             // decision row (D329 PR 2b).
             Err(e) if e.code == "OutcomeUnknown" => return Err(e),
             Err(e) => {
-                driver.abort(branches).await;
+                abort().await;
                 return Err(e);
             }
         };
@@ -4990,12 +5026,29 @@ impl Service {
                 return Err(ApiError::outcome_unknown("abandoned before the decides"));
             }
         }
-        let mut parts = vec![proto::TxnPart {
+        let home = proto::TxnPart {
             partition: driver.home.to_string(),
             seqno: info.seqno,
             applied: true,
-        }];
-        parts.extend(driver.decide(branches, true).await);
+        };
+        // The decides on their own budget, in a task of their own: they go on to every
+        // branch whatever the client's deadline; the answer waits for them until then.
+        let decides = {
+            let (d, b) = (driver.for_round(), branches.to_vec());
+            tokio::spawn(async move { d.decide(&b, true).await })
+        };
+        let decided = tokio::time::timeout_at(driver.deadline, decides).await;
+        let mut parts = vec![home];
+        match decided {
+            Ok(Ok(decided)) => parts.extend(decided),
+            // Not all answered in time (or the round's task failed): each is committed, and
+            // its resolver applies it if this round doesn't.
+            _ => parts.extend(branches.iter().map(|p| proto::TxnPart {
+                partition: p.clone(),
+                seqno: 0,
+                applied: false,
+            })),
+        }
         Ok(proto::TxnCommitResponse {
             commit: Some(convert::commit_info(info)),
             parts,
@@ -5013,13 +5066,25 @@ impl Service {
         branches: &[String],
     ) -> super::sessions::Outcome {
         let seqno = txn.snapshot_seqno();
-        // The home's own hold first: a branch's taken after it overlaps it.
+        let lost = || {
+            ApiError::from_code(
+                pigeonhole::ErrorCode::Conflict,
+                "a read of the transaction changed or lost its hold before the commit (a \
+                 partition's lease lapsed, it moved or it reopened): retry it",
+            )
+        };
+        // The home's own hold first: a branch's taken after it overlaps it. A home whose
+        // read call failed holds nothing (`InvalidArgument`: no reads).
         let home = if home_read {
             let term = gate.serving_term()?;
-            let hold = self
+            match self
                 .blocking(move || txn.hold_reads().map_err(ApiError::from))
-                .await?;
-            Some((hold, term))
+                .await
+            {
+                Ok(hold) => Some((hold, term)),
+                Err(e) if e.code == "InvalidArgument" => None,
+                Err(e) => return Err(e),
+            }
         } else {
             drop(txn);
             None
@@ -5028,21 +5093,26 @@ impl Service {
         #[cfg(test)]
         {
             use super::cluster::spanning::seams;
-            let _ = seams::at(&driver.xid, seams::Step::Release).await;
+            if seams::at(&driver.xid, seams::Step::Release).await {
+                // Abandoned: the branches' holds are never released (they expire).
+                return Err(lost());
+            }
         }
-        let lasted = refused.is_none() && driver.release(&held).await;
+        let round = driver.for_round();
+        let lasted = refused.is_none() && round.release(&held).await;
         let home_lasted = match home {
             Some((hold, term)) => {
                 let lasted = self
                     .blocking(move || hold.release().map_err(ApiError::from))
-                    .await?;
+                    .await
+                    .unwrap_or(false);
                 lasted && gate.serving_term().is_ok_and(|t| t == term)
             }
             None => true,
         };
         if refused.is_some() {
             // Release whatever was held; the answer is the refusal's.
-            let _ = driver.release(&held).await;
+            let _ = round.release(&held).await;
         }
         if lasted && home_lasted {
             Ok(proto::TxnCommitResponse {
@@ -5053,11 +5123,7 @@ impl Service {
                 parts: Vec::new(),
             })
         } else {
-            Err(ApiError::from_code(
-                pigeonhole::ErrorCode::Conflict,
-                "a read of the transaction changed or lost its hold before the commit (a \
-                 partition's lease lapsed, it moved or it reopened): retry it",
-            ))
+            Err(lost())
         }
     }
 

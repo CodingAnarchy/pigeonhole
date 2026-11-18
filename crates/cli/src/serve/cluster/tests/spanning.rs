@@ -321,6 +321,14 @@ fn a_spanning_transaction_is_its_tokens_and_a_client_cant_call_the_branch_arms()
                 .unwrap_err();
             assert_eq!(code(&e), "NotFound", "{row}: {e}");
         }
+        // Another token's Abort finds nothing, and changes nothing (audit120's M1).
+        let r = super::super::proto::TxnAbortRequest { txn_id: id.clone() };
+        let e = txns(b)
+            .await
+            .abort(with(r, Some("t0ken-b")))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
         // A client token can't prepare or decide a branch itself.
         for op in [
             forward_request::Op::BranchPrepare(BranchPrepare {
@@ -349,10 +357,58 @@ fn a_spanning_transaction_is_its_tokens_and_a_client_cant_call_the_branch_arms()
             txn_id: id.clone(),
             rows: Vec::new(),
         };
-        txns(b)
+        let reply = txns(b)
             .await
             .commit(with(r, Some("t0ken-a")))
             .await
+            .unwrap()
+            .into_inner();
+        // The branch's write is in: the other token's Abort didn't touch it.
+        let parts: Vec<&str> = reply.parts.iter().map(|p| p.partition.as_str()).collect();
+        assert_eq!(parts, ["p2", "p1"], "{reply:?}");
+        assert_eq!(cell(&t.dbs[0], "alice"), Some(b"1".to_vec()));
+    });
+}
+
+/// `row`'s value in partition database `db`, read directly.
+fn cell(db: &pigeonhole::Pigeonhole, row: &str) -> Option<Vec<u8>> {
+    db.table("users")
+        .unwrap()
+        .open()
+        .unwrap()
+        .get(row.as_bytes(), "f", b"q")
+        .unwrap()
+        .map(|c| c.value().to_vec())
+}
+
+#[test]
+fn a_repeated_commit_with_branch_rows_answers_its_first_outcome_and_writes_them_once() {
+    // audit120's M3: the home's session is taken before a Commit's rows go anywhere, so a
+    // repeat finds the tombstone and sends nothing to the branch.
+    let t = Three::start(["", "", ""]);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        let first = commit_parts(a, &id, vec![put_row("alice", "1"), put_row("zed", "1")])
+            .await
             .unwrap();
+        let again = commit_parts(b, &id, vec![put_row("alice", "2"), put_row("zed", "2")])
+            .await
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"1".to_vec()));
+        // The decision table stays hidden from the schema (audit120's S5).
+        let mut s = super::super::proto::schema_client::SchemaClient::new(channel(c).await);
+        let tables = s
+            .list_tables(super::super::proto::ListTablesRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .tables;
+        assert!(
+            tables.iter().all(|t| !t.starts_with("__phdb_")),
+            "{tables:?}"
+        );
     });
 }

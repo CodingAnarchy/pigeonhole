@@ -3,32 +3,36 @@
 //! A transaction begun with `BeginRequest.spans_partitions` has a home, the partition its
 //! `Begin` routed to, and an id that is also its xid: `<home>:h<history_epoch>-<32 hex>`
 //! ([`super::super::sessions::spanning_parts`]). Every call on it routes to the home's owner,
-//! the coordinator. A call on a row of another partition P opens a branch there (a session
-//! in P's table under the same id, at P's snapshot then) and goes on to P's owner as a
-//! forward naming P. A branch on the home's own node is a local call.
+//! the coordinator, which takes the home's session first: its caller, its renewal, and the
+//! coordinator's state ([`Span`]: what each partition did) all live in it (audit120's M1 on
+//! #2062). A call on a row of another partition P opens a branch there (a session in P's
+//! table under the same id, at P's snapshot then) and goes on to P's owner as a forward
+//! naming P; every later call of the transaction renews its branches (S4, M2). A branch on
+//! the home's own node is a local call.
 //!
 //! **Commit, when anything was written** (by a `Write`, or by the `Commit`'s own rows,
 //! anywhere):
-//! 1. Every branch prepares, durably, in parallel (a branch that only read too: its hold is
-//!    what the commit point relies on).
+//! 1. Every branch that read or wrote prepares, durably, in parallel (a branch that only
+//!    read too: its hold is what the commit point relies on).
 //! 2. The commit point: the home's own transaction reads the decision row
 //!    `__phdb_txn_decisions/<xid>` (it must be absent) and writes `COMMITTED` there, through
 //!    the home's gate, at `GroupSync` or stronger. Before it, any refusal aborts the
 //!    prepared branches and answers `Conflict`. An `OutcomeUnknown` there passes through:
 //!    the branches stay in doubt for their resolver (D329 PR 2b).
-//! 3. Every branch is decided, and syncs before it answers. The reply waits for them up to
-//!    the call's deadline, then answers with the parts not yet applied marked.
+//! 3. Every branch is decided, and syncs before it answers. The decides run on a budget of
+//!    their own; the reply waits for them up to the call's deadline, then answers with the
+//!    parts not yet applied marked.
 //!
 //! **Commit, when nothing was written:** there is no commit point. Every partition that
 //! read, the home too, holds its reads in memory ([`pigeonhole::Transaction::hold_reads`]),
 //! then a release round confirms each hold lasted, under the same lease term as it was
-//! taken in (audit120's conditions). Any lost hold answers `Conflict`.
+//! taken in (audit120's conditions). Any lost hold answers `Conflict`. A hold whose release
+//! never comes goes when its time is up ([`Spanning::keep_hold`]).
 //!
-//! The coordinator's table ([`Spanning::homes`]) and the branch side's holds
-//! ([`Spanning::holds`]) are this node's, in memory: a restart loses both, which a home
-//! answers as an expired transaction and a branch's release as a lost hold.
+//! The branch side's holds ([`Spanning::holds`]) are this node's, in memory: a restart loses
+//! them, which a branch's release answers as a lost hold.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -40,6 +44,7 @@ use super::super::proto::forward_request::Op;
 use super::super::proto::forward_response::Reply;
 use super::super::router::Parts;
 use super::super::service::{Service, ServiceOp, ServiceReply};
+use super::super::sessions::{Span, Taken};
 use super::Node;
 use super::forward::{self, Forwarder};
 
@@ -64,32 +69,54 @@ pub(crate) fn committed_value(history_epoch: u64, branches: &[String]) -> Vec<u8
     v.into_bytes()
 }
 
-/// What one partition did in a spanning transaction, as its home sees it.
-#[derive(Debug, Default, Clone, Copy)]
-struct Touched {
-    read: bool,
-    wrote: bool,
-    /// When the branch was last opened or renewed on its owner (`None` for the home).
-    renewed: Option<Instant>,
+/// What a spanning transaction's [`Span`] says, for its commit.
+pub(crate) trait SpanView {
+    /// Whether any partition buffered writes.
+    fn wrote(&self) -> bool;
+    /// Whether `partition` read anything.
+    fn read(&self, partition: &str) -> bool;
+    /// The branches that read or wrote: every such partition but `home`.
+    fn branches(&self, home: &str) -> Vec<String>;
+    /// The branches opened that did nothing (their first call failed): ended, not prepared
+    /// (audit120's S3).
+    fn idle(&self, home: &str) -> Vec<String>;
 }
 
-/// A spanning transaction's coordinator state: what each partition did, the home included.
-#[derive(Debug, Default)]
-struct Home {
-    parts: BTreeMap<String, Touched>,
+impl SpanView for Span {
+    fn wrote(&self) -> bool {
+        self.parts.values().any(|t| t.wrote)
+    }
+
+    fn read(&self, partition: &str) -> bool {
+        self.parts.get(partition).is_some_and(|t| t.read)
+    }
+
+    fn branches(&self, home: &str) -> Vec<String> {
+        self.parts
+            .iter()
+            .filter(|(p, t)| *p != home && (t.read || t.wrote))
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    fn idle(&self, home: &str) -> Vec<String> {
+        self.parts
+            .iter()
+            .filter(|(p, t)| *p != home && !t.read && !t.wrote && t.renewed.is_some())
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
 }
 
-/// A read-only branch's hold, kept until its release.
+/// A read-only branch's hold, kept until its release or its time is up.
 struct Hold {
     hold: pigeonhole::ReadHold,
     partition: String,
     term: u64,
 }
 
-/// This node's spanning transactions: those it coordinates, and the read-only holds its
-/// partitions keep for others' release rounds.
+/// The read-only holds this node's partitions keep for other nodes' release rounds.
 pub(crate) struct Spanning {
-    homes: Mutex<HashMap<Arc<str>, Home>>,
     holds: Mutex<HashMap<u64, Hold>>,
     /// The high half of every hold id: random per process, so a hold id from before a
     /// restart never names one taken after it (audit120's condition 1).
@@ -117,71 +144,27 @@ impl Spanning {
                     & 0xffff_ffff
             });
         Arc::new(Self {
-            homes: Mutex::new(HashMap::new()),
             holds: Mutex::new(HashMap::new()),
             nonce: nonce << 32,
             next: AtomicU64::new(1),
         })
     }
 
-    fn homes(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Home>> {
-        self.homes.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn holds(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Hold>> {
         self.holds.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records that `xid` touched `partition` (reading, or writing).
-    fn touch(&self, xid: &str, partition: &str, wrote: bool) {
-        let mut homes = self.homes();
-        let home = homes.entry(xid.into()).or_default();
-        let t = home.parts.entry(partition.to_owned()).or_default();
-        t.read |= !wrote;
-        t.wrote |= wrote;
-    }
-
-    /// Whether branch `partition` of `xid` must be opened or renewed on its owner now: never
-    /// opened, or last renewed `renew_after` ago (S4: renewed with the home's own calls).
-    fn needs_begin(&self, xid: &str, partition: &str, renew_after: Duration) -> bool {
-        let homes = self.homes();
-        homes
-            .get(xid)
-            .and_then(|h| h.parts.get(partition))
-            .and_then(|t| t.renewed)
-            .is_none_or(|at| at.elapsed() >= renew_after)
-    }
-
-    /// The branches `xid` has opened (every partition touched but `home`).
-    fn branches(&self, xid: &str, home: &str) -> std::collections::BTreeSet<String> {
-        self.homes()
-            .get(xid)
-            .map(|h| {
-                h.parts
-                    .iter()
-                    .filter(|(p, t)| *p != home && t.renewed.is_some())
-                    .map(|(p, _)| p.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn begun(&self, xid: &str, partition: &str) {
-        let mut homes = self.homes();
-        let home = homes.entry(xid.into()).or_default();
-        home.parts.entry(partition.to_owned()).or_default().renewed = Some(Instant::now());
-    }
-
-    /// What `xid` touched, by partition, and forgets it: its commit or abort has begun.
-    fn take(&self, xid: &str) -> BTreeMap<String, Touched> {
-        self.homes()
-            .remove(xid)
-            .map(|h| h.parts)
-            .unwrap_or_default()
-    }
-
-    /// Keeps `hold`, taken under lease term `term` on `partition`, until its release.
-    pub(crate) fn keep_hold(&self, hold: pigeonhole::ReadHold, partition: &str, term: u64) -> u64 {
+    /// Keeps `hold`, taken under lease term `term` on `partition`, until its release, or
+    /// for `ttl` at most: a release that never comes (its home died, its round ran out of
+    /// time) leaves no rows held past it (audit120's M4 on #2062). A release after that
+    /// finds no hold and answers lost.
+    pub(crate) fn keep_hold(
+        self: &Arc<Self>,
+        hold: pigeonhole::ReadHold,
+        partition: &str,
+        term: u64,
+        ttl: Duration,
+    ) -> u64 {
         let id = self.nonce | (self.next.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
         self.holds().insert(
             id,
@@ -191,10 +174,22 @@ impl Spanning {
                 term,
             },
         );
+        let me = Arc::downgrade(self);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                tokio::time::sleep(ttl).await;
+                if let Some(me) = me.upgrade() {
+                    // Dropped outside the lock: dropping a hold releases it on its shards.
+                    let gone = me.holds().remove(&id);
+                    drop(gone);
+                }
+            });
+        }
         id
     }
 
-    /// Hold `id`, if this process took it for `partition`. Whoever takes it releases it.
+    /// Hold `id`, if this process took it for `partition` and it's still kept. Whoever
+    /// takes it releases it.
     pub(crate) fn take_hold(
         &self,
         id: u64,
@@ -237,7 +232,7 @@ fn rows_of(op: &ServiceOp) -> Vec<(&str, &[u8])> {
 /// forward ([`is_branch`]) or the home's own call to a branch on its node.
 pub(crate) async fn serve_branch(
     node: &Node,
-    spanning: &Spanning,
+    spanning: &Arc<Spanning>,
     service: Arc<Service>,
     partition: &str,
     op: Op,
@@ -245,7 +240,7 @@ pub(crate) async fn serve_branch(
 ) -> Result<proto::ForwardResponse, ApiError> {
     let reply = match op {
         Op::BranchBegin(b) => {
-            service.begin_branch(&b.xid, caller)?;
+            service.begin_branch(&b.xid, caller, b.renew)?;
             Reply::Empty(proto::Empty {})
         }
         Op::BranchPrepare(b) => Reply::BranchPrepare(
@@ -305,7 +300,9 @@ pub(crate) async fn serve_branch(
 }
 
 /// A spanning transaction's calls to its branches, from its home's node: the coordinator's
-/// side. Built per call; cheap (handles to the node's parts).
+/// side. Built per call; cheap (handles to the node's parts). It holds no state of the
+/// transaction's: that's the home session's [`Span`], which the caller holds out of its
+/// entry with the session.
 #[derive(Clone)]
 pub(crate) struct Driver {
     pub(crate) node: Arc<Node>,
@@ -315,11 +312,15 @@ pub(crate) struct Driver {
     pub(crate) xid: Arc<str>,
     pub(crate) home: Arc<str>,
     pub(crate) caller: Caller,
+    /// The client call's deadline.
     pub(crate) deadline: tokio::time::Instant,
     /// How long a branch may go unrenewed: half the transactions' idle lease.
     pub(crate) renew_after: Duration,
     /// `--txn-max-branches`.
     pub(crate) max_branches: usize,
+    /// The budget of a round that must reach every branch whatever the client's deadline
+    /// (decides, aborts, releases): the request timeout (audit120's S1 on #2062).
+    pub(crate) round: Duration,
 }
 
 /// One partition's prepared share, as the home's release or decide round needs it.
@@ -338,6 +339,30 @@ impl Driver {
             .ok_or_else(ApiError::deadline_exceeded)
     }
 
+    /// This driver with a deadline of its own, [`round`](Self::round) from now: for a round
+    /// that runs in the commit's detached task and must reach every branch even after the
+    /// client's deadline passed (a slow prepare round, or a prepare that timed out).
+    pub(crate) fn for_round(&self) -> Driver {
+        let mut d = self.clone();
+        d.deadline = tokio::time::Instant::now() + self.round;
+        d
+    }
+
+    /// Branch `partition`'s owner by this node's map now, and the map's version.
+    fn owner(&self, partition: &str) -> Result<(super::route::Owner, u64), ApiError> {
+        let routes = self.node.routes();
+        let routes = routes
+            .as_ref()
+            .ok_or_else(|| ApiError::wrong_partition(0, "this node has no cluster map yet"))?;
+        let owner = routes.owner(partition).cloned().ok_or_else(|| {
+            ApiError::wrong_partition(
+                routes.map_version(),
+                format!("the map no longer lists partition {partition:?}"),
+            )
+        })?;
+        Ok((owner, routes.map_version()))
+    }
+
     /// Sends `op` to branch `partition`'s owner, or serves it here if that's this node.
     async fn send(
         &self,
@@ -345,19 +370,7 @@ impl Driver {
         op: Op,
         writes: bool,
     ) -> Result<proto::ForwardResponse, ApiError> {
-        let (owner, map_version) = {
-            let routes = self.node.routes();
-            let routes = routes
-                .as_ref()
-                .ok_or_else(|| ApiError::wrong_partition(0, "this node has no cluster map yet"))?;
-            let owner = routes.owner(partition).cloned().ok_or_else(|| {
-                ApiError::wrong_partition(
-                    routes.map_version(),
-                    format!("the map no longer lists partition {partition:?}"),
-                )
-            })?;
-            (owner, routes.map_version())
-        };
+        let (owner, map_version) = self.owner(partition)?;
         if owner.node == self.node.id() {
             let service = self
                 .parts
@@ -387,57 +400,107 @@ impl Driver {
             .await
     }
 
-    /// Opens (or renews) branch `partition` if it's due, then records what the call does.
-    async fn branch(&self, partition: &str, wrote: bool) -> Result<(), ApiError> {
-        if self
-            .spanning
-            .needs_begin(&self.xid, partition, self.renew_after)
-        {
-            let open = self.spanning.branches(&self.xid, &self.home);
-            if !open.contains(partition) && open.len() >= self.max_branches {
-                return Err(ApiError::failed_precondition(format!(
-                    "the transaction already touches {} partitions besides its home, the most \
-                     --txn-max-branches allows",
-                    open.len()
-                )));
-            }
-            let begin = Op::BranchBegin(proto::BranchBegin {
+    /// Opens branch `partition` (`renew`: renews the open one). An open that meets a newer
+    /// map at the owner (`WrongPartition`) takes that map and tries once more where it now
+    /// puts the partition; a renew never moves, since the branch's snapshot and writes are
+    /// that owner's.
+    async fn begin(&self, partition: &str, renew: bool) -> Result<(), ApiError> {
+        let begin = || {
+            Op::BranchBegin(proto::BranchBegin {
                 xid: self.xid.to_string(),
-            });
-            match self.send(partition, begin, false).await {
-                Ok(_) => self.spanning.begun(&self.xid, partition),
-                // A branch begun at an owner the map has since moved: the transaction can't
-                // go on there (its snapshot and buffered writes are the old owner's).
-                Err(e) => return Err(e),
+                renew,
+            })
+        };
+        match self.send(partition, begin(), false).await {
+            Err(e) if e.code == "WrongPartition" && !renew => {
+                let (owner, version) = self.owner(partition)?;
+                tokio::time::timeout(
+                    self.left()?,
+                    self.node.pull_now(&owner.node, &owner.address, version),
+                )
+                .await
+                .map_err(|_| ApiError::deadline_exceeded())?
+                .map_err(|why| {
+                    ApiError::partition_unavailable(format!(
+                        "node {} has a newer cluster map, which this node couldn't take: {why}",
+                        owner.node
+                    ))
+                })?;
+                self.send(partition, begin(), false).await.map(drop)
+            }
+            r => r.map(drop),
+        }
+    }
+
+    /// Renews every open branch in `span` last renewed [`renew_after`](Self::renew_after)
+    /// ago, at once (S4): a transaction working on its home, or on one branch, keeps the
+    /// others. A branch that's gone (expired) fails the call with `TransactionExpired`,
+    /// never reopened (audit120's M2 on #2062).
+    pub(crate) async fn renew(&self, span: &mut Span) -> Result<(), ApiError> {
+        let due: Vec<String> = span
+            .parts
+            .iter()
+            .filter(|(p, t)| {
+                **p != *self.home && t.renewed.is_some_and(|at| at.elapsed() >= self.renew_after)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let calls: Vec<_> = due
+            .iter()
+            .map(|p| {
+                let (d, p) = (self.clone(), p.clone());
+                tokio::spawn(async move { d.begin(&p, true).await })
+            })
+            .collect();
+        for (p, r) in joined(&due, calls).await {
+            r?;
+            if let Some(t) = span.parts.get_mut(&p) {
+                t.renewed = Some(Instant::now());
             }
         }
-        self.spanning.touch(&self.xid, partition, wrote);
         Ok(())
     }
 
-    /// A transaction call (`TxnGet`, `TxnGetRow`, `TxnWrite`) on branch `partition`.
+    /// A transaction call (`TxnGet`, `TxnGetRow`, `TxnWrite`) on branch `partition`, with the
+    /// home session's `span` (held out of its entry by the caller): opens the branch if this
+    /// is its first call, then records what it did once it did it (audit120's S3).
     pub(crate) async fn call(
         &self,
+        span: &mut Span,
         partition: &str,
         op: ServiceOp,
     ) -> Result<ServiceReply, ApiError> {
         let wrote = matches!(op, ServiceOp::TxnWrite(_));
-        self.branch(partition, wrote).await?;
+        let opened = span
+            .parts
+            .get(partition)
+            .is_some_and(|t| t.renewed.is_some());
+        if !opened {
+            let open = span
+                .parts
+                .iter()
+                .filter(|(p, t)| **p != *self.home && t.renewed.is_some())
+                .count();
+            if open >= self.max_branches {
+                return Err(ApiError::failed_precondition(format!(
+                    "the transaction already touches {open} partitions besides its home, the \
+                     most --txn-max-branches allows"
+                )));
+            }
+            self.begin(partition, false).await?;
+            span.parts.entry(partition.to_owned()).or_default().renewed = Some(Instant::now());
+        }
         let reply = self
             .send(partition, forward::op_to_forward(op)?, wrote)
             .await?;
-        forward::reply_of(reply)
-    }
-
-    /// Records the home's own call (`wrote`: a write).
-    pub(crate) fn home_touched(&self, wrote: bool) {
-        let home = self.home.to_string();
-        self.spanning.touch(&self.xid, &home, wrote);
-    }
-
-    /// Takes what the transaction touched, by partition, as its commit or abort starts.
-    pub(crate) fn finish(&self) -> Touches {
-        Touches(self.spanning.take(&self.xid))
+        let reply = forward::reply_of(reply)?;
+        let t = span.parts.entry(partition.to_owned()).or_default();
+        t.read |= !wrote;
+        t.wrote |= wrote;
+        Ok(reply)
     }
 
     /// Checks again that every node keeps `spanning_txns` (a node on an older build may
@@ -453,20 +516,22 @@ impl Driver {
         parts: &[String],
         read_only: bool,
     ) -> (Vec<Prepared>, Option<ApiError>) {
-        let calls = parts.iter().map(|p| {
-            let (d, p) = (self.clone(), p.clone());
-            tokio::spawn(async move {
-                let op = Op::BranchPrepare(proto::BranchPrepare {
-                    xid: d.xid.to_string(),
-                    read_only,
-                });
-                let r = d.send(&p, op, !read_only).await;
-                (p, r)
+        let calls: Vec<_> = parts
+            .iter()
+            .map(|p| {
+                let (d, p) = (self.clone(), p.clone());
+                tokio::spawn(async move {
+                    let op = Op::BranchPrepare(proto::BranchPrepare {
+                        xid: d.xid.to_string(),
+                        read_only,
+                    });
+                    d.send(&p, op, !read_only).await
+                })
             })
-        });
+            .collect();
         let mut done = Vec::new();
         let mut refused = None;
-        for (partition, r) in joined(calls.collect()).await {
+        for (partition, r) in joined(parts, calls).await {
             match r.and_then(|r| match r.reply {
                 Some(Reply::BranchPrepare(b)) => Ok(b),
                 _ => Err(ApiError::internal(
@@ -487,23 +552,26 @@ impl Driver {
     }
 
     /// Decides every branch in `parts` (commit or abort), at once, each syncing before it
-    /// answers. A branch that answers in time is applied; one that doesn't stays in doubt
-    /// for its resolver, which the parts say.
+    /// answers. A part is `applied` only if its branch answered with its commit: one that
+    /// didn't answer in time stays in doubt for its resolver, and one that found nothing in
+    /// doubt (its partition's history changed) is no applied share (audit120's S2).
     pub(crate) async fn decide(&self, parts: &[String], commit: bool) -> Vec<proto::TxnPart> {
-        let calls = parts.iter().map(|p| {
-            let (d, p) = (self.clone(), p.clone());
-            tokio::spawn(async move {
-                let op = Op::BranchDecide(proto::BranchDecide {
-                    xid: d.xid.to_string(),
-                    commit,
-                    hold: 0,
-                    term: 0,
-                });
-                let r = d.send(&p, op, true).await;
-                (p, r)
+        let calls: Vec<_> = parts
+            .iter()
+            .map(|p| {
+                let (d, p) = (self.clone(), p.clone());
+                tokio::spawn(async move {
+                    let op = Op::BranchDecide(proto::BranchDecide {
+                        xid: d.xid.to_string(),
+                        commit,
+                        hold: 0,
+                        term: 0,
+                    });
+                    d.send(&p, op, true).await
+                })
             })
-        });
-        joined(calls.collect())
+            .collect();
+        joined(parts, calls)
             .await
             .into_iter()
             .map(|(partition, r)| {
@@ -517,7 +585,7 @@ impl Driver {
                 proto::TxnPart {
                     partition,
                     seqno,
-                    applied: r.is_ok(),
+                    applied: seqno > 0,
                 }
             })
             .collect()
@@ -525,20 +593,23 @@ impl Driver {
 
     /// Releases the read-only holds in `held`, at once: whether every one lasted.
     pub(crate) async fn release(&self, held: &[Prepared]) -> bool {
-        let calls = held.iter().map(|h| {
-            let (d, h) = (self.clone(), h.clone());
-            tokio::spawn(async move {
-                let op = Op::BranchDecide(proto::BranchDecide {
-                    xid: d.xid.to_string(),
-                    commit: true,
-                    hold: h.hold,
-                    term: h.term,
-                });
-                let r = d.send(&h.partition, op, false).await.map(drop);
-                (h.partition, r)
+        let names: Vec<String> = held.iter().map(|h| h.partition.clone()).collect();
+        let calls: Vec<_> = held
+            .iter()
+            .map(|h| {
+                let (d, h) = (self.clone(), h.clone());
+                tokio::spawn(async move {
+                    let op = Op::BranchDecide(proto::BranchDecide {
+                        xid: d.xid.to_string(),
+                        commit: true,
+                        hold: h.hold,
+                        term: h.term,
+                    });
+                    d.send(&h.partition, op, false).await.map(drop)
+                })
             })
-        });
-        joined(calls.collect())
+            .collect();
+        joined(&names, calls)
             .await
             .into_iter()
             .all(|(_, r)| r.is_ok())
@@ -551,43 +622,22 @@ impl Driver {
     }
 }
 
-/// Each spawned branch call's answer, in order: a task that panicked is that branch's
-/// failure, never a lost answer.
+/// Each spawned branch call's answer, by its partition (`parts`, in order): a task that
+/// panicked is that branch's failure, never a lost answer.
 async fn joined<T>(
-    calls: Vec<tokio::task::JoinHandle<(String, Result<T, ApiError>)>>,
+    parts: &[String],
+    calls: Vec<tokio::task::JoinHandle<Result<T, ApiError>>>,
 ) -> Vec<(String, Result<T, ApiError>)> {
     let mut out = Vec::with_capacity(calls.len());
-    for c in calls {
-        out.push(c.await.unwrap_or_else(|e| {
-            (
-                String::new(),
-                Err(ApiError::internal(format!(
-                    "a branch call's task failed: {e}"
-                ))),
-            )
-        }));
+    for (p, c) in parts.iter().zip(calls) {
+        let r = c.await.unwrap_or_else(|e| {
+            Err(ApiError::internal(format!(
+                "partition {p:?}'s branch call failed: {e}"
+            )))
+        });
+        out.push((p.clone(), r));
     }
     out
-}
-
-/// What a spanning transaction touched, by partition, the home included.
-pub(crate) struct Touches(BTreeMap<String, Touched>);
-
-impl Touches {
-    /// Whether any partition buffered writes.
-    pub(crate) fn wrote(&self) -> bool {
-        self.0.values().any(|t| t.wrote)
-    }
-
-    /// Whether `partition` read anything.
-    pub(crate) fn read(&self, partition: &str) -> bool {
-        self.0.get(partition).is_some_and(|t| t.read)
-    }
-
-    /// The branches: every partition touched but `home`.
-    pub(crate) fn branches(&self, home: &str) -> Vec<String> {
-        self.0.keys().filter(|p| *p != home).cloned().collect()
-    }
 }
 
 /// Whether every node of the map keeps `spanning_txns`: `FailedPrecondition` naming any
@@ -636,8 +686,10 @@ pub(crate) fn spanning_call(op: &ServiceOp) -> bool {
 }
 
 /// A spanning transaction's call at its home's owner (D329), `home` the home partition's
-/// service here: a row of the home is the home's, and any other partition's row goes to
-/// that partition's branch through `driver`.
+/// service here. The home's session is taken first, for every call: it checks the caller,
+/// renews the session and its branches, and holds the transaction's [`Span`] for the call
+/// (audit120's M1 on #2062). A row of the home is then the home's, and any other partition's
+/// row goes to that partition's branch through `driver`.
 pub(crate) async fn serve_home(
     driver: Driver,
     home: Arc<Service>,
@@ -663,7 +715,8 @@ pub(crate) async fn serve_home(
     // Rows by partition, the home's apart.
     let split = |rows: Vec<proto::RowWrites>| -> Result<_, ApiError> {
         let mut mine = Vec::new();
-        let mut others: BTreeMap<String, Vec<proto::RowWrites>> = BTreeMap::new();
+        let mut others: std::collections::BTreeMap<String, Vec<proto::RowWrites>> =
+            std::collections::BTreeMap::new();
         for rw in rows {
             let key = rw
                 .row
@@ -678,89 +731,106 @@ pub(crate) async fn serve_home(
         }
         Ok((mine, others))
     };
-    match op {
-        ServiceOp::Begin(r) => {
-            check_feature(&driver.node, driver.deadline).await?;
-            let epoch = {
-                let routes = driver.node.routes();
-                routes
-                    .as_ref()
-                    .and_then(|r| r.owner(&driver.home))
-                    .map(|o| o.history_epoch)
-                    .ok_or_else(|| super::super::router::not_open(&driver.home))?
+    if let ServiceOp::Begin(r) = op {
+        check_feature(&driver.node, driver.deadline).await?;
+        let epoch = {
+            let routes = driver.node.routes();
+            routes
+                .as_ref()
+                .and_then(|r| r.owner(&driver.home))
+                .map(|o| o.history_epoch)
+                .ok_or_else(|| super::super::router::not_open(&driver.home))?
+        };
+        let admit = ServiceOp::Begin(r.clone()).admit();
+        drop(home.admit(&admit, caller, prepaid).await?);
+        return Ok(ServiceReply::Begin(
+            home.begin_spanning(r, caller, epoch).await?,
+        ));
+    }
+    let budget = home.admit(&op.admit(), caller, prepaid).await?;
+    // The home's session first, whatever the call (M1, M3): a repeated `Commit` finds its
+    // tombstone here, before any row goes anywhere.
+    let mut g = match home.take_txn(&driver.xid, caller)? {
+        Taken::Open(g) => g,
+        Taken::Done(outcome) => {
+            return match op {
+                ServiceOp::Commit(_) => outcome.map(ServiceReply::Commit),
+                _ => Err(ApiError::transaction_finished(&outcome)),
             };
-            let admit = ServiceOp::Begin(r.clone()).admit();
-            drop(home.admit(&admit, caller, prepaid).await?);
-            Ok(ServiceReply::Begin(
-                home.begin_spanning(r, caller, epoch).await?,
-            ))
         }
+    };
+    let Some(span) = g.span() else {
+        return Err(ApiError::internal("a spanning id on a plain session"));
+    };
+    if !matches!(op, ServiceOp::Abort(_)) {
+        driver.renew(span).await?;
+    }
+    match op {
         ServiceOp::TxnGet(ref r) if partition_of(&r.table, &r.row)? != *driver.home => {
             let p = partition_of(&r.table, &r.row)?;
-            let budget = home.admit(&op.admit(), caller, prepaid).await?;
-            let reply = driver.call(&p, op).await;
-            drop(budget);
+            let reply = driver.call(span, &p, op).await;
+            drop((g, budget));
             reply
         }
         ServiceOp::TxnGetRow(ref r) if partition_of(&r.table, &r.row)? != *driver.home => {
             let p = partition_of(&r.table, &r.row)?;
-            let budget = home.admit(&op.admit(), caller, prepaid).await?;
-            let reply = driver.call(&p, op).await;
-            drop(budget);
+            let reply = driver.call(span, &p, op).await;
+            drop((g, budget));
             reply
         }
         ServiceOp::TxnGet(_) | ServiceOp::TxnGetRow(_) => {
-            driver.home_touched(false);
-            home.call(op, caller, prepaid).await
+            span.parts.entry(driver.home.to_string()).or_default().read = true;
+            // The home's own read takes the session itself.
+            drop(g);
+            home.call(op, caller, Some(budget)).await
         }
         ServiceOp::TxnWrite(r) => {
-            let admit = ServiceOp::TxnWrite(r.clone()).admit();
-            let budget = home.admit(&admit, caller, prepaid).await?;
             let (mine, others) = split(r.rows)?;
             for (p, rows) in others {
                 let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
                     txn_id: r.txn_id.clone(),
                     rows,
                 });
-                driver.call(&p, w).await?;
+                driver.call(span, &p, w).await?;
             }
-            if !mine.is_empty() {
-                driver.home_touched(true);
-                let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
-                    txn_id: r.txn_id,
-                    rows: mine,
-                });
-                drop(budget);
-                return home.call(w, caller, None).await;
+            if mine.is_empty() {
+                return Ok(ServiceReply::Empty(proto::Empty {}));
             }
-            Ok(ServiceReply::Empty(proto::Empty {}))
+            span.parts.entry(driver.home.to_string()).or_default().wrote = true;
+            drop(g);
+            let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
+                txn_id: r.txn_id,
+                rows: mine,
+            });
+            home.call(w, caller, Some(budget)).await
         }
         ServiceOp::Commit(r) => {
-            let admit = ServiceOp::Commit(r.clone()).admit();
-            let budget = home.admit(&admit, caller, prepaid).await?;
             let (mine, others) = split(r.rows)?;
             for (p, rows) in others {
                 let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
                     txn_id: r.txn_id.clone(),
                     rows,
                 });
-                driver.call(&p, w).await?;
+                driver.call(span, &p, w).await?;
             }
             if !mine.is_empty() {
-                driver.home_touched(true);
+                span.parts.entry(driver.home.to_string()).or_default().wrote = true;
             }
             let r = proto::TxnCommitRequest {
                 txn_id: r.txn_id,
                 rows: mine,
             };
             Ok(ServiceReply::Commit(
-                home.commit_spanning(r, caller, budget, driver).await?,
+                home.commit_spanning(g, r, caller, budget, driver).await?,
             ))
         }
-        ServiceOp::Abort(r) => {
-            let touched = driver.finish();
-            driver.abort(&touched.branches(&driver.home)).await;
-            home.call(ServiceOp::Abort(r), caller, prepaid).await
+        ServiceOp::Abort(_) => {
+            let mut branches = span.branches(&driver.home);
+            branches.extend(span.idle(&driver.home));
+            drop(budget);
+            driver.for_round().abort(&branches).await;
+            g.abort();
+            Ok(ServiceReply::Empty(proto::Empty {}))
         }
         _ => Err(ApiError::internal("not a spanning transaction's call")),
     }

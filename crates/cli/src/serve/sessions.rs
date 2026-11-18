@@ -84,6 +84,28 @@ struct Entry {
     /// and on each branch partition's (the branch). Such a session is found only by this
     /// exact text, never by the plain `<partition>:<32 hex>` form of the same key.
     xid: Option<Arc<str>>,
+    /// A spanning transaction's home session: what each partition did (`None` while a call
+    /// has it out, as the transaction).
+    span: Option<Span>,
+}
+
+/// A spanning transaction's coordinator state (D329), kept in its home session's entry:
+/// what each partition it touched did. Taken out and put back with the transaction, so it
+/// is found, checked against the caller, renewed and dropped with the session, under one
+/// lock (audit120's M1 on #2062).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Span {
+    pub(crate) parts: std::collections::BTreeMap<String, Touched>,
+}
+
+/// What one partition did in a spanning transaction, as its home sees it.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Touched {
+    pub(crate) read: bool,
+    pub(crate) wrote: bool,
+    /// When the branch was last opened or renewed on its owner (`None`: not opened, or the
+    /// home).
+    pub(crate) renewed: Option<Instant>,
 }
 
 impl Entry {
@@ -289,7 +311,7 @@ impl Sessions {
         lifetime: Duration,
     ) -> Result<String, ApiError> {
         let id = new_id()?;
-        self.insert_at(id, principal, state, durability, idle, lifetime, None)?;
+        self.insert_at(id, principal, state, durability, idle, lifetime, None, None)?;
         Ok(self.text(&id))
     }
 
@@ -304,6 +326,7 @@ impl Sessions {
         idle: Duration,
         lifetime: Duration,
         xid: Option<Arc<str>>,
+        span: Option<Span>,
     ) -> Result<(), ApiError> {
         self.start_reaper();
         let now = Instant::now();
@@ -325,6 +348,7 @@ impl Sessions {
                 hard: now + lifetime,
                 opened: now,
                 xid,
+                span,
             },
         );
         Ok(())
@@ -368,19 +392,23 @@ impl Sessions {
             self.leases.txn_idle,
             self.leases.txn_lifetime,
             Some(Arc::clone(&xid)),
+            Some(Span::default()),
         )?;
         Ok(xid.to_string())
     }
 
-    /// Opens spanning transaction `xid`'s branch here for `principal` (D329), or renews it
-    /// if it's open: the home's first call on this partition opens it, later ones renew it
-    /// (S4). A branch that already ended (prepared, decided, expired) answers `NotFound`, so
-    /// the home never reopens one at a newer snapshot.
+    /// Opens spanning transaction `xid`'s branch here for `principal` (D329), or with
+    /// `renew` renews the open one: the home's first call on this partition opens it, and
+    /// its later calls renew it (S4). A renew finds the branch or answers
+    /// `TransactionExpired`, and an open finds none or answers `NotFound`, so the home never
+    /// silently reopens a branch at a newer snapshot with what it read and wrote gone
+    /// (audit120's M2 on #2062).
     pub(crate) fn begin_branch(
         self: &Arc<Self>,
         principal: Principal,
         open: impl FnOnce() -> Result<Transaction, ApiError>,
         xid: &str,
+        renew: bool,
     ) -> Result<(), ApiError> {
         let gone = || ApiError::not_found("no such transaction");
         let key = spanning_parts(xid)
@@ -390,17 +418,21 @@ impl Sessions {
             let now = Instant::now();
             let mut t = self.lock();
             t.expire(&key, now, &self.leases);
-            if let Some(e) = t.map.get_mut(&key) {
-                if e.xid.as_deref() != Some(xid) || e.principal != principal {
-                    return Err(gone());
+            match t.map.get_mut(&key) {
+                Some(e) if e.xid.as_deref() == Some(xid) && e.principal == principal => {
+                    return match e.state {
+                        State::Txn(_) if renew => {
+                            e.renew(now);
+                            Ok(())
+                        }
+                        State::Txn(_) | State::Committing => Err(gone()),
+                        State::Expired => Err(ApiError::transaction_expired()),
+                        _ => Err(gone()),
+                    };
                 }
-                return match e.state {
-                    State::Txn(_) => {
-                        e.renew(now);
-                        Ok(())
-                    }
-                    _ => Err(gone()),
-                };
+                Some(_) => return Err(gone()),
+                None if renew => return Err(ApiError::transaction_expired()),
+                None => {}
             }
         }
         self.insert_at(
@@ -411,6 +443,7 @@ impl Sessions {
             self.leases.txn_idle,
             self.leases.txn_lifetime,
             Some(xid.into()),
+            None,
         )
     }
 
@@ -478,6 +511,7 @@ impl Sessions {
                     txn: Some(txn),
                     durability: e.durability,
                     wrote: e.wrote,
+                    span: e.span.take(),
                     ended: false,
                 }))
             }
@@ -678,12 +712,13 @@ impl Sessions {
     }
 
     /// Puts a call's transaction back, or (with `None`) records that the call lost it.
-    fn put_back(&self, id: &Id, txn: Option<Transaction>, wrote: bool) {
+    fn put_back(&self, id: &Id, txn: Option<Transaction>, wrote: bool, span: Option<Span>) {
         let now = Instant::now();
         let mut t = self.lock();
         if let Some(e) = t.map.get_mut(id) {
             e.busy = 0;
             e.wrote |= wrote;
+            e.span = span;
             e.renew(now);
             e.state = match txn {
                 Some(txn) => State::Txn(Some(txn)),
@@ -741,6 +776,8 @@ pub(crate) struct TxnGuard {
     /// The entry's `wrote`, and set by [`TxnGuard::wrote_now`]: put back with the
     /// transaction.
     wrote: bool,
+    /// A spanning transaction's coordinator state, out of its entry with the transaction.
+    span: Option<Span>,
     ended: bool,
 }
 
@@ -771,6 +808,11 @@ impl TxnGuard {
     /// Whether the transaction has buffered writes from a `TxnWrite`.
     pub(crate) fn wrote(&self) -> bool {
         self.wrote
+    }
+
+    /// A spanning transaction's coordinator state (D329): `None` for any other session.
+    pub(crate) fn span(&mut self) -> Option<&mut Span> {
+        self.span.as_mut()
     }
 
     /// Starts the commit: the session answers `SessionBusy` until the ticket records the
@@ -804,7 +846,7 @@ impl Drop for TxnGuard {
     fn drop(&mut self) {
         if !self.ended {
             self.sessions
-                .put_back(&self.id, self.txn.take(), self.wrote);
+                .put_back(&self.id, self.txn.take(), self.wrote, self.span.take());
         }
     }
 }
@@ -1131,11 +1173,19 @@ mod tests {
         assert_eq!(home.take(&xid, p(2)).err().unwrap().code, "NotFound");
         // A branch: opened, renewed by a second begin, taken by the home's own call.
         branch
-            .begin_branch(p(1), || Ok(db.transaction().unwrap()), &xid)
+            .begin_branch(p(1), || Ok(db.transaction().unwrap()), &xid, false)
             .unwrap();
         branch
-            .begin_branch(p(1), || panic!("not opened twice"), &xid)
+            .begin_branch(p(1), || panic!("not opened twice"), &xid, true)
             .unwrap();
+        // Opened again (the home thinks it new), it's refused: never two snapshots.
+        assert_eq!(
+            branch
+                .begin_branch(p(1), || panic!("not reopened"), &xid, false)
+                .unwrap_err()
+                .code,
+            "NotFound"
+        );
         assert!(matches!(branch.take(&xid, p(1)), Ok(Taken::Open(_))));
         assert!(matches!(branch.take_branch(&xid), Ok(Taken::Open(_))));
         // Another home's prefix on the same key is another transaction: not found.

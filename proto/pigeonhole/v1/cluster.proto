@@ -652,9 +652,11 @@ message ForwardedCaller {
 // A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 // call's own status.
 // Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
-// transaction's id (its xid), at that partition's snapshot now.
+// transaction's id (its xid), at that partition's snapshot now; with `renew`, renews the open
+// one instead, or answers `TransactionExpired` if it's gone (never reopening it).
 message BranchBegin {
   string xid = 1;
+  bool renew = 2;
 }
 
 // Prepares a branch (D329): a writing transaction's durably (its reads and writes held until

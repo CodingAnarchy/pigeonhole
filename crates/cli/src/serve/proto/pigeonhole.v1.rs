@@ -7604,11 +7604,14 @@ pub struct ForwardedCaller {
 /// A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 /// call's own status.
 /// Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
-/// transaction's id (its xid), at that partition's snapshot now.
+/// transaction's id (its xid), at that partition's snapshot now; with `renew`, renews the open
+/// one instead, or answers `TransactionExpired` if it's gone (never reopening it).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BranchBegin {
     #[prost(string, tag = "1")]
     pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub renew: bool,
 }
 /// Prepares a branch (D329): a writing transaction's durably (its reads and writes held until
 /// `BranchDecide`), or with `read_only` a hold of its reads in memory, released by a

@@ -776,3 +776,112 @@ fn a_spanning_transactions_branch_on_its_homes_node_is_a_local_call() {
         assert_eq!(get_row(c, "hank").await.unwrap(), None);
     });
 }
+
+/// A spanning transaction begun through `port` with its home at "zed" (p3, node a).
+async fn begin_spanning(port: u16) -> String {
+    txns(port)
+        .await
+        .begin(crate::serve::proto::BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .txn_id
+}
+
+#[test]
+fn a_spanning_transactions_branches_are_renewed_by_its_other_calls() {
+    // audit120's M2 and the design's S4: a branch idle past --txn-idle-ms while the
+    // transaction works elsewhere is renewed by those calls, so the commit has its write;
+    // without it the branch would expire and its write be lost.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.leases.txn_idle = std::time::Duration::from_millis(800);
+    let t = Several::start(limits);
+    let [_, b, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(b).await;
+        txn_write(
+            c,
+            &id,
+            vec![put_row("hank", "1"), put_row("alice", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        // Two and a half idle leases of calls on the home alone.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            txn_get(c, &id, "zed").await.unwrap();
+        }
+        let reply = txns(c)
+            .await
+            .commit(crate::serve::proto::TxnCommitRequest {
+                txn_id: id.clone(),
+                rows: vec![put_row("zed", "1")],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.parts.iter().all(|p| p.applied), "{reply:?}");
+        assert_eq!(get_row(c, "hank").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+}
+
+#[test]
+fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
+    // audit120's M4: a home lost in its release round leaves its branches' holds; each goes
+    // at twice the request timeout, and its row takes writes again.
+    use crate::serve::cluster::spanning::seams;
+    let mut limits = crate::serve::server_tests::limits();
+    limits.request_timeout = std::time::Duration::from_millis(800);
+    let t = Several::start(limits);
+    let [_, b, c] = t.ports;
+    t.rt.block_on(async {
+        put(c, "hank", "0").await;
+        let id = begin_spanning(b).await;
+        txn_get(c, &id, "hank").await.unwrap();
+        let pause = seams::pause(&id, seams::Step::Release);
+        let task = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                txns(c)
+                    .await
+                    .commit(crate::serve::proto::TxnCommitRequest {
+                        txn_id: id,
+                        rows: Vec::new(),
+                    })
+                    .await
+            })
+        };
+        pause.reached.notified().await;
+        // p2 holds hank now: a write is refused.
+        let e = data(c)
+            .await
+            .mutate(crate::serve::proto::MutateRequest {
+                writes: Some(put_row("hank", "1")),
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Busy", "{e}");
+        // The home abandons its round: the hold is never released, so it expires.
+        pause.go.send(true).unwrap();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        eventually("the hold to expire", async || {
+            data(c)
+                .await
+                .mutate(crate::serve::proto::MutateRequest {
+                    writes: Some(put_row("hank", "1")),
+                    durability: 0,
+                })
+                .await
+                .is_ok()
+        })
+        .await;
+    });
+}

@@ -76,6 +76,7 @@ impl Cluster {
             deadline,
             renew_after: home_service.txn_idle() / 2,
             max_branches: home_service.txn_max_branches(),
+            round: home_service.request_timeout(),
         })
     }
 }
