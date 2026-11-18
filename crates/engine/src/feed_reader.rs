@@ -1472,7 +1472,8 @@ impl FeedReader {
         if let Some(marks) = self.writer.as_ref().and_then(|f| f.marks(s)) {
             cursor.follow_head(Arc::clone(marks));
         }
-        silent_gate(&self.shared, &mut cursor);
+        // The mark is decoded here and checked against `incompat` bit 3 by `read_one`'s filter.
+        cursor.accept_silent(true, None);
         Ok(cursor)
     }
 
@@ -2484,16 +2485,17 @@ impl FeedReader {
     /// expires the feed).
     fn read_one<const INDEXING: bool>(&mut self, s: usize) -> Result<Option<ReadRecord>> {
         let (tables, prefix, include_silent) = (&self.tables, &self.prefix, self.include_silent);
+        let shared = &self.shared;
         // D320: a record past the read-ahead's cutoff is passed over before its mutations
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        // A feed-silent batch (D331, ICR 0141) holds nothing for a subscription: its commit is
-        // passed over as one to other tables is, and the reader's position moves past it.
-        // Checked here, not in `pack`, which stays as it was (#2055's feed shapes).
+        // A feed-silent batch (D331, ICR 0141): checked against `incompat` bit 3 and passed
+        // over for a subscription, out of line. The cursors take the mark, so this one test
+        // per batch is the feed path's whole cost (#2055's feed shapes); `pack` is as it was.
         let filter = |batch: BatchRef<'_>| {
-            if !include_silent && batch.is_silent() {
-                Ok(Raws::default())
+            if batch.is_silent() {
+                silent_batch(shared, batch, tables, prefix, include_silent)
             } else {
                 pack(batch, tables, prefix)
             }
@@ -3047,7 +3049,7 @@ impl FeedReader {
                 at,
             )
             .ok()?;
-            silent_gate(&self.shared, &mut cursor);
+            cursor.accept_silent(true, None);
             Some(cursor)
         };
         // Each stream's first retained segment of every earlier session in the history.
@@ -3580,30 +3582,39 @@ fn note_silent(record: &WalRecord<'_>, seen: &mut HashSet<Seqno>) {
     seen.insert(key);
 }
 
-/// Lets `cursor` take feed-silent batches' mark (D331, ICR 0141) once the database has
-/// `incompat` bit 3: at once if it has now, else asked again when the cursor meets one (a
-/// writer sets the bit before appending the first). A reader process's pager doesn't see the
-/// bit until it reloads, and setting it commits no manifest, so the check reads the
-/// superblocks on disk again (simp724's S1 on #2055); a `true` is kept.
-fn silent_gate(shared: &Arc<Shared>, cursor: &mut FeedCursor) {
-    let known = |shared: &Shared| shared.silent_flagged.load(Ordering::Acquire);
-    let check = {
-        let shared = Arc::clone(shared);
-        Arc::new(move || {
-            if known(&shared) {
-                return true;
-            }
-            let on_disk = shared
-                .pager
-                .features_on_disk()
-                .is_ok_and(|f| f.incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0);
-            if on_disk {
-                shared.silent_flagged.store(true, Ordering::Release);
-            }
-            on_disk
-        }) as pigeonhole_wal::SilentCheck
-    };
-    cursor.accept_silent(known(shared), Some(check));
+/// A feed-silent batch a feed read (D331, ICR 0141): `Corruption` unless the database has
+/// `incompat` bit 3, which a writer sets before appending the first (a stray bit is never
+/// read as the mark); then nothing for a subscription, whose commit is passed over as one
+/// to other tables is, and the batch's mutations for a reader that includes them. A reader
+/// process's pager doesn't see the bit until it reloads, and setting it commits no
+/// manifest, so the superblocks on disk are read again (simp724's S1 on #2055); a `true`
+/// is kept in `silent_flagged`.
+#[cold]
+#[inline(never)]
+fn silent_batch(
+    shared: &Shared,
+    batch: BatchRef<'_>,
+    tables: &[TableId],
+    prefix: &[u8],
+    include_silent: bool,
+) -> Result<Raws> {
+    if !shared.silent_flagged.load(Ordering::Acquire) {
+        let on_disk = shared
+            .pager
+            .features_on_disk()
+            .is_ok_and(|f| f.incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0);
+        if !on_disk {
+            return Err(Error::Corruption(
+                pigeonhole_format::wal::SILENT_WITHOUT_BIT.to_owned(),
+            ));
+        }
+        shared.silent_flagged.store(true, Ordering::Release);
+    }
+    if include_silent {
+        pack(batch, tables, prefix)
+    } else {
+        Ok(Raws::default())
+    }
 }
 
 #[cfg(test)]
