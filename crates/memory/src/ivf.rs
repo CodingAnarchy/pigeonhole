@@ -48,7 +48,8 @@ impl IvfOptions {
 
     /// A namespace with fewer memories with an embedding than `n` is recalled exactly,
     /// as in a store without the index (T5: exact search stays under 15 ms at p99 up to a
-    /// few thousand per namespace). At least 1.
+    /// few thousand per namespace). At least 1. The count is the namespace's at the recall's
+    /// snapshot; a recall at the same snapshot as an earlier one reuses that one's count.
     pub fn min_namespace_len(mut self, n: u64) -> Self {
         self.min_namespace_len = n;
         self
@@ -224,6 +225,71 @@ fn found(
         return None;
     }
     Some(hits.into_iter().map(|h| h.id).collect())
+}
+
+/// The most namespaces a store keeps a count for ([`NsCounts`]), past which it starts again
+/// (ai1249's S1 on #2040): per-user namespaces would otherwise grow it without bound, and a
+/// dropped count only costs a read.
+const NS_COUNTS_MAX: usize = 4096;
+
+/// The namespace counts a store's recalls read, each with the snapshot it was read at (#2040):
+/// a recall at the same snapshot takes it from here instead of reading the counter again.
+///
+/// A counter read folds every operand since the counter's last D291 checkpoint, and until the
+/// shard applies the checkpoint that read sent, every other read folds them all again: about
+/// 6% of a recall for a namespace of 2,000 memories. At one snapshot the counter has one
+/// value, so a count is reused only at the same snapshot, and any commit makes the next
+/// recall read it. The key is the snapshot's seqno with the database's recovery generation:
+/// a recovery can lose unsynced commits a snapshot saw and use their seqnos again, with other
+/// content. With `auto_recover` off the generation stays fixed, but then nothing recovers in
+/// the process, and a reopen starts with an empty cache. A reader process keeps no counts: a
+/// writer's restart can reuse a seqno it saw too, and it has no generation to tell (#2040's
+/// cost is the writer's; ai1249).
+#[derive(Debug, Default)]
+pub(crate) struct NsCounts {
+    /// Namespace to `((generation, seqno), count)`.
+    counts: std::sync::Mutex<std::collections::HashMap<String, (At, u64)>>,
+    /// Counter reads kept here (an inspection count for tests): a reader process keeps
+    /// none, so its reads aren't counted.
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) reads: std::sync::atomic::AtomicU64,
+}
+
+/// A count's snapshot: the database's recovery generation and the snapshot's seqno.
+pub(crate) type At = (u64, u64);
+
+impl NsCounts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, (At, u64)>> {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `ns`'s count read at `at`, if there is one.
+    pub(crate) fn get(&self, ns: &str, at: At) -> Option<u64> {
+        match self.lock().get(ns) {
+            Some(&(a, c)) if a == at => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Keeps `ns`'s count read at `at`, unless a later snapshot's is kept already.
+    pub(crate) fn put(&self, ns: &str, at: At, count: u64) {
+        #[cfg(feature = "__unstable-hooks")]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut m = self.lock();
+        match m.get_mut(ns) {
+            Some(e) if e.0 > at => {}
+            Some(e) => *e = (at, count),
+            None => {
+                if m.len() >= NS_COUNTS_MAX {
+                    m.clear();
+                }
+                m.insert(ns.to_owned(), (at, count));
+            }
+        }
+    }
 }
 
 /// The namespace counter at `s`: memories with an embedding (0 when absent).
