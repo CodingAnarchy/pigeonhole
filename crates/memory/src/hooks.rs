@@ -108,6 +108,12 @@ pub fn ivf_pending(store: &crate::Store) -> usize {
     store.ivf_pending_len()
 }
 
+/// The namespace counter reads the store's IVF recalls made (#2040): an inspection helper.
+/// A recall at the snapshot of an earlier one takes its counts without a read.
+pub fn ns_count_reads(store: &crate::Store) -> u64 {
+    store.ns_count_reads()
+}
+
 /// The store's IVF index's list lengths, in list order, or `None` without an index: an
 /// inspection helper. A background index's lists only split when its rebalancer runs, so a
 /// test counts the lists to see whether one does (#1640).

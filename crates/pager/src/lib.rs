@@ -1454,7 +1454,8 @@ impl Pager {
     /// block is held while it is punched, outside the allocator lock, so no allocation lands
     /// in it, no relocation or truncation moves it, and the next large allocation does not
     /// grow the file for want of it. A failed punch records nothing; a filesystem that cannot
-    /// punch fails with [`ErrorKind::Unsupported`].
+    /// punch fails with [`ErrorKind::Unsupported`]. A poisoned pager (a failed root commit or
+    /// sync) punches nothing and fails: the failed root may still be the one recovery opens.
     pub fn punch_free(&self, reserve: u64) -> Result<Option<u64>> {
         if !self.inner.writable {
             return Err(io_err(ErrorKind::Unsupported, "punch on a read-only pager"));
@@ -1464,6 +1465,15 @@ impl Pager {
         else {
             return Ok(None);
         };
+        // A failed root commit poisons the pager before its writer abandons the new root's
+        // extents (its manifest), and that root's superblock may be on disk anyway: recovery
+        // can open it, so those extents must stay as written (simp724's M1 on #2034).
+        // Checked after the take: a block taken from abandoned extents was freed after the
+        // poison was set, so this sees it.
+        if lock(&self.inner.state).poisoned {
+            lock(&self.inner.alloc).end_punch(&[]);
+            return Err(poisoned_error().into());
+        }
         let started = std::time::Instant::now();
         // Returns the block even if a punch panics (simp724's S2 on #2033): a block left
         // held would stop every later pass and stay out of the free map until reopen.

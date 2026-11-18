@@ -2557,9 +2557,7 @@ mod tests {
 
     /// Real commits of seqnos the test can't choose, read off a feed.
     fn commits(name: &str, n: usize) -> (Vec<Commit>, Pigeonhole, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("phdb-feed-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::fresh(&format!("phdb-feed-{name}-"));
         let db = Pigeonhole::open(
             dir.join("r.phdb"),
             Options::default()

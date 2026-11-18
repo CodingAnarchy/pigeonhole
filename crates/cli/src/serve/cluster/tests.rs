@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::proto::{
@@ -15,47 +15,9 @@ use super::proto::{
 use super::{MapState, Node, Peers, identity, read_map, routes};
 use crate::serve::auth::Tokens;
 
-/// The directories [`test_dir`] made on this thread, removed when it ends: a test's thread
-/// ends after its servers, runtimes and databases are dropped, so its files are closed by
-/// then. Each partition's WAL files are 64 MiB (a shard's first slot): kept, a full run left
-/// ~100 GB of them, sparse on macOS and Linux but not on Windows, whose CI disk filled
-/// partway through the cli tests ("no space left on device").
-struct Made(std::cell::RefCell<Vec<PathBuf>>);
-
-impl Drop for Made {
-    fn drop(&mut self) {
-        for dir in self.0.take() {
-            // A handle a stopped server's thread is still closing: Windows refuses to remove
-            // an open file, so a few tries.
-            for _ in 0..20 {
-                if std::fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
-
-thread_local! {
-    static MADE: Made = const { Made(std::cell::RefCell::new(Vec::new())) };
-}
-
-/// A new directory for a test, removed when the test's thread ends.
+/// A new directory for a test, removed when the test's thread ends (`crate::test_dir`).
 pub(super) fn test_dir() -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "phdb-cluster-{}-{nanos}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    MADE.with(|m| m.0.borrow_mut().push(dir.clone()));
-    dir
+    crate::test_dir::fresh("phdb-cluster-")
 }
 
 /// The lease the test nodes grant (D326): three of their push timeouts, the least a node

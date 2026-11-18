@@ -234,12 +234,7 @@ fn served_shards(file: &std::path::Path, shards: Option<usize>) -> usize {
 /// since the count isn't stored in the file (ICR 0132).
 #[test]
 fn a_restart_without_shards_keeps_the_servers_default_count() {
-    let dir = std::env::temp_dir().join(format!(
-        "phdb-serve-shards-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_dir::fresh("phdb-serve-shards-");
     let file = dir.join("s.phdb");
     let default = super::placement::default_shards();
     assert_eq!(served_shards(&file, None), default, "created");

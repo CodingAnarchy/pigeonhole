@@ -1383,15 +1383,7 @@ mod tests {
             Aggregation, BloomParams, Compaction, Compression, Family, HistogramParams, Metric,
             Priority, QuantileParams, VectorSpec,
         };
-        let dir = std::env::temp_dir().join(format!(
-            "phdb-family-json-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::fresh("phdb-family-json-");
         let db = pigeonhole::Pigeonhole::open(
             dir.join("f.phdb"),
             pigeonhole::Options::default()

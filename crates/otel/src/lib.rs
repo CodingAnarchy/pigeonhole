@@ -1013,6 +1013,60 @@ static SPECS: &[Spec] = &[
         |s, out| out.push((seconds(s.e.file_growth_nanos), Vec::new()))
     ),
     spec!(
+        "pigeonhole.file.punches",
+        Counter,
+        false,
+        "{punch}",
+        [],
+        "Free blocks given back to the filesystem as holes (Options::punch_freed).",
+        |s, out| one(out, s.e.file_punches)
+    ),
+    spec!(
+        "pigeonhole.file.punch.time",
+        Counter,
+        true,
+        "s",
+        [],
+        "Time those punches took.",
+        |s, out| out.push((seconds(s.e.file_punch_nanos), Vec::new()))
+    ),
+    spec!(
+        "pigeonhole.file.punched",
+        Counter,
+        false,
+        "By",
+        [],
+        "Bytes those punches gave back.",
+        |s, out| one(out, s.e.file_punch_bytes)
+    ),
+    spec!(
+        "pigeonhole.file.holes",
+        Gauge,
+        false,
+        "By",
+        [],
+        "Free bytes of the file that are holes now; the file's length less this is about what it occupies on disk.",
+        |s, out| one(out, s.m.file_punched_bytes)
+    ),
+    spec!(
+        "pigeonhole.file.punch.passes",
+        Counter,
+        false,
+        "{pass}",
+        [],
+        "Punch passes started.",
+        |s, out| one(out, s.e.file_punch_passes)
+    ),
+    spec!(
+        "pigeonhole.file.punch.refusals",
+        Counter,
+        false,
+        "{refusal}",
+        [],
+        "Punches that failed; a filesystem that cannot punch fails once, and punching stops until the next open.",
+        |s, out| one(out, s.e.file_punch_refusals)
+    ),
+    spec!(
         "pigeonhole.sst.count",
         Gauge,
         false,
@@ -1360,6 +1414,11 @@ counters!(EngineRest {
     pinned_warnings: |r: &Raw| r.m.block_cache_pinned_warnings,
     file_growths: |r: &Raw| r.m.file_growths,
     file_growth_nanos: |r: &Raw| r.m.file_growth_nanos,
+    file_punches: |r: &Raw| r.m.file_punches,
+    file_punch_nanos: |r: &Raw| r.m.file_punch_nanos,
+    file_punch_bytes: |r: &Raw| r.m.file_punch_bytes,
+    file_punch_passes: |r: &Raw| r.m.file_punch_passes,
+    file_punch_refusals: |r: &Raw| r.m.file_punch_refusals,
     async_sync_reads: |r: &Raw| r.m.async_sync_reads,
     shard_busy_nanos: |r: &Raw| r.m.shard_busy_nanos,
     reader_slots_reclaimed: |r: &Raw| r.m.reader_slots_reclaimed,
