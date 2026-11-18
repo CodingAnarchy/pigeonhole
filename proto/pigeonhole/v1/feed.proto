@@ -67,6 +67,10 @@ message FeedEvent {
   }
   // On a cluster subscription, the partition the event came from; empty on a single node.
   string partition = 5;
+  // A commit of a transaction across partitions (D329, `BeginRequest.spans_partitions`): its
+  // id, the same on every partition's share of it, so a subscriber can group them. Empty
+  // for any other commit.
+  bytes xid = 7;
 }
 
 // On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,

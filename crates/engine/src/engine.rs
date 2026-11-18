@@ -787,6 +787,8 @@ fn external_pins(
             .unwrap_or_default();
         let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
         rec.accept_silent(silent_ok);
+        // Tagged batches only behind `incompat` bit 2 (D329 2b): this pass runs only with it.
+        rec.accept_xid(true);
         while let Some((_, record)) = rec.next_record()? {
             match record {
                 WalRecord::Prepare { seqno, .. } => {
@@ -1603,6 +1605,9 @@ impl Engine {
                 Recovery::open(&vfs, path, stream, db_id, checkpoint)?
             };
             rec.accept_silent(silent_ok);
+            rec.accept_xid(
+                pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0,
+            );
             let mut records = Vec::new();
             while let Some((end, record)) = rec.next_record()? {
                 match record {
@@ -2702,6 +2707,19 @@ impl Engine {
     /// ago it was prepared, in nanoseconds.
     pub fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
         self.inner.in_doubt()
+    }
+
+    /// [`in_doubt`](Self::in_doubt), with each share's batch bytes (what it keeps in the
+    /// WAL, as the in-doubt limit counts it): `(xid, nanoseconds since prepared, bytes)`.
+    pub fn in_doubt_shares(&self) -> Vec<(Vec<u8>, u64, u64)> {
+        let now = self.inner.shared.vfs.monotonic_nanos();
+        self.inner
+            .shared
+            .external
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, e)| (xid, now.saturating_sub(e.prepared_at), e.bytes))
+            .collect()
     }
 
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
@@ -5809,6 +5827,18 @@ impl Inner {
     /// Separates the puts of `builder` above the inline limit into blob files (#230). Waits
     /// for a manifest commit when there is one; the waiting thread drives that commit
     /// itself (`manifest::commit_from_thread`, as `shrink` does), so it may drive a shard.
+    /// Tags routed batch `builder` with `xid`, a spanning commit's (D329 2b), as its last
+    /// step, behind `incompat` bit 2. Rebuilds after it (large values, counters, the split
+    /// into shares) carry it. Nothing for an untagged batch.
+    #[inline]
+    fn tag_routed(&self, xid: Option<Arc<[u8]>>, builder: &mut BatchBuilder) -> Result<()> {
+        if let Some(xid) = xid {
+            self.flag_external()?;
+            builder.tag_xid(&xid)?;
+        }
+        Ok(())
+    }
+
     fn separate_large(
         &self,
         builder: BatchBuilder,
@@ -5964,6 +5994,13 @@ impl Inner {
             ));
         }
         let view = self.shared.view.load();
+        // An External Prepare's record names its xid itself: a tagged batch has no place
+        // there (feed1248's point 6 on 2b).
+        if batch.xid.is_some() {
+            return Err(Error::InvalidArgument(
+                "an external prepare's batch can't carry an xid tag".to_owned(),
+            ));
+        }
         let (builder, mut shards) = self.route(batch, &view)?;
         let (builder, large) = self.separate_large(builder)?;
         if large.is_some() {
@@ -6286,7 +6323,10 @@ impl Inner {
         // One tablet map for the whole routing: its version goes with a cross-shard commit,
         // which a participant moving a tablet refuses and the coordinator retries.
         let view = self.shared.view.load();
-        let (builder, mut shards) = self.route(batch, &view)?;
+        let mut batch = batch;
+        let xid = batch.xid.take();
+        let (mut builder, mut shards) = self.route(batch, &view)?;
+        self.tag_routed(xid, &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
@@ -6489,7 +6529,10 @@ impl Inner {
         }
         let durability = durability.unwrap_or_else(|| self.shared.default_durability());
         let view = self.shared.view.load();
-        let (builder, shards) = self.route(batch, &view)?;
+        let mut batch = batch;
+        let xid = batch.xid.take();
+        let (mut builder, shards) = self.route(batch, &view)?;
+        self.tag_routed(xid, &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         let shard = match shards.as_slice() {
             [] => view
@@ -7336,6 +7379,17 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
 /// the last write.
 ///
+/// Tags `to`, a batch rebuilt from `from`, with `from`'s xid if it has one (D329 2b): the
+/// rebuild's last step, so its pushes never meet the trailer. One bit test for an untagged
+/// batch.
+#[inline]
+pub(crate) fn carry_xid(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    if let Some(xid) = from.batch().xid() {
+        to.tag_xid(xid)?;
+    }
+    Ok(())
+}
+
 /// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
 /// one, the only change is the fixed timestamp, and the batch is copied straight through: no
 /// map, no list of writes, and the copy sized once (#1795: a lone `incr`'s rebuilt batch grew
@@ -7368,6 +7422,7 @@ fn prepare_counter_writes(
             );
             out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
         }
+        carry_xid(batch, &mut out)?;
         return Ok(out);
     }
     struct Write<'a> {
@@ -7473,6 +7528,7 @@ fn prepare_counter_writes(
         let value = w.value.as_deref().unwrap_or(m.value);
         out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, value)?;
     }
+    carry_xid(batch, &mut out)?;
     Ok(out)
 }
 

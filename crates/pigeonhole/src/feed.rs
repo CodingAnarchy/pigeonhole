@@ -139,6 +139,8 @@ pub struct Commit {
     seqno: u64,
     ts: u64,
     changes: Vec<Change>,
+    /// A spanning commit's xid (D329 2b): [`xid`](Self::xid), and a replicated event's.
+    pub(crate) xid: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Commit {
@@ -151,6 +153,16 @@ impl Commit {
     /// Its commit timestamp.
     pub fn timestamp(&self) -> u64 {
         self.ts
+    }
+
+    /// The transaction it is a share of, when it's a spanning commit's (D329 2b, ICR 0140
+    /// amendment 2): every share of one commit, on every partition, carries the same, so a
+    /// subscriber can group them. `None` for any other commit. Hidden, as
+    /// [`Transaction::tag_xid`](crate::Transaction::tag_xid).
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn xid(&self) -> Option<&[u8]> {
+        self.xid.as_deref()
     }
 
     /// Its changes the feed follows, in the order the commit wrote them.
@@ -166,6 +178,7 @@ impl Commit {
             seqno: 0,
             ts: 0,
             changes: Vec::new(),
+            xid: None,
         }
     }
 }
@@ -1066,6 +1079,7 @@ fn catalog_change(names: &mut Names, ev: &CatalogEvent) -> CatalogChange {
 fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Commit) -> Result<()> {
     out.seqno = c.seqno;
     out.ts = c.ts;
+    out.xid.clone_from(&c.xid);
     // The commit's `Change`s are reused: their buffers keep their capacity across commits.
     out.changes.truncate(c.changes.len());
     for (i, ch) in c.changes.iter().enumerate() {
@@ -1173,6 +1187,7 @@ mod tests {
         let bad = pigeonhole_engine::Commit {
             seqno: 9,
             ts: 1,
+            xid: None,
             changes: vec![pigeonhole_engine::Change {
                 table: info.id,
                 family: info.families[0].id,

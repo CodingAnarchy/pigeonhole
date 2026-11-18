@@ -100,6 +100,8 @@ pub(crate) enum ServiceOp {
     /// ([`Service::fanout_part`]).
     TextStats(proto::TextStatsRequest),
     TextSearchPart(proto::TextSearchPartRequest),
+    /// `Transactions.Outcome` (D329 2b).
+    Outcome(proto::TxnOutcomeRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -141,6 +143,8 @@ pub(crate) enum ServiceReply {
     Forget(proto::ForgetResponse),
     MemoryWatch(super::memory::MemoryEvents),
     RecallPool(proto::RecallPoolResponse),
+    /// `Transactions.Outcome` (D329 2b).
+    Outcome(proto::TxnOutcomeResponse),
     RecallBodies(proto::RecallBodiesResponse),
     TextStats(proto::TextStatsResponse),
     /// A unary read's reply with its share of `--inflight-bytes` (#1567): held until the
@@ -334,6 +338,7 @@ impl ServiceOp {
             Self::RecallBodies(_) => 51,
             Self::TextStats(_) => 52,
             Self::TextSearchPart(_) => 53,
+            Self::Outcome(_) => 54,
         }
     }
 
@@ -431,6 +436,9 @@ impl ServiceOp {
             | Self::Batch(_)
             | Self::MutateReturning(_)
             | Self::TxnWrite(_) => Scope::Write,
+            // It may end the transaction it asks about (D329: an abort marker), so it's a
+            // write on the home partition (audit120's S3 on the design).
+            Self::Outcome(_) => Scope::Write,
         }
     }
 
@@ -490,6 +498,7 @@ impl ServiceOp {
             Self::RecallBodies(r) => r.encoded_len(),
             Self::TextStats(r) => r.encoded_len(),
             Self::TextSearchPart(r) => r.encoded_len(),
+            Self::Outcome(r) => r.encoded_len(),
         }
     }
 
@@ -618,8 +627,11 @@ impl ServiceOp {
             },
             // A transaction's or snapshot's start and end, a pinned snapshot's release: no rows
             // (a transaction's routing key picks its home, it reads nothing).
+            // `Outcome` (D329) reads its own decision record, in the internal decision table,
+            // which no move names.
             Self::Begin(_)
             | Self::Abort(_)
+            | Self::Outcome(_)
             | Self::OpenSnapshot(_)
             | Self::ReleaseSnapshot(_)
             // The schema, maintenance and the node's own calls: whole tables or none, never a
@@ -859,7 +871,7 @@ fn step_recall(r: Option<proto::RecallRequest>) -> Result<crate::memcore::Recall
         .and_then(super::memory::recall)
 }
 
-pub(crate) const RPCS: [&str; 54] = [
+pub(crate) const RPCS: [&str; 55] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -918,6 +930,7 @@ pub(crate) const RPCS: [&str; 54] = [
     // another node's search, never a client's call.
     "Text.Stats",
     "Text.SearchPart",
+    "Transactions.Outcome",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -2300,6 +2313,43 @@ impl Service {
             ServiceOp::Abort(r) => {
                 drop(budget);
                 self.abort(&r, caller).map(ServiceReply::Empty)
+            }
+            // A cluster's home answers it through `spanning::settle`, before here; this is a
+            // single node's: a session's recorded outcome, while it lasts (D329 2b).
+            ServiceOp::Outcome(r) => {
+                drop(budget);
+                use super::sessions::Peek;
+                use proto::TxnOutcomeState as S;
+                let answer = |state: S, reason: &str| proto::TxnOutcomeResponse {
+                    state: state as i32,
+                    reason: reason.to_owned(),
+                    ..Default::default()
+                };
+                match self.peek_txn(&r.txn_id, caller) {
+                    Peek::Live => Ok(answer(
+                        S::InProgress,
+                        "the transaction is open or committing",
+                    )),
+                    Peek::Done(Ok(c)) => Ok(proto::TxnOutcomeResponse {
+                        state: S::Committed as i32,
+                        commit: c.commit,
+                        parts: c.parts,
+                        reason: String::new(),
+                    }),
+                    Peek::Done(Err(e)) => Ok(answer(
+                        if e.code == "OutcomeUnknown" {
+                            S::Unknown
+                        } else {
+                            S::Aborted
+                        },
+                        &e.message,
+                    )),
+                    Peek::Gone => Err(ApiError::not_found(
+                        "no such transaction (its outcome is kept only while its session's \
+                         record is)",
+                    )),
+                }
+                .map(ServiceReply::Outcome)
             }
             ServiceOp::OpenSnapshot(r) => {
                 drop(budget);
@@ -4946,6 +4996,157 @@ impl Service {
         err
     }
 
+    /// How long after its begin a spanning transaction's decision record can still be asked
+    /// for (D329 2b): its lifetime, the request timeout and `--txn-outcome-retention`. Past
+    /// it, an absent record may have been GC'd, and isn't presumed aborted.
+    pub(crate) fn outcome_horizon(&self) -> std::time::Duration {
+        self.limits.leases.txn_lifetime
+            + self.limits.request_timeout
+            + self.limits.txn_outcome_retention
+    }
+
+    /// `--txn-outcome-retention`.
+    pub(crate) fn outcome_retention(&self) -> std::time::Duration {
+        self.limits.txn_outcome_retention
+    }
+
+    /// Records that branches `acked` applied spanning transaction `xid`'s commit (D329 2b), in
+    /// its decision row, for its GC. A row that's gone, or isn't a commit, is left as it is.
+    pub(crate) async fn ack_decision(&self, xid: &str, acked: &[String]) -> Result<(), ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, with_acks};
+        if acked.is_empty() {
+            return Ok(());
+        }
+        let table = self.decisions_table().await?;
+        let row = xid.as_bytes().to_vec();
+        for _ in 0..3 {
+            let mut txn = self.part()?.db.transaction()?;
+            let Some(c) = txn
+                .get_async(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER)
+                .await?
+            else {
+                return Ok(());
+            };
+            let Some(value) = with_acks(c.value(), acked) else {
+                return Ok(());
+            };
+            txn.put(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER, &value);
+            let held = match &self.gate {
+                Some(gate) => Some(gate.enter()?),
+                None => None,
+            };
+            let done = txn.commit_async().await.map_err(ApiError::from);
+            drop(held);
+            match done {
+                Ok(_) => return Ok(()),
+                Err(e) if e.code == "Conflict" => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes this home's decision rows past `--txn-outcome-retention` at `now_ms` (D329
+    /// 2b): commits every branch acknowledged, and abort markers. Returns how many went.
+    pub(crate) async fn sweep_decisions(&self, now_ms: u64) -> Result<usize, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
+        let table = self.decisions_table().await?;
+        let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        let gone: Vec<Vec<u8>> = {
+            let table = table.clone();
+            self.blocking(move || {
+                let mut gone = Vec::new();
+                for row in table.scan_prefix(b"").iter()? {
+                    let row = row?;
+                    let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
+                        continue;
+                    };
+                    if collectable(cell.value(), now_ms, retention) {
+                        gone.push(row.key().to_vec());
+                    }
+                }
+                Ok(gone)
+            })
+            .await?
+        };
+        let held = match &self.gate {
+            Some(gate) => Some(gate.enter()?),
+            None => None,
+        };
+        let mut n = 0;
+        for key in &gone {
+            table.mutate(key).delete_row().commit()?;
+            n += 1;
+        }
+        drop(held);
+        Ok(n)
+    }
+
+    /// What transaction `id` is now, for `caller` (D329's `Outcome` and resolver), without
+    /// taking it.
+    pub(crate) fn peek_txn(&self, id: &str, caller: &Caller) -> super::sessions::Peek {
+        self.sessions.peek(id, caller.principal)
+    }
+
+    /// Spanning transaction `xid`'s decision row on this home partition (D329), read now:
+    /// `None` when it has none.
+    pub(crate) async fn decision(&self, xid: &str) -> Result<Option<Vec<u8>>, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER};
+        let table = self.decisions_table().await?;
+        let row = xid.as_bytes().to_vec();
+        self.blocking(move || {
+            Ok(table
+                .get(&row, DECISION_FAMILY, DECISION_QUALIFIER)?
+                .map(|c| c.value().to_vec()))
+        })
+        .await
+    }
+
+    /// Makes spanning transaction `xid`'s outcome final as aborted, if nothing decided it
+    /// (D329: the resolver's and `Outcome`'s absent row, with the home's history unchanged):
+    /// an OCC transaction that reads the row and, absent, writes the abort marker through
+    /// the gate at `GroupSync`, so the commit point (which reads the row absent and writes
+    /// `COMMITTED`) and this can't both win. Returns the row as it is now: the marker, or
+    /// what a commit point that won the race wrote.
+    pub(crate) async fn decide_absent(&self, xid: &str, epoch: u64) -> Result<Vec<u8>, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, aborted_value};
+        let table = self.decisions_table().await?;
+        let row = xid.as_bytes().to_vec();
+        for _ in 0..3 {
+            let mut txn = self.part()?.db.transaction()?;
+            if let Some(c) = txn
+                .get_async(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER)
+                .await?
+            {
+                return Ok(c.value().to_vec());
+            }
+            let marker = aborted_value(epoch);
+            txn.put(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER, &marker);
+            let held = match &self.gate {
+                Some(gate) => Some(gate.enter()?),
+                None => None,
+            };
+            let committed = txn
+                .commit_with_async(pigeonhole::Durability::GroupSync)
+                .await
+                .map_err(ApiError::from)
+                .and_then(|c| match &held {
+                    Some(h) => h.committed().map(|()| c),
+                    None => Ok(c),
+                });
+            drop(held);
+            match committed {
+                Ok(_) => return Ok(marker),
+                // The commit point (or another resolver) wrote it meanwhile: read again.
+                Err(e) if e.code == "Conflict" => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ApiError::unavailable(
+            "the transaction's decision row kept changing: ask again",
+        ))
+    }
+
     /// Takes transaction `id` for `caller`'s call (D329's coordinator: a spanning
     /// transaction's home session, with its span).
     pub(crate) fn take_txn(&self, id: &str, caller: &Caller) -> Result<Taken, ApiError> {
@@ -5167,8 +5368,28 @@ impl Service {
             };
             ticket.finish(outcome.clone());
             drop(budget);
+            // The branches its decide round applied, recorded for the decision row's GC,
+            // after the reply (D329 2b).
+            let applied: Vec<String> = match &outcome {
+                Ok(r) => r
+                    .parts
+                    .iter()
+                    .skip(1)
+                    .filter(|p| p.applied)
+                    .map(|p| p.partition.clone())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
             if tx.send(outcome).is_err() {
                 metrics.replies_lost.fetch_add(1, Ordering::Relaxed);
+            }
+            if !applied.is_empty()
+                && let Err(e) = me.ack_decision(&driver.xid, &applied).await
+            {
+                eprintln!(
+                    "phdb serve: recording a transaction's branch acks: {}",
+                    e.message
+                );
             }
         });
         rx.await.unwrap_or_else(|_| {
@@ -5271,6 +5492,9 @@ impl Service {
             DECISION_QUALIFIER,
             &committed_value(epoch, branches),
         );
+        // Its records and feed events carry the xid, as every branch's share does (D329 2b):
+        // a subscriber groups the commit's shares by it. A home-only commit too (F3).
+        txn.tag_xid(driver.xid.as_bytes());
         let held = match gate.enter() {
             Ok(h) => h,
             Err(e) => {

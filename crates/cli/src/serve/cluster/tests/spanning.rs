@@ -4,7 +4,7 @@
 
 use super::*;
 
-async fn begin_spanning(port: u16, row: &str) -> Result<String, tonic::Status> {
+pub(super) async fn begin_spanning(port: u16, row: &str) -> Result<String, tonic::Status> {
     let r = super::super::proto::BeginRequest {
         durability: 0,
         route: route_row(row),
@@ -13,7 +13,7 @@ async fn begin_spanning(port: u16, row: &str) -> Result<String, tonic::Status> {
     Ok(txns(port).await.begin(r).await?.into_inner().txn_id)
 }
 
-async fn commit_parts(
+pub(super) async fn commit_parts(
     port: u16,
     id: &str,
     rows: Vec<super::super::proto::RowWrites>,
@@ -33,7 +33,7 @@ async fn channel(port: u16) -> tonic::transport::Channel {
         .unwrap()
 }
 
-async fn abort(port: u16, id: &str) -> Result<(), tonic::Status> {
+pub(super) async fn abort(port: u16, id: &str) -> Result<(), tonic::Status> {
     let r = super::super::proto::TxnAbortRequest { txn_id: id.into() };
     txns(port).await.abort(r).await.map(drop)
 }
@@ -410,5 +410,268 @@ fn a_repeated_commit_with_branch_rows_answers_its_first_outcome_and_writes_them_
             tables.iter().all(|t| !t.starts_with("__phdb_")),
             "{tables:?}"
         );
+    });
+}
+
+/// Spanning transaction `id`'s decision row in home partition file `db`.
+fn decision_row(db: &pigeonhole::Pigeonhole, id: &str) -> Option<Vec<u8>> {
+    use crate::serve::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, DECISIONS};
+    let t = db.table(DECISIONS).ok()?.open().ok()?;
+    t.get(id.as_bytes(), DECISION_FAMILY, DECISION_QUALIFIER)
+        .ok()
+        .flatten()
+        .map(|c| c.value().to_vec())
+}
+
+/// Limits whose resolver asks about a share in doubt after 200 ms (D329 2b).
+fn resolving() -> crate::serve::config::Limits {
+    let mut l = crate::serve::server_tests::limits();
+    l.txn_resolve_delay = Duration::from_millis(200);
+    l
+}
+
+/// `Transactions.Outcome` of `id` through `port`.
+async fn outcome(
+    port: u16,
+    id: &str,
+) -> Result<super::super::proto::TxnOutcomeResponse, tonic::Status> {
+    txns(port)
+        .await
+        .outcome(super::super::proto::TxnOutcomeRequest {
+            txn_id: id.to_owned(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// `id` with its begin time set to `ms` (the first 48 bits of its hex) and, with `epoch`, its
+/// home's history epoch replaced: an id the home never gave out.
+fn forged(id: &str, ms: u64, epoch: Option<u64>) -> String {
+    let (prefix, hex) = id.rsplit_once('-').unwrap();
+    let prefix = match epoch {
+        Some(e) => format!("{}h{e}", prefix.rsplit_once('h').unwrap().0),
+        None => prefix.to_owned(),
+    };
+    format!("{prefix}-{:012x}{}", ms & ((1 << 48) - 1), &hex[12..])
+}
+
+#[test]
+fn the_resolver_commits_a_branch_whose_home_reached_its_commit_point() {
+    // D329 2b: the home died after its decision row committed. p1's share, in doubt, asks
+    // the home (ResolveTxn), finds the row and commits; Outcome says so, with the parts.
+    use crate::serve::cluster::spanning::seams::Step;
+    use crate::serve::proto::TxnOutcomeState as St;
+    let t = Three::start_limits(["", "", ""], resolving());
+    let [_, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let (pause, commit) = paused_commit(c, &id, Step::Decide).await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        // Out of doubt once its decision is logged, and visible once applied just after.
+        eventually("the resolver to commit p1's share", async || {
+            !in_doubt(&t, &id) && get_row(c, "alice").await.unwrap() == Some(b"1".to_vec())
+        })
+        .await;
+        let o = outcome(c, &id).await.unwrap();
+        assert_eq!(o.state(), St::Committed, "{o:?}");
+        // p1 acked the commit it applied: the home's record marks it, for the GC.
+        eventually("p1's ack on the home's decision row", async || {
+            decision_row(&t.dbs[1], &id).is_some_and(|v| v.ends_with(b"\n+p1"))
+        })
+        .await;
+    });
+}
+
+#[test]
+fn the_resolver_aborts_a_branch_whose_home_never_reached_its_commit_point() {
+    // D329 2b: no decision row, the home's history unchanged: the home writes an abort
+    // marker (OCC), so a late commit can't follow, and p1's share aborts.
+    use crate::serve::cluster::spanning::seams::Step;
+    use crate::serve::proto::TxnOutcomeState as St;
+    let t = Three::start_limits(["", "", ""], resolving());
+    let [_, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let (pause, commit) = paused_commit(c, &id, Step::CommitPoint).await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        eventually("the resolver to abort p1's share", async || {
+            !in_doubt(&t, &id)
+        })
+        .await;
+        assert_eq!(get_row(c, "alice").await.unwrap(), None);
+        assert_eq!(get_row(c, "zed").await.unwrap(), None);
+        let o = outcome(c, &id).await.unwrap();
+        assert_eq!(o.state(), St::Aborted, "{o:?}");
+        // p1 takes a plain write of alice at once: its share is gone.
+        put(c, "alice", "2").await;
+    });
+}
+
+#[test]
+fn outcome_answers_in_progress_unknown_and_not_found() {
+    // D329 2b's Outcome: a live transaction is in progress (nothing written); an id from
+    // another history of its home is unknown; one begun before the retention horizon,
+    // with no record, is not found (never presumed aborted: its record may have been GC'd).
+    use crate::serve::proto::TxnOutcomeState as St;
+    let t = Three::start(["", "", ""]);
+    let [_, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(c, &id, vec![put_row("zed", "1")], None)
+            .await
+            .unwrap();
+        let o = outcome(c, &id).await.unwrap();
+        assert_eq!(o.state(), St::InProgress, "{o:?}");
+        // Asking wrote nothing: the transaction still commits.
+        commit_parts(c, &id, Vec::new()).await.unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let other = forged(&id, now, Some(999));
+        let o = outcome(c, &other).await.unwrap();
+        assert_eq!(o.state(), St::Unknown, "{o:?}");
+        let old = forged(&id, 1, None);
+        let e = outcome(c, &old).await.unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
+    });
+}
+
+/// `phdb cluster txn decide`'s call: decides `id`'s share on partition `p` through `port`.
+async fn decide(
+    port: u16,
+    p: &str,
+    id: &str,
+    commit: bool,
+    force: bool,
+) -> Result<super::super::proto::LocalPartition, tonic::Status> {
+    client(port)
+        .await
+        .decide_txn(super::super::proto::DecideTxnRequest {
+            partition: p.into(),
+            xid: id.into(),
+            commit,
+            force,
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// Node `port`'s status line for partition `p`.
+async fn line(port: u16, p: &str) -> super::super::proto::LocalPartition {
+    client(port)
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == p)
+        .unwrap()
+}
+
+#[test]
+fn a_share_in_doubt_shows_in_status_and_is_decided_by_hand_only_when_its_home_cant_answer() {
+    // D329 2b: p1's status line lists the share in doubt. The operator's decide is refused
+    // while the home answers (its resolver settles the share) unless forced; once the home
+    // can't answer (its node down), it decides. A fence doesn't silence a home: it still
+    // reads its decision rows.
+    use crate::serve::cluster::spanning::seams::Step;
+    let mut t = Three::start(["", "", ""]);
+    let [a, b, c] = t.ports;
+    let bob = t.rt.block_on(async {
+        let lost = async |row: &str| {
+            let id = begin_spanning(c, "zed").await.unwrap();
+            txn_write(c, &id, vec![put_row(row, "1"), put_row("zed", "1")], None)
+                .await
+                .unwrap();
+            let (pause, commit) = paused_commit(c, &id, Step::CommitPoint).await;
+            pause.go.send(true).unwrap();
+            assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+            id
+        };
+        let id = lost("alice").await;
+        let lp = line(a, "p1").await;
+        assert_eq!(lp.in_doubt, 1, "{lp:?}");
+        assert_eq!(lp.in_doubt_oldest_xid, id);
+        assert_eq!(lp.in_doubt_shares[0].xid, id, "{lp:?}");
+        let e = decide(a, "p1", &id, true, false).await.unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        assert!(in_doubt(&t, &id), "a refused decide leaves it");
+        set_fence(b, "p2", true).await;
+        let e = decide(a, "p1", &id, true, false).await.unwrap_err();
+        assert_eq!(
+            code(&e),
+            "FailedPrecondition",
+            "a fenced home still answers: {e}"
+        );
+        set_fence(b, "p2", false).await;
+        // With the home answering, `force` decides (here: commit, the operator's call).
+        decide(a, "p1", &id, true, true).await.unwrap();
+        assert!(!in_doubt(&t, &id));
+        assert_eq!(get_row(a, "alice").await.unwrap(), Some(b"1".to_vec()));
+        lost("bob").await
+    });
+    // The home's node down: it can't answer, so the decide goes ahead unforced.
+    drop(std::mem::replace(
+        &mut t.stops[1],
+        tokio::sync::oneshot::channel().0,
+    ));
+    t.rt.block_on(async {
+        assert!(in_doubt(&t, &bob));
+        let lp = decide(a, "p1", &bob, false, false).await.unwrap();
+        assert_eq!(lp.in_doubt, 0, "{lp:?}");
+        assert_eq!(get_row(a, "bob").await.unwrap(), None);
+    });
+}
+
+#[test]
+fn a_cluster_partition_refuses_a_follower_outside_its_map_replicas() {
+    // D329 2b (the coordinator's option a): a cluster node serves `Replication.Follow` only
+    // to a cluster-scope caller whose node id is one of the partition's map replicas. An
+    // outside follower (`--replica-of` a cluster node), with or without a node id, is
+    // refused with the reason, not served the partition's raw history.
+    use crate::serve::proto::FollowRequest;
+    use crate::serve::proto::replication_client::ReplicationClient;
+    let t = Three::start(["", "", ""]);
+    let [a, _, _] = t.ports;
+    t.rt.block_on(async {
+        for node_id in [None, Some("c"), Some("zz")] {
+            let mut req = tonic::Request::new(FollowRequest::default());
+            if let Some(id) = node_id {
+                req.metadata_mut()
+                    .insert(super::super::NODE_ID_HEADER, id.parse().unwrap());
+            }
+            let mut c = ReplicationClient::new(channel(a).await);
+            let e = match c.follow(req).await {
+                Err(e) => e,
+                Ok(stream) => stream
+                    .into_inner()
+                    .message()
+                    .await
+                    .expect_err("a follower outside the map's replicas is served"),
+            };
+            assert_eq!(code(&e), "FailedPrecondition", "{node_id:?}: {e}");
+            assert!(e.message().contains("map replicas"), "{e}");
+        }
     });
 }

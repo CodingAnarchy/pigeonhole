@@ -327,3 +327,120 @@ fn a_silent_batch_is_read_only_with_its_bit() {
     .encode(&mut rec);
     assert!(WalRecord::decode(&rec).is_ok());
 }
+
+/// D329 2b (ICR 0140 amendment 2): a batch's xid trailer, flagged by the count's bit 30.
+/// It reads back with the mutations as they were, beside the silent mark or without it.
+/// Every count reader masks both bits, and a reader that knows the file lacks `incompat`
+/// bit 2 refuses it.
+#[test]
+fn an_xid_trailer_reads_back_beside_the_silent_mark_and_is_refused_without_its_bit() {
+    use pigeonhole_format::wal::{BatchBuilder, BatchRef, SILENT_BATCH, WalRecord, XID_BATCH};
+    use pigeonhole_format::{FamilyId, Kind, TableId};
+
+    let batch = |silent: bool, xid: Option<&[u8]>| {
+        let mut b = BatchBuilder::new();
+        for row in [&b"a"[..], b"b", b"c"] {
+            b.push(
+                TableId(1),
+                FamilyId(2),
+                Kind::Put,
+                row,
+                b"q",
+                Some(5),
+                b"\x00v",
+            )
+            .unwrap();
+        }
+        if silent {
+            b.mark_silent();
+        }
+        if let Some(x) = xid {
+            b.tag_xid(x).unwrap();
+        }
+        b
+    };
+    let xid = b"p2:h7-0123456789abcdef0123456789abcdef";
+    for silent in [false, true] {
+        let b = batch(silent, Some(xid));
+        let bytes = b.batch().as_bytes().to_vec();
+        let raw = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        assert_eq!(raw & XID_BATCH, XID_BATCH, "the trailer's bit");
+        assert_eq!(raw & SILENT_BATCH != 0, silent, "the silent mark beside it");
+        assert_eq!(
+            *bytes.last().unwrap() as usize,
+            xid.len(),
+            "its length last"
+        );
+        let parsed = BatchRef::new(&bytes).unwrap();
+        assert_eq!(parsed.len(), 3, "the count masks both bits");
+        assert_eq!(parsed.iter().count(), 3, "the walk stops at the trailer");
+        assert_eq!(parsed.xid(), Some(&xid[..]));
+        assert_eq!(parsed.is_silent(), silent);
+        // In a record: taken with the bit, refused without it.
+        let mut rec = Vec::new();
+        WalRecord::Batch {
+            seqno: 9,
+            commit_ts: 100,
+            batch: b.batch(),
+        }
+        .encode(&mut rec);
+        let taken = WalRecord::decode_flags(&rec, true, true).unwrap();
+        assert_eq!(taken.batch().unwrap().xid(), Some(&xid[..]));
+        assert!(WalRecord::decode_flags(&rec, true, false).is_err());
+        let mut rec = Vec::new();
+        WalRecord::Prepare {
+            seqno: 9,
+            commit_ts: 100,
+            coordinator: pigeonhole_format::StreamId(0),
+            batch: b.batch(),
+        }
+        .encode(&mut rec);
+        assert!(WalRecord::decode_flags(&rec, true, false).is_err());
+        assert_eq!(
+            WalRecord::decode_flags(&rec, true, true)
+                .unwrap()
+                .batch()
+                .unwrap()
+                .xid(),
+            Some(&xid[..])
+        );
+    }
+    // An untagged batch has none; a second tag, an empty xid or one over 255 bytes is refused.
+    let plain = batch(false, None);
+    assert_eq!(plain.batch().xid(), None);
+    let mut b = batch(false, Some(xid));
+    assert!(b.tag_xid(b"again").is_err());
+    let mut b = batch(false, None);
+    assert!(b.tag_xid(b"").is_err());
+    assert!(b.tag_xid(&[b'x'; 256]).is_err());
+    // A trailer whose length runs past the batch, or a zero length, is corrupt.
+    let mut bytes = batch(false, Some(xid)).batch().as_bytes().to_vec();
+    *bytes.last_mut().unwrap() = 250;
+    assert!(BatchRef::new(&bytes).is_err());
+    *bytes.last_mut().unwrap() = 0;
+    assert!(BatchRef::new(&bytes).is_err());
+    // Bytes between the last mutation and the trailer are still trailing bytes.
+    let mut b = batch(false, None);
+    let mut bytes = b.batch().as_bytes().to_vec();
+    bytes.push(0xEE);
+    bytes.extend_from_slice(xid);
+    bytes.push(xid.len() as u8);
+    bytes[3] |= (XID_BATCH >> 24) as u8;
+    assert!(BatchRef::new(&bytes).is_err());
+    b.clear();
+    assert_eq!(b.batch().xid(), None, "clear drops the tag");
+}
+
+/// A count near the mask's cap round-trips with both flags set and with either, and a push
+/// past the cap is refused before it reaches a flag bit (perf2's point 4 on 2b).
+#[test]
+fn a_count_near_its_cap_keeps_its_flags_apart() {
+    use pigeonhole_format::wal::{COUNT_FLAGS, COUNT_MASK, SILENT_BATCH, XID_BATCH};
+    let cap = COUNT_MASK & !COUNT_FLAGS;
+    assert_eq!(cap, (1 << 30) - 1);
+    for flags in [0, SILENT_BATCH, XID_BATCH, SILENT_BATCH | XID_BATCH] {
+        let raw = cap | flags;
+        assert_eq!(raw & COUNT_MASK, cap, "{flags:#x}");
+        assert_eq!(raw & COUNT_FLAGS, flags);
+    }
+}

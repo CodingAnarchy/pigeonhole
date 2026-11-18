@@ -652,6 +652,13 @@ impl proto::transactions_server::Transactions for TxnGrpc {
     ) -> Result<Response<proto::Empty>, Status> {
         unary!(&self.0, req, Abort, Empty)
     }
+
+    async fn outcome(
+        &self,
+        req: Request<proto::TxnOutcomeRequest>,
+    ) -> Result<Response<proto::TxnOutcomeResponse>, Status> {
+        unary!(&self.0, req, Outcome, Outcome)
+    }
 }
 
 /// `Feed` over gRPC (D313 R2): the fan-out's events, an error as the stream's final status.
@@ -920,7 +927,14 @@ impl proto::replication_server::Replication for ReplicationGrpc {
         &self,
         req: Request<proto::FollowRequest>,
     ) -> Result<Response<Self::FollowStream>, Status> {
-        match call(&self.0, req, ServiceOp::Follow).await? {
+        // Which node follows, for the owner's map-replica check (D329 2b).
+        let node = req
+            .metadata()
+            .get(super::cluster::NODE_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let followed = super::router::FOLLOWER.scope(node, call(&self.0, req, ServiceOp::Follow));
+        match followed.await? {
             ServiceReply::Follow(b) => Ok(Response::new(Box::pin(GrpcStream(b)))),
             _ => Err(unexpected()),
         }

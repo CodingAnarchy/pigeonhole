@@ -1275,12 +1275,21 @@ fn data_node_served(
             replica_run: 256,
         },
     );
-    // A restart with a map: the node takes its peers' newer maps, as `run` has it.
-    let start = if restart {
+    // A restart with a map: the node takes its peers' newer maps, as `run` has it. D329's
+    // resolver starts once it serves, as `run` starts it.
+    let sync = if restart {
         super::start_sync(&node, node.get_map().map_or(0, |m| m.map_version))
     } else {
         None
     };
+    let resolver =
+        super::spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        if let Some(sync) = sync {
+            sync();
+        }
+        resolver();
+    }));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let app = crate::serve::http::router(shared);
     rt.spawn(async move {
@@ -2130,6 +2139,11 @@ struct Three {
 
 impl Three {
     fn start(tokens: [&str; 3]) -> Self {
+        Self::start_limits(tokens, crate::serve::server_tests::limits())
+    }
+
+    /// [`Three::start`] under `limits` (each node's).
+    fn start_limits(tokens: [&str; 3], limits: crate::serve::config::Limits) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -2150,7 +2164,7 @@ impl Three {
         {
             let dir = test_dir();
             super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_tokens(&rt, &dir, id, local, l, tokens);
+            let (stop, db) = data_node_limits(&rt, &dir, id, local, l, tokens, limits.clone());
             stops.push(stop);
             dbs.extend(db);
         }

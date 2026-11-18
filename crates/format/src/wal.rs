@@ -96,6 +96,21 @@ pub const INCOMPAT_FEED_SILENT: u64 = 1 << 3;
 /// replication. The mutation count is the low 31 bits.
 pub const SILENT_BATCH: u32 = 1 << 31;
 
+/// The bit of a batch's `count u32` that says the batch ends in an xid trailer (D329 2b,
+/// FORMAT §10.3): after the mutations, the xid's bytes and then its length (one byte,
+/// 1–255), so a reader finds it from the end. The transaction a spanning commit's share
+/// belongs to, which the change feed delivers with it. Written only by a database with
+/// `incompat` bit 2 ([`INCOMPAT_EXTERNAL_PREPARE`]); a build without it reads the count as
+/// over a billion mutations and reports the record corrupt.
+pub const XID_BATCH: u32 = 1 << 30;
+
+/// A batch count's flag bits ([`SILENT_BATCH`], [`XID_BATCH`]); the mutation count is the
+/// rest ([`COUNT_MASK`]). Every reader of a count masks through it.
+pub const COUNT_FLAGS: u32 = SILENT_BATCH | XID_BATCH;
+
+/// A batch count's mutation count bits: everything below the flags.
+pub const COUNT_MASK: u32 = !COUNT_FLAGS;
+
 /// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch read without
 /// `incompat` bit 3 (D331): a reader that may have opened before the bit was set asks
 /// again on this one only.
@@ -113,6 +128,25 @@ fn marked(bytes: &[u8]) -> bool {
         Some(1) => top(20),
         Some(2) => top(24),
         Some(5) => external_marked(bytes),
+        _ => false,
+    }
+}
+
+/// The `Corrupt` reason [`WalRecord::decode_flags`] gives a batch with an xid trailer read
+/// without `incompat` bit 2 (D329 2b): a stray bit is never read as a trailer.
+pub const XID_WITHOUT_BIT: &str = "wal record: an xid-tagged batch without incompat bit 2";
+
+/// Whether a record's batch has [`XID_BATCH`] set, at the same fixed places as [`marked`]
+/// (the count's top byte, bit 6). An External Prepare's batch never may (its share names
+/// its xid), which decoding refuses. Out of line: only a reader that may meet a stray bit
+/// asks.
+#[cold]
+#[inline(never)]
+fn xid_marked(bytes: &[u8]) -> bool {
+    let bit = |at: usize| bytes.get(at).is_some_and(|b| b & 0x40 != 0);
+    match bytes.first() {
+        Some(1) => bit(20),
+        Some(2) => bit(24),
         _ => false,
     }
 }
@@ -1016,6 +1050,25 @@ impl WalRecord<'_> {
     /// test more (#2055's feed shapes).
     #[inline]
     pub fn decode_with(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
+        Self::decode_flags(bytes, silent_ok, true)
+    }
+
+    /// [`decode_with`](Self::decode_with), refusing a batch's [`XID_BATCH`] trailer unless
+    /// `xid_ok` (the superblock has [`INCOMPAT_EXTERNAL_PREPARE`], D329 2b): a reader that
+    /// knows the database's bits passes both (recovery, the check tool), so a stray bit is
+    /// never read as a trailer. An External Prepare's batch refuses the bit whatever
+    /// `xid_ok` says.
+    #[inline]
+    pub fn decode_flags(
+        bytes: &[u8],
+        silent_ok: bool,
+        xid_ok: bool,
+    ) -> crate::Result<WalRecord<'_>> {
+        if !xid_ok && xid_marked(bytes) {
+            return Err(Error::Corrupt {
+                what: XID_WITHOUT_BIT,
+            });
+        }
         if !silent_ok && marked(bytes) {
             return Err(silent_without_bit());
         }
@@ -1193,6 +1246,37 @@ impl BatchBuilder {
     pub fn mark_silent(&mut self) {
         self.silent = true;
         self.write_count();
+        if self.tagged() {
+            // `write_count` wrote the count without the trailer's bit: put it back.
+            self.buf[3] |= (XID_BATCH >> 24) as u8;
+        }
+    }
+
+    /// Ends the batch with an xid trailer (D329 2b, [`XID_BATCH`]): the transaction a
+    /// spanning commit's share belongs to. The batch's last step: a push after it is a bug
+    /// (the trailer would sit inside the mutations), and the engine tags a share only once
+    /// it's whole, so `push` needn't look. `InvalidArgument` for an empty xid or one over
+    /// 255 bytes, or for a batch already tagged. Its writer sets `incompat` bit 2 first.
+    pub fn tag_xid(&mut self, xid: &[u8]) -> crate::Result<()> {
+        let len = u8::try_from(xid.len()).map_err(|_| Error::InvalidArgument {
+            what: "an xid over 255 bytes",
+        })?;
+        if len == 0 || self.tagged() {
+            return Err(Error::InvalidArgument {
+                what: "an empty xid, or a batch already tagged",
+            });
+        }
+        self.buf.extend_from_slice(xid);
+        self.buf.push(len);
+        self.buf[3] |= (XID_BATCH >> 24) as u8;
+        Ok(())
+    }
+
+    /// Whether [`tag_xid`](Self::tag_xid) tagged it (since the last `clear`).
+    fn tagged(&self) -> bool {
+        self.buf
+            .get(3)
+            .is_some_and(|b| b & (XID_BATCH >> 24) as u8 != 0)
     }
 
     /// Whether [`mark_silent`](Self::mark_silent) marked it (since the last `clear`).
@@ -1261,7 +1345,7 @@ impl BatchBuilder {
         let count = self
             .count
             .checked_add(1)
-            .filter(|&c| c & SILENT_BATCH == 0)
+            .filter(|&c| c & COUNT_FLAGS == 0)
             .ok_or(Error::ValueTooLarge)?;
         let b = &mut self.buf;
         // One growth for the whole mutation, not one per field.
@@ -1331,9 +1415,25 @@ impl<'a> BatchRef<'a> {
     /// mark without `incompat` bit 3, never straight through here (perf2's N2 on #2055).
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
         let mut r = Reader::new(bytes, "wal batch");
-        let count = r.u32()? & !SILENT_BATCH;
+        let raw = r.u32()?;
+        let count = raw & COUNT_MASK;
+        let mut rest = r.rest();
+        if raw & XID_BATCH != 0 {
+            // The xid trailer (D329 2b): its length last, then the xid before it. The
+            // mutations end where it begins, and anything else past them is still refused.
+            let (&len, before) = rest.split_last().ok_or(Error::Corrupt {
+                what: "wal batch: an xid trailer without its length",
+            })?;
+            let len = usize::from(len);
+            if len == 0 || before.len() < len {
+                return Err(Error::Corrupt {
+                    what: "wal batch: a malformed xid trailer",
+                });
+            }
+            rest = &before[..before.len() - len];
+        }
         let mut it = BatchIter {
-            rest: r.rest(),
+            rest,
             remaining: count,
             validate: true,
         };
@@ -1368,6 +1468,20 @@ impl<'a> BatchRef<'a> {
     #[inline]
     pub fn is_silent(&self) -> bool {
         self.bytes.get(3).is_some_and(|b| b & 0x80 != 0)
+    }
+
+    /// The transaction this batch is a share of ([`XID_BATCH`], D329 2b): its trailer, read
+    /// from the end. `None` for an untagged batch: one bit test.
+    #[inline]
+    pub fn xid(&self) -> Option<&'a [u8]> {
+        if self
+            .bytes
+            .get(3)
+            .is_none_or(|b| b & (XID_BATCH >> 24) as u8 == 0)
+        {
+            return None;
+        }
+        xid_trailer(self.bytes)
     }
 
     /// Iterates the mutations in insertion order.
@@ -1540,4 +1654,14 @@ impl<'a> StreamList<'a> {
         let (ids, _) = self.bytes[2..].as_chunks::<4>();
         ids.iter().map(|c| StreamId(u32::from_le_bytes(*c)))
     }
+}
+
+/// The xid trailer of encoded batch `bytes` whose count has [`XID_BATCH`]: out of line, as
+/// only spanning commits' shares have one.
+#[cold]
+#[inline(never)]
+fn xid_trailer(bytes: &[u8]) -> Option<&[u8]> {
+    let (&len, before) = bytes.get(4..)?.split_last()?;
+    let len = usize::from(len);
+    before.get(before.len().checked_sub(len)?..)
 }

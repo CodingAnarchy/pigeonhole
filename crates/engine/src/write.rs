@@ -50,6 +50,12 @@ pub struct WriteBatch {
     pub(crate) row_deletes: Vec<RowDelete>,
     /// Scratch for value encoding (kept between calls).
     value_buf: Vec<u8>,
+    /// The transaction a spanning commit's share belongs to (D329 2b, [`tag_xid`]): written
+    /// into each shard's share as its last step, once routed. Here, not on the builder, so
+    /// a shard's commit message doesn't grow (perf2 on the 2b design).
+    ///
+    /// [`tag_xid`]: WriteBatch::tag_xid
+    pub(crate) xid: Option<std::sync::Arc<[u8]>>,
 }
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
@@ -104,6 +110,7 @@ impl Default for WriteBatch {
             builder,
             row_deletes: Vec::new(),
             value_buf: Vec::new(),
+            xid: None,
         }
     }
 }
@@ -123,6 +130,15 @@ fn check_operand(operand: ValueRef<'_>) -> crate::Result<()> {
 }
 
 impl WriteBatch {
+    /// Tags the batch with the transaction it is a share of (D329 2b): its records carry
+    /// `xid` (`XID_BATCH`), and its change-feed events deliver it. 1–255 bytes; checked when
+    /// the batch is committed. Hidden: `phdb serve` tags a spanning commit's home share and
+    /// a replica's apply of one.
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) {
+        self.xid = Some(xid.into());
+    }
+
     /// An empty batch.
     pub fn new() -> Self {
         Self::default()
@@ -1318,6 +1334,13 @@ impl Txn {
     /// The buffered writes.
     pub fn batch(&mut self) -> &mut WriteBatch {
         &mut self.batch
+    }
+
+    /// Tags the transaction's commit with `xid` (D329 2b, [`WriteBatch::tag_xid`]): a
+    /// spanning commit's home share. Hidden.
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) {
+        self.batch.tag_xid(xid);
     }
 
     /// The commit of a transaction that writes nothing (#694, ICR 0060): it needs no

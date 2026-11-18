@@ -134,6 +134,11 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "ID", requires = "partition")]
         to: Option<String>,
     },
+    /// Transactions across partitions (D329): `txn decide`.
+    Txn {
+        #[command(subcommand)]
+        command: TxnCommand,
+    },
     /// Fence a partition on the node that serves it (`--node`): its writes answer `Fenced`
     /// through every node until it's unfenced, relocated or closed; reads go on. Answers
     /// once the writes admitted before the fence have finished. Kept across a restart.
@@ -334,6 +339,17 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 to: to.clone(),
             },
         )),
+        ClusterCommand::Txn {
+            command:
+                TxnCommand::Decide {
+                    xid,
+                    partition,
+                    commit,
+                    abort: _,
+                    force,
+                    node,
+                },
+        } => runtime()?.block_on(txn_decide(node, partition, xid, *commit, *force)),
         ClusterCommand::Fence { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Fence))
         }
@@ -385,6 +401,58 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
 }
 
 /// One of the per-partition calls on a node (D317 ticket 6).
+/// `phdb cluster txn ...` (D329).
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(crate) enum TxnCommand {
+    /// Decide a transaction's share held in doubt on partition `--partition`, on the node
+    /// that serves it (`--node`), for a transaction whose home will never answer. Refused
+    /// while the home answers (its resolver settles the share then) unless `--force`, which
+    /// can break the transaction's atomicity. Answers the partition's line.
+    Decide {
+        /// The transaction's id (as `phdb cluster status` lists it).
+        xid: String,
+        #[arg(long, value_name = "P")]
+        partition: String,
+        /// Commit the share.
+        #[arg(long, conflicts_with = "abort", required_unless_present = "abort")]
+        commit: bool,
+        /// Abort the share.
+        #[arg(long)]
+        abort: bool,
+        /// Decide even though the home answers.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+}
+
+/// `phdb cluster txn decide`: the share's decide on `--node`, and the partition's line there.
+async fn txn_decide(
+    args: &NodeArgs,
+    partition: &str,
+    xid: &str,
+    commit: bool,
+    force: bool,
+) -> Result<Report, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    let req = request(
+        proto::DecideTxnRequest {
+            partition: partition.to_owned(),
+            xid: xid.to_owned(),
+            commit,
+            force,
+        },
+        token.as_deref(),
+    )?;
+    let lp = c
+        .decide_txn(req)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    Ok(local_report("cluster txn decide", &args.node, &lp))
+}
+
 #[derive(Clone, Copy)]
 enum Call {
     Fence,
@@ -1209,7 +1277,17 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     rows.push(node_row("", String::new(), ""));
                 }
                 for lp in &s.partitions {
-                    rows.push(node_row(&lp.id, state_text(lp), &lp.error));
+                    // D329: shares held in doubt there, and how long the oldest has waited
+                    // (each one's xid and reason are in the JSON).
+                    let state = match lp.in_doubt {
+                        0 => state_text(lp),
+                        n => format!(
+                            "{}, {n} in doubt (oldest {}s)",
+                            state_text(lp),
+                            lp.in_doubt_oldest_age_ms / 1000
+                        ),
+                    };
+                    rows.push(node_row(&lp.id, state, &lp.error));
                 }
                 nodes.push(serde_json::to_value(&s).expect("NodeStatus serializes"));
             }

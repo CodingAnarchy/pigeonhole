@@ -1072,6 +1072,7 @@ impl Member {
             token: self.token.clone(),
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
+            xid: Default::default(),
         };
         self.send(Out::event(event), true).await
     }

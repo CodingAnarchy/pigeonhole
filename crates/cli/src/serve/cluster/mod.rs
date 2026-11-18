@@ -166,7 +166,7 @@ pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
-const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
+pub(crate) const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
 /// Takes `dir`'s lock, or says another server or command has it.
 pub(crate) fn lock_dir(dir: &Path) -> Result<std::fs::File, Failure> {
@@ -568,7 +568,7 @@ impl Node {
     }
 
     /// The node's map, or `NotFound` before it has one.
-    fn get_map(&self) -> Result<ClusterMap, ApiError> {
+    pub(crate) fn get_map(&self) -> Result<ClusterMap, ApiError> {
         self.state()
             .map
             .as_ref()
@@ -1352,6 +1352,17 @@ impl Node {
                     .map(|c| c.replicas.load_full())
             })
             .unwrap_or_default();
+        let spanning = self
+            .server
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .and_then(|shared| {
+                shared
+                    .router
+                    .cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.spanning))
+            });
         for path in files {
             let file = path
                 .file_name()
@@ -1432,6 +1443,10 @@ impl Node {
                     };
                     lp.ok = lp.error.is_empty();
                 }
+            }
+            // D329: its shares held in doubt, the oldest first named, and why each waits.
+            if let Some(part) = open.get(&named) {
+                in_doubt(&mut lp, &part.db, &named, spanning.as_deref());
             }
             partitions.push(lp);
         }
@@ -1881,6 +1896,64 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let id = req.partition;
         self.0.unfence(&id, req.force).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
+    }
+
+    /// `phdb cluster txn decide` (D329 2b): decides a share held in doubt on this node's
+    /// partition, for a transaction whose home will never answer. Admin or cluster scope.
+    /// It can break the transaction's atomicity, so without `force` it's refused while the
+    /// home answers `ResolveTxn` (its resolver settles the share then).
+    async fn decide_txn(
+        &self,
+        req: Request<proto::DecideTxnRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(
+            &req,
+            &[Scope::Admin, Scope::Cluster],
+            "decide a transaction",
+        )?;
+        let r = req.into_inner();
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return Err(ApiError::unsupported("this node isn't a cluster node").into());
+        };
+        let service = {
+            let routes = cluster.node.routes();
+            let Some(routes) = routes.as_ref() else {
+                return Err(
+                    ApiError::wrong_partition(0, "this node has no cluster map yet").into(),
+                );
+            };
+            cluster.owned_here(routes, &r.partition)?
+        };
+        if !r.force {
+            let asked = spanning::ask_home(
+                &cluster.node,
+                &cluster.parts,
+                &cluster.forwarder,
+                &cluster.spanning,
+                &r.xid,
+                None,
+                shared.limits.request_timeout,
+            )
+            .await;
+            if let Ok(home) = asked {
+                return Err(ApiError::failed_precondition(format!(
+                    "the transaction's home answers ({:?}: {}), so its resolver settles this \
+                     share; --force only for a home that will never answer, and it can break \
+                     the transaction's atomicity",
+                    proto::TxnOutcomeState::try_from(home.state)
+                        .unwrap_or(proto::TxnOutcomeState::Unspecified),
+                    home.reason
+                ))
+                .into());
+            }
+        }
+        service
+            .decide_branch(&r.xid, r.commit, 0, 0, &cluster.spanning, &r.partition)
+            .await?;
+        Ok(tonic::Response::new(self.local(&r.partition).await?))
     }
 
     /// `phdb cluster close P --node N` (D317 amendment 2): admin scope.
@@ -2561,6 +2634,17 @@ pub(crate) fn run(
     }
     let placement = Arc::new(placement);
     let limits = args.limits();
+    // D329: a decision record must outlive any transaction that could still ask for it
+    // (audit120's S2 on the design).
+    let floor =
+        limits.leases.txn_lifetime + limits.request_timeout + std::time::Duration::from_secs(60);
+    if limits.txn_outcome_retention < floor {
+        return Err(Failure::usage(&format!(
+            "--txn-outcome-retention {:?} is below --txn-lifetime-ms + the request timeout + 1 \
+             minute ({floor:?}): a transaction's outcome must outlive its session",
+            limits.txn_outcome_retention
+        )));
+    }
     let metrics = Arc::new(super::service::Metrics::default());
     // The node's service, which serves no partition itself: its budgets, pools, session
     // caps and metrics are every partition's (D317 ticket 8a), as is its one `Backups`
@@ -2667,8 +2751,17 @@ pub(crate) fn run(
             replica_run: args.replica_run.max(1),
         },
     );
-    // A node that restarts with a map takes a newer one from its peers, then pushes.
-    let start = start_sync(&node, version);
+    // A node that restarts with a map takes a newer one from its peers, then pushes; and
+    // D329's resolver starts once it serves.
+    let resolver =
+        spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let sync = start_sync(&node, version);
+    let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        if let Some(sync) = sync {
+            sync();
+        }
+        resolver();
+    }));
     super::serve_shared(
         super::Serving {
             args,
@@ -3067,6 +3160,37 @@ fn open_partition(
             )))
         }
     }
+}
+
+/// Fills `lp`'s in-doubt fields (D329, `LocalPartition` 21–25) from `db`'s shares held in
+/// doubt, with each one's reason as the resolver last found it.
+fn in_doubt(
+    lp: &mut LocalPartition,
+    db: &pigeonhole::Pigeonhole,
+    partition: &str,
+    spanning: Option<&spanning::Spanning>,
+) {
+    let mut shares = db.in_doubt_shares();
+    if shares.is_empty() {
+        return;
+    }
+    // The oldest first.
+    shares.sort_by(|a, b| b.1.cmp(&a.1));
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    lp.in_doubt = u32::try_from(shares.len()).unwrap_or(u32::MAX);
+    lp.in_doubt_oldest_xid = String::from_utf8_lossy(&shares[0].0).into_owned();
+    lp.in_doubt_oldest_age_ms = ms(shares[0].1);
+    lp.in_doubt_wal_bytes = shares.iter().map(|s| s.2).sum();
+    lp.in_doubt_shares = shares
+        .iter()
+        .map(|(xid, age, _)| proto::InDoubtShare {
+            xid: String::from_utf8_lossy(xid).into_owned(),
+            age_ms: ms(*age),
+            reason: spanning
+                .and_then(|s| s.reason(partition, xid))
+                .unwrap_or_else(|| "its decision hasn't arrived yet".to_owned()),
+        })
+        .collect();
 }
 
 /// The partitions whose owner, epoch or history `new` changes from `old` (all of them for a

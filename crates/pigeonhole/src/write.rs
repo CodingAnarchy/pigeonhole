@@ -1475,6 +1475,15 @@ impl WriteBatch {
         self
     }
 
+    /// Tags the batch with a spanning commit's xid (D329 2b), as a replica applying the
+    /// primary's share does, so its own feed carries it. Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) -> &mut Self {
+        self.builder.batch.tag_xid(xid);
+        self
+    }
+
     /// Adds one mutation of `row` in `table`'s `family` (`qualifier` and `value` only size
     /// errors).
     fn op(
@@ -2370,6 +2379,18 @@ impl Transaction {
             .prepare(xid, durability.engine())
             .map(CommitInfo::from_engine)
             .map_err(|e| commit_error(e, largest, max))
+    }
+
+    /// Tags the transaction's commit with `xid` (D329 2b, ICR 0140 amendment 2): its records
+    /// carry it, and its change-feed events deliver it ([`feed::Commit::xid`]), so a
+    /// subscriber can group a spanning commit's shares. 1–255 bytes, checked at commit.
+    /// Hidden: not part of the API, outside the semver promise.
+    ///
+    /// [`feed::Commit::xid`]: crate::feed::Commit::xid
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) {
+        self.txn.tag_xid(xid);
     }
 
     /// Validates the transaction's reads and holds them in memory (D329, ICR 0140

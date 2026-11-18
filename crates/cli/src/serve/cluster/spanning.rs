@@ -58,15 +58,241 @@ pub(crate) const DECISION_QUALIFIER: &[u8] = b"decision";
 /// The map feature every node must keep before a transaction may span partitions.
 pub(crate) const SPANNING_TXNS_FEATURE: &str = "spanning_txns";
 
-/// A `COMMITTED` decision row's value: the home's history epoch and the branches, one per
-/// line after the first (2b's resolver and `Outcome` read it).
+/// Now, in ms since the epoch: a decision row's time.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Decision row `value` with branches `acked` marked as having applied the commit, or
+/// `None` when it isn't a commit or nothing changes.
+pub(crate) fn with_acks(value: &[u8], acked: &[String]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(value).ok()?;
+    let mut lines = text.lines();
+    let head = lines.next()?;
+    if !head.starts_with("committed ") {
+        return None;
+    }
+    let mut changed = false;
+    let mut out = head.to_owned();
+    for line in lines {
+        out.push('\n');
+        if !line.starts_with('+') && acked.iter().any(|a| a == line) {
+            out.push('+');
+            changed = true;
+        }
+        out.push_str(line);
+    }
+    changed.then(|| out.into_bytes())
+}
+
+/// Whether decision row `value` may go at `now_ms` with `retention_ms` (D329 2b): an abort
+/// marker, or a commit every branch acknowledged, whose time is that far past.
+pub(crate) fn collectable(value: &[u8], now_ms: u64, retention_ms: u64) -> bool {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(head) = lines.next() else {
+        return false;
+    };
+    let Some(at) = head
+        .split(' ')
+        .find_map(|t| t.strip_prefix("at"))
+        .and_then(|t| t.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    if at.saturating_add(retention_ms) > now_ms {
+        return false;
+    }
+    match head.split(' ').next() {
+        Some("aborted") => true,
+        Some("committed") => lines.all(|l| l.starts_with('+')),
+        _ => false,
+    }
+}
+
+/// A `COMMITTED` decision row's value: `committed h<epoch> at<ms>`, then one line per branch,
+/// `+`-prefixed once it acknowledged applying the commit (2b's resolver, `Outcome` and GC
+/// read it).
 pub(crate) fn committed_value(history_epoch: u64, branches: &[String]) -> Vec<u8> {
-    let mut v = format!("committed h{history_epoch}");
+    let mut v = format!("committed h{history_epoch} at{}", now_ms());
     for b in branches {
         v.push('\n');
         v.push_str(b);
     }
     v.into_bytes()
+}
+
+/// An abort marker: the decision row's value for a transaction made final as aborted by
+/// the resolver or `Outcome` (D329), with its home's history epoch.
+pub(crate) fn aborted_value(history_epoch: u64) -> Vec<u8> {
+    format!("aborted h{history_epoch} at{}", now_ms()).into_bytes()
+}
+
+/// A decision row's outcome: committed (with the branches it names) or aborted.
+fn read_decision(value: &[u8]) -> Result<(bool, Vec<String>), ApiError> {
+    let text =
+        std::str::from_utf8(value).map_err(|_| ApiError::internal("a decision row isn't UTF-8"))?;
+    let mut lines = text.lines();
+    match lines.next().and_then(|l| l.split_once(' ')) {
+        Some(("committed", _)) => Ok((
+            true,
+            lines
+                .map(|l| l.strip_prefix('+').unwrap_or(l).to_owned())
+                .collect(),
+        )),
+        Some(("aborted", _)) => Ok((false, Vec::new())),
+        _ => Err(ApiError::internal("a decision row this build can't read")),
+    }
+}
+
+/// What became of transaction `id`, at its home `home` (D329): `Outcome`'s answer, and the
+/// resolver's. Its live session answers in progress; its recorded outcome answers as it is
+/// (but an unknown commit, which only the decision row settles); then a spanning
+/// transaction's decision row. An absent row is made final as aborted while the home's
+/// history is the one the transaction began in, and is unknown after a history change
+/// (cli692's M1 on the design). A plain transaction past its session is `NotFound`.
+pub(crate) async fn settle(
+    node: &Node,
+    home: &Service,
+    id: &str,
+    caller: &Caller,
+) -> Result<proto::TxnOutcomeResponse, ApiError> {
+    use super::super::sessions::Peek;
+    use proto::TxnOutcomeState as S;
+    let answer = |state: S, reason: &str| proto::TxnOutcomeResponse {
+        state: state as i32,
+        reason: reason.to_owned(),
+        ..Default::default()
+    };
+    match home.peek_txn(id, caller) {
+        Peek::Live => {
+            return Ok(answer(
+                S::InProgress,
+                "the transaction is open or committing",
+            ));
+        }
+        Peek::Done(Ok(c)) => {
+            return Ok(proto::TxnOutcomeResponse {
+                state: S::Committed as i32,
+                commit: c.commit,
+                parts: c.parts,
+                reason: String::new(),
+            });
+        }
+        Peek::Done(Err(e)) if e.code != "OutcomeUnknown" => {
+            return Ok(answer(S::Aborted, &e.message));
+        }
+        Peek::Done(Err(_)) | Peek::Gone => {}
+    }
+    let Some((home_id, epoch, _)) = super::super::sessions::spanning_parts(id) else {
+        return Err(ApiError::not_found(
+            "no such transaction (its outcome is kept only while its session's record is)",
+        ));
+    };
+    let value = match home.decision(id).await? {
+        Some(v) => v,
+        None => {
+            // Past what its record is kept for, an absent record may have been GC'd: not
+            // presumed aborted (D329 2b).
+            let begun = super::super::sessions::spanning_begun_ms(id).unwrap_or(0);
+            let horizon = u64::try_from(home.outcome_horizon().as_millis()).unwrap_or(u64::MAX);
+            if begun.saturating_add(horizon) < now_ms() {
+                return Err(ApiError::not_found(
+                    "no record of the transaction: its outcome is kept for \
+                     --txn-outcome-retention after it ends",
+                ));
+            }
+            let current = {
+                let routes = node.routes();
+                routes
+                    .as_ref()
+                    .and_then(|r| r.owner(home_id))
+                    .map(|o| o.history_epoch)
+            };
+            if current != Some(epoch) {
+                return Ok(answer(
+                    S::Unknown,
+                    "the home partition's history changed since the transaction began (a \
+                     promotion or a restore): its decision may be lost, so nothing is presumed",
+                ));
+            }
+            home.decide_absent(id, epoch).await?
+        }
+    };
+    let (committed, branches) = read_decision(&value)?;
+    if !committed {
+        return Ok(answer(S::Aborted, "the transaction was not committed"));
+    }
+    let mut resp = answer(S::Committed, "");
+    resp.parts = std::iter::once(home_id.to_owned())
+        .chain(branches)
+        .map(|partition| proto::TxnPart {
+            partition,
+            seqno: 0,
+            applied: false,
+        })
+        .collect();
+    Ok(resp)
+}
+
+/// Asks transaction `xid`'s home what was decided (D329: the resolver, and `DecideTxn`'s
+/// check that the home is gone): a `ResolveTxn` to the home's owner by this node's map, or
+/// answered here if that's this node. The node's own call, under the cluster token.
+pub(crate) async fn ask_home(
+    node: &Arc<Node>,
+    parts: &Parts,
+    forwarder: &Forwarder,
+    spanning: &Arc<Spanning>,
+    xid: &str,
+    acked: Option<&str>,
+    timeout: Duration,
+) -> Result<proto::TxnResolution, ApiError> {
+    let (home, _, _) = super::super::sessions::spanning_parts(xid)
+        .ok_or_else(|| ApiError::invalid("not a spanning transaction's id"))?;
+    let (owner, map_version) = {
+        let routes = node.routes();
+        let routes = routes
+            .as_ref()
+            .ok_or_else(|| ApiError::wrong_partition(0, "this node has no cluster map yet"))?;
+        let owner = routes.owner(home).cloned().ok_or_else(|| {
+            ApiError::partition_unavailable(format!(
+                "the map no longer lists the transaction's home partition {home:?}"
+            ))
+        })?;
+        (owner, routes.map_version())
+    };
+    let op = Op::ResolveTxn(proto::ResolveTxn {
+        xid: xid.to_owned(),
+        acked: acked.unwrap_or_default().to_owned(),
+    });
+    let caller = Caller::anonymous();
+    let reply = if owner.node == node.id() {
+        let service = parts
+            .load()
+            .get(home)
+            .cloned()
+            .ok_or_else(|| super::super::router::not_open(home))?;
+        serve_branch(node, spanning, service, home, op, &caller).await?
+    } else {
+        let req = proto::ForwardRequest {
+            map_version,
+            caller: Some(forward::forwarded_caller(&caller)?),
+            partition: home.to_owned(),
+            op: Some(op),
+            ..Default::default()
+        };
+        forwarder.send(&owner.address, req, timeout, true).await?
+    };
+    match reply.reply {
+        Some(Reply::ResolveTxn(r)) => Ok(r),
+        _ => Err(ApiError::internal(
+            "a home answered ResolveTxn with something else",
+        )),
+    }
 }
 
 /// What a spanning transaction's [`Span`] says, for its commit.
@@ -115,9 +341,12 @@ struct Hold {
     term: u64,
 }
 
-/// The read-only holds this node's partitions keep for other nodes' release rounds.
+/// The read-only holds this node's partitions keep for other nodes' release rounds, and why
+/// each share the resolver couldn't settle is still in doubt (for `Status`).
 pub(crate) struct Spanning {
     holds: Mutex<HashMap<u64, Hold>>,
+    /// The resolver's last word on a share it couldn't settle: (partition, xid) → reason.
+    reasons: Mutex<HashMap<(String, Vec<u8>), String>>,
     /// The high half of every hold id: random per process, so a hold id from before a
     /// restart never names one taken after it (audit120's condition 1).
     nonce: u64,
@@ -145,6 +374,7 @@ impl Spanning {
             });
         Arc::new(Self {
             holds: Mutex::new(HashMap::new()),
+            reasons: Mutex::new(HashMap::new()),
             nonce: nonce << 32,
             next: AtomicU64::new(1),
         })
@@ -188,6 +418,29 @@ impl Spanning {
         id
     }
 
+    /// Why partition `partition`'s share of `xid` is still in doubt, as the resolver last
+    /// found it (`Status`'s `InDoubtShare.reason`).
+    pub(crate) fn reason(&self, partition: &str, xid: &[u8]) -> Option<String> {
+        self.reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(partition.to_owned(), xid.to_vec()))
+            .cloned()
+    }
+
+    fn note(&self, partition: &str, xid: &[u8], reason: Option<String>) {
+        let mut r = self.reasons.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (partition.to_owned(), xid.to_vec());
+        match reason {
+            Some(why) => {
+                r.insert(key, why);
+            }
+            None => {
+                r.remove(&key);
+            }
+        }
+    }
+
     /// Hold `id`, if this process took it for `partition` and it's still kept. Whoever
     /// takes it releases it.
     pub(crate) fn take_hold(
@@ -207,7 +460,9 @@ impl Spanning {
 /// the branch arms, or a transaction call on a branch, which names its partition.
 pub(crate) fn is_branch(msg: &proto::ForwardRequest) -> bool {
     match &msg.op {
-        Some(Op::BranchBegin(_) | Op::BranchPrepare(_) | Op::BranchDecide(_)) => true,
+        Some(
+            Op::BranchBegin(_) | Op::BranchPrepare(_) | Op::BranchDecide(_) | Op::ResolveTxn(_),
+        ) => true,
         Some(Op::TxnGet(_) | Op::TxnGetRow(_) | Op::TxnWrite(_)) => !msg.partition.is_empty(),
         _ => false,
     }
@@ -248,6 +503,19 @@ pub(crate) async fn serve_branch(
                 .prepare_branch(&b.xid, b.read_only, spanning, partition)
                 .await?,
         ),
+        // A share in doubt elsewhere asks this home what was decided (D329's resolver).
+        Op::ResolveTxn(r) => {
+            if !r.acked.is_empty() {
+                service
+                    .ack_decision(&r.xid, std::slice::from_ref(&r.acked))
+                    .await?;
+            }
+            let settled = settle(node, &service, &r.xid, caller).await?;
+            Reply::ResolveTxn(proto::TxnResolution {
+                state: settled.state,
+                reason: settled.reason,
+            })
+        }
         Op::BranchDecide(b) => {
             match service
                 .decide_branch(&b.xid, b.commit, b.hold, b.term, spanning, partition)
@@ -944,5 +1212,180 @@ pub(crate) mod seams {
         };
         reached.notify_one();
         go.await.unwrap_or(false)
+    }
+}
+
+/// D329's resolver, started once the node serves: each partition's shares held in doubt
+/// longer than `delay` (default: the request timeout, so it never fires on a healthy
+/// commit) ask their home what was decided (`ResolveTxn`), and are decided by the answer.
+/// A home that's unreachable, still committing, or whose history changed leaves the share
+/// in doubt, with the reason kept for `Status`, and it's asked again after a backoff that
+/// doubles to a minute. The loop holds the server only while it runs a pass.
+pub(crate) fn start_resolver(
+    shared: std::sync::Weak<super::super::Shared>,
+    delay: Duration,
+) -> Box<dyn FnOnce() + Send> {
+    Box::new(move || {
+        tokio::spawn(async move {
+            let period = (delay / 4).clamp(Duration::from_millis(100), Duration::from_secs(5));
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // (partition, xid) → (when to ask again, the backoff's step).
+            let mut next: HashMap<(String, Vec<u8>), (Instant, Duration)> = HashMap::new();
+            let sweep_every = shared
+                .upgrade()
+                .map_or(Duration::from_secs(600), |s| {
+                    s.limits.txn_outcome_retention / 24
+                })
+                .clamp(Duration::from_secs(60), Duration::from_secs(600));
+            let mut last_sweep = Instant::now();
+            loop {
+                tick.tick().await;
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                let Some(cluster) = shared.router.cluster.as_ref() else {
+                    return;
+                };
+                let timeout = shared.limits.request_timeout;
+                let parts = cluster.parts.load_full();
+                let mut seen = std::collections::HashSet::new();
+                for (partition, service) in parts.iter() {
+                    let Ok(part) = service.part() else {
+                        continue;
+                    };
+                    for (xid, age, _) in part.db.in_doubt_shares() {
+                        let key = (partition.clone(), xid.clone());
+                        seen.insert(key.clone());
+                        if age < delay || next.get(&key).is_some_and(|(at, _)| Instant::now() < *at)
+                        {
+                            continue;
+                        }
+                        let Ok(text) = String::from_utf8(xid.clone()) else {
+                            continue;
+                        };
+                        let asked = ask_home(
+                            &cluster.node,
+                            &cluster.parts,
+                            &cluster.forwarder,
+                            &cluster.spanning,
+                            &text,
+                            None,
+                            timeout,
+                        )
+                        .await;
+                        use proto::TxnOutcomeState as St;
+                        let why = match asked {
+                            Ok(r) => match St::try_from(r.state).unwrap_or(St::Unspecified) {
+                                St::Committed | St::Aborted => {
+                                    let commit = r.state == St::Committed as i32;
+                                    match service
+                                        .decide_branch(
+                                            &text,
+                                            commit,
+                                            0,
+                                            0,
+                                            &cluster.spanning,
+                                            partition,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            // A commit applied here: its home's record may
+                                            // go once every branch said so (GC).
+                                            if commit {
+                                                let _ = ask_home(
+                                                    &cluster.node,
+                                                    &cluster.parts,
+                                                    &cluster.forwarder,
+                                                    &cluster.spanning,
+                                                    &text,
+                                                    Some(partition),
+                                                    timeout,
+                                                )
+                                                .await;
+                                            }
+                                            None
+                                        }
+                                        Err(e) => {
+                                            Some(format!("deciding it failed: {}", e.message))
+                                        }
+                                    }
+                                }
+                                St::InProgress => Some("its home is still committing it".into()),
+                                St::Unknown | St::Unspecified => Some(r.reason),
+                            },
+                            Err(e) => Some(format!("its home didn't answer: {}", e.message)),
+                        };
+                        match &why {
+                            None => {
+                                next.remove(&key);
+                            }
+                            Some(_) => {
+                                let step = next
+                                    .get(&key)
+                                    .map_or(Duration::from_secs(1), |(_, s)| *s * 2)
+                                    .min(Duration::from_secs(60));
+                                next.insert(key.clone(), (Instant::now() + step, step));
+                            }
+                        }
+                        cluster.spanning.note(partition, &xid, why);
+                    }
+                }
+                // The decision records past retention on the partitions this node owns (GC),
+                // every `retention / 24`, between one and ten minutes.
+                if last_sweep.elapsed() >= sweep_every {
+                    last_sweep = Instant::now();
+                    for (_, service) in parts.iter() {
+                        if let Err(e) = service.sweep_decisions(now_ms()).await
+                            && e.code != "Fenced"
+                        {
+                            eprintln!("phdb serve: sweeping decision records: {}", e.message);
+                        }
+                    }
+                }
+                // Shares no longer in doubt (decided, or their partition closed) are forgotten.
+                next.retain(|k, _| seen.contains(k));
+                cluster
+                    .spanning
+                    .reasons
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|k, _| seen.contains(k));
+            }
+        });
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collectable, with_acks};
+
+    #[test]
+    fn a_decision_row_is_collected_only_past_retention_and_once_every_branch_acked() {
+        // D329 2b's GC: an abort marker goes once its time is `retention` past; a commit, only
+        // once every branch it names is `+`-acked as well. Anything unreadable stays.
+        let retention = 1_000;
+        let aborted = b"aborted h3 at5000".to_vec();
+        assert!(!collectable(&aborted, 5_999, retention));
+        assert!(collectable(&aborted, 6_000, retention));
+        let committed = b"committed h3 at5000\np1\np4".to_vec();
+        assert!(!collectable(&committed, 99_999, retention), "nothing acked");
+        let one = with_acks(&committed, &["p4".to_owned()]).unwrap();
+        assert_eq!(one, b"committed h3 at5000\np1\n+p4");
+        assert!(!collectable(&one, 99_999, retention), "p1 not acked");
+        let both = with_acks(&one, &["p1".to_owned(), "p4".to_owned()]).unwrap();
+        assert_eq!(both, b"committed h3 at5000\n+p1\n+p4");
+        assert!(!collectable(&both, 5_999, retention), "within retention");
+        assert!(collectable(&both, 6_000, retention));
+        // Acking again, or an unknown branch, changes nothing; an abort takes no acks.
+        assert_eq!(with_acks(&both, &["p1".to_owned()]), None);
+        assert_eq!(with_acks(&one, &["p9".to_owned()]), None);
+        assert_eq!(with_acks(&aborted, &["p1".to_owned()]), None);
+        // A commit naming no branch (a home-only one) goes on its time alone.
+        assert!(collectable(b"committed h3 at5000", 6_000, retention));
+        for bad in [&b""[..], b"committed h3", b"atx", b"\xff", b"maybe h1 at1"] {
+            assert!(!collectable(bad, u64::MAX, 0), "{bad:?}");
+        }
     }
 }
