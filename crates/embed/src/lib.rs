@@ -56,11 +56,15 @@
 //!   the application's global rayon pool, every call queues for it, and
 //!   [`LoadOptions::on_thread_start`] can place its threads.
 //! - **candle's process-wide pool** for large element-wise steps (64K elements and up: long
-//!   texts, or batches). It's started on first use with `CANDLE_NUM_THREADS` threads (by
-//!   default one per physical core, less one), which spin briefly before parking. On Linux,
+//!   texts, or batches). It's started on first use with `CANDLE_NUM_THREADS` threads, less
+//!   one (unset: `RAYON_NUM_THREADS`, else on Linux the CPUs of `CANDLE_CPU_MASK`, else the
+//!   physical cores), which spin briefly before parking. On Linux,
 //!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. Set both in the process's
-//!   environment before it starts (they're read once, and a library can't set them safely):
-//!   `phdb serve` prints the values for its placement.
+//!   environment before it starts (they're read once, and a library can't set them safely).
+//!   [`LoadOptions::threads`] doesn't bound this pool, and `on_thread_start` doesn't place
+//!   it. `phdb serve` warns at startup with the values for its placement while either is
+//!   unset. (`CANDLE_NUM_THREADS=1` would leave it without workers, but costs 25–50% of the
+//!   throughput of batches and long texts: #2061.)
 //!
 //! **On Linux, set `RAYON_NUM_THREADS` or `CANDLE_CPU_MASK`.** With neither set, candle
 //! 0.11 re-reads `/proc/cpuinfo` on every matrix product to count the physical cores
