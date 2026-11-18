@@ -531,22 +531,27 @@ impl ServiceOp {
         self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
     }
 
-    /// Calls `f` with each (table, key) the call names, in request order, until `f` returns
-    /// `Break` (D331's range gates, D332's sampled read keys).
+    /// Calls `f` with each (table or index, key) the call names, in request order, until `f`
+    /// returns `Break` (D331's range gates, D332's sampled read keys). A name is a table's or
+    /// an index's: they never clash (`validate_indexes`), and an index that follows a table
+    /// takes that table's ranges, so a gate maps it to the table.
     ///
-    /// - **Rows:** the point reads report their rows; the writes (`Mutate`,
+    /// - **A table's rows:** the point reads report their rows; the writes (`Mutate`,
     ///   `MutateReturning`, `CheckAndMutate`, `Batch`) and a transaction's reads, writes and
     ///   commit theirs, a row named twice twice. A write naming no row reports nothing: it's
     ///   refused on its way in.
-    /// - **Ranges:** a scan and a nearest search report their range (no range: the whole
-    ///   table), or a nearest search its keys. A resumed scan reports its whole range, not
-    ///   the rest after `after`: a superset, safe for a gate and harmless for a sample.
+    /// - **A table's ranges:** a scan and a nearest search report their range (no range: the
+    ///   whole table), or a nearest search its keys. A resumed scan reports its whole range,
+    ///   not the rest after `after`: a superset, safe for a gate and harmless for a sample.
     /// - **A traversal** reports its seeds. The rows its edges lead to aren't in the request:
     ///   it reads them through the partitions' clipped fan-out, which D331 audits apart.
-    /// - **Nothing:** every other call, each arm saying why. None of them writes a table's
-    ///   rows, which are all a range move moves: the index and memory calls write an index's
-    ///   or the memory store's own placement, which no move names. So a gate passes a call
-    ///   that reports nothing; a new call must be sorted into an arm before it compiles.
+    /// - **An index's ids:** `Text.Put` and `Text.Delete` (which write the source table's
+    ///   row beside its postings) and `Vectors.Insert` and `Vectors.Delete` report their id;
+    ///   a bulk load, a text rebuild, a search and a verify report the whole index.
+    /// - **Nothing:** every other call, each arm saying why. None writes a table's or an
+    ///   index's rows; the memory calls write the memory store's own placement, which no move
+    ///   names. So a gate passes a call that reports nothing, and a new call must be sorted
+    ///   into an arm before it compiles.
     #[cfg_attr(
         not(test),
         expect(
@@ -599,6 +604,25 @@ impl ServiceOp {
             Self::Batch(r) => rows(&r.rows),
             Self::TxnWrite(r) => rows(&r.rows),
             Self::Commit(r) => rows(&r.rows),
+            // An index's ids: a text index always follows its source table, and `Text.Put`
+            // writes the source table's row keyed by exactly the id (`Index::put_in`; pinned
+            // by `a_text_put_writes_the_source_row_its_id_names`), so a gate fences that row.
+            // A vector index may follow a table, whose ranges route its ids.
+            Self::TextPut(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::TextDelete(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::VectorInsert(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::VectorDelete(r) => f(&r.index, Touch::Row(&r.id)),
+            // A whole index: its ids are in the stream, or it reads or rebuilds every one.
+            Self::VectorBulkLoad(op) => f(&op.index, Touch::of_range(None)),
+            Self::VectorSearch(r) => f(&r.index, Touch::of_range(None)),
+            Self::VectorVerify(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextSearch(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextRebuild(r) | Self::TextVerify(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextStats(proto::TextStatsRequest { search, .. })
+            | Self::TextSearchPart(proto::TextSearchPartRequest { search, .. }) => match search {
+                Some(r) => f(&r.index, Touch::of_range(None)),
+                None => ControlFlow::Continue(()),
+            },
             // A transaction's or snapshot's start and end, a pinned snapshot's release: no rows
             // (a transaction's routing key picks its home, it reads nothing).
             Self::Begin(_)
@@ -611,6 +635,8 @@ impl ServiceOp {
             | Self::CreateTable(_)
             | Self::DropTable(_)
             | Self::DescribeTable(_)
+            | Self::CreateIndex(_)
+            | Self::TextCreateIndex(_)
             | Self::Info(_)
             | Self::Flush(_)
             | Self::Compact(_)
@@ -623,24 +649,6 @@ impl ServiceOp {
             | Self::Subscribe(_)
             | Self::Follow(_)
             | Self::MemoryWatch(_)
-            // Vector indexes: ids in the index's own placement (`ClusterMap.indexes`), not a
-            // table's rows.
-            | Self::CreateIndex(_)
-            | Self::VectorInsert(_)
-            | Self::VectorDelete(_)
-            | Self::VectorSearch(_)
-            | Self::VectorVerify(_)
-            | Self::VectorBulkLoad(_)
-            // Text indexes: document ids in the index's own placement, and a rebuild or a
-            // search's rounds over the whole index.
-            | Self::TextCreateIndex(_)
-            | Self::TextPut(_)
-            | Self::TextDelete(_)
-            | Self::TextSearch(_)
-            | Self::TextRebuild(_)
-            | Self::TextVerify(_)
-            | Self::TextStats(_)
-            | Self::TextSearchPart(_)
             // Agent memory: memory ids in the memory store's placement (`ClusterMap.memory`),
             // which a range move never names (D331 Amendment 3).
             | Self::Remember(_)
@@ -5747,22 +5755,67 @@ mod touches_tests {
     }
 
     #[test]
-    fn calls_without_a_tables_rows_report_nothing() {
+    fn calls_without_rows_or_ids_report_nothing() {
         for op in [
             ServiceOp::Info(proto::Empty::default()),
             ServiceOp::Begin(proto::BeginRequest::default()),
             ServiceOp::Abort(proto::TxnAbortRequest::default()),
-            ServiceOp::VectorInsert(proto::VectorInsertRequest {
-                index: "v".into(),
-                id: "a".into(),
-                ..Default::default()
-            }),
+            ServiceOp::TextCreateIndex(proto::CreateTextIndexRequest::default()),
             ServiceOp::Forget(proto::ForgetRequest {
                 ids: vec!["a".into()],
             }),
         ] {
             assert!(touched(&op, usize::MAX).is_empty(), "{op:?}");
         }
+    }
+
+    #[test]
+    fn index_calls_report_their_ids_or_the_whole_index() {
+        let put = ServiceOp::TextPut(proto::TextPutRequest {
+            index: "x".into(),
+            id: "d1".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&put, usize::MAX), pairs(&[("x", "d1")]));
+        let delete = ServiceOp::VectorDelete(proto::VectorDeleteRequest {
+            index: "v".into(),
+            id: "a".into(),
+        });
+        assert_eq!(touched(&delete, usize::MAX), pairs(&[("v", "a")]));
+        let rebuild = ServiceOp::TextRebuild(proto::TextIndexRequest { index: "x".into() });
+        assert_eq!(touched(&rebuild, usize::MAX), pairs(&[("x", "*..*")]));
+        let stats = ServiceOp::TextStats(proto::TextStatsRequest {
+            search: Some(proto::TextSearchRequest {
+                index: "x".into(),
+                ..Default::default()
+            }),
+        });
+        assert_eq!(touched(&stats, usize::MAX), pairs(&[("x", "*..*")]));
+    }
+
+    /// What a gate maps `Text.Put`'s id to: the source table's row of the same key.
+    #[test]
+    fn a_text_put_writes_the_source_row_its_id_names() {
+        use pigeonhole::{Family, Options, Pigeonhole};
+        use pigeonhole_text::{Index, IndexOptions, Source};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let table = db
+            .table("docs")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let index = Index::create(
+            &db,
+            "x",
+            Source::new(&table, "f", b"body"),
+            IndexOptions::new(),
+        )
+        .unwrap();
+        index.put(b"d1", "hello there").unwrap();
+        let cell = table.get(b"d1", "f", b"body").unwrap().unwrap();
+        assert_eq!(cell.value(), b"hello there");
     }
 
     #[test]
