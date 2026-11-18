@@ -7021,9 +7021,68 @@ pub struct ClusterMap {
     /// D330: automatic failover, off by default (the owner's Q1), turned on with `set-map`.
     /// Off: no node elects a new writer on its own; the writer changes only as before D330
     /// (an operator's `set-map --force`, which raises the term). Set only once every node
-    /// keeps it (`map_features`: `writer_terms`).
+    /// keeps it (`map_features`: `writer_terms`). On: a writer whose lease lapses is replaced
+    /// by election, and the writer fails a down partition over to its freshest replica (PR 2),
+    /// unless the partition opts out (`Partition.failover`).
     #[prost(bool, tag = "11")]
     pub failover: bool,
+    /// D330: reserved for an old owner rejoining as a replica on its own (the owner's Q4); a
+    /// map setting it is refused in 1.3.0, where the operator rejoins it.
+    #[prost(bool, tag = "12")]
+    pub failover_rejoin: bool,
+    /// D330: the failovers and writer elections this map records, oldest first: the last 16
+    /// done or abandoned, and every promote still pending (one whose `to_epoch` is above its
+    /// partition's epoch), which is never dropped. A writer's change keeps them; a `set-map`
+    /// that drops or alters a pending one is refused.
+    #[prost(message, repeated, tag = "13")]
+    pub failovers: ::prost::alloc::vec::Vec<FailoverEvent>,
+}
+/// D330: one failover of a partition to a replica, or one writer election, as the writer
+/// that made it recorded it in the map.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FailoverEvent {
+    #[prost(enumeration = "FailoverKind", tag = "1")]
+    pub kind: i32,
+    /// PARTITION: the partition failed over; empty for WRITER.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// PARTITION: its owner before, and the replica's node it's promoted on. WRITER: the
+    /// writer before, and the node elected.
+    #[prost(string, tag = "3")]
+    pub from: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub to: ::prost::alloc::string::String,
+    /// The writer's wall clock when it recorded the event, in ms since the Unix epoch: for
+    /// operators, never compared.
+    #[prost(uint64, tag = "5")]
+    pub at_ms: u64,
+    /// The writer that recorded it, and its term then.
+    #[prost(string, tag = "6")]
+    pub writer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub writer_term: u64,
+    /// PARTITION: the primary seqno the promoted copy had applied through, and the owner's
+    /// durable seqno as the copy last heard it. Their difference is the known part of what
+    /// the failover lost; commits the owner acknowledged after the copy last heard from it
+    /// may be lost too (D330 §4). `primary_seqno` 0: unknown (the copy's follower hadn't heard
+    /// the owner's frontier since it last reconnected).
+    #[prost(uint64, tag = "8")]
+    pub applied_seqno: u64,
+    #[prost(uint64, tag = "9")]
+    pub primary_seqno: u64,
+    /// PARTITION: the external transaction shares the old owner reported in doubt, as of its
+    /// last lease renewal before it went down (at most 4 KiB of ids), and how many there were.
+    #[prost(string, repeated, tag = "10")]
+    pub in_doubt_xids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "11")]
+    pub in_doubt_count: u64,
+    /// PARTITION: the epoch the promote stamps the copy at, above every earlier pending
+    /// promote's of the partition, so a copy stamped by a promote that never finished is never
+    /// taken for this history (simp724's S2 on the D330 PR 2 plan).
+    #[prost(uint64, tag = "12")]
+    pub to_epoch: u64,
+    #[prost(enumeration = "FailoverState", tag = "13")]
+    pub state: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -7062,6 +7121,14 @@ pub struct Partition {
     /// write or P's lease. A change to this alone is no move: P's epoch stays. (6 is unused.)
     #[prost(string, repeated, tag = "7")]
     pub replicas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// D330: whether the writer fails P over on its own while the map's `failover` is on.
+    /// The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
+    #[prost(enumeration = "FailoverMode", tag = "8")]
+    pub failover: i32,
+    /// D330: how many times P has failed over, ever: monotonic, unlike the map's last-16
+    /// events (`pigeonhole_cluster_failovers_total`).
+    #[prost(uint64, tag = "11")]
+    pub failover_count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -7253,6 +7320,18 @@ pub struct NodeStatus {
     /// once it has run out (or this node never granted it).
     #[prost(uint64, tag = "10")]
     pub writer_lease_remaining_ms: u64,
+    /// D330, on the writer: each partition it finds down but doesn't fail over, and why
+    /// ("failover off", "no fresh replica", "waiting: node X still grants its lease", ...).
+    #[prost(map = "string, string", tag = "12")]
+    pub failover_blocked: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    /// D330: every partition lease this node grants that still runs: the partition, its
+    /// holder, and the time left on this node's clock (not the writer lease). The writer asks
+    /// before it fails a partition over: an owner some node still grants is alive.
+    #[prost(message, repeated, tag = "13")]
+    pub grants: ::prost::alloc::vec::Vec<LeaseWithheld>,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7825,6 +7904,13 @@ pub struct LeaseRequest {
     /// the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
     #[prost(uint64, tag = "8")]
     pub writer_term: u64,
+    /// D330 PR 2: an election's pre-vote. The request asks for the writer lease alone, as a
+    /// vote does; the answer grants it only if this node would vote, and records nothing.
+    /// A candidate asks for real votes only once a majority would, so a node that can't win
+    /// never records a vote, whose term would fence the live writer's maps from it once it
+    /// rejoins.
+    #[prost(bool, tag = "9")]
+    pub pre_vote: bool,
 }
 /// A partition at an epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7837,6 +7923,13 @@ pub struct LeasePart {
     /// granted; `epoch` is then 0. 0 for a partition.
     #[prost(uint64, tag = "3")]
     pub term: u64,
+    /// D330, from an owner: the external transaction shares it holds in doubt for this
+    /// partition (at most 4 KiB of ids), and how many there are, so a writer that fails the
+    /// partition over can name them. Empty in a grantor's answer.
+    #[prost(string, repeated, tag = "4")]
+    pub in_doubt_xids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "5")]
+    pub in_doubt_count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseResponse {
@@ -7973,6 +8066,103 @@ impl FenceReason {
             "FENCE_REASON_OPERATOR" => Some(Self::Operator),
             "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
             "FENCE_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FailoverKind {
+    Unspecified = 0,
+    Partition = 1,
+    Writer = 2,
+}
+impl FailoverKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAILOVER_KIND_UNSPECIFIED",
+            Self::Partition => "FAILOVER_KIND_PARTITION",
+            Self::Writer => "FAILOVER_KIND_WRITER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAILOVER_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAILOVER_KIND_PARTITION" => Some(Self::Partition),
+            "FAILOVER_KIND_WRITER" => Some(Self::Writer),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FailoverState {
+    Unspecified = 0,
+    /// Recorded before the stamp: the map doesn't give the partition its new node yet.
+    Pending = 1,
+    /// The map gives it its new node at `to_epoch` (every WRITER event is done).
+    Done = 2,
+    /// A later promote of the partition took over: a copy stamped at this event's
+    /// `to_epoch` is orphaned, never served.
+    Abandoned = 3,
+}
+impl FailoverState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAILOVER_STATE_UNSPECIFIED",
+            Self::Pending => "FAILOVER_STATE_PENDING",
+            Self::Done => "FAILOVER_STATE_DONE",
+            Self::Abandoned => "FAILOVER_STATE_ABANDONED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAILOVER_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAILOVER_STATE_PENDING" => Some(Self::Pending),
+            "FAILOVER_STATE_DONE" => Some(Self::Done),
+            "FAILOVER_STATE_ABANDONED" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FailoverMode {
+    Unspecified = 0,
+    Inherit = 1,
+    Off = 2,
+    On = 3,
+}
+impl FailoverMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAILOVER_MODE_UNSPECIFIED",
+            Self::Inherit => "FAILOVER_MODE_INHERIT",
+            Self::Off => "FAILOVER_MODE_OFF",
+            Self::On => "FAILOVER_MODE_ON",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAILOVER_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAILOVER_MODE_INHERIT" => Some(Self::Inherit),
+            "FAILOVER_MODE_OFF" => Some(Self::Off),
+            "FAILOVER_MODE_ON" => Some(Self::On),
             _ => None,
         }
     }

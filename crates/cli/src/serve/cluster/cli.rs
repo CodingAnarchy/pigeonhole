@@ -1066,7 +1066,13 @@ pub(crate) async fn set_map(
         } else {
             m.writer.clear();
             m.writer_term = 0;
+            // Nor any failover field: a node without terms can't keep them.
             m.failover = false;
+            m.failovers.clear();
+            for p in &mut m.partitions {
+                p.failover = 0;
+                p.failover_count = 0;
+            }
         }
         forced_unchecked = Some(unchecked);
         c.set_map(request(
@@ -1161,6 +1167,7 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
     // D330: the writer, and its lease as the writer last renewed it (null: unreachable).
     let writer = super::schema::writer(&m).to_owned();
     let mut writer_lease = Value::Null;
+    let mut failover_blocked = Value::Null;
     for n in &m.nodes {
         let url = format!("{scheme}://{}", n.address);
         let got = async {
@@ -1178,6 +1185,10 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                 }
                 if n.id == writer {
                     writer_lease = json!(s.writer_lease_remaining_ms);
+                    // Down partitions the writer doesn't fail over, and why (D330).
+                    let blocked: std::collections::BTreeMap<_, _> =
+                        s.failover_blocked.iter().collect();
+                    failover_blocked = json!(blocked);
                 }
                 let ok = s.partitions.iter().filter(|p| p.ok).count();
                 let node_row = |partition: &str, state: String, error: &str| {
@@ -1227,6 +1238,11 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
         ("writer_term", json!(m.writer_term)),
         ("writer_lease_remaining_ms", writer_lease),
         ("failover", json!(m.failover)),
+        ("failover_blocked", failover_blocked),
+        (
+            "failovers",
+            serde_json::to_value(&m.failovers).expect("FailoverEvent serializes"),
+        ),
     ];
     let mut r = report("cluster status", summary, json!({ "nodes": nodes }));
     r.columns = [

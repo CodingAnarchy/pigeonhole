@@ -347,6 +347,17 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_failover_after_ms: u64,
+    /// The most a replica may lag the owner's last renewal and still be failed over to, in
+    /// milliseconds (D330): an automatic failover refuses a staler one. 0: no limit, only
+    /// the freshness rule (a heartbeat).
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0,
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub cluster_failover_max_lag_ms: u64,
     /// The window a partition's load is averaged over (an exponential average, each 30 s
     /// reading weighing `1 − e^(−30/window)`), and the node's device ceiling taken across,
     /// in seconds, 30 to 86400 (D332): what the cluster balancer compares. Measured on every
@@ -604,6 +615,7 @@ mod tests {
             ["--cluster-push-timeout-ms", "7"],
             ["--cluster-lease-ms", "21"],
             ["--cluster-failover-after-ms", "40"],
+            ["--cluster-failover-max-lag-ms", "500"],
             ["--balance-window", "60"],
         ] {
             if flag[0] != "--node-id" {

@@ -393,6 +393,8 @@ mod tests {
             epoch,
             memory_bytes: 0,
             replicas: Vec::new(),
+            failover: 0,
+            failover_count: 0,
         };
         ClusterMap {
             cluster_id: "c1".into(),
@@ -432,6 +434,8 @@ mod tests {
             writer: String::new(),
             writer_term: 0,
             failover: false,
+            failover_rejoin: false,
+            failovers: Vec::new(),
         }
     }
 

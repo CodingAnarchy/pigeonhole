@@ -12,6 +12,7 @@ mod backup;
 mod bulkfan;
 pub(crate) mod cli;
 pub(crate) mod close;
+pub(crate) mod failover;
 pub(crate) mod fanout;
 pub(crate) mod feed;
 pub(crate) mod fence;
@@ -213,6 +214,12 @@ fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
 #[cfg(test)]
 pub(crate) static CUT_OFF: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
 
+/// A fault seam (tests): the node in each directory can't reach the paired address, one way
+/// (D330 PR 2's test 7: an owner cut off from the writer alone). List both ways to cut a
+/// pair.
+#[cfg(test)]
+pub(crate) static CUT_BETWEEN: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
 /// A fault seam (tests): nodes acting as a build before `nearest_qualifiers` (#1915 PR 3),
 /// by cluster directory. `status`: its `Status` leaves the feature out. `parts`: its
 /// partitions' nearest searches rank every qualifier, as such a build's would (with
@@ -267,6 +274,11 @@ fn cut_off(dir: &Path, address: &str) -> bool {
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .any(|(d, a)| d == dir || a == address)
+        || CUT_BETWEEN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(d, a)| d == dir && a == address)
 }
 
 /// `d` in whole milliseconds, for a proto field.
@@ -322,6 +334,8 @@ struct Peers {
     /// `--cluster-failover-after-ms` (D330): the margin a writer goes without its lease
     /// before an election, 2·L by default.
     failover_after: Duration,
+    /// `--cluster-failover-max-lag-ms` (D330 PR 2): none for 0.
+    failover_max_lag: Option<Duration>,
     /// `--balance-window` (D332): the load averages' and the device ceiling's window.
     balance_window: Duration,
     /// How often a partition's load averages take a reading ([`load::INTERVAL`]; shorter in
@@ -401,6 +415,13 @@ pub(crate) struct Node {
     /// When this node first found an election due ([`Node::maybe_elect`]): it waits a margin
     /// per smaller live id from there.
     elect_since: Mutex<Option<tokio::time::Instant>>,
+    /// Whether the writer's duties run ([`Node::spawn_duties`]): set (Acquire/Release swap)
+    /// by the tick that claims them, cleared (Release) by their task's guard on every exit.
+    /// Serve's shared state isn't in concurrency.md's inventory (engine and runtime only).
+    duties: std::sync::atomic::AtomicBool,
+    /// The writer's failover state (D330 PR 2): when it took office, the last survey, the
+    /// promote in progress.
+    failovers: failover::Failovers,
     /// The node's device ceiling (D332): the highest one-second rate of its partitions'
     /// device bytes within `--balance-window`, fed by [`Node::watch_device`].
     device_ceiling: load::DeviceCeiling,
@@ -486,6 +507,8 @@ impl Node {
             writer_lease: Mutex::new((0, 0)),
             candidate: std::sync::atomic::AtomicU64::new(0),
             elect_since: Mutex::new(None),
+            duties: std::sync::atomic::AtomicBool::new(false),
+            failovers: failover::Failovers::default(),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -646,6 +669,7 @@ impl Node {
         self.reconcile_locked(&_one, &canonical, None);
         let routes = Arc::new(route::Routes::new(&canonical));
         let mut st = self.state();
+        let moved = moved_partitions(st.map.as_ref().map(|(m, _)| m), &canonical);
         st.map = Some((canonical, json));
         // Under the state lock, so the routes never run behind the map `GetMap` answers.
         self.routes.store(Some(routes));
@@ -667,7 +691,28 @@ impl Node {
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
         self.end_moved_feeds(version);
+        self.wake_copies(&moved);
         Ok(version)
+    }
+
+    /// Wakes this node's replica copies of `moved` (D330 amendment 2): their followers look
+    /// the owner up in the map now rather than after their pause.
+    fn wake_copies(&self, moved: &[String]) {
+        if moved.is_empty() {
+            return;
+        }
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
+            return;
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return;
+        };
+        let copies = cluster.replicas.load();
+        for id in moved {
+            if let Some(copy) = copies.get(id) {
+                copy.follower.wake();
+            }
+        }
     }
 
     /// Ends the cluster feed components of every partition open here that the map,
@@ -779,7 +824,7 @@ impl Node {
             map.writer = current.writer.clone();
             map.writer_term = current.writer_term;
             self.await_writer_lease(&current).await?;
-            if !current.failover && map.failover {
+            if !map::uses_failover(&current) && map::uses_failover(&map) {
                 self.every_node_keeps(&map, WRITER_TERMS_FEATURE, "failover")
                     .await?;
             }
@@ -827,7 +872,7 @@ impl Node {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
                     .await?;
             }
-            if map.failover || map.writer_term > 0 {
+            if map::uses_failover(&map) || map.writer_term > 0 {
                 self.every_node_keeps(&map, WRITER_TERMS_FEATURE, "failover or a writer term")
                     .await?;
             }
@@ -1475,6 +1520,8 @@ impl Node {
             writer,
             writer_term,
             writer_lease_remaining_ms: millis(writer_lease),
+            failover_blocked: self.failovers.blocked(),
+            grants: self.grants.granted(),
             node_id: self.id.clone(),
             map_version: version,
             cluster_id,
@@ -1891,6 +1938,15 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 req.cluster_id, mine.cluster_id
             ))
             .into());
+        }
+        // A pre-vote is answered as a ballot whatever its term: never as a lease request,
+        // which could grant the writer lease it names.
+        if req.pre_vote {
+            return Ok(tonic::Response::new(self.0.grants.pre_vote(
+                &mine,
+                &req,
+                self.0.peers.failover_after,
+            )?));
         }
         if self.0.is_vote(&mine, &req) {
             return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
@@ -2407,6 +2463,8 @@ pub(crate) fn run(
                 0 => args.cluster_lease_ms.saturating_mul(2),
                 ms => ms,
             }),
+            failover_max_lag: (args.cluster_failover_max_lag_ms > 0)
+                .then(|| Duration::from_millis(args.cluster_failover_max_lag_ms)),
             balance_window: Duration::from_secs(args.balance_window),
             load_interval: load::INTERVAL,
         },
@@ -3009,4 +3067,22 @@ fn open_partition(
             )))
         }
     }
+}
+
+/// The partitions whose owner, epoch or history `new` changes from `old` (all of them for a
+/// first map): what a copy's follower must look up again (D330 amendment 2).
+fn moved_partitions(old: Option<&ClusterMap>, new: &ClusterMap) -> Vec<String> {
+    // By id, not a scan per partition (perf2's nit on #2069): this runs under the state lock.
+    let before: HashMap<&str, &crate::serve::proto::Partition> = old
+        .map(|o| o.partitions.iter().map(|q| (q.id.as_str(), q)).collect())
+        .unwrap_or_default();
+    new.partitions
+        .iter()
+        .filter(|p| {
+            before.get(p.id.as_str()).is_none_or(|q| {
+                q.node != p.node || q.epoch != p.epoch || q.history_epoch != p.history_epoch
+            })
+        })
+        .map(|p| p.id.clone())
+        .collect()
 }

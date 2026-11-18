@@ -204,8 +204,69 @@ message ClusterMap {
   // D330: automatic failover, off by default (the owner's Q1), turned on with `set-map`.
   // Off: no node elects a new writer on its own; the writer changes only as before D330
   // (an operator's `set-map --force`, which raises the term). Set only once every node
-  // keeps it (`map_features`: `writer_terms`).
+  // keeps it (`map_features`: `writer_terms`). On: a writer whose lease lapses is replaced
+  // by election, and the writer fails a down partition over to its freshest replica (PR 2),
+  // unless the partition opts out (`Partition.failover`).
   bool failover = 11;
+  // D330: reserved for an old owner rejoining as a replica on its own (the owner's Q4); a
+  // map setting it is refused in 1.3.0, where the operator rejoins it.
+  bool failover_rejoin = 12;
+  // D330: the failovers and writer elections this map records, oldest first: the last 16
+  // done or abandoned, and every promote still pending (one whose `to_epoch` is above its
+  // partition's epoch), which is never dropped. A writer's change keeps them; a `set-map`
+  // that drops or alters a pending one is refused.
+  repeated FailoverEvent failovers = 13;
+}
+
+// D330: one failover of a partition to a replica, or one writer election, as the writer
+// that made it recorded it in the map.
+message FailoverEvent {
+  FailoverKind kind = 1;
+  // PARTITION: the partition failed over; empty for WRITER.
+  string partition = 2;
+  // PARTITION: its owner before, and the replica's node it's promoted on. WRITER: the
+  // writer before, and the node elected.
+  string from = 3;
+  string to = 4;
+  // The writer's wall clock when it recorded the event, in ms since the Unix epoch: for
+  // operators, never compared.
+  uint64 at_ms = 5;
+  // The writer that recorded it, and its term then.
+  string writer = 6;
+  uint64 writer_term = 7;
+  // PARTITION: the primary seqno the promoted copy had applied through, and the owner's
+  // durable seqno as the copy last heard it. Their difference is the known part of what
+  // the failover lost; commits the owner acknowledged after the copy last heard from it
+  // may be lost too (D330 §4). `primary_seqno` 0: unknown (the copy's follower hadn't heard
+  // the owner's frontier since it last reconnected).
+  uint64 applied_seqno = 8;
+  uint64 primary_seqno = 9;
+  // PARTITION: the external transaction shares the old owner reported in doubt, as of its
+  // last lease renewal before it went down (at most 4 KiB of ids), and how many there were.
+  repeated string in_doubt_xids = 10;
+  uint64 in_doubt_count = 11;
+  // PARTITION: the epoch the promote stamps the copy at, above every earlier pending
+  // promote's of the partition, so a copy stamped by a promote that never finished is never
+  // taken for this history (simp724's S2 on the D330 PR 2 plan).
+  uint64 to_epoch = 12;
+  FailoverState state = 13;
+}
+
+enum FailoverKind {
+  FAILOVER_KIND_UNSPECIFIED = 0;
+  FAILOVER_KIND_PARTITION = 1;
+  FAILOVER_KIND_WRITER = 2;
+}
+
+enum FailoverState {
+  FAILOVER_STATE_UNSPECIFIED = 0;
+  // Recorded before the stamp: the map doesn't give the partition its new node yet.
+  FAILOVER_STATE_PENDING = 1;
+  // The map gives it its new node at `to_epoch` (every WRITER event is done).
+  FAILOVER_STATE_DONE = 2;
+  // A later promote of the partition took over: a copy stamped at this event's
+  // `to_epoch` is orphaned, never served.
+  FAILOVER_STATE_ABANDONED = 3;
 }
 
 message Node {
@@ -236,6 +297,19 @@ message Partition {
   // (which must be on) and serves reads that allow a bounded staleness; it never takes a
   // write or P's lease. A change to this alone is no move: P's epoch stays. (6 is unused.)
   repeated string replicas = 7;
+  // D330: whether the writer fails P over on its own while the map's `failover` is on.
+  // The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
+  FailoverMode failover = 8;
+  // D330: how many times P has failed over, ever: monotonic, unlike the map's last-16
+  // events (`pigeonhole_cluster_failovers_total`).
+  uint64 failover_count = 11;
+}
+
+enum FailoverMode {
+  FAILOVER_MODE_UNSPECIFIED = 0;
+  FAILOVER_MODE_INHERIT = 1;
+  FAILOVER_MODE_OFF = 2;
+  FAILOVER_MODE_ON = 3;
 }
 
 message TablePlacement {
@@ -375,6 +449,13 @@ message NodeStatus {
   // another node: the time left on this node's grant of the writer lease to the writer. 0
   // once it has run out (or this node never granted it).
   uint64 writer_lease_remaining_ms = 10;
+  // D330, on the writer: each partition it finds down but doesn't fail over, and why
+  // ("failover off", "no fresh replica", "waiting: node X still grants its lease", ...).
+  map<string, string> failover_blocked = 12;
+  // D330: every partition lease this node grants that still runs: the partition, its
+  // holder, and the time left on this node's clock (not the writer lease). The writer asks
+  // before it fails a partition over: an owner some node still grants is alive.
+  repeated LeaseWithheld grants = 13;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -805,6 +886,12 @@ message LeaseRequest {
   // `(writer_term, map_version)`, and answers `newer_map_version` when its own sorts after
   // the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
   uint64 writer_term = 8;
+  // D330 PR 2: an election's pre-vote. The request asks for the writer lease alone, as a
+  // vote does; the answer grants it only if this node would vote, and records nothing.
+  // A candidate asks for real votes only once a majority would, so a node that can't win
+  // never records a vote, whose term would fence the live writer's maps from it once it
+  // rejoins.
+  bool pre_vote = 9;
 }
 
 // A partition at an epoch.
@@ -814,6 +901,11 @@ message LeasePart {
   // D330: for the writer lease (`partition` "__writer"), the writer term asked for or
   // granted; `epoch` is then 0. 0 for a partition.
   uint64 term = 3;
+  // D330, from an owner: the external transaction shares it holds in doubt for this
+  // partition (at most 4 KiB of ids), and how many there are, so a writer that fails the
+  // partition over can name them. Empty in a grantor's answer.
+  repeated string in_doubt_xids = 4;
+  uint64 in_doubt_count = 5;
 }
 
 message LeaseResponse {

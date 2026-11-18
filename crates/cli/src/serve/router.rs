@@ -439,6 +439,8 @@ impl Router {
             .map(|(id, c)| (id.as_str(), &*c.follower))
             .collect();
         super::replica::Replica::render_copies(&followers, &mut text);
+        // The map's failover counts and writer term (D330).
+        cluster.node.render_failover_metrics(&mut text);
         text
     }
 

@@ -415,11 +415,17 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             })
             .max()
             .unwrap_or(0);
+        // Above every epoch a promote of P recorded too (D330): a copy an unfinished one
+        // stamped is never taken for the restored history.
+        let promoted = live
+            .as_ref()
+            .map_or(0, |l| super::promote::promote_floor(l, &p.id));
         let epoch = 1 + copy
             .epoch
             .max(p.epoch)
             .max(old.map_or(0, |o| o.epoch))
-            .max(floor);
+            .max(floor)
+            .max(promoted);
         // Stamped by an earlier run under this live map, and its node's file says so.
         let earlier = progress.as_ref().is_some_and(|pr| {
             pr.stamped.get(&p.id)
@@ -882,7 +888,12 @@ async fn restore_partition(
             now.node
         )));
     }
-    let e = copy.epoch.max(now.epoch).max(floor);
+    // Above every epoch a promote of P recorded too (D330).
+    let e = copy
+        .epoch
+        .max(now.epoch)
+        .max(floor)
+        .max(super::promote::promote_floor(&live, partition));
     // Stamped by an earlier run at this epoch still: no upload, no stamp.
     let stamped = mine == Some((target.clone(), e + 1)) && target_has == Some(e + 1);
     let mut pr = PartProgress {
