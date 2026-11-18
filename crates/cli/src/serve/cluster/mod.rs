@@ -69,7 +69,14 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     NEAREST_QUALIFIERS_FEATURE,
     MEMORY_TOOL_FIELDS_FEATURE,
     REPLICAS_FEATURE,
+    LEASES_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for a build that serves `Cluster.Lease` (D326 amendment 1, #2048):
+/// a peer whose `Lease` answers `Unimplemented` counts as granting only if its `Status`
+/// lacks it (a 1.2 node), never when it reports it (a 1.3 node behind something that doesn't
+/// route the call, audit120's S1).
+pub(crate) const LEASES_FEATURE: &str = "leases";
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
 pub(crate) const MEMORY_FEATURE: &str = "memory";
@@ -1361,6 +1368,10 @@ impl Node {
                         return false;
                     }
                     #[cfg(test)]
+                    if f == LEASES_FEATURE && fence::pre_lease(&self.dir) {
+                        return false;
+                    }
+                    #[cfg(test)]
                     if f == MEMORY_TOOL_FIELDS_FEATURE
                         && OLD_MEMORY
                             .lock()
@@ -1726,6 +1737,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::LeaseRequest>,
     ) -> Result<tonic::Response<proto::LeaseResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "ask for a partition lease")?;
+        #[cfg(test)]
+        if fence::pre_lease(&self.0.dir) || fence::lease_unrouted(&self.0.dir) {
+            return Err(Status::unimplemented("a build before D326"));
+        }
         let req = req.into_inner();
         let mine = self.0.get_map()?;
         if req.cluster_id != mine.cluster_id {
@@ -1744,6 +1759,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::ReleaseRequest>,
     ) -> Result<tonic::Response<proto::ReleaseResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "release a partition lease")?;
+        #[cfg(test)]
+        if fence::pre_lease(&self.0.dir) || fence::lease_unrouted(&self.0.dir) {
+            return Err(Status::unimplemented("a build before D326"));
+        }
         let req = req.into_inner();
         let mine = self.0.get_map()?;
         if req.cluster_id != mine.cluster_id {
