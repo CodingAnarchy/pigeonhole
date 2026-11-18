@@ -7947,6 +7947,11 @@ impl ShardState {
                     && !share.tracked
                 {
                     share.tracked = true;
+                    #[cfg(feature = "test-hooks")]
+                    self.shared.metrics[usize::from(self.id.0)]
+                        .hooks
+                        .shares_tracked
+                        .fetch_add(1, Ordering::Relaxed);
                     share.commit_ts = floor;
                     share.reads = reads;
                     share.read_tablets = read_tablets;
