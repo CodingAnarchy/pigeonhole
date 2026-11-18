@@ -951,6 +951,62 @@ fn wal() {
     }
     // Starting 100 bytes before a frame end, so the first record is split First/Last.
     check("wal_fragments.bin", &frames);
+
+    // D331 (ICR 0141): the same batch marked feed-silent (`count` bit 31), in each record
+    // that carries a batch. `decode` refuses each (a file without `incompat` bit 3, or a
+    // build before D331); `decode_with(.., true)` takes it, mark and all (perf2's S1, S2).
+    let mut quiet = BatchBuilder::from_batch(b.batch());
+    quiet.mark_silent();
+    let mut quiet_share = Vec::new();
+    ExternalShare::encode(
+        b"p1:h3-00ff",
+        &[StreamId(0), StreamId(5)],
+        reads.iter().copied(),
+        Some(quiet.batch()),
+        &mut quiet_share,
+    )
+    .unwrap();
+    let silent = [
+        (
+            "wal_record_batch_silent.bin",
+            WalRecord::Batch {
+                seqno: 106,
+                commit_ts: 1_700_000_000_000_003,
+                batch: quiet.batch(),
+            },
+        ),
+        (
+            "wal_record_prepare_silent.bin",
+            WalRecord::Prepare {
+                seqno: 107,
+                commit_ts: 1_700_000_000_000_004,
+                coordinator: StreamId(0),
+                batch: quiet.batch(),
+            },
+        ),
+        (
+            "wal_record_external_prepare_silent.bin",
+            WalRecord::ExternalPrepare {
+                seqno: 108,
+                coordinator: StreamId(0),
+                share: ExternalShare::decode(&quiet_share, true).unwrap(),
+            },
+        ),
+    ];
+    for (name, rec) in &silent {
+        let mut out = Vec::new();
+        rec.encode(&mut out);
+        check(name, &out);
+        let taken = WalRecord::decode_with(&out, true).unwrap();
+        assert_eq!(&taken, rec, "{name}");
+        assert!(taken.batch().unwrap().is_silent(), "{name}");
+        for refused in [WalRecord::decode(&out), WalRecord::decode_with(&out, false)] {
+            assert!(
+                matches!(refused, Err(pigeonhole_format::Error::Corrupt { .. })),
+                "{name}: {refused:?}"
+            );
+        }
+    }
 }
 
 #[test]

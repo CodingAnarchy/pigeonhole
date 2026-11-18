@@ -5132,3 +5132,40 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **C2:** every user of the placeholder flag (`truncate`, the shrink plan, region clearing, `abandon`) treats a block mid-punch as allocated, with a test of a shrink while a pass holds a block at the tail.
 - **S1:** only whole filesystem blocks are punched; macOS's `EINVAL` is an error, never "unsupported".
 - **S3:** the simulator's punch survives a power loss zeroed or not, at random.
+
+<a id="d331"></a>
+## D331 — Splitting a partition and moving a key range online: phases in the map, a durable range fence, one map version as the commit point (cli692, design; owner, 2026-11-16; reviewed by simp724 and perf287; ai1249 builds it; engine, cli, #1499, ICR 0141, amends ICR 0117) · D317, D326, D328, D310, D329
+
+**Problem (#1499).** A cluster's table layer is fixed once a range holds data (D317): `move` and `relocate` move a whole partition file, and nothing moves keys between partitions. A hot or large partition can't be split, and a range can't go to a partition with room.
+
+**Decision.**
+- **A range move** takes rows `[a, b)` of one table from partition S to partition T, an existing partition or a new one (a split). Its phases are recorded in the map (`ClusterMap.moves`), so a rerun, the next writer or a crash recovery continues from them:
+  1. COPYING: T copies the range from S in chunks, each at its own snapshot;
+  2. CATCHING_UP: T follows S's feed for the range;
+  3. HANDING_OVER: S fences the range's writes, durably, and T catches up to S's visible seqno, by feed position;
+  4. HANDED_OVER: the commit point, one map version giving the range to T and raising S's epoch;
+  5. CLEANING: S deletes its copy.
+- **T serves the range** only once S acknowledged that map, or a lease (L·(1+ρ)) passed since a majority held it (the never-both rule).
+- **Writes:**
+  - The copy and the catch-up write each cell at S's timestamp. T raises its timestamp floor past them before it serves.
+  - S's moved ranges make a transaction that read them fail validation (`Conflict`), for the transaction lifetime.
+  - D329 shares that read or wrote the range block the hand-over.
+- **Feeds:**
+  - The copy, the catch-up and S's cleanup are **feed-silent**: logged, durable and replicated, never delivered to a subscription. S's feed ends the range's history at the hand-over, and T's starts it.
+  - The cluster feed's merge holds T's component while S's is behind the hand-over (it blocks, never buffers).
+  - A new partition's feed is read from its start.
+  - Replicas apply silent batches silent, so they stay copies.
+- **The source's change feed is required** (owner, Q2). The move holds S's feed retention from the copy's first snapshot, up to `--move-retention-cap`, and aborts past it.
+- **`split` and `move-range` both ship in 1.3.0** (owner, Q1). A **merge** (`phdb cluster merge S --into T`) is range moves plus dropping the emptied S.
+- **Backups clip on restore** (owner, Q3): restore deletes rows outside each partition's ranges and rolls an in-flight move back or forward.
+- **The guide documents the measured pause** (owner, Q4): the range's sub-second LAN pause, plus S's whole-partition pause of one lease round.
+
+**Engine (ICR 0141, PR 1).**
+- Feed-silent batches: bit 31 of a batch's count, behind `incompat` bit 3 (sticky). A reader refuses the mark without the bit.
+- `raise_ts_floor`.
+- A feed retention hold with a cap.
+- A silent commit crosses replication as a version 2 event, which builds before D331 refuse.
+
+**PRs.** 1, the engine; 2, the map record and the gates; 3, the paths that must clip, the cluster feed's hold, and backups; 4, the copy and the range follower; 5, the driver, hand-over, cleanup and CLI; 6, merge. Follow-ups #2052 (SST ingest for the copy) and #2053 (dropping whole SSTs on cleanup), both Post-1.0 unless perf287's box run says otherwise.
+
+**Design:** `.coord/cli692-design-1499.md` (with simp724's, perf287's and Amendment 5's reviews), `.coord/ai1249-plan-1499.md`.

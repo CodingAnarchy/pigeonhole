@@ -1461,6 +1461,20 @@ impl WriteBatch {
         }
     }
 
+    /// Marks the batch feed-silent (D331, ICR 0141): committed, durable and replicated as
+    /// any batch, but never delivered to a change-feed subscription. A range move's copy and
+    /// its source's cleanup write so: the range's history isn't new on either partition. The
+    /// first silent commit sets the file's `incompat` bit 3, which builds before D331 refuse
+    /// to open. Refused on a replica, which takes its primary's silent commits only through
+    /// [`Pigeonhole::apply_replicated`](crate::Pigeonhole::apply_replicated), silent there too
+    /// (cli692's N2 on #2055). Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn mark_feed_silent(&mut self) -> &mut Self {
+        self.builder.batch.mark_feed_silent();
+        self
+    }
+
     /// Adds one mutation of `row` in `table`'s `family` (`qualifier` and `value` only size
     /// errors).
     fn op(

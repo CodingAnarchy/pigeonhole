@@ -536,6 +536,12 @@ pub(crate) struct Shared {
     /// logged. Set once, under the manifest writer's lock, after `flag_incompat` returned;
     /// read (Acquire) by `Engine::prepare_external` to skip the lock.
     pub external_flagged: AtomicBool,
+    /// `incompat` bit 3 is set in both superblock pages (D331, ICR 0141): a feed-silent
+    /// batch may be logged, and a WAL reader takes its mark. Seeded at open from the
+    /// superblock; set once by `Engine::flag_silent`, under the manifest writer's lock, after
+    /// `flag_incompat` returned and before the first silent batch is routed; read (Acquire)
+    /// by the commit path to skip the lock and by feed cursors that meet a silent batch.
+    pub silent_flagged: AtomicBool,
     /// Externally prepared transactions in doubt (D329, ICR 0140), by xid: each one's id and
     /// coordinator shard. A leaf lock: inserted by the coordinator once every share is
     /// prepared (before it answers the caller, so a `decide` after `prepare` returned
@@ -11331,6 +11337,8 @@ impl ShardState {
         let Some(feed) = &self.shared.feed else {
             return;
         };
+        // A retention hold past its cap lapses first (D331), so this pass trims again.
+        feed.enforce_retention_caps();
         if let Some(wal) = self.wal.as_mut()
             && !self.poisoned
         {
