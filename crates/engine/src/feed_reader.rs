@@ -1731,11 +1731,24 @@ impl FeedReader {
         self.out_silent
     }
 
-    /// The silent notes held now (test hook): bounded by the commits ready or held, so
-    /// empty once a feed has drained.
+    /// The silent notes held now (test hook), each checked against what the reader keeps: a
+    /// single commit's in `ready`, a round's among the held shares. So empty once a feed has
+    /// drained.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn notes(&self) -> usize {
+        for &k in &self.silent_seen {
+            let kept = self.ready.contains_key(&k)
+                || self
+                    .held
+                    .range((k, 0)..(k.saturating_add(1), 0))
+                    .next()
+                    .is_some();
+            assert!(
+                kept,
+                "a silent note for {k}, a commit the reader doesn't keep"
+            );
+        }
         self.silent_seen.len()
     }
 
@@ -2215,8 +2228,14 @@ impl FeedReader {
         self.forget_ready(&p);
         let (stream, start) = p.at();
         self.ahead.skip(stream, start);
-        if let Pending::Decided { id, .. } = p {
-            self.evict_round(id);
+        match p {
+            // A round's note goes with its shares (`remove_held`).
+            Pending::Decided { id, .. } => self.evict_round(id),
+            // A single's goes here: it's read again, and noted again, past the cutoff
+            // (ai1249's nit on #2068).
+            Pending::Single { .. } => {
+                self.silent_seen.remove(&key);
+            }
         }
         self.ahead.lower_cutoff(key - 1);
     }
