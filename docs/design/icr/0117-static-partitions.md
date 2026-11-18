@@ -826,6 +826,7 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 - A copy of a target serves the range once it has applied the target's serving row. A copy of a source refuses a moved range from the source's moved-away row.
 - A copy whose file lacks a row it needs waits, keeping its previous span for a source, and its follower reads the rows again after each run it applies.
 - While a move names a partition as its target, or as its source from HANDED_OVER on, the routing view lists no copies for it, so bounded reads go to the owner. A gated copy never counts as behind or unreachable.
+  - The cost (cli692's note on the 3a review): for the move's length, CLEANING included, the partition's bounded reads of every table, not only the moved one, are its owner's. Moves are short, and narrowing it would need per-table copy lists in the routing view. PR 5's guide states it.
 
 **Restore:**
 - A cluster backup never spans a hand-over: `backup::moved` refuses a backup during which a placement or epoch changed.
