@@ -161,6 +161,22 @@ pub struct FeedCursor {
     silent_check: Option<SilentCheck>,
 }
 
+/// A marked batch met while the cursor doesn't take the mark: takes it from now on if
+/// `check` says the superblock has `incompat` bit 3 now, else the decoder's refusal.
+#[cold]
+#[inline(never)]
+fn take_mark(ok: &mut bool, check: Option<&(dyn Fn() -> bool + Send + Sync)>) -> Result<()> {
+    if check.is_some_and(|c| c()) {
+        *ok = true;
+        Ok(())
+    } else {
+        Err(pigeonhole_format::Error::Corrupt {
+            what: pigeonhole_format::wal::SILENT_WITHOUT_BIT,
+        }
+        .into())
+    }
+}
+
 /// Asked when a cursor meets a feed-silent batch (D331, ICR 0141) and doesn't yet take the
 /// mark: whether the database's superblock now has `incompat` bit 3. A writer sets the bit
 /// before appending the first such batch, so a cursor opened earlier finds it set.
@@ -536,21 +552,14 @@ impl FeedCursor {
                         let start = Lsn::new(epoch, last_end as u32);
                         let session = cur.session;
                         let cur = self.cur.as_ref().expect("checked above");
-                        let record = match WalRecord::decode_with(cur.dec.record(), self.silent_ok)
-                        {
-                            Ok(record) => record,
-                            // A feed-silent batch while the cursor doesn't take the mark: the
-                            // writer may have set `incompat` bit 3 since it opened, so ask
-                            // again, on this refusal only (simp724's N2 on #2055).
-                            Err(e)
-                                if pigeonhole_format::wal::is_silent_refusal(&e)
-                                    && self.silent_check.as_ref().is_some_and(|c| c()) =>
-                            {
-                                self.silent_ok = true;
-                                WalRecord::decode_with(cur.dec.record(), true)?
-                            }
-                            Err(e) => return Err(e.into()),
-                        };
+                        let bytes = cur.dec.record();
+                        // A feed-silent batch while the cursor doesn't take the mark: the
+                        // writer may have set `incompat` bit 3 since it opened, so ask again
+                        // (simp724's S1 and N2 on #2055), out of line.
+                        if !self.silent_ok && WalRecord::is_marked(bytes) {
+                            take_mark(&mut self.silent_ok, self.silent_check.as_deref())?;
+                        }
+                        let record = WalRecord::decode_with(bytes, true)?;
                         return Ok(Step::Record {
                             start,
                             end: Lsn::new(epoch, end as u32),

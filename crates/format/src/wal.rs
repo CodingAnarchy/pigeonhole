@@ -106,7 +106,7 @@ pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without in
 /// timestamp before it), a Prepare's at byte 25 (and the coordinator). An External Prepare's
 /// batch follows its variable-length share, so it's decoded (a rare record). A record too
 /// short to hold its count isn't marked here: decoding then reports it.
-#[inline]
+#[inline(always)]
 fn marked(bytes: &[u8]) -> bool {
     let top = |at: usize| bytes.get(at).is_some_and(|b| b & 0x80 != 0);
     match bytes.first() {
@@ -131,13 +131,6 @@ fn silent_without_bit() -> Error {
     Error::Corrupt {
         what: SILENT_WITHOUT_BIT,
     }
-}
-
-/// Whether `e` is [`WalRecord::decode_with`]'s refusal of a feed-silent batch's mark (and no
-/// other corruption): what a reader that may have opened before `incompat` bit 3 was set
-/// asks again on.
-pub fn is_silent_refusal(e: &Error) -> bool {
-    matches!(e, Error::Corrupt { what } if *what == SILENT_WITHOUT_BIT)
 }
 
 /// The header in frame 0 of every segment.
@@ -1027,6 +1020,14 @@ impl WalRecord<'_> {
             return Err(silent_without_bit());
         }
         Self::decode_any(bytes)
+    }
+
+    /// Whether the encoded record `bytes` carries a batch marked [`SILENT_BATCH`] (D331),
+    /// read at the mark's place without decoding the record: a reader that doesn't take
+    /// the mark yet tests it first, then decodes with [`decode_with`](Self::decode_with).
+    #[inline(always)]
+    pub fn is_marked(bytes: &[u8]) -> bool {
+        marked(bytes)
     }
 
     /// The batch a record carries, if any: a Batch's, a Prepare's, or an external PREPARE's.

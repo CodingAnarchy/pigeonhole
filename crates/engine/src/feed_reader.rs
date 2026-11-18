@@ -2757,7 +2757,9 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
-                    self.out_silent = self.include_silent && self.silent_seen.remove(&key);
+                    if self.include_silent {
+                        self.out_silent = self.silent_seen.remove(&key);
+                    }
                     (ts, Packs::One(changes))
                 }
                 Pending::Decided {
@@ -2771,7 +2773,9 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
-                    self.out_silent = self.include_silent && self.silent_seen.remove(&id);
+                    if self.include_silent {
+                        self.out_silent = self.silent_seen.remove(&id);
+                    }
                     match self.take_round(id, &participants, session) {
                         Round::Whole(raws) => (ts, Packs::Many(raws)),
                         Round::Dropped => {
