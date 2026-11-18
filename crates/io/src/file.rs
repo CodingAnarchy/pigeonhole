@@ -51,15 +51,25 @@ pub enum LockMode {
 /// Locks are per handle (OFD locks on Linux, `fcntl` behind a per-process registry on macOS
 /// and BSD so closing one handle never drops another's lock, `LockFileEx` on Windows).
 ///
-/// A method added here must also be forwarded by the engine's counting wrapper,
-/// `CountingFile` (pigeonhole-engine's `io_count.rs`, D332): a defaulted method it doesn't
-/// forward would silently take the default under it.
+/// A `File` that wraps another must forward [`File::count_into`], or the wrapped file's I/O
+/// goes uncounted (D332).
 pub trait File: Send + Sync + Debug {
     /// Reads exactly `buf.len()` bytes at `offset`; fails with `UnexpectedEof` if short.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()>;
 
     /// Writes all of `buf` at `offset`.
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()>;
+
+    /// Counts this file's I/O into `counters` from now on (D332, ICR 0142): the buffer length
+    /// of each read and write as it's submitted (`read_at`, `submit_read`,
+    /// `submit_reads_ahead`, `write_at`, `submit_write`), a short or failed one in full. Not
+    /// syncs, writeback hints, allocations or punches. Bytes moved before the call (an
+    /// open's own reads) aren't counted. A second call with the same counters does nothing;
+    /// with others it's a bug, caught in debug builds. The default counts nothing: a test's
+    /// or an application's own `File` (a wrapper must forward it).
+    fn count_into(&self, counters: std::sync::Arc<crate::IoCounters>) {
+        let _ = counters;
+    }
 
     /// For a handle opened with [`OpenOptions::direct`], the alignment its I/O needs: offsets,
     /// lengths and buffer addresses a multiple of it, else

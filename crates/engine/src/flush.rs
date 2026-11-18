@@ -299,7 +299,7 @@ fn flush_gc(
     pigeonhole_compaction::GcPolicy,
 ) {
     let view = shared.view.load();
-    let now = shared.vfs.now_micros();
+    let now = shared.clock_vfs.now_micros();
     let mut policy =
         pigeonhole_compaction::GcPolicy::new(crate::compact::gc_snapshots(shared), now, false);
     policy.no_outside_deletes = item.guard.is_some();
@@ -419,7 +419,7 @@ pub(crate) struct FlushTask {
 
 impl FlushTask {
     pub(crate) fn new(shared: Arc<Shared>, shard: ShardId, items: Vec<FlushItem>) -> Self {
-        let started = shared.vfs.monotonic_nanos();
+        let started = shared.clock_vfs.monotonic_nanos();
         Self {
             shared,
             shard,
@@ -511,7 +511,7 @@ impl FlushTask {
                     item.family,
                     item.tablet,
                 );
-                options.created_micros = self.shared.vfs.now_micros();
+                options.created_micros = self.shared.clock_vfs.now_micros();
                 self.sink = Some(
                     SstSink::new(
                         Arc::clone(&self.shared.pager),
@@ -554,7 +554,7 @@ impl FlushTask {
                 n += 1;
                 if n.is_multiple_of(CLOCK_EVERY)
                     && deadline != u64::MAX
-                    && self.shared.vfs.monotonic_nanos() >= deadline
+                    && self.shared.clock_vfs.monotonic_nanos() >= deadline
                 {
                     return Ok(false);
                 }

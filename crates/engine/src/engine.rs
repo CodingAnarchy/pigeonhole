@@ -1113,8 +1113,12 @@ impl Engine {
             ));
         }
         // Every file of the database counts its bytes (D332, ICR 0142).
-        let io = Arc::new(crate::io_count::IoCounters::default());
+        let io = Arc::new(pigeonhole_io::IoCounters::new());
         let mut options = options;
+        // The backend itself, for the clock reads on the commit path and the runtime's: only
+        // opens need the counting wrapper, and a clock read through it costs an extra call
+        // (#2063's callgrind: about 40 instructions a commit).
+        let clock_vfs = Arc::clone(&options.vfs);
         options.vfs = crate::io_count::CountingVfs::wrap(Arc::clone(&options.vfs), Arc::clone(&io));
         let vfs = Arc::clone(&options.vfs);
         let registry = Arc::new(options.merge_operators.clone());
@@ -1469,6 +1473,7 @@ impl Engine {
                 n => n,
             },
             feed: feed.clone(),
+            clock_vfs: Arc::clone(&clock_vfs),
             ..Shared::base(
                 &vfs,
                 &shm,
@@ -1838,7 +1843,7 @@ impl Engine {
             drop(recoveries);
             // D329: its shares in doubt are listed (`in_doubt`), for an operator to see; no
             // share is held, and `decide` is refused (`ReadOnly`), so nothing else is.
-            let now = shared.vfs.monotonic_nanos();
+            let now = shared.clock_vfs.monotonic_nanos();
             for (stream, seqno, coordinator) in &in_doubt {
                 if stream != coordinator {
                     continue;
@@ -1923,7 +1928,7 @@ impl Engine {
             }
             // D329: each in-doubt share is held again on its shard, and its coordinator
             // awaits `decide`, before any shard admits a write.
-            let now = shared.vfs.monotonic_nanos();
+            let now = shared.clock_vfs.monotonic_nanos();
             for (stream, seqno, coordinator) in &in_doubt {
                 let (Some(e), Some((.., bytes))) = (
                     external.get(&(*stream, *seqno)),
@@ -2111,7 +2116,8 @@ impl Engine {
             .saturating_sub(64 * 1024)
             .min(64 << 20)
             .min((options.memtable_budget / 2) as usize);
-        let mut config = RuntimeConfig::new(Arc::clone(&vfs));
+        // The runtime opens no file: it reads the clock, through the backend itself.
+        let mut config = RuntimeConfig::new(Arc::clone(&shared.clock_vfs));
         config.shards = shards;
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
@@ -3167,7 +3173,7 @@ impl Engine {
                         rc,
                         &snapshot.view,
                         snapshot.seqno,
-                        inner.shared.vfs.now_micros(),
+                        inner.shared.clock_vfs.now_micros(),
                         table,
                         family,
                         row,
@@ -3204,7 +3210,7 @@ impl Engine {
             if view.released {
                 return Err(Error::Closed);
             }
-            let clock = || inner.shared.vfs.now_micros();
+            let clock = || inner.shared.clock_vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && let Some(got) = crate::row_cache::get_through(
                     rc,
@@ -3237,7 +3243,7 @@ impl Engine {
     ) -> Result<Option<RowData>> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         snapshot.checked(read::read_row(snapshot, table, row, &families, spec, now))
     }
 
@@ -3256,7 +3262,7 @@ impl Engine {
     ) -> Result<bool> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         snapshot.checked(read::read_row_into(
             &snapshot.view,
             snapshot.seqno,
@@ -3286,7 +3292,7 @@ impl Engine {
     ) -> Result<bool> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         snapshot.checked(crate::row_cache::read_row_cached(
             rc,
             &snapshot.view,
@@ -3473,7 +3479,7 @@ impl Engine {
         }
         if let Some((view, seqno)) = inner.latest_view()? {
             let families = families_in_order(&view, table, families)?;
-            let now = inner.shared.vfs.now_micros();
+            let now = inner.shared.clock_vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && crate::row_cache::serves_spec(spec)
             {
@@ -3503,7 +3509,7 @@ impl Engine {
     pub fn scan(&self, snapshot: &Snapshot, table: TableId, spec: ScanSpec) -> Result<ScanCursor> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         Ok(ScanCursor::new(
             snapshot.clone(),
             table,
@@ -3533,7 +3539,7 @@ impl Engine {
     {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         let may_fan_out = self
             .inner
             .shared
@@ -3567,7 +3573,7 @@ impl Engine {
     {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         let may_fan_out = self
             .inner
             .shared
@@ -3598,7 +3604,7 @@ impl Engine {
     ) -> Result<crate::KeyCursor> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         crate::KeyCursor::new(
             snapshot.clone(),
             table,
@@ -3623,7 +3629,7 @@ impl Engine {
         spec: &crate::TraverseSpec,
     ) -> Result<crate::Traversal> {
         snapshot.check_process()?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         let may_fan_out = self
             .inner
             .shared
@@ -3655,7 +3661,7 @@ impl Engine {
             table,
             seeds,
             spec,
-            self.inner.shared.vfs.now_micros(),
+            self.inner.shared.clock_vfs.now_micros(),
             Arc::clone(&self.inner.shared),
         ))
     }
@@ -3717,7 +3723,7 @@ impl Engine {
                     table,
                     families.into_vec(),
                     read,
-                    self.inner.shared.vfs.now_micros(),
+                    self.inner.shared.clock_vfs.now_micros(),
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
@@ -3793,7 +3799,7 @@ impl Engine {
                     table,
                     families.into_vec(),
                     read,
-                    self.inner.shared.vfs.now_micros(),
+                    self.inner.shared.clock_vfs.now_micros(),
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
@@ -4426,7 +4432,7 @@ impl Engine {
             );
         }
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
-        m.default_ts_lead_micros = shared.clock.lead(shared.vfs.now_micros());
+        m.default_ts_lead_micros = shared.clock.lead(shared.clock_vfs.now_micros());
         m.block_cache = shared.cache.hits_and_misses();
         m.block_cache_pinned = shared.cache.pinned() as u64;
         m.block_cache_capacity = shared.cache.capacity() as u64;
@@ -4820,7 +4826,7 @@ fn spill_recovered(
     states: &mut [ShardState],
     spill: &mut Spilled,
 ) -> Result<()> {
-    let created = shared.vfs.now_micros();
+    let created = shared.clock_vfs.now_micros();
     for state in states.iter_mut() {
         for ((tablet, family), reader, bytes, max_seqno) in state.take_memtables() {
             let Some(meta) = catalog.family(family) else {
@@ -6003,7 +6009,7 @@ impl Inner {
             parts,
             durability,
             reply: tx,
-            submitted_at: self.shared.vfs.monotonic_nanos(),
+            submitted_at: self.shared.clock_vfs.monotonic_nanos(),
             validate,
             map_version: view.tablets.version(),
             epoch: 0,
@@ -6086,7 +6092,7 @@ impl Inner {
     /// The externally prepared transactions in doubt here (D329): each one's xid, and how
     /// long ago (the engine's monotonic clock) it was prepared, in nanoseconds.
     pub(crate) fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
-        let now = self.shared.vfs.monotonic_nanos();
+        let now = self.shared.clock_vfs.monotonic_nanos();
         self.shared
             .external
             .in_doubt()
@@ -6184,7 +6190,7 @@ impl Inner {
                 }
             }
         }
-        let submitted_at = self.shared.vfs.monotonic_nanos();
+        let submitted_at = self.shared.clock_vfs.monotonic_nanos();
         let (tx, waiter) = crate::write::commit_completion();
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::commit_succeeded);
@@ -6385,7 +6391,7 @@ impl Inner {
             [s] => *s,
             _ => unreachable!("one row routes to one shard"),
         };
-        let submitted_at = self.shared.vfs.monotonic_nanos();
+        let submitted_at = self.shared.clock_vfs.monotonic_nanos();
         let (tx, rx) = completion();
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::check_succeeded);
@@ -6496,7 +6502,7 @@ impl Inner {
                 rc,
                 &snapshot.view,
                 snapshot.seqno,
-                self.shared.vfs.now_micros(),
+                self.shared.clock_vfs.now_micros(),
                 table,
                 family,
                 row,
@@ -6508,7 +6514,7 @@ impl Inner {
         snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
-            || self.shared.vfs.now_micros(),
+            || self.shared.clock_vfs.now_micros(),
             table,
             family,
             row,
@@ -7900,6 +7906,7 @@ impl Shared {
     ) -> Self {
         Shared {
             vfs: Arc::clone(vfs),
+            clock_vfs: Arc::clone(vfs),
             shm: shm.clone(),
             reader_reclaim_at: AtomicU64::new(0),
             reader_slots_reclaimed: AtomicU64::new(0),

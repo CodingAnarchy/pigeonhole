@@ -1350,7 +1350,7 @@ impl ShardState {
         trace!("shard {} tablet timer armed for {deadline}", self.id.0);
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             deadline,
             Arc::clone(&state),
             ctx.submitter(self.id).clone(),
@@ -2744,7 +2744,7 @@ impl ShardState {
         }
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             self.next_balance,
             Arc::clone(&state),
             ctx.submitter(self.id).clone(),

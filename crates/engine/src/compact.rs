@@ -585,7 +585,7 @@ impl CompactionWork {
         gc: GcPolicy,
         record: Option<CompactionRecord>,
     ) -> Result<Self> {
-        let started = shared.vfs.monotonic_nanos();
+        let started = shared.clock_vfs.monotonic_nanos();
         let job = if matches!(task.kind, TaskKind::Rewrite | TaskKind::BlobGc { .. }) {
             let priority = SstSet::priority(meta.options.cache_priority);
             let mut inputs: Vec<Arc<SstReader>> = Vec::new();
