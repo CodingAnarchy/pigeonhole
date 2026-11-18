@@ -440,7 +440,9 @@ impl Sessions {
             principal,
             State::Txn(Some(open()?)),
             None,
-            self.leases.txn_idle,
+            // Twice the home's: the home renews it at a call once it's half an idle lease
+            // old, and calls may come up to an idle lease apart (audit120's second pass).
+            self.leases.txn_idle * 2,
             self.leases.txn_lifetime,
             Some(xid.into()),
             None,

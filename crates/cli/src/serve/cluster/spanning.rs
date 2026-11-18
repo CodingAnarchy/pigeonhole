@@ -503,6 +503,31 @@ impl Driver {
         Ok(reply)
     }
 
+    /// Whether `span` has room for the branches `partitions` would open
+    /// (`--txn-max-branches`): checked before a call sends any row (audit120's M3b).
+    pub(crate) fn room<'p>(
+        &self,
+        span: &Span,
+        partitions: impl Iterator<Item = &'p String>,
+    ) -> Result<(), ApiError> {
+        let open = span
+            .parts
+            .iter()
+            .filter(|(p, t)| **p != *self.home && t.renewed.is_some())
+            .count();
+        let new = partitions
+            .filter(|p| span.parts.get(*p).is_none_or(|t| t.renewed.is_none()))
+            .count();
+        if open + new > self.max_branches {
+            return Err(ApiError::failed_precondition(format!(
+                "the transaction would touch {} partitions besides its home, more than \
+                 --txn-max-branches allows",
+                open + new
+            )));
+        }
+        Ok(())
+    }
+
     /// Checks again that every node keeps `spanning_txns` (a node on an older build may
     /// have joined since `Begin`).
     pub(crate) async fn check_feature(&self) -> Result<(), ApiError> {
@@ -759,6 +784,7 @@ pub(crate) async fn serve_home(
             };
         }
     };
+    let buffered = g.wrote();
     let Some(span) = g.span() else {
         return Err(ApiError::internal("a spanning id on a plain session"));
     };
@@ -785,33 +811,57 @@ pub(crate) async fn serve_home(
             home.call(op, caller, Some(budget)).await
         }
         ServiceOp::TxnWrite(r) => {
+            // All or nothing, as on one node (audit120's M3b): everything that can refuse
+            // is checked before the first row goes to a branch, and a failure after that
+            // ends the transaction, so a retry can't apply the sent rows twice.
             let (mine, others) = split(r.rows)?;
+            let rows = home.txn_rows(&mine).await?;
+            if !mine.is_empty() {
+                home.writable()?;
+            }
+            driver.room(span, others.keys())?;
             for (p, rows) in others {
                 let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
                     txn_id: r.txn_id.clone(),
                     rows,
                 });
-                driver.call(span, &p, w).await?;
+                if let Err(e) = driver.call(span, &p, w).await {
+                    drop(budget);
+                    return Err(Service::end_spanning(g, e, &driver));
+                }
             }
-            if mine.is_empty() {
-                return Ok(ServiceReply::Empty(proto::Empty {}));
+            if !rows.is_empty() {
+                span.parts.entry(driver.home.to_string()).or_default().wrote = true;
+                Service::buffer_rows(&mut g, &rows);
             }
-            span.parts.entry(driver.home.to_string()).or_default().wrote = true;
-            drop(g);
-            let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
-                txn_id: r.txn_id,
-                rows: mine,
-            });
-            home.call(w, caller, Some(budget)).await
+            drop((g, budget));
+            Ok(ServiceReply::Empty(proto::Empty {}))
         }
         ServiceOp::Commit(r) => {
+            // As `TxnWrite`: what the commit can refuse before any row goes out (M3b).
             let (mine, others) = split(r.rows)?;
+            let writes = buffered
+                || !mine.is_empty()
+                || !others.is_empty()
+                || span.parts.values().any(|t| t.wrote);
+            if writes && !caller.scope.allows(super::super::auth::Scope::Write) {
+                return Err(ApiError::permission_denied("commit writes"));
+            }
+            drop(home.txn_rows(&mine).await?);
+            if writes {
+                drop(home.decisions_table().await?);
+            }
+            driver.room(span, others.keys())?;
+            let forwarded = !others.is_empty();
             for (p, rows) in others {
                 let w = ServiceOp::TxnWrite(proto::TxnWriteRequest {
                     txn_id: r.txn_id.clone(),
                     rows,
                 });
-                driver.call(span, &p, w).await?;
+                if let Err(e) = driver.call(span, &p, w).await {
+                    drop(budget);
+                    return Err(Service::end_spanning(g, e, &driver));
+                }
             }
             if !mine.is_empty() {
                 span.parts.entry(driver.home.to_string()).or_default().wrote = true;
@@ -821,7 +871,8 @@ pub(crate) async fn serve_home(
                 rows: mine,
             };
             Ok(ServiceReply::Commit(
-                home.commit_spanning(g, r, caller, budget, driver).await?,
+                home.commit_spanning(g, r, caller, budget, driver, forwarded)
+                    .await?,
             ))
         }
         ServiceOp::Abort(_) => {

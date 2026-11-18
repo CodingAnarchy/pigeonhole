@@ -885,3 +885,53 @@ fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
         .await;
     });
 }
+
+/// `row`'s writes with one that carries no operation: refused where it's decoded.
+fn bad_row(row: &str) -> crate::serve::proto::RowWrites {
+    let mut w = put_row(row, "x");
+    w.writes.push(crate::serve::proto::Write { op: None });
+    w
+}
+
+#[test]
+fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
+    // audit120's M3b: rows a call already sent to a branch can't be applied twice by a
+    // retry. What the home could refuse is checked before any row goes out; a failure after
+    // that ends the transaction.
+    let t = Several::start(crate::serve::server_tests::limits());
+    let [_, b, c] = t.ports;
+    let commit = |id: String, rows| async move {
+        txns(c)
+            .await
+            .commit(crate::serve::proto::TxnCommitRequest { txn_id: id, rows })
+            .await
+    };
+    t.rt.block_on(async {
+        // A bad home row: refused before alice's row went to p1; the transaction goes on,
+        // and its corrected commit writes alice once.
+        let id = begin_spanning(b).await;
+        let e = commit(id.clone(), vec![put_row("alice", "1"), bad_row("zed")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        commit(id.clone(), vec![put_row("alice", "1"), put_row("zed", "1")])
+            .await
+            .unwrap();
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+        // A bad row for the second branch (p2), after p1 took its rows: the transaction
+        // ends, its retry answers that outcome, and p1's row is never committed.
+        let id = begin_spanning(b).await;
+        let e = commit(id.clone(), vec![put_row("bob", "1"), bad_row("hank")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        let e = commit(id.clone(), vec![put_row("bob", "1"), put_row("hank", "1")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "the recorded outcome: {e}");
+        assert_eq!(get_row(c, "bob").await.unwrap(), None);
+        assert_eq!(get_row(c, "hank").await.unwrap(), None);
+        // p1's branch was aborted: bob takes a plain write at once.
+        put(c, "bob", "2").await;
+    });
+}

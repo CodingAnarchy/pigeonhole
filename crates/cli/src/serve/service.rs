@@ -4498,7 +4498,7 @@ impl Service {
     /// and decoded (`convert::txn_ops`), all before the transaction is taken out. So a missing
     /// table or a malformed write fails the call with nothing buffered (simp724's T1 on
     /// #1511), and buffering the rest can't fail on the server's side.
-    async fn txn_rows<'r>(
+    pub(crate) async fn txn_rows<'r>(
         &self,
         rows: &'r [proto::RowWrites],
     ) -> Result<Vec<(Table, &'r [u8], Vec<convert::TxnOp<'r>>)>, ApiError> {
@@ -4685,6 +4685,52 @@ impl Service {
         })
     }
 
+    /// Buffers decoded `rows` ([`txn_rows`](Self::txn_rows)) in the transaction `g` holds:
+    /// it can't fail (D329's coordinator buffers a spanning call's home rows on the session
+    /// it already holds).
+    pub(crate) fn buffer_rows(
+        g: &mut super::sessions::TxnGuard,
+        rows: &[(Table, &[u8], Vec<convert::TxnOp<'_>>)],
+    ) {
+        for (table, row, ops) in rows {
+            convert::txn_apply(g.txn(), table, row, ops);
+        }
+        if !rows.is_empty() {
+            g.wrote_now();
+        }
+    }
+
+    /// Whether the partition takes writes now (its gate admits one): what a spanning call
+    /// checks before its first row goes to a branch.
+    pub(crate) fn writable(&self) -> Result<(), ApiError> {
+        match &self.gate {
+            Some(gate) => gate.enter().map(drop),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends spanning transaction `g` after a call that sent rows to a branch failed (D329,
+    /// audit120's M3b on #2062): its branches are aborted (in the background, on their own
+    /// budget), and `err` becomes the session's recorded outcome, so a retry finds the
+    /// transaction ended rather than applying those rows again. Returns `err`.
+    pub(crate) fn end_spanning(
+        mut g: super::sessions::TxnGuard,
+        err: ApiError,
+        driver: &super::cluster::spanning::Driver,
+    ) -> ApiError {
+        use super::cluster::spanning::SpanView;
+        if let Some(span) = g.span() {
+            let mut branches = span.branches(&driver.home);
+            branches.extend(span.idle(&driver.home));
+            let d = driver.for_round();
+            tokio::spawn(async move { d.abort(&branches).await });
+        }
+        let (txn, _, ticket) = g.commit();
+        drop(txn);
+        ticket.finish(Err(err.clone()));
+        err
+    }
+
     /// Takes transaction `id` for `caller`'s call (D329's coordinator: a spanning
     /// transaction's home session, with its span).
     pub(crate) fn take_txn(&self, id: &str, caller: &Caller) -> Result<Taken, ApiError> {
@@ -4836,6 +4882,7 @@ impl Service {
         caller: &Caller,
         budget: OwnedSemaphorePermit,
         driver: super::cluster::spanning::Driver,
+        forwarded: bool,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
         use super::cluster::spanning::SpanView;
         let gate = Arc::clone(
@@ -4849,12 +4896,28 @@ impl Service {
             .cloned()
             .ok_or_else(|| ApiError::internal("a spanning id on a plain session"))?;
         let writes = span.wrote() || !r.rows.is_empty() || g.wrote();
+        // The coordinator checked these before the commit's rows went to branches; if one
+        // fails now anyway (a table dropped in between), a commit that sent rows ends the
+        // transaction rather than leave them applied for a retry (audit120's M3b).
+        let refuse = |g, e: ApiError| {
+            if forwarded {
+                Err(Self::end_spanning(g, e, &driver))
+            } else {
+                Err(e)
+            }
+        };
         if writes && !caller.scope.allows(Scope::Write) {
-            return Err(ApiError::permission_denied("commit writes"));
+            return refuse(g, ApiError::permission_denied("commit writes"));
         }
-        let rows = self.txn_rows(&r.rows).await?;
+        let rows = match self.txn_rows(&r.rows).await {
+            Ok(rows) => rows,
+            Err(e) => return refuse(g, e),
+        };
         let decisions = if writes {
-            Some(self.decisions_table().await?)
+            match self.decisions_table().await {
+                Ok(t) => Some(t),
+                Err(e) => return refuse(g, e),
+            }
         } else {
             None
         };
@@ -4871,9 +4934,11 @@ impl Service {
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             // Branches opened that did nothing aren't prepared (they'd refuse): their
-            // sessions end (audit120's S3).
+            // sessions end (audit120's S3), beside the round, not before it (a silent node
+            // there mustn't spend the client's deadline).
             if !idle.is_empty() {
-                driver.for_round().abort(&idle).await;
+                let d = driver.for_round();
+                tokio::spawn(async move { d.abort(&idle).await });
             }
             let outcome = match decisions {
                 Some(decisions) => {
@@ -4901,7 +4966,7 @@ impl Service {
     /// The home's decision table (D329). Created through the gate if it's missing (a write
     /// to the file: never past a fence's drain), the first time a spanning transaction
     /// begins on the partition.
-    async fn decisions_table(&self) -> Result<Table, ApiError> {
+    pub(crate) async fn decisions_table(&self) -> Result<Table, ApiError> {
         use super::cluster::spanning::{DECISION_FAMILY, DECISIONS};
         let db = self.part()?.db.clone();
         if let Ok(t) = db.table(DECISIONS).and_then(|t| t.open()) {
