@@ -638,7 +638,8 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
   1. A map without ID in P's replicas (which closes the copy).
   2. The stamp with `promote`.
   3. The map with P on ID at the epoch + 1 and a new history.
-  4. The report: `applied_seqno`, `owner_durable_seqno` and `lost_commits` ("unknown" with `--old-unreachable`).
+  4. A wait until ID serves P at that epoch, as a move's (`--timeout` bounds it; #2035).
+  5. The report: `applied_seqno`, `owner_durable_seqno` and `lost_commits` ("unknown" with `--old-unreachable`).
 - **A rerun** finishes from the closed or stamped copy, if the map still has P where the stopped run left it. Once the map has moved on (a set-map, relocate or promote since), the stamp refuses a file that's already a primary, rather than stamp it over what P took since: the operator moves it aside.
 - **Not in 1.3.0:** making the old owner a replica automatically (the owner's #1484 call: the operator rejoins it).
 - **`Admin.Promote` on a cluster node** answers `FailedPrecondition`, naming `phdb cluster promote`.
