@@ -41,6 +41,7 @@ use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
 mod tablets;
+pub(crate) use tablets::shared_bytes;
 
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
@@ -462,7 +463,12 @@ fn new_memtable(
 /// (`open_writer_inner`) overrides its own fields. A new field whose writer value differs
 /// from a reader's must be added to that override list too.
 pub(crate) struct Shared {
+    /// The database's VFS: for opens and file-system calls. On a writer it's the device-byte
+    /// counting wrapper (D332), so read the clock through [`Shared::clock_vfs`].
     pub vfs: VfsRef,
+    /// The same backend unwrapped, for clock reads (`monotonic_nanos`, `now_micros`): they
+    /// run on every commit, and through the wrapper each cost an extra call (#2063).
+    pub clock_vfs: VfsRef,
     pub shm: ShmRegion,
     /// When the writer next frees the slots of reader processes that are gone (monotonic
     /// nanoseconds; [`Shared::reclaim_dead_readers`], #833).
@@ -574,6 +580,12 @@ pub(crate) struct Shared {
     pub flushed_through: Vec<Padded>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
+    /// Per shard, each tablet's write load as of its last balancer pass (D332, ICR 0142): the
+    /// tablet and its moving average of rows written per interval. Stored whole by the
+    /// owning shard (`ArcSwap`), loaded by [`Engine::tablets`](crate::Engine::tablets).
+    pub tablet_loads: Vec<ArcSwap<Vec<(TabletId, f64)>>>,
+    /// The database's device bytes (D332): every file it opens counts into it.
+    pub io: Arc<pigeonhole_io::IoCounters>,
     pub balance: BalanceConfig,
     /// Bytes of a shared-memory view buffer (a split that would outgrow it is refused, D28).
     pub view_capacity: usize,
@@ -695,7 +707,7 @@ impl Shared {
         let Some(file) = &self.lock_file else {
             return;
         };
-        let now = self.vfs.monotonic_nanos();
+        let now = self.clock_vfs.monotonic_nanos();
         let at = self.reader_reclaim_at.load(Ordering::Relaxed);
         if now >= at
             && self
@@ -5613,7 +5625,7 @@ impl ShardState {
                     let state = TimerState::new();
                     self.flush_retry = Some(Arc::clone(&state));
                     ctx.spawn(Box::new(ClockTimer::new(
-                        &self.shared.vfs,
+                        &self.shared.clock_vfs,
                         ctx.now_nanos().saturating_add(backoff_nanos(
                             self.shared.flush_backoff_nanos,
                             FLUSH_BACKOFF_CAP,
@@ -5863,7 +5875,7 @@ impl ShardState {
         let state = TimerState::new();
         self.feed_sync_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             ctx.now_nanos().saturating_add(feed.sync_interval_nanos),
             state,
             ctx.submitter(self.id).clone(),
@@ -5944,7 +5956,7 @@ impl ShardState {
         let state = TimerState::new();
         self.feed_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             ctx.now_nanos().saturating_add(feed.flush_interval_nanos),
             state,
             ctx.submitter(self.id).clone(),
@@ -6082,7 +6094,7 @@ impl ShardState {
     fn reserve_stamps(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let (first, t0) = self.shared.clock.reserve_group(
             n,
             k,
@@ -6178,7 +6190,7 @@ impl ShardState {
         if sources.is_empty() {
             return Ok(None);
         }
-        let mut opts = ResolveOptions::new(u64::MAX, self.shared.vfs.now_micros());
+        let mut opts = ResolveOptions::new(u64::MAX, self.shared.clock_vfs.now_micros());
         opts.ttl_micros = meta.options.ttl_micros;
         opts.versions = 1;
         opts.merge = meta.merge_op.clone();
@@ -6274,7 +6286,7 @@ impl ShardState {
         out: &CheckSlot,
     ) -> Result<bool> {
         let (family, qualifier) = predicate_column(predicate);
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let cell = self.read_before::<true>(table, family, row, qualifier, u64::MAX, now)?;
         let holds = match predicate {
             Predicate::Exists { .. } => cell.is_some(),
@@ -7402,7 +7414,7 @@ impl ShardState {
             self.stall.timer = Some(Arc::clone(&state));
             let due = self.stall.arm(now, rate);
             ctx.spawn(Box::new(ClockTimer::new(
-                &self.shared.vfs,
+                &self.shared.clock_vfs,
                 due,
                 state,
                 ctx.submitter(self.id).clone(),
@@ -10100,7 +10112,7 @@ impl ShardState {
     /// seqno from readers until the last participant applied (D278), or the coordinator
     /// releases it after an abort (`on_applied`).
     fn decide_commit(&mut self) -> (Seqno, Timestamp) {
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, &self.shared.shm);
         self.note_stamped(commit_ts);
         (apply_seqno, commit_ts)
@@ -11392,7 +11404,7 @@ impl ShardState {
         let state = TimerState::new();
         self.checkpoint_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             ctx.now_nanos().saturating_add(backoff_nanos(
                 self.shared.compaction_backoff_nanos,
                 COMPACTION_BACKOFF_CAP,
@@ -11459,7 +11471,7 @@ impl ShardState {
         if let Some(wal) = self.wal.as_mut()
             && !self.poisoned
         {
-            wal.trim_retained(self.shared.vfs.now_micros(), feed.age_micros);
+            wal.trim_retained(self.shared.clock_vfs.now_micros(), feed.age_micros);
         }
         let stream = usize::from(self.id.0);
         if let Some(marks) = feed.marks(stream) {
@@ -11477,7 +11489,7 @@ impl ShardState {
         }
         self.feed_maintain();
         let view = self.shared.view.load_full();
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         // The write stall's score: the highest L0 depth over its trigger among the slots.
         let mut score = 0.0f64;
         // Slots that need a compaction, most urgent first.
@@ -11782,7 +11794,7 @@ impl ShardState {
         let state = TimerState::new();
         self.backoff_timer = Some((Arc::clone(&state), deadline));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             deadline,
             state,
             ctx.submitter(self.id).clone(),
@@ -11890,7 +11902,7 @@ impl ShardState {
             })
         });
         let mem_min_ts = mem_min_ts.min(self.prepared_min_ts(key.1));
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let mut gc = compact::gc_policy(
             &self.shared,
             fam,

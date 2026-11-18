@@ -1272,7 +1272,7 @@ impl Txn {
                 },
             );
         }
-        let now = self.engine.shared.vfs.now_micros();
+        let now = self.engine.shared.clock_vfs.now_micros();
         self.snapshot.checked(crate::read::read_row_into(
             &self.snapshot.view,
             self.snapshot.seqno,

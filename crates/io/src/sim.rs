@@ -280,6 +280,8 @@ struct SimState {
     next_node: u64,
     next_handle: u64,
     bytes_written: u64,
+    /// Bytes read by every file, as asked for (D332's check of the engine's counting).
+    bytes_read: u64,
     ops: u64,
     /// Scheduled faults (`FaultPlan::fail_on`) fired so far.
     scheduled_fired: u64,
@@ -610,6 +612,7 @@ impl SimVfs {
                 next_node: 1,
                 next_handle: 1,
                 bytes_written: 0,
+                bytes_read: 0,
                 ops: 0,
                 scheduled_fired: 0,
                 scheduled_fired_outside: 0,
@@ -860,6 +863,15 @@ impl SimVfs {
         self.state().shm.len()
     }
 
+    /// Bytes every file of this VFS has read and written since it was made, as each read
+    /// and write asked (a read past the end, or one that failed after its checks, counted in
+    /// full): what a database's device-byte counters (D332) must match when it's the only
+    /// user.
+    pub fn bytes_moved(&self) -> (u64, u64) {
+        let st = self.state();
+        (st.bytes_read, st.bytes_written)
+    }
+
     /// Deferred operations in flight.
     pub fn io_in_flight(&self) -> usize {
         self.state().in_flight.len()
@@ -1074,6 +1086,7 @@ impl SimVfs {
             writable,
             direct: false,
             owner: false,
+            counts: crate::count::FileCounts::default(),
         };
         job(&file);
         let mut st = self.state();
@@ -1165,6 +1178,9 @@ struct SimFile {
     /// Whether dropping this closes the handle (`false` for the view a deferred operation
     /// runs on).
     owner: bool,
+    /// Its device bytes' counters, once given (D332): counted at the trait's entry points,
+    /// never by the uncounted bodies (`read_raw`, `write_raw`) an operation runs.
+    counts: crate::count::FileCounts,
 }
 
 impl fmt::Debug for SimFile {
@@ -1267,17 +1283,16 @@ impl SimFile {
     }
 }
 
-impl File for SimFile {
-    fn direct_align(&self) -> Option<usize> {
-        self.direct.then_some(SIM_DIRECT_ALIGN)
-    }
-
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+impl SimFile {
+    /// [`File::read_at`]'s body, uncounted: what an operation runs (D332 counts at the
+    /// trait's entry points, so a submitted read counts once).
+    fn read_raw(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         self.with(|st| {
             if buf.is_empty() {
                 return Ok(());
             }
+            st.bytes_read += buf.len() as u64;
             st.inject("read: injected I/O error")?;
             let data = &st.node(self.node).data;
             let end = offset.checked_add(buf.len() as u64);
@@ -1291,7 +1306,8 @@ impl File for SimFile {
         })
     }
 
-    fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+    /// [`File::write_at`]'s body, uncounted (as [`SimFile::read_raw`]).
+    fn write_raw(&self, buf: &[u8], offset: u64) -> Result<()> {
         self.check_writable("write: file not opened for writing")?;
         self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         self.with(|st| {
@@ -1329,22 +1345,45 @@ impl File for SimFile {
             Ok(())
         })
     }
+}
 
+impl File for SimFile {
+    fn direct_align(&self) -> Option<usize> {
+        self.direct.then_some(SIM_DIRECT_ALIGN)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.counts.read(buf.len());
+        self.read_raw(buf, offset)
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        self.counts.written(buf.len());
+        self.write_raw(buf, offset)
+    }
+
+    fn count_into(&self, counters: std::sync::Arc<crate::IoCounters>) {
+        self.counts.set(counters);
+    }
+
+    // `submit_reads_ahead` takes the default, which goes through `submit_read`: counted once.
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
+        self.counts.read(buf.len());
         if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
         self.vfs.submit(self, false, false, move |f| {
-            f.read_at(&mut buf, offset).map(|()| buf)
+            f.read_raw(&mut buf, offset).map(|()| buf)
         })
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        self.counts.written(buf.len());
         if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
         self.vfs.submit(self, true, false, move |f| {
-            f.write_at(&buf, offset).map(|()| buf)
+            f.write_raw(&buf, offset).map(|()| buf)
         })
     }
 
@@ -1502,6 +1541,7 @@ impl Vfs for SimVfs {
             writable: opts.write || opts.create || opts.create_new,
             direct: opts.direct,
             owner: true,
+            counts: crate::count::FileCounts::default(),
         }))
     }
 

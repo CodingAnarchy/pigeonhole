@@ -20,6 +20,7 @@ pub(crate) mod hub;
 pub(crate) mod identity;
 mod indexfan;
 pub(crate) mod lease;
+pub(crate) mod load;
 pub(crate) mod map;
 mod memfan;
 pub(crate) mod memwatch;
@@ -321,6 +322,11 @@ struct Peers {
     /// `--cluster-failover-after-ms` (D330): the margin a writer goes without its lease
     /// before an election, 2·L by default.
     failover_after: Duration,
+    /// `--balance-window` (D332): the load averages' and the device ceiling's window.
+    balance_window: Duration,
+    /// How often a partition's load averages take a reading ([`load::INTERVAL`]; shorter in
+    /// tests).
+    load_interval: Duration,
 }
 
 /// A cluster node.
@@ -395,6 +401,11 @@ pub(crate) struct Node {
     /// When this node first found an election due ([`Node::maybe_elect`]): it waits a margin
     /// per smaller live id from there.
     elect_since: Mutex<Option<tokio::time::Instant>>,
+    /// The node's device ceiling (D332): the highest one-second rate of its partitions'
+    /// device bytes within `--balance-window`, fed by [`Node::watch_device`].
+    device_ceiling: load::DeviceCeiling,
+    /// Whether [`Node::watch_device`]'s loop runs.
+    watching_device: std::sync::atomic::AtomicBool,
 }
 
 /// How long a node change's `SetMap` goes on pushing it, in push timeouts, for a majority of
@@ -466,7 +477,10 @@ impl Node {
             .as_ref()
             .map(|(m, _)| Arc::new(route::Routes::new(m)));
         let grants = lease::Grants::new(Arc::default(), peers.lease).with_voted(voted);
+        let device_ceiling = load::DeviceCeiling::new(peers.balance_window);
         Arc::new_cyclic(|me| Self {
+            device_ceiling,
+            watching_device: std::sync::atomic::AtomicBool::new(false),
             grants,
             joint_seen: Mutex::new(None),
             writer_lease: Mutex::new((0, 0)),
@@ -1440,6 +1454,11 @@ impl Node {
                 // its lease.
                 lp.awaiting_peers = self.awaiting_peers(&id);
                 lp.lease_remaining_ms = millis(self.lease_remaining(&id));
+                // D332: its load, folded now if an interval has ended.
+                if let Some(part) = open.get(&id) {
+                    let l = self.partition_load(part);
+                    (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
+                }
             }
         }
         let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
@@ -2388,6 +2407,8 @@ pub(crate) fn run(
                 0 => args.cluster_lease_ms.saturating_mul(2),
                 ms => ms,
             }),
+            balance_window: Duration::from_secs(args.balance_window),
+            load_interval: load::INTERVAL,
         },
         state,
         voted,

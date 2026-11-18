@@ -52,6 +52,8 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             push_timeout: Duration::from_millis(500),
             lease: TEST_LEASE,
             failover_after: TEST_LEASE * 2,
+            balance_window: Duration::from_secs(300),
+            load_interval: Duration::from_millis(500),
         },
         state,
         super::read_voted(dir).unwrap(),
@@ -1977,6 +1979,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-push-timeout-ms",
         "cluster-lease-ms",
         "cluster-failover-after-ms",
+        "balance-window",
         "tls-key",
         "tls-cert",
     ];
@@ -2265,6 +2268,55 @@ async fn get_at(port: u16, row: &str, snapshot: &str) -> Result<Option<Vec<u8>>,
         })
         .await?;
     Ok(reply.into_inner().cell.map(|c| c.value.to_vec()))
+}
+
+#[test]
+fn status_reports_each_partitions_load_and_a_read_only_partitions_sampled_cpu() {
+    // D332 (simp724's S5 and M1 on #2063): Status fills `load_*`. Writes to p1 count as its
+    // shards' busy time; ReadRows of p2, which never run on a shard, count from their
+    // sampled CPU on the read pools, where their work runs.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, b) = (ports[0], ports[1]);
+    let row_of = async |port: u16, p: &str| {
+        client(port)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == p)
+            .unwrap()
+    };
+    rt.block_on(async {
+        put(a, "hank", "v").await;
+        // The first reading of each partition's interval.
+        assert_eq!(row_of(a, "p1").await.load, 0.0);
+        assert_eq!(row_of(b, "p2").await.load, 0.0);
+        for i in 0..300 {
+            put(a, &format!("a{i:03}"), "v").await;
+        }
+        let mut c = data(b).await;
+        for _ in 0..(16 * 100) {
+            c.read_row(super::proto::ReadRowRequest {
+                table: "users".into(),
+                row: b"hank".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        eventually("p1's and p2's loads", async || {
+            let (p1, p2) = (row_of(a, "p1").await, row_of(b, "p2").await);
+            p1.load_cpu > 0.0
+                && p2.load_cpu > 0.0
+                && p1.load == p1.load_cpu.max(p1.load_device)
+                && p2.load == p2.load_cpu.max(p2.load_device)
+        })
+        .await;
+    });
 }
 
 async fn put(port: u16, row: &str, value: &str) {

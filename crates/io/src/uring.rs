@@ -329,6 +329,7 @@ impl Vfs for UringVfs {
         Ok(Arc::new(UringFile {
             file: self.files.open_file(path, opts)?,
             ring: Arc::clone(&self.ring),
+            counts: crate::count::FileCounts::default(),
         }))
     }
 
@@ -359,6 +360,7 @@ impl Vfs for UringVfs {
             Ok(file) => UringFile {
                 file,
                 ring: Arc::clone(&self.ring),
+                counts: crate::count::FileCounts::default(),
             }
             .submit_sync_all(),
             Err(_) => Completion::ready(self.files.sync_dir(dir)),
@@ -396,6 +398,9 @@ impl Vfs for UringVfs {
 struct UringFile {
     file: Arc<PreadFile>,
     ring: Arc<RingHandle>,
+    /// Its device bytes' counters, once given (D332). Counted here only: `file`, the pread
+    /// handle it submits through, never gets any, so nothing counts twice.
+    counts: crate::count::FileCounts,
 }
 
 impl fmt::Debug for UringFile {
@@ -523,14 +528,21 @@ impl File for UringFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.counts.read(buf.len());
         self.file.read_at(buf, offset)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        self.counts.written(buf.len());
         self.file.write_at(buf, offset)
     }
 
+    fn count_into(&self, counters: Arc<crate::IoCounters>) {
+        self.counts.set(counters);
+    }
+
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
+        self.counts.read(buf.len());
         if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
@@ -556,6 +568,8 @@ impl File for UringFile {
     /// `uring_lock` that every submitter queues on (#974). A thread that runs its I/O inline
     /// reads each in turn.
     fn submit_reads_ahead(&self, reads: Vec<(IoBuf, u64)>) -> Vec<Completion> {
+        // Counted here, all at once: it doesn't go through `submit_read`.
+        self.counts.read(reads.iter().map(|(b, _)| b.len()).sum());
         if self.inline_here() {
             return reads
                 .into_iter()
@@ -611,6 +625,7 @@ impl File for UringFile {
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        self.counts.written(buf.len());
         if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }

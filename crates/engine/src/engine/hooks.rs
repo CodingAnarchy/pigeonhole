@@ -1020,7 +1020,7 @@ impl Engine {
     /// moves leave a claimed shard alone.
     #[doc(hidden)]
     pub fn claim_shard(&self, shard: usize, passes: u64) -> bool {
-        let now = self.inner.shared.vfs.monotonic_nanos();
+        let now = self.inner.shared.clock_vfs.monotonic_nanos();
         self.inner.shared.loads[shard].claim(passes, u64::MAX, now)
     }
 
@@ -1028,7 +1028,7 @@ impl Engine {
     /// change that waits on a compaction claims nothing.
     #[doc(hidden)]
     pub fn shard_claimed(&self, shard: usize) -> bool {
-        let now = self.inner.shared.vfs.monotonic_nanos();
+        let now = self.inner.shared.clock_vfs.monotonic_nanos();
         !self.inner.shared.loads[shard].claimable(now)
     }
 

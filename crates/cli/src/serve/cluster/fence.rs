@@ -1113,6 +1113,8 @@ impl Node {
     /// One loop per node, started once its partitions are open; it holds the node only
     /// while a round runs, and ends once the node is gone.
     pub(crate) fn renew_leases(self: &Arc<Self>) {
+        // The node's device ceiling's readings start with its lease renewals (D332).
+        self.watch_device();
         if self
             .fences
             .retrying
