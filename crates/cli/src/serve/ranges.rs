@@ -464,6 +464,38 @@ impl RangeState {
 }
 
 impl RangeState {
+    /// Whether every key of `table` is in a range this partition moved away (feed1248's M3
+    /// on PR 3b): its `Moved` spans cover the table from its first key on, unbroken.
+    pub(crate) fn moved_whole(&self, table: &str) -> bool {
+        let mut spans: Vec<&Span> = self
+            .spans
+            .iter()
+            .filter(|s| s.rule == Rule::Moved && s.table == table)
+            .collect();
+        spans.sort_by(|a, b| a.start.cmp(&b.start));
+        let mut reached: Vec<u8> = Vec::new();
+        for s in spans {
+            if s.start > reached {
+                return false;
+            }
+            match &s.end {
+                None => return true,
+                Some(e) if *e > reached => reached = e.clone(),
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a move into this partition still withholds a range of `table` (its target,
+    /// before CLEANING or before its serving row is here): a resume that gained the
+    /// partition asks again shortly rather than expiring (cli692's M1 on PR 3b).
+    pub(crate) fn awaits_hand_over(&self, table: &str) -> bool {
+        self.spans
+            .iter()
+            .any(|s| s.rule == Rule::Unserved && s.table == table)
+    }
+
     /// Whether it fences move `id`'s range.
     pub(crate) fn fences(&self, id: &str) -> bool {
         self.spans
@@ -484,9 +516,10 @@ pub(crate) struct RangeGate {
     pending: std::sync::atomic::AtomicBool,
     /// The visible seqno of the file when its rows here were read ([`load_rows_at`]).
     rows_at: std::sync::atomic::AtomicU64,
-    /// Bumped whenever the serving rows change (PR 3b): a running cluster component of the
-    /// partition looks for a new hand-over's barrier when it moves.
-    serving_version: std::sync::atomic::AtomicU64,
+    /// Bumped whenever the serving or moved-away rows or the state change (PR 3b): a running
+    /// cluster component of the partition looks for a new hand-over's barrier, or for its
+    /// tables having moved away whole (feed1248's M3 on PR 3b), when it moves.
+    rows_version: std::sync::atomic::AtomicU64,
 }
 
 impl RangeGate {
@@ -506,7 +539,7 @@ impl RangeGate {
     pub(crate) fn load_rows(&self, moved: Vec<Moved>, serving: Vec<Moved>) {
         *self.moved() = moved;
         *self.serving() = serving;
-        self.serving_version
+        self.rows_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
@@ -528,7 +561,7 @@ impl RangeGate {
         *m = moved;
         *self.serving() = serving;
         self.rows_at.store(visible, Ordering::Release);
-        self.serving_version.fetch_add(1, Ordering::Release);
+        self.rows_version.fetch_add(1, Ordering::Release);
         true
     }
 
@@ -541,15 +574,14 @@ impl RangeGate {
         let mut serving = self.serving();
         serving.retain(|m| m.id != row.id);
         serving.push(row);
-        self.serving_version
+        self.rows_version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    /// The serving rows' version ([`serving_version`]): one load.
+    /// The rows' and state's version ([`rows_version`]): one load.
     #[inline]
-    pub(crate) fn serving_version(&self) -> u64 {
-        self.serving_version
-            .load(std::sync::atomic::Ordering::Acquire)
+    pub(crate) fn rows_version(&self) -> u64 {
+        self.rows_version.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The moved-away rows the file holds, for a cluster component of a table moved away
@@ -573,6 +605,8 @@ impl RangeGate {
         let mut moved = self.moved();
         moved.retain(|m| m.id != row.id);
         moved.push(row);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether the file already records move `id`'s hand-over.
@@ -595,6 +629,8 @@ impl RangeGate {
         self.state.store(next.map(Arc::new));
         self.pending
             .store(pending, std::sync::atomic::Ordering::Release);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether the state waits for a row the file doesn't hold yet (see `pending`).

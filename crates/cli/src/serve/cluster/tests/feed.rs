@@ -2230,6 +2230,11 @@ async fn subscribe_when_leased(port: u16, req: SubscribeRequest) -> tonic::Strea
 /// Table `orders` on p1 alone, through the writer at `port`, retried while a node that just
 /// started is still taking its peers' maps.
 async fn orders_on_p1(port: u16) {
+    table_on(port, "orders", "p1").await;
+}
+
+/// Table `name` on `partition` alone, as [`orders_on_p1`].
+async fn table_on(port: u16, name: &str, partition: &str) {
     use crate::serve::proto::{
         CreateTableRequest, FamilySpec, TablePlacementRequest, schema_client::SchemaClient,
     };
@@ -2241,7 +2246,7 @@ async fn orders_on_p1(port: u16) {
             .unwrap();
         SchemaClient::new(channel)
             .create_table(CreateTableRequest {
-                name: "orders".into(),
+                name: name.into(),
                 families: vec![FamilySpec {
                     name: "f".into(),
                     ..Default::default()
@@ -2250,7 +2255,7 @@ async fn orders_on_p1(port: u16) {
                 placement: Some(TablePlacementRequest {
                     group: String::new(),
                     splits: Vec::new(),
-                    partitions: vec!["p1".into()],
+                    partitions: vec![partition.into()],
                 }),
             })
             .await
@@ -2261,10 +2266,15 @@ async fn orders_on_p1(port: u16) {
 
 /// Puts `row` of `orders` through `port`, retried until it's taken: its commit's seqno.
 async fn put_order(port: u16, row: &str) -> u64 {
+    put_in(port, "orders", row).await
+}
+
+/// Puts `row` of `table` through `port`, as [`put_order`].
+async fn put_in(port: u16, table: &str, row: &str) -> u64 {
     let mut out = 0;
-    eventually("an order to be written", async || {
+    eventually("a row to be written", async || {
         let mut w = put_row(row, "v");
-        w.row.as_mut().unwrap().table = "orders".into();
+        w.row.as_mut().unwrap().table = table.into();
         match data(port)
             .await
             .mutate(MutateRequest {
@@ -2287,6 +2297,22 @@ async fn put_order(port: u16, row: &str) -> u64 {
 /// Takes `orders` `[start, ..)` from p1 to p2 through every phase (pushed to every node),
 /// with the move's last seqno `final_seqno`, ending at CLEANING.
 async fn move_orders(ports: &[u16], start: &str, final_seqno: u64) {
+    move_orders_to(
+        ports,
+        start,
+        final_seqno,
+        crate::serve::proto::MovePhase::Cleaning,
+    )
+    .await;
+}
+
+/// [`move_orders`] up to phase `last`.
+async fn move_orders_to(
+    ports: &[u16],
+    start: &str,
+    final_seqno: u64,
+    last: crate::serve::proto::MovePhase,
+) {
     use crate::serve::proto::{GetMapRequest, MoveKind, MovePhase, PushMapRequest, RangeMove};
     let base = client(ports[0])
         .await
@@ -2301,7 +2327,10 @@ async fn move_orders(ports: &[u16], start: &str, final_seqno: u64) {
         MovePhase::HandingOver,
         MovePhase::HandedOver,
         MovePhase::Cleaning,
-    ] {
+    ]
+    .into_iter()
+    .filter(|p| *p <= last)
+    {
         version += 1;
         let mut m = base.clone();
         m.map_version = version;
@@ -2450,6 +2479,235 @@ fn a_token_from_before_a_whole_table_move_resumes_through_the_source_then_the_ta
                     .collect::<Vec<_>>(),
                 [("p1", "k2"), ("p2", "k3")]
             );
+            assert!(
+                !other
+                    .iter()
+                    .any(|e| matches!(e.event, Some(Event::MoveBarrier(_)))),
+                "a barrier reached the client"
+            );
+        });
+    });
+}
+
+/// D331 PR 3b (cli692's M1): between a move's HANDED_OVER and CLEANING the target serves none
+/// of the range yet and has no hand-over position: a subscription isn't rerouted then, and a
+/// resume that would gain the target is refused retry-safe (`PartitionUnavailable`), not
+/// expired. From CLEANING the subscription is rerouted, and its resume reads the target.
+#[test]
+fn between_the_hand_over_and_cleaning_a_resume_waits_rather_than_expiring() {
+    use crate::serve::proto::{GetMapRequest, MovePhase, PushMapRequest};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let req = |start| SubscribeRequest {
+                tables: vec!["orders".into()],
+                checkpoint_every: 1,
+                start,
+                ..Default::default()
+            };
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            let last = put_order(c, "a1").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            let token = seen[0].token.clone().unwrap();
+            move_orders_to(&ports, "m", last, MovePhase::HandedOver).await;
+            // Not rerouted: nothing ends it within a while.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1500), s.message())
+                    .await
+                    .is_err(),
+                "rerouted before CLEANING"
+            );
+            // A resume gaining p2 now asks again, retry-safe.
+            let e = subscribe(c, req(Some(Start::Resume(token.clone()))))
+                .await
+                .err()
+                .expect("refused before CLEANING");
+            assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+            // CLEANING: rerouted, and the resume reads p2.
+            let m = client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let mut cleaning = m.clone();
+            cleaning.map_version += 1;
+            cleaning.moves[0].phase = MovePhase::Cleaning as i32;
+            for port in &ports {
+                client(*port)
+                    .await
+                    .push_map(PushMapRequest {
+                        map: Some(cleaning.clone()),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let end = loop {
+                match tokio::time::timeout(Duration::from_secs(20), s.message())
+                    .await
+                    .expect("the merge notices CLEANING")
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("ended without an error"),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(code(&end), "FeedRerouted", "{end}");
+            put_order(c, "zz").await;
+            let mut r = subscribe_when_leased(c, req(Some(Start::Resume(token)))).await;
+            let (seen, _) = commits(&mut r, 1).await;
+            assert_eq!(seen[0].partition, "p2", "{seen:?}");
+        });
+    });
+}
+
+/// D331 PR 3b (feed1248's M1): a token from before a move took all of `orders` off p1, of a
+/// subscription of `orders` and `items` (on `items_on`), resumes with nothing lost and
+/// nothing expired. With `items` on p1 too, p1's part reads `orders` up to the move's last
+/// seqno beside `items`; on another partition, p1 leaves `items` out rather than refusing.
+fn whole_table_move_beside_another_table(items_on: &str) {
+    let items_on = items_on.to_owned();
+    bounded(Duration::from_secs(180), move || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            table_on(a, "items", &items_on).await;
+            let req = |start| SubscribeRequest {
+                tables: vec!["items".into(), "orders".into()],
+                checkpoint_every: 1,
+                start,
+                ..Default::default()
+            };
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            put_in(c, "items", "i1").await;
+            let (first, _) = commits(&mut s, 1).await;
+            let token = first[0].token.clone().unwrap();
+            drop(s);
+            let last = put_order(c, "k2").await;
+            move_orders(&ports, "", last).await;
+            put_order(c, "k3").await;
+            let mut r = subscribe_when_leased(c, req(Some(Start::Resume(token)))).await;
+            let (seen, other) = commits(&mut r, 2).await;
+            assert_eq!(
+                seen.iter()
+                    .map(|s| (s.partition.as_str(), s.rows[0].as_str()))
+                    .collect::<Vec<_>>(),
+                [("p1", "k2"), ("p2", "k3")]
+            );
+            assert!(
+                !other
+                    .iter()
+                    .any(|e| matches!(e.event, Some(Event::MoveBarrier(_)))),
+                "a barrier reached the client"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_resume_across_a_whole_table_move_reads_the_moved_table_beside_one_that_stays() {
+    whole_table_move_beside_another_table("p1");
+}
+
+#[test]
+fn a_resume_across_a_whole_table_move_leaves_out_a_table_never_on_the_source() {
+    whole_table_move_beside_another_table("p2");
+}
+
+/// D331 PR 3b (feed1248's M3): a subscription connected across a move of all of `orders`
+/// off p1 retires p1's part once it has read up to the move's last seqno, with no
+/// reconnect: its checkpoints leave p1 out, so a resume from them never needs p1's
+/// moved-away row (which PR 5 prunes). At CLEANING it's rerouted, and the resume reads p2.
+#[test]
+fn a_subscription_connected_across_a_whole_table_move_retires_the_source_part() {
+    use crate::serve::cluster::token::ClusterToken;
+    use crate::serve::proto::{GetMapRequest, MovePhase, PushMapRequest};
+    bounded(Duration::from_secs(180), || {
+        let t = Three::start();
+        let ports = t.ports.clone();
+        let (a, c) = (ports[0], ports[2]);
+        t.rt.block_on(async {
+            orders_on_p1(a).await;
+            let req = |start| SubscribeRequest {
+                tables: vec!["orders".into()],
+                checkpoint_every: 1,
+                start,
+                ..Default::default()
+            };
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            let last = put_order(c, "k1").await;
+            let (seen, _) = commits(&mut s, 1).await;
+            let mut token = seen[0].token.clone().unwrap();
+            move_orders_to(&ports, "", last, MovePhase::HandedOver).await;
+            // p1's part ends at its next event (quiet progress at the latest): a checkpoint
+            // without p1 follows.
+            let reads = |b: &Bytes| {
+                ClusterToken::decode(b)
+                    .unwrap()
+                    .components
+                    .iter()
+                    .any(|c| c.partition == "p1")
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while reads(&token) {
+                let e = tokio::time::timeout_at(deadline, s.message())
+                    .await
+                    .expect("p1's part retires")
+                    .unwrap()
+                    .expect("the stream stays open");
+                assert!(
+                    !matches!(e.event, Some(Event::MoveBarrier(_))),
+                    "a barrier reached the client"
+                );
+                if !e.token.is_empty() {
+                    token = e.token.clone();
+                }
+            }
+            // CLEANING: rerouted, and the resume reads p2 (no p1 in its token).
+            let m = client(a)
+                .await
+                .get_map(GetMapRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            let mut cleaning = m.clone();
+            cleaning.map_version += 1;
+            cleaning.moves[0].phase = MovePhase::Cleaning as i32;
+            for port in &ports {
+                client(*port)
+                    .await
+                    .push_map(PushMapRequest {
+                        map: Some(cleaning.clone()),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let end = loop {
+                match tokio::time::timeout(Duration::from_secs(20), s.message())
+                    .await
+                    .expect("the merge notices CLEANING")
+                {
+                    Ok(Some(e)) => {
+                        if !e.token.is_empty() {
+                            token = e.token.clone();
+                        }
+                    }
+                    Ok(None) => panic!("ended without an error"),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(code(&end), "FeedRerouted", "{end}");
+            assert!(!reads(&token), "the last checkpoint still reads p1");
+            put_order(c, "k3").await;
+            let mut r = subscribe_when_leased(c, req(Some(Start::Resume(token)))).await;
+            let (seen, other) = commits(&mut r, 1).await;
+            assert_eq!(seen[0].partition, "p2", "{seen:?}");
+            assert_eq!(seen[0].rows, ["k3"]);
             assert!(
                 !other
                     .iter()

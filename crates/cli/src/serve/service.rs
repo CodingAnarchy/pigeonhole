@@ -4800,6 +4800,20 @@ impl Service {
             .filter(|m| !m.token.is_empty() && tables.contains(&m.table))
             .collect();
         if from_hand_over {
+            // A move into this partition that hasn't reached CLEANING (or whose serving row
+            // isn't here yet) is no gap: it serves none of the range yet, so the resume asks
+            // again shortly (cli692's M1 on PR 3b). No move at all is one.
+            let handing = self
+                .gate
+                .as_ref()
+                .and_then(|g| g.ranges().load().as_ref().cloned())
+                .is_some_and(|s| tables.iter().any(|t| s.awaits_hand_over(t)));
+            if rows.is_empty() && handing {
+                return Err(ApiError::partition_unavailable(
+                    "this partition is taking a range of these tables over from another, \
+                     and doesn't serve it yet: resume again shortly",
+                ));
+            }
             let first = rows.iter().min_by_key(|m| m.seqno).ok_or_else(|| {
                 ApiError::from_code(
                     pigeonhole::ErrorCode::FeedExpired,

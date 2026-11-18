@@ -74,10 +74,6 @@ message FeedEvent {
   string partition = 5;
 }
 
-// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
-// which keeps the stream open; sent at the start for each partition unavailable then, and
-// on each change), or available again. Its commits are delivered, in order and once each,
-// when it comes back.
 // D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 message MoveBarrier {
   string move_id = 1;
@@ -88,6 +84,10 @@ message MoveBarrier {
   uint64 final_seqno = 3;
 }
 
+// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
+// which keeps the stream open; sent at the start for each partition unavailable then, and
+// on each change), or available again. Its commits are delivered, in order and once each,
+// when it comes back.
 message PartitionState {
   string partition = 1;
   bool available = 2;

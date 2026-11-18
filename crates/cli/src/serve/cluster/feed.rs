@@ -166,9 +166,19 @@ pub(crate) async fn subscribe(
     if let Some(S::Resume(bytes)) = &r.start
         && let Ok(t) = ClusterToken::decode(bytes)
     {
+        // Every subscription table, whatever the map now places there (feed1248's M1 on PR
+        // 3b): a table moved off it whole while another stays would otherwise go unread up
+        // to the move's last seqno. The partition keeps those it serves or holds a
+        // moved-away row of, and leaves out the rest ([`moved_end`]).
         for c in &t.components {
-            if !placed.contains_key(&c.partition) && routes.owner(&c.partition).is_some() {
-                placed.insert(c.partition.clone(), tables.clone());
+            if routes.owner(&c.partition).is_some() {
+                let on = placed.entry(c.partition.clone()).or_default();
+                for t in &tables {
+                    if !on.contains(t) {
+                        on.push(t.clone());
+                    }
+                }
+                on.sort();
             }
         }
     }
@@ -645,22 +655,37 @@ impl Merge {
             .collect();
         tables.sort_unstable();
         tables.dedup();
-        for t in tables {
-            let gained = routes
-                .partitions_of_table(t, &self.ctx.prefix)
-                .into_iter()
-                .flatten()
-                .find(|p| !self.parts.iter().any(|q| q.partition == *p));
-            if let Some(p) = gained {
-                return Some(ApiError::feed_rerouted(format!(
-                    "the cluster map (version {}) gave partition {p:?} a range of table {t:?}, \
-                     which this subscription doesn't read yet: resume from its last token, \
-                     which reads {p:?} from the range's hand-over on",
-                    routes.map_version()
-                )));
-            }
-        }
-        None
+        // A partition a move gives a range is counted only from the move's CLEANING on: it
+        // serves none of the range before, and only then has the hand-over position a
+        // resume starts it at (cli692's M1 on PR 3b). Read once a map version.
+        let moves = self.ctx.node.get_map().map(|m| m.moves).unwrap_or_default();
+        let handing = |table: &str, p: &str| {
+            moves.iter().any(|m| {
+                m.table == table
+                    && m.to == p
+                    && super::map::phase(m) < crate::serve::proto::MovePhase::Cleaning
+            })
+        };
+        let prefix = &self.ctx.prefix;
+        let (t, p) = gained(
+            &self.parts,
+            &tables,
+            |t| {
+                routes
+                    .partitions_of_table(t, prefix)
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect()
+            },
+            handing,
+        )?;
+        Some(ApiError::feed_rerouted(format!(
+            "the cluster map (version {}) gave partition {p:?} a range of table {t:?}, which \
+             this subscription doesn't read yet: resume from its last token, which reads \
+             {p:?} from the range's hand-over on",
+            routes.map_version()
+        )))
     }
 
     /// A checkpoint now, as its token's bytes.
@@ -976,6 +1001,24 @@ fn poll_parts(
     Poll::Pending
 }
 
+/// The first of `tables` with a partition (`partitions_of`) that no live part of `parts`
+/// reads and no move is still handing it (`handing`), and that partition: a merge that
+/// reroutes ([`Merge::rerouted`]). A retired part reads nothing more of its partition
+/// (feed1248's M2 on PR 3b), so a later move back to it is a gain too.
+fn gained<'t>(
+    parts: &[Part],
+    tables: &[&'t str],
+    partitions_of: impl Fn(&str) -> Vec<String>,
+    handing: impl Fn(&str, &str) -> bool,
+) -> Option<(&'t str, String)> {
+    tables.iter().find_map(|t| {
+        partitions_of(t)
+            .into_iter()
+            .find(|p| !parts.iter().any(|q| q.partition == *p && !q.retired) && !handing(t, p))
+            .map(|p| (*t, p))
+    })
+}
+
 /// Drops part `i`'s range move holds that no longer hold, and whether one still does: a
 /// hold holds while its source's part is below the move's `final_seqno`. A merge with no
 /// part for the source holds nothing (cli692's F4: a subscription that never read the
@@ -985,10 +1028,17 @@ fn poll_parts(
 /// source a hold lifts up to its quiet interval late (feed1248's S3).
 fn release(parts: &mut [Part], i: usize) -> bool {
     while let Some(h) = parts[i].holds.front() {
+        // A source part still at `Now` holds nothing (feed1248's S1): a barrier exists only
+        // from the target's serving row, written at CLEANING, after the move's
+        // `final_seqno` was fixed at HANDING_OVER from the source's visible seqno, so a
+        // start at the source's now is past it, and an unopened (down) source part would
+        // only stall the target for a finished move.
         let behind = parts
             .iter()
             .find(|p| p.partition == h.source)
-            .is_some_and(|s| s.at.seqno().is_none_or(|at| at < h.final_seqno));
+            .is_some_and(|s| {
+                !matches!(s.at, At::Now) && s.at.seqno().is_none_or(|at| at < h.final_seqno)
+            });
         if behind {
             return true;
         }
@@ -1345,16 +1395,19 @@ impl Ctx {
                     open.partition
                 )));
             };
+            let mut request = open.request;
             let ends_at = {
                 let routes = self.node.routes();
                 let routes = routes
                     .as_ref()
                     .ok_or_else(|| ApiError::partition_unavailable("this node has no map"))?;
-                moved_end(&here, routes, &open.partition, &open.request.tables)?
+                let (kept, ends_at) = moved_end(&here, routes, &open.partition, &request.tables)?;
+                request.tables = kept;
+                ends_at
             };
             let events = here
                 .subscribe_part(
-                    open.request,
+                    request,
                     &self.caller,
                     crate::serve::service::PartStart {
                         skip: open.skip,
@@ -1515,7 +1568,7 @@ pub(crate) async fn serve(
     req: proto::ForwardSubscribeRequest,
 ) -> Result<FeedEvents, ApiError> {
     let caller = super::forward::caller_of(req.caller, &node.tokens)?;
-    let r = req
+    let mut r = req
         .request
         .ok_or_else(|| ApiError::invalid("a ForwardSubscribe carries no request"))?;
     if r.allow_partial || !r.skip_through.is_empty() || r.checkpoint_every != 0 {
@@ -1549,7 +1602,8 @@ pub(crate) async fn serve(
                 req.partition
             )));
         };
-        let ends_at = moved_end(&service, routes, &req.partition, &r.tables)?;
+        let (kept, ends_at) = moved_end(&service, routes, &req.partition, &r.tables)?;
+        r.tables = kept;
         (service, ends_at)
     };
     #[cfg(test)]
@@ -1573,18 +1627,24 @@ pub(crate) async fn serve(
     Ok(events)
 }
 
-/// D331 PR 3b: where a component of `tables` on `partition` (served by `service`) ends.
-/// A table the map no longer places on it that a range move took from it whole is still
-/// its own to serve, up to the move's last seqno, while it holds the moved-away row; without
-/// the row, `WrongPartition` (a resume of it expires). When every table is such, the
-/// component ends past the latest of their last seqnos (`Some`); else it reads on (`None`:
-/// the moved tables' later events here are only feed-silent cleanup).
+/// D331 PR 3b: which of `tables` a component on `partition` (served by `service`) reads,
+/// and where it ends. A table the map places here is read. One it doesn't that a range move
+/// took from it whole is still its own to serve, up to the move's last seqno, while it holds
+/// the moved-away row. Any other is left out (feed1248's M1): it was never here, or PR 5
+/// pruned its row, which it does only once this partition's feed retention has passed the
+/// move's last seqno, so a position below that fails on retention here anyway (ICR 0117's
+/// D331 PR 3b section). None left: `WrongPartition` (a resume of it expires). When every
+/// table kept is a moved one, the component ends past the latest of their last seqnos
+/// (`Some`); else it reads on (`None`: the moved tables' later events here are only
+/// feed-silent cleanup). A running component finds the same end when a move takes its last
+/// table here ([`crate::serve::feed`]'s barriers' watch).
 fn moved_end(
     service: &Service,
     routes: &super::route::Routes,
     partition: &str,
     tables: &[String],
-) -> Result<Option<u64>, ApiError> {
+) -> Result<(Vec<String>, Option<u64>), ApiError> {
+    let mut kept = Vec::with_capacity(tables.len());
     let mut gone = 0;
     let mut last = 0;
     for t in tables {
@@ -1592,18 +1652,21 @@ fn moved_end(
             .partitions_of_table(t, b"")
             .is_some_and(|ps| ps.contains(&partition));
         if here {
-            continue;
+            kept.push(t.clone());
+        } else if let Some(f) = service.moved_away(t) {
+            kept.push(t.clone());
+            gone += 1;
+            last = last.max(f);
         }
-        let Some(f) = service.moved_away(t) else {
-            return Err(ApiError::wrong_partition(
-                routes.map_version(),
-                format!("this node doesn't serve partition {partition:?} with table {t:?}"),
-            ));
-        };
-        gone += 1;
-        last = last.max(f);
     }
-    Ok((gone > 0 && gone == tables.len()).then_some(last))
+    if kept.is_empty() {
+        return Err(ApiError::wrong_partition(
+            routes.map_version(),
+            format!("this node doesn't serve partition {partition:?} with those tables"),
+        ));
+    }
+    let ends = (gone == kept.len()).then_some(last);
+    Ok((kept, ends))
 }
 
 /// A hold seam (tests): a forwarded subscribe of partition `p` on the node in a listed
@@ -1841,13 +1904,49 @@ pub(super) mod tests {
         parts[0].at = token(60);
         assert!(!release(&mut parts, 1));
         assert!(parts[1].holds.is_empty());
-        // A source with no position yet holds; one the merge has no part of doesn't.
+        // A source with no position yet from its oldest or its hand-over holds; one still at
+        // its now doesn't (feed1248's S1: it opens past the move's last seqno), nor one the
+        // merge has no part of.
+        for at in [At::Oldest, At::HandOver] {
+            parts[0].at = at;
+            parts[1].holds.clear();
+            parts[1].holds.push_back(hold("p1", 1));
+            assert!(release(&mut parts, 1));
+        }
         parts[0].at = At::Now;
-        parts[1].holds.push_back(hold("p1", 1));
-        assert!(release(&mut parts, 1));
+        assert!(!release(&mut parts, 1));
         parts[1].holds.clear();
         parts[1].holds.push_back(hold("p9", u64::MAX));
         assert!(!release(&mut parts, 1));
+    }
+
+    /// D331 PR 3b (feed1248's M2): a merge reroutes on a partition no live part reads, a
+    /// retired part's included (a move back to it), but not on one a move is still handing.
+    #[test]
+    fn a_retired_part_doesnt_count_as_reading_its_partition() {
+        let part = |partition: &str, retired| Part {
+            partition: partition.into(),
+            tables: vec!["users".into()],
+            epoch: 1,
+            at: At::Now,
+            skip: 0,
+            events: None,
+            retry: None,
+            opening: false,
+            unavailable: false,
+            holds: std::collections::VecDeque::new(),
+            retired,
+        };
+        let on = |_: &str| vec!["p1".to_owned(), "p2".to_owned()];
+        let none = |_: &str, _: &str| false;
+        let mut parts = vec![part("p1", false), part("p2", false)];
+        assert_eq!(gained(&parts, &["users"], on, none), None);
+        parts[0].retired = true;
+        assert_eq!(
+            gained(&parts, &["users"], on, none),
+            Some(("users", "p1".to_owned()))
+        );
+        assert_eq!(gained(&parts, &["users"], on, |_, p| p == "p1"), None);
     }
 
     #[test]

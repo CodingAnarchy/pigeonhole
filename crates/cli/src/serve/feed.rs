@@ -2335,16 +2335,42 @@ impl Barriers {
         }
     }
 
-    /// The barriers a hand-over taken since the last look adds (one load while none was).
+    /// The barriers a hand-over taken since the last look adds, and the end a move that took
+    /// the component's last table here sets (one load while neither changed).
     fn refresh(&mut self) {
         let Some((gate, tables)) = &self.watch else {
             return;
         };
-        let version = gate.ranges().serving_version();
+        let version = gate.ranges().rows_version();
         if version == self.version {
             return;
         }
         self.version = version;
+        // Every table moved away whole, each with its row (feed1248's M3 on PR 3b): read up to
+        // the moves' last seqno, then end, as a component opened after the move does
+        // (`moved_end`). Without this, a subscription connected across the move kept the
+        // partition in its tokens, and a reconnect after PR 5 pruned the row would expire.
+        if self.ends_at.is_none()
+            && let Some(state) = gate.ranges().load().as_ref()
+            && tables.iter().all(|t| state.moved_whole(t))
+        {
+            let rows = gate.ranges().moved_rows();
+            let ends: Option<Vec<u64>> = tables
+                .iter()
+                .map(|t| {
+                    rows.iter()
+                        .filter(|m| &m.table == t)
+                        .map(|m| m.final_seqno)
+                        .max()
+                })
+                .collect();
+            if let Some(end) = ends.and_then(|e| e.into_iter().max()) {
+                self.ends_at = Some(end);
+                if self.last >= end {
+                    self.done = Some(true);
+                }
+            }
+        }
         let mut added = false;
         for m in gate.ranges().serving_rows() {
             if m.token.is_empty() || !tables.contains(&m.table) || self.known.contains(&m.id) {
@@ -2394,6 +2420,14 @@ impl Barriers {
     /// `t_from`.
     fn due(&mut self, out: &Out) -> Option<Barrier> {
         let next = self.pending.front()?;
+        // A component's events carry D310 tokens or none (feed1248's S2). Failing closed
+        // (handing the barrier out) isn't safe: its token would move the merge's position to
+        // `t_from` ahead of events still to come.
+        debug_assert!(
+            out.token().is_empty()
+                || crate::serve::cluster::token::token_seqno(out.token()).is_some(),
+            "a component event's token isn't a D310 token"
+        );
         let seqno = crate::serve::cluster::token::token_seqno(out.token())?;
         if seqno > next.t_from {
             self.pending.pop_front()
@@ -2600,9 +2634,7 @@ impl FeedEvents {
             return self;
         }
         barriers.sort_by(|a, b| (a.t_from, &a.move_id).cmp(&(b.t_from, &b.move_id)));
-        let version = watch
-            .as_ref()
-            .map_or(0, |(g, _)| g.ranges().serving_version());
+        let version = watch.as_ref().map_or(0, |(g, _)| g.ranges().rows_version());
         self.2 = Some(Box::new(Barriers {
             known: barriers.iter().map(|b| b.move_id.clone()).collect(),
             pending: barriers.into(),
