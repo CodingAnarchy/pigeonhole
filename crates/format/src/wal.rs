@@ -1019,7 +1019,16 @@ impl WalRecord<'_> {
         if !silent_ok && marked(bytes) {
             return Err(silent_without_bit());
         }
-        Self::decode_any(bytes)
+        let record = Self::decode_any(bytes);
+        // The mark's places in the bytes agree with the decoded batch (perf2's nit on #2055).
+        debug_assert!(
+            record
+                .as_ref()
+                .map_or(true, |r| r.batch().is_some_and(|b| b.is_silent())
+                    == marked(bytes)),
+            "a feed-silent mark at a place the decoder doesn't read"
+        );
+        record
     }
 
     /// Whether the encoded record `bytes` carries a batch marked [`SILENT_BATCH`] (D331),

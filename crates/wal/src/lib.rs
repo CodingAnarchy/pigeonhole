@@ -71,7 +71,7 @@ use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
 use pigeonhole_io::{Completion, VfsRef};
 
-pub use feed::{FeedCursor, SilentCheck, Step};
+pub use feed::{FeedCursor, Step};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;

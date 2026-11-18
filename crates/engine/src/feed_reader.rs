@@ -1473,7 +1473,7 @@ impl FeedReader {
             cursor.follow_head(Arc::clone(marks));
         }
         // The mark is decoded here and checked against `incompat` bit 3 by `read_one`'s filter.
-        cursor.accept_silent(true, None);
+        cursor.accept_silent(true);
         Ok(cursor)
     }
 
@@ -2463,6 +2463,10 @@ impl FeedReader {
                     // Its shares are never delivered; the abort's own seqno holds nothing, so
                     // the frontier passes it as any seqno with no event (ICR 0140's E1).
                     self.remove_held(id);
+                    // Nor is it a silent commit to report (simp724's N2 on #2055).
+                    if self.include_silent {
+                        self.silent_seen.remove(&id);
+                    }
                 }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
@@ -3049,7 +3053,7 @@ impl FeedReader {
                 at,
             )
             .ok()?;
-            cursor.accept_silent(true, None);
+            cursor.accept_silent(true);
             Some(cursor)
         };
         // Each stream's first retained segment of every earlier session in the history.

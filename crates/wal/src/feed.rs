@@ -155,32 +155,9 @@ pub struct FeedCursor {
     tail_window: bool,
     /// A stop short of its successor's recorded end, deferred once (#1370): `(epoch, stop)`.
     deferred: Option<(u32, u64)>,
-    /// Whether a feed-silent batch's mark is taken (D331), and how to ask again when one is
-    /// met while it isn't ([`FeedCursor::accept_silent`]).
+    /// Whether a feed-silent batch's mark is taken (D331, [`FeedCursor::accept_silent`]).
     silent_ok: bool,
-    silent_check: Option<SilentCheck>,
 }
-
-/// A marked batch met while the cursor doesn't take the mark: takes it from now on if
-/// `check` says the superblock has `incompat` bit 3 now, else the decoder's refusal.
-#[cold]
-#[inline(never)]
-fn take_mark(ok: &mut bool, check: Option<&(dyn Fn() -> bool + Send + Sync)>) -> Result<()> {
-    if check.is_some_and(|c| c()) {
-        *ok = true;
-        Ok(())
-    } else {
-        Err(pigeonhole_format::Error::Corrupt {
-            what: pigeonhole_format::wal::SILENT_WITHOUT_BIT,
-        }
-        .into())
-    }
-}
-
-/// Asked when a cursor meets a feed-silent batch (D331, ICR 0141) and doesn't yet take the
-/// mark: whether the database's superblock now has `incompat` bit 3. A writer sets the bit
-/// before appending the first such batch, so a cursor opened earlier finds it set.
-pub type SilentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug)]
 struct Cursor {
@@ -237,7 +214,6 @@ impl FeedCursor {
             tail_window: false,
             deferred: None,
             silent_ok: false,
-            silent_check: None,
         };
         this.cur = this.place(at);
         Ok(this)
@@ -272,14 +248,12 @@ impl FeedCursor {
         self.marks = Some(marks);
     }
 
-    /// Takes feed-silent batches' mark (D331, ICR 0141): `ok` when the superblock has
-    /// `incompat` bit 3 now; otherwise `check` is asked when a marked batch is met (the bit
-    /// may be set after the cursor opened). Without either, a marked batch is corrupt. The
-    /// cursor only decodes the mark: whether a silent commit is delivered is its reader's
-    /// call.
-    pub fn accept_silent(&mut self, ok: bool, check: Option<SilentCheck>) {
+    /// Takes feed-silent batches' mark (D331, ICR 0141); without it a marked batch is
+    /// corrupt. The engine's change feed takes it and checks `incompat` bit 3 itself where it
+    /// looks at each batch (a writer may set the bit after the cursor opened). The cursor only
+    /// decodes the mark: whether a silent commit is delivered is its reader's call.
+    pub fn accept_silent(&mut self, ok: bool) {
         self.silent_ok = ok;
-        self.silent_check = check;
     }
 
     /// The stream's segments as their headers were last read, by epoch: `(epoch,
@@ -552,14 +526,7 @@ impl FeedCursor {
                         let start = Lsn::new(epoch, last_end as u32);
                         let session = cur.session;
                         let cur = self.cur.as_ref().expect("checked above");
-                        let bytes = cur.dec.record();
-                        // A feed-silent batch while the cursor doesn't take the mark: the
-                        // writer may have set `incompat` bit 3 since it opened, so ask again
-                        // (simp724's S1 and N2 on #2055), out of line.
-                        if !self.silent_ok && WalRecord::is_marked(bytes) {
-                            take_mark(&mut self.silent_ok, self.silent_check.as_deref())?;
-                        }
-                        let record = WalRecord::decode_with(bytes, true)?;
+                        let record = WalRecord::decode_with(cur.dec.record(), self.silent_ok)?;
                         return Ok(Step::Record {
                             start,
                             end: Lsn::new(epoch, end as u32),
