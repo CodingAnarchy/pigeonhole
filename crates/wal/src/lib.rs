@@ -71,7 +71,7 @@ use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
 use pigeonhole_io::{Completion, VfsRef};
 
-pub use feed::{FeedCursor, Step};
+pub use feed::{FeedCursor, SilentCheck, Step};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;
@@ -143,6 +143,28 @@ impl std::error::Error for Error {
 impl From<pigeonhole_io::Error> for Error {
     fn from(e: pigeonhole_io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+/// Decodes a WAL record, taking a feed-silent batch's mark (D331, ICR 0141) only when `ok`
+/// (the superblock has `incompat` bit 3), or when `check` says it now does: a writer sets
+/// the bit before the first silent batch is appended, so a reader that opened before it
+/// asks again when it meets one. `check` runs only for a marked batch, and a `true` is
+/// kept in `ok`.
+pub(crate) fn decode_gated<'r>(
+    bytes: &'r [u8],
+    ok: &mut bool,
+    check: Option<&(dyn Fn() -> bool + Send + Sync)>,
+) -> Result<WalRecord<'r>> {
+    if *ok {
+        return Ok(WalRecord::decode_with(bytes, true)?);
+    }
+    match WalRecord::decode_with(bytes, false) {
+        Err(pigeonhole_format::Error::Corrupt { .. }) if check.is_some_and(|c| c()) => {
+            *ok = true;
+            Ok(WalRecord::decode_with(bytes, true)?)
+        }
+        r => Ok(r?),
     }
 }
 

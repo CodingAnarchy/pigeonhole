@@ -216,6 +216,8 @@ struct RawHead {
 struct Raws {
     heads: Box<[RawHead]>,
     bytes: Box<[u8]>,
+    /// From a feed-silent batch (D331), taken by a reader that includes them.
+    silent: bool,
 }
 
 /// A mutation of a [`Raws`].
@@ -267,7 +269,17 @@ fn alloc_size(n: usize) -> u64 {
 /// result's two allocations, the second fills them, so each is made once at its exact size
 /// and nothing outlives the call (a scratch buffer would keep the largest batch's size,
 /// outside the read-ahead's count: simp724's S1 on #1667).
-fn pack(batch: BatchRef<'_>, tables: &[TableId], prefix: &[u8]) -> Result<Raws> {
+fn pack(
+    batch: BatchRef<'_>,
+    tables: &[TableId],
+    prefix: &[u8],
+    include_silent: bool,
+) -> Result<Raws> {
+    // A feed-silent batch (D331, ICR 0141) holds nothing for a subscription: its commit is
+    // passed over as one to other tables is, and the reader's position moves past it.
+    if batch.is_silent() && !include_silent {
+        return Ok(Raws::default());
+    }
     let len = |b: &[u8]| {
         u32::try_from(b.len())
             .map_err(|_| Error::Corruption("a logged mutation's field is over 4 GiB".into()))
@@ -316,6 +328,7 @@ fn pack(batch: BatchRef<'_>, tables: &[TableId], prefix: &[u8]) -> Result<Raws> 
     Ok(Raws {
         heads: heads.into_boxed_slice(),
         bytes: bytes.into_boxed_slice(),
+        silent: batch.is_silent(),
     })
 }
 
@@ -727,6 +740,10 @@ pub struct FeedReader {
     /// An entry goes once the floor passes its segment.
     dropped: HashMap<Seqno, (usize, u32)>,
     out: Commit,
+    /// Feed-silent commits are delivered (D331: a replica's follower only), and whether the
+    /// last commit delivered was one.
+    include_silent: bool,
+    out_silent: bool,
     /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
     /// delivered, in order; the last one delivered (its root sequence, in the token); how far
     /// the sidecar is read; and the tables dropped by delivered changes, whose later changes
@@ -1282,6 +1299,8 @@ impl FeedReader {
             ahead: ReadAhead::new(shared.shards, READ_AHEAD_BYTES),
             dropped: HashMap::new(),
             out: Commit::default(),
+            include_silent: false,
+            out_silent: false,
             expired: None,
             failed: None,
             key,
@@ -1461,6 +1480,7 @@ impl FeedReader {
         if let Some(marks) = self.writer.as_ref().and_then(|f| f.marks(s)) {
             cursor.follow_head(Arc::clone(marks));
         }
+        silent_gate(&self.shared, &mut cursor);
         Ok(cursor)
     }
 
@@ -1695,6 +1715,23 @@ impl FeedReader {
     /// The frontier as of the last poll.
     pub fn frontier(&self) -> Seqno {
         self.frontier
+    }
+
+    /// Delivers feed-silent commits too (D331, ICR 0141), each with [`silent`](Self::silent)
+    /// set: for a replica's follower only, which applies them silent, so the replica stays a
+    /// copy of its primary and its own feed matches the primary's. Never reachable from a
+    /// client's subscription: the public API's feed options have no such field. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn include_silent(&mut self) {
+        self.include_silent = true;
+    }
+
+    /// Whether the commit last delivered is feed-silent (only ever, with
+    /// [`include_silent`](Self::include_silent)). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn silent(&self) -> bool {
+        self.out_silent
     }
 
     /// The last delivered seqno: every commit at or below it was delivered (or precedes the
@@ -2454,12 +2491,12 @@ impl FeedReader {
     /// tables and prefix; `None` at the readable end, or once its segment is gone (which
     /// expires the feed).
     fn read_one<const INDEXING: bool>(&mut self, s: usize) -> Result<Option<ReadRecord>> {
-        let (tables, prefix) = (&self.tables, &self.prefix);
+        let (tables, prefix, include_silent) = (&self.tables, &self.prefix, self.include_silent);
         // D320: a record past the read-ahead's cutoff is passed over before its mutations
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        let filter = |batch: BatchRef<'_>| pack(batch, tables, prefix);
+        let filter = |batch: BatchRef<'_>| pack(batch, tables, prefix, include_silent);
         let (start, end, session, record) = match self.streams[s].cursor.step()? {
             Step::Record {
                 start,
@@ -2770,6 +2807,7 @@ impl FeedReader {
             self.out.seqno = key;
             self.out.ts = ts;
             self.out.changes.clear();
+            self.out_silent = packs.iter().any(|r| r.silent);
             // Takes change `$r` into the commit, or ends the reader (a blob gone, or an error).
             // One copy of the code in each loop below, so a feed of some tables runs exactly
             // the loop it ran before #1857's check.
@@ -2991,14 +3029,16 @@ impl FeedReader {
     fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>, u64)> {
         let shards = self.shared.shards;
         let open = |s: usize, at: Lsn| {
-            FeedCursor::open(
+            let mut cursor = FeedCursor::open(
                 &self.shared.vfs,
                 &self.shared.path,
                 StreamId(s as u32),
                 db_id,
                 at,
             )
-            .ok()
+            .ok()?;
+            silent_gate(&self.shared, &mut cursor);
+            Some(cursor)
         };
         // Each stream's first retained segment of every earlier session in the history.
         let mut firsts: Vec<HashMap<u64, u32>> = Vec::with_capacity(shards);
@@ -3507,6 +3547,22 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
         ));
     }
     Ok((h.db_id, h.delivered, h.catalog_seq))
+}
+
+/// Lets `cursor` take feed-silent batches' mark (D331, ICR 0141) once the database has
+/// `incompat` bit 3: at once if it has now, else asked again when the cursor meets one (a
+/// writer sets the bit before appending the first). A reader process sees the bit once its
+/// pager has reloaded the superblock that carries it.
+fn silent_gate(shared: &Arc<Shared>, cursor: &mut FeedCursor) {
+    let flagged = |shared: &Shared| {
+        shared.silent_flagged.load(Ordering::Acquire)
+            || shared.pager.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0
+    };
+    let check = {
+        let shared = Arc::clone(shared);
+        Arc::new(move || flagged(&shared)) as pigeonhole_wal::SilentCheck
+    };
+    cursor.accept_silent(flagged(shared), Some(check));
 }
 
 #[cfg(test)]

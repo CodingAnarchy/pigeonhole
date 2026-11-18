@@ -1235,6 +1235,10 @@ impl ShardState {
     /// Runs a refused cross-shard commit again through the current tablet map.
     pub(super) fn retry(&mut self, r: CoordinateReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         let mut builder = BatchBuilder::new();
+        // The parts of a feed-silent batch are all silent (D331): so is the batch again.
+        if r.parts.iter().any(|(_, p)| p.is_silent()) {
+            builder.mark_silent();
+        }
         let mut failed = None;
         for (_, part) in &r.parts {
             for mu in part.batch().iter() {
@@ -3391,8 +3395,17 @@ pub(crate) fn split_by_shard(
     builder: &BatchBuilder,
     shards: &[ShardId],
 ) -> Result<Vec<(ShardId, Arc<BatchBuilder>)>> {
-    let mut parts: Vec<(ShardId, BatchBuilder)> =
-        shards.iter().map(|s| (*s, BatchBuilder::new())).collect();
+    let mut parts: Vec<(ShardId, BatchBuilder)> = shards
+        .iter()
+        .map(|s| {
+            let mut part = BatchBuilder::new();
+            // Every share of a feed-silent batch is silent (D331).
+            if builder.is_silent() {
+                part.mark_silent();
+            }
+            (*s, part)
+        })
+        .collect();
     for m in builder.batch().iter() {
         let m = m?;
         let Some((_, shard)) = view.tablets.route(m.table, m.row) else {

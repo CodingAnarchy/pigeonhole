@@ -21,6 +21,8 @@ pub struct ReplicatedEvent {
     pub(crate) after: StreamPosition,
     pub(crate) token: FeedToken,
     pub(crate) body: Body,
+    /// A feed-silent commit (D331, ICR 0141): a replica applies it silent too.
+    pub(crate) silent: bool,
 }
 
 /// What a [`ReplicatedEvent`] holds.
@@ -52,6 +54,7 @@ impl ReplicatedEvent {
         event: &FeedEvent,
         (before, after): (StreamPosition, StreamPosition),
         token: FeedToken,
+        silent: bool,
     ) -> Self {
         let body = match event {
             FeedEvent::Commit(c) => Body::Commit {
@@ -76,12 +79,20 @@ impl ReplicatedEvent {
             },
             FeedEvent::Catalog(change) => Body::Catalog(change.raw().clone()),
         };
+        let silent = silent && matches!(body, Body::Commit { .. });
         Self {
             before,
             after,
             token,
             body,
+            silent,
         }
+    }
+
+    /// Whether it is a feed-silent commit (D331, ICR 0141): a range move's copy or cleanup,
+    /// which a replica applies silent so its own feed matches its primary's.
+    pub fn is_silent(&self) -> bool {
+        self.silent
     }
 
     /// Whether it is a catalog change (applied with `apply_catalog`, between runs of commits).
@@ -102,10 +113,16 @@ impl ReplicatedEvent {
 
     /// The event's bytes, for a replica in another process (#1436: `phdb serve`'s
     /// `Replication.Follow`): versioned, opaque to the transport. [`decode`](Self::decode)
-    /// reads them back.
+    /// reads them back. A feed-silent commit is version 2 (D331), every other event version
+    /// 1, so a stream without one is what builds before D331 read; an older replica refuses
+    /// a version 2 event rather than apply it as an ordinary write.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(EVENT_VERSION);
+        out.push(if self.silent {
+            SILENT_EVENT_VERSION
+        } else {
+            EVENT_VERSION
+        });
         for v in [
             self.before.seqno,
             self.before.catalog,
@@ -156,9 +173,11 @@ impl ReplicatedEvent {
     /// newer encoding.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
-        if r.u8()? != EVENT_VERSION {
-            return Err(invalid("not a replicated event of this version".to_owned()));
-        }
+        let silent = match r.u8()? {
+            EVENT_VERSION => false,
+            SILENT_EVENT_VERSION => true,
+            _ => return Err(invalid("not a replicated event of this version".to_owned())),
+        };
         let before = StreamPosition {
             seqno: r.u64()?,
             catalog: r.u64()?,
@@ -214,6 +233,9 @@ impl ReplicatedEvent {
             }
             _ => return Err(invalid("a replicated event's body".to_owned())),
         };
+        if silent && matches!(body, Body::Catalog(_)) {
+            return Err(invalid("a feed-silent catalog change".to_owned()));
+        }
         if !r.0.is_empty() {
             return Err(invalid(
                 "trailing bytes after a replicated event".to_owned(),
@@ -224,12 +246,17 @@ impl ReplicatedEvent {
             after,
             token,
             body,
+            silent,
         })
     }
 }
 
 /// [`ReplicatedEvent::encode`]'s version.
 const EVENT_VERSION: u8 = 1;
+
+/// [`ReplicatedEvent::encode`]'s version for a feed-silent commit (D331, ICR 0141): version 1's
+/// fields, read only by builds that apply the mark.
+const SILENT_EVENT_VERSION: u8 = 2;
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -576,10 +603,12 @@ impl Pigeonhole {
                 .map(|c| c.row.len() + c.qualifier.len() + c.stored.len() + 32)
                 .sum();
             // A cell and timestamp this part already writes, or a part this event would take
-            // past the byte cap (simp724's S1): commit the part first. One event is never
-            // split: a primary commit applies whole.
+            // past the byte cap (simp724's S1), or a feed-silent event after an ordinary one
+            // or the other way round (D331: one commit is silent or not): commit the part
+            // first. One event is never split: a primary commit applies whole.
             if let Some(end) = part_end
                 && (part_bytes + bytes > cap
+                    || end.silent != event.silent
                     || changes.iter().any(|c| {
                         cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
                     }))
@@ -590,6 +619,11 @@ impl Pigeonhole {
                 part_bytes = 0;
             }
             part_bytes += bytes;
+            // A primary's silent commit stays silent here: the replica's own feed skips it as
+            // the primary's does, and a promoted replica's feed is the primary's.
+            if event.silent {
+                batch.mark_feed_silent();
+            }
             for c in changes {
                 batch.push_logged(
                     c.table,
@@ -618,6 +652,29 @@ impl Pigeonhole {
             return Ok(());
         }
         self.commit_part(batch, end, max_ts)
+    }
+
+    /// Raises the timestamp floor to at least `ts`, durably (D331, ICR 0141): a range move's
+    /// target, before it serves the range, so a write it timestamps later sorts after every
+    /// version it copied, whatever the clocks. Refused on a replica. Not part of the stable
+    /// API.
+    #[doc(hidden)]
+    pub fn raise_ts_floor(&self, ts: u64) -> Result<()> {
+        self.engine().raise_ts_floor(ts)?;
+        Ok(())
+    }
+
+    /// Holds the change feed's history from now on (D331, ICR 0141), until the hold is
+    /// dropped or the database retains more than `cap_bytes` of history, when it lapses:
+    /// a range move's catch-up then finds the source's history from its copy's first
+    /// snapshot, or learns it can't. `InvalidArgument` without the change feed. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn hold_feed_retention(
+        &self,
+        cap_bytes: u64,
+    ) -> Result<pigeonhole_engine::FeedRetentionHold> {
+        Ok(self.engine().hold_feed_retention(cap_bytes)?)
     }
 
     fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {

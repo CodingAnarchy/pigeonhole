@@ -460,6 +460,9 @@ pub struct FeedMarks {
     /// The retention in effect: retained segments times the stream file's own slot size.
     retention: AtomicU64,
     checkpoint: AtomicU64,
+    /// The oldest epoch a retention hold keeps (D331, ICR 0141): retention trims nothing from
+    /// it on while it's set. 0 (no epoch is 0) when nothing holds the stream.
+    hold: AtomicU32,
     /// Where the marks are published for other processes (D310 PR 4), once set.
     mirror: std::sync::OnceLock<Box<dyn MarkMirror>>,
 }
@@ -528,6 +531,25 @@ impl FeedMarks {
             && let Some(m) = self.mirror.get()
         {
             m.checkpoint(self.checkpoint());
+        }
+    }
+
+    /// Keeps retention from trimming the segment of `epoch` or any later one (D331, ICR 0141:
+    /// a range move's catch-up reads the source's history from its copy's first snapshot),
+    /// from the stream's next retention pass on; `None` lets it go. Take it at an epoch the
+    /// stream still has: the head's always is, since retention never trims the current
+    /// segment. A held stream's file grows by what its writes add meanwhile, so the holder
+    /// bounds it ([`retained_bytes`](Self::retained_bytes)). Without retention, nothing is
+    /// trimmed for a feed and the hold changes nothing.
+    pub fn set_hold(&self, epoch: Option<u32>) {
+        self.hold.store(epoch.unwrap_or(0), Ordering::Release);
+    }
+
+    /// The epoch [`set_hold`](Self::set_hold) holds from, if any.
+    pub fn hold(&self) -> Option<u32> {
+        match self.hold.load(Ordering::Acquire) {
+            0 => None,
+            e => Some(e),
         }
     }
 
@@ -1811,6 +1833,11 @@ impl WalStream {
                     _ => break,
                 }
             }
+        }
+        // A retention hold (D331) keeps its epoch on: the floor stops below it, and never goes
+        // down (a segment already past it may be reused).
+        if let Some(held) = self.marks.hold() {
+            floor = floor.min(held).max(self.retain_floor);
         }
         self.retain_floor = floor;
     }
