@@ -1710,6 +1710,11 @@ pub(crate) enum ShardMsg {
         commit: bool,
         reply: Notifier<Result<Settled>>,
     },
+    /// A read-only transaction's reads this shard owns, to validate and hold in memory
+    /// (`Engine::hold_reads`, ICR 0140 amendment 1, D329 PR 2a). Boxed for the message size.
+    HoldReads(Box<HoldReadsReq>),
+    /// Ends read hold `.0` here; `.1` answers whether it was still held.
+    ReleaseReads(Box<(u64, Option<Notifier<bool>>)>),
     Prepared {
         seqno: Seqno,
         from: ShardId,
@@ -2312,6 +2317,30 @@ struct PreparedShare {
     /// whether it is `None` (written by no write of its own). A commit decision holds the
     /// feed's watermarks at its apply seqno until a write and a sync pass it.
     feed_end: Option<(Lsn, bool)>,
+}
+
+/// [`ShardMsg::HoldReads`]: hold `token`'s `reads` (the ones this shard owned when the
+/// engine routed them), validated against `validate`'s snapshot.
+#[derive(Debug)]
+pub(crate) struct HoldReadsReq {
+    pub token: u64,
+    /// The snapshot's seqno, and its pin, which keeps the writes above it from being purged
+    /// before they are looked for.
+    pub validate: Arc<crate::write::Validate>,
+    pub reads: Vec<crate::write::ReadKey>,
+    /// Each read's tablet in the engine's view when it routed them, for a read of a table
+    /// this shard's map doesn't have yet.
+    pub tablets: Vec<TabletId>,
+    pub reply: Notifier<Result<()>>,
+}
+
+/// A read hold this shard keeps (ICR 0140 amendment 1): its rows, counted in
+/// `pending_reads`, and their tablets, which a tablet change gives up for.
+#[derive(Debug)]
+struct ReadHoldHere {
+    /// `hash_row`, sorted.
+    rows: Vec<u64>,
+    tablets: Vec<TabletId>,
 }
 
 /// A `Decide` waiting for its share's PREPARE to settle (D279).
@@ -3556,6 +3585,9 @@ pub(crate) struct ShardState {
     waiting_singles: FastMap<u32, WaitingSingle>,
     /// A row's waiting singles (any row they write or read).
     single_rows: FastMap<u64, Vec<u32>>,
+    /// Read holds by token (ICR 0140 amendment 1, D329 PR 2a): a write to a held row is
+    /// refused at once, as over an external share in doubt.
+    read_holds: FastMap<u64, ReadHoldHere>,
     next_share_wait: u32,
     /// Refused commits that read, each older than every undecided share on its rows: while
     /// one is listed, a younger blind PREPARE on its rows is refused, not chained, so the
@@ -3942,6 +3974,7 @@ impl ShardState {
             overlap_refused: Vec::new(),
             waiting_singles: FastMap::default(),
             single_rows: FastMap::default(),
+            read_holds: FastMap::default(),
             next_share_wait: 0,
             reader_fences: Vec::new(),
             overlap_released: Vec::new(),
@@ -9392,6 +9425,78 @@ impl ShardState {
         self.share_seqnos.get(&id).map_or(id, |s| s.0)
     }
 
+    /// [`ShardMsg::HoldReads`] (ICR 0140 amendment 1): validates the reads this shard owns
+    /// against the snapshot, then holds them. Handled between groups: every member admitted
+    /// so far is in its memtable, so `conflicts` sees it (perf2's Q3 on the design).
+    /// `Conflict` for a write above the snapshot, a row an undecided share writes (its seqno
+    /// lands above the snapshot at its decision), or a row a waiting single writes (it is
+    /// admitted later without checking holds, D267). `Busy` for a read whose tablet moved
+    /// here or is being changed: the caller tries again.
+    #[cold]
+    #[inline(never)]
+    fn on_hold_reads(&mut self, req: HoldReadsReq) {
+        let HoldReadsReq {
+            token,
+            validate,
+            reads,
+            tablets: routed,
+            reply,
+        } = req;
+        if self.closing || self.poisoned {
+            reply.notify(Err(Error::Closed));
+            return;
+        }
+        let mut rows = Vec::with_capacity(reads.len());
+        let mut tablets = Vec::with_capacity(reads.len());
+        for (r, routed) in reads.iter().zip(routed) {
+            // `None`: a table created since this shard's map (the engine routed it here with
+            // its newer view), on which no tablet change can be running yet: the engine's
+            // tablet is kept, so a later change of it gives up for the hold.
+            match self.tablets.route(r.table, &r.row) {
+                None => tablets.push(routed),
+                Some((tablet, shard)) if shard == self.id && !self.moving.contains(&tablet) => {
+                    tablets.push(tablet);
+                }
+                Some(_) => {
+                    reply.notify(Err(Error::Busy));
+                    return;
+                }
+            }
+            let h = hash_row(r.table, &r.row);
+            let single_writes = self.single_rows.get(&h).is_some_and(|ids| {
+                ids.iter().any(|id| {
+                    self.waiting_singles
+                        .get(id)
+                        .is_some_and(|w| w.writes.binary_search(&h).is_ok())
+                })
+            });
+            if self.pending_rows.contains_key(&h) || single_writes {
+                reply.notify(Err(Error::Conflict));
+                return;
+            }
+            match self.conflicts(validate.seqno, r) {
+                Ok(false) => {}
+                Ok(true) => {
+                    reply.notify(Err(Error::Conflict));
+                    return;
+                }
+                Err(e) => {
+                    reply.notify(Err(e));
+                    return;
+                }
+            }
+            rows.push(h);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        tablets.sort_unstable();
+        tablets.dedup();
+        self.track_share_reads(&rows, true);
+        self.read_holds
+            .insert(token, ReadHoldHere { rows, tablets });
+        reply.notify(Ok(()));
+    }
+
     /// The tablets of this shard `reads` route to, sorted and deduplicated (#2050).
     fn read_tablets<'r>(&self, reads: impl Iterator<Item = (TableId, &'r [u8])>) -> Vec<TabletId> {
         let mut tablets: Vec<TabletId> = reads
@@ -9459,17 +9564,24 @@ impl ShardState {
         if let Some((table, row, _)) = m.predicate.as_deref() {
             reads.push(hash_row(*table, row));
         }
-        self.prepared
+        // A read hold (ICR 0140 amendment 1) is refused over as a share in doubt is, for a
+        // write to a row it holds (perf2's T1 on the 2a design: waiting instead would admit
+        // the write later with `waited`, past the hold).
+        self.read_holds
             .values()
-            .filter(|p| p.external.is_some() && p.tracked)
-            .any(|p| {
-                writes.iter().any(|w| p.reads.contains(w))
-                    || p.bytes
-                        .batch()
-                        .iter()
-                        .flatten()
-                        .any(|mu| reads.contains(&hash_row(mu.table, mu.row)))
-            })
+            .any(|h| writes.iter().any(|w| h.rows.binary_search(w).is_ok()))
+            || self
+                .prepared
+                .values()
+                .filter(|p| p.external.is_some() && p.tracked)
+                .any(|p| {
+                    writes.iter().any(|w| p.reads.contains(w))
+                        || p.bytes
+                            .batch()
+                            .iter()
+                            .flatten()
+                            .any(|mu| reads.contains(&hash_row(mu.table, mu.row)))
+                })
     }
 
     fn overlaps_undecided(&self, m: &Member) -> bool {
@@ -10967,9 +11079,14 @@ impl ShardState {
                 let Some((at, holders, replayed)) = self.share_seqnos.get(&l.seqno) else {
                     return true;
                 };
+                // A share with nothing to flush (a reads-only external one, ICR 0140
+                // amendment 1) has no slot to keep it: this shard's own flushed-through stands
+                // in, as for a replayed one. Its apply seqno is held until the COMMIT is
+                // written (D266), so a sole participant's own PREPARE stays until then
+                // (asserted where the COMMIT is logged).
                 unflushed(slots, *at)
                     || self.peers_behind(holders, *at).next().is_some()
-                    || (*replayed && self.own_behind(*at))
+                    || ((*replayed || slots.is_empty()) && self.own_behind(*at))
             }
             // Never the record that decides a live commit: its own PREPARE precedes it and
             // waits on the same holders (asserted where the COMMIT is logged). A replayed one
@@ -12520,6 +12637,17 @@ impl ShardState {
                     reply.notify(Err(Error::Closed));
                 } else {
                     self.on_external_decide(id, commit, reply, ctx);
+                }
+            }
+            ShardMsg::HoldReads(req) => self.on_hold_reads(*req),
+            ShardMsg::ReleaseReads(b) => {
+                let (token, reply) = *b;
+                let held = self.read_holds.remove(&token);
+                if let Some(h) = &held {
+                    self.track_share_reads(&h.rows, false);
+                }
+                if let Some(reply) = reply {
+                    reply.notify(held.is_some());
                 }
             }
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),

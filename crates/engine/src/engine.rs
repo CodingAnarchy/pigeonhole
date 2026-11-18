@@ -5818,10 +5818,11 @@ impl Inner {
                 }
             }
         }
-        if shards.is_empty() || builder.is_empty() {
+        // A branch that only read (D329 2a) logs its read set with an empty batch, and holds
+        // those rows until decided, as any share does: its shards are the reads' shards.
+        if shards.is_empty() {
             return Err(Error::InvalidArgument(
-                "an external prepare needs writes (a read-only prepare is ICR 0140's later part)"
-                    .to_owned(),
+                "an external prepare needs reads or writes".to_owned(),
             ));
         }
         // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
@@ -5863,6 +5864,109 @@ impl Inner {
             },
             token,
         ))
+    }
+
+    /// Validates and holds a read-only transaction's `validate.reads` in memory (ICR 0140
+    /// amendment 1, D329 PR 2a): each shard owning some checks them against the snapshot
+    /// and holds them; nothing is logged. The answer's token and shards are for
+    /// [`release_reads`](Self::release_reads). `Conflict` if a read changed since the
+    /// snapshot or overlaps an undecided write; `Busy` past the in-doubt share limit (live
+    /// holds count), or for a read whose tablet is moving. Refused on a replica, and on a
+    /// read-only open (`ReadOnly`).
+    pub(crate) fn hold_reads(&self, validate: Arc<Validate>) -> Result<(u64, Vec<ShardId>)> {
+        if self.read_only || self.replica.load(Ordering::Relaxed) {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        if validate.reads.is_empty() {
+            return Err(Error::InvalidArgument("a read hold needs reads".to_owned()));
+        }
+        let view = self.shared.view.load();
+        type Routed = (Vec<crate::write::ReadKey>, Vec<TabletId>);
+        let mut by_shard: BTreeMap<ShardId, Routed> = BTreeMap::new();
+        for r in &validate.reads {
+            if let Some((tablet, shard)) = view.tablets().route(r.table, &r.row) {
+                let (reads, tablets) = by_shard.entry(shard).or_default();
+                reads.push(r.clone());
+                tablets.push(tablet);
+            }
+        }
+        drop(view);
+        let token = self.shared.external.reserve_hold()?;
+        let mut waiting = Vec::with_capacity(by_shard.len());
+        let mut shards = Vec::with_capacity(by_shard.len());
+        let mut failed = None;
+        for (shard, (reads, tablets)) in by_shard {
+            let (tx, rx) = completion();
+            let msg = ShardMsg::HoldReads(Box::new(crate::shard::HoldReadsReq {
+                token,
+                validate: Arc::clone(&validate),
+                reads,
+                tablets,
+                reply: tx,
+            }));
+            match self.shared.submitter(shard).submit(msg) {
+                Ok(()) => waiting.push((shard, rx)),
+                Err(e) => {
+                    failed = Some(Error::from(e));
+                    break;
+                }
+            }
+        }
+        for (shard, rx) in waiting {
+            match rx.wait() {
+                Some(Ok(())) => shards.push(shard),
+                // A conflict wins over another shard's transient refusal: retrying can't help.
+                Some(Err(e)) => {
+                    if !matches!(failed, Some(Error::Conflict)) {
+                        failed = Some(e);
+                    }
+                }
+                None => {
+                    failed.get_or_insert(Error::Closed);
+                }
+            }
+        }
+        match failed {
+            None => Ok((token, shards)),
+            Some(e) => {
+                self.release_reads(token, &shards, false);
+                Err(e)
+            }
+        }
+    }
+
+    /// Ends read hold `token` on `shards` (ICR 0140 amendment 1); with `wait`, answers
+    /// whether every shard still held it (`false` once the hold was lost to a close or a
+    /// recovery). Without `wait`, or on a thread that drives a shard, it doesn't wait and
+    /// answers `false`. The hold stops counting against the limit either way.
+    pub(crate) fn release_reads(&self, token: u64, shards: &[ShardId], wait: bool) -> bool {
+        self.shared.external.release_hold();
+        let wait = wait && !self.shared.drivers.current_drives();
+        let mut held = true;
+        let mut waiting = Vec::new();
+        for &shard in shards {
+            let (reply, rx) = if wait {
+                let (tx, rx) = completion();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if self
+                .shared
+                .submitter(shard)
+                .submit(ShardMsg::ReleaseReads(Box::new((token, reply))))
+                .is_err()
+            {
+                held = false;
+            } else if let Some(rx) = rx {
+                waiting.push(rx);
+            }
+        }
+        for rx in waiting {
+            held &= rx.wait() == Some(true);
+        }
+        held && wait
     }
 
     /// [`submit_prepare_external`](Self::submit_prepare_external), waited for. The answer in,

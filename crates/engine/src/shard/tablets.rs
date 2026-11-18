@@ -1644,6 +1644,15 @@ impl ShardState {
     /// Whether a prepared, undecided share writes or reads a tablet being changed: `None`
     /// if none does, `Some(true)` if one is an external share (D329), else `Some(false)`.
     fn shares_touch_moving(&self) -> Option<bool> {
+        // A read hold (ICR 0140 amendment 1) is given up for, as a share in doubt is: its
+        // caller may keep it for a while.
+        if self
+            .read_holds
+            .values()
+            .any(|h| h.tablets.iter().any(|t| self.moving.contains(t)))
+        {
+            return Some(true);
+        }
         let mut touch = None;
         for share in self.prepared.values() {
             // Its reads too (#2050): a write to a row it read, admitted on the tablet's new

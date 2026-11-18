@@ -1160,6 +1160,38 @@ pub struct Txn {
     pub(crate) batch: WriteBatch,
 }
 
+/// A read-only transaction's reads, validated and held in memory ([`Txn::hold_reads`],
+/// ICR 0140 amendment 1). Dropping it releases the hold without asking whether it lasted.
+#[derive(Debug)]
+pub struct ReadHold {
+    engine: std::sync::Weak<Inner>,
+    token: u64,
+    shards: Vec<pigeonhole_runtime::ShardId>,
+    done: bool,
+}
+
+impl ReadHold {
+    /// Ends the hold, answering whether it was still in place on every shard (`true`), or
+    /// was lost to a close or a recovery (`false`). On a thread that drives a shard it can't
+    /// wait, and answers `false`.
+    pub fn release(mut self) -> bool {
+        self.done = true;
+        self.engine
+            .upgrade()
+            .is_some_and(|e| e.release_reads(self.token, &self.shards, true))
+    }
+}
+
+impl Drop for ReadHold {
+    fn drop(&mut self) {
+        if !self.done
+            && let Some(e) = self.engine.upgrade()
+        {
+            e.release_reads(self.token, &self.shards, false);
+        }
+    }
+}
+
 impl Txn {
     /// The transaction's snapshot seqno.
     pub fn snapshot(&self) -> &crate::Snapshot {
@@ -1380,9 +1412,12 @@ impl Txn {
     /// ICR 0140): its shares are logged (`durability`, GroupSync at least for the caller's
     /// atomicity) and hold their rows, and its decision waits for
     /// [`Engine::decide`](crate::Engine::decide), across a close and a reopen. The answer's
-    /// seqno is the commit's id. `Conflict` as a commit would be; `InvalidArgument` for a
-    /// transaction with no writes (a read-only prepare is a later part of ICR 0140), a value
-    /// over the inline limit, or an `xid` already in doubt here.
+    /// seqno is the commit's id. A transaction that only read logs its reads with an empty
+    /// batch and holds them the same way (a spanning commit's read-only branch, ICR 0140
+    /// amendment 1); a wholly read-only spanning commit holds its reads in memory instead
+    /// ([`hold_reads`](Self::hold_reads)). `Conflict` as a commit would be;
+    /// `InvalidArgument` for a transaction with no reads and no writes, a value over the
+    /// inline limit, or an `xid` already in doubt here.
     pub fn prepare(self, xid: &[u8], durability: Durability) -> crate::Result<CommitInfo> {
         let Txn {
             engine,
@@ -1392,6 +1427,37 @@ impl Txn {
         } = self;
         engine.shared.refuse_blocking_on_driver("Txn::prepare")?;
         engine.prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
+    }
+
+    /// Validates the transaction's reads and holds them in memory (ICR 0140 amendment 1,
+    /// D329 PR 2a): a wholly read-only transaction's part of a spanning commit. Nothing is
+    /// logged and nothing is ever in doubt. While the [`ReadHold`] lives, a write to a held
+    /// row is refused at once (a transaction's prepare with `Conflict`, any other write
+    /// `Busy`), and a tablet change touching one is given up (`Busy`).
+    /// `InvalidArgument` for a transaction with writes or without reads; `Conflict` if a read
+    /// changed since the snapshot or overlaps an undecided write; `Busy` past the in-doubt
+    /// share limit (live holds count) or while a read's tablet moves; `ReadOnly` on a replica
+    /// or a read-only open.
+    pub fn hold_reads(self) -> crate::Result<ReadHold> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+        } = self;
+        if !batch.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "a read hold is for a transaction without writes: prepare it instead".to_owned(),
+            ));
+        }
+        engine.shared.refuse_blocking_on_driver("Txn::hold_reads")?;
+        let (token, shards) = engine.hold_reads(Validate::new(snapshot, reads))?;
+        Ok(ReadHold {
+            engine: Arc::downgrade(&engine),
+            token,
+            shards,
+            done: false,
+        })
     }
 
     /// [`prepare`](Self::prepare) without waiting (D329): the [`PendingCommit`] resolves as
