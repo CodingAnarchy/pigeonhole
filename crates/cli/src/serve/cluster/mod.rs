@@ -166,7 +166,7 @@ pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
-pub(crate) const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
+const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
 /// Takes `dir`'s lock, or says another server or command has it.
 pub(crate) fn lock_dir(dir: &Path) -> Result<std::fs::File, Failure> {
@@ -568,7 +568,7 @@ impl Node {
     }
 
     /// The node's map, or `NotFound` before it has one.
-    pub(crate) fn get_map(&self) -> Result<ClusterMap, ApiError> {
+    fn get_map(&self) -> Result<ClusterMap, ApiError> {
         self.state()
             .map
             .as_ref()
@@ -3175,7 +3175,7 @@ fn in_doubt(
         return;
     }
     // The oldest first.
-    shares.sort_by(|a, b| b.1.cmp(&a.1));
+    shares.sort_by_key(|s| std::cmp::Reverse(s.1));
     let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     lp.in_doubt = u32::try_from(shares.len()).unwrap_or(u32::MAX);
     lp.in_doubt_oldest_xid = String::from_utf8_lossy(&shares[0].0).into_owned();

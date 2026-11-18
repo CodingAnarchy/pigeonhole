@@ -601,6 +601,28 @@ impl ShardSpin {
     }
 }
 
+/// A duration flag's value: a number and a unit, `ms`, `s`, `m`, `h` or `d` (`500ms`, `30s`,
+/// `24h`).
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("{s:?} needs a unit: ms, s, m, h or d (as in 30s)"))?;
+    let (n, unit) = s.split_at(split);
+    let n: u64 = n
+        .parse()
+        .map_err(|_| format!("{s:?} doesn't start with a whole number"))?;
+    let ms = match unit {
+        "ms" => n,
+        "s" => n.saturating_mul(1_000),
+        "m" => n.saturating_mul(60_000),
+        "h" => n.saturating_mul(3_600_000),
+        "d" => n.saturating_mul(86_400_000),
+        _ => return Err(format!("{s:?}: the unit is one of ms, s, m, h or d")),
+    };
+    Ok(Duration::from_millis(ms))
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
@@ -689,26 +711,4 @@ mod tests {
         assert_eq!("10000".parse::<ShardSpin>(), Ok(ShardSpin::Micros(10_000)));
         assert!("1000000".parse::<ShardSpin>().is_err());
     }
-}
-
-/// A duration flag's value: a number and a unit, `ms`, `s`, `m`, `h` or `d` (`500ms`, `30s`,
-/// `24h`).
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let s = s.trim();
-    let split = s
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("{s:?} needs a unit: ms, s, m, h or d (as in 30s)"))?;
-    let (n, unit) = s.split_at(split);
-    let n: u64 = n
-        .parse()
-        .map_err(|_| format!("{s:?} doesn't start with a whole number"))?;
-    let ms = match unit {
-        "ms" => n,
-        "s" => n.saturating_mul(1_000),
-        "m" => n.saturating_mul(60_000),
-        "h" => n.saturating_mul(3_600_000),
-        "d" => n.saturating_mul(86_400_000),
-        _ => return Err(format!("{s:?}: the unit is one of ms, s, m, h or d")),
-    };
-    Ok(Duration::from_millis(ms))
 }

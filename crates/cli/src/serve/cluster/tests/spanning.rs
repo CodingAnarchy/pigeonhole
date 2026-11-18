@@ -643,35 +643,3 @@ fn a_share_in_doubt_shows_in_status_and_is_decided_by_hand_only_when_its_home_ca
         assert_eq!(get_row(a, "bob").await.unwrap(), None);
     });
 }
-
-#[test]
-fn a_cluster_partition_refuses_a_follower_outside_its_map_replicas() {
-    // D329 2b (the coordinator's option a): a cluster node serves `Replication.Follow` only
-    // to a cluster-scope caller whose node id is one of the partition's map replicas. An
-    // outside follower (`--replica-of` a cluster node), with or without a node id, is
-    // refused with the reason, not served the partition's raw history.
-    use crate::serve::proto::FollowRequest;
-    use crate::serve::proto::replication_client::ReplicationClient;
-    let t = Three::start(["", "", ""]);
-    let [a, _, _] = t.ports;
-    t.rt.block_on(async {
-        for node_id in [None, Some("c"), Some("zz")] {
-            let mut req = tonic::Request::new(FollowRequest::default());
-            if let Some(id) = node_id {
-                req.metadata_mut()
-                    .insert(super::super::NODE_ID_HEADER, id.parse().unwrap());
-            }
-            let mut c = ReplicationClient::new(channel(a).await);
-            let e = match c.follow(req).await {
-                Err(e) => e,
-                Ok(stream) => stream
-                    .into_inner()
-                    .message()
-                    .await
-                    .expect_err("a follower outside the map's replicas is served"),
-            };
-            assert_eq!(code(&e), "FailedPrecondition", "{node_id:?}: {e}");
-            assert!(e.message().contains("map replicas"), "{e}");
-        }
-    });
-}

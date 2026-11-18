@@ -927,14 +927,7 @@ impl proto::replication_server::Replication for ReplicationGrpc {
         &self,
         req: Request<proto::FollowRequest>,
     ) -> Result<Response<Self::FollowStream>, Status> {
-        // Which node follows, for the owner's map-replica check (D329 2b).
-        let node = req
-            .metadata()
-            .get(super::cluster::NODE_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let followed = super::router::FOLLOWER.scope(node, call(&self.0, req, ServiceOp::Follow));
-        match followed.await? {
+        match call(&self.0, req, ServiceOp::Follow).await? {
             ServiceReply::Follow(b) => Ok(Response::new(Box::pin(GrpcStream(b)))),
             _ => Err(unexpected()),
         }

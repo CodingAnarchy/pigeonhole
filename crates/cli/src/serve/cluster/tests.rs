@@ -2059,6 +2059,8 @@ fn a_partition_takes_every_option_a_single_node_does() {
                 "/tmp/phdb-1775",
                 "http://127.0.0.1:1",
                 "127.0.0.1:1",
+                // A duration flag's (D329's `--txn-*`): a number and a unit.
+                "30s",
             ]
             .map(str::to_owned)
             .to_vec()
@@ -2164,7 +2166,7 @@ impl Three {
         {
             let dir = test_dir();
             super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_limits(&rt, &dir, id, local, l, tokens, limits.clone());
+            let (stop, db) = data_node_limits(&rt, &dir, id, local, l, tokens, limits);
             stops.push(stop);
             dbs.extend(db);
         }

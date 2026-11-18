@@ -1336,7 +1336,7 @@ pub(crate) fn start_resolver(
                 // every `retention / 24`, between one and ten minutes.
                 if last_sweep.elapsed() >= sweep_every {
                     last_sweep = Instant::now();
-                    for (_, service) in parts.iter() {
+                    for service in parts.values() {
                         if let Err(e) = service.sweep_decisions(now_ms()).await
                             && e.code != "Fenced"
                         {
