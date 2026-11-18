@@ -1499,3 +1499,36 @@ mod tests {
         assert!(!qualifier_selected(&both, b"a"));
     }
 }
+
+#[cfg(test)]
+mod vector_of_tests {
+    use super::*;
+
+    /// #1722 PR 3 (audit120's N5 on #2045): `vector_of` writes back what `elements` read,
+    /// for every element kind; a bit vector's dimension is 8 per byte.
+    #[test]
+    fn vector_of_reads_back_as_the_same_elements() {
+        let v = |element: proto::Element, dim: u32, data: Vec<u8>| proto::Vector {
+            element: element as i32,
+            dim,
+            data: data.into(),
+        };
+        for sent in [
+            v(
+                proto::Element::F32,
+                2,
+                [1.5f32, -2.0]
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect(),
+            ),
+            v(proto::Element::I8, 3, vec![0x80, 0x00, 0x7f]),
+            v(proto::Element::Bit, 16, vec![0b1010_0001, 0xff]),
+            v(proto::Element::F16, 2, vec![0x00, 0x3c, 0x00, 0xc0]),
+            v(proto::Element::Bf16, 2, vec![0x80, 0x3f, 0x00, 0x40]),
+        ] {
+            let back = vector_of(&elements(&sent).unwrap());
+            assert_eq!(back, sent, "{:?}", sent.element);
+        }
+    }
+}

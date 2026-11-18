@@ -1007,6 +1007,7 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
             expected: first.expected,
             input,
             wait,
+            siblings: 1,
         });
         let rpc = op.index();
         let pump = super::bulk::pump(tx, (first, first_budget), GrpcSource { stream, meter });

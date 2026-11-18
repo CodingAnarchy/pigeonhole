@@ -3,22 +3,29 @@
 //! - **The entry node splits the client's stream by id.** It reads the client's messages
 //!   as a single node does (each holding its share of the in-flight budget, each within
 //!   `--stream-idle-ms`), and sends each message's vectors to the partition each id's range
-//!   is in, as one message a partition. A partition's stream opens with its first vector: a
-//!   load of its own on this node, or `Cluster.ForwardBulkLoad` to the node serving it,
-//!   which serves it as that partition's own `BulkLoad`, metered and gated as a client's.
+//!   is in, as one message a partition, each with its piece of the message's budget. A
+//!   partition's part opens with its first vector: a load of its own on this node, or
+//!   `Cluster.ForwardBulkLoad` to the node serving it, which serves it as that partition's
+//!   own `BulkLoad`, metered and gated as a client's.
 //! - **`expected` is the client's on every partition** (the coordinator's call, E1): a
 //!   partition's share of the load isn't known until it has been read, and each partition's
 //!   load ends at about twice its `expected`, so only the whole load's bound can't fail one.
 //!   Each partition's lists are sized for the whole load, and each reserves the whole load's
-//!   worst case from its node's `--bulk-load-bytes`.
+//!   worst case from its node's `--bulk-load-bytes`. So a node that can't hold that for
+//!   every partition of the index it serves refuses the load at once ([`bulk::fits`]):
+//!   this node before it reads anything, another node as its first part opens.
 //! - **Backpressure:** a message's parts go out before the next message is read, so a slow
 //!   partition slows the client, as a slow loader does on one node. A partition left waiting
 //!   meanwhile gets an empty message every third of `--stream-idle-ms`, so its node's idle
 //!   bound doesn't end its part while another partition is the slow one.
 //! - **Strict:** a partition whose part fails (it can't be reached, its index isn't empty,
 //!   a map change moved it, it ran past its `expected`) fails the load, naming it. The other
-//!   partitions' parts end with it, each keeping the vectors it took, so once any vector
-//!   went out the error says the index may be loaded in part (`retry_safe: false`).
+//!   parts are ended (a local load's input breaks off, a forwarded stream ends), each keeping
+//!   the vectors it took, and the error comes once every part has answered, as one node's
+//!   comes once its loader has stopped. If any part may have taken a vector, it says the
+//!   index may be loaded in part (`retry_safe: false`).
+//! - **A client that goes away** drops the call: every part's input ends as above, and the
+//!   parts finish on their own, as one node's load does.
 //! - **Before it reads anything,** every node serving a part of the index must run a build
 //!   that serves `ForwardBulkLoad` ([`INDEX_BULK_LOAD_FEATURE`](super::INDEX_BULK_LOAD_FEATURE)):
 //!   an older one is refused with `Unsupported`, naming it, rather than part way.
@@ -32,6 +39,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::task::JoinHandle;
 
 use super::forward;
+use super::route::Routes;
 use crate::serve::auth::Caller;
 use crate::serve::bulk::{self, Batch, BulkLoadOp, Item, Msg};
 use crate::serve::errors::ApiError;
@@ -45,12 +53,72 @@ fn on(partition: &str, mut e: ApiError) -> ApiError {
     e
 }
 
+/// Whether a part that answered `r` may have taken a vector: it loaded, or its failure says
+/// it did or may have (`applied_partly`), or the forward's outcome is unknown. A part refused
+/// before it took anything (its index isn't empty, its node can't hold it) took none.
+fn took(r: &Result<(), ApiError>) -> bool {
+    match r {
+        Ok(()) => true,
+        Err(e) => e.message.contains("loaded") || e.code == "OutcomeUnknown",
+    }
+}
+
+/// How many of the partitions in `placed` the node serving `partition` serves.
+fn siblings(routes: &Routes, placed: &[String], partition: &str) -> u64 {
+    let Some(node) = routes.owner(partition).map(|o| o.node.as_str()) else {
+        return 1;
+    };
+    placed
+        .iter()
+        .filter(|p| routes.owner(p).is_some_and(|o| o.node == node))
+        .count() as u64
+}
+
 /// Where a partition's part of the load goes.
+#[derive(Clone)]
 enum Feed {
     /// A load on this node: the loader's own channel.
     Local(mpsc::Sender<Msg>),
     /// `ForwardBulkLoad` to the node serving it: the stream's next `load`.
     Remote(mpsc::Sender<proto::VectorBulkLoadRequest>),
+}
+
+impl Feed {
+    /// Sends `items` (`bytes` of the message, holding `budget`) to the part; `false` when
+    /// the part has already ended, so it took nothing more. A local part's loader holds the
+    /// budget until it takes the last of them, as one node's does; a forwarded part's goes
+    /// once the stream has them, since the serving node reserves them again as they arrive.
+    async fn deliver(
+        self,
+        items: Vec<Item>,
+        bytes: u64,
+        budget: Option<OwnedSemaphorePermit>,
+    ) -> bool {
+        match self {
+            Feed::Local(tx) => tx
+                .send(Msg::Batch(Batch::of(items, bytes, budget)))
+                .await
+                .is_ok(),
+            Feed::Remote(tx) => {
+                let items = items
+                    .iter()
+                    .map(|(id, e)| proto::VectorItem {
+                        id: id.clone(),
+                        vector: Some(crate::serve::convert::vector_of(e)),
+                    })
+                    .collect();
+                let sent = tx
+                    .send(proto::VectorBulkLoadRequest {
+                        items,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_ok();
+                drop(budget);
+                sent
+            }
+        }
+    }
 }
 
 /// One partition's part: its feed, and the task that ends with its answer.
@@ -63,30 +131,6 @@ struct Part {
 }
 
 impl Part {
-    /// Sends `items` (`bytes` of the message) to the partition; `false` when its part has
-    /// already ended, so it took nothing more.
-    async fn send(&mut self, items: Vec<Item>, bytes: u64) -> bool {
-        match &self.feed {
-            Some(Feed::Local(tx)) => tx.send(Msg::Batch(Batch::of(items, bytes))).await.is_ok(),
-            Some(Feed::Remote(tx)) => {
-                let items = items
-                    .iter()
-                    .map(|(id, e)| proto::VectorItem {
-                        id: id.clone(),
-                        vector: Some(crate::serve::convert::vector_of(e)),
-                    })
-                    .collect();
-                tx.send(proto::VectorBulkLoadRequest {
-                    items,
-                    ..Default::default()
-                })
-                .await
-                .is_ok()
-            }
-            None => false,
-        }
-    }
-
     /// The part's answer, waiting for it.
     async fn answer(&mut self) -> Result<(), ApiError> {
         if self.done.is_none() {
@@ -113,6 +157,15 @@ fn ended(parts: &mut [Part], cx: &mut Context<'_>) -> Poll<(usize, Result<(), Ap
         }
     }
     Poll::Pending
+}
+
+/// A part that ended before the client's stream did: its failure, naming it.
+fn early(parts: &[Part], i: usize, r: Result<(), ApiError>) -> ApiError {
+    on(
+        &parts[i].partition,
+        r.err()
+            .unwrap_or_else(|| ApiError::internal("its load ended before the client's stream")),
+    )
 }
 
 /// A forwarded part's messages: the first (with the header), then each `load` the entry
@@ -204,6 +257,7 @@ impl Router {
             expected,
             mut input,
             wait,
+            ..
         }) = op
         else {
             return Err(ApiError::internal("fan_bulk_load takes a BulkLoad"));
@@ -253,20 +307,28 @@ impl Router {
                 "partition {p} isn't reachable: its node {node} didn't answer"
             )));
         }
+        // This node's own `--bulk-load-bytes`, for a part on each of its partitions of the
+        // index, before anything is read (audit120's S1 and simp724's M1 on #2045). Another
+        // node checks its own as its first part opens.
+        if let Some(p) = placed
+            .iter()
+            .find(|p| routes.owner(p).is_some_and(|o| o.node == cluster.node.id()))
+            && let Place::Here(service) =
+                crate::serve::router::place(&cluster.node, &cluster.parts, &routes, p)
+                    .map_err(|e| on(p, e))?
+        {
+            service
+                .bulk_fits(&index, expected, siblings(&routes, &placed, p))
+                .await
+                .map_err(|e| on(p, e))?;
+        }
         let mut parts: Vec<Part> = Vec::new();
-        let mut sent = false;
         let read = async {
             loop {
                 let msg = tokio::select! {
                     m = input.recv() => m,
                     (i, r) = std::future::poll_fn(|cx| ended(&mut parts, cx)) => {
-                        // A part ended before the load did: its failure, or an early end.
-                        return Err(on(
-                            &parts[i].partition,
-                            r.err().unwrap_or_else(|| {
-                                ApiError::internal("its load ended before the client's stream")
-                            }),
-                        ));
+                        return Err(early(&parts, i, r));
                     }
                 };
                 let batch = match msg {
@@ -275,7 +337,7 @@ impl Router {
                     Some(Msg::Failed(e)) => return Err(e),
                     None => return Err(ApiError::internal("the load's input ended early")),
                 };
-                let (items, bytes, budget) = batch.into_parts();
+                let (items, bytes, mut budget) = batch.into_parts();
                 let total = items.len().max(1) as u64;
                 // The message's vectors by partition, in the order each first appears.
                 let mut groups: Vec<(String, Vec<Item>)> = Vec::new();
@@ -288,62 +350,72 @@ impl Router {
                         None => groups.push((p.to_owned(), vec![item])),
                     }
                 }
+                let mut left = total as usize;
                 for (p, items) in groups {
-                    let i =
-                        match parts.iter().position(|x| x.partition == p) {
-                            Some(i) => i,
-                            None => {
-                                parts.push(self.open_part(
-                                    cluster, &routes, &p, &index, expected, wait, caller,
-                                )?);
-                                parts.len() - 1
-                            }
-                        };
+                    let i = match parts.iter().position(|x| x.partition == p) {
+                        Some(i) => i,
+                        None => {
+                            parts.push(self.open_part(
+                                cluster, &routes, &placed, &p, &index, expected, wait, caller,
+                            )?);
+                            parts.len() - 1
+                        }
+                    };
+                    // This group's piece of the message's budget, by its share of the vectors
+                    // (audit120's S3, simp724's S1 on #2045): the last group takes the rest.
+                    let piece = if items.len() >= left {
+                        budget.take()
+                    } else {
+                        budget.as_mut().and_then(|b| {
+                            let n = b.num_permits() * items.len() / left.max(1);
+                            b.split(n)
+                        })
+                    };
+                    left = left.saturating_sub(items.len());
                     let share = bytes * items.len() as u64 / total;
-                    sent = true;
-                    if !parts[i].send(items, share).await {
-                        let e = parts[i].answer().await.err().unwrap_or_else(|| {
-                            ApiError::internal("its load ended before the client's stream")
-                        });
-                        return Err(on(&p, e));
+                    let Some(feed) = parts[i].feed.clone() else {
+                        return Err(on(&p, ApiError::internal("its part has no input")));
+                    };
+                    // Another part's end is seen while this one waits for room (audit120's
+                    // N2 on #2045).
+                    let delivered = tokio::select! {
+                        ok = feed.deliver(items, share, piece) => ok,
+                        (j, r) = std::future::poll_fn(|cx| ended(&mut parts, cx)) => {
+                            return Err(early(&parts, j, r));
+                        }
+                    };
+                    if !delivered {
+                        let r = parts[i].answer().await;
+                        return Err(early(&parts, i, r));
                     }
                 }
-                // The message's share, once every partition has room for its part.
-                drop(budget);
             }
         };
         let outcome: Result<(), ApiError> = read.await;
-        match outcome {
-            Ok(()) => {
-                // The client's end, to every part: a local load is told, a forwarded stream
-                // ends. Then each part's answer, the first failure the load's.
-                for p in &mut parts {
-                    if let Some(Feed::Local(tx)) = p.feed.take() {
-                        let _ = tx.send(Msg::End).await;
-                    }
-                }
-                let mut first = None;
-                for p in &mut parts {
-                    if let Err(e) = p.answer().await {
-                        first.get_or_insert_with(|| on(&p.partition, e));
-                    }
-                }
-                match first {
-                    None => Ok(ServiceReply::Empty(proto::Empty {})),
-                    Some(e) => Err(e.applied_partly(false)),
-                }
+        // The client's end, or the load's failure, to every part: a local load is told the
+        // end (or its input breaks off), a forwarded stream ends. Each keeps what it took.
+        let clean = outcome.is_ok();
+        for p in &mut parts {
+            if let (true, Some(Feed::Local(tx))) = (clean, p.feed.take()) {
+                let _ = tx.send(Msg::End).await;
             }
-            Err(e) => {
-                // Every other part ends with what it took: a local load's input breaks off,
-                // a forwarded stream is reset.
-                for p in &mut parts {
-                    p.feed = None;
-                    if p.done.is_none() {
-                        p.run.abort();
-                    }
-                }
-                Err(if sent { e.applied_partly(false) } else { e })
+            p.feed = None;
+        }
+        // Then every part's answer, as one node answers once its loader has stopped
+        // (audit120's S4 on #2045): a client told to load again finds the slots free.
+        let mut first = outcome.err();
+        let mut partly = false;
+        for p in &mut parts {
+            let r = p.answer().await;
+            partly |= took(&r);
+            if let Err(e) = r {
+                first.get_or_insert_with(|| on(&p.partition, e));
             }
+        }
+        match first {
+            None => Ok(ServiceReply::Empty(proto::Empty {})),
+            Some(e) if partly => Err(e.applied_partly(false)),
+            Some(e) => Err(e),
         }
     }
 
@@ -353,7 +425,8 @@ impl Router {
     fn open_part(
         &self,
         cluster: &Cluster,
-        routes: &super::route::Routes,
+        routes: &Routes,
+        placed: &[String],
         partition: &str,
         index: &str,
         expected: u64,
@@ -370,6 +443,7 @@ impl Router {
                     expected,
                     input,
                     wait,
+                    siblings: siblings(routes, placed, partition),
                 });
                 let caller = caller.clone();
                 let run =
@@ -414,7 +488,9 @@ impl Router {
 
     /// `Cluster.ForwardBulkLoad` here (#1722 PR 3): one partition's part of a load another
     /// node splits, served as this partition's own `BulkLoad`, if this node's map places the
-    /// index on it and gives it the partition (`WrongPartition` otherwise).
+    /// index on it and gives it the partition (`WrongPartition` otherwise). Refused at once
+    /// unless this node's `--bulk-load-bytes` holds a part on every partition of the index
+    /// it serves ([`bulk::fits`]).
     pub(crate) async fn serve_forwarded_bulk_load(
         &self,
         partition: &str,
@@ -427,7 +503,7 @@ impl Router {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
-        let service = {
+        let (service, siblings) = {
             let routes = cluster.node.routes();
             let Some(routes) = routes.as_ref() else {
                 return Err(ApiError::wrong_partition(
@@ -435,10 +511,13 @@ impl Router {
                     "this node has no cluster map yet",
                 ));
             };
-            let placed = routes
+            let placed: Vec<String> = routes
                 .index_partitions(&load.index, b"")
-                .is_some_and(|ps| ps.contains(&partition));
-            if !placed {
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if !placed.iter().any(|p| p == partition) {
                 return Err(ApiError::wrong_partition(
                     routes.map_version(),
                     format!(
@@ -447,7 +526,10 @@ impl Router {
                     ),
                 ));
             }
-            cluster.owned_here(routes, partition)?
+            (
+                cluster.owned_here(routes, partition)?,
+                siblings(routes, &placed, partition),
+            )
         };
         let (tx, input) = mpsc::channel(1);
         let op = ServiceOp::VectorBulkLoad(BulkLoadOp {
@@ -455,6 +537,7 @@ impl Router {
             expected: load.expected,
             input,
             wait,
+            siblings,
         });
         let pump = bulk::pump(tx, (load, budget), source);
         let call = service.call(op, caller, None);

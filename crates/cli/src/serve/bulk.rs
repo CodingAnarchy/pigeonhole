@@ -52,13 +52,14 @@ pub(crate) struct Batch {
 }
 
 impl Batch {
-    /// A batch of `items` holding no budget, `bytes` long for the gauge: one partition's
-    /// part of a message a cluster's entry node split by id (#1722 PR 3).
-    pub(crate) fn of(items: Vec<Item>, bytes: u64) -> Self {
+    /// A batch of `items`, `bytes` long for the gauge, holding `budget` until the loader
+    /// takes its last vector: one partition's part of a message a cluster's entry node split
+    /// by id, with its piece of the message's budget (#1722 PR 3).
+    pub(crate) fn of(items: Vec<Item>, bytes: u64, budget: Option<OwnedSemaphorePermit>) -> Self {
         Self {
             items,
             bytes,
-            budget: None,
+            budget,
         }
     }
 
@@ -101,6 +102,10 @@ pub(crate) struct BulkLoadOp {
     /// How long the call may wait for the one-load slot: the request timeout, or the
     /// client's deadline when that is shorter.
     pub(crate) wait: Duration,
+    /// How many partitions of the index this node serves (#1722 PR 3): on a cluster, each
+    /// may take a part of the same load, each reserving the whole load's worst case, so the
+    /// load is refused at once ([`fits`]) unless all of them fit. 1 on a single node.
+    pub(crate) siblings: u64,
 }
 
 impl std::fmt::Debug for BulkLoadOp {
@@ -389,6 +394,37 @@ fn too_large(n: &Need, spec: &pigeonhole::VectorSpec, expected: u64, limit: u64)
     ))
 }
 
+/// Whether a load of `expected` vectors into `index` fits `--bulk-load-bytes` (`limit`) on
+/// a node serving `siblings` partitions of the index, each of which may take a part of it
+/// reserving the whole load's worst case (#1722 PR 3, the coordinator's E1): `InvalidArgument`
+/// at once otherwise, before the load takes anything, so a node that can't hold all its
+/// parts says so instead of waiting for the bytes its own other part holds.
+pub(crate) fn fits(
+    index: &Index,
+    expected: u64,
+    siblings: u64,
+    limit: u64,
+) -> Result<(), ApiError> {
+    let spec = index.spec();
+    // A list splits past twice its target (`Index::max_list_len`).
+    let target = (index.max_list_len() / 2).max(1);
+    let one = need(&spec, target, expected, ID_ALLOWANCE);
+    if one.bytes() > limit {
+        return Err(too_large(&one, &spec, expected, limit));
+    }
+    let all = one.bytes().saturating_mul(siblings.max(1));
+    if all > limit {
+        return Err(ApiError::invalid(format!(
+            "a BulkLoad of {expected} expected vectors reserves up to {} bytes on each \
+             partition of the index, and this node serves {siblings} of them: {all} bytes, \
+             more than its --bulk-load-bytes ({limit}). Raise --bulk-load-bytes on this node to \
+             at least {all}, or load fewer vectors at once",
+            one.bytes()
+        )));
+    }
+    Ok(())
+}
+
 /// The budget a load reserves its worst case from, in KiB (a semaphore counts `u32`s).
 fn kib(bytes: u64) -> u32 {
     u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX)
@@ -483,13 +519,11 @@ impl BulkLoads {
         gate: Option<&Arc<super::gate::WriteGate>>,
         budget: Budget<'_>,
     ) -> Result<(), ApiError> {
+        fits(&index, op.expected, op.siblings, budget.limit)?;
         let spec = index.spec();
         // A list splits past twice its target (`Index::max_list_len`).
         let target = (index.max_list_len() / 2).max(1);
         let first = need(&spec, target, op.expected, ID_ALLOWANCE);
-        if first.bytes() > budget.limit {
-            return Err(too_large(&first, &spec, op.expected, budget.limit));
-        }
         let started = Instant::now();
         let slot = match tokio::time::timeout(op.wait, Arc::clone(&self.slot).acquire_owned()).await
         {

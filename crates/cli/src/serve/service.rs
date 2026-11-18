@@ -3504,6 +3504,24 @@ impl Service {
         })
     }
 
+    /// Whether a load of `expected` vectors into index `name` fits this node's
+    /// `--bulk-load-bytes` with a part on each of `siblings` partitions ([`super::bulk::fits`]):
+    /// a cluster's entry node checks its own partitions before reading a load (#1722 PR 3).
+    pub(crate) async fn bulk_fits(
+        &self,
+        name: &str,
+        expected: u64,
+        siblings: u64,
+    ) -> Result<(), ApiError> {
+        let index = self.index(name).await?;
+        super::bulk::fits(
+            &index,
+            expected,
+            siblings,
+            self.limits.bulk_load_bytes as u64,
+        )
+    }
+
     /// The IVF index `name`, from the cache, or opened on the blocking pool on a miss.
     async fn index(&self, name: &str) -> Result<Arc<pigeonhole_vector::Index>, ApiError> {
         if let Some(i) = self.part()?.indexes.cached(name) {

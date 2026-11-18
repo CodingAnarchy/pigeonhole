@@ -836,6 +836,7 @@ async fn bulk_load(shared: &Arc<Shared>, caller: &super::auth::Caller, req: Requ
         expected: first.0.expected,
         input,
         wait: shared.limits.request_timeout,
+        siblings: 1,
     });
     let rpc = op.index();
     let pump = super::bulk::pump(tx, first, src);
