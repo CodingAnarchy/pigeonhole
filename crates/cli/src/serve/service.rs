@@ -499,38 +499,6 @@ impl ServiceOp {
     /// delivery is gated instead), nor the calls that read no rows (the schema, metrics,
     /// maintenance), nor a transaction's `Commit`: one with writes is gated as a write where
     /// it's answered, and a read-only one reads nothing past its transaction's reads.
-    /// Calls `f` with each (table name, key) the op touches, in request order, until it
-    /// returns `Break`. A stub with ai1249's signature (D331 PR 2 brings the full one, which
-    /// replaces it): only point reads and prefix scans here, enough for D332's sampled read
-    /// keys.
-    pub(crate) fn touches(
-        &self,
-        f: &mut dyn FnMut(&str, Touch<'_>) -> std::ops::ControlFlow<()>,
-    ) -> std::ops::ControlFlow<()> {
-        use std::ops::ControlFlow;
-        match self {
-            Self::Get(r) => f(&r.table, Touch::Row(&r.row)),
-            Self::ReadRow(r) => f(&r.table, Touch::Row(&r.row)),
-            Self::MultiGet(r) => {
-                for k in &r.keys {
-                    f(&r.table, Touch::Row(k))?;
-                }
-                ControlFlow::Continue(())
-            }
-            Self::Scan(r) => match r.range.as_ref().and_then(|k| k.range.as_ref()) {
-                Some(proto::key_range::Range::Prefix(p)) => f(
-                    &r.table,
-                    Touch::Range {
-                        start: p,
-                        end: None,
-                    },
-                ),
-                _ => ControlFlow::Continue(()),
-            },
-            _ => ControlFlow::Continue(()),
-        }
-    }
-
     pub(crate) fn reads_partition(&self) -> bool {
         matches!(
             self,
@@ -584,13 +552,6 @@ impl ServiceOp {
     ///   index's rows; the memory calls write the memory store's own placement, which no move
     ///   names. So a gate passes a call that reports nothing, and a new call must be sorted
     ///   into an arm before it compiles.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by D331's range gates and D332's load sample"
-        )
-    )]
     pub(crate) fn touches(
         &self,
         f: &mut dyn FnMut(&str, Touch<'_>) -> ControlFlow<()>,
@@ -1546,22 +1507,6 @@ impl Pinning {
     }
 }
 
-/// A key an op touches ([`ServiceOp::touches`]).
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Touch<'a> {
-    /// A point op's row.
-    Row(&'a [u8]),
-    /// A scan's bounds (a prefix scan as its `[prefix, next)` range).
-    Range {
-        start: &'a [u8],
-        #[expect(
-            dead_code,
-            reason = "read by D331's range moves (ai1249's `touches` PR)"
-        )]
-        end: Option<&'a [u8]>,
-    },
-}
-
 /// What a node opens on the database it serves: the engine, the table cache, the indexes,
 /// the feeds, the memory store and the bulk loads (D317 ticket 2, cli692's S1). The node's
 /// own state (connections, budgets, pools, sessions, limits, metrics) stays on [`Service`].
@@ -2145,12 +2090,20 @@ impl Service {
             && super::cluster::load::sample_read()
         {
             let _ = op.touches(&mut |table, touch| {
+                // A range read's first key; one from the table's start has none to sample.
                 let key = match touch {
-                    Touch::Row(k) => k,
-                    Touch::Range { start, .. } => start,
+                    Touch::Row(k) | Touch::Prefix(k) => k,
+                    Touch::Range {
+                        start: Bound::Included(k) | Bound::Excluded(k),
+                        ..
+                    } => k,
+                    Touch::Range {
+                        start: Bound::Unbounded,
+                        ..
+                    } => return ControlFlow::Continue(()),
                 };
                 load.add_read(table, key);
-                std::ops::ControlFlow::Break(())
+                ControlFlow::Break(())
             });
         }
         let mut reply = match load {
