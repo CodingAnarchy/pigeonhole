@@ -12,6 +12,8 @@ use std::ffi::OsString;
 use std::io::Write;
 
 mod args;
+#[doc(hidden)]
+pub mod candle_env;
 mod cmd;
 mod exit;
 mod mcp;

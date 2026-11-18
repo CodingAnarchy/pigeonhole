@@ -10,6 +10,12 @@
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> std::process::ExitCode {
+    // First, before any thread: `--embed-local` runs itself again with candle's pool
+    // variables when they're unset (#2061, `candle_env`). Only an exec failure returns here.
+    #[cfg(all(unix, feature = "embed-local"))]
+    if let Err(e) = pigeonhole_cli::candle_env::reexec() {
+        eprintln!("phdb: --embed-local: couldn't set candle's pool variables ({e}); going on without them");
+    }
     let status = pigeonhole_cli::run(
         std::env::args_os(),
         // Unlocked handles, which lock per write: a held lock blocks every other thread that

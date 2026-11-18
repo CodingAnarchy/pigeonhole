@@ -787,14 +787,8 @@ impl Placement {
         }
     }
 
-    /// The CPUs the server's own heavy threads may run on, as a CPU list (`2-7,10`), when the
-    /// plan pins them: the value for `CANDLE_CPU_MASK`.
-    pub(crate) fn cpu_list(&self) -> Option<String> {
-        self.masks.blocking.as_deref().map(format_cpu_list)
-    }
-
-    /// The request runtime's CPUs, as a CPU list, when they differ from
-    /// [`Placement::cpu_list`]'s: for the startup line.
+    /// The request runtime's CPUs, as a CPU list, when they differ from the blocking
+    /// threads': for the startup line.
     pub(crate) fn network_cpu_list(&self) -> Option<String> {
         (self.masks.network != self.masks.blocking)
             .then(|| self.masks.network.as_deref().map(format_cpu_list))
@@ -1436,7 +1430,6 @@ mod tests {
             ),
             "{off:?} against {plan:?}"
         );
-        assert_eq!(off.cpu_list(), None, "{off:?}");
         assert!(
             ["unpinned", "unmasked (--affinity off)"].contains(&off.mode),
             "{off:?}"

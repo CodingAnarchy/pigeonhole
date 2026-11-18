@@ -70,9 +70,11 @@ impl LoadOptions {
     /// The embedder's threads (at least 1). Unset: `min(available parallelism, 4)`.
     ///
     /// Every call on one embedder queues for this pool, so `threads` bounds the CPU its
-    /// matrix products take, however many threads call it. (candle also runs large
-    /// element-wise steps on a process-wide pool of its own, sized by `CANDLE_NUM_THREADS`
-    /// and, on Linux, placed by `CANDLE_CPU_MASK`: see the crate docs.)
+    /// matrix products take, however many threads call it. It doesn't size candle's own
+    /// process-wide pool, which runs large element-wise steps on threads of its own: the
+    /// process sizes that with `CANDLE_NUM_THREADS` (and places it, on Linux, with
+    /// `CANDLE_CPU_MASK`) before it starts. With `CANDLE_NUM_THREADS=1` it has no threads,
+    /// and those steps run here too (the crate docs).
     ///
     /// More isn't faster for single texts: on a 16-core x86 server, 32 threads embedded a
     /// 16-token text in 9.4 ms against 6.4 ms on 4. Keep about 4 for interactive use.

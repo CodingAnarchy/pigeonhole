@@ -273,42 +273,6 @@ fn embed_threads(free: usize) -> usize {
     free.clamp(1, 4)
 }
 
-/// With `--embed-local` and the shards pinned (`cpus`, the CPUs left to the network side as a
-/// list), a line telling the operator what to export, or `None` once both are set. candle runs
-/// large element-wise steps on a process-wide pool of its own, which
-/// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_CPU_MASK` places it (Linux) and
-/// `CANDLE_NUM_THREADS` sizes it. The mask alone isn't enough: unsized, the pool takes a
-/// thread per core (from `RAYON_NUM_THREADS` or the core count) and crowds them onto the
-/// masked CPUs (cli692's N2 on #1671). Its size is the embedder's own, `threads`, so
-/// embedding takes about that many CPUs in all (N1). Without the mask or `RAYON_NUM_THREADS`,
-/// candle 0.11 also re-reads `/proc/cpuinfo` on every matrix product (huggingface/candle#4070).
-/// They're read once, from the environment, and setting them here would need `unsafe` (D318),
-/// so the operator sets them before the start. Only the unset ones are named.
-fn candle_advice(
-    cpus: Option<String>,
-    threads: usize,
-    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<String> {
-    let cpus = cpus?;
-    let missing: Vec<String> = [
-        ("CANDLE_CPU_MASK", cpus),
-        ("CANDLE_NUM_THREADS", threads.to_string()),
-    ]
-    .into_iter()
-    .filter(|(k, _)| env(k).is_none())
-    .map(|(k, v)| format!("{k}={v}"))
-    .collect();
-    if missing.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "phdb serve: --embed-local: candle's own thread pool isn't placed and sized off the \
-         shards' CPUs. Start the server with these in its environment (they're read once, at \
-         start):\n  export {}",
-        missing.join(" ")
-    ))
-}
-
 /// The options every database `serve` opens takes: a single node's and each cluster
 /// partition's alike (#1775: a partition had missed `--no-wal-preallocate`'s default, so its
 /// logs grew while commits waited on them). Only the shard count, the compaction threads and
@@ -703,14 +667,14 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         if let Some(note) = &placement.note {
             let _ = writeln!(stderr, "phdb serve: {note}");
         }
-        if args.memory.embed_local
-            && let Some(line) = candle_advice(
-                placement.cpu_list(),
-                embed_threads(placement.free_cpus),
-                &|k| std::env::var_os(k),
-            )
-        {
-            let _ = writeln!(stderr, "{line}");
+        if args.memory.embed_local {
+            // candle's own pool (#2061): phdb sets its variables before it starts when
+            // they're unset (`candle_env`); this says what the process runs with.
+            let _ = writeln!(
+                stderr,
+                "phdb serve: --embed-local: {}",
+                crate::candle_env::report(&|k| std::env::var_os(k))
+            );
         }
         if let Some(r) = &replica {
             let _ = writeln!(stderr, "phdb serve: a replica of {}", r.primary());

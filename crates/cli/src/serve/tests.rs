@@ -172,35 +172,11 @@ fn a_quiet_stream_still_moves_its_token() {
     assert_eq!(back, event);
 }
 
-// ---- `--embed-local`'s startup advice (#1345 PR 2) ----
+// ---- `--embed-local`'s threads (#1345 PR 2) ----
 
-/// The line comes only when the shards are pinned, and names only the variables still unset:
-/// the placement's CPU list for `CANDLE_CPU_MASK` and the embedder's thread count for
-/// `CANDLE_NUM_THREADS` (cli692's N1 and N2 on #1671). `RAYON_NUM_THREADS` alone places
-/// nothing, so it doesn't silence it.
+/// The embedder's threads on the network side's free CPUs: at most 4 (D318).
 #[test]
-fn embed_local_advice_names_the_placements_cpus_until_both_are_set() {
-    use std::ffi::OsString;
-    let env =
-        |set: &'static [&'static str]| move |k: &str| set.contains(&k).then(|| OsString::from("1"));
-    let pinned = || Some("2-7,10".to_owned());
-    let advice = |set: &'static [&'static str]| super::candle_advice(pinned(), 4, &env(set));
-
-    let line = advice(&[]).expect("pinned, nothing set: advice");
-    assert!(line.starts_with("phdb serve: --embed-local:"), "{line}");
-    assert!(
-        line.ends_with("export CANDLE_CPU_MASK=2-7,10 CANDLE_NUM_THREADS=4"),
-        "{line}"
-    );
-    assert!(advice(&["RAYON_NUM_THREADS"]).is_some());
-    // The mask alone leaves the pool a thread per core: the count is still asked for.
-    let line = advice(&["CANDLE_CPU_MASK"]).expect("mask only: advice");
-    assert!(line.ends_with("export CANDLE_NUM_THREADS=4"), "{line}");
-    let line = advice(&["CANDLE_NUM_THREADS"]).expect("count only: advice");
-    assert!(line.ends_with("export CANDLE_CPU_MASK=2-7,10"), "{line}");
-    assert_eq!(advice(&["CANDLE_CPU_MASK", "CANDLE_NUM_THREADS"]), None);
-    // No placement (`--unpin`, or nothing pinned): nothing to say.
-    assert_eq!(super::candle_advice(None, 4, &env(&[])), None);
+fn embed_local_threads_are_the_free_cpus_up_to_four() {
     assert_eq!(super::embed_threads(0), 1);
     assert_eq!(super::embed_threads(3), 3);
     assert_eq!(super::embed_threads(30), 4);

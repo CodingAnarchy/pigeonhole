@@ -58,9 +58,12 @@
 //! - **candle's process-wide pool** for large element-wise steps (64K elements and up: long
 //!   texts, or batches). It's started on first use with `CANDLE_NUM_THREADS` threads (by
 //!   default one per physical core, less one), which spin briefly before parking. On Linux,
-//!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. Set both in the process's
-//!   environment before it starts (they're read once, and a library can't set them safely):
-//!   `phdb serve` prints the values for its placement.
+//!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. Set them in the process's
+//!   environment before it starts (they're read once, and a library can't set them safely).
+//!   `CANDLE_NUM_THREADS=1` leaves that pool without workers: its steps then run on the
+//!   embedder's own threads, which [`LoadOptions::threads`] counts and
+//!   [`LoadOptions::on_thread_start`] places. `phdb --embed-local` sets that, and the mask,
+//!   itself when they're unset (#2061).
 //!
 //! **On Linux, set `RAYON_NUM_THREADS` or `CANDLE_CPU_MASK`.** With neither set, candle
 //! 0.11 re-reads `/proc/cpuinfo` on every matrix product to count the physical cores
