@@ -784,3 +784,133 @@ fn a_reinstalled_shares_commit_survives_a_crash_after_another_slots_flush() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn a_tablet_change_is_given_up_while_an_in_doubt_share_reads_a_row_on_it() {
+    // #2050: a share in doubt that only reads row `r` (it writes `w`, on another tablet)
+    // holds `r` against writes. A move of `r`'s tablet would take the row to a shard with no
+    // hold on it, where a write would land below the share's decision: the move is given up
+    // (`Busy`) while the share is in doubt, as for a row it writes.
+    let vfs = SimVfs::new(43);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    let uf = u.family("f").unwrap().id;
+    let from = db.shard_of(t.id, b"r").expect("routed");
+    let to = 1 - from;
+    let mut txn = db.begin().unwrap();
+    let _ = txn.get(t.id, f, b"r", b"q").unwrap();
+    txn.batch()
+        .put(u.id, uf, b"w", b"q", None, ValueRef::Bytes(b"held"))
+        .unwrap();
+    txn.prepare(b"rm", Durability::GroupSync).unwrap();
+    let moved = db
+        .move_tablet_pending(t.id, b"r", to as u16)
+        .and_then(finish);
+    assert!(matches!(moved, Err(Error::Busy)), "{moved:?}");
+    assert_eq!(db.shard_of(t.id, b"r"), Some(from), "the tablet stays");
+    // The hold is still there: a write to `r` is refused.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"under"))
+        .unwrap();
+    let w = db.commit(wb, Some(Durability::GroupSync));
+    assert!(matches!(w, Err(Error::Busy)), "{w:?}");
+    db.decide(b"rm", true).unwrap().expect("in doubt");
+    // Decided: the move goes through.
+    finish(db.move_tablet_pending(t.id, b"r", to as u16).unwrap()).unwrap();
+    assert_eq!(db.shard_of(t.id, b"r"), Some(to));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it() {
+    // #2050, the D263 case: a cross-shard transaction that reads `r` and writes `w` on the
+    // other shard, its decision held. A move of `r`'s tablet waits for the decision (an
+    // internal share decides soon), rather than taking `r` to a shard where a write would
+    // land below the share's decision seqno.
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let vfs = SimVfs::new(44);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"r").expect("routed");
+    let other = 1 - here;
+    if db.shard_of(u.id, b"w") == Some(here) {
+        finish(db.move_tablet_pending(u.id, b"w", other as u16).unwrap()).unwrap();
+    }
+    db.inject(Fault::HoldDecisionRecords, true);
+    let mut reader = db.begin().unwrap();
+    let _ = reader.get(t.id, f, b"r", b"q").unwrap();
+    reader
+        .batch()
+        .put(u.id, uf, b"w", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    let mut commit = reader.submit(Some(Durability::GroupSync)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Undecided once an external prepare reading `w` is refused for the overlap.
+    let mut n = 0;
+    loop {
+        n += 1;
+        let xid = format!("p{n}");
+        let mut p = txn(&db, &u, b"w", &[b"zz"], b"x")
+            .submit_prepare(xid.as_bytes(), Durability::GroupSync)
+            .unwrap();
+        let answer = loop {
+            if let Poll::Ready(r) = std::pin::Pin::new(&mut p).poll(&mut cx) {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe never answered"
+            );
+            std::thread::yield_now();
+        };
+        match answer {
+            Ok(_) => {
+                db.decide(xid.as_bytes(), false).unwrap().expect("in doubt");
+                assert!(std::time::Instant::now() < deadline, "never undecided");
+                std::thread::yield_now();
+            }
+            Err(Error::Busy) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let mut moving = db.move_tablet_pending(t.id, b"r", other as u16).unwrap();
+    let held_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < held_until {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut moving).poll(&mut cx) {
+            db.release_held_decisions();
+            panic!("the move finished over an undecided share's read: {r:?}");
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(db.shard_of(t.id, b"r"), Some(here), "the tablet stays");
+    db.inject(Fault::HoldDecisionRecords, false);
+    db.release_held_decisions();
+    loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut commit).poll(&mut cx) {
+            r.unwrap();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the commit never decided"
+        );
+        std::thread::yield_now();
+    }
+    finish(moving).unwrap();
+    assert_eq!(db.shard_of(t.id, b"r"), Some(other));
+    db.close().unwrap();
+}
