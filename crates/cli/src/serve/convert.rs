@@ -104,6 +104,31 @@ pub(crate) fn elements(v: &proto::Vector) -> Result<Elements> {
     )
 }
 
+/// `e` as a request's vector again, which [`elements`] reads back to `e` (#1722 PR 3: a
+/// BulkLoad part forwarded to another node). A bit vector's dimension is 8 per byte, as
+/// [`elements`] keeps only its bytes.
+pub(crate) fn vector_of(e: &Elements) -> proto::Vector {
+    fn le<T: Copy, const N: usize>(x: &[T], to: fn(T) -> [u8; N]) -> Vec<u8> {
+        x.iter().flat_map(|&v| to(v)).collect()
+    }
+    let (element, dim, data) = match e {
+        Elements::F32(x) => (proto::Element::F32, x.len(), le(x, f32::to_le_bytes)),
+        Elements::I8(x) => (
+            proto::Element::I8,
+            x.len(),
+            x.iter().map(|&v| v as u8).collect(),
+        ),
+        Elements::Bits(x) => (proto::Element::Bit, 8 * x.len(), x.clone()),
+        Elements::F16(x) => (proto::Element::F16, x.len(), le(x, u16::to_le_bytes)),
+        Elements::Bf16(x) => (proto::Element::Bf16, x.len(), le(x, u16::to_le_bytes)),
+    };
+    proto::Vector {
+        element: element as i32,
+        dim: u32::try_from(dim).unwrap_or(u32::MAX),
+        data: data.into(),
+    }
+}
+
 fn value_of(v: Option<&proto::Value>) -> Result<&value::Kind> {
     v.and_then(|v| v.kind.as_ref())
         .ok_or_else(|| ApiError::invalid("a put needs a value"))

@@ -137,7 +137,7 @@ pub(crate) async fn prepay(
         rest: data,
     };
     let meter = Meter::default();
-    let body = if parts.uri.path() == BULK_LOAD {
+    let body = if parts.uri.path() == BULK_LOAD || parts.uri.path() == FORWARD_BULK_LOAD {
         Body::from_stream(Metered {
             inner: rest,
             meter: meter.clone(),
@@ -214,10 +214,15 @@ pub(crate) async fn health_prepay(
 /// The client stream whose messages are each reserved as they arrive.
 const BULK_LOAD: &str = "/pigeonhole.v1.Vectors/BulkLoad";
 
+/// A partition's part of a cluster's `BulkLoad` from another node (#1722 PR 3): a client
+/// stream too, each message reserved as it arrives. Mounted on a route of its own behind
+/// [`prepay`] (`cluster::routes`).
+pub(crate) const FORWARD_BULK_LOAD: &str = "/pigeonhole.v1.Cluster/ForwardBulkLoad";
+
 /// The reservations [`Metered`] made for a stream's later messages, in order, for its
 /// handler to take one per message; or the reservation that failed.
 #[derive(Clone, Default)]
-struct Meter(
+pub(crate) struct Meter(
     Arc<
         Mutex<(
             std::collections::VecDeque<OwnedSemaphorePermit>,
@@ -1025,6 +1030,45 @@ impl proto::vectors_server::Vectors for VectorsGrpc {
         req: Request<proto::VectorVerifyRequest>,
     ) -> Result<Response<proto::VectorVerifyResponse>, Status> {
         unary!(&self.0, req, VectorVerify, VectorVerify)
+    }
+}
+
+/// What [`prepay`] reserved for a client stream: its first message's share, and the meter
+/// its later messages' shares arrive on. For a handler outside this module
+/// (`Cluster.ForwardBulkLoad`, #1722 PR 3).
+pub(crate) fn stream_budget<T>(req: &Request<T>) -> (Option<OwnedSemaphorePermit>, Meter) {
+    (
+        req.extensions().get::<Prepaid>().and_then(Prepaid::take),
+        req.extensions().get::<Meter>().cloned().unwrap_or_default(),
+    )
+}
+
+/// A forwarded BulkLoad part's later messages (#1722 PR 3), each with the reservation
+/// `Metered` made for it: their `load`. A message without one is an empty batch (the
+/// sending node's keep-alive while another partition holds it up).
+pub(crate) struct ForwardSource {
+    pub(crate) stream: tonic::Streaming<proto::ForwardBulkLoadRequest>,
+    pub(crate) meter: Meter,
+}
+
+impl super::bulk::Source for ForwardSource {
+    async fn next(
+        &mut self,
+    ) -> Result<Option<(proto::VectorBulkLoadRequest, Option<OwnedSemaphorePermit>)>, ApiError>
+    {
+        match self.stream.message().await {
+            Ok(Some(m)) => Ok(Some((
+                m.load.unwrap_or_default(),
+                self.meter.lock().0.pop_front(),
+            ))),
+            Ok(None) => Ok(None),
+            Err(status) => Err(self.meter.lock().1.take().unwrap_or_else(|| {
+                ApiError::invalid(format!(
+                    "the forwarded load's stream failed: {}",
+                    status.message()
+                ))
+            })),
+        }
     }
 }
 

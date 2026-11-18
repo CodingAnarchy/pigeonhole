@@ -51,6 +51,23 @@ pub(crate) struct Batch {
     budget: Option<OwnedSemaphorePermit>,
 }
 
+impl Batch {
+    /// A batch of `items` holding no budget, `bytes` long for the gauge: one partition's
+    /// part of a message a cluster's entry node split by id (#1722 PR 3).
+    pub(crate) fn of(items: Vec<Item>, bytes: u64) -> Self {
+        Self {
+            items,
+            bytes,
+            budget: None,
+        }
+    }
+
+    /// The batch's vectors, its encoded length, and the budget its message holds.
+    pub(crate) fn into_parts(self) -> (Vec<Item>, u64, Option<OwnedSemaphorePermit>) {
+        (self.items, self.bytes, self.budget)
+    }
+}
+
 /// What a front-end hands the loader.
 pub(crate) enum Msg {
     Batch(Batch),

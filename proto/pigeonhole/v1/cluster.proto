@@ -57,6 +57,13 @@ service Cluster {
   // partition's lease lapses or it closes. The events are a single node's. Cluster scope,
   // gRPC only.
   rpc ForwardMemoryWatch(ForwardMemoryWatchRequest) returns (stream MemoryEvent);
+  // Node to node (#1722 PR 3, ICR 0138): one partition's part of a `Vectors.BulkLoad`
+  // into an index on several partitions, which the sending node splits by id. Served as
+  // this node's own `BulkLoad` of the partition, for the caller it names, only if its map
+  // gives it `partition`; each message reserves its share of the in-flight budget as a
+  // client's does, on connections of their own, outside the `Cluster` calls' limit.
+  // Cluster scope, gRPC only.
+  rpc ForwardBulkLoad(stream ForwardBulkLoadRequest) returns (Empty);
   // D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
   // (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
   // unfenced, or at its new node); its reads go on. Answers once every write admitted before
@@ -609,6 +616,18 @@ message ForwardScanRequest {
   bool to_replica = 7;
   uint64 replica_max_lag_ms = 5;
   uint64 min_primary_seqno = 6;
+}
+
+// One message of a forwarded `Vectors.BulkLoad` part (#1722 PR 3). The first carries
+// `map_version`, `caller` and `partition`, and its `load` the index and `expected` (the
+// client's, for the whole load); the later ones carry only `load.items`.
+message ForwardBulkLoadRequest {
+  // The sending node's map version, as in `ForwardRequest`.
+  uint64 map_version = 1;
+  ForwardedCaller caller = 2;
+  // The partition to load: it must be this node's.
+  string partition = 3;
+  VectorBulkLoadRequest load = 4;
 }
 
 // The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are

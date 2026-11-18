@@ -316,7 +316,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
   - **`/metrics`:** `pigeonhole_serve_connections` (open now), `pigeonhole_serve_connections_max`, `pigeonhole_serve_connections_refused_total` and `pigeonhole_serve_accept_errors_total`. Out of descriptors (`EMFILE`), accepting waits for a connection to close, a second at most, and logs a line a second at most.
 - `--max-scans` (64): scans streaming at once, refused past that the same way. A scan's pages count against `--inflight-bytes` until they're handed to the connection, and at most half the blocking threads read scan pages at once.
 - `--stream-idle-ms` (30,000): how long a scan waits for its client to read a page, a feed stream with a full buffer waits for its client to take an event, or a `Vectors.BulkLoad` waits for its client's next message, before ending the stream.
-- `--bulk-load-bytes` (1 GiB): what the node's `Vectors.BulkLoad`s hold at most, outside `--inflight-bytes`: a load's sample while it clusters it, then its lists' pending batches. A load whose worst case is more is refused before it starts ([Graphs, vectors and text](#graphs-vectors-and-text) has the sizing).
+- `--bulk-load-bytes` (1 GiB): what the node's `Vectors.BulkLoad`s hold at most, outside `--inflight-bytes`: a load's sample while it clusters it, then its lists' pending batches. A load whose worst case is more is refused before it starts ([Graphs, vectors and text](#graphs-vectors-and-text) has the sizing). On a cluster, each partition's part of a load reserves the whole load's worst case, so a node serving several partitions of one index may need it raised ([Indexes on a cluster](#indexes-on-a-cluster)).
 - `--max-streams` (256): feed streams at once. `--max-feed-hubs` (32): distinct table sets subscribed at once. Past either, a subscription gets `Overloaded`.
 - **128 streams per connection:** one HTTP/2 connection carries at most 128 streams at once (scans, feed streams and calls alike). A client that opens more on one connection doesn't get an error: the extra streams wait until earlier ones end, and a feed stream may never end. Open another connection for each 128 concurrent streams. With tonic, that means another `Channel`, because one `Channel` is one connection.
 - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
@@ -548,7 +548,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - backups and restore;
   - several partitions per node.
 - **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
-  - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Text.Search`, `Text.Rebuild` and both kinds' `Verify` across an index's partitions, but doesn't yet run `Vectors.BulkLoad` across them ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
+  - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Vectors.BulkLoad`, `Text.Search`, `Text.Rebuild` and both kinds' `Verify` across an index's partitions ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
   - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve reads that allow staleness, across partitions too. A replica is made the owner by hand (`phdb cluster promote`); automatic failover is #1484. A cluster node refuses `--replica-of` and `Admin.Promote`.
@@ -636,7 +636,6 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **A batch across partitions** is refused with `CrossPartition` before anything is written. The error names each partition and its first row, so you can split the batch.
 - **Where a node's map is older:** `WrongPartition` is handled between nodes. A node with an older map pulls the newer one and forwards again. A fanned-out read's part whose partition a newer map dropped since the read began answers `WrongPartition` too: read the map again and retry.
 - **Refused with `Unsupported`** on a cluster node in this release:
-  - the index call not yet run across an index's partitions: `Vectors.BulkLoad` (#1722, 1.3.0). Creates, drops, writes, both kinds' `Search` and `Verify`, and `Text.Rebuild` work ([Indexes on a cluster](#indexes-on-a-cluster));
   - `Admin.Promote`. `Admin.Info`, `Flush` and `Compact` cover the node's own partitions ([Admin](#admin)), and `Admin.Metrics`, `Backup` and `BackupDownload` work ([Backup and restore](#backup-and-restore));
   - `/mcp` on a node that only routes ([Remote MCP](#remote-mcp)).
 - **A node holds every partition its map gives it,** opened at start in id order after checking each file's identity row against the map. One that fails to open stops the node from starting. A node the map gives no partition only routes.
@@ -704,7 +703,14 @@ An IVF or BM25 index on a cluster (#1722, ICR 0138) is an **index placement** in
     - **To tell when it's done:** call `Text.Rebuild` again. While that node is still rebuilding, its partition answers `Overloaded` ("already rebuilding"), and the call retries it after the `RetryInfo` delay. Once that node is free, the call rebuilds again and answers the counts. `Text.Verify` shows the progress without rebuilding: its `source_mismatch` falls to 0 once every source row is indexed as it stands.
     - **A retry is safe:** a rebuild reads the source and rewrites the index to match it, so running it again changes nothing that's already right. It does reread the whole source.
   - **Searches go on during a rebuild,** strict ones included: the index stays whole while it's rebuilt. Only a new index's background fill answers `Unavailable`.
-- **Not yet:** `Vectors.BulkLoad` answers `Unsupported` until #1722 PR 3. Use `Vectors.Insert` meanwhile.
+- **`Vectors.BulkLoad`** goes through any node, which splits the stream by id: each vector goes to the partition its id's range is in.
+  - **Each partition loads its own part** as a single node does, into its own empty index. A partition none of the ids fall in isn't touched, and its index stays empty.
+  - **`expected` applies to every partition:** a partition's share isn't known until the load has been read, and each partition's load stops at about twice its `expected`. So every partition takes the whole load's value.
+    - Each partition's lists are sized for the whole load, so each list holds less than on a single node, until later writes split or merge them.
+    - Each partition's load reserves the whole load's worst case from its node's `--bulk-load-bytes`. A node serving several of the index's partitions may need the flag raised, or the load is refused before it starts.
+  - **One slow partition slows the whole load,** as a slow loader does on a single node: a message's vectors all go out before the next is read.
+  - **A partition that fails or can't be reached** fails the load, naming it. The other partitions stop with the vectors they took, so the error says the index may be loaded in part (`retry_safe: false`): `Insert` the rest, or drop the index and load again.
+  - **Every node serving a partition of the index must run 1.3.0 or later.** A load with one that doesn't is refused with `Unsupported`, naming it, before anything is read.
 
 ### Schema through the cluster
 Tables and their families live in the cluster map ([D317](../design/decisions/phase-3.md#d317)). `Schema.CreateTable`, `DropTable`, `ListTables`, `DescribeTable` and `GET /v1/tables` work through any node, with a single node's scopes: `write` to create (`if_missing` included), `admin` to drop, `read` to list and describe. Every node makes its partitions' files follow the map.
