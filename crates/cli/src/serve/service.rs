@@ -1032,6 +1032,23 @@ pub(crate) fn render_sessions(out: &mut String, tables: &[&super::sessions::Sess
     );
 }
 
+/// `--embed-local`'s candle variables left unset at startup (#2061), one gauge per variable:
+/// 1 while the server runs without it, as its startup warning said. Only with `--embed-local`.
+pub(crate) fn render_candle(out: &mut String, bits: u8) {
+    use std::fmt::Write as _;
+    if bits & 0x80 == 0 {
+        return;
+    }
+    let _ = writeln!(out, "# TYPE pigeonhole_serve_embed_env_unset gauge");
+    for (i, var) in super::CANDLE_VARS.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "pigeonhole_serve_embed_env_unset{{variable=\"{var}\"}} {}",
+            (bits >> i) & 1
+        );
+    }
+}
+
 /// `Vectors.BulkLoad`'s gauges (perf287's B3 on 7b2): the running load's phase, and the
 /// vectors and message bytes handed to it, an upper bound on what it holds.
 fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
@@ -2873,6 +2890,7 @@ impl Service {
             let _ = writeln!(text, "# TYPE pigeonhole_serve_feed_hub_threads gauge");
             let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
         }
+        render_candle(&mut text, super::CANDLE_UNSET.load(Ordering::Relaxed));
         render_bulk(&mut text, parts);
         if self.text_rebuilds.packs() {
             render_text_packs(&mut text, parts);
