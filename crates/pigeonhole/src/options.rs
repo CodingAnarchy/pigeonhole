@@ -287,7 +287,7 @@ impl Default for Options {
             pin_threads: true,
             in_doubt_limits: (0, 0),
             wal_preallocate: false,
-            punch_freed: true,
+            punch_freed: false, // scratch: the pre-gate's punching-off arm
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,

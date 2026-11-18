@@ -344,7 +344,7 @@ impl EngineOptions {
             write_stall_timeout_nanos: 30_000_000_000,
             arena_chunk_bytes: None,
             grow_ahead: None,
-            punch_freed: true,
+            punch_freed: false, // scratch: the pre-gate's punching-off arm
             punch_tuning: None,
             balance_cold_passes: None,
             compaction_backoff_nanos: 1_000_000_000,
