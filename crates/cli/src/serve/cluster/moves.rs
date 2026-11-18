@@ -151,6 +151,20 @@ impl Node {
                 ),
             }
         }
+        // D331 PR 3: each replica copy here derives its gate again too, from its file's
+        // rows (its follower brings them in) and the new map.
+        for (id, copy) in cluster.replicas.load().iter() {
+            let Ok(part) = copy.service.part() else {
+                continue;
+            };
+            if let Err(e) = copy.follower.arm_ranges(&part.db) {
+                eprintln!(
+                    "phdb serve: the replica copy of {id} couldn't take map version {}'s \
+                     range moves: {e}; it keeps its last gate",
+                    map.map_version
+                );
+            }
+        }
         if raised {
             self.ask_after_raise();
         }

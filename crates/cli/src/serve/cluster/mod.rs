@@ -573,7 +573,7 @@ impl Node {
     }
 
     /// The node's map, or `NotFound` before it has one.
-    fn get_map(&self) -> Result<ClusterMap, ApiError> {
+    pub(crate) fn get_map(&self) -> Result<ClusterMap, ApiError> {
         self.state()
             .map
             .as_ref()

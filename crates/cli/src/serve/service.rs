@@ -2087,6 +2087,7 @@ impl Service {
         {
             ranges.check(&op, op.writes())?;
         }
+        self.copy_ranges(&op)?;
         // D332: a cluster partition's sampled loads. A read's first key, one read in 64 per
         // thread; a call's CPU per poll, one in 16 per thread. An unsampled call touches
         // nothing shared (perf287's must).
@@ -2759,6 +2760,7 @@ impl Service {
                 ranges.check(&op, false)?;
             }
         }
+        self.copy_ranges(&op)?;
         let reply = self.fanout_read(op, caller).await?;
         if let Some(gate) = &self.gate {
             gate.serving()?;
@@ -4291,6 +4293,7 @@ impl Service {
             .ok_or_else(|| ApiError::internal("a replica scan on a service that isn't one"))?;
         let op = ServiceOp::Scan(r);
         let budget = self.admit(&op.admit(), caller, None).await?;
+        self.copy_ranges(&op)?;
         let ServiceOp::Scan(r) = op else {
             unreachable!("made a scan just above")
         };
@@ -4302,6 +4305,20 @@ impl Service {
             .bounded(replica, max_lag_ms);
         drop(budget);
         opener.open(r, Some(slot), None, Some(Arc::clone(&self.metrics)))
+    }
+
+    /// D331 PR 3: on a cluster replica copy (it has no `WriteGate`), the copy's range gate,
+    /// which its follower keeps: a copy of a move's target serves the range once it has
+    /// applied the target's serving row, and a copy of its source refuses a moved range as
+    /// the source does. One load, `None` on every other service.
+    #[inline]
+    fn copy_ranges(&self, op: &ServiceOp) -> Result<(), ApiError> {
+        if let Some(replica) = &self.replica
+            && let Some(ranges) = &*replica.ranges().load()
+        {
+            ranges.check(op, false)?;
+        }
+        Ok(())
     }
 
     /// A `--max-scans` slot, or `Overloaded`.

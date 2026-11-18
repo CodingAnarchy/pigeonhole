@@ -387,6 +387,9 @@ pub(crate) struct RangeGate {
     state: ArcSwapOption<RangeState>,
     moved: Mutex<Vec<Moved>>,
     serving: Mutex<Vec<Moved>>,
+    /// The state waits for a row the file doesn't hold yet: a replica copy's follower, which
+    /// brings rows in, reloads them after each run it applies while this is set (PR 3).
+    pending: std::sync::atomic::AtomicBool,
 }
 
 impl RangeGate {
@@ -440,7 +443,7 @@ impl RangeGate {
     /// it in; `visible` is the partition's visible seqno now, a new fence's seqno.
     pub(crate) fn update(&self, map: &ClusterMap, partition: &str, visible: u64) {
         let prev = self.state.load_full();
-        let next = derive(
+        let (next, pending) = derive(
             map,
             partition,
             &self.moved(),
@@ -449,12 +452,22 @@ impl RangeGate {
             visible,
         );
         self.state.store(next.map(Arc::new));
+        self.pending
+            .store(pending, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the state waits for a row the file doesn't hold yet (see `pending`).
+    pub(crate) fn pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/// `partition`'s state under `map`, with its moved-away rows `moved`; `prev` its state
-/// before (a fence keeps its seqno while it stands), `visible` its visible seqno now.
-/// `None` when nothing gates it.
+/// `partition`'s state under `map`, with its moved-away rows `moved` and serving rows
+/// `serving`; `prev` its state before (a fence keeps its seqno while it stands), `visible`
+/// its visible seqno now. `None` when nothing gates it; and whether it waits for a row the
+/// file doesn't hold yet (a replica copy whose follower hasn't applied it: a target's
+/// serving row at CLEANING, or a source's moved-away row once the map dropped its move,
+/// whose span it keeps from `prev` meanwhile).
 fn derive(
     map: &ClusterMap,
     partition: &str,
@@ -462,9 +475,10 @@ fn derive(
     serving: &[Moved],
     prev: Option<&RangeState>,
     visible: u64,
-) -> Option<RangeState> {
+) -> (Option<RangeState>, bool) {
     let mut spans = Vec::new();
     let mut handover_seqno = 0;
+    let mut pending = false;
     let span = |m: &super::proto::RangeMove, rule| {
         let (start, end) = map::move_range(m).ok()?;
         Some(Span {
@@ -498,6 +512,7 @@ fn derive(
             // Served from CLEANING on, once its serving row is in the file (written before
             // the gate opens it, so nothing of the range lands here below its `t_from`).
             spans.extend(span(m, Rule::Unserved));
+            pending |= phase >= MovePhase::Cleaning;
         }
     }
     // The rows of moves the map no longer carries: each part of the range a later move
@@ -556,8 +571,20 @@ fn derive(
             }));
         }
     }
+    // A source's span for a move the map dropped, whose row hasn't reached this file yet (a
+    // replica copy behind its owner): kept until it does.
+    if let Some(prev) = prev {
+        for s in prev.spans.iter().filter(|s| {
+            s.rule == Rule::Moved
+                && !map.moves.iter().any(|m| m.id == s.move_id)
+                && !moved.iter().any(|r| r.id == s.move_id)
+        }) {
+            spans.push(s.clone());
+            pending = true;
+        }
+    }
     if spans.is_empty() {
-        return None;
+        return (None, pending);
     }
     let fenced = |s: &RangeState| s.spans.iter().any(|x| x.rule == Rule::Fenced);
     let fence_seqno = if spans.iter().any(|s| s.rule == Rule::Fenced) {
@@ -566,13 +593,16 @@ fn derive(
     } else {
         0
     };
-    Some(RangeState {
-        partition: partition.to_owned(),
-        map_version: map.map_version,
-        spans,
-        fence_seqno,
-        handover_seqno,
-    })
+    (
+        Some(RangeState {
+            partition: partition.to_owned(),
+            map_version: map.map_version,
+            spans,
+            fence_seqno,
+            handover_seqno,
+        }),
+        pending,
+    )
 }
 
 /// A key range, `[start, end)`; `end` `None`: to the table's end.
@@ -940,6 +970,52 @@ mod tests {
             .load_full()
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_copy_waits_for_the_rows_its_follower_brings() {
+        // A copy of the source, whose map already dropped the move but whose file hasn't
+        // got the moved-away row: it keeps the span it had, and waits for the row.
+        let mut handed = map(Some(MovePhase::HandedOver));
+        handed.tables[0] = map::handed_over(&handed.tables[0], b"c", Some(b"f"), "p2");
+        let g = gate(&handed, "p1", Vec::new(), 10);
+        let mut done = map(None);
+        done.tables[0] = handed.tables[0].clone();
+        g.update(&done, "p1", 11);
+        assert!(g.pending(), "waits for its row");
+        let s = g.state.load_full().expect("still gated");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("WrongPartition"));
+        // The row arrives: no longer waiting, still gated, now from the row.
+        let row = Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"f".to_vec()),
+            term: 0,
+            version: 5,
+            seqno: 9,
+            at_ms: 0,
+        };
+        g.load_rows(vec![row.clone()], Vec::new());
+        g.update(&done, "p1", 12);
+        assert!(!g.pending());
+        let s = g.state.load_full().expect("gated");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("WrongPartition"));
+        // A copy of the target at CLEANING waits for its serving row, then serves.
+        let cleaning = map(Some(MovePhase::Cleaning));
+        let t = gate(&cleaning, "p2", Vec::new(), 10);
+        assert!(t.pending());
+        assert!(t.state.load_full().is_some());
+        t.load_rows(
+            Vec::new(),
+            vec![Moved {
+                id: "mv1".into(),
+                ..row
+            }],
+        );
+        t.update(&cleaning, "p2", 11);
+        assert!(!t.pending());
+        assert!(t.state.load_full().is_none(), "serves it");
     }
 
     #[test]
