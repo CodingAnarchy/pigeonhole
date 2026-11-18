@@ -358,6 +358,10 @@ pub(crate) struct ShardCounters {
     /// Entries read validation visited in the shard's memtables (`Engine::validate_entries`,
     /// D273's tests: a hot row validates in a few entries, not one per version).
     pub validate_entries: AtomicU64,
+    /// Cross-shard shares the shard admitted and holds until their decision
+    /// (`Engine::shares_tracked`): a test waits for a share to be admitted on a condition,
+    /// not a clock (perf2's S1 on #2058).
+    pub shares_tracked: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -529,6 +533,41 @@ impl Engine {
             let _ = subs[usize::from(to.0)].submit(msg);
         }
         n
+    }
+
+    /// How many PREPAREs `Fault::HoldPrepares` holds now (test hook).
+    #[doc(hidden)]
+    pub fn held_prepares(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .held_prepares
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// How many cross-shard shares shard `shard` has admitted and tracked so far, each until
+    /// its decision (test hook): a share counted here holds its rows and reads there.
+    #[doc(hidden)]
+    pub fn shares_tracked(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .shares_tracked
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many commit `Decide`s `Fault::HoldDecides` holds now (test hook): one held means
+    /// its coordinator decided, so every participant had prepared its share.
+    #[doc(hidden)]
+    pub fn held_decides(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .held_decides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Sends the oldest `max` of the `Decide`s `Fault::HoldDecides` held, in the order they

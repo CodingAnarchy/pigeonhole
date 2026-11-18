@@ -849,7 +849,11 @@ fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it()
     if db.shard_of(u.id, b"w") == Some(here) {
         finish(db.move_tablet_pending(u.id, b"w", other as u16).unwrap()).unwrap();
     }
-    db.inject(Fault::HoldDecisionRecords, true);
+    // Its commit `Decide` to `r`'s shard is held (`Fault::HoldDecides`): that share stays
+    // undecided there. (Holding only the DECISION record isn't enough: D286 sends early
+    // `Decide`s that the participant applies meanwhile, so the share could be decided before
+    // the move, the second way #2056's CI run raced.)
+    db.inject(Fault::HoldDecides, true);
     let mut reader = db.begin().unwrap();
     let _ = reader.get(t.id, f, b"r", b"q").unwrap();
     reader
@@ -859,46 +863,27 @@ fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it()
     let mut commit = reader.submit(Some(Durability::GroupSync)).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    // Undecided once an external prepare reading `w` is refused for the overlap.
-    let mut n = 0;
-    loop {
-        n += 1;
-        let xid = format!("p{n}");
-        let mut p = txn(&db, &u, b"w", &[b"zz"], b"x")
-            .submit_prepare(xid.as_bytes(), Durability::GroupSync)
-            .unwrap();
-        let answer = loop {
-            if let Poll::Ready(r) = std::pin::Pin::new(&mut p).poll(&mut cx) {
-                break r;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the probe never answered"
-            );
-            std::thread::yield_now();
-        };
-        match answer {
-            Ok(_) => {
-                db.decide(xid.as_bytes(), false).unwrap().expect("in doubt");
-                assert!(std::time::Instant::now() < deadline, "never undecided");
-                std::thread::yield_now();
-            }
-            Err(Error::Busy) => break,
-            Err(e) => panic!("{e:?}"),
-        }
+    // Its coordinator decided once a `Decide` is held, which it sends only after every
+    // participant prepared: `r`'s shard holds the share, undecided. (A probe on `w` proved
+    // only the coordinator's own share, admitted first, while the PREPARE to `r`'s shard
+    // could still be on its way: the first way #2056's CI run raced.)
+    while db.held_decides() == 0 {
+        assert!(std::time::Instant::now() < deadline, "never decided");
+        std::thread::yield_now();
     }
     let mut moving = db.move_tablet_pending(t.id, b"r", other as u16).unwrap();
     let held_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
     while std::time::Instant::now() < held_until {
         if let Poll::Ready(r) = std::pin::Pin::new(&mut moving).poll(&mut cx) {
-            db.release_held_decisions();
+            db.inject(Fault::HoldDecides, false);
+            db.release_held_decides(usize::MAX);
             panic!("the move finished over an undecided share's read: {r:?}");
         }
         std::thread::yield_now();
     }
     assert_eq!(db.shard_of(t.id, b"r"), Some(here), "the tablet stays");
-    db.inject(Fault::HoldDecisionRecords, false);
-    db.release_held_decisions();
+    db.inject(Fault::HoldDecides, false);
+    db.release_held_decides(usize::MAX);
     loop {
         if let Poll::Ready(r) = std::pin::Pin::new(&mut commit).poll(&mut cx) {
             r.unwrap();
@@ -912,5 +897,81 @@ fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it()
     }
     finish(moving).unwrap();
     assert_eq!(db.shard_of(t.id, b"r"), Some(other));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_whose_tablet_moved_to_a_participant_after_it_validated_is_still_validated() {
+    // The CI failure of #2054's test, made deterministic. A cross-shard commit reads `r`
+    // (shard `here`) and writes `w` (shard `other`, its coordinator), after a write to `r`
+    // since its snapshot. The coordinator admits its own share first, while `r` isn't its
+    // row, so it doesn't validate it; the PREPARE to `here` is held (`Fault::HoldPrepares`)
+    // while `r`'s tablet moves to `other`. Released, `here` finds `r` now owned by a
+    // participant and leaves it to that one, which validated before it owned it: nobody
+    // would validate `r`. The commit must fail `Conflict` (or be retried through the new
+    // map and fail there), never commit over the changed read.
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let vfs = SimVfs::new(45);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"r").expect("routed");
+    let other = 1 - here;
+    if db.shard_of(u.id, b"w") == Some(here) {
+        finish(db.move_tablet_pending(u.id, b"w", other as u16).unwrap()).unwrap();
+    }
+    let mut txn = db.begin().unwrap();
+    let _ = txn.get(t.id, f, b"r", b"q").unwrap();
+    txn.batch()
+        .put(u.id, uf, b"w", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    // `r` changes after the snapshot.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"since"))
+        .unwrap();
+    db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    db.inject(Fault::HoldPrepares, true);
+    let mut commit = txn.submit(Some(Durability::GroupSync)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    // The PREPARE to `here` is held, and the coordinator admitted its own share, before the
+    // move: on conditions, not a clock (perf2's S1 on #2058: a move first would route the
+    // coordinator's share with the new map, which then validates `r` itself, and the test
+    // would pass without reaching the hole).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.held_prepares() == 0 || db.shares_tracked(other) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the coordinator's share was never admitted"
+        );
+        assert!(std::pin::Pin::new(&mut commit).poll(&mut cx).is_pending());
+        std::thread::yield_now();
+    }
+    assert_eq!(db.shares_tracked(here), 0, "r's shard has seen nothing yet");
+    finish(db.move_tablet_pending(t.id, b"r", other as u16).unwrap()).unwrap();
+    assert_eq!(db.shard_of(t.id, b"r"), Some(other));
+    db.inject(Fault::HoldPrepares, false);
+    assert!(db.release_held_prepares() > 0, "no PREPARE was held");
+    let r = loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut commit).poll(&mut cx) {
+            break r;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the commit never answered"
+        );
+        std::thread::yield_now();
+    };
+    assert!(matches!(r, Err(Error::Conflict)), "{r:?}");
+    assert_eq!(
+        get_bytes(&db, &u, b"w"),
+        None,
+        "nothing written over the stale read"
+    );
     db.close().unwrap();
 }
