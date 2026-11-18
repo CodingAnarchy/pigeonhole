@@ -22,6 +22,7 @@
 mod async_poll;
 mod buf;
 mod completion;
+mod count;
 mod error;
 mod file;
 mod nowait;
@@ -43,6 +44,7 @@ pub use async_poll::{
 };
 pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver};
+pub use count::IoCounters;
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, Locality, LockMode, OpenOptions};
 #[doc(hidden)]

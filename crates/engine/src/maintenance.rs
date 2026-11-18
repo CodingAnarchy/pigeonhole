@@ -116,7 +116,7 @@ fn copy_into(
         // New SSTs (the memtables', and any rewritten) take ids above every source SST's.
         sst_ids: Arc::new(AtomicU64::new(source.counters.next_sst)),
         seqno: snapshot.seqno,
-        created: shared.vfs.now_micros(),
+        created: shared.clock_vfs.now_micros(),
         closing,
     };
     let (mut plan, kept_refs) = CopyPlan::new(&source, copier.seqno);

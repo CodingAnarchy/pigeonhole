@@ -498,6 +498,38 @@ impl ServiceOp {
     /// delivery is gated instead), nor the calls that read no rows (the schema, metrics,
     /// maintenance), nor a transaction's `Commit`: one with writes is gated as a write where
     /// it's answered, and a read-only one reads nothing past its transaction's reads.
+    /// Calls `f` with each (table name, key) the op touches, in request order, until it
+    /// returns `Break`. A stub with ai1249's signature (D331 PR 2 brings the full one, which
+    /// replaces it): only point reads and prefix scans here, enough for D332's sampled read
+    /// keys.
+    pub(crate) fn touches(
+        &self,
+        f: &mut dyn FnMut(&str, Touch<'_>) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
+        use std::ops::ControlFlow;
+        match self {
+            Self::Get(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::ReadRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::MultiGet(r) => {
+                for k in &r.keys {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Scan(r) => match r.range.as_ref().and_then(|k| k.range.as_ref()) {
+                Some(proto::key_range::Range::Prefix(p)) => f(
+                    &r.table,
+                    Touch::Range {
+                        start: p,
+                        end: None,
+                    },
+                ),
+                _ => ControlFlow::Continue(()),
+            },
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
     pub(crate) fn reads_partition(&self) -> bool {
         matches!(
             self,
@@ -1350,6 +1382,22 @@ impl Pinning {
     }
 }
 
+/// A key an op touches ([`ServiceOp::touches`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Touch<'a> {
+    /// A point op's row.
+    Row(&'a [u8]),
+    /// A scan's bounds (a prefix scan as its `[prefix, next)` range).
+    Range {
+        start: &'a [u8],
+        #[expect(
+            dead_code,
+            reason = "read by D331's range moves (ai1249's `touches` PR)"
+        )]
+        end: Option<&'a [u8]>,
+    },
+}
+
 /// What a node opens on the database it serves: the engine, the table cache, the indexes,
 /// the feeds, the memory store and the bulk loads (D317 ticket 2, cli692's S1). The node's
 /// own state (connections, budgets, pools, sessions, limits, metrics) stays on [`Service`].
@@ -1363,6 +1411,8 @@ pub(crate) struct Partition {
     /// How its engine's threads were placed when it opened (D317 ticket 8a's pinning
     /// check): a cluster node's gauges.
     pub(crate) pinning: Pinning,
+    /// Its sampled load, for the cluster balancer (D332): request CPU and read keys.
+    pub(crate) load: Arc<super::cluster::load::PartitionLoad>,
     /// Its engine memory (D317 ticket 8a's `--engine-memory`): as resolved at open, then as a
     /// node's re-split at another partition's open or close changed its caches (#1761). A
     /// cluster node's gauges, and the next re-split's starting point.
@@ -1494,6 +1544,7 @@ impl Partition {
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: config.pinning,
+            load: Arc::default(),
             engine_memory: std::sync::Mutex::new(config.engine_memory),
             backups: config.backups,
             indexes: Arc::new(super::indexes::Indexes::new(
@@ -1918,7 +1969,36 @@ impl Service {
             }
             _ => (None, None),
         };
-        let mut reply = self.answer(op, caller, budget).await;
+        // D332: a cluster partition's sampled loads. A read's first key, one read in 64 per
+        // thread; a call's CPU per poll, one in 16 per thread. An unsampled call touches
+        // nothing shared (perf287's must).
+        let load = match (&self.gate, &self.part) {
+            (Some(_), Some(part)) => Some(&part.load),
+            _ => None,
+        };
+        if let Some(load) = load
+            && op.reads_partition()
+            && super::cluster::load::sample_read()
+        {
+            let _ = op.touches(&mut |table, touch| {
+                let key = match touch {
+                    Touch::Row(k) => k,
+                    Touch::Range { start, .. } => start,
+                };
+                load.add_read(table, key);
+                std::ops::ControlFlow::Break(())
+            });
+        }
+        let mut reply = match load {
+            Some(load) if super::cluster::load::sample_cpu() => {
+                super::cluster::load::sampled_call(
+                    Arc::clone(load),
+                    self.answer(op, caller, budget),
+                )
+                .await
+            }
+            _ => self.answer(op, caller, budget).await,
+        };
         if reply.is_ok() {
             if let Some(h) = &held
                 && let Err(e) = h.committed()
@@ -4855,10 +4935,12 @@ async fn held<T: Send + 'static>(
     _place: OwnedSemaphorePermit,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(|| {
+    // A sampled call's work is timed where it runs (D332, simp724's M1 on #2063).
+    let sampled = super::cluster::load::sampled();
+    tokio::task::spawn_blocking(move || {
         // A reused pool thread takes a mask published since it started (D317 ticket 6).
         super::placement::refresh();
-        f()
+        super::cluster::load::run_sampled(sampled.as_ref(), f)
     })
     .await
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?

@@ -208,7 +208,7 @@ impl Task for PunchPass {
             return TaskPoll::Done;
         }
         let simulated = self.shared.vfs.clock_is_simulated();
-        let now = self.shared.vfs.monotonic_nanos();
+        let now = self.shared.clock_vfs.monotonic_nanos();
         let next_at = punch.next_at.load(Ordering::Relaxed);
         if !simulated && now < next_at {
             return TaskPoll::SleepUntil(next_at);
