@@ -7,6 +7,7 @@
 //! or fails as it would have, and a lost reply is logged and counted.
 
 use std::collections::HashMap;
+use std::ops::{Bound, ControlFlow};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -498,38 +499,6 @@ impl ServiceOp {
     /// delivery is gated instead), nor the calls that read no rows (the schema, metrics,
     /// maintenance), nor a transaction's `Commit`: one with writes is gated as a write where
     /// it's answered, and a read-only one reads nothing past its transaction's reads.
-    /// Calls `f` with each (table name, key) the op touches, in request order, until it
-    /// returns `Break`. A stub with ai1249's signature (D331 PR 2 brings the full one, which
-    /// replaces it): only point reads and prefix scans here, enough for D332's sampled read
-    /// keys.
-    pub(crate) fn touches(
-        &self,
-        f: &mut dyn FnMut(&str, Touch<'_>) -> std::ops::ControlFlow<()>,
-    ) -> std::ops::ControlFlow<()> {
-        use std::ops::ControlFlow;
-        match self {
-            Self::Get(r) => f(&r.table, Touch::Row(&r.row)),
-            Self::ReadRow(r) => f(&r.table, Touch::Row(&r.row)),
-            Self::MultiGet(r) => {
-                for k in &r.keys {
-                    f(&r.table, Touch::Row(k))?;
-                }
-                ControlFlow::Continue(())
-            }
-            Self::Scan(r) => match r.range.as_ref().and_then(|k| k.range.as_ref()) {
-                Some(proto::key_range::Range::Prefix(p)) => f(
-                    &r.table,
-                    Touch::Range {
-                        start: p,
-                        end: None,
-                    },
-                ),
-                _ => ControlFlow::Continue(()),
-            },
-            _ => ControlFlow::Continue(()),
-        }
-    }
-
     pub(crate) fn reads_partition(&self) -> bool {
         matches!(
             self,
@@ -560,6 +529,162 @@ impl ServiceOp {
     /// engine's gate (R6).
     pub(crate) fn writes(&self) -> bool {
         self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
+    }
+
+    /// Calls `f` with each (table or index, key) the call names, in request order, until `f`
+    /// returns `Break` (D331's range gates, D332's sampled read keys). A name is a table's or
+    /// an index's: they never clash (`validate_indexes`), and an index that follows a table
+    /// takes that table's ranges, so a gate maps it to the table.
+    ///
+    /// - **A table's rows:** the point reads report their rows; the writes (`Mutate`,
+    ///   `MutateReturning`, `CheckAndMutate`, `Batch`) and a transaction's reads, writes and
+    ///   commit theirs, a row named twice twice. A write naming no row reports nothing: it's
+    ///   refused on its way in.
+    /// - **A table's ranges:** a scan and a nearest search report their range (no range: the
+    ///   whole table), or a nearest search its keys. A resumed scan reports its whole range,
+    ///   not the rest after `after`: a superset, safe for a gate and harmless for a sample.
+    /// - **A traversal** reports its seeds. The rows its edges lead to aren't in the request:
+    ///   it reads them through the partitions' clipped fan-out, which D331 audits apart.
+    /// - **An index's ids:** `Text.Put` and `Text.Delete` (which write the source table's
+    ///   row beside its postings) and `Vectors.Insert` and `Vectors.Delete` report their id;
+    ///   a bulk load, a text rebuild, a search and a verify report the whole index.
+    /// - **Nothing:** every other call, each arm saying why. None writes a table's or an
+    ///   index's rows; the memory calls write the memory store's own placement, which no move
+    ///   names. So a gate passes a call that reports nothing, and a new call must be sorted
+    ///   into an arm before it compiles.
+    pub(crate) fn touches(
+        &self,
+        f: &mut dyn FnMut(&str, Touch<'_>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let mut rows = |rows: &[proto::RowWrites]| {
+            for k in rows.iter().filter_map(|r| r.row.as_ref()) {
+                f(&k.table, Touch::Row(&k.row))?;
+            }
+            ControlFlow::Continue(())
+        };
+        match self {
+            Self::Get(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::ReadRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::TxnGet(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::TxnGetRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::MultiGet(r) => {
+                for k in &r.keys {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Scan(r) => f(&r.table, Touch::of_range(r.range.as_ref())),
+            Self::Nearest(r) => match &r.source {
+                Some(proto::nearest_request::Source::Keys(keys)) => {
+                    for k in &keys.keys {
+                        f(&r.table, Touch::Row(k))?;
+                    }
+                    ControlFlow::Continue(())
+                }
+                Some(proto::nearest_request::Source::Range(range)) => {
+                    f(&r.table, Touch::of_range(Some(range)))
+                }
+                None => f(&r.table, Touch::of_range(None)),
+            },
+            Self::Traverse(r) => {
+                for k in &r.seeds {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Mutate(r) | Self::MutateReturning(r) => rows(r.writes.as_slice()),
+            Self::CheckAndMutate(r) => rows(r.writes.as_slice()),
+            Self::Batch(r) => rows(&r.rows),
+            Self::TxnWrite(r) => rows(&r.rows),
+            Self::Commit(r) => rows(&r.rows),
+            // An index's ids: a text index always follows its source table, and `Text.Put`
+            // writes the source table's row keyed by exactly the id (`Index::put_in`; pinned
+            // by `a_text_put_writes_the_source_row_its_id_names`), so a gate fences that row.
+            // A vector index may follow a table, whose ranges route its ids.
+            Self::TextPut(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::TextDelete(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::VectorInsert(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::VectorDelete(r) => f(&r.index, Touch::Row(&r.id)),
+            // A whole index: its ids are in the stream, or it reads or rebuilds every one.
+            Self::VectorBulkLoad(op) => f(&op.index, Touch::of_range(None)),
+            Self::VectorSearch(r) => f(&r.index, Touch::of_range(None)),
+            Self::VectorVerify(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextSearch(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextRebuild(r) | Self::TextVerify(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextStats(proto::TextStatsRequest { search, .. })
+            | Self::TextSearchPart(proto::TextSearchPartRequest { search, .. }) => match search {
+                Some(r) => f(&r.index, Touch::of_range(None)),
+                None => ControlFlow::Continue(()),
+            },
+            // A transaction's or snapshot's start and end, a pinned snapshot's release: no rows
+            // (a transaction's routing key picks its home, it reads nothing).
+            Self::Begin(_)
+            | Self::Abort(_)
+            | Self::OpenSnapshot(_)
+            | Self::ReleaseSnapshot(_)
+            // The schema, maintenance and the node's own calls: whole tables or none, never a
+            // row's write.
+            | Self::ListTables(_)
+            | Self::CreateTable(_)
+            | Self::DropTable(_)
+            | Self::DescribeTable(_)
+            | Self::CreateIndex(_)
+            | Self::TextCreateIndex(_)
+            | Self::Info(_)
+            | Self::Flush(_)
+            | Self::Compact(_)
+            | Self::Backup(_)
+            | Self::BackupDownload(_)
+            | Self::Metrics(_)
+            | Self::Promote(_)
+            // Feeds: a subscription and a replica's follow read history, not rows; a feed
+            // clips by map range where it's served (D331 PR 3).
+            | Self::Subscribe(_)
+            | Self::Follow(_)
+            | Self::MemoryWatch(_)
+            // Agent memory: memory ids in the memory store's placement (`ClusterMap.memory`),
+            // which a range move never names (D331 Amendment 3).
+            | Self::Remember(_)
+            | Self::Recall(_)
+            | Self::MarkUsed(_)
+            | Self::Supersede(_)
+            | Self::Link(_)
+            | Self::Forget(_)
+            | Self::RecallPool(_)
+            | Self::RecallBodies(_) => ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// A key a call names ([`ServiceOp::touches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Touch<'a> {
+    /// One row.
+    Row(&'a [u8]),
+    /// The rows within these bounds, as the scan's request gives them.
+    Range {
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
+    },
+    /// Every row starting with these bytes.
+    Prefix(&'a [u8]),
+}
+
+impl<'a> Touch<'a> {
+    /// A read's key range as its request gives it: no range is the whole table.
+    fn of_range(range: Option<&'a proto::KeyRange>) -> Self {
+        use proto::key_range::Range;
+        match range.and_then(|k| k.range.as_ref()) {
+            Some(Range::Prefix(p)) => Touch::Prefix(p),
+            Some(Range::Bounds(b)) => Touch::Range {
+                start: convert::bound(b.start.as_ref()),
+                end: convert::bound(b.end.as_ref()),
+            },
+            None => Touch::Range {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+        }
     }
 }
 
@@ -1382,22 +1507,6 @@ impl Pinning {
     }
 }
 
-/// A key an op touches ([`ServiceOp::touches`]).
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Touch<'a> {
-    /// A point op's row.
-    Row(&'a [u8]),
-    /// A scan's bounds (a prefix scan as its `[prefix, next)` range).
-    Range {
-        start: &'a [u8],
-        #[expect(
-            dead_code,
-            reason = "read by D331's range moves (ai1249's `touches` PR)"
-        )]
-        end: Option<&'a [u8]>,
-    },
-}
-
 /// What a node opens on the database it serves: the engine, the table cache, the indexes,
 /// the feeds, the memory store and the bulk loads (D317 ticket 2, cli692's S1). The node's
 /// own state (connections, budgets, pools, sessions, limits, metrics) stays on [`Service`].
@@ -1981,12 +2090,20 @@ impl Service {
             && super::cluster::load::sample_read()
         {
             let _ = op.touches(&mut |table, touch| {
+                // A range read's first key; one from the table's start has none to sample.
                 let key = match touch {
-                    Touch::Row(k) => k,
-                    Touch::Range { start, .. } => start,
+                    Touch::Row(k) | Touch::Prefix(k) => k,
+                    Touch::Range {
+                        start: Bound::Included(k) | Bound::Excluded(k),
+                        ..
+                    } => k,
+                    Touch::Range {
+                        start: Bound::Unbounded,
+                        ..
+                    } => return ControlFlow::Continue(()),
                 };
                 load.add_read(table, key);
-                std::ops::ControlFlow::Break(())
+                ControlFlow::Break(())
             });
         }
         let mut reply = match load {
@@ -5517,5 +5634,270 @@ mod text_part_tests {
             .unwrap();
         assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
         filled(&index, "x").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod touches_tests {
+    use std::ops::{Bound, ControlFlow};
+
+    use super::{ServiceOp, Touch, proto};
+
+    /// What `op.touches` reports, owned, stopping after `limit` keys.
+    fn touched(op: &ServiceOp, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let _ = op.touches(&mut |table: &str, touch: Touch<'_>| {
+            let show = |b: Bound<&[u8]>| match b {
+                Bound::Included(k) => format!("[{}", String::from_utf8_lossy(k)),
+                Bound::Excluded(k) => format!("({}", String::from_utf8_lossy(k)),
+                Bound::Unbounded => "*".to_owned(),
+            };
+            let key = match touch {
+                Touch::Row(k) => String::from_utf8_lossy(k).into_owned(),
+                Touch::Prefix(p) => format!("{}…", String::from_utf8_lossy(p)),
+                Touch::Range { start, end } => format!("{}..{}", show(start), show(end)),
+            };
+            out.push((table.to_owned(), key));
+            if out.len() == limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        out
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|&(t, k)| (t.to_owned(), k.to_owned()))
+            .collect()
+    }
+
+    fn row(table: &str, row: &'static str) -> proto::RowWrites {
+        proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: table.into(),
+                row: row.into(),
+            }),
+            writes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn point_reads_report_their_rows_in_request_order() {
+        let get = ServiceOp::Get(proto::GetRequest {
+            table: "t".into(),
+            row: "a".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&get, usize::MAX), pairs(&[("t", "a")]));
+        let multi = ServiceOp::MultiGet(proto::MultiGetRequest {
+            table: "t".into(),
+            keys: vec!["c".into(), "a".into(), "c".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&multi, usize::MAX),
+            pairs(&[("t", "c"), ("t", "a"), ("t", "c")])
+        );
+        let txn = ServiceOp::TxnGetRow(proto::TxnGetRowRequest {
+            table: "u".into(),
+            row: "r".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&txn, usize::MAX), pairs(&[("u", "r")]));
+    }
+
+    #[test]
+    fn a_scan_reports_its_range_as_given() {
+        use proto::key_range::Range;
+        let scan = |range| {
+            ServiceOp::Scan(proto::ScanRequest {
+                table: "t".into(),
+                range,
+                ..Default::default()
+            })
+        };
+        let prefix = scan(Some(proto::KeyRange {
+            range: Some(Range::Prefix("ab".into())),
+        }));
+        assert_eq!(touched(&prefix, usize::MAX), pairs(&[("t", "ab…")]));
+        let bounds = scan(Some(proto::KeyRange {
+            range: Some(Range::Bounds(proto::Bounds {
+                start: Some(proto::Bound {
+                    key: "b".into(),
+                    inclusive: false,
+                }),
+                end: Some(proto::Bound {
+                    key: "m".into(),
+                    inclusive: true,
+                }),
+            })),
+        }));
+        assert_eq!(touched(&bounds, usize::MAX), pairs(&[("t", "(b..[m")]));
+        let open_end = scan(Some(proto::KeyRange {
+            range: Some(Range::Bounds(proto::Bounds {
+                start: Some(proto::Bound {
+                    key: "b".into(),
+                    inclusive: true,
+                }),
+                end: None,
+            })),
+        }));
+        assert_eq!(touched(&open_end, usize::MAX), pairs(&[("t", "[b..*")]));
+        assert_eq!(touched(&scan(None), usize::MAX), pairs(&[("t", "*..*")]));
+    }
+
+    #[test]
+    fn writes_report_each_row_with_its_own_table() {
+        let batch = ServiceOp::Batch(proto::BatchRequest {
+            rows: vec![
+                row("t", "a"),
+                proto::RowWrites::default(),
+                row("u", "b"),
+                row("t", "a"),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&batch, usize::MAX),
+            pairs(&[("t", "a"), ("u", "b"), ("t", "a")])
+        );
+        let mutate = ServiceOp::MutateReturning(proto::MutateRequest {
+            writes: Some(row("t", "x")),
+            ..Default::default()
+        });
+        assert_eq!(touched(&mutate, usize::MAX), pairs(&[("t", "x")]));
+        let no_row = ServiceOp::Mutate(proto::MutateRequest::default());
+        assert!(touched(&no_row, usize::MAX).is_empty());
+        let check = ServiceOp::CheckAndMutate(proto::CheckAndMutateRequest {
+            writes: Some(row("t", "y")),
+            ..Default::default()
+        });
+        assert_eq!(touched(&check, usize::MAX), pairs(&[("t", "y")]));
+        let write = ServiceOp::TxnWrite(proto::TxnWriteRequest {
+            rows: vec![row("t", "p")],
+            ..Default::default()
+        });
+        assert_eq!(touched(&write, usize::MAX), pairs(&[("t", "p")]));
+        let commit = ServiceOp::Commit(proto::TxnCommitRequest {
+            rows: vec![row("u", "q"), row("t", "p")],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&commit, usize::MAX),
+            pairs(&[("u", "q"), ("t", "p")])
+        );
+    }
+
+    #[test]
+    fn break_stops_the_walk() {
+        let batch = ServiceOp::Batch(proto::BatchRequest {
+            rows: vec![row("t", "a"), row("t", "b"), row("t", "c")],
+            ..Default::default()
+        });
+        assert_eq!(touched(&batch, 1), pairs(&[("t", "a")]));
+        assert_eq!(
+            batch.touches(&mut |_, _| ControlFlow::Break(())),
+            ControlFlow::Break(())
+        );
+        assert_eq!(
+            batch.touches(&mut |_, _| ControlFlow::Continue(())),
+            ControlFlow::Continue(())
+        );
+    }
+
+    #[test]
+    fn calls_without_rows_or_ids_report_nothing() {
+        for op in [
+            ServiceOp::Info(proto::Empty::default()),
+            ServiceOp::Begin(proto::BeginRequest::default()),
+            ServiceOp::Abort(proto::TxnAbortRequest::default()),
+            ServiceOp::TextCreateIndex(proto::CreateTextIndexRequest::default()),
+            ServiceOp::Forget(proto::ForgetRequest {
+                ids: vec!["a".into()],
+            }),
+        ] {
+            assert!(touched(&op, usize::MAX).is_empty(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn index_calls_report_their_ids_or_the_whole_index() {
+        let put = ServiceOp::TextPut(proto::TextPutRequest {
+            index: "x".into(),
+            id: "d1".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&put, usize::MAX), pairs(&[("x", "d1")]));
+        let delete = ServiceOp::VectorDelete(proto::VectorDeleteRequest {
+            index: "v".into(),
+            id: "a".into(),
+        });
+        assert_eq!(touched(&delete, usize::MAX), pairs(&[("v", "a")]));
+        let rebuild = ServiceOp::TextRebuild(proto::TextIndexRequest { index: "x".into() });
+        assert_eq!(touched(&rebuild, usize::MAX), pairs(&[("x", "*..*")]));
+        let stats = ServiceOp::TextStats(proto::TextStatsRequest {
+            search: Some(proto::TextSearchRequest {
+                index: "x".into(),
+                ..Default::default()
+            }),
+        });
+        assert_eq!(touched(&stats, usize::MAX), pairs(&[("x", "*..*")]));
+    }
+
+    /// What a gate maps `Text.Put`'s id to: the source table's row of the same key.
+    #[test]
+    fn a_text_put_writes_the_source_row_its_id_names() {
+        use pigeonhole::{Family, Options, Pigeonhole};
+        use pigeonhole_text::{Index, IndexOptions, Source};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let table = db
+            .table("docs")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let index = Index::create(
+            &db,
+            "x",
+            Source::new(&table, "f", b"body"),
+            IndexOptions::new(),
+        )
+        .unwrap();
+        index.put(b"d1", "hello there").unwrap();
+        let cell = table.get(b"d1", "f", b"body").unwrap().unwrap();
+        assert_eq!(cell.value(), b"hello there");
+    }
+
+    #[test]
+    fn a_nearest_search_reports_its_rows_and_a_traversal_its_seeds() {
+        use proto::nearest_request::Source;
+        let nearest = |source| {
+            ServiceOp::Nearest(proto::NearestRequest {
+                table: "t".into(),
+                source,
+                ..Default::default()
+            })
+        };
+        let keys = nearest(Some(Source::Keys(proto::KeyList {
+            keys: vec!["b".into(), "a".into()],
+        })));
+        assert_eq!(touched(&keys, usize::MAX), pairs(&[("t", "b"), ("t", "a")]));
+        let range = nearest(Some(Source::Range(proto::KeyRange {
+            range: Some(proto::key_range::Range::Prefix("ab".into())),
+        })));
+        assert_eq!(touched(&range, usize::MAX), pairs(&[("t", "ab…")]));
+        assert_eq!(touched(&nearest(None), usize::MAX), pairs(&[("t", "*..*")]));
+        let traverse = ServiceOp::Traverse(proto::TraverseRequest {
+            table: "g".into(),
+            seeds: vec!["s1".into(), "s2".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&traverse, usize::MAX),
+            pairs(&[("g", "s1"), ("g", "s2")])
+        );
     }
 }

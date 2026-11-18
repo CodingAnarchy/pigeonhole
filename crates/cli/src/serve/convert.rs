@@ -468,7 +468,7 @@ pub(crate) fn value_filter(f: Option<&proto::ValueFilter>) -> Result<pigeonhole:
     )
 }
 
-fn bound(b: Option<&proto::Bound>) -> Bound<&[u8]> {
+pub(crate) fn bound(b: Option<&proto::Bound>) -> Bound<&[u8]> {
     match b {
         None => Bound::Unbounded,
         Some(b) if b.inclusive => Bound::Included(&b.key[..]),
