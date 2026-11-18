@@ -261,7 +261,7 @@ pub(crate) fn table_ranges(t: &TablePlacement) -> Vec<(Vec<u8>, Option<Vec<u8>>,
 }
 
 /// Whether `[start, end)` lies inside one range of `t` that partition `p` holds.
-fn inside(t: &TablePlacement, start: &[u8], end: Option<&[u8]>, p: &str) -> bool {
+pub(crate) fn inside(t: &TablePlacement, start: &[u8], end: Option<&[u8]>, p: &str) -> bool {
     table_ranges(t).iter().any(|(lo, hi, q)| {
         *q == p
             && lo.as_slice() <= start
@@ -384,13 +384,6 @@ fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
         }
     }
     Ok(())
-}
-
-/// Whether a node holding `map` is at or past the map identified by `(term, version)`: the
-/// one order of maps (D330's `(writer_term, map_version)`, as [`newer`]) every "S holds the
-/// hand-over map" check goes through (D331).
-pub(crate) fn at_or_after(map: &ClusterMap, term: u64, version: u64) -> bool {
-    (map.writer_term, map.map_version) >= (term, version)
 }
 
 /// `t` with `[start, end)` given to partition `to` (D331's hand-over): the range's ends
@@ -1629,17 +1622,6 @@ mod tests {
         moved.map_version = 8;
         moved.moves[0].handed_over_version = 7;
         refused(validate_change(&cleaning, &moved), "hand-over map changed");
-    }
-
-    #[test]
-    fn at_or_after_orders_by_term_then_version() {
-        let mut m = map();
-        m.writer_term = 2;
-        m.map_version = 5;
-        assert!(at_or_after(&m, 2, 5));
-        assert!(at_or_after(&m, 1, 9));
-        assert!(!at_or_after(&m, 2, 6));
-        assert!(!at_or_after(&m, 3, 1));
     }
 
     #[test]

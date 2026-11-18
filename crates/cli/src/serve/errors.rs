@@ -430,6 +430,16 @@ impl ApiError {
         )
     }
 
+    /// D331: a write touching a range its partition is handing over to another (reason
+    /// `RANGE_MOVING`), refused before anything is written. Unlike the operator's fence it's
+    /// retry-safe and short: the range takes writes again at its target once the hand-over's
+    /// map lands, and the client's retry is routed there.
+    pub(crate) fn range_moving(message: impl Into<String>) -> Self {
+        Self::fenced(message)
+            .retry(RetryFrom::Request)
+            .after(RETRY_AFTER_MS)
+    }
+
     /// D317 (ICR 0117): the partition's node couldn't be reached, and nothing was sent to
     /// it, so a write is safe to retry too (B3: a forward that failed after it was sent
     /// answers `OutcomeUnknown` instead).

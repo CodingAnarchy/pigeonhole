@@ -24,6 +24,7 @@ pub(crate) mod load;
 pub(crate) mod map;
 mod memfan;
 pub(crate) mod memwatch;
+mod moves;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
@@ -671,6 +672,10 @@ impl Node {
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
         self.end_moved_feeds(version);
+        // D331: each partition's range gate, and a source's hand-over.
+        if let Some(m) = &installed {
+            self.apply_moves(m);
+        }
         Ok(version)
     }
 
@@ -1472,6 +1477,10 @@ impl Node {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
                 }
+            }
+            // D331: the moves naming it (the follower's lag comes with PR 4's follower).
+            if let Some(m) = &map {
+                lp.moves = crate::serve::ranges::statuses(m, &id);
             }
         }
         let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
@@ -2516,10 +2525,13 @@ pub(crate) fn run(
         .map_err(|e| Failure::usage(&e))?;
     let parts: Vec<(String, super::service::Service)> = opened
         .iter()
-        .map(|o| {
+        .map(|o| -> Result<_, Failure> {
             // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
             let gate = node.open_gate(&o.id, epoch);
+            // D331: its range gate, before it serves.
+            node.arm_ranges(&gate, &o.id, &o.db)
+                .map_err(|e| Failure::usage(&format!("partition {}: {e}", o.id)))?;
             let config = super::service::PartitionConfig {
                 backups: Arc::clone(&backups),
                 placement: Some(Arc::clone(&placement)),
@@ -2530,9 +2542,9 @@ pub(crate) fn run(
             // A text index rebuild a fence or a shutdown stopped carries on once the
             // partition takes writes (#1756).
             part.resume_text_rebuilds();
-            (o.id.clone(), part)
+            Ok((o.id.clone(), part))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let serving = if mine.is_empty() {
         format!(
             "no partition, routing only, as cluster node {id} of {}; map version {version}",

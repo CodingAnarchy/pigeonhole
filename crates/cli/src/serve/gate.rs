@@ -137,6 +137,8 @@ pub(crate) struct WriteGate {
     clock: Arc<LeaseClock>,
     /// Woken when the last write finishes while fenced.
     drained: Notify,
+    /// The ranges a move gates (D331): read beside the gate on every call.
+    ranges: super::ranges::RangeGate,
 }
 
 impl WriteGate {
@@ -152,7 +154,14 @@ impl WriteGate {
             leased_once: std::sync::atomic::AtomicBool::new(false),
             clock,
             drained: Notify::new(),
+            ranges: super::ranges::RangeGate::default(),
         })
+    }
+
+    /// The partition's range gate (D331).
+    #[inline]
+    pub(crate) fn ranges(&self) -> &super::ranges::RangeGate {
+        &self.ranges
     }
 
     /// Admits a write, or answers `Fenced`: the operator's fence, or no live lease. The

@@ -2078,6 +2078,13 @@ impl Service {
             }
             _ => (None, None),
         };
+        // D331: a range a move fences, moved away or doesn't serve here yet. One load while
+        // no move names the partition.
+        if let Some(gate) = &self.gate
+            && let Some(ranges) = &*gate.ranges().load()
+        {
+            ranges.check(&op, op.writes())?;
+        }
         // D332: a cluster partition's sampled loads. A read's first key, one read in 64 per
         // thread; a call's CPU per poll, one in 16 per thread. An unsampled call touches
         // nothing shared (perf287's must).
@@ -2743,9 +2750,12 @@ impl Service {
         // The caller's scope, as admission checks it; the budget is the fanning-out node's.
         self.check(&op.admit(), caller)?;
         // Its partition's lease, before the read and again after it took its snapshot
-        // (D326, audit120's S3).
+        // (D326, audit120's S3); and its ranges a move gates (D331).
         if let Some(gate) = &self.gate {
             gate.serving()?;
+            if let Some(ranges) = &*gate.ranges().load() {
+                ranges.check(&op, false)?;
+            }
         }
         let reply = self.fanout_read(op, caller).await?;
         if let Some(gate) = &self.gate {
@@ -4815,6 +4825,13 @@ impl Service {
             Some(gate) if g.wrote() || !rows.is_empty() => Some(gate.enter()?),
             _ => None,
         };
+        // D331's M3: a transaction open across a range's fence or hand-over, as simp724
+        // agreed it ([`super::ranges`]).
+        if let Some(gate) = &self.gate
+            && let Some(ranges) = &*gate.ranges().load()
+        {
+            ranges.commit(g.txn().snapshot_seqno(), g.wrote() || !rows.is_empty())?;
+        }
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);
         }

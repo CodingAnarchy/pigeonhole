@@ -4993,6 +4993,7 @@ mod memory;
 mod metrics;
 mod moving;
 mod open;
+mod range_moves;
 mod replicas;
 mod restore;
 mod several;

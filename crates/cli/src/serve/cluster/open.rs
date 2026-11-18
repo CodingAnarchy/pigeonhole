@@ -692,6 +692,19 @@ impl Node {
         // Reopened: its files change from here, so the hashes a close kept go (feed1248),
         // in the step that makes it served.
         let gate = self.open_gate(id, epoch);
+        // D331: its range gate, from its file's moved-away rows and the map, before it
+        // serves.
+        {
+            let (node, gate, db, id) = (
+                Arc::clone(self),
+                Arc::clone(&gate),
+                opened.db.clone(),
+                id.to_owned(),
+            );
+            tokio::task::spawn_blocking(move || node.arm_ranges(&gate, &id, &db))
+                .await?
+                .map_err(|e| ApiError::internal(format!("partition's range gate: {e}")))?;
+        }
         let config = crate::serve::service::PartitionConfig {
             backups: Arc::clone(&server.backups),
             placement: Some(Arc::clone(&server.placement)),
