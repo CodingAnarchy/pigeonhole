@@ -424,6 +424,20 @@ message LocalPartition {
   uint64 replica_lag_ms = 19;
   // For a replica copy: where its follower is.
   ReplicaState replica_state = 20;
+  // D332: the partition's load on this node, for the cluster balancer, each a moving
+  // average over `--balance-window` (the newest 30 s interval weighted 0.2). 0 for a replica
+  // copy, and until the first interval ends.
+  // - `load_cpu`: its share of the node's cores, `(max(B, sync_busy) + sampled request CPU) ÷
+  //   cores`, B and sync_busy being its database's shard busy and group-sync fractions. CPU
+  //   outside the partition's service calls (request decoding and encoding, framing, sockets)
+  //   isn't counted, so read-heavy partitions read low: compare partitions, not absolutes.
+  // - `load_device`: its device bytes per second (the engine's estimate at its files: reads
+  //   the OS page cache served count too) over this node's ceiling, the highest one-second
+  //   rate of the same counters summed over the node's partitions within the window.
+  // - `load`: the larger of the two.
+  double load_cpu = 29;
+  double load_device = 30;
+  double load = 31;
 }
 
 // D328: how a node holds a partition.

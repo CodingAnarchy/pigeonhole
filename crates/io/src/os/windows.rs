@@ -571,6 +571,39 @@ pub(crate) fn boot_clock_ns() -> u64 {
     t.saturating_mul(100)
 }
 
+/// The calling thread's cycles (`QueryThreadCycleTime`).
+fn thread_cycles() -> u64 {
+    let mut cycles: u64 = 0;
+    // SAFETY: the pseudo-handle of the current thread is always valid, and `cycles` is a
+    // valid, writable `u64` for the call's duration.
+    let ok = unsafe {
+        windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime(
+            windows_sys::Win32::System::Threading::GetCurrentThread(),
+            &mut cycles,
+        )
+    };
+    if ok == 0 { 0 } else { cycles }
+}
+
+/// Cycles per nanosecond, measured once: a 2 ms busy loop's thread cycles over the
+/// interrupt clock's nanoseconds (a scheduler preemption in it only lowers the rate a little).
+fn cycles_per_ns() -> f64 {
+    static RATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let (c0, t0) = (thread_cycles(), boot_clock_ns());
+        while boot_clock_ns() - t0 < 2_000_000 {
+            std::hint::spin_loop();
+        }
+        let (c1, t1) = (thread_cycles(), boot_clock_ns());
+        let rate = (c1 - c0) as f64 / (t1 - t0).max(1) as f64;
+        if rate > 0.0 { rate } else { 1.0 }
+    })
+}
+
+pub(crate) fn thread_cpu_nanos() -> u64 {
+    (thread_cycles() as f64 / cycles_per_ns()) as u64
+}
+
 /// The cached process id ([`crate::sys::process_id`]). Windows has no `fork`, so the id never
 /// changes under a running process.
 #[inline]

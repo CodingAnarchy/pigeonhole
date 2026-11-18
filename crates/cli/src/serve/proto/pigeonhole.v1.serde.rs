@@ -11264,6 +11264,15 @@ impl serde::Serialize for LocalPartition {
         if self.replica_state != 0 {
             len += 1;
         }
+        if self.load_cpu != 0. {
+            len += 1;
+        }
+        if self.load_device != 0. {
+            len += 1;
+        }
+        if self.load != 0. {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -11345,6 +11354,15 @@ impl serde::Serialize for LocalPartition {
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replica_state)))?;
             struct_ser.serialize_field("replica_state", &v)?;
         }
+        if self.load_cpu != 0. {
+            struct_ser.serialize_field("load_cpu", &self.load_cpu)?;
+        }
+        if self.load_device != 0. {
+            struct_ser.serialize_field("load_device", &self.load_device)?;
+        }
+        if self.load != 0. {
+            struct_ser.serialize_field("load", &self.load)?;
+        }
         struct_ser.end()
     }
 }
@@ -11387,6 +11405,11 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "replicaLagMs",
             "replica_state",
             "replicaState",
+            "load_cpu",
+            "loadCpu",
+            "load_device",
+            "loadDevice",
+            "load",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -11411,6 +11434,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             ReplicaPrimarySeqno,
             ReplicaLagMs,
             ReplicaState,
+            LoadCpu,
+            LoadDevice,
+            Load,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -11452,6 +11478,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "replicaPrimarySeqno" | "replica_primary_seqno" => Ok(GeneratedField::ReplicaPrimarySeqno),
                             "replicaLagMs" | "replica_lag_ms" => Ok(GeneratedField::ReplicaLagMs),
                             "replicaState" | "replica_state" => Ok(GeneratedField::ReplicaState),
+                            "loadCpu" | "load_cpu" => Ok(GeneratedField::LoadCpu),
+                            "loadDevice" | "load_device" => Ok(GeneratedField::LoadDevice),
+                            "load" => Ok(GeneratedField::Load),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -11491,6 +11520,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut replica_primary_seqno__ = None;
                 let mut replica_lag_ms__ = None;
                 let mut replica_state__ = None;
+                let mut load_cpu__ = None;
+                let mut load_device__ = None;
+                let mut load__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -11625,6 +11657,30 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             replica_state__ = Some(map_.next_value::<ReplicaState>()? as i32);
                         }
+                        GeneratedField::LoadCpu => {
+                            if load_cpu__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("loadCpu"));
+                            }
+                            load_cpu__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::LoadDevice => {
+                            if load_device__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("loadDevice"));
+                            }
+                            load_device__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Load => {
+                            if load__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("load"));
+                            }
+                            load__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -11648,6 +11704,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     replica_primary_seqno: replica_primary_seqno__.unwrap_or_default(),
                     replica_lag_ms: replica_lag_ms__.unwrap_or_default(),
                     replica_state: replica_state__.unwrap_or_default(),
+                    load_cpu: load_cpu__.unwrap_or_default(),
+                    load_device: load_device__.unwrap_or_default(),
+                    load: load__.unwrap_or_default(),
                 })
             }
         }

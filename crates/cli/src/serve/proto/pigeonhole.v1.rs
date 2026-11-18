@@ -7298,6 +7298,23 @@ pub struct LocalPartition {
     /// For a replica copy: where its follower is.
     #[prost(enumeration = "ReplicaState", tag = "20")]
     pub replica_state: i32,
+    /// D332: the partition's load on this node, for the cluster balancer, each a moving
+    /// average over `--balance-window` (the newest 30 s interval weighted 0.2). 0 for a replica
+    /// copy, and until the first interval ends.
+    ///
+    /// * `load_cpu`: its share of the node's cores, `(max(B, sync_busy) + sampled request CPU) ÷ cores`, B and sync_busy being its database's shard busy and group-sync fractions. CPU
+    ///   outside the partition's service calls (request decoding and encoding, framing, sockets)
+    ///   isn't counted, so read-heavy partitions read low: compare partitions, not absolutes.
+    /// * `load_device`: its device bytes per second (the engine's estimate at its files: reads
+    ///   the OS page cache served count too) over this node's ceiling, the highest one-second
+    ///   rate of the same counters summed over the node's partitions within the window.
+    /// * `load`: the larger of the two.
+    #[prost(double, tag = "29")]
+    pub load_cpu: f64,
+    #[prost(double, tag = "30")]
+    pub load_device: f64,
+    #[prost(double, tag = "31")]
+    pub load: f64,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]

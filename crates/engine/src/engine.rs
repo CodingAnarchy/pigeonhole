@@ -77,6 +77,23 @@ pub struct FamilyInfo {
     pub options: FamilyOptions,
 }
 
+/// One tablet as [`Engine::tablets`] reports it (D332, ICR 0142). Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TabletStats {
+    /// Its table's name.
+    pub table: String,
+    /// Inclusive start row; empty is unbounded.
+    pub start: Vec<u8>,
+    /// Exclusive end row; `None` is unbounded.
+    pub end: Option<Vec<u8>>,
+    /// Bytes of the SSTs it references, a shared SST's divided among its tablets.
+    pub bytes: u64,
+    /// Its shard's moving average of rows written to it per balancer interval.
+    pub write_load: f64,
+}
+
 /// A table as the catalog knows it. Immutable; adding a family publishes a new `TableInfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -232,6 +249,13 @@ pub struct Metrics {
     /// `GroupSync` member: a `Sync` commit's own sync isn't in it. Published at each group
     /// sync's start and finish (D316 A3, ICR 0116).
     pub group_sync_nanos: u64,
+    /// Bytes this database's files read since open, at their size on disk, readahead
+    /// included (D332, ICR 0142). The engine's own estimate of its device reads: reads the
+    /// OS page cache served count too, and metadata such as the manifest is included.
+    pub device_read_bytes: u64,
+    /// Bytes this database's files wrote since open: the WAL's, flushes' and compactions'
+    /// (D332, ICR 0142). Syncs, writeback hints and punches count nothing.
+    pub device_write_bytes: u64,
     /// Nanoseconds the compaction pool's threads spent in slices of the shards' flushes and
     /// compactions, summed over shards (D256). Its rise over an interval, divided by the
     /// interval, is how many threads' worth of pool work the store did; zero with the pool
@@ -1086,6 +1110,10 @@ impl Engine {
                 "memtable_budget must be at least 128 KiB".to_owned(),
             ));
         }
+        // Every file of the database counts its bytes (D332, ICR 0142).
+        let io = Arc::new(crate::io_count::IoCounters::default());
+        let mut options = options;
+        options.vfs = crate::io_count::CountingVfs::wrap(Arc::clone(&options.vfs), Arc::clone(&io));
         let vfs = Arc::clone(&options.vfs);
         let registry = Arc::new(options.merge_operators.clone());
 
@@ -1411,6 +1439,8 @@ impl Engine {
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
+            tablet_loads: (0..shards).map(|_| ArcSwap::default()).collect(),
+            io: Arc::clone(&io),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
                 interval_nanos: options.balance_interval_nanos,
@@ -4117,6 +4147,38 @@ impl Engine {
         rt.as_ref().map(|rt| rt.driver_trace()).unwrap_or_default()
     }
 
+    /// Every tablet's row range, SST bytes and write load (D332, ICR 0142): for a cluster
+    /// balancer choosing a split key. The bytes of an SST two tablets share (after a split,
+    /// until compaction rewrites it) count once, divided between them. The write load is
+    /// each tablet's moving average of rows written per balancer interval, as its shard last
+    /// published it (0 until it has, or with `tablet_changes` off). Not part of the stable
+    /// API.
+    #[doc(hidden)]
+    pub fn tablets(&self) -> Vec<TabletStats> {
+        let shared = &self.inner.shared;
+        let view = shared.view.load();
+        let loads: HashMap<TabletId, f64> = shared
+            .tablet_loads
+            .iter()
+            .flat_map(|l| l.load().iter().copied().collect::<Vec<_>>())
+            .collect();
+        let refs = view.catalog.sst_refs();
+        view.tablets
+            .iter()
+            .map(|t| TabletStats {
+                table: view
+                    .catalog
+                    .table(t.table)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_default(),
+                start: t.start.clone(),
+                end: t.end.clone(),
+                bytes: crate::shard::shared_bytes(&view, t, &refs),
+                write_load: loads.get(&t.id).copied().unwrap_or(0.0),
+            })
+            .collect()
+    }
+
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,
     /// issue #51).
     #[doc(hidden)]
@@ -4251,6 +4313,7 @@ impl Engine {
                 }
             }
         }
+        (m.device_read_bytes, m.device_write_bytes) = shared.io.totals();
         for s in &shared.metrics {
             let limit = s.memtable_limit.load(Ordering::Relaxed);
             m.memtable_limit += limit;
@@ -7783,6 +7846,8 @@ impl Shared {
             clock: Default::default(),
             flushed_through: Vec::new(),
             loads: Vec::new(),
+            tablet_loads: Vec::new(),
+            io: Arc::default(),
             balance: BalanceConfig::default(),
             view_capacity,
             tablet_epoch: AtomicU64::new(0),

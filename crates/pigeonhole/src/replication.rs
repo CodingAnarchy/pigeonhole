@@ -358,6 +358,33 @@ fn invalid(message: String) -> Error {
 }
 
 impl Pigeonhole {
+    /// Bytes this database's files have read and written since open, as the engine counts
+    /// them at its files (D332, ICR 0142): on-disk sizes, readahead included, syncs not. An
+    /// estimate for comparing databases on one node, since reads the OS page cache served
+    /// count too. Not part of the stable API.
+    pub fn device_bytes(&self) -> (u64, u64) {
+        let m = self.engine().metrics();
+        (m.device_read_bytes, m.device_write_bytes)
+    }
+
+    /// Every tablet's row range, SST bytes and write load (D332, ICR 0142): what a cluster
+    /// balancer splits a partition by. A shared SST's bytes are divided among its tablets;
+    /// the write load is the engine's moving average of rows written per balancer interval
+    /// (0 with `tablet_changes` off). Not part of the stable API.
+    pub fn tablets(&self) -> Vec<TabletLoad> {
+        self.engine()
+            .tablets()
+            .into_iter()
+            .map(|t| TabletLoad {
+                table: t.table,
+                start: t.start,
+                end: t.end,
+                bytes: t.bytes,
+                write_load: t.write_load,
+            })
+            .collect()
+    }
+
     /// Makes this database, a bootstrap copy of a primary (its [`backup_at`](Self::backup_at)
     /// of a snapshot), a replica that follows the primary from `token`: the token of a feed of
     /// every table opened `from_snapshot` on that same snapshot (#1436, ICR 0125). The first
@@ -657,4 +684,20 @@ impl Pigeonhole {
         self.engine().store_replication_state(&state.encode())?;
         Ok(())
     }
+}
+
+/// One tablet as [`Pigeonhole::tablets`] reports it (D332, ICR 0142).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TabletLoad {
+    /// Its table's name.
+    pub table: String,
+    /// Inclusive start row; empty is unbounded.
+    pub start: Vec<u8>,
+    /// Exclusive end row; `None` is unbounded.
+    pub end: Option<Vec<u8>>,
+    /// Bytes of the SSTs it references, a shared SST's divided among its tablets.
+    pub bytes: u64,
+    /// Rows written to it per balancer interval, a moving average.
+    pub write_load: f64,
 }

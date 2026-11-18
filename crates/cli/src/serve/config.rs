@@ -342,6 +342,18 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_failover_after_ms: u64,
+    /// The window a partition's load is averaged over, and the node's device ceiling taken
+    /// across, in seconds (D332): what the cluster balancer compares. Measured on every
+    /// cluster node; read only by a balancer.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(30..),
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub balance_window: u64,
     /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
     /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
@@ -582,6 +594,7 @@ mod tests {
             ["--cluster-push-timeout-ms", "7"],
             ["--cluster-lease-ms", "21"],
             ["--cluster-failover-after-ms", "40"],
+            ["--balance-window", "60"],
         ] {
             if flag[0] != "--node-id" {
                 assert!(

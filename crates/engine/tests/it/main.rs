@@ -14,6 +14,7 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+mod device_bytes;
 #[path = "../gate/mod.rs"]
 mod gate;
 

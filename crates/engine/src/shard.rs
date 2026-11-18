@@ -41,6 +41,7 @@ use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
 mod tablets;
+pub(crate) use tablets::shared_bytes;
 
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
@@ -568,6 +569,12 @@ pub(crate) struct Shared {
     pub flushed_through: Vec<Padded>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
+    /// Per shard, each tablet's write load as of its last balancer pass (D332, ICR 0142): the
+    /// tablet and its moving average of rows written per interval. Stored whole by the
+    /// owning shard (`ArcSwap`), loaded by [`Engine::tablets`](crate::Engine::tablets).
+    pub tablet_loads: Vec<ArcSwap<Vec<(TabletId, f64)>>>,
+    /// The database's device bytes (D332): every file it opens counts into it.
+    pub io: Arc<crate::io_count::IoCounters>,
     pub balance: BalanceConfig,
     /// Bytes of a shared-memory view buffer (a split that would outgrow it is refused, D28).
     pub view_capacity: usize,

@@ -5071,6 +5071,30 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 2. Partition failover, with its events, metrics and per-partition mode.
 3. The guide.
 
+<a id="d332"></a>
+## D332 — A balancer that moves, splits and merges cluster partitions between nodes (cli692, design; owner, 2026-11-16; reviewed by simp724 and perf287; cli, engine, #1485, ICR 0117, ICR 0142) · D134, D214, D317, D326, D328, D330, D331
+
+**Problem (#1485).** A cluster's partitions stay where an operator put them. A node that ends up holding the hot or big ones stays overloaded until someone moves or splits them by hand.
+
+**Decision (the owner's answers, 2026-11-16).** The design is `.coord/cli692-design-1485.md`, with its amendments 1–3; the PR plan is `.coord/cli692-d332-plan.md`, with simp724's and perf287's amendments. In short:
+- **A loop on the map's writer:** every 30 s it decides at most one action and runs it through the existing movers: D331's split, move-range and merge, and a whole-partition move recorded in the map (simp724's M1).
+  - It acts only after its condition has held for N passes, with hysteresis and a dwell after each action, as the in-process balancer does (D214).
+  - Every map change it makes re-checks the writer lease, at any term (simp724 on the plan's Q1).
+- **Off by default (Q1):** `ClusterMap.balancer` is OFF, ON or PAUSED. Partitions and ranges can be pinned, and one that bounces is pinned automatically.
+- **The load (Q2):** a partition's load is the larger of two shares, both averaged over `--balance-window`:
+  - **CPU:** `(max(B, sync_busy) + sampled request CPU) ÷ cores`;
+  - **device:** its device bytes over the node's ceiling, the highest one-second rate of the same counters summed over the node's partitions.
+
+  Device bytes are the engine's own estimate at its files (perf287); there's no flag for 1.3.0, and #2057 tracks an override. A split key is a tablet boundary that halves the load (ICR 0142's `tablets()`, plus serve's sampled read keys).
+- **`Node.weight` (Q4)** covers unlike machines.
+- **Merges are in 1.3.0 (Q3):** the policy calls D331 PR 6's merge.
+
+**PRs:**
+1. The measurements: ICR 0142 and the `LocalPartition` load fields.
+2. Whole-partition moves recorded in `moves`.
+3. The policy, the loop, the map fields, the CLI and the `Forward` tablets arm.
+4. The guide.
+
 <a id="d334"></a>
 ## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
 

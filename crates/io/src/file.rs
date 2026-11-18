@@ -50,6 +50,10 @@ pub enum LockMode {
 ///
 /// Locks are per handle (OFD locks on Linux, `fcntl` behind a per-process registry on macOS
 /// and BSD so closing one handle never drops another's lock, `LockFileEx` on Windows).
+///
+/// A method added here must also be forwarded by the engine's counting wrapper,
+/// `CountingFile` (pigeonhole-engine's `io_count.rs`, D332): a defaulted method it doesn't
+/// forward would silently take the default under it.
 pub trait File: Send + Sync + Debug {
     /// Reads exactly `buf.len()` bytes at `offset`; fails with `UnexpectedEof` if short.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()>;

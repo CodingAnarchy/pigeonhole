@@ -52,6 +52,7 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             push_timeout: Duration::from_millis(500),
             lease: TEST_LEASE,
             failover_after: TEST_LEASE * 2,
+            balance_window: Duration::from_secs(300),
         },
         state,
         super::read_voted(dir).unwrap(),
@@ -1976,6 +1977,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-push-timeout-ms",
         "cluster-lease-ms",
         "cluster-failover-after-ms",
+        "balance-window",
         "tls-key",
         "tls-cert",
     ];
