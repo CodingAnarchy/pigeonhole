@@ -154,3 +154,51 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
     );
     let _ = db_a.close();
 }
+
+/// A partition opening after its move is done and gone from the map (a restart, or a
+/// promoted replica copy holding the row through the feed) gates the moved range from its
+/// file's row before it serves.
+#[test]
+fn an_opening_partition_gates_a_moved_range_from_its_file() {
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    let n = node(&dir, "a");
+    let done = moving(&the_map(1, &ports), 7, None);
+    n.push_map(done.clone(), None).unwrap();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("p1.phdb"),
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap();
+    crate::serve::ranges::write_moved(
+        &db,
+        &crate::serve::ranges::Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"f".to_vec()),
+            term: 0,
+            version: 5,
+            seqno: 3,
+        },
+    )
+    .unwrap();
+    let gate = n.open_gate("p1", 2);
+    n.arm_ranges(&gate, "p1", &db).unwrap();
+    let state = (*gate.ranges().load())
+        .clone()
+        .expect("the row gates the range");
+    let get = |row: &str| {
+        crate::serve::service::ServiceOp::Get(crate::serve::proto::GetRequest {
+            table: "users".into(),
+            row: row.to_owned().into(),
+            ..Default::default()
+        })
+    };
+    assert_eq!(
+        state.check(&get("d"), false).unwrap_err().code,
+        "WrongPartition"
+    );
+    state.check(&get("a"), false).unwrap();
+    let _ = db.close();
+}
