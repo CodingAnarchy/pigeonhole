@@ -1726,6 +1726,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::LeaseRequest>,
     ) -> Result<tonic::Response<proto::LeaseResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "ask for a partition lease")?;
+        #[cfg(test)]
+        if fence::pre_lease(&self.0.dir) {
+            return Err(Status::unimplemented("a build before D326"));
+        }
         let req = req.into_inner();
         let mine = self.0.get_map()?;
         if req.cluster_id != mine.cluster_id {
@@ -1744,6 +1748,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::ReleaseRequest>,
     ) -> Result<tonic::Response<proto::ReleaseResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "release a partition lease")?;
+        #[cfg(test)]
+        if fence::pre_lease(&self.0.dir) {
+            return Err(Status::unimplemented("a build before D326"));
+        }
         let req = req.into_inner();
         let mine = self.0.get_map()?;
         if req.cluster_id != mine.cluster_id {

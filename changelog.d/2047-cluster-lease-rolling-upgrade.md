@@ -1,0 +1,2 @@
+### Fixed
+- **Cluster: a rolling upgrade from 1.2 keeps partitions serving** (#2047, D326 amendment 1). A 1.2 node doesn't answer `Cluster.Lease`, so the first node upgraded in a three-node cluster would have served nothing until a second ran 1.3. A 1.3 node now counts a 1.2 peer that holds the round's map as granting, and logs once that it does. Until every node runs 1.3, the guarantee is 1.2's rather than the lease's; upgrade one node at a time, in any order, and finish the upgrade before relying on leases (`relocate --old-unreachable`).

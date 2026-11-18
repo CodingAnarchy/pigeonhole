@@ -127,6 +127,9 @@ pub(crate) struct Fences {
     /// its grants at once rather than a lease later, so a planned move's new owner needn't
     /// wait them out.
     asked: std::sync::atomic::AtomicBool,
+    /// Peers whose build answers `Cluster.Lease` with `Unimplemented` (1.2, #2047), counted
+    /// as granting: kept so the log says so once per peer, and again if it comes back.
+    pre_lease: Mutex<BTreeSet<String>>,
 }
 
 /// [`Node::confirm_soon`]'s state.
@@ -223,6 +226,21 @@ pub(super) fn gate_state(gate: &WriteGate) -> (LocalPartitionState, FenceReason)
 impl Fences {
     fn local(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Local>> {
         self.local.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes whether `peer` answered a lease request as a build before D326 (#2047); `true`
+    /// when that's news, so the log says it once.
+    fn pre_lease(&self, peer: &str, is: bool) -> bool {
+        let mut set = self
+            .pre_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if is {
+            set.insert(peer.to_owned())
+        } else {
+            set.remove(peer);
+            false
+        }
     }
 
     /// How many partitions have an entry (tests): one that is nothing here has none.
@@ -742,13 +760,40 @@ impl Node {
             let (node, peer, address, req) =
                 (Arc::clone(self), peer.clone(), address.clone(), req.clone());
             asks.spawn(async move {
-                let answer =
-                    tokio::time::timeout(node.peers.push_timeout, node.ask_lease(&address, req))
-                        .await;
+                let answer = tokio::time::timeout(
+                    node.peers.push_timeout,
+                    node.ask_lease(&address, req.clone()),
+                )
+                .await;
                 match answer {
-                    Ok(Ok(r)) => Some((peer, r)),
-                    Ok(Err(e)) => {
-                        eprintln!("phdb serve: node {peer}'s lease grant: {e}");
+                    Ok(Ok(r)) => {
+                        node.fences.pre_lease(&peer, false);
+                        Some((peer, r))
+                    }
+                    // A build before D326 (1.2) in a rolling upgrade (#2047): it holds the
+                    // round's map (it answered with it, or took it), and grants as 1.2
+                    // serves, on that map alone. So a mixed cluster serves, with D317's
+                    // confirmation and the 1.3 nodes' grants, and the full lease guarantee
+                    // once every node runs 1.3.
+                    Ok(Err(s)) if s.code() == tonic::Code::Unimplemented => {
+                        if node.fences.pre_lease(&peer, true) {
+                            eprintln!(
+                                "phdb serve: node {peer} runs a build without partition \
+                                 leases (before 1.3): counted as granting each lease this \
+                                 node asks, until it's upgraded"
+                            );
+                        }
+                        let granted = req.parts.clone();
+                        Some((
+                            peer,
+                            super::proto::LeaseResponse {
+                                granted,
+                                ..Default::default()
+                            },
+                        ))
+                    }
+                    Ok(Err(s)) => {
+                        eprintln!("phdb serve: node {peer}'s lease grant: {}", s.message());
                         None
                     }
                     Err(_) => None,
@@ -816,7 +861,11 @@ impl Node {
                     node.send_release(&n.address, req),
                 )
                 .await;
-                if let Ok(Err(e)) = sent {
+                // A build before D326 (1.2, #2047) holds no grant to release.
+                if let Ok(Err(e)) = sent
+                    && e.code() != tonic::Code::Unimplemented
+                {
+                    let e = e.message();
                     eprintln!(
                         "phdb serve: releasing a partition's lease at node {}: {e}",
                         n.id
@@ -831,29 +880,28 @@ impl Node {
         &self,
         address: &str,
         req: super::proto::ReleaseRequest,
-    ) -> Result<(), String> {
-        let mut client = self.client(address).await?;
-        let req = self.request(req)?;
-        client
-            .release(req)
+    ) -> Result<(), tonic::Status> {
+        let mut client = self
+            .client(address)
             .await
-            .map(drop)
-            .map_err(|s| s.message().to_owned())
+            .map_err(tonic::Status::unavailable)?;
+        let req = self.request(req).map_err(tonic::Status::internal)?;
+        client.release(req).await.map(drop)
     }
 
-    /// Asks the node at `address` for a lease grant.
+    /// Asks the node at `address` for a lease grant: its answer, or its status (a build
+    /// before D326 answers `Unimplemented`).
     async fn ask_lease(
         &self,
         address: &str,
         req: LeaseRequest,
-    ) -> Result<super::proto::LeaseResponse, String> {
-        let mut client = self.client(address).await?;
-        let req = self.request(req)?;
-        client
-            .lease(req)
+    ) -> Result<super::proto::LeaseResponse, tonic::Status> {
+        let mut client = self
+            .client(address)
             .await
-            .map(tonic::Response::into_inner)
-            .map_err(|s| s.message().to_owned())
+            .map_err(tonic::Status::unavailable)?;
+        let req = self.request(req).map_err(tonic::Status::internal)?;
+        client.lease(req).await.map(tonic::Response::into_inner)
     }
 
     /// Gives each partition served here the lease `round` gives it (D326): until
@@ -1032,6 +1080,20 @@ impl Node {
 /// node then waits out the old node's grants.
 #[cfg(test)]
 pub(crate) static DROP_RELEASES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before D326 (1.2), by cluster directory:
+/// their `Cluster.Lease` and `Cluster.Release` answer `Unimplemented` (#2047).
+#[cfg(test)]
+pub(crate) static PRE_LEASE: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn pre_lease(dir: &Path) -> bool {
+    PRE_LEASE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}
 
 #[cfg(test)]
 fn drop_releases(dir: &Path) -> bool {
