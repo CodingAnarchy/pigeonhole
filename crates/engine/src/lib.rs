@@ -68,6 +68,8 @@ pub use check::{
     WalFile,
 };
 #[doc(hidden)]
+pub use engine::FeedRetentionHold;
+#[doc(hidden)]
 pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{

@@ -722,3 +722,70 @@ fn a_reader_of_the_replaced_file_never_removes_the_new_file_s_wal() {
     drop(t);
     db.close().unwrap();
 }
+
+/// D331 (ICR 0141): a primary's feed-silent commits reach a replica that includes them, as
+/// version 2 events (the rest stay version 1), and the replica applies them silent: it
+/// matches the primary, and neither's own subscription ever sees a silent write. A feed
+/// that doesn't include them (any client's) passes them over. A newer event version is
+/// refused.
+#[test]
+fn a_replica_applies_silent_commits_silent() {
+    let (pv, rv) = (SimVfs::new(31), SimVfs::new(32));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let mut client = primary.feed().open().unwrap();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let mut own = replica.feed().open().unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for step in 0..12u32 {
+        let silent = step % 3 != 0;
+        let mut wb = primary.write_batch();
+        if silent {
+            wb.mark_feed_silent();
+        }
+        let row = format!("{}{step}", if silent { "quiet" } else { "loud" });
+        wb.put(&t, row.as_bytes(), "a", b"q", b"v");
+        wb.commit().unwrap();
+        let events = ready(&mut feed);
+        for e in &events {
+            let version = e.encode()[0];
+            assert_eq!(version, if e.is_silent() { 2 } else { 1 });
+        }
+        assert!(events.iter().any(|e| e.is_silent()) == silent);
+        apply(&replica, &events, 3);
+    }
+    assert_eq!(contents(&replica), contents(&primary));
+
+    for (who, f) in [
+        ("the primary's client", &mut client),
+        ("the replica's own", &mut own),
+    ] {
+        while let Some(ev) = f.next_event(Duration::from_millis(200)).unwrap() {
+            if let FeedEvent::Commit(c) = ev {
+                assert!(
+                    c.changes().iter().all(|ch| !ch.row().starts_with(b"quiet")),
+                    "{who} feed delivered a silent write"
+                );
+            }
+        }
+    }
+
+    let mut wb = primary.write_batch();
+    wb.put(&t, b"last", "a", b"q", b"v");
+    wb.commit().unwrap();
+    let mut bytes = ready(&mut feed)[0].encode();
+    bytes[0] = 3;
+    assert!(
+        ReplicatedEvent::decode(&bytes).is_err(),
+        "a newer version is refused"
+    );
+    drop((feed, client, own));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}

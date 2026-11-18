@@ -19,7 +19,7 @@
 
 use pigeonhole_format::hash::FastMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_format::BlobFileId;
@@ -533,6 +533,12 @@ pub(crate) struct Feed {
     pub sync_interval_nanos: u64,
     /// Each stream's feed marks, set as its stream opens.
     marks: Vec<OnceLock<Arc<FeedMarks>>>,
+    /// Retention holds (D331, ICR 0141), oldest first. A leaf lock: taken by
+    /// `hold_retention` and a hold's release, and by a shard's feed maintenance only while
+    /// `retention_hold_count` isn't 0. Each stream's mark holds the oldest epoch any hold
+    /// keeps, stored under it.
+    retention_holds: Mutex<Vec<Arc<RetentionHold>>>,
+    retention_hold_count: AtomicUsize,
     held: Mutex<Held>,
     /// Bytes of the held files (`DatabaseInfo`).
     held_bytes: AtomicU64,
@@ -673,6 +679,8 @@ impl Feed {
             flush_interval_nanos: FLUSH_INTERVAL_NANOS,
             sync_interval_nanos: SYNC_INTERVAL_NANOS,
             marks: (0..streams).map(|_| OnceLock::new()).collect(),
+            retention_holds: Mutex::default(),
+            retention_hold_count: AtomicUsize::new(0),
             held: Mutex::default(),
             held_bytes: AtomicU64::new(0),
             sidecar: Mutex::new(None),
@@ -1157,6 +1165,78 @@ impl Feed {
         self.sidecar_syncs.load(Ordering::Relaxed)
     }
 
+    /// Holds every stream's history from its current segment on (D331, ICR 0141), until
+    /// the hold is released or the database retains more than `cap` bytes of history, when
+    /// it lapses: it's dropped and marked so, and retention trims as before. `None` until
+    /// every stream is open.
+    ///
+    /// A stream's head segment is never trimmed, so the hold always starts at history the
+    /// stream has; it takes effect at each stream's next retention pass.
+    pub(crate) fn hold_retention(&self, cap: u64) -> Option<Arc<RetentionHold>> {
+        let mut holds = self
+            .retention_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let epochs = self
+            .marks
+            .iter()
+            .map(|m| m.get().map(|m| m.head()))
+            .collect::<Option<Vec<u32>>>()?;
+        let hold = Arc::new(RetentionHold {
+            epochs,
+            cap,
+            lapsed: AtomicBool::new(false),
+        });
+        holds.push(Arc::clone(&hold));
+        self.publish_holds(&holds);
+        Some(hold)
+    }
+
+    /// Lets `hold` go (a no-op once it lapsed).
+    pub(crate) fn release_retention(&self, hold: &Arc<RetentionHold>) {
+        let mut holds = self
+            .retention_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        holds.retain(|h| !Arc::ptr_eq(h, hold));
+        self.publish_holds(&holds);
+    }
+
+    /// Lapses every hold whose cap the retained history has passed (a shard's feed
+    /// maintenance, before its retention pass). One load while nothing holds.
+    pub(crate) fn enforce_retention_caps(&self) {
+        if self.retention_hold_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let retained = self.retained_bytes();
+        let mut holds = self
+            .retention_holds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let before = holds.len();
+        holds.retain(|h| {
+            let keep = retained <= h.cap;
+            if !keep {
+                h.lapsed.store(true, Ordering::Release);
+            }
+            keep
+        });
+        if holds.len() != before {
+            self.publish_holds(&holds);
+        }
+    }
+
+    /// Stores each stream's oldest held epoch in its marks, under the holds' lock.
+    fn publish_holds(&self, holds: &[Arc<RetentionHold>]) {
+        for (s, m) in self.marks.iter().enumerate() {
+            if let Some(m) = m.get() {
+                m.set_hold(holds.iter().map(|h| h.epochs[s]).min());
+            }
+        }
+        self.retention_hold_count
+            .store(holds.len(), Ordering::Release);
+    }
+
     /// The WAL bytes retained as history, over every stream.
     pub(crate) fn retained_bytes(&self) -> u64 {
         self.marks
@@ -1304,6 +1384,23 @@ impl Feed {
 /// Drops the held blob files the history has passed (from a shard's maintenance): one
 /// manifest request at a time, computed against the catalog at commit, so a file whose
 /// hold came from a commit that failed (still live there) is left alone.
+/// A retention hold ([`Feed::hold_retention`], D331): each stream's epoch it keeps history
+/// from, its cap, and whether it lapsed at the cap.
+#[derive(Debug)]
+pub(crate) struct RetentionHold {
+    epochs: Vec<u32>,
+    cap: u64,
+    lapsed: AtomicBool,
+}
+
+impl RetentionHold {
+    /// Whether it lapsed: the history it kept passed its cap, so retention trims again and a
+    /// reader it was for may find its position gone.
+    pub(crate) fn lapsed(&self) -> bool {
+        self.lapsed.load(Ordering::Acquire)
+    }
+}
+
 pub(crate) fn release_held(shared: &Arc<Shared>, shard: ShardId) {
     let Some(feed) = &shared.feed else {
         return;

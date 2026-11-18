@@ -220,3 +220,110 @@ fn caller_misuse_is_invalid_argument() {
         Err(Error::Corrupt { .. })
     ));
 }
+
+/// D331 (ICR 0141): a feed-silent batch's mark is the count's bit 31. A builder carries it
+/// into the record, `decode_with(.., true)` takes it, and `decode` (a database without
+/// `incompat` bit 3, or a build before D331) refuses it as corrupt, so a stray bit is never
+/// read as the mark.
+#[test]
+fn a_silent_batch_is_read_only_with_its_bit() {
+    use pigeonhole_format::wal::{BatchBuilder, SILENT_BATCH, WalRecord};
+    use pigeonhole_format::{FamilyId, Kind, TableId};
+
+    let mut b = BatchBuilder::new();
+    b.push(
+        TableId(1),
+        FamilyId(2),
+        Kind::Put,
+        b"row",
+        b"q",
+        Some(7),
+        b"\x00v",
+    )
+    .unwrap();
+    b.mark_silent();
+    b.push(
+        TableId(1),
+        FamilyId(2),
+        Kind::Put,
+        b"row2",
+        b"q",
+        None,
+        b"\x00w",
+    )
+    .unwrap();
+    let bytes = b.batch().as_bytes().to_vec();
+    let raw = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    assert_eq!(raw, SILENT_BATCH | 2, "the mark is in the encoded count");
+    let mut rec = Vec::new();
+    WalRecord::Batch {
+        seqno: 9,
+        commit_ts: 100,
+        batch: b.batch(),
+    }
+    .encode(&mut rec);
+
+    let taken = WalRecord::decode_with(&rec, true).unwrap();
+    let batch = taken.batch().unwrap();
+    assert!(batch.is_silent());
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch.iter().count(), 2);
+    assert_eq!(
+        taken,
+        WalRecord::Batch {
+            seqno: 9,
+            commit_ts: 100,
+            batch: b.batch()
+        }
+    );
+
+    for refused in [WalRecord::decode(&rec), WalRecord::decode_with(&rec, false)] {
+        assert!(matches!(refused, Err(Error::Corrupt { .. })), "{refused:?}");
+    }
+
+    // As a build before D331 reads it: the whole count as mutations, so the batch ends
+    // long before two billion of them.
+    let mut old = bytes.clone();
+    let plain = raw.to_le_bytes();
+    old[..4].copy_from_slice(&plain);
+    let mut r = &old[4..];
+    let mut parsed = 0u64;
+    while !r.is_empty() && parsed < u64::from(raw) {
+        // Skip one mutation by re-encoding it as a lone batch would: table, family, kind
+        // (and ts), then three varint-length fields.
+        let flags = r[8];
+        r = &r[9 + if flags & 0x80 != 0 { 8 } else { 0 }..];
+        for _ in 0..3 {
+            let (len, used) = varint::get_u64(r).unwrap();
+            r = &r[used + len as usize..];
+        }
+        parsed += 1;
+    }
+    assert!(
+        parsed < u64::from(raw),
+        "an old build runs out of bytes: corrupt"
+    );
+
+    // Cleared, the builder's next batch is ordinary.
+    b.clear();
+    assert!(!b.is_silent());
+    b.push(
+        TableId(1),
+        FamilyId(2),
+        Kind::Put,
+        b"r",
+        b"q",
+        None,
+        b"\x00v",
+    )
+    .unwrap();
+    assert!(!b.batch().is_silent());
+    let mut rec = Vec::new();
+    WalRecord::Batch {
+        seqno: 10,
+        commit_ts: 100,
+        batch: b.batch(),
+    }
+    .encode(&mut rec);
+    assert!(WalRecord::decode(&rec).is_ok());
+}

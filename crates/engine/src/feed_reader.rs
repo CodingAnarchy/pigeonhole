@@ -727,6 +727,14 @@ pub struct FeedReader {
     /// An entry goes once the floor passes its segment.
     dropped: HashMap<Seqno, (usize, u32)>,
     out: Commit,
+    /// Feed-silent commits are delivered (D331: a replica's follower only), and whether the
+    /// last commit delivered was one.
+    include_silent: bool,
+    out_silent: bool,
+    /// With `include_silent`, the silent commits read and not yet delivered: a single
+    /// commit's seqno, a round's id. Kept beside the records, not in them, so a reader that
+    /// doesn't include them carries nothing for it (#2055's feed shapes).
+    silent_seen: HashSet<Seqno>,
     /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
     /// delivered, in order; the last one delivered (its root sequence, in the token); how far
     /// the sidecar is read; and the tables dropped by delivered changes, whose later changes
@@ -1282,6 +1290,9 @@ impl FeedReader {
             ahead: ReadAhead::new(shared.shards, READ_AHEAD_BYTES),
             dropped: HashMap::new(),
             out: Commit::default(),
+            include_silent: false,
+            out_silent: false,
+            silent_seen: HashSet::new(),
             expired: None,
             failed: None,
             key,
@@ -1461,6 +1472,8 @@ impl FeedReader {
         if let Some(marks) = self.writer.as_ref().and_then(|f| f.marks(s)) {
             cursor.follow_head(Arc::clone(marks));
         }
+        // The mark is decoded here and checked against `incompat` bit 3 by `read_one`'s filter.
+        cursor.accept_silent(true);
         Ok(cursor)
     }
 
@@ -1695,6 +1708,23 @@ impl FeedReader {
     /// The frontier as of the last poll.
     pub fn frontier(&self) -> Seqno {
         self.frontier
+    }
+
+    /// Delivers feed-silent commits too (D331, ICR 0141), each with [`silent`](Self::silent)
+    /// set: for a replica's follower only, which applies them silent, so the replica stays a
+    /// copy of its primary and its own feed matches the primary's. Never reachable from a
+    /// client's subscription: the public API's feed options have no such field. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn include_silent(&mut self) {
+        self.include_silent = true;
+    }
+
+    /// Whether the commit last delivered is feed-silent (only ever, with
+    /// [`include_silent`](Self::include_silent)). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn silent(&self) -> bool {
+        self.out_silent
     }
 
     /// The last delivered seqno: every commit at or below it was delivered (or precedes the
@@ -2433,6 +2463,10 @@ impl FeedReader {
                     // Its shares are never delivered; the abort's own seqno holds nothing, so
                     // the frontier passes it as any seqno with no event (ICR 0140's E1).
                     self.remove_held(id);
+                    // Nor is it a silent commit to report (simp724's N2 on #2055).
+                    if self.include_silent {
+                        self.silent_seen.remove(&id);
+                    }
                 }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
@@ -2454,12 +2488,22 @@ impl FeedReader {
     /// tables and prefix; `None` at the readable end, or once its segment is gone (which
     /// expires the feed).
     fn read_one<const INDEXING: bool>(&mut self, s: usize) -> Result<Option<ReadRecord>> {
-        let (tables, prefix) = (&self.tables, &self.prefix);
+        let (tables, prefix, include_silent) = (&self.tables, &self.prefix, self.include_silent);
+        let shared = &self.shared;
         // D320: a record past the read-ahead's cutoff is passed over before its mutations
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        let filter = |batch: BatchRef<'_>| pack(batch, tables, prefix);
+        // A feed-silent batch (D331, ICR 0141): checked against `incompat` bit 3 and passed
+        // over for a subscription, out of line. The cursors take the mark, so this one test
+        // per batch is the feed path's whole cost (#2055's feed shapes); `pack` is as it was.
+        let filter = |batch: BatchRef<'_>| {
+            if batch.is_silent() {
+                silent_batch(shared, batch, tables, prefix, include_silent)
+            } else {
+                pack(batch, tables, prefix)
+            }
+        };
         let (start, end, session, record) = match self.streams[s].cursor.step()? {
             Step::Record {
                 start,
@@ -2498,6 +2542,10 @@ impl FeedReader {
             | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
+        // D331: a reader that includes silent commits notes each one, for `emit`.
+        if include_silent {
+            note_silent(&record, &mut self.silent_seen);
+        }
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
             // Its round's apply seqno is above its id.
@@ -2715,6 +2763,9 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
+                    if self.include_silent {
+                        self.out_silent = self.silent_seen.remove(&key);
+                    }
                     (ts, Packs::One(changes))
                 }
                 Pending::Decided {
@@ -2728,6 +2779,9 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
+                    if self.include_silent {
+                        self.out_silent = self.silent_seen.remove(&id);
+                    }
                     match self.take_round(id, &participants, session) {
                         Round::Whole(raws) => (ts, Packs::Many(raws)),
                         Round::Dropped => {
@@ -2991,14 +3045,16 @@ impl FeedReader {
     fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>, u64)> {
         let shards = self.shared.shards;
         let open = |s: usize, at: Lsn| {
-            FeedCursor::open(
+            let mut cursor = FeedCursor::open(
                 &self.shared.vfs,
                 &self.shared.path,
                 StreamId(s as u32),
                 db_id,
                 at,
             )
-            .ok()
+            .ok()?;
+            cursor.accept_silent(true);
+            Some(cursor)
         };
         // Each stream's first retained segment of every earlier session in the history.
         let mut firsts: Vec<HashMap<u64, u32>> = Vec::with_capacity(shards);
@@ -3507,6 +3563,62 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
         ));
     }
     Ok((h.db_id, h.delivered, h.catalog_seq))
+}
+
+/// Notes `record`'s key in `seen` if it's a feed-silent commit (D331): a single commit's
+/// seqno, a round's share by its id. Only for a reader that includes them, out of line.
+#[cold]
+#[inline(never)]
+fn note_silent(record: &WalRecord<'_>, seen: &mut HashSet<Seqno>) {
+    let key = match record {
+        WalRecord::Batch { seqno, batch, .. } | WalRecord::Prepare { seqno, batch, .. }
+            if batch.is_silent() =>
+        {
+            *seqno
+        }
+        WalRecord::ExternalPrepare { seqno, share, .. }
+            if share.batch().is_some_and(|b| b.is_silent()) =>
+        {
+            *seqno
+        }
+        _ => return,
+    };
+    seen.insert(key);
+}
+
+/// A feed-silent batch a feed read (D331, ICR 0141): `Corruption` unless the database has
+/// `incompat` bit 3, which a writer sets before appending the first (a stray bit is never
+/// read as the mark); then nothing for a subscription, whose commit is passed over as one
+/// to other tables is, and the batch's mutations for a reader that includes them. A reader
+/// process's pager doesn't see the bit until it reloads, and setting it commits no
+/// manifest, so the superblocks on disk are read again (simp724's S1 on #2055); a `true`
+/// is kept in `silent_flagged`.
+#[cold]
+#[inline(never)]
+fn silent_batch(
+    shared: &Shared,
+    batch: BatchRef<'_>,
+    tables: &[TableId],
+    prefix: &[u8],
+    include_silent: bool,
+) -> Result<Raws> {
+    if !shared.silent_flagged.load(Ordering::Acquire) {
+        let on_disk = shared
+            .pager
+            .features_on_disk()
+            .is_ok_and(|f| f.incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0);
+        if !on_disk {
+            return Err(Error::Corruption(
+                pigeonhole_format::wal::SILENT_WITHOUT_BIT.to_owned(),
+            ));
+        }
+        shared.silent_flagged.store(true, Ordering::Release);
+    }
+    if include_silent {
+        pack(batch, tables, prefix)
+    } else {
+        Ok(Raws::default())
+    }
 }
 
 #[cfg(test)]

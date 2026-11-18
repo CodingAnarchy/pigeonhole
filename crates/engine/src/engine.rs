@@ -768,6 +768,7 @@ fn external_pins(
     db_id: [u8; 16],
     catalog: &Catalog,
     shards: usize,
+    silent_ok: bool,
 ) -> Result<HashMap<TabletId, ShardId>> {
     // Each external PREPARE: (stream, id) -> (coordinator, participants, rows).
     #[allow(clippy::type_complexity)]
@@ -785,6 +786,7 @@ fn external_pins(
             .copied()
             .unwrap_or_default();
         let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
+        rec.accept_silent(silent_ok);
         while let Some((_, record)) = rec.next_record()? {
             match record {
                 WalRecord::Prepare { seqno, .. } => {
@@ -1381,10 +1383,14 @@ impl Engine {
         // perf2's M1 on #2000). Whether tablet changes are on is this open's choice, and an
         // earlier open's may have moved a tablet, so the pre-pass runs whenever the file may
         // hold external PREPAREs; a read-only open holds nothing, and skips it.
+        // Whether the WAL may hold feed-silent batches (D331, ICR 0141): their mark is taken
+        // only with `incompat` bit 3, set before the first was appended.
+        let silent_ok =
+            pager.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0;
         let pins = if !no_writes
             && pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0
         {
-            external_pins(&vfs, path, db_id, &catalog, shards)?
+            external_pins(&vfs, path, db_id, &catalog, shards, silent_ok)?
         } else {
             HashMap::new()
         };
@@ -1591,6 +1597,7 @@ impl Engine {
             } else {
                 Recovery::open(&vfs, path, stream, db_id, checkpoint)?
             };
+            rec.accept_silent(silent_ok);
             let mut records = Vec::new();
             while let Some((end, record)) = rec.next_record()? {
                 match record {
@@ -2420,6 +2427,49 @@ impl Engine {
         self.push_replication_state(&mut batch, state)?;
         self.inner.shared.clock.seed_ts(max_ts);
         self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// Holds the change feed's retained history from now on (D331, ICR 0141): retention
+    /// trims nothing written from here until the hold is dropped, or until the database
+    /// retains more than `cap_bytes` of history, when the hold lapses
+    /// ([`FeedRetentionHold::lapsed`]) and retention trims as before. A range move takes one
+    /// before its copy's first snapshot, so its catch-up from that snapshot's token finds the
+    /// history there however long the copy takes, or the move learns it can't. The WAL
+    /// grows by the writes made while it holds. `InvalidArgument` without the change feed;
+    /// `Busy` before every stream has opened.
+    /// Not part of the stable API.
+    #[doc(hidden)]
+    pub fn hold_feed_retention(&self, cap_bytes: u64) -> Result<FeedRetentionHold> {
+        let shared = &self.inner.shared;
+        let Some(feed) = &shared.feed else {
+            return Err(Error::InvalidArgument(
+                "a retention hold needs the change feed".to_owned(),
+            ));
+        };
+        // Every stream opens with the database; one not open yet is a moment's wait
+        // (simp724's N1 on #2055).
+        let hold = feed.hold_retention(cap_bytes).ok_or(Error::Busy)?;
+        Ok(FeedRetentionHold {
+            shared: Arc::clone(shared),
+            hold,
+        })
+    }
+
+    /// Raises the timestamp floor (D271's `H`) to at least `ts`, durably (D331, ICR 0141): a
+    /// range move's target, before it serves the range, raises it past every timestamp it
+    /// copied from the source, so a default timestamp it hands out later sorts after them all,
+    /// whatever the two nodes' clocks. The floor is committed to the manifest before this
+    /// returns: replay recovers only commit timestamps, not a copy's explicit ones. Refused
+    /// on a replica, whose floor follows its primary's applies. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn raise_ts_floor(&self, ts: Timestamp) -> Result<()> {
+        self.inner.refuse_on_replica()?;
+        self.inner.shared.clock.seed_ts(ts);
+        self.inner.catalog_change(move |catalog| {
+            catalog.counters.ts_floor = catalog.counters.ts_floor.max(ts);
+            Ok(vec![catalog.counters_edit()])
+        })?;
+        Ok(())
     }
 
     /// The most bytes of logged changes one replicated commit should carry (D315 PR 3;
@@ -4595,6 +4645,31 @@ impl Engine {
     }
 }
 
+/// A change-feed retention hold ([`Engine::hold_feed_retention`], D331): released when
+/// dropped. Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FeedRetentionHold {
+    shared: Arc<Shared>,
+    hold: Arc<crate::feed::RetentionHold>,
+}
+
+impl FeedRetentionHold {
+    /// Whether it lapsed at its cap: retention trims again, and a reader that relied on it
+    /// may find its position gone (its feed then expires).
+    pub fn lapsed(&self) -> bool {
+        self.hold.lapsed()
+    }
+}
+
+impl Drop for FeedRetentionHold {
+    fn drop(&mut self) {
+        if let Some(feed) = &self.shared.feed {
+            feed.release_retention(&self.hold);
+        }
+    }
+}
+
 /// What [`Engine::close_for_reopen`] keeps for [`Engine::open_with`]: the writer lock, the
 /// presence and the handle they live on, and the path they belong to (D265). Dropping it
 /// releases the locks but runs no last-one-out cleanup: the WAL files and the shm region
@@ -5738,10 +5813,17 @@ impl Inner {
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
         if batch.logged() {
+            if batch.builder.is_silent() {
+                self.flag_silent()?;
+            }
             return route_logged(batch, view);
         }
+        // A replica refuses its own writes before a silent one's bit is set.
         if self.replica.load(Ordering::Relaxed) {
             return Err(replica_refusal());
+        }
+        if batch.builder.is_silent() {
+            self.flag_silent()?;
         }
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
@@ -6026,6 +6108,25 @@ impl Inner {
             .unwrap_or_else(PoisonError::into_inner);
         writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE)?;
         self.shared.external_flagged.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Sets `incompat` bit 3 in both superblock pages before the first feed-silent batch is
+    /// routed (D331, ICR 0141), so every record carrying the mark is behind it: once per
+    /// database, under the manifest writer's lock. Sticky (FORMAT §8.2).
+    #[cold]
+    #[inline(never)]
+    fn flag_silent(&self) -> Result<()> {
+        if self.shared.silent_flagged.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut writer = self
+            .shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_FEED_SILENT)?;
+        self.shared.silent_flagged.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -7132,6 +7233,9 @@ fn prepare_counter_writes(
 ) -> Result<BatchBuilder> {
     // Each write may gain an 8-byte timestamp.
     let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
+    if batch.is_silent() {
+        out.mark_silent();
+    }
     if !combines {
         for m in batch.batch().iter() {
             let mut m = m?;
@@ -7840,6 +7944,9 @@ impl Shared {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             external_flagged: AtomicBool::new(false),
+            silent_flagged: AtomicBool::new(
+                pager.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0,
+            ),
             external: Arc::new(crate::external_registry::ExternalRegistry::new(
                 options.in_doubt_limits,
             )),

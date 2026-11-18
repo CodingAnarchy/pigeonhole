@@ -51,6 +51,7 @@ mod feed_head;
 mod feed_reader;
 mod feed_reader_process;
 mod feed_retention;
+mod feed_silent;
 mod feed_written;
 mod fifo_expiry;
 mod file_growth;
