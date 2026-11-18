@@ -39,6 +39,13 @@ pub(super) fn handing_over<'m>(map: &'m ClusterMap, partition: &str) -> Option<&
         .find(|m| m.from == partition && map::phase(m) >= MovePhase::HandedOver)
 }
 
+/// Now, in milliseconds since the Unix epoch, on this node's clock (a row's time).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Fault seam (tests): the node directory whose next hand-over stamp fails once.
 #[cfg(test)]
 pub(super) static FAIL_STAMP: std::sync::Mutex<Option<std::path::PathBuf>> =
@@ -68,9 +75,7 @@ pub(super) fn finish_hand_over(
             term: m.handed_over_term,
             version: m.handed_over_version,
             seqno: db.visible_seqno(),
-            at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            at_ms: now_ms(),
         };
         ranges::write_moved(db, &row)?;
         wrote = Some(row);
@@ -108,7 +113,8 @@ impl Node {
             .installing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        gate.ranges().load_moved(ranges::read_moved(db)?);
+        gate.ranges()
+            .load_rows(ranges::read_moved(db)?, ranges::read_serving(db)?);
         let raised = match self.get_map() {
             Ok(map) => self.settle(gate, id, db, &map)?,
             Err(_) => false,
@@ -180,6 +186,28 @@ impl Node {
         if let Some(m) = fencing {
             visible = ranges::mark_fence(db, &m.id)?;
         }
+        // A target taking a move's CLEANING map records that it serves the range, with its
+        // visible seqno just before (`t_from`), before its gate opens it (simp724's C2): so
+        // nothing of the range lands here at or below `t_from` but the move's feed-silent
+        // copy, and a later map that gives a range back to its old owner is told apart
+        // from one that returns it with no copy (cli692's point on the PR 2 review).
+        for m in map.moves.iter().filter(|m| {
+            m.to == id && map::phase(m) >= MovePhase::Cleaning && !gate.ranges().has_serving(&m.id)
+        }) {
+            let (start, end) = map::move_range(m)?;
+            let row = Moved {
+                id: m.id.clone(),
+                table: m.table.clone(),
+                start,
+                end,
+                term: m.handed_over_term,
+                version: m.handed_over_version,
+                seqno: db.visible_seqno(),
+                at_ms: now_ms(),
+            };
+            ranges::write_serving(db, &row)?;
+            gate.ranges().add_serving(row);
+        }
         let Some(m) = handing_over(map, id).filter(|m| {
             // The map's epoch for it here is past the one it's served at, or its file lacks
             // the row: not yet (fully) taken.
@@ -202,7 +230,8 @@ impl Node {
                 Ok(())
             }
             None if !gate.ranges().has_moved(&m.id) => {
-                gate.ranges().load_moved(ranges::read_moved(db)?);
+                gate.ranges()
+                    .load_rows(ranges::read_moved(db)?, ranges::read_serving(db)?);
                 Ok(())
             }
             None => Ok(()),

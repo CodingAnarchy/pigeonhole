@@ -49,6 +49,8 @@ use super::service::{ServiceOp, Touch};
 /// The moved-away rows' family in `__phdb_cluster`, and their row prefix (`moved/<move id>`).
 const FAMILY: &str = "moved";
 const PREFIX: &[u8] = b"moved/";
+/// The serving rows' prefix (`serving/<move id>`): a target's ranges ([`read_serving`]).
+const SERVING: &[u8] = b"serving/";
 
 /// A range that moved off this partition, as its file records it once the partition takes
 /// the hand-over's map. It outlives the map's move record: M3's conflicts and stale
@@ -79,6 +81,35 @@ pub(crate) struct Moved {
 
 /// The moved-away rows in `db`.
 pub(crate) fn read_moved(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
+    read_rows(db, PREFIX)
+}
+
+/// The serving rows in `db`: the ranges this partition, as a move's target, took over and
+/// serves (written as it takes the CLEANING map, before its gate opens them). Each holds the
+/// same fields as a moved-away row; its `seqno` is the partition's visible seqno just
+/// before it (`t_from`: nothing of the range landed at or below it here but feed-silent
+/// copies).
+///
+/// **Lifetime (cli692):** a serving row gates the target's serving while its move is in the
+/// map, and afterwards clears the part of an older moved-away row it covers (a move back).
+/// So it lives as long as either holds: PR 5's writer prunes it only once no older
+/// moved-away row here overlaps it, never on the feed's retention.
+///
+/// **Copies:** it's a plain logged write, so a replica copy of the target has it once it
+/// has applied past `t_from`. A copy promoted (D330) while the move is in the map can't
+/// happen (failover is blocked for a move's partitions until it's done); one promoted after
+/// is gated by no move record, so it needs the row only to clear an older moved-away one,
+/// which it applied before it.
+pub(crate) fn read_serving(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
+    read_rows(db, SERVING)
+}
+
+/// Records serving row `m` in `db` (see [`read_serving`]).
+pub(crate) fn write_serving(db: &Pigeonhole, m: &Moved) -> Result<(), String> {
+    write_row(db, SERVING, m)
+}
+
+fn read_rows(db: &Pigeonhole, prefix: &[u8]) -> Result<Vec<Moved>, String> {
     let t = match db.table(identity::TABLE).and_then(|t| t.open()) {
         Ok(t) => t,
         Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(Vec::new()),
@@ -88,14 +119,14 @@ pub(crate) fn read_moved(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
         return Ok(Vec::new());
     }
     let rows = t
-        .scan_prefix(PREFIX)
+        .scan_prefix(prefix)
         .family(FAMILY)
         .iter()
         .map_err(|e| format!("read the moved-away ranges: {e}"))?;
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|e| format!("read the moved-away ranges: {e}"))?;
-        let id = String::from_utf8_lossy(&row.key()[PREFIX.len()..]).into_owned();
+        let id = String::from_utf8_lossy(&row.key()[prefix.len()..]).into_owned();
         let bytes = |q: &[u8]| row.get(FAMILY, q).map(|c| c.value().to_vec());
         let number = |q: &[u8]| -> Result<u64, String> {
             bytes(q)
@@ -120,11 +151,15 @@ pub(crate) fn read_moved(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
 /// Records `m` in `db`, durably once the commit returns (the row is the gate's after a
 /// restart: S rebuilds its gate from it before it serves).
 pub(crate) fn write_moved(db: &Pigeonhole, m: &Moved) -> Result<(), String> {
+    write_row(db, PREFIX, m)
+}
+
+fn write_row(db: &Pigeonhole, prefix: &[u8], m: &Moved) -> Result<(), String> {
     let t = db
         .table(identity::TABLE)
         .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
         .map_err(|e| format!("open the moved-away ranges: {e}"))?;
-    let row = [PREFIX, m.id.as_bytes()].concat();
+    let row = [prefix, m.id.as_bytes()].concat();
     let mut w = t
         .mutate(&row)
         .put(FAMILY, b"table", m.table.as_bytes())
@@ -167,6 +202,11 @@ enum Rule {
     Moved,
     /// Everything: `PartitionUnavailable`.
     Unserved,
+    /// Everything: `PartitionUnavailable`. A range this partition handed away (its row says
+    /// so) that the map places here again with no move giving it back (cli692's point on
+    /// the PR 2 review: a forced map): its copy here may be cleaned, so serving it would
+    /// answer rows as absent.
+    Returned,
 }
 
 /// One gated range of one table.
@@ -272,6 +312,13 @@ impl RangeState {
                          {:?} is handing it over): retry",
                         self.partition, s.move_id
                     ))),
+                    Rule::Returned => Some(ApiError::partition_unavailable(format!(
+                        "partition {:?} handed this range of table {table:?} away (move {:?}) \
+                         and the cluster map gives it back with no move that copied it back: \
+                         its rows here may be gone, so it isn't served. Move the range with a \
+                         range move, or restore it",
+                        self.partition, s.move_id
+                    ))),
                 };
                 return ControlFlow::Break(());
             }
@@ -339,6 +386,7 @@ impl RangeState {
 pub(crate) struct RangeGate {
     state: ArcSwapOption<RangeState>,
     moved: Mutex<Vec<Moved>>,
+    serving: Mutex<Vec<Moved>>,
 }
 
 impl RangeGate {
@@ -353,9 +401,27 @@ impl RangeGate {
         self.moved.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes the moved-away rows the partition's file holds, as it opens (before it serves).
-    pub(crate) fn load_moved(&self, rows: Vec<Moved>) {
-        *self.moved() = rows;
+    /// Takes the moved-away and serving rows the partition's file holds, as it opens (before
+    /// it serves).
+    pub(crate) fn load_rows(&self, moved: Vec<Moved>, serving: Vec<Moved>) {
+        *self.moved() = moved;
+        *self.serving() = serving;
+    }
+
+    fn serving(&self) -> std::sync::MutexGuard<'_, Vec<Moved>> {
+        self.serving.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds a serving row once it's durable in the file.
+    pub(crate) fn add_serving(&self, row: Moved) {
+        let mut serving = self.serving();
+        serving.retain(|m| m.id != row.id);
+        serving.push(row);
+    }
+
+    /// Whether the file records that it serves move `id`'s range.
+    pub(crate) fn has_serving(&self, id: &str) -> bool {
+        self.serving().iter().any(|m| m.id == id)
     }
 
     /// Adds a moved-away row once it's durable in the file.
@@ -374,7 +440,14 @@ impl RangeGate {
     /// it in; `visible` is the partition's visible seqno now, a new fence's seqno.
     pub(crate) fn update(&self, map: &ClusterMap, partition: &str, visible: u64) {
         let prev = self.state.load_full();
-        let next = derive(map, partition, &self.moved(), prev.as_deref(), visible);
+        let next = derive(
+            map,
+            partition,
+            &self.moved(),
+            &self.serving(),
+            prev.as_deref(),
+            visible,
+        );
         self.state.store(next.map(Arc::new));
     }
 }
@@ -386,6 +459,7 @@ fn derive(
     map: &ClusterMap,
     partition: &str,
     moved: &[Moved],
+    serving: &[Moved],
     prev: Option<&RangeState>,
     visible: u64,
 ) -> Option<RangeState> {
@@ -418,32 +492,69 @@ fn derive(
                 }
                 _ => {}
             }
-        } else if m.to == partition && phase < MovePhase::Cleaning {
+        } else if m.to == partition
+            && (phase < MovePhase::Cleaning || !serving.iter().any(|r| r.id == m.id))
+        {
+            // Served from CLEANING on, once its serving row is in the file (written before
+            // the gate opens it, so nothing of the range lands here below its `t_from`).
             spans.extend(span(m, Rule::Unserved));
         }
     }
-    // The rows of moves the map no longer carries, unless the map gives the range back to
-    // this partition (a later move brought it home).
+    // The rows of moves the map no longer carries: each part of the range a later move
+    // gave back (a newer serving row here) is served again; the rest is refused, as moved
+    // away, or, where the map places it here anyway, as returned with no copy back.
     for r in moved {
         if map.moves.iter().any(|m| m.id == r.id) {
             continue;
         }
-        let home = map
+        let mut left = vec![(r.start.clone(), r.end.clone())];
+        for back in serving
+            .iter()
+            .filter(|b| b.table == r.table && (b.term, b.version) > (r.term, r.version))
+        {
+            left = left
+                .into_iter()
+                .flat_map(|piece| subtract(&piece, &(back.start.clone(), back.end.clone())))
+                .collect();
+        }
+        if left.is_empty() {
+            continue;
+        }
+        handover_seqno = handover_seqno.max(r.seqno);
+        let homes: Vec<(Vec<u8>, Option<Vec<u8>>)> = map
             .tables
             .iter()
             .find(|t| t.name == r.table)
-            .is_some_and(|t| map::inside(t, &r.start, r.end.as_deref(), partition));
-        if home {
-            continue;
+            .map(|t| {
+                map::table_ranges(t)
+                    .into_iter()
+                    .filter(|(_, _, p)| *p == partition)
+                    .map(|(a, b, _)| (a, b))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for piece in left {
+            let mut away = vec![piece.clone()];
+            for home in &homes {
+                if let Some(both) = intersect(&piece, home) {
+                    spans.push(Span {
+                        move_id: r.id.clone(),
+                        table: r.table.clone(),
+                        start: both.0.clone(),
+                        end: both.1.clone(),
+                        rule: Rule::Returned,
+                    });
+                    away = away.into_iter().flat_map(|a| subtract(&a, &both)).collect();
+                }
+            }
+            spans.extend(away.into_iter().map(|(start, end)| Span {
+                move_id: r.id.clone(),
+                table: r.table.clone(),
+                start,
+                end,
+                rule: Rule::Moved,
+            }));
         }
-        spans.push(Span {
-            move_id: r.id.clone(),
-            table: r.table.clone(),
-            start: r.start.clone(),
-            end: r.end.clone(),
-            rule: Rule::Moved,
-        });
-        handover_seqno = handover_seqno.max(r.seqno);
     }
     if spans.is_empty() {
         return None;
@@ -462,6 +573,38 @@ fn derive(
         fence_seqno,
         handover_seqno,
     })
+}
+
+/// A key range, `[start, end)`; `end` `None`: to the table's end.
+type KeyRange = (Vec<u8>, Option<Vec<u8>>);
+
+/// `a` and `b`'s overlap, if they overlap.
+fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
+    let start = a.0.clone().max(b.0.clone());
+    let end = match (&a.1, &b.1) {
+        (None, e) | (e, None) => e.clone(),
+        (Some(x), Some(y)) => Some(x.clone().min(y.clone())),
+    };
+    end.as_ref()
+        .is_none_or(|e| start < *e)
+        .then_some((start, end))
+}
+
+/// What's left of `a` once `b` is taken out: none, one or two ranges.
+fn subtract(a: &KeyRange, b: &KeyRange) -> Vec<KeyRange> {
+    let Some(both) = intersect(a, b) else {
+        return vec![a.clone()];
+    };
+    let mut out = Vec::new();
+    if a.0 < both.0 {
+        out.push((a.0.clone(), Some(both.0.clone())));
+    }
+    if let Some(e) = both.1
+        && a.1.as_ref().is_none_or(|ae| e < *ae)
+    {
+        out.push((e, a.1.clone()));
+    }
+    out
 }
 
 /// The moves naming `partition` as `Status` reports them (`LocalPartition.moves`).
@@ -565,8 +708,18 @@ mod tests {
     }
 
     fn gate(map: &ClusterMap, partition: &str, moved: Vec<Moved>, visible: u64) -> RangeGate {
+        gate_serving(map, partition, moved, Vec::new(), visible)
+    }
+
+    fn gate_serving(
+        map: &ClusterMap,
+        partition: &str,
+        moved: Vec<Moved>,
+        serving: Vec<Moved>,
+        visible: u64,
+    ) -> RangeGate {
         let g = RangeGate::default();
-        g.load_moved(moved);
+        g.load_rows(moved, serving);
         g.update(map, partition, visible);
         g
     }
@@ -644,7 +797,28 @@ mod tests {
             assert_eq!(code(&t, &put("d")).as_deref(), Some("PartitionUnavailable"));
             assert_eq!(code(&t, &get("n")), None);
         }
-        assert!(at(MovePhase::Cleaning, "p2").is_none(), "T serves it");
+        // At CLEANING it serves the range once its serving row is in its file (written as it
+        // takes that map, before the gate opens it: simp724's C2).
+        let t = at(MovePhase::Cleaning, "p2").expect("no serving row yet");
+        assert_eq!(code(&t, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        let serving = Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"f".to_vec()),
+            term: 0,
+            version: 5,
+            seqno: 30,
+            at_ms: 0,
+        };
+        let cleaning = map(Some(MovePhase::Cleaning));
+        assert!(
+            gate_serving(&cleaning, "p2", Vec::new(), vec![serving], 31)
+                .state
+                .load_full()
+                .is_none(),
+            "T serves it"
+        );
         // HANDING_OVER: the source fences the range's writes, retry-safe; reads go on.
         let s = at(MovePhase::HandingOver, "p1").expect("gated");
         let e = s.check(&put("d"), true).unwrap_err();
@@ -693,28 +867,102 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_away_row_outlives_the_move_until_the_range_comes_home() {
-        let row = Moved {
-            id: "mv1".into(),
+    fn a_moved_away_row_outlives_the_move_until_a_move_brings_the_range_home() {
+        let row = |id: &str, start: &[u8], end: &[u8], version: u64| Moved {
+            id: id.into(),
             table: "users".into(),
-            start: b"c".to_vec(),
-            end: Some(b"f".to_vec()),
+            start: start.to_vec(),
+            end: Some(end.to_vec()),
             term: 0,
-            version: 5,
+            version,
             seqno: 40,
             at_ms: 0,
         };
         // The move is done and gone from the map, which gives `[c, f)` to p2.
         let mut done = map(None);
         done.tables[0] = map::handed_over(&done.tables[0], b"c", Some(b"f"), "p2");
-        let s = gate(&done, "p1", vec![row.clone()], 50)
+        let s = gate(&done, "p1", vec![row("mv1", b"c", b"f", 5)], 50)
             .state
             .load_full()
             .expect("gated");
         assert_eq!(code(&s, &get("d")).as_deref(), Some("WrongPartition"));
         assert_eq!(code(&s, &get("a")), None);
-        // A later map that gives the range back to p1 ungates it.
-        assert!(gate(&map(None), "p1", vec![row], 50).load().is_none());
+        // cli692's point: a map that places the range on p1 again with no move bringing it
+        // back (a forced map) doesn't make p1 serve rows it may have cleaned.
+        let s = gate(&map(None), "p1", vec![row("mv1", b"c", b"f", 5)], 50)
+            .state
+            .load_full()
+            .expect("still gated");
+        let e = s.check(&get("d"), false).unwrap_err();
+        assert_eq!(e.code, "PartitionUnavailable");
+        assert!(
+            e.message.contains("no move that copied it back"),
+            "{}",
+            e.message
+        );
+        // A later move that brought `[d, e)` home (p1's newer serving row) serves that part
+        // again; the rest stays refused.
+        let s = gate_serving(
+            &map(None),
+            "p1",
+            vec![row("mv1", b"c", b"f", 5)],
+            vec![row("mv2", b"d", b"e", 9)],
+            50,
+        )
+        .state
+        .load_full()
+        .expect("partly gated");
+        assert_eq!(code(&s, &get("d")), None);
+        assert_eq!(code(&s, &get("c")).as_deref(), Some("PartitionUnavailable"));
+        assert_eq!(code(&s, &get("e")).as_deref(), Some("PartitionUnavailable"));
+        // A serving row from before the hand-over doesn't count.
+        let s = gate_serving(
+            &map(None),
+            "p1",
+            vec![row("mv1", b"c", b"f", 5)],
+            vec![row("mv0", b"c", b"f", 3)],
+            50,
+        )
+        .state
+        .load_full()
+        .expect("gated");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        // Brought home whole: ungated.
+        assert!(
+            gate_serving(
+                &map(None),
+                "p1",
+                vec![row("mv1", b"c", b"f", 5)],
+                vec![row("mv2", b"b", b"g", 9)],
+                50,
+            )
+            .state
+            .load_full()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ranges_intersect_and_subtract() {
+        let r = |a: &[u8], b: Option<&[u8]>| (a.to_vec(), b.map(<[u8]>::to_vec));
+        assert_eq!(
+            intersect(&r(b"c", Some(b"f")), &r(b"d", None)),
+            Some(r(b"d", Some(b"f")))
+        );
+        assert_eq!(intersect(&r(b"c", Some(b"f")), &r(b"f", None)), None);
+        assert_eq!(
+            subtract(&r(b"c", Some(b"f")), &r(b"d", Some(b"e"))),
+            [r(b"c", Some(b"d")), r(b"e", Some(b"f"))]
+        );
+        assert_eq!(
+            subtract(&r(b"c", None), &r(b"d", None)),
+            [r(b"c", Some(b"d"))]
+        );
+        assert!(subtract(&r(b"c", Some(b"f")), &r(b"", None)).is_empty());
+        assert_eq!(
+            subtract(&r(b"c", Some(b"f")), &r(b"x", None)),
+            [r(b"c", Some(b"f"))]
+        );
     }
 
     #[test]
@@ -818,7 +1066,10 @@ mod tests {
         let t = statuses(&map(Some(MovePhase::HandingOver)), "p2");
         assert!(!t[0].source && !t[0].fenced && !t[0].serving);
         let t = statuses(&map(Some(MovePhase::Cleaning)), "p2");
-        assert!(t[0].serving);
+        assert!(
+            t[0].serving,
+            "the phase allows it (the gate also waits for its row)"
+        );
         let s = statuses(&map(Some(MovePhase::Cleaning)), "p1");
         assert!(!s[0].serving);
     }
