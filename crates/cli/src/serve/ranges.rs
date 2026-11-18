@@ -279,6 +279,13 @@ struct Span {
     /// A target's span from a move at CLEANING, waiting for its serving row: kept when the
     /// map drops the move until the row is here (simp724's S3 on PR 3a). An aborted move's
     /// span never is: it never gets a row.
+    ///
+    /// In memory only, so a copy that restarts after the map dropped the move, and before
+    /// the row reached it, rebuilds without the wait. That's safe only through D328's
+    /// freshness rule (cli692): the serving row is written at CLEANING, long before PR 5
+    /// drops the record after the source's cleanup, so a copy fresh enough to serve already
+    /// has the row, and a stale one sends its reads to the owner. Loosening either rule
+    /// needs this one to be persisted.
     awaits_row: bool,
 }
 
