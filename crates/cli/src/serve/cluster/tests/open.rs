@@ -334,6 +334,8 @@ fn opened_off_the_others_cores_alone() {
         memory_bytes: 0,
         history_epoch: 0,
         replicas: Vec::new(),
+        failover: 0,
+        failover_count: 0,
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -357,6 +359,8 @@ fn opened_off_the_others_cores_alone() {
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -657,6 +661,8 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         memory_bytes: 0,
         history_epoch: 0,
         replicas: Vec::new(),
+        failover: 0,
+        failover_count: 0,
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -680,6 +686,8 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     // One 1-shard partition: 64 MiB of memtables and 448 MiB of caches.
@@ -790,6 +798,8 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         memory_bytes: 0,
         history_epoch: 0,
         replicas: Vec::new(),
+        failover: 0,
+        failover_count: 0,
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -813,6 +823,8 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     const BUDGET: u64 = 4 << 20;
@@ -1313,6 +1325,8 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
         memory_bytes: 0,
         history_epoch: 0,
         replicas: Vec::new(),
+        failover: 0,
+        failover_count: 0,
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -1336,6 +1350,8 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
