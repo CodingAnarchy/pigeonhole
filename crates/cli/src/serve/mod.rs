@@ -273,40 +273,55 @@ fn embed_threads(free: usize) -> usize {
     free.clamp(1, 4)
 }
 
-/// With `--embed-local` and the shards pinned (`cpus`, the CPUs left to the network side as a
-/// list), a line telling the operator what to export, or `None` once both are set. candle runs
-/// large element-wise steps on a process-wide pool of its own, which
-/// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_CPU_MASK` places it (Linux) and
-/// `CANDLE_NUM_THREADS` sizes it. The mask alone isn't enough: unsized, the pool takes a
-/// thread per core (from `RAYON_NUM_THREADS` or the core count) and crowds them onto the
-/// masked CPUs (cli692's N2 on #1671). Its size is the embedder's own, `threads`, so
-/// embedding takes about that many CPUs in all (N1). Without the mask or `RAYON_NUM_THREADS`,
-/// candle 0.11 also re-reads `/proc/cpuinfo` on every matrix product (huggingface/candle#4070).
-/// They're read once, from the environment, and setting them here would need `unsafe` (D318),
-/// so the operator sets them before the start. Only the unset ones are named.
-fn candle_advice(
+/// candle's process-wide pool's variables `--embed-local` found unset at startup (#2061): bit
+/// 0 `CANDLE_NUM_THREADS`, bit 1 `CANDLE_CPU_MASK`, and bit 7 set once `--embed-local` is on,
+/// so `/metrics` shows the gauge only then. Process-wide, as the environment is.
+pub(crate) static CANDLE_UNSET: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// candle's variables, in [`CANDLE_UNSET`]'s bit order.
+const CANDLE_VARS: [&str; 2] = ["CANDLE_NUM_THREADS", "CANDLE_CPU_MASK"];
+
+/// With `--embed-local`: a warning naming the line to export, and [`CANDLE_UNSET`]'s bits, while
+/// either of candle's variables is unset; `None` (and only the on bit) once both are. candle
+/// runs large element-wise steps on a process-wide pool of its own, which
+/// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_NUM_THREADS` sizes it (one thread per
+/// core by default) and `CANDLE_CPU_MASK` places it (Linux). Unset, its threads can run on the
+/// shards' CPUs. Unsized, the mask alone crowds a thread per core onto the masked CPUs
+/// (cli692's N2 on #1671), so its size is the embedder's own, `threads` (N1). Without the mask
+/// or `RAYON_NUM_THREADS`, candle 0.11 also re-reads `/proc/cpuinfo` on every matrix product
+/// (huggingface/candle#4070). They're read once, from the environment, and setting them here
+/// would need `unsafe` (D318), so the operator exports them before the start. `cpus` is the
+/// placement's CPU list when the shards are pinned, else the process's own (any list avoids
+/// the cpuinfo re-read); the mask is Linux's only. Pinning the pool to one thread instead was
+/// measured and declined: −25 to −50% on batches and long texts (#2061).
+fn candle_warning(
     cpus: Option<String>,
     threads: usize,
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<String> {
-    let cpus = cpus?;
-    let missing: Vec<String> = [
-        ("CANDLE_CPU_MASK", cpus),
-        ("CANDLE_NUM_THREADS", threads.to_string()),
-    ]
-    .into_iter()
-    .filter(|(k, _)| env(k).is_none())
-    .map(|(k, v)| format!("{k}={v}"))
-    .collect();
-    if missing.is_empty() {
-        return None;
+) -> (Option<String>, u8) {
+    let mut bits = 0x80;
+    let mut missing = Vec::new();
+    if env(CANDLE_VARS[0]).is_none() {
+        bits |= 1;
+        missing.push(format!("{}={threads}", CANDLE_VARS[0]));
     }
-    Some(format!(
-        "phdb serve: --embed-local: candle's own thread pool isn't placed and sized off the \
-         shards' CPUs. Start the server with these in its environment (they're read once, at \
-         start):\n  export {}",
+    if cfg!(target_os = "linux") && env(CANDLE_VARS[1]).is_none() {
+        bits |= 2;
+        if let Some(cpus) = cpus {
+            missing.push(format!("{}={cpus}", CANDLE_VARS[1]));
+        }
+    }
+    if bits == 0x80 {
+        return (None, bits);
+    }
+    let line = format!(
+        "phdb serve: WARN: --embed-local: candle's own thread pool isn't sized and placed off the \
+         shards' CPUs, and on Linux re-reads /proc/cpuinfo on every matrix product (see the \
+         guide's \"Embedding placement\"). Start the server with these in its environment \
+         (they're read once, at start):\n  export {}",
         missing.join(" ")
-    ))
+    );
+    (Some(line), bits)
 }
 
 /// The options every database `serve` opens takes: a single node's and each cluster
@@ -703,14 +718,19 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
         if let Some(note) = &placement.note {
             let _ = writeln!(stderr, "phdb serve: {note}");
         }
-        if args.memory.embed_local
-            && let Some(line) = candle_advice(
-                placement.cpu_list(),
+        if args.memory.embed_local {
+            let cpus = placement.cpu_list().or_else(|| {
+                placement::process_cpus().map(|c| placement::format_cpu_list(&c))
+            });
+            let (line, bits) = candle_warning(
+                cpus,
                 embed_threads(placement.free_cpus),
                 &|k| std::env::var_os(k),
-            )
-        {
-            let _ = writeln!(stderr, "{line}");
+            );
+            CANDLE_UNSET.store(bits, std::sync::atomic::Ordering::Relaxed);
+            if let Some(line) = line {
+                let _ = writeln!(stderr, "{line}");
+            }
         }
         if let Some(r) = &replica {
             let _ = writeln!(stderr, "phdb serve: a replica of {}", r.primary());
