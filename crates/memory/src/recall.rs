@@ -232,6 +232,8 @@ pub struct Recall<'a> {
     rows: Rows<'a>,
     index: Idx<'a>,
     ivf: Option<&'a crate::ivf::Ivf>,
+    /// The store's namespace counts by snapshot (#2040); `None` in a reader process.
+    counts: Option<&'a crate::ivf::NsCounts>,
     exact: bool,
     nprobe: Option<u32>,
     model: Option<&'a EmbeddingModel>,
@@ -279,6 +281,7 @@ impl<'a> Recall<'a> {
         rows: Rows<'a>,
         index: Idx<'a>,
         ivf: Option<&'a crate::ivf::Ivf>,
+        counts: Option<&'a crate::ivf::NsCounts>,
         model: Option<&'a EmbeddingModel>,
         db: Snap<'a>,
         namespaces: &[&str],
@@ -287,6 +290,7 @@ impl<'a> Recall<'a> {
             rows,
             index,
             ivf,
+            counts,
             exact: false,
             nprobe: None,
             model,
@@ -623,16 +627,55 @@ impl<'a> Recall<'a> {
     /// at the recall's snapshot, as the search and the memories are) reaches the store's
     /// `min_namespace_len`. Not in the map: exact.
     fn ivf_counts(&self, s: &Snapshot) -> Result<BTreeMap<&str, u64>> {
-        let mut ivf_counts: BTreeMap<&str, u64> = BTreeMap::new();
-        if let Some(min) = self.ivf_min() {
-            for ns in &self.namespaces {
-                let c = crate::ivf::count(&self.rows, s, ns)?;
-                if c >= min {
-                    ivf_counts.insert(ns.as_str(), c);
-                }
-            }
+        let Some(min) = self.ivf_min() else {
+            return Ok(BTreeMap::new());
+        };
+        let at = self.counts_at(s);
+        let mut counts = Vec::with_capacity(self.namespaces.len());
+        for ns in &self.namespaces {
+            counts.push(match self.cached_count(ns, at) {
+                Some(c) => c,
+                None => self.read_count(ns, at, crate::ivf::count(&self.rows, s, ns)?),
+            });
         }
-        Ok(ivf_counts)
+        Ok(self.over(min, counts))
+    }
+
+    /// The key a recall at `s` keeps its namespace counts under, or `None` when it keeps
+    /// none (a reader process: a writer's restart can lose commits a reader saw and use their
+    /// seqnos again, and a reader has no generation to tell them apart). Read before the
+    /// counts, so a count is only ever kept under `s`'s own generation: `s` carries the
+    /// generation it was taken in, and once a recovery passes it, every read at `s` fails
+    /// with `SnapshotExpired` and nothing is kept.
+    fn counts_at(&self, s: &Snapshot) -> Option<crate::ivf::At> {
+        match (self.counts, &self.db) {
+            (Some(_), Snap::W(db)) => Some((db.recovery_stats().generation, s.seqno())),
+            _ => None,
+        }
+    }
+
+    /// `ns`'s count from an earlier recall at the same snapshot, if there is one (#2040).
+    fn cached_count(&self, ns: &str, at: Option<crate::ivf::At>) -> Option<u64> {
+        self.counts?.get(ns, at?)
+    }
+
+    /// `c`, `ns`'s count just read, kept for later recalls at the same snapshot.
+    fn read_count(&self, ns: &str, at: Option<crate::ivf::At>, c: u64) -> u64 {
+        if let (Some(counts), Some(at)) = (self.counts, at) {
+            counts.put(ns, at, c);
+        }
+        c
+    }
+
+    /// The namespaces of `counts` (in the recall's order) that reach `min`, with their
+    /// counts: the IVF index serves those.
+    fn over(&self, min: u64, counts: Vec<u64>) -> BTreeMap<&str, u64> {
+        self.namespaces
+            .iter()
+            .zip(counts)
+            .filter(|&(_, c)| c >= min)
+            .map(|(ns, c)| (ns.as_str(), c))
+            .collect()
     }
 
     /// The namespace length from which the IVF index serves this recall, if it can.
@@ -1511,16 +1554,21 @@ impl<'a> Recall<'a> {
 
     /// [`ivf_counts`](Self::ivf_counts)' async twin.
     async fn ivf_counts_async(&self, s: &Snapshot) -> Result<BTreeMap<&str, u64>> {
-        let mut ivf_counts: BTreeMap<&str, u64> = BTreeMap::new();
-        if let Some(min) = self.ivf_min() {
-            for ns in &self.namespaces {
-                let c = crate::ivf::count_async(&self.rows, s, ns).await?;
-                if c >= min {
-                    ivf_counts.insert(ns.as_str(), c);
+        let Some(min) = self.ivf_min() else {
+            return Ok(BTreeMap::new());
+        };
+        let at = self.counts_at(s);
+        let mut counts = Vec::with_capacity(self.namespaces.len());
+        for ns in &self.namespaces {
+            counts.push(match self.cached_count(ns, at) {
+                Some(c) => c,
+                None => {
+                    let c = crate::ivf::count_async(&self.rows, s, ns).await?;
+                    self.read_count(ns, at, c)
                 }
-            }
+            });
         }
-        Ok(ivf_counts)
+        Ok(self.over(min, counts))
     }
 
     /// [`gather_cands`](Self::gather_cands)' async twin: per namespace, its vector, keyword

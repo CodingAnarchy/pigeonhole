@@ -1,0 +1,2 @@
+### Fixed
+- Under sustained `GroupSync` writes of large values on Linux, blob files (values over a family's `blob_threshold`) now start their writeback as they're written, a megabyte at a time, as SST output does since D334. A flush, compaction or large commit no longer sends a whole blob file to the disk at once, ahead of the WAL's small synced writes (#2023). There's no change to durability or the file format.

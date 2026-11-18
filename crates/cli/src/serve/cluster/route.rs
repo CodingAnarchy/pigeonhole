@@ -19,6 +19,24 @@ struct Placement {
 }
 
 impl Placement {
+    /// Its ranges in key order, each with its partition: range `i` is
+    /// `[splits[i-1], splits[i])`.
+    fn ranges(&self) -> Vec<PartRange> {
+        self.partitions
+            .iter()
+            .enumerate()
+            .map(|(i, partition)| PartRange {
+                partition: partition.clone(),
+                start: if i == 0 {
+                    Vec::new()
+                } else {
+                    self.splits[i - 1].clone()
+                },
+                end: self.splits.get(i).cloned(),
+            })
+            .collect()
+    }
+
     /// The partitions holding ids that start with `prefix`, in key order and without
     /// repeats (an empty prefix: all of them). Range `i` is `[splits[i-1], splits[i])`: it
     /// holds such an id when it ends past the prefix and starts before the first key past
@@ -273,22 +291,14 @@ impl Routes {
     /// `table`'s partitions in key order, each with its half-open range (D317 ticket 4's
     /// fan-out); `None` for a table the map doesn't place.
     pub(crate) fn ranges(&self, table: &str) -> Option<Vec<PartRange>> {
-        let p = self.tables.get(table)?;
-        Some(
-            p.partitions
-                .iter()
-                .enumerate()
-                .map(|(i, partition)| PartRange {
-                    partition: partition.clone(),
-                    start: if i == 0 {
-                        Vec::new()
-                    } else {
-                        p.splits[i - 1].clone()
-                    },
-                    end: p.splits.get(i).cloned(),
-                })
-                .collect(),
-        )
+        Some(self.tables.get(table)?.ranges())
+    }
+
+    /// `index`'s id ranges in order, each with its partition (#1722 PR 2b: the ranges an
+    /// `allow_partial` text search names as missing); `None` for an index the map doesn't
+    /// place.
+    pub(crate) fn index_ranges(&self, index: &str) -> Option<Vec<PartRange>> {
+        Some(self.indexes.get(index)?.ranges())
     }
 
     /// Where `partition` is served; `None` for a partition the map doesn't list.

@@ -9,6 +9,7 @@
 //! partition's identity under it.
 
 mod backup;
+mod bulkfan;
 pub(crate) mod cli;
 pub(crate) mod close;
 pub(crate) mod fanout;
@@ -25,6 +26,7 @@ pub(crate) mod memwatch;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
+pub(crate) mod promote;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -68,7 +70,15 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     NEAREST_QUALIFIERS_FEATURE,
     MEMORY_TOOL_FIELDS_FEATURE,
     REPLICAS_FEATURE,
+    INDEX_BULK_LOAD_FEATURE,
+    LEASES_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for a build that serves `Cluster.Lease` (D326 amendment 1, #2048):
+/// a peer whose `Lease` answers `Unimplemented` counts as granting only if its `Status`
+/// lacks it (a 1.2 node), never when it reports it (a 1.3 node behind something that doesn't
+/// route the call, audit120's S1).
+pub(crate) const LEASES_FEATURE: &str = "leases";
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.memory` (#1915).
 pub(crate) const MEMORY_FEATURE: &str = "memory";
@@ -76,6 +86,12 @@ pub(crate) const MEMORY_FEATURE: &str = "memory";
 /// [`MAP_FEATURES`]' name for `ClusterMap.indexes` (#1722, ICR 0138): a node without it
 /// would drop the field from the map it stores, and read as divergent.
 pub(crate) const INDEXES_FEATURE: &str = "indexes";
+
+/// [`MAP_FEATURES`]' name for a build that serves `Cluster.ForwardBulkLoad` (#1722 PR 3, ICR
+/// 0138): an entry node checks every node holding a part of the index for it before a
+/// `Vectors.BulkLoad` reads anything, so an older one refuses the load up front, not
+/// part way.
+pub(crate) const INDEX_BULK_LOAD_FEATURE: &str = "index_bulk_load";
 
 /// [`MAP_FEATURES`]' name for a build that applies `NearestRequest.qualifiers` (#1915 PR 3):
 /// a node without it would rank every qualifier.
@@ -183,6 +199,11 @@ pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Ve
 /// by cluster directory: their `Status` leaves the feature out.
 #[cfg(test)]
 pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before `ForwardBulkLoad` (#1722 PR 3), by
+/// cluster directory: their `Status` leaves `index_bulk_load` out.
+#[cfg(test)]
+pub(crate) static OLD_BULK_LOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// A fault seam (tests): nodes acting as a build before `ClusterMap.indexes` (#1722), by
 /// cluster directory: their `Status` leaves `indexes` out.
@@ -1212,10 +1233,14 @@ impl Node {
                 lp.replica_applied_seqno = c.applied;
                 lp.replica_primary_seqno = c.primary_seqno;
                 lp.replica_lag_ms = c.lag_ms;
-                lp.epoch = map
-                    .as_ref()
-                    .and_then(|m| m.partitions.iter().find(|p| p.id == named))
-                    .map_or(0, |p| p.epoch);
+                // The copy's identity epoch: its owner's at the bootstrap (`e_b`), which a
+                // promotion checks against P's history (D328 PR 3).
+                lp.epoch = copy
+                    .service
+                    .part()
+                    .ok()
+                    .and_then(|part| identity::read(&part.db).ok().flatten())
+                    .map_or(0, |id| id.epoch);
                 lp.ok = c.state != proto::ReplicaState::Behind
                     && c.state != proto::ReplicaState::OwnerFeedOff;
                 lp.error = if lp.ok { String::new() } else { c.last_error };
@@ -1353,6 +1378,20 @@ impl Node {
                             .iter()
                             .any(|d| self.dir.starts_with(d))
                     {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    if f == INDEX_BULK_LOAD_FEATURE
+                        && OLD_BULK_LOAD
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .any(|d| self.dir.starts_with(d))
+                    {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    if f == LEASES_FEATURE && fence::pre_lease(&self.dir) {
                         return false;
                     }
                     #[cfg(test)]
@@ -1721,6 +1760,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::LeaseRequest>,
     ) -> Result<tonic::Response<proto::LeaseResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "ask for a partition lease")?;
+        #[cfg(test)]
+        if fence::pre_lease(&self.0.dir) || fence::lease_unrouted(&self.0.dir) {
+            return Err(Status::unimplemented("a build before D326"));
+        }
         let req = req.into_inner();
         let mine = self.0.get_map()?;
         if req.cluster_id != mine.cluster_id {
@@ -1739,6 +1782,10 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::ReleaseRequest>,
     ) -> Result<tonic::Response<proto::ReleaseResponse>, Status> {
         self.caller(&req, &[Scope::Cluster], "release a partition lease")?;
+        #[cfg(test)]
+        if fence::pre_lease(&self.0.dir) || fence::lease_unrouted(&self.0.dir) {
+            return Err(Status::unimplemented("a build before D326"));
+        }
         let req = req.into_inner();
         let mine = self.0.get_map()?;
         if req.cluster_id != mine.cluster_id {
@@ -1904,6 +1951,49 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         )))
     }
 
+    /// Node to node: one partition's part of a `Vectors.BulkLoad` another node splits by id
+    /// (#1722 PR 3). Cluster scope; served for the caller it names, as this node's own load
+    /// of the partition, if this node's map gives it the partition. Mounted on a route of its
+    /// own behind `prepay`, outside the `Cluster` calls' small limit (a load runs for
+    /// minutes), so each message reserves its share of the in-flight budget as it arrives.
+    async fn forward_bulk_load(
+        &self,
+        req: Request<tonic::Streaming<proto::ForwardBulkLoadRequest>>,
+    ) -> Result<tonic::Response<proto::Empty>, Status> {
+        let peer = self.caller(&req, &[Scope::Cluster], "forward a bulk load")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        self.0.catch_up(&peer, req.metadata()).await?;
+        let (budget, meter) = crate::serve::grpc::stream_budget(&req);
+        let limits = shared.limits;
+        let wait = crate::serve::grpc::grpc_timeout(req.metadata().as_ref())
+            .map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
+        let mut stream = req.into_inner();
+        let Some(first) = stream.message().await? else {
+            return Err(ApiError::invalid(
+                "a forwarded BulkLoad's first message names its partition and index",
+            )
+            .into());
+        };
+        let caller = forward::caller_of(first.caller, &self.0.tokens)?;
+        let load = first
+            .load
+            .ok_or_else(|| ApiError::invalid("a forwarded BulkLoad carries no load"))?;
+        shared
+            .router
+            .serve_forwarded_bulk_load(
+                &first.partition,
+                load,
+                budget,
+                crate::serve::grpc::ForwardSource { stream, meter },
+                &caller,
+                wait,
+            )
+            .await?;
+        Ok(tonic::Response::new(proto::Empty {}))
+    }
+
     type ForwardScanStream =
         std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<proto::ScanPage, Status>> + Send>>;
 
@@ -2010,7 +2100,23 @@ pub(crate) fn routes(
             Some(Arc::clone(shared)),
         ))
         .max_decoding_message_size(max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE));
-        (feeds, watches)
+        // A BulkLoad's part (#1722 PR 3): a client stream, metered by `prepay` as a client's
+        // `Vectors.BulkLoad` is, and outside the limit below, since a load runs for minutes.
+        let loads = tower::ServiceBuilder::new()
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(shared),
+                crate::serve::grpc::prepay,
+            ))
+            .service(
+                proto::cluster_server::ClusterServer::new(ClusterGrpc(
+                    Arc::clone(&node),
+                    Some(Arc::clone(shared)),
+                ))
+                .max_decoding_message_size(
+                    max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE),
+                ),
+            );
+        (feeds, watches, loads)
     });
     // A forward carries a call the entry node took within its `--max-request-bytes`, inside
     // an envelope (audit120's S-C2).
@@ -2030,9 +2136,10 @@ pub(crate) fn routes(
     }
     let app = app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS));
     match streams {
-        Some((feeds, watches)) => app
+        Some((feeds, watches, loads)) => app
             .route_service(feed::FORWARD_SUBSCRIBE, feeds)
-            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches),
+            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches)
+            .route_service(crate::serve::grpc::FORWARD_BULK_LOAD, loads),
         None => app,
     }
 }

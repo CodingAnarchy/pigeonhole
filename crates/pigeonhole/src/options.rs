@@ -45,7 +45,9 @@ pub struct Options {
     compaction_cores: Option<usize>,
     compaction_cpu_set: Option<Vec<usize>>,
     pin_threads: bool,
+    in_doubt_limits: (usize, u64),
     wal_preallocate: bool,
+    punch_freed: bool,
     memtable_budget: u64,
     block_cache: Option<usize>,
     row_cache: usize,
@@ -283,7 +285,9 @@ impl Default for Options {
             compaction_cores: None,
             compaction_cpu_set: None,
             pin_threads: true,
+            in_doubt_limits: (0, 0),
             wal_preallocate: false,
+            punch_freed: true,
             memtable_budget: 64 << 20,
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
@@ -457,6 +461,17 @@ impl Options {
         self
     }
 
+    /// The in-doubt limits for transactions prepared for an external coordinator (D329,
+    /// ICR 0140): past `max_shares` in doubt or `max_bytes` of their batches, a new
+    /// `Transaction::prepare` answers `Busy`. 0: no limit (the default). Hidden: not part
+    /// of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn in_doubt_limits(mut self, max_shares: usize, max_bytes: u64) -> Self {
+        self.in_doubt_limits = (max_shares, max_bytes);
+        self
+    }
+
     /// Memtable arena per shard, in bytes (default 64 MiB): the in-memory write buffer, also
     /// the size of the shared-memory arena. Data beyond it is flushed into the file, so it
     /// does not bound the database size; it bounds the largest value and batch. A batch
@@ -511,6 +526,42 @@ impl Options {
     /// ```
     pub fn wal_preallocate(mut self, yes: bool) -> Self {
         self.wal_preallocate = yes;
+        self
+    }
+
+    /// Gives the data file's free space back to the filesystem (on by default, D333).
+    ///
+    /// The data file keeps its largest size: space that compaction frees is reused for new
+    /// data, but never returned, so after a large delete or a TTL expiry the file can occupy
+    /// several times its live data on disk. With this on (the default), a background pass punches holes in
+    /// that free space (`fallocate(FALLOC_FL_PUNCH_HOLE)` on Linux, `F_PUNCHHOLE` on macOS).
+    /// The file keeps its length, as `ls -l` shows it, but occupies about its live data, as
+    /// `du` shows it.
+    ///
+    /// - **What's punched:** only space nothing can read any more, never live data or
+    ///   anything a snapshot, a reader process or crash recovery may still need. The lowest
+    ///   free space, at least 64 MiB, or twice the memtable budgets if larger, stays written
+    ///   (capped at a quarter of the file), since new data goes there first.
+    /// - **The cost:** a pass punches one free block (up to 64 MiB) at a time, at most
+    ///   256 MiB, paced to 64 MiB/s, on a background thread. Writes into a punched range
+    ///   allocate on the filesystem again.
+    /// - **Where it does nothing:** Windows, other platforms, and filesystems that cannot
+    ///   punch (the first refusal stops it until the next open). The metrics count passes,
+    ///   punches and bytes (`file_punch_*`).
+    ///
+    /// [`Pigeonhole::shrink`](crate::Pigeonhole::shrink) is the other way to give space back: it
+    /// moves live data down and truncates the file, which also shortens it, but runs only
+    /// when called.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// // Keep the file's freed space allocated on disk (punching is on by default).
+    /// let options = Options::default().punch_freed(false);
+    /// # let _ = options;
+    /// ```
+    pub fn punch_freed(mut self, yes: bool) -> Self {
+        self.punch_freed = yes;
         self
     }
 
@@ -1912,7 +1963,9 @@ impl Options {
             },
         };
         o.pin_threads = self.pin_threads;
+        o.in_doubt_limits = self.in_doubt_limits;
         o.wal_preallocate = self.wal_preallocate;
+        o.punch_freed = self.punch_freed;
         o.shard_threads = budget.drivers;
         // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,
         // 2026-10-28), never with a fixed count; application-owned shards run on the

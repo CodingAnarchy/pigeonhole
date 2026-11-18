@@ -457,13 +457,7 @@ mod tests {
     }
 
     fn db() -> (Dir, Pigeonhole) {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = Dir(std::env::temp_dir().join(format!(
-            "phdb-memslot-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )));
-        std::fs::create_dir_all(&dir.0).unwrap();
+        let dir = Dir(crate::test_dir::fresh("phdb-memslot-"));
         let db = Pigeonhole::open(
             dir.0.join("t.phdb"),
             Options::default().create_if_missing(true),

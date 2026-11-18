@@ -4,7 +4,8 @@
 //! to exact; graph expansions of 1 to 4 hops, with `max` and byte-budget cuts, a budget cut
 //! inside a hop among them (ai1249's M1); the filters; the linear blend; `k` and the
 //! candidates. From a cold block cache, without a synchronous read; in a reader process too;
-//! and the futures are `Send`.
+//! and the futures are `Send`. Recalls at one snapshot read a namespace's counter once
+//! (#2040).
 //!
 //! The store is on the simulated device with its I/O deferred and completed after each
 //! `Pending`, so every block a recall misses is fetched and no read completes at submit,
@@ -492,5 +493,44 @@ fn a_warm_filtered_recall_yields_between_its_rows() {
     // and the multi-gets read hundreds of rows.
     assert!(pendings >= 2, "{pendings} yields");
     drop(store);
+    db.close().unwrap();
+}
+
+#[test]
+fn async_recalls_at_one_snapshot_read_the_namespace_counter_once() {
+    // #2040, through `run_async`: the first recall at a snapshot reads each namespace's
+    // counter, and later ones at it, sync or async, take the count it read. `a` (300) takes
+    // the index and `b` (30) falls back from it, both from their counts.
+    let vfs = SimVfs::new(2040);
+    let db = build(&vfs, 2040);
+    let store = Store::open(&db, "notes", MODEL).expect("open store");
+    let s = db.snapshot().unwrap();
+    let mut rng = Rng::new(2040);
+    let reads = pigeonhole_memory::hooks::ns_count_reads(&store);
+    for i in 0..20 {
+        let q = emb(&mut rng);
+        let ((_, st), _) = {
+            let (r, p) = drive(
+                &vfs,
+                store
+                    .recall(&["a", "b"])
+                    .embedding(q.clone())
+                    .snapshot(&s)
+                    .run_with_stats_async(),
+            );
+            (r.unwrap(), p)
+        };
+        assert_eq!(st.ivf_namespaces + st.ivf_fallbacks, 2, "recall {i}");
+        let (_, want) = store
+            .recall(&["a", "b"])
+            .embedding(q)
+            .snapshot(&s)
+            .run_with_stats()
+            .unwrap();
+        assert_eq!(st, want, "recall {i}");
+    }
+    assert_eq!(pigeonhole_memory::hooks::ns_count_reads(&store) - reads, 2);
+    drop(store);
+    vfs.complete_all_io();
     db.close().unwrap();
 }

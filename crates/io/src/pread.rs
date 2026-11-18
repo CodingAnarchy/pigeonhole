@@ -694,6 +694,11 @@ impl File for PreadFile {
         os::allocate(self.inner.file(), offset, len)
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
+        os::punch_hole(self.inner.file(), offset, len)
+    }
+
     fn lock(&self, byte: u64, mode: LockMode) -> Result<()> {
         let mut held = lock(&self.inner.held);
         if held.get(&byte) == Some(&mode) {

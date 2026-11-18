@@ -68,6 +68,12 @@ pub(crate) const PACK_AFTER: &[u8] = b"pack-after";
 /// [`Index::resume_rebuild_with`](crate::Index::resume_rebuild_with) continues after. Absent
 /// when no rebuild is pending.
 pub(crate) const REBUILD_AFTER: &[u8] = b"rebuild-after";
+/// An index created unfilled (#1722 PR 2c): present from
+/// [`Index::create_unfilled`](crate::Index::create_unfilled) until a walk of the whole
+/// source (its fill, or a rebuild or repair that reaches the end) finishes. Unlike
+/// [`REBUILD_AFTER`], a client's rebuild never sets it: until it goes, the index lacks
+/// source rows rather than holding stale postings for some.
+pub(crate) const UNFILLED: &[u8] = b"unfilled";
 
 /// The layout an index is created with: postings as one cell a document.
 pub(crate) const LAYOUT_VERSION: u64 = 1;

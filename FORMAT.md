@@ -370,6 +370,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 |---|---|---|
 | `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 15, and a family's `kind_params`, §9.2.1), and vector families with value tag `0x04` (D303; `kind` 16, §3.7). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 | `incompat` | 1 | WAL pad fragments (D327, §10.2 fragment type 5): a stream's WAL may hold padding before a record, which a build without D327 refuses mid-replay. Reserved: no build sets it, since D327's writer was shelved (2026-11-15); readers from 1.3 on accept the bit and step over pads. Set, in both pages, at an open that enables padding, before any WAL write; never cleared (sticky), since retained feed segments (D310, §10.4) can keep pads long after a checkpoint. |
+| `incompat` | 2 | Externally prepared transactions (D329, §10.3 record types 5 and 6): a build without D329 would replay an in-doubt share as an undecided Prepare and drop it, or fail on the record type. Set, in both pages, before the first External Prepare is appended; never cleared (sticky), since retained feed segments (D310, §10.4) keep such records past every checkpoint. A database that ever prepared externally doesn't open on a build before 1.3. |
 | `ro_compat` | 0 | A replica's state (D315 PR 3): the reserved table of §9's rule, created by a replica's first apply. Set, in both pages, before the manifest commit that creates it, so a build that doesn't know it opens the file read-only and can't drop the replica's state or write into the tables it mirrors. Created only by a replica's bootstrap or its first apply, and kept while the table exists. Promoting a replica to a primary (#1436, ICR 0125) drops the table in one manifest commit, then clears the bit in both pages before the next one, once the drop is durable; a writable open that finds the bit with no state table (a crash between the two) clears it. |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
@@ -546,6 +547,8 @@ The payload of a reassembled record:
 | Prepare | `2` | `seqno` u64, `commit_ts` u64, `coordinator_stream` u32, batch |
 | Commit | `3` | `seqno` u64, `count` u16, `count` x `participant_stream` u32 |
 | Decision | `4` | `seqno` u64, `apply_seqno` u64, `commit_ts` u64, `count` u16, `count` x `participant_stream` u32 |
+| External Prepare | `5` | `seqno` u64, `coordinator_stream` u32, *external share* with its batch (D329, `incompat` bit 2) |
+| External Abort | `6` | `seqno` u64, `abort_seqno` u64, *external share* without a batch (D329, `incompat` bit 2) |
 
 **Batch** encoding (shared with the engine's `WriteBatch`, so commit never re-encodes): `count` u32, then `count` mutations:
 
@@ -562,6 +565,19 @@ The payload of a reassembled record:
 **Cross-shard commits** (decision D263, ICR 0046). A commit's **id** is a seqno its coordinator reserves once, at the start (`NEXT_SEQNO`, §11.3), and never applies: nothing is ever written at it, so it is never held, and it is unique for the life of the database (D26). Each participant writes a Prepare carrying the id in `seqno` and its share of the mutations; the Prepare's `commit_ts` is 0, since the timestamp is not picked yet, and every mutation without an explicit timestamp takes the Decision's. Once every Prepare meets the requested durability, the coordinator picks the commit timestamp above every participant's floor, reserves the seqno the commit **applies at** (held from then until every participant applied, §11.3), and writes a Decision to its own stream: the id in `seqno`, then `apply_seqno` and `commit_ts`. At recovery, a Prepare is applied if and only if its coordinator's stream holds a Decision (or a Commit, below) with the same id, and it is applied at the Decision's `apply_seqno` and `commit_ts`. Recovery sets `next_seqno` above every seqno in every replayed record, **including discarded Prepares and every Decision's `apply_seqno`**, so no seqno is ever reused. A stream's checkpoint never advances past a Decision or Commit record while any of its participants' Prepares may still need replay (decision D24).
 
 A **Commit** (type 3) is the decision as format version 2 (0.2.x, 0.3.x) wrote it: its Prepares carry the commit's own seqno and timestamp, and are applied at those. This build replays it; it writes only Decisions.
+
+**Externally prepared transactions** (D329, ICR 0140, `incompat` bit 2). A transaction prepared for a coordinator outside the database (a cluster's spanning transaction) is a cross-shard commit whose decision waits for the caller, across a crash and a reopen:
+- **Its shares are External Prepares (type 5),** one per participant stream, even for a single shard. Each carries the id (`seqno`), the coordinator stream, then the *external share*:
+  - `xid` (varint-length bytes, 1 byte to 64 KiB);
+  - `participants`, a `u32` byte length followed by a participant list encoded as a Decision's (`count` u16, `count` × u32), naming every stream of the transaction;
+  - the reads the participant validated (`count` u32, then each: `table` u32, `family` u32, `row` as varint-length bytes, and a `u8` flag, 0 for a whole family's read or 1 followed by the `qualifier` as varint-length bytes);
+  - then the participant's batch.
+  - There is no `commit_ts`. Mutations without an explicit timestamp take the decision's.
+- **A commit is an ordinary Decision (type 4)** on the coordinator stream, applied as above.
+- **An abort is an External Abort (type 6)** on the coordinator stream. It carries the id, `abort_seqno` (a seqno reserved for the abort and applied empty, so a reader's frontier passes it), and the external share without its batch.
+- **Recovery:** a Decision with every participant's type 5 present applies them. An External Abort drops them. Neither, with every participant's type 5 present, leaves the transaction *in doubt*: the shares and the rows they read and write are held again before the database admits a write, and the caller decides them. A type 5 with a participant's record missing is dropped as aborted.
+- **Checkpoints:** an in-doubt share's records stay needed, so no checkpoint passes them until the decision. Recovery counts each type 5's id and each type 6's `abort_seqno` toward `next_seqno`.
+- **The bit:** `incompat` bit 2 is set in both superblock pages before the first type 5 is appended, and never cleared (§8.2).
 
 A `Durability::None` commit's record is appended to the shard's in-memory stream buffer with no I/O of its own; the next `write()` or fsync, triggered by a stronger commit on the same stream, carries it to the file. So a stronger commit also makes every earlier `None` commit of its stream durable (the mixed-levels rule), and a `None` commit that no stronger commit follows survives nothing past the last flush.
 
@@ -804,6 +820,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.
 - Golden files for every structure are frozen at 1.0 (format brief).
+- **Externally prepared transactions (D329, 1.3)** take `incompat` bit 2 (§8.2) and WAL record types 5 and 6 (§10.3): no version change. A 1.2 or earlier build refuses a database with the bit set, at open.
 - **WAL pad fragments (D327, 1.3)** take `incompat` bit 1 (§8.2) and fragment type 5 (§10.2): no version change. A 1.2 or earlier build refuses a database with the bit set, at open. D327's writer was shelved (2026-11-15), so no build sets the bit; the reader's support stays, and the bit and type stay reserved for pads.
 - **Version 4 is the last 1.x version.** A later 1.x feature takes a feature bit (§8.2) and the room §13.1 names for it (§13.2 lists the paths for tracked features); 2.0 is format 5.
 
@@ -873,6 +890,7 @@ A full-text index (`pigeonhole-text`, D309) is an ordinary table: the engine sto
 | `G` | `meta` | `layout`, `opts`, `source`, `tokenizer`, `fingerprint`, `normalizer-unicode` | the version; the options (28 bytes: `1`, `k1` and `b` as `f64`, stop words, `max_term_bytes` and `max_terms` as `u32`, positions, normalisation); the source (three length-prefixed strings: table, family, qualifier); the tokeniser's name and fingerprint; the normaliser's Unicode version |
 | `G` | `meta` | `repair` | present (empty) while a repair runs |
 | `G` | `meta` | `rebuild-after` | a stopped rebuild's cursor: the last source row it reconciled, or empty before its first page |
+| `G` | `meta` | `unfilled` | empty; present from `create_unfilled` until a walk of the whole source (its fill's resume, a rebuild or a repair) finishes, cleared at the walk's end: in the commit that clears `rebuild-after` for a rebuild, in a commit of its own for a repair, which removed the cursor at its start (#1722 PR 2c). A client's rebuild never writes it. Absent in an index made by `create`, or by a build before 1.3's PR 2c |
 
 Every family but the counters and aggregates keeps one version.
 

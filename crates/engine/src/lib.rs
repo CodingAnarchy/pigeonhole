@@ -31,6 +31,7 @@ mod close_gate;
 mod compact;
 mod engine;
 mod error;
+mod external_registry;
 mod feed;
 mod feed_reader;
 #[cfg(all(test, engine_loom))]
@@ -48,6 +49,7 @@ mod manifest;
 mod nonblocking;
 mod options;
 mod position;
+mod punch;
 mod purge_guard;
 mod read;
 mod row_cache;
@@ -82,6 +84,7 @@ pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};
 pub use position::ColumnPosition;
+pub use punch::PunchTuning;
 pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, NEAREST_POLL_CELLS, PendingNearest, Score};
 pub use read::reduce::{

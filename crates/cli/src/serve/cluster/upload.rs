@@ -667,14 +667,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     fn dir() -> PathBuf {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "phdb-upload-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::test_dir::fresh("phdb-upload-")
     }
 
     fn file(name: &str, data: &[u8]) -> PartitionFile {

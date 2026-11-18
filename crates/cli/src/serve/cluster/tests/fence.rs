@@ -1205,6 +1205,91 @@ fn a_node_cut_off_from_the_majority_stops_serving_within_its_lease() {
 }
 
 #[test]
+fn in_a_rolling_upgrade_a_node_beside_builds_without_leases_serves_and_still_lapses_when_cut_off() {
+    // #2047: b and c act as 1.2 (no `Cluster.Lease`: `Unimplemented`), and a restarts as
+    // the first node upgraded. Each of them holds the round's map, so a counts it as
+    // granting, as 1.2 serves: p1 serves on a, within a's own start grace. A peer that
+    // can't be reached isn't counted, so a cut off from both still stops within its lease.
+    let mut t = Rig::start();
+    super::super::fence::PRE_LEASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend([t.dirs[1].clone(), t.dirs[2].clone()]);
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        eventually(
+            "p1 to serve on a beside two builds without leases",
+            async || state(a, "p1").await == LocalPartitionState::Serving,
+        )
+        .await;
+        let grace = client(a)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .grace_remaining_ms;
+        assert!(grace > 0, "p1 served on b's and c's counts alone: {grace}");
+        try_put(a, "alice", "1").await.unwrap();
+        try_get(a, "alice").await.unwrap();
+    });
+    cut(&t, 0, true);
+    let since = std::time::Instant::now();
+    t.rt.block_on(async {
+        eventually("p1's lease on a to run out", async || {
+            reason(a, "p1").await == FenceReason::LeaseLapsed
+        })
+        .await;
+        assert!(
+            since.elapsed() < TEST_LEASE + Duration::from_millis(500),
+            "{:?}",
+            since.elapsed()
+        );
+        assert!(try_put(a, "alice", "2").await.is_err());
+    });
+    cut(&t, 0, false);
+    super::super::fence::PRE_LEASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|d| *d != t.dirs[1] && *d != t.dirs[2]);
+}
+
+#[test]
+fn a_peer_reporting_leases_whose_lease_call_answers_unimplemented_counts_as_no_grant() {
+    // audit120's S1 on #2048: a 1.3 node behind a proxy that doesn't route `Cluster.Lease`
+    // answers it `Unimplemented` (an HTTP 404) while its `Status` reports `leases`. It must
+    // count as nothing, not as a 1.2 node's grant: b and c are such nodes, so a, restarted,
+    // has at most its own grant, never a majority, and p1 stays fenced. Routed again, p1
+    // serves.
+    let mut t = Rig::start();
+    super::super::fence::LEASE_UNROUTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend([t.dirs[1].clone(), t.dirs[2].clone()]);
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        // Past a's start grace, through several rounds.
+        tokio::time::sleep(2 * TEST_LEASE).await;
+        assert_eq!(state(a, "p1").await, LocalPartitionState::Fenced);
+        assert!(try_put(a, "alice", "1").await.is_err());
+    });
+    super::super::fence::LEASE_UNROUTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|d| *d != t.dirs[1] && *d != t.dirs[2]);
+    t.rt.block_on(async {
+        eventually("p1 to serve on a once b and c answer Lease", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+    });
+}
+
+#[test]
 fn a_restarted_node_grants_nothing_in_its_start_grace_and_a_majority_still_serves() {
     // D326: grants live in memory, so a node that starts grants no lease for L·(1+ρ), its
     // own included, and Status says how long is left. In a cluster of three, the other two

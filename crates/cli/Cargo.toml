@@ -56,6 +56,8 @@ serve = [
     "dep:h2",
     # `--replica-of` (#1436): the replica side of replication, hidden in the library.
     "pigeonhole/__unstable-replication",
+    # D329: a cluster transaction's branches prepare and are decided by the home partition.
+    "pigeonhole/__unstable-txn-prepare",
     # D317 ticket 8a: a node's compaction default from the physical cores this process may
     # run on, counted as the library counts them.
     "dep:pigeonhole-io",
@@ -144,6 +146,9 @@ ureq = { version = "3.5", default-features = false, features = ["json"] }
 h2 = "0.4"
 # `serve`'s idle-limit tests on a paused clock, so a slow runner can't fire a deadline (#1531).
 tokio = { version = "1", features = ["test-util"] }
+# The unit tests' directories: new, under a random name, so never one an earlier run left
+# (#2015).
+tempfile = "3.27"
 
 [lints]
 workspace = true

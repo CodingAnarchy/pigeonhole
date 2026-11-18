@@ -532,6 +532,10 @@ async fn call(
         Ok(ServiceReply::RecallPool(_) | ServiceReply::RecallBodies(_)) => {
             ApiError::internal("a recall's step on the HTTP API").into_response()
         }
+        // So is a text search's round 1 (#1722 PR 2b).
+        Ok(ServiceReply::TextStats(_)) => {
+            ApiError::internal("a text search's statistics on the HTTP API").into_response()
+        }
         Err(e) => e.into_response(),
     };
     let mut resp = resp;
@@ -832,6 +836,7 @@ async fn bulk_load(shared: &Arc<Shared>, caller: &super::auth::Caller, req: Requ
         expected: first.0.expected,
         input,
         wait: shared.limits.request_timeout,
+        siblings: 1,
     });
     let rpc = op.index();
     let pump = super::bulk::pump(tx, first, src);

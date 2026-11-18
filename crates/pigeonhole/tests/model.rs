@@ -3254,16 +3254,94 @@ fn seed_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// How long each gdb attempt in a hang report may take (`timeout`'s bound; `-k 5` after it).
+/// How long the hang report's first gdb pass, every thread's stack, may take (`timeout`'s
+/// bound; `-k 5` after it).
+const STACKS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long its second pass, the frames' locals, may take: slow on a large debug binary.
 const GDB_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Every thread's stack, then the locals of each thread's six innermost frames (frames 0–5:
+/// where a thread waits, and the frame `level 5` alone used to show, often `shard_main`,
+/// whose locals hold the `ShardState`: its close stage, what it waits for; simp724's N1 on
+/// #2046), from gdb attached to this process,
+/// straight to this process's stdout and stderr as gdb writes them (#838, #2044).
+///
+/// - **Two passes:** the stacks alone first, so they're out before the slow locals pass
+///   starts. On #2044's hang one pass did both and printed nothing. `-s` skips a thread
+///   gdb can't read rather than ending the pass there.
+/// - **`timeout` runs under `sudo`, not around it:** root's gdb outlived a `timeout` that
+///   killed only `sudo`, and kept every thread stopped until the outside killer (#2044).
+/// - **No pipe:** gdb writes to this process's own stdout and stderr, so a pass that times
+///   out still leaves what it printed, and nothing waits for a pipe's end of file.
+/// - **`sudo -n`** where it works (the runners, where root bypasses `ptrace_scope`), else
+///   plain gdb. The arguments are given on the command line, not in a script file, so a
+///   stalled disk can't keep gdb from starting.
+fn dump_stacks() {
+    let pid = std::process::id().to_string();
+    let sudo = std::process::Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let setup = [
+        "set pagination off",
+        "set print pretty on",
+        "set print elements 400",
+    ];
+    let passes: [(&str, Duration, &[&str]); 2] = [
+        (
+            "thread stacks",
+            STACKS_TIMEOUT,
+            &["thread apply all -s bt 30"],
+        ),
+        (
+            "frame locals",
+            GDB_TIMEOUT,
+            &[
+                "thread apply all -s frame apply 6 -s info frame",
+                "thread apply all -s frame apply 6 -s info locals",
+            ],
+        ),
+    ];
+    for (what, limit, commands) in passes {
+        let _ = writeln!(
+            std::io::stderr(),
+            "HUNG: {what} (gdb{}):",
+            if sudo { ", sudo" } else { "" }
+        );
+        let mut cmd = std::process::Command::new(if sudo { "sudo" } else { "timeout" });
+        if sudo {
+            cmd.args(["-n", "timeout"]);
+        }
+        let status = cmd
+            .args(["-k", "5", &limit.as_secs().to_string()])
+            .args(["gdb", "-nx", "--batch", "-p", &pid])
+            .args(setup.iter().chain(commands).flat_map(|c| ["-ex", c]))
+            .stdin(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                let _ = writeln!(std::io::stderr(), "HUNG: gdb's {what} pass ended {s}");
+            }
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "HUNG: gdb could not run: {e}");
+                return;
+            }
+        }
+    }
+}
+
 /// Starts the hang report's deadlines, before the report does anything that can block: once
-/// the report (two gdb attempts, then 5 s of trace) has had time to finish, the process ends,
-/// whatever the report is blocked on. A stalled disk then ends the job about
-/// [`seed_timeout`] plus 2.5 minutes after the seed started, not at the job's limit.
+/// the report ([`dump_stacks`]' two gdb passes, then 5 s of trace) has had time to finish,
+/// the process ends, whatever the report is blocked on. A stalled disk then ends the job
+/// about [`seed_timeout`] plus 135 s after the seed started, not at the job's limit.
 ///
 /// Two of them:
-/// - a thread of this process that writes a note and aborts, at 150 s;
+/// - a thread of this process that writes a note and aborts, at 125 s;
 /// - a process outside it that kills it (`SIGKILL`) 10 s later, for when the thread can't
 ///   run: an attached gdb stops every thread of the process, and a gdb stuck on the disk
 ///   while attached may not die to `timeout`'s kill until its I/O returns (audit120's S1 on
@@ -3271,7 +3349,7 @@ const GDB_TIMEOUT: Duration = Duration::from_secs(60);
 ///   process ends first, `cat` reads end of file and nothing is killed: a reused pid is
 ///   never signalled. Where there is no `timeout` (macOS), it does nothing.
 fn hang_deadline() {
-    let report = 2 * (GDB_TIMEOUT + Duration::from_secs(5)) + Duration::from_secs(20);
+    let report = STACKS_TIMEOUT + GDB_TIMEOUT + Duration::from_secs(2 * 5 + 25);
     let outside = report + Duration::from_secs(10);
     let pid = std::process::id();
     if let Ok(mut killer) = std::process::Command::new("sh")
@@ -3384,50 +3462,7 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 if std::env::var_os("CI").is_some()
                     || std::env::var("PIGEONHOLE_HUNG_STACKS").is_ok_and(|v| v == "1")
                 {
-                    let pid = std::process::id().to_string();
-                    // Every thread's stack, then the shard threads' state: `shard_main`'s
-                    // locals hold the `ShardState` (its close stage, what it waits for).
-                    // Given as arguments, not a script file, so a stalled disk can't keep
-                    // gdb from starting.
-                    let commands = [
-                        "set pagination off",
-                        "set print pretty on",
-                        "set print elements 400",
-                        "thread apply all bt 30",
-                        "thread apply all -s frame apply level 5 info frame",
-                        "thread apply all -s frame apply level 5 info locals",
-                    ];
-                    for cmd in [&["sudo", "-n", "gdb"][..], &["gdb"][..]] {
-                        let out = std::process::Command::new("timeout")
-                            .args(["-k", "5", &GDB_TIMEOUT.as_secs().to_string()])
-                            .args(cmd)
-                            .args(["--batch", "-p", &pid])
-                            .args(commands.iter().flat_map(|c| ["-ex", c]))
-                            .output();
-                        match out {
-                            Ok(o) if o.status.success() => {
-                                let _ = writeln!(std::io::stderr(), "HUNG: thread stacks (gdb):");
-                                let _ = std::io::stderr().write_all(&o.stdout);
-                                break;
-                            }
-                            Ok(o) => {
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "HUNG: {} failed ({}): {}",
-                                    cmd.join(" "),
-                                    o.status,
-                                    String::from_utf8_lossy(&o.stderr).trim()
-                                );
-                            }
-                            Err(e) => {
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "HUNG: {} could not run: {e}",
-                                    cmd.join(" ")
-                                );
-                            }
-                        }
-                    }
+                    dump_stacks();
                 }
                 // What the shards do from here on, if anything (#244).
                 pigeonhole_engine::set_tracing(true);

@@ -192,7 +192,15 @@ impl Waiting {
                 self.since.elapsed().as_secs(),
             );
         }
-        tokio::time::sleep(self.left().map_or(POLL, |l| l.min(POLL))).await;
+        // Less than two polls left: sleep them all, and give up with this answer. Polled
+        // once more, the next call could be left a sliver of the limit, too little for a
+        // busy node to answer, and the wait would end on "the node didn't answer" rather
+        // than on what the node said (#2015, a macOS CI run).
+        let sleep = match self.left() {
+            Some(l) if l < 2 * POLL => l,
+            _ => POLL,
+        };
+        tokio::time::sleep(sleep).await;
         Ok(())
     }
 }
@@ -217,11 +225,20 @@ pub(super) async fn run(
     timeout: Option<Duration>,
 ) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
-    let m = c
+    let mut m = c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
         .await
         .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
         .into_inner();
+    // A node holding P's replica copy (D328) leaves P's replicas and closes its copy before
+    // anything is staged there (S4): the installed set then replaces the copy's file.
+    if super::promote::leave_replicas(args, &m, partition, to).await? {
+        m = c
+            .get_map(request(GetMapRequest {}, token.as_deref())?)
+            .await
+            .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+            .into_inner();
+    }
     let Some(p) = m.partitions.iter().find(|p| p.id == partition).cloned() else {
         return Err(Failure::usage(&format!(
             "the map (version {}) has no partition {partition:?}",
@@ -849,6 +866,8 @@ async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<Partition
             to_epoch: e + 1,
             restore: false,
             restore_from_cluster_id: String::new(),
+            promote: false,
+            replica_epoch: 0,
         },
         new.token.as_deref(),
     )?)
@@ -912,10 +931,10 @@ mod tests {
                 }
                 assert!(ticks < 100, "never gave up");
             };
-            // Polled every 200 ms, and the last sleep is cut to the limit: given up at it,
-            // not at the next poll.
+            // Polled every 200 ms, and with less than two polls left the last sleep runs to
+            // the limit (at 800 ms, 300 ms left): given up at it, not at the next poll.
             assert_eq!(start.elapsed(), Duration::from_millis(1100));
-            assert_eq!(ticks, 6);
+            assert_eq!(ticks, 5);
             assert_eq!(e.status(), crate::ExitStatus::ERROR);
             assert_eq!(
                 e.message(),
@@ -958,7 +977,7 @@ mod tests {
         paused().block_on(async {
             let mut wait = Waiting::new(
                 "waiting".into(),
-                Some(Duration::from_millis(300)),
+                Some(Duration::from_millis(500)),
                 "".into(),
             );
             wait.tick("opening").await.unwrap();
@@ -972,7 +991,39 @@ mod tests {
                 .expect_err("no time left");
             assert_eq!(
                 e.message(),
-                "gave up waiting after 300ms (--timeout): opening: retrying. "
+                "gave up waiting after 500ms (--timeout): opening: retrying. "
+            );
+        });
+    }
+
+    #[test]
+    fn a_wait_never_leaves_its_last_call_a_sliver_of_the_limit() {
+        // #2015: a node that takes 70 ms to answer, polled every 200 ms. A poll at 2.97 s
+        // would leave its call 30 ms of a 3 s limit, too little, so the wait would end on
+        // "the node didn't answer". Instead the last poll sleeps to the limit, and the wait
+        // ends on what the node said.
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let mut wait = Waiting::new("waiting".into(), Some(Duration::from_secs(3)), "".into());
+            let e = loop {
+                let answered = wait
+                    .ask(async {
+                        tokio::time::sleep(Duration::from_millis(70)).await;
+                        "serving at epoch 1"
+                    })
+                    .await;
+                let now = match answered {
+                    Ok(now) => now,
+                    Err(e) => break e,
+                };
+                if let Err(e) = wait.tick(now).await {
+                    break e;
+                }
+            };
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+            assert_eq!(
+                e.message(),
+                "gave up waiting after 3s (--timeout): serving at epoch 1. "
             );
         });
     }

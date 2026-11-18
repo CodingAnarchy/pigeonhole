@@ -186,6 +186,32 @@ pub(crate) enum ClusterCommand {
         #[arg(long, conflicts_with = "old_unreachable")]
         copy: bool,
     },
+    /// Make node `--to`, which holds a replica of the partition, its owner (D328): the
+    /// replica copy is closed, made a primary at the last commit it applied and stamped at
+    /// the next epoch, then the map gives `--to` the partition, with a new change-feed
+    /// history. The owner must have it fenced or closed, unless `--old-unreachable`.
+    /// Commits the old owner acknowledged after the copy's last one are lost: the report
+    /// gives their count when the old owner could be asked. Run it again to finish one that
+    /// stopped.
+    Promote {
+        partition: String,
+        /// The node id holding the replica to promote.
+        #[arg(long, value_name = "ID")]
+        to: String,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// The owner can't be reached (its process is stopped): skip the check that it's
+        /// fenced or closed. Its last acknowledged commits may be lost, and the report says
+        /// so.
+        #[arg(long)]
+        old_unreachable: bool,
+        /// Give up the wait for `--to` to serve the partition once the map gives it to it
+        /// after SECS (at least 1), as `move --timeout` does. The error names the node's last
+        /// `status` line for the partition. The wait asks the node every 200 ms. Without it,
+        /// the wait goes on as long as it takes, saying every 10 s what it waits for.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
     /// Move a partition to node `--to` with its files copied whole, so its change-feed
     /// history and tokens carry over: fence and close it on the node serving it, copy every
     /// file (the main file, the WAL files a clean close keeps, the feed's) to `--to`, stamp
@@ -209,8 +235,8 @@ pub(crate) enum ClusterCommand {
         /// Give up a wait for a node after SECS (at least 1): OLD hashing the closed files, or `--to`
         /// serving the partition once the map gives it to it. The error names the step and
         /// the node's last `status` line for the partition. It bounds each wait, not the
-        /// copy, which takes as long as the files do. Without it, a wait goes on as long as
-        /// it takes, saying every 10 s what it waits for.
+        /// copy, which takes as long as the files do. A wait asks the node every 200 ms.
+        /// Without it, a wait goes on as long as it takes, saying every 10 s what it waits for.
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
@@ -340,6 +366,19 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             old_unreachable,
             copy,
         } => runtime()?.block_on(relocate(node, partition, to, *old_unreachable, *copy)),
+        ClusterCommand::Promote {
+            partition,
+            to,
+            node,
+            old_unreachable,
+            timeout,
+        } => runtime()?.block_on(super::promote::promote(
+            node,
+            partition,
+            to,
+            *old_unreachable,
+            timeout.map(Duration::from_secs),
+        )),
     }
 }
 
@@ -571,15 +610,14 @@ pub(super) async fn relocate_as(
         return Ok(r);
     }
     // A node holding P's replica copy (D328) holds `P.phdb` open as a replica, where the
-    // stamp would install the owner's: it leaves `replicas` first (simp724's S4; a replica
-    // made the owner in place is `phdb cluster promote`'s, D328's third PR).
-    if p.replicas.iter().any(|r| r == to) {
-        return Err(Failure::usage(&format!(
-            "node {to:?} holds a replica of {partition}: set a map without it in \
-             {partition}'s replicas first (phdb cluster set-map), and once node {to:?} has \
-             closed its copy, move its {partition}.phdb aside (phdb cluster drop-partition \
-             {partition} on that node), then run this again"
-        )));
+    // stamp installs the owner's: it leaves P's replicas, and closes its copy, first (S4).
+    // The installed set replaces the copy's file, which goes aside.
+    if super::promote::leave_replicas(args, &m, partition, to).await? {
+        m = c
+            .get_map(request(GetMapRequest {}, token.as_deref())?)
+            .await
+            .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+            .into_inner();
     }
     // A restore's old node may have lost P (not listed: `Unspecified`).
     if let Some(state) = old_state
@@ -644,6 +682,8 @@ pub(super) async fn relocate_as(
                 to_epoch: from + 1,
                 restore: restoring.is_some(),
                 restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
             },
             new_token.as_deref(),
         )?)
@@ -763,7 +803,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
         .map_err(|e| Failure::io("start the runtime", &e))
 }
 
-pub(super) fn report(
+pub(crate) fn report(
     command: &'static str,
     summary: Vec<(&'static str, Value)>,
     extra: Value,
@@ -841,7 +881,7 @@ pub(super) fn column(name: &'static str) -> Column {
 pub(super) type Client = proto::cluster_client::ClusterClient<tonic::transport::Channel>;
 
 /// A client for the node at `url`, and the token to present.
-pub(super) async fn connect(
+pub(crate) async fn connect(
     args: &NodeArgs,
     url: &str,
 ) -> Result<(Client, Option<String>), Failure> {
@@ -889,7 +929,7 @@ pub(super) async fn channel(
     Ok((channel, token))
 }
 
-pub(super) fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Request<T>, Failure> {
+pub(crate) fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Request<T>, Failure> {
     let mut req = tonic::Request::new(message);
     if let Some(t) = token {
         req.metadata_mut().insert(
@@ -903,7 +943,7 @@ pub(super) fn request<T>(message: T, token: Option<&str>) -> Result<tonic::Reque
 }
 
 /// A node's URL from its map address, in the scheme `--node` uses.
-pub(super) fn url_of(args: &NodeArgs, address: &str) -> String {
+pub(crate) fn url_of(args: &NodeArgs, address: &str) -> String {
     let scheme = if args.node.starts_with("https://") {
         "https"
     } else {

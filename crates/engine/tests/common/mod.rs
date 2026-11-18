@@ -389,6 +389,11 @@ pub struct Config {
     /// (D314), its values checked against the model. 0 draws nothing, so other suites'
     /// seeds replay unchanged; the `returning` target turns it on.
     pub returning_ppm: u32,
+    /// How often (ppm) a commit runs as a transaction prepared for an external coordinator
+    /// (D329, `Txn::submit_prepare`), and, while any is in doubt, how often a step decides one
+    /// (`Engine::submit_decide`). Needs tablet changes on. 0 draws nothing, so other suites'
+    /// seeds replay unchanged.
+    pub external_ppm: u32,
     /// `final_dump` only: a process crash and reopen every this many ops.
     pub crash_every: Option<usize>,
     /// `final_dump` only: a flush and full compaction every this many ops (with background
@@ -475,6 +480,7 @@ impl Config {
             } else {
                 0
             },
+            external_ppm: 0,
             crash_every: None,
             compact_every: None,
             memtable_freeze_bytes: 16 << 10,
@@ -532,9 +538,24 @@ pub struct Stats {
     /// they resolved (#860): acknowledged, and not.
     pub crash_poll_acked: usize,
     pub crash_poll_unacked: usize,
+    /// D329: external prepares submitted, answered in doubt, decides submitted, commits
+    /// and aborts applied, and shares a reopen found in doubt or dropped after an unknown
+    /// outcome (or lost below GroupSync).
+    pub external_prepares: usize,
+    pub external_in_doubt: usize,
+    pub external_decides: usize,
+    pub external_committed: usize,
+    pub external_aborted: usize,
+    pub external_adopted: usize,
+    pub external_dropped: usize,
     /// Armed power losses that fired on background I/O and surfaced as a later step's error.
     pub background_crashes: usize,
     pub busy: usize,
+    /// D329: plain commits that gave up with `Busy` while no external share in doubt (or
+    /// maybe in doubt) held one of their rows: on a fault-free run nothing else explains one.
+    pub busy_unheld: usize,
+    /// Free blocks the engines punched (D333), summed over the runs a crash ended.
+    pub punches: u64,
     pub flushes: u64,
     pub compactions: u64,
     pub purges: usize,
@@ -797,6 +818,18 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     // default, the largest extent), so crash runs cover those growths too. A block holds a
     // flush's extent at the budgets these tests use.
     o.grow_ahead = Some((4 << 20, 4 << 20));
+    // Free space is punched (D333) once 64 KiB past the reserve is not yet a hole, so
+    // crash and model runs cover punches between commits, reclaims, shrinks and crashes.
+    // The simulator does not pace them. `PIGEONHOLE_PUNCH=0` turns it off.
+    if std::env::var("PIGEONHOLE_PUNCH").as_deref() != Ok("0") {
+        o.punch_freed = true;
+        let mut tuning = pigeonhole_engine::PunchTuning::default();
+        tuning.min_reserve = 0;
+        tuning.trigger_bytes = 64 << 10;
+        o.punch_tuning = Some(tuning);
+    } else {
+        o.punch_freed = false;
+    }
     o
 }
 
@@ -1301,6 +1334,9 @@ pub enum RecKind {
     Batch,
     Prepare,
     Commit,
+    /// D329: an external transaction's abort (type 6), keyed by its commit's id. It applies
+    /// nothing, and names no commit.
+    Abort,
 }
 
 /// What the WAL holds (after every stream's checkpoint).
@@ -1314,6 +1350,8 @@ pub struct WalRead {
     pub commits: BTreeMap<(u32, Seqno), Vec<u32>>,
     /// D263: each DECISION's id, with the seqno and timestamp it applies at.
     pub decisions: BTreeMap<Seqno, (Seqno, Timestamp)>,
+    /// D329: each external PREPARE's id, with its participants and the streams holding it.
+    pub external: BTreeMap<Seqno, (Vec<u32>, BTreeSet<u32>)>,
 }
 
 /// A commit's records as the WAL holds them.
@@ -1407,6 +1445,26 @@ pub fn read_wal(
                         participants.iter().map(|p| p.0).collect(),
                     );
                 }
+                // D329: an external share, keyed by its id as a PREPARE is (a DECISION rekeys
+                // it); its abort names no commit.
+                WalRecord::ExternalPrepare { seqno, share, .. } => {
+                    list.push((seqno, RecKind::Prepare));
+                    let e = out.external.entry(seqno).or_default();
+                    e.0 = share.participants().iter().map(|p| p.0).collect();
+                    e.1.insert(stream.0);
+                    if let Some(batch) = share.batch() {
+                        out.batches
+                            .entry(seqno)
+                            .or_insert_with(|| Survivor {
+                                seqno,
+                                commit_ts: 0,
+                                batches: Vec::new(),
+                            })
+                            .batches
+                            .push(batch.as_bytes().to_vec());
+                    }
+                }
+                WalRecord::ExternalAbort { seqno, .. } => list.push((seqno, RecKind::Abort)),
                 other => return Err(format!("stream {}: unexpected record {other:?}", stream.0)),
             }
         }
@@ -1468,6 +1526,11 @@ enum Kind {
         snapshot: Seqno,
         reads: Vec<TxnRead>,
     },
+    /// D329: a transaction prepared for an external coordinator as `xid`, or its decision.
+    External {
+        xid: Vec<u8>,
+        phase: ExternalPhase,
+    },
     /// A returning commit (D314) of `(table, row)`: the sum cells its ops increment, as
     /// `(family, qualifier, ts)`, and what the engine returned, by family id (errors as
     /// text).
@@ -1481,6 +1544,29 @@ enum Kind {
         previous_of: Vec<(String, Vec<u8>)>,
         previous: Option<Vec<PreviousCell>>,
     },
+}
+
+/// What an external transaction's in-flight call is (D329).
+#[derive(Debug, Clone)]
+enum ExternalPhase {
+    /// `submit_prepare`, its reads at `snapshot` (for the conflict oracle).
+    Prepare {
+        snapshot: Seqno,
+        reads: Vec<TxnRead>,
+    },
+    /// `submit_decide(commit)`: applied at its decision's seqno, as a cross-shard commit.
+    Commit,
+    /// `submit_decide(abort)`: applies nothing.
+    Abort,
+}
+
+/// An external transaction in doubt (D329): its ops and routing as prepared, the rows it
+/// read, and whether a decide of it is in flight.
+#[derive(Debug, Clone)]
+struct ExternalEntry {
+    commit: Committed,
+    reads: Vec<(String, Vec<u8>)>,
+    deciding: bool,
 }
 
 /// One previous value a returning commit returned (D314 amendment 1): family, qualifier,
@@ -1737,6 +1823,19 @@ struct World {
     acked_pending: Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)>,
     /// Commits that returned an error (or were in flight at a crash): maybe landed.
     unacked: Vec<Committed>,
+    /// D329: external transactions prepared here and in doubt, by xid.
+    external: BTreeMap<Vec<u8>, ExternalEntry>,
+    /// D329: external shares' ids (their PREPAREs' seqno): a DECISION of any later run
+    /// rekeys them.
+    external_ids: BTreeSet<Seqno>,
+    /// D329: prepares a crash or an unknown outcome left uncertain, reconciled with
+    /// `Engine::in_doubt` at the next open.
+    external_unsure: Vec<Committed>,
+    /// D329: the last xid handed out; xids are never reused in a run.
+    next_xid: u64,
+    /// D329: shares decided below GroupSync: a power loss may take the decision's record,
+    /// and the next open finds the share in doubt again, to be decided again.
+    external_decided_weak: BTreeMap<Vec<u8>, ExternalEntry>,
     /// Attempts the engine refused (a false predicate, a conflict, a full arena): a
     /// cross-shard one may have left PREPARE records under a seqno of its own.
     aborted: Vec<Committed>,
@@ -1834,6 +1933,11 @@ impl World {
             history: BTreeMap::new(),
             acked_pending: Vec::new(),
             unacked: Vec::new(),
+            external: BTreeMap::new(),
+            external_ids: BTreeSet::new(),
+            external_unsure: Vec::new(),
+            next_xid: 0,
+            external_decided_weak: BTreeMap::new(),
             aborted: Vec::new(),
             settled_seqnos: BTreeSet::new(),
             in_flight: Vec::new(),
@@ -1965,6 +2069,7 @@ impl World {
                 AppendedKind::Batch => RecKind::Batch,
                 AppendedKind::Prepare => RecKind::Prepare,
                 AppendedKind::Commit => RecKind::Commit,
+                AppendedKind::Abort => RecKind::Abort,
             };
             if kind == RecKind::Batch {
                 self.appended_ts.insert(r.seqno, (epoch, r.commit_ts));
@@ -1984,13 +2089,31 @@ impl World {
                 self.appended_ts.insert(r.apply_seqno, (epoch, r.commit_ts));
                 // Only this run's PREPAREs: an id whose PREPAREs a crash lost (or a seqno a
                 // lost DECISION reserved) may be taken again after it, as a lost seqno may.
+                // An external share's (D329) were logged by any run before, in doubt across
+                // the crashes since, and its id is never reused (recovery counts it, E2).
                 let crashes = epoch;
+                // A DECISION whose PREPAREs an earlier run appended decides a share that was
+                // in doubt across the crash: only an external one can be (a D263 id never
+                // spans a crash), so its id is known external from here (a share adopted
+                // after an unsure prepare, whose id the harness never heard).
+                let earlier = self.stream_records.iter().any(|(stream, list)| {
+                    let epochs = self.stream_epochs.get(stream);
+                    list.iter().enumerate().any(|(i, (q, k))| {
+                        *q == r.seqno
+                            && *k == RecKind::Prepare
+                            && epochs.and_then(|e| e.get(i)).is_some_and(|e| *e != crashes)
+                    })
+                });
+                if earlier && self.cfg.external_ppm > 0 {
+                    self.external_ids.insert(r.seqno);
+                }
+                let external = self.external_ids.contains(&r.seqno);
                 for (stream, list) in self.stream_records.iter_mut() {
                     let epochs = self.stream_epochs.get(stream);
                     for (i, (q, k)) in list.iter_mut().enumerate() {
                         if *q == r.seqno
                             && *k == RecKind::Prepare
-                            && epochs.and_then(|e| e.get(i)) == Some(&crashes)
+                            && (external || epochs.and_then(|e| e.get(i)) == Some(&crashes))
                         {
                             *q = r.apply_seqno;
                         }
@@ -2065,6 +2188,7 @@ impl World {
                     RecKind::Batch => single = Some(*stream as usize),
                     RecKind::Prepare => participants.push(*stream as usize),
                     RecKind::Commit => coordinator = Some(*stream as usize),
+                    RecKind::Abort => {}
                 }
             }
         }
@@ -2793,6 +2917,9 @@ impl World {
         // The crashed run's epoch: every later drain of the dead engine keys its records
         // to it (#876).
         let crashed = self.stats.crashes;
+        if let Some(store) = self.store.as_ref() {
+            self.stats.punches += store.engine.metrics().file_punches.0;
+        }
         self.stats.crashes += 1;
         if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
@@ -2869,6 +2996,8 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
         };
         self.store = Some(store);
+        // D329: what the crash left of the external transactions.
+        self.reconcile_external()?;
         // A reopen places tablets afresh (`Catalog::reassign`) and replays a write into its
         // row's owner now, flushed or not: an owner at acknowledgement holds only within
         // the run that acknowledged (#724). `note_recovered_owners` records the new ones.
@@ -2881,13 +3010,52 @@ impl World {
         let lost: Vec<(Seqno, Seqno)> = self
             .decided_ids
             .iter()
-            .filter(|(_, (s, _))| *s >= next)
+            .filter(|(id, (s, _))| {
+                *s >= next
+                    // D329: an external share whose every participant still holds its
+                    // PREPARE, with no DECISION: the crash took the DECISION the engine
+                    // appended, and recovery has the share in doubt again (keyed by its id),
+                    // though later seqnos survived. A DECISION checkpointed away leaves some
+                    // participant without its PREPARE too: that share stays decided.
+                    || (self.external_ids.contains(id)
+                        && !raw_wal.decisions.contains_key(id)
+                        && raw_wal
+                            .external
+                            .get(id)
+                            .is_some_and(|(ps, held)| ps.iter().all(|p| held.contains(p))))
+            })
             .map(|(id, (s, _))| (*id, *s))
             .collect();
         if !lost.is_empty() && self.revert_aliases {
             self.stats.aliases_reverted += lost.len();
             for (id, s) in &lost {
                 self.decided_ids.remove(id);
+                // D329: an external share's lost DECISION withdraws its commit, acknowledged
+                // or not: the share is in doubt again and will be decided again. Only a
+                // `Buffered` decision may be lost once acknowledged.
+                if self.external_ids.contains(id) {
+                    if let Some(c) = self.history.remove(s) {
+                        if matches!(c.durability, Durability::GroupSync | Durability::Sync) {
+                            return fail(
+                                FailureClass::LostAckedCommit,
+                                format!(
+                                    "external commit {s} (id {id}) was acknowledged at {:?}, \
+                                     but its DECISION did not survive",
+                                    c.durability
+                                ),
+                            );
+                        }
+                        self.aborted.push(c);
+                    }
+                    for list in self.stream_records.values_mut() {
+                        for (q, _) in list.iter_mut() {
+                            if *q == *s {
+                                *q = *id;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // An acknowledged commit (its level allowed the loss) is now known by its id.
                 if let Some(mut c) = self.history.remove(s) {
                     c.seqno = Some(*id);
@@ -2942,6 +3110,21 @@ impl World {
             // or below a participant's timestamp floor (D244, with tablet changes on or off),
             // is retried under a new seqno, so such an attempt must not be taken for an
             // unacknowledged commit's seqno.
+            // D329: an external share's records under its id were never committed: aborted
+            // (type 6), in doubt, or left by a DECISION the crash lost (a landed one rekeys
+            // them to the seqno it applies at).
+            if self.external_ids.contains(seqno)
+                || wal
+                    .streams
+                    .values()
+                    .flatten()
+                    .any(|(s, kind)| *s == *seqno && *kind == RecKind::Abort)
+            {
+                self.settled_seqnos.insert(*seqno);
+                self.trace
+                    .push(format!("  seqno {seqno}: an aborted external share"));
+                continue;
+            }
             let prepares_only = wal
                 .streams
                 .values()
@@ -3423,6 +3606,21 @@ impl World {
             c.acked = true;
             self.history.insert(seqno, c);
         }
+        // D329: a share in doubt after the reopen has no commit in the model: a decision a
+        // crash took (a `Buffered` one may go even once acknowledged) is withdrawn, so a
+        // later abort finds nothing of it (perf2 on #2000).
+        if let Some(c) = self.history.values().find(|c| {
+            matches!(&c.kind, Kind::External { xid, phase: ExternalPhase::Commit }
+                if self.external.contains_key(xid))
+        }) {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "{:?}: in doubt after the reopen, but its commit is in the model",
+                    c.kind
+                ),
+            );
+        }
         self.model = model;
         // Each stream goes on from the last record the WAL kept: what came after it is
         // gone (the next crash's records continue from there, possibly reusing seqnos).
@@ -3568,9 +3766,12 @@ impl World {
                     reused += 1;
                     continue;
                 }
+                if *kind == RecKind::Abort {
+                    continue;
+                }
                 records[s].push(match kind {
                     RecKind::Batch => StreamRecord::Single(i),
-                    RecKind::Prepare => StreamRecord::Prepare(i),
+                    RecKind::Prepare | RecKind::Abort => StreamRecord::Prepare(i),
                     RecKind::Commit => StreamRecord::Commit {
                         commit: i,
                         participants: match &all[i].streams {
@@ -3911,7 +4112,7 @@ impl World {
                 | Error::Unsupported(_)
                 | Error::Closed
                 | Error::Io(_)
-        );
+        ) || (matches!(e, Error::Busy) && !self.external.is_empty());
         if ok {
             self.stats.tablet_refused += 1;
             self.trace.push(format!("  -> tablet change refused: {e}"));
@@ -4380,8 +4581,26 @@ impl World {
         successes: &mut Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)>,
     ) -> Result<Resolved, Fail> {
         let armed = inf.armed;
+        if let Kind::External { phase, .. } = &inf.commit.kind
+            && !matches!(phase, ExternalPhase::Commit)
+        {
+            return self.external_outcome(inf, outcome, dead);
+        }
         match outcome {
-            Outcome::Commit(Ok(info)) => successes.push((info.seqno, inf, Some(info))),
+            Outcome::Commit(Ok(info)) => {
+                if let Kind::External { xid, .. } = &inf.commit.kind {
+                    if info.seqno == 0 {
+                        return fail(
+                            FailureClass::Protocol,
+                            format!("commit of {}: decided by another call", text(xid)),
+                        );
+                    }
+                    self.stats.external_committed += 1;
+                    let xid = xid.clone();
+                    self.forget_external(&xid);
+                }
+                successes.push((info.seqno, inf, Some(info)));
+            }
             Outcome::Cas(Ok((applied, info))) => {
                 let Kind::Cas { expected, .. } = &inf.commit.kind else {
                     unreachable!()
@@ -4413,7 +4632,18 @@ impl World {
                 }
             }
             Outcome::Commit(Err(Error::Busy)) | Outcome::Cas(Err(Error::Busy)) => {
+                // A decide of a share in doubt applies a decision already held: nothing may
+                // refuse it, and a refused one would stay `deciding` for good (perf2 on #2000).
+                if let Kind::External { xid, .. } = &inf.commit.kind {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!("decide commit of {}: Busy", text(xid)),
+                    );
+                }
                 self.stats.busy += 1;
+                if !self.overlaps_external(&inf.commit) {
+                    self.stats.busy_unheld += 1;
+                }
                 self.trace.push("  -> busy (arena full)".into());
                 self.aborted.push(inf.commit);
             }
@@ -4421,11 +4651,12 @@ impl World {
                 let Kind::Txn { snapshot, reads } = &inf.commit.kind else {
                     return fail(FailureClass::Protocol, "conflict on a plain commit".into());
                 };
-                // A real conflict: some commit above the snapshot touched a read key.
+                // A real conflict: some commit above the snapshot touched a read key. Or, with
+                // D329's shares in doubt, one holds a row it reads or writes.
                 let real = self.history.values().any(|c| {
                     c.seqno.is_some_and(|s| s > *snapshot)
                         && reads.iter().any(|read| c.touches_read(read))
-                });
+                }) || self.overlaps_external(&inf.commit);
                 if !real {
                     return fail(
                         FailureClass::Protocol,
@@ -5328,6 +5559,475 @@ impl World {
 
     /// Begins a transaction, reads a few columns (checked against the model), and submits
     /// its commit without waiting (`Txn::submit`).
+    /// D329: prepares `ops` as a transaction of an external coordinator, under a new xid:
+    /// one read (of the first op's row), checked against the model, then
+    /// `Txn::submit_prepare`. A prepare answered applies nothing: the share is in doubt
+    /// until a later step decides it (`submit_decide`).
+    fn submit_external(
+        &mut self,
+        ops: Vec<ModelOp>,
+        durability: Durability,
+        rng: &mut Rng,
+    ) -> Result<(), Fail> {
+        // An external prepare and its decision are logged (the engine refuses `None`).
+        let durability = if durability == Durability::None {
+            Durability::Buffered
+        } else {
+            durability
+        };
+        let now = self.now();
+        let armed = self.arm(rng);
+        let shards = self.shards_of(&ops);
+        self.stats.submitted += 1;
+        self.stats.external_prepares += 1;
+        let store = self.store.as_ref().expect("store open");
+        let mut txn = match store.engine.begin() {
+            Ok(t) => t,
+            Err(e) => return fail(FailureClass::Protocol, format!("begin: {e}")),
+        };
+        let snapshot = txn.snapshot().seqno();
+        let fams = families();
+        let (table, row) = (op_table(&ops[0]).to_owned(), op_row(&ops[0]).to_vec());
+        let family = fams[rng.below(fams.len() as u64) as usize].name.clone();
+        let qualifier = format!("q{}", rng.below(self.cfg.spec.qualifiers)).into_bytes();
+        let fam_id = store.family_ids[&(table.clone(), family.clone())];
+        let table_id = store.tables[&table].id;
+        let got = txn
+            .get(table_id, fam_id, &row, &qualifier)
+            .map(|c| c.map(|c| (c.timestamp(), value_bytes(c.value()))));
+        let want = self
+            .model
+            .try_get(
+                &table,
+                &row,
+                &family,
+                &qualifier,
+                self.model_seqno(snapshot),
+                now,
+            )
+            .map(|c| c.map(|c| (c.ts, c.value)));
+        match (got, want) {
+            (Ok(g), Ok(w)) if g == w => {}
+            (Err(Error::Merge(_)), Err(_)) => {}
+            (Err(e), _) if !self.alive() => {
+                drop(txn);
+                return self.background_crash(e, rng);
+            }
+            (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 && self.faults_on() => {
+                drop(txn);
+                self.stats.io_errors += 1;
+                self.trace
+                    .push(format!("  -> external read I/O error ({e})"));
+                self.need_reopen = true;
+                return Ok(());
+            }
+            (g, w) => {
+                return fail(
+                    FailureClass::LiveReadMismatch,
+                    format!(
+                        "external read {}/{family}:{}: engine {g:?} vs model {w:?}",
+                        text(&row),
+                        text(&qualifier)
+                    ),
+                );
+            }
+        }
+        let reads: Vec<TxnRead> = vec![(table, row, family, Some(qualifier))];
+        let batch = match store.batch(&ops) {
+            Ok(b) => b,
+            Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
+        };
+        *txn.batch() = batch;
+        self.next_xid += 1;
+        let xid = format!("x{}", self.next_xid).into_bytes();
+        self.trace.push(format!(
+            "external prepare {} {durability:?} snapshot={snapshot} [{}]{}",
+            text(&xid),
+            ops.iter().map(show).collect::<Vec<_>>().join("; "),
+            if armed { " (crash armed)" } else { "" }
+        ));
+        let pending = match txn.submit_prepare(&xid, durability) {
+            Ok(pc) => Pending::Poll(pc),
+            Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
+        };
+        let read_shards: Vec<u16> = {
+            let store = self.store();
+            let view = store.engine.snapshot().expect("snapshot").view().clone();
+            reads
+                .iter()
+                .filter_map(|(t, r, _, _)| {
+                    view.tablets()
+                        .route(store.tables[t].id, r)
+                        .map(|(_, s)| s.0)
+                })
+                .collect()
+        };
+        self.in_flight.push(InFlight {
+            pending,
+            commit: Committed {
+                seqno: None,
+                ops,
+                commit_ts: None,
+                durability,
+                streams: streams_of(&shards, &read_shards),
+                shards,
+                acked: false,
+                observed: false,
+                kind: Kind::External {
+                    xid,
+                    phase: ExternalPhase::Prepare { snapshot, reads },
+                },
+            },
+            armed,
+            alone: true,
+        });
+        self.pending_advance = 2;
+        Ok(())
+    }
+
+    /// D329: decides one external transaction in doubt, commit or abort at random, with
+    /// `Engine::submit_decide`. A commit is applied at its decision's seqno as a cross-shard
+    /// commit is; an abort applies nothing.
+    fn submit_decide(&mut self, rng: &mut Rng) -> Result<(), Fail> {
+        let ready: Vec<Vec<u8>> = self
+            .external
+            .iter()
+            .filter(|(_, e)| !e.deciding)
+            .map(|(x, _)| x.clone())
+            .collect();
+        let xid = ready[rng.below(ready.len() as u64) as usize].clone();
+        let commit = rng.chance(600_000);
+        let now = self.now();
+        let armed = self.arm(rng);
+        let entry = self.external.get_mut(&xid).expect("ready");
+        entry.deciding = true;
+        let mut c = entry.commit.clone();
+        c.commit_ts = Some(now);
+        c.kind = Kind::External {
+            xid: xid.clone(),
+            phase: if commit {
+                ExternalPhase::Commit
+            } else {
+                ExternalPhase::Abort
+            },
+        };
+        self.stats.external_decides += 1;
+        self.trace.push(format!(
+            "external decide {} {} ts={now}{}",
+            text(&xid),
+            if commit { "commit" } else { "abort" },
+            if armed { " (crash armed)" } else { "" }
+        ));
+        let pending = match self.store().engine.submit_decide(&xid, commit) {
+            Ok(Some(pc)) => Pending::Poll(pc),
+            Ok(None) => {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("decide {}: not in doubt", text(&xid)),
+                );
+            }
+            Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
+        };
+        self.in_flight.push(InFlight {
+            pending,
+            commit: c,
+            armed,
+            alone: true,
+        });
+        self.pending_advance = 2;
+        Ok(())
+    }
+
+    /// D329: whether `c`'s rows (its writes, and a transaction's reads) meet a row an
+    /// external share in doubt (or one maybe in doubt) wrote or read: a refusal there is the
+    /// share's hold (`Busy` for a single, `Conflict` for a PREPARE), not a conflict.
+    fn overlaps_external(&self, c: &Committed) -> bool {
+        let mut rows: Vec<(String, Vec<u8>)> = c
+            .ops
+            .iter()
+            .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+            .collect();
+        if let Kind::Txn { reads, .. }
+        | Kind::External {
+            phase: ExternalPhase::Prepare { reads, .. },
+            ..
+        } = &c.kind
+        {
+            rows.extend(reads.iter().map(|(t, r, _, _)| (t.clone(), r.clone())));
+        }
+        let held = self
+            .external
+            .values()
+            .flat_map(|e| {
+                e.commit
+                    .ops
+                    .iter()
+                    .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+                    .chain(e.reads.iter().cloned())
+            })
+            .chain(self.external_unsure.iter().flat_map(|u| {
+                u.ops
+                    .iter()
+                    .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+            }));
+        let held: BTreeSet<(String, Vec<u8>)> = held.collect();
+        rows.iter().any(|r| held.contains(r))
+    }
+
+    /// D329: the outcome of an external prepare or abort (a commit's goes the commit way).
+    fn external_outcome(
+        &mut self,
+        inf: InFlight,
+        outcome: Outcome,
+        dead: bool,
+    ) -> Result<Resolved, Fail> {
+        let Kind::External { xid, phase } = inf.commit.kind.clone() else {
+            unreachable!()
+        };
+        let Outcome::Commit(result) = outcome else {
+            return fail(
+                FailureClass::Protocol,
+                "an external call answered as a check".into(),
+            );
+        };
+        match (phase, result) {
+            (ExternalPhase::Prepare { reads, .. }, Ok(info)) => {
+                self.stats.external_in_doubt += 1;
+                self.trace
+                    .push(format!("  -> {} in doubt (id {})", text(&xid), info.seqno));
+                self.external_ids.insert(info.seqno);
+                self.external.insert(
+                    xid,
+                    ExternalEntry {
+                        commit: inf.commit,
+                        reads: reads.into_iter().map(|(t, r, _, _)| (t, r)).collect(),
+                        deciding: false,
+                    },
+                );
+            }
+            (ExternalPhase::Prepare { snapshot, reads }, Err(Error::Conflict)) => {
+                let real = self.history.values().any(|c| {
+                    c.seqno.is_some_and(|s| s > snapshot)
+                        && reads.iter().any(|read| c.touches_read(read))
+                });
+                if !real && !self.overlaps_external(&inf.commit) {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "spurious conflict on external {}: nothing above snapshot \
+                             {snapshot} touched {reads:?}, and no share in doubt holds its rows",
+                            text(&xid)
+                        ),
+                    );
+                }
+                self.stats.conflicts += 1;
+                self.trace.push("  -> conflict".into());
+                self.aborted.push(inf.commit);
+            }
+            (ExternalPhase::Prepare { .. }, Err(Error::Busy)) => {
+                self.stats.busy += 1;
+                self.trace.push("  -> busy".into());
+                self.aborted.push(inf.commit);
+            }
+            // ICR 0140's first part: a value stored apart (a family's separation threshold)
+            // can't be held in doubt, refused before anything is logged.
+            (ExternalPhase::Prepare { .. }, Err(Error::InvalidArgument(m)))
+                if m.contains("inline limit") =>
+            {
+                self.trace.push("  -> refused: a value stored apart".into());
+                self.aborted.push(inf.commit);
+            }
+            (ExternalPhase::Abort, Ok(info)) => {
+                if info.seqno == 0 {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!("abort of {}: decided by another call", text(&xid)),
+                    );
+                }
+                self.stats.external_aborted += 1;
+                self.trace.push(format!("  -> {} aborted", text(&xid)));
+                self.forget_external(&xid);
+            }
+            (phase, Err(e))
+                if dead
+                    || !self.alive()
+                    || is_crashed(&e)
+                    || matches!(
+                        e,
+                        Error::Closed | Error::Io(_) | Error::OutcomeUnknown | Error::ShardFailed
+                    ) =>
+            {
+                // Its outcome is the WAL's: reconciled with `in_doubt` at the next open.
+                self.trace.push(format!(
+                    "  -> {} unsure ({e}); reconciled at the reopen",
+                    text(&xid)
+                ));
+                if matches!(phase, ExternalPhase::Prepare { .. }) {
+                    self.external_unsure.push(inf.commit);
+                }
+                if dead {
+                    return Ok(Resolved::Done);
+                }
+                if !self.alive() || is_crashed(&e) {
+                    return Ok(Resolved::Crashed);
+                }
+                self.need_reopen = true;
+            }
+            (phase, r) => {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("external {} {phase:?}: unexpected {r:?}", text(&xid)),
+                );
+            }
+        }
+        Ok(Resolved::Done)
+    }
+
+    /// D329: `xid` is decided; one decided below GroupSync is remembered, as a power loss may
+    /// bring it back in doubt.
+    fn forget_external(&mut self, xid: &[u8]) {
+        if let Some(mut e) = self.external.remove(xid)
+            && !matches!(
+                e.commit.durability,
+                Durability::GroupSync | Durability::Sync
+            )
+        {
+            e.deciding = false;
+            self.external_decided_weak.insert(xid.to_vec(), e);
+        }
+    }
+
+    /// D329, after a reopen: what the crash left of the external transactions, from
+    /// `Engine::in_doubt`. A prepare left unsure is in doubt if listed, else dropped. A
+    /// decide in flight landed if its xid isn't listed (a commit's records are then the
+    /// WAL's to match) and didn't if it is. A share prepared and acknowledged at GroupSync or
+    /// Sync must still be listed; one at a lower level may have been lost.
+    fn reconcile_external(&mut self) -> Result<(), Fail> {
+        if self.external.is_empty() && self.external_unsure.is_empty() {
+            let listed = self.store().engine.in_doubt();
+            if listed.is_empty() {
+                return Ok(());
+            }
+        }
+        let listed: BTreeSet<Vec<u8>> = self
+            .store()
+            .engine
+            .in_doubt()
+            .into_iter()
+            .map(|(x, _)| x)
+            .collect();
+        // Prepares and aborts the crash left in `unacked` are no commits for the WAL to match.
+        let mut unsure = std::mem::take(&mut self.external_unsure);
+        let mut kept = Vec::new();
+        for c in std::mem::take(&mut self.unacked) {
+            match &c.kind {
+                Kind::External {
+                    phase: ExternalPhase::Prepare { .. },
+                    ..
+                } => unsure.push(c),
+                Kind::External {
+                    phase: ExternalPhase::Abort,
+                    ..
+                } => {}
+                // Its DECISION didn't land: still in doubt, nothing to match.
+                Kind::External {
+                    xid,
+                    phase: ExternalPhase::Commit,
+                } if listed.contains(xid) => {}
+                _ => kept.push(c),
+            }
+        }
+        self.unacked = kept;
+        for c in unsure {
+            let Kind::External { xid, phase } = c.kind.clone() else {
+                unreachable!()
+            };
+            if listed.contains(&xid) {
+                self.stats.external_adopted += 1;
+                self.trace.push(format!(
+                    "  external {} in doubt after the reopen",
+                    text(&xid)
+                ));
+                let reads = match phase {
+                    ExternalPhase::Prepare { reads, .. } => {
+                        reads.into_iter().map(|(t, r, _, _)| (t, r)).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                self.external.insert(
+                    xid,
+                    ExternalEntry {
+                        commit: c,
+                        reads,
+                        deciding: false,
+                    },
+                );
+            } else {
+                self.stats.external_dropped += 1;
+            }
+        }
+        let mut gone = Vec::new();
+        for (xid, e) in self.external.iter_mut() {
+            if listed.contains(xid) {
+                e.deciding = false;
+                continue;
+            }
+            if !e.deciding
+                && matches!(
+                    e.commit.durability,
+                    Durability::GroupSync | Durability::Sync
+                )
+            {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "external {} was prepared at {:?} and acknowledged, and isn't in doubt \
+                         after the reopen",
+                        text(xid),
+                        e.commit.durability
+                    ),
+                );
+            }
+            if !e.deciding {
+                self.stats.external_dropped += 1;
+            }
+            gone.push(xid.clone());
+        }
+        for x in gone {
+            self.external.remove(&x);
+        }
+        // A decision below GroupSync the power loss took: in doubt again.
+        for x in &listed {
+            if !self.external.contains_key(x)
+                && let Some(e) = self.external_decided_weak.remove(x)
+            {
+                self.stats.external_adopted += 1;
+                self.trace.push(format!(
+                    "  external {} in doubt again: its {:?} decision was lost",
+                    text(x),
+                    e.commit.durability
+                ));
+                self.external.insert(x.clone(), e);
+            }
+        }
+        // A share a reopen reinstalled decides at GroupSync (its prepare's level isn't logged).
+        for (x, e) in self.external.iter_mut() {
+            if listed.contains(x) {
+                e.commit.durability = Durability::GroupSync;
+            }
+        }
+        if let Some(x) = listed.iter().find(|x| !self.external.contains_key(*x)) {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "{} is in doubt after the reopen, but was never prepared",
+                    text(x)
+                ),
+            );
+        }
+        Ok(())
+    }
+
     fn submit_txn(
         &mut self,
         ops: Vec<ModelOp>,
@@ -5739,6 +6439,14 @@ impl World {
                 return Ok(());
             }
         }
+        // D329: a share in doubt is decided now and then; the op waits for the next step.
+        if self.cfg.external_ppm > 0
+            && self.external.values().any(|e| !e.deciding)
+            && rng.chance(self.cfg.external_ppm)
+        {
+            self.queued.push_front(op);
+            return self.submit_decide(rng);
+        }
         let now = self.now();
         match op {
             Op::Commit(mut ops, durability) => {
@@ -5749,6 +6457,14 @@ impl World {
                 }
                 if rng.chance(self.cfg.txn_ppm) {
                     return self.submit_txn(ops, durability, rng);
+                }
+                // D329: no draw at all with it off, so other suites' seeds run as before.
+                if self.cfg.external_ppm > 0
+                    && self.cfg.tablet_changes
+                    && large_puts(&ops) == 0
+                    && rng.chance(self.cfg.external_ppm)
+                {
+                    return self.submit_external(ops, durability, rng);
                 }
                 if self.cfg.returning_ppm > 0
                     && returning_cells(&ops).is_some()
@@ -6157,6 +6873,11 @@ fn run_with(
                         return Ok(true);
                     }
                     let Some(op) = w.next_op() else {
+                        // D329: every share still in doubt is decided before the run ends.
+                        if w.cfg.external_ppm > 0 && w.external.values().any(|e| !e.deciding) {
+                            w.submit_decide(rng)?;
+                            return Ok(true);
+                        }
                         return Ok(false);
                     };
                     w.op_index += 1;
@@ -6205,6 +6926,7 @@ fn run_with(
                             Kind::Cas { .. } => "cas",
                             Kind::Txn { .. } => "txn",
                             Kind::Returning { .. } => "returning",
+                            Kind::External { .. } => "external",
                         };
                         let pending = match &i.pending {
                             Pending::Poll(_) => "pending",
@@ -6230,7 +6952,10 @@ fn run_with(
     }
     w.stats.mutating_ops = vfs.mutating_ops();
     if let Some(store) = w.store.as_ref() {
-        (w.stats.returning_fast, w.stats.returning_full) = store.engine.returning_folds();
+        let folds = store.engine.returning_folds();
+        let punches = store.engine.metrics().file_punches.0;
+        (w.stats.returning_fast, w.stats.returning_full) = folds;
+        w.stats.punches += punches;
     }
     if w.failure.is_none() {
         // Finish with one more crash so the tail of every run is checked.

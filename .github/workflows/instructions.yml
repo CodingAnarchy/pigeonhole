@@ -315,8 +315,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for side in base head; do
-            groups=()
+          # Counts SIDE's states and shapes into OUT, keeping each one's callgrind output in
+          # CGDIR. With names after CGDIR, only those states and shapes (the retry below).
+          count_side() {
+            local side="$1" out="$2" cgdir="$3"
+            shift 3
+            # `only` filters the `BINARY:shape,shape` entries of SHAPES by shape name, and
+            # hotrow's states by `states`' names in scripts/instructions-per-cell.sh.
+            local only=" $* " g s hot
+            local -a groups=() keep=() list=()
             for g in $SHAPES; do
               # Base on its own examples: only the shapes base has a ceiling for.
               if [ "$side" = base ] && [ -e /tmp/base-own-examples ]; then
@@ -333,14 +340,24 @@ jobs:
                 [ "${#keep[@]}" -gt 0 ] || continue
                 g="${g%%:*}:$(IFS=,; echo "${keep[*]}")"
               fi
+              if [ "$only" != "  " ]; then
+                keep=()
+                IFS=, read -ra list <<< "${g#*:}"
+                for s in "${list[@]}"; do
+                  [[ "$only" == *" $s "* ]] && keep+=("$s")
+                done
+                [ "${#keep[@]}" -gt 0 ] || continue
+                g="${g%%:*}:$(IFS=,; echo "${keep[*]}")"
+              fi
               groups+=("/tmp/bin-$side/$g")
             done
             # The text shapes' index, built natively once per side (about 25 s) and opened
             # read-only by every text shape: valgrind runs only the searches (#1560 PR 0). The
             # build pins its clock and ids, so each side indexes the same bytes of text into
-            # the same layout. It also checks the corpus (the hub term's postings).
+            # the same layout. It also checks the corpus (the hub term's postings). A retry
+            # reuses the first count's.
             if [ -x "/tmp/bin-$side/textshapes" ]; then
-              "/tmp/bin-$side/textshapes" build "/tmp/textidx-$side"
+              [ -d "/tmp/textidx-$side" ] || "/tmp/bin-$side/textshapes" build "/tmp/textidx-$side"
               export TEXTSHAPES_INDEX="/tmp/textidx-$side"
             else
               unset TEXTSHAPES_INDEX
@@ -348,14 +365,27 @@ jobs:
             # The packed shapes' index (#1585): that index copied and packed, natively, once
             # per side that has the example (a base older than it has no such shapes).
             if [ -x "/tmp/bin-$side/textpacked" ] && [ -n "${TEXTSHAPES_INDEX:-}" ]; then
-              "/tmp/bin-$side/textpacked" build "$TEXTSHAPES_INDEX" "/tmp/textpacked-$side"
+              [ -d "/tmp/textpacked-$side" ] ||
+                "/tmp/bin-$side/textpacked" build "$TEXTSHAPES_INDEX" "/tmp/textpacked-$side"
               export TEXTPACKED_INDEX="/tmp/textpacked-$side"
             else
               unset TEXTPACKED_INDEX
             fi
             hot="/tmp/bin-$side/$HOTROW"
             [ "$HOTROW" = - ] && hot=-
-            scripts/instructions-per-cell.sh "$hot" "${groups[@]}" > "/tmp/$side.txt"
+            # A retry runs hotrow's states only if one of them is retried.
+            if [ "$only" != "  " ] && [[ "$only" != *" as-written "* ]] &&
+              [[ "$only" != *" flushed "* ]] && [[ "$only" != *" compacted "* ]]; then
+              hot=-
+            fi
+            if [ "$hot" = - ] && [ "${#groups[@]}" -eq 0 ]; then
+              : > "$out"
+              return
+            fi
+            CG_OUT_DIR="$cgdir" scripts/instructions-per-cell.sh "$hot" ${groups[@]+"${groups[@]}"} > "$out"
+          }
+          for side in base head; do
+            count_side "$side" "/tmp/$side.txt" "/tmp/cg-first/$side"
           done
           # Base counts nothing only when every shape is new (its examples are all new).
           if [ ! -s /tmp/head.txt ] || { [ ! -s /tmp/base.txt ] && [ ! -e /tmp/base-own-examples ]; }; then
@@ -380,12 +410,73 @@ jobs:
           done
           # Base and head by name: `name base head flag`, base `-` for a shape new in the head,
           # flag `x` for one whose example code differs from base's.
-          awk 'FILENAME == ARGV[1] { d[$1] = 1; next }
-               FILENAME == ARGV[2] { bin[$1] = $2; next }
-               FILENAME == ARGV[3] { b[$1] = $2; next }
-               { e = ($1 in bin) ? bin[$1] : "hotrow"
-                 print $1, (($1 in b) ? b[$1] : "-"), $2, (("ALL" in d) || (e in d)) ? "x" : "-" }' \
-            /tmp/differ-bins /tmp/shape-bins /tmp/base.txt /tmp/head.txt > /tmp/pairs.txt
+          pairs() {
+            awk 'FILENAME == ARGV[1] { d[$1] = 1; next }
+                 FILENAME == ARGV[2] { bin[$1] = $2; next }
+                 FILENAME == ARGV[3] { b[$1] = $2; next }
+                 { e = ($1 in bin) ? bin[$1] : "hotrow"
+                   print $1, (($1 in b) ? b[$1] : "-"), $2, (("ALL" in d) || (e in d)) ? "x" : "-" }' \
+              /tmp/differ-bins /tmp/shape-bins /tmp/base.txt /tmp/head.txt > /tmp/pairs.txt
+          }
+          pairs
+          # One retry for outliers (#2007, #2033: memory-recall read 3.9% and 6.3% high once
+          # each on code that counted level on a rerun). A shape above its ceiling, or more
+          # than 2% from base either way, is counted again on both sides, and the gate below
+          # judges the retry's counts: a real change fails twice. Loud either way: a warning
+          # per shape, a section in the summary, and both runs' callgrind outputs uploaded
+          # (the callgrind-retry artifact), so an outlier can be diffed by function.
+          retry=$(
+            {
+              python3 scripts/instruction-ceilings.py check /tmp/head.txt |
+                sed -n 's/^| \([^ |]*\) | [0-9]* | [0-9]* | \*\*above the ceiling\*\* |$/\1/p' || true
+              awk '$2 != "-" && $4 != "x" && ($3 > $2 * 1.02 || $3 < $2 * 0.98) { print $1 }' /tmp/pairs.txt
+            } | sort -u | tr '\n' ' '
+          )
+          if [ -n "${retry// }" ]; then
+            cp /tmp/base.txt /tmp/base-first.txt
+            cp /tmp/head.txt /tmp/head-first.txt
+            retry_base=$(for n in $retry; do awk -v n="$n" '$1 == n && $2 != "-" { print n }' /tmp/pairs.txt; done | tr '\n' ' ')
+            for n in $retry; do
+              echo "::warning title=callgrind retry::$n counted $(awk -v n="$n" '$1 == n { print $2 " (base) -> " $3 " (head)" }' /tmp/pairs.txt) on the first run: counting it again on both sides"
+            done
+            count_side head /tmp/head-retry.txt /tmp/cg-retry/head $retry
+            if [ -n "${retry_base// }" ]; then
+              count_side base /tmp/base-retry.txt /tmp/cg-retry/base $retry_base
+            else
+              : > /tmp/base-retry.txt
+            fi
+            # The retry's counts replace the first run's for the retried shapes only: a retried
+            # hotrow state reruns all three, and the other two keep their first counts
+            # (simp724's R1 on #2037).
+            for side in base head; do
+              awk -v names=" $retry " 'FILENAME == ARGV[1] { if (index(names, " " $1 " ")) r[$1] = $2; next }
+                   { print $1, ($1 in r) ? r[$1] : $2 }' \
+                "/tmp/$side-retry.txt" "/tmp/$side-first.txt" > "/tmp/$side.txt"
+            done
+            pairs
+            # The artifact: both runs' callgrind outputs of the retried shapes.
+            for side in base head; do
+              mkdir -p "/tmp/cg-artifact/first/$side"
+              for n in $retry; do
+                f="/tmp/cg-first/$side/$n.callgrind.out"
+                [ -e "$f" ] && cp "$f" "/tmp/cg-artifact/first/$side/"
+              done
+              [ -d "/tmp/cg-retry/$side" ] && cp -R "/tmp/cg-retry/$side" "/tmp/cg-artifact/retry-$side"
+            done
+            {
+              echo "### RETRIED: an outlier's shapes were counted twice"
+              echo
+              echo "The gate below judges the retry. Both runs' callgrind outputs are in this job's \`callgrind-retry\` artifact."
+              echo
+              echo "| shape | first base | first head | retry base | retry head |"
+              echo "|---|--:|--:|--:|--:|"
+              for n in $retry; do
+                get() { awk -v n="$n" '$1 == n { print $2 }' "$1"; }
+                echo "| $n | $(get /tmp/base-first.txt) | $(get /tmp/head-first.txt) | $(get /tmp/base-retry.txt) | $(get /tmp/head-retry.txt) |"
+              done
+              echo
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
           {
             echo "### Instructions per unit (callgrind)"
             echo
@@ -436,3 +527,12 @@ jobs:
             echo "a shape is above its absolute ceiling, or has none (D193)"
             exit 1
           fi
+      # A retry's callgrind outputs, first and second run (see the retry in `count`).
+      - name: upload the retried shapes' callgrind outputs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: callgrind-retry-${{ strategy.job-index }}
+          path: /tmp/cg-artifact
+          if-no-files-found: ignore
+          retention-days: 14

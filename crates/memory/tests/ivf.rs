@@ -8,6 +8,8 @@
 //! - Two remembers into one namespace don't conflict through the counter.
 //! - `verify` reports a drifted counter apart from mismatches.
 //! - `verify` checks the index's membership, not its count, at its own snapshot (#1427).
+//! - Recalls at one snapshot read a namespace's counter once, below the threshold and above
+//!   it, and any commit makes the next recall read it again (#2040).
 
 use std::collections::BTreeSet;
 
@@ -623,4 +625,115 @@ fn a_namespace_s_ivf_candidates_dont_depend_on_the_other_namespaces_recalled() {
         assert_eq!(with.0, alone.0, "query {i}");
         assert_eq!((with.1, alone.1), (1, 1), "query {i}");
     }
+}
+
+/// Small lists, with IVF from 8 memories (#2040's tests).
+fn tiny() -> IvfOptions {
+    IvfOptions::new()
+        .min_namespace_len(8)
+        .target_list_len(8)
+        .nprobe(2)
+}
+
+/// One recall of `ns` by embedding, at `s`: 1 when its count reached the threshold (the
+/// IVF index served it, or it fell back to exact from there), 0 when it was below.
+fn recall_at(store: &Store, ns: &str, s: &pigeonhole::Snapshot, rng: &mut Rng) -> usize {
+    let st = store
+        .recall(&[ns])
+        .embedding(emb(rng))
+        .snapshot(s)
+        .run_with_stats()
+        .unwrap()
+        .1;
+    st.ivf_namespaces + st.ivf_fallbacks
+}
+
+#[test]
+fn recalls_at_one_snapshot_read_the_namespace_counter_once() {
+    // #2040: a counter read folds every operand since the counter's last checkpoint, and
+    // folds them all again until the shard applies the checkpoint, about 6% of a recall. At
+    // one snapshot the count can't change, so only the first recall reads it, below the
+    // threshold and above it.
+    let (_dir, db) = open();
+    let store = create(&db, tiny());
+    let mut rng = Rng(0x2040);
+    for i in 0..4 {
+        store
+            .remember(
+                "few",
+                Memory::new(format!("few {i}")).embedding(emb(&mut rng)),
+            )
+            .unwrap();
+    }
+    // Past the threshold in one transaction (a bulk of 40).
+    db.transact(&RetryPolicy::default(), |txn| {
+        for i in 0..40 {
+            store.remember_in(
+                txn,
+                "many",
+                Memory::new(format!("many {i}")).embedding(emb(&mut rng)),
+            )?;
+        }
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+    store.settle();
+    let s = db.snapshot().unwrap();
+    let reads = pigeonhole_memory::hooks::ns_count_reads(&store);
+    for _ in 0..50 {
+        assert_eq!(recall_at(&store, "few", &s, &mut rng), 0, "below: exact");
+        assert_eq!(recall_at(&store, "many", &s, &mut rng), 1, "above: IVF");
+    }
+    assert_eq!(
+        pigeonhole_memory::hooks::ns_count_reads(&store) - reads,
+        2,
+        "one read per namespace"
+    );
+}
+
+#[test]
+fn a_commit_between_two_recalls_makes_the_second_read_the_count() {
+    // ai1249 on #2040: a count is reused only at its own snapshot. A namespace cached below
+    // the threshold that passes it in one transaction takes the IVF index on the next
+    // recall, and a recall at the older snapshot is still exact.
+    let (_dir, db) = open();
+    let store = create(&db, tiny());
+    let mut rng = Rng(0x2041);
+    for i in 0..4 {
+        store
+            .remember("n", Memory::new(format!("n {i}")).embedding(emb(&mut rng)))
+            .unwrap();
+    }
+    let before = db.snapshot().unwrap();
+    let reads = pigeonhole_memory::hooks::ns_count_reads(&store);
+    assert_eq!(recall_at(&store, "n", &before, &mut rng), 0);
+    db.transact(&RetryPolicy::default(), |txn| {
+        for i in 0..20 {
+            store.remember_in(
+                txn,
+                "n",
+                Memory::new(format!("bulk {i}")).embedding(emb(&mut rng)),
+            )?;
+        }
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+    store.settle();
+    let after = db.snapshot().unwrap();
+    assert_eq!(recall_at(&store, "n", &after, &mut rng), 1, "past it: IVF");
+    assert_eq!(recall_at(&store, "n", &after, &mut rng), 1);
+    // The older snapshot's count was replaced by the newer one's: read again, and exact.
+    assert_eq!(
+        recall_at(&store, "n", &before, &mut rng),
+        0,
+        "at the older snapshot"
+    );
+    assert_eq!(pigeonhole_memory::hooks::ns_count_reads(&store) - reads, 3);
+    // Any commit, even one that doesn't touch the namespace, makes the next recall read.
+    store
+        .remember("other", Memory::new("elsewhere").embedding(emb(&mut rng)))
+        .unwrap();
+    let later = db.snapshot().unwrap();
+    assert_eq!(recall_at(&store, "n", &later, &mut rng), 1);
+    assert_eq!(pigeonhole_memory::hooks::ns_count_reads(&store) - reads, 4);
 }

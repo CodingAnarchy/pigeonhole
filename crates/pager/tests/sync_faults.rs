@@ -153,6 +153,9 @@ impl File for FaultFile {
         self.faults.hints.fetch_add(1, Ordering::AcqRel);
         self.inner.start_writeback(offset, len)
     }
+    fn punch_hole(&self, offset: u64, len: u64) -> Result<()> {
+        self.inner.punch_hole(offset, len)
+    }
     fn sync_data(&self) -> Result<()> {
         if take_one(&self.faults.fail_sync_data) {
             return Err(pigeonhole_io::Error::new(
@@ -308,6 +311,31 @@ fn a_failed_growth_sync_poisons_later_commits() {
     assert!(pager.submit_commit_root(root(2)).wait().is_err());
     drop(pager);
     assert_eq!(reopened_root(&vfs), root(1));
+}
+
+/// simp724's M1 on #2034: a failed root commit's writer abandons the new root's extents (its
+/// manifest), but that root's superblock may be on disk, so recovery can open it. A poisoned
+/// pager punches none of that space: the punch fails before it touches the file.
+#[test]
+fn a_poisoned_pager_punches_nothing() {
+    let (vfs, faults, pager) = setup();
+    // The new root's manifest, written, then its commit's sync fails.
+    let manifest = pager.allocate(256 << 10).unwrap();
+    pager.write(manifest, 0, &[9; 4096]).unwrap();
+    faults.fail_sync_data.store(1, Ordering::Release);
+    assert!(pager.commit_root(root(2)).is_err());
+    pager.abandon(manifest);
+    let err = pager.punch_free(0).unwrap_err();
+    assert!(err.to_string().contains("reopen"), "{err}");
+    let stats = pager.stats();
+    assert_eq!((stats.punches, stats.punched_bytes), (0, 0));
+    // The block went back to the free map: the refusal held nothing.
+    assert!(pager.punch_free(0).is_err());
+    let mut back = vec![0; 4096];
+    pager.read(manifest, 0, &mut back).unwrap();
+    assert_eq!(back, vec![9; 4096]);
+    drop(pager);
+    let _ = reopened_root(&vfs);
 }
 
 #[test]

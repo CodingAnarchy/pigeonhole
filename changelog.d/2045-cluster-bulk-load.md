@@ -1,0 +1,2 @@
+### Added
+- `phdb serve` on a cluster: `Vectors.BulkLoad` runs across an index's partitions (#1722, ICR 0138). The node you call splits the stream by id, and each partition loads its own part. Every partition takes the client's `expected`, so a node serving several of an index's partitions may need `--bulk-load-bytes` raised. A partition that fails or can't be reached fails the load, naming it, and a node on an older build is refused before anything is read.

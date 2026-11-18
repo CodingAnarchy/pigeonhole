@@ -342,12 +342,18 @@ fn a_resume_through_another_node_delivers_the_rest_with_no_repeat_and_no_gap() {
         .unwrap();
         let (seen, _) = commits(&mut s, first.len()).await;
         drop(s);
-        // The client handled the first 45, then stopped; its last checkpoint is at or before.
-        let handled = 45;
-        let at = (0..handled)
-            .rev()
+        // The client handled a few events past a checkpoint, then stopped. Where checkpoints
+        // fall depends on when the member moves from its own merge to its hub's ring (each
+        // counts 8 from its own start), so the stop is placed from the ones it got: 4 past
+        // the first at or after event 30, before the next one 8 on.
+        let at = (30..first.len())
             .find(|&i| seen[i].token.is_some())
             .expect("a checkpoint");
+        let handled = at + 4;
+        assert!(
+            seen[at + 1..handled].iter().all(|x| x.token.is_none()),
+            "checkpoints 8 apart"
+        );
         let token = seen[at].token.clone().unwrap();
         let mut last: BTreeMap<String, u64> = BTreeMap::new();
         for s in &seen[..handled] {
@@ -1981,15 +1987,19 @@ fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or
         // sooner would keep it going.
         metric_until(c, "pigeonhole_serve_feed_idle_drops_total", |n| n == 1).await;
         let mut seen = Vec::new();
-        // A cluster member's idle end closes its stream (hub.rs `start`: only a failure
-        // sends an error; #2021).
-        while let Some(e) = tokio::time::timeout(Duration::from_secs(10), s.message())
-            .await
-            .expect("the stream ends at its idle limit")
-            .unwrap()
-        {
-            seen.extend(seen_of(&e));
-        }
+        // What was queued, then a single node's `DeadlineExceeded` (#2021).
+        let end = loop {
+            match tokio::time::timeout(Duration::from_secs(10), s.message())
+                .await
+                .expect("the stream ends at its idle limit")
+            {
+                Ok(Some(e)) => seen.extend(seen_of(&e)),
+                Ok(None) => panic!("a clean end, after {} commits", seen.len()),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(end.code(), tonic::Code::DeadlineExceeded, "{end:?}");
+        assert!(end.message().contains("--stream-idle-ms"), "{end:?}");
         assert!(
             !seen.is_empty() && seen.len() < want.len(),
             "{} of {} before the end",

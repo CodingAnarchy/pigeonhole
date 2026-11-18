@@ -460,14 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_restarted_partial_holds_only_what_is_written_after() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "phdb-partial-{}-{nanos}.phdb.partial",
-            std::process::id()
-        ));
+        let path = crate::test_dir::fresh("phdb-partial-").join("p1.phdb.partial");
         let file = tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)

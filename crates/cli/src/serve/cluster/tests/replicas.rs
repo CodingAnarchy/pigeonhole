@@ -55,8 +55,22 @@ async fn set_replicas(a: u16, p: &str, replicas: &[&str]) {
     panic!("set the map: {last:?}");
 }
 
-/// Table `r` on p3 alone, through the writer at `port`.
+/// Table `r` on p3 alone, through the writer at `port`: retried while a node that just
+/// started is still taking its peers' maps (the restarted-node rig).
 async fn table_on_p3(port: u16) {
+    for _ in 0..100 {
+        match try_table_on_p3(port).await {
+            Ok(()) => return,
+            Err(e) if e.code() == tonic::Code::Unavailable => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    panic!("table r was never created on p3");
+}
+
+async fn try_table_on_p3(port: u16) -> Result<(), tonic::Status> {
     let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
         .connect()
@@ -77,7 +91,7 @@ async fn table_on_p3(port: u16) {
             }),
         })
         .await
-        .unwrap();
+        .map(|_| ())
 }
 
 /// How many bootstraps the follower of the replica copy in `dir` has finished.
@@ -294,6 +308,8 @@ fn a_stamp_onto_a_node_holding_the_partitions_replica_is_refused() {
                 to_epoch: 2,
                 restore: false,
                 restore_from_cluster_id: String::new(),
+                promote: false,
+                replica_epoch: 0,
             })
             .await
             .unwrap_err();
@@ -765,6 +781,449 @@ fn an_idle_owners_replica_stays_fresh() {
             .unwrap();
         assert_eq!(value.as_deref(), Some(&b"v"[..]));
         assert_eq!(by.as_deref(), Some("replica"));
+    });
+}
+
+/// The map as node `port` has it: P's node, epoch, history epoch and replicas.
+async fn placed(port: u16, p: &str) -> (String, u64, u64, Vec<String>) {
+    let m = client(port)
+        .await
+        .get_map(GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let q = m.partitions.into_iter().find(|q| q.id == p).unwrap();
+    (q.node, q.epoch, q.history_epoch, q.replicas)
+}
+
+/// D328 PR 3: a planned promotion. With p3 closed on its owner c (which releases its
+/// lease), `phdb cluster promote p3 --to a` makes a's replica the owner at the next epoch
+/// with a new history: the rows c had are there, writes land on a, and nothing is lost.
+#[test]
+fn a_planned_promotion_makes_the_replica_the_owner() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let last = put_in(ports[1], "r", "k2").await;
+        eventually("a's copy to apply k2", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= last)
+        })
+        .await;
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        assert_eq!(r.document["lost_commits"], 0, "{:?}", r.document);
+        // The promote waited for a to serve p3 (#2035): a read on a at once, no retry.
+        let (value, _, _) = read_through(ports[1], "k2", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+        let (node, epoch, history, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        assert!(replicas.is_empty(), "{replicas:?}");
+        // The rows the owner had, and a write after it, on a.
+        let after = put_after_move(ports[1], "r", "k3").await;
+        assert!(after > 0);
+        for row in ["k1", "k2", "k3"] {
+            let (value, _, _) = read_through(ports[1], row, None, None).await.unwrap();
+            assert_eq!(value.as_deref(), Some(&b"v"[..]), "{row}");
+        }
+        // Run again: done.
+        let again = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(again.document.contains_key("done"), "{:?}", again.document);
+    });
+}
+
+/// A promotion to a node that holds no replica of the partition is refused, and so is one
+/// whose owner still serves it.
+#[test]
+fn a_promotion_needs_a_replica_and_an_owner_that_stopped_serving() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .err()
+        .expect("the owner still serves p3");
+        assert!(
+            e.message().contains("isn't fenced or closed"),
+            "{}",
+            e.message()
+        );
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "b",
+            true,
+            None,
+        ))
+        .await
+        .err()
+        .expect("b holds no replica of p3");
+        assert!(
+            e.message().contains("answers and serves") || e.message().contains("no copy"),
+            "{}",
+            e.message()
+        );
+    });
+}
+
+/// `--old-unreachable`: c, p3's owner, stops (real 1.5 s leases here). The promotion goes
+/// ahead, reports the loss as unknown, and a serves p3 once c's lease has run out.
+#[test]
+fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dirs = [test_dir(), test_dir(), test_dir()];
+    let (mut stops, ports) = three_leased(&rt, &dirs);
+    rt.block_on(async {
+        table_on_p3(ports[0]).await;
+        let first = put_after_move(ports[1], "r", "k1").await;
+        set_replicas(ports[0], "p3", &["a"]).await;
+        eventually("a's copy to apply k1", async || {
+            copy_of(ports[0], "p3")
+                .await
+                .is_some_and(|lp| lp.replica_applied_seqno >= first)
+        })
+        .await;
+    });
+    let _ = stops.remove(2).send(());
+    rt.block_on(async {
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            r.document["lost_commits"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("unknown")),
+            "{:?}",
+            r.document
+        );
+        let after = put_after_move(ports[1], "r", "k2").await;
+        assert!(after > 0);
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// S4 (D328 PR 3): a move of p3 onto a, which holds p3's replica, takes a out of p3's
+/// replicas and closes its copy first, then moves p3 there as any move does: its rows and
+/// history come along, and the copy's file went aside.
+#[test]
+fn a_move_onto_a_replicas_node_takes_it_out_of_the_replicas_first() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let (_, _, history_before, _) = placed(ports[1], "p3").await;
+        within(super::super::moving::run(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+        let (node, epoch, history, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("a", 2));
+        assert_eq!(history, history_before, "a move keeps p3's history");
+        assert!(replicas.is_empty(), "{replicas:?}");
+        let after = put_after_move(ports[1], "r", "k2").await;
+        assert!(after > 0);
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// A promotion that stopped after its stamp, before its map (a crash there): a's file is
+/// at the next epoch, a primary, out of p3's replicas, and the map still gives p3 to c.
+/// Run again, it finishes: no second stamp, and the map gives a the partition.
+#[test]
+fn a_promotion_stopped_after_its_stamp_finishes_when_run_again() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1), "the map didn't move");
+        assert!(replicas.is_empty(), "{replicas:?}");
+        let r = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
+        let (node, epoch, history, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch, history), ("a", 2, 2));
+        // The promote waited for a to serve p3 (#2035): read at once, no retry.
+        let (value, _, _) = read_through(ports[1], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// simp724's M1 on #2007: a promote that stopped after its stamp doesn't overwrite a map
+/// someone changed since. Here a set-map put a back in p3's replicas: the rerun refuses,
+/// says what it found, and the map stays as that set-map left it.
+#[test]
+fn a_promotion_doesnt_overwrite_a_map_changed_since_its_stamp() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        set_replicas(ports[0], "p3", &["a"]).await;
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("the map changed");
+        assert!(e.message().contains("the map changed"), "{}", e.message());
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 1));
+        assert_eq!(replicas, vec!["a".to_owned()]);
+    });
+}
+
+/// simp724's M1 on #2007, the rerun's side: a promote stopped after its stamp, then a
+/// set-map moved p3's epoch on (p3 still on c). The rerun reads the new epoch, so a's file
+/// looks like an unstamped copy at it; the stamp refuses a file that's already a primary, and
+/// the map stays as the set-map left it.
+#[test]
+fn a_promotion_rerun_refuses_once_the_map_moved_past_its_stamp() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let args = args_at(ports[0]);
+        super::super::promote::STOP_AFTER_STAMP
+            .lock()
+            .unwrap()
+            .push(args.node.clone());
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("stopped");
+        assert!(
+            e.message().contains("after the promote's stamp"),
+            "{}",
+            e.message()
+        );
+        // A set-map: p3's epoch 1 -> 2, still on c.
+        let mut m = client(ports[0])
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let expected = m.map_version;
+        m.map_version += 1;
+        for q in m.partitions.iter_mut().filter(|q| q.id == "p3") {
+            q.epoch += 1;
+        }
+        client(ports[0])
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+            .unwrap();
+        eventually("a to hold p3 at epoch 2 in its map", async || {
+            placed(ports[1], "p3").await.1 == 2
+        })
+        .await;
+        let e = within(super::super::promote::promote(
+            &args, "p3", "a", false, None,
+        ))
+        .await
+        .err()
+        .expect("a's file is already a primary");
+        assert!(e.message().contains("already a primary"), "{}", e.message());
+        let (node, epoch, _, replicas) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("c", 2), "the set-map's map stays");
+        assert!(replicas.is_empty(), "{replicas:?}");
+    });
+}
+
+/// #2035: a promote returns only once the promoted node serves the partition, as a move
+/// does. a's open of p3 is held for a second (the seam): the promote is still waiting when
+/// the hold is let go, and a read on a right after it returns needs no retry.
+#[test]
+fn a_promotion_returns_once_the_new_owner_serves() {
+    use crate::serve::proto::PartitionRequest;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    let released = std::sync::Arc::new(AtomicBool::new(false));
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        super::super::open::HOLD_OPEN
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), wait));
+        let flag = released.clone();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            flag.store(true, Ordering::SeqCst);
+            let _ = release.send(());
+        });
+        let r = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the promote returned while a's open of p3 was held: {:?}",
+            r.document
+        );
+        holder.join().unwrap();
+        let (value, _, _) = read_through(ports[0], "k1", None, None).await.unwrap();
+        assert_eq!(value.as_deref(), Some(&b"v"[..]));
+    });
+}
+
+/// #2035: with `--timeout`, a promote whose node doesn't serve in time gives up, says what
+/// it waited for, and leaves the map giving that node the partition (as a move's wait does).
+#[test]
+fn a_promotion_gives_up_waiting_at_its_timeout() {
+    use crate::serve::proto::PartitionRequest;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    rt.block_on(async {
+        let req = || PartitionRequest {
+            partition: "p3".into(),
+            ..Default::default()
+        };
+        client(ports[2]).await.fence(req()).await.unwrap();
+        client(ports[2]).await.close(req()).await.unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        super::super::open::HOLD_OPEN
+            .lock()
+            .unwrap()
+            .push((dirs[0].clone(), wait));
+        let e = within(super::super::promote::promote(
+            &args_at(ports[0]),
+            "p3",
+            "a",
+            false,
+            Some(Duration::from_secs(1)),
+        ))
+        .await
+        .err()
+        .expect("a's open of p3 is held past the timeout");
+        assert!(
+            e.message()
+                .contains("gave up waiting for node \"a\" to serve p3 at epoch 2"),
+            "{}",
+            e.message()
+        );
+        let (node, epoch, _, _) = placed(ports[1], "p3").await;
+        assert_eq!((node.as_str(), epoch), ("a", 2), "the map gives a p3");
+        drop(release);
+        eventually("a to serve p3 once the hold is let go", async || {
+            read_through(ports[0], "k1", None, None)
+                .await
+                .is_ok_and(|(value, _, _)| value.as_deref() == Some(&b"v"[..]))
+        })
+        .await;
     });
 }
 

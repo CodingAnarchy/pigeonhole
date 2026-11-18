@@ -63,6 +63,11 @@ message TextSearchRequest {
   bytes id_prefix = 5;
   // Return each hit's text with the matches' ranges.
   bool highlight = 6;
+  // On a cluster (#1722, ICR 0138): go on when partitions of the index can't answer,
+  // rather than fail with `PartitionUnavailable`. The search then scores with the
+  // statistics of the partitions that answered (`partial`), and skips the hits of those
+  // that didn't (`missing`). A single node ignores it.
+  bool allow_partial = 7;
 }
 
 message TextQuery {
@@ -98,6 +103,17 @@ enum Fuzziness {
 
 message TextSearchResponse {
   repeated TextHit hits = 1;
+  // With `allow_partial`: some partitions didn't answer, so the answer is short. Either
+  // their statistics are missing, so the scores aren't the ones the whole index would
+  // give, or their hits are (`missing`), or both.
+  bool partial = 2;
+  // With `allow_partial`: the id ranges whose partitions didn't answer, whose hits are
+  // missing. `partial` is set whenever it isn't empty.
+  repeated MissingRange missing = 3;
+  // The fuzzy clauses (indexes into the query's clauses) whose expansions were cut at
+  // `max_expansions`: matching terms were left out. A fuzzy term two clauses yield is
+  // listed under the first. On a cluster, a cut in any partition counts.
+  repeated uint32 cut_clauses = 4;
 }
 
 message TextHit {

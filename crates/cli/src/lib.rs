@@ -23,6 +23,9 @@ mod output;
 #[cfg(feature = "serve")]
 mod serve;
 mod shell;
+// The serve tests' directories (#2015).
+#[cfg(all(test, feature = "serve"))]
+mod test_dir;
 
 #[doc(hidden)]
 pub use exit::ExitStatus;

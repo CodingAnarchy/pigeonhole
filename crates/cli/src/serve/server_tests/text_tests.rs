@@ -1,25 +1,33 @@
 use super::*;
 
-/// `texts::STEP_DELAY_MS` is process-wide: a test that slows rebuilds holds this from setting
-/// it until it resets it, so another test's reset can't speed its rebuild past its fence or
-/// close (#1995).
+/// `texts::STEP_DELAY_MS` and `texts::HOLD_PACK` are process-wide: a test that slows
+/// rebuilds or holds packs holds this from setting one until it resets it, so another test's
+/// reset can't speed its rebuild past its fence or close (#1995).
 static STEP_DELAY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Rebuilds wait 5 ms after each document until this is dropped.
+/// Rebuilds wait 5 ms after each document until this is dropped, or packs hold after each
+/// chunk ([`hold_packs`]).
 struct SlowSteps {
     _held: std::sync::MutexGuard<'static, ()>,
 }
 
 fn slow_steps() -> SlowSteps {
-    slow_steps_ms(5)
-}
-
-/// As [`slow_steps`], each step waiting `ms`.
-fn slow_steps_ms(ms: u64) -> SlowSteps {
     let held = STEP_DELAY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::serve::texts::STEP_DELAY_MS.store(ms, Ordering::Relaxed);
+    crate::serve::texts::STEP_DELAY_MS.store(5, Ordering::Relaxed);
+    SlowSteps { _held: held }
+}
+
+/// Until this is dropped, a pack of `db` waits after each chunk until a client or a resume
+/// wants the slot (`texts::HOLD_PACK`). Rebuilds aren't slowed, nor other servers' packs.
+fn hold_packs(db: &Pigeonhole) -> SlowSteps {
+    let held = STEP_DELAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *crate::serve::texts::HOLD_PACK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(db.path().to_path_buf());
     SlowSteps { _held: held }
 }
 
@@ -27,6 +35,9 @@ impl Drop for SlowSteps {
     // Before the lock is released: the field drops after this.
     fn drop(&mut self) {
         crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+        *crate::serve::texts::HOLD_PACK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -785,9 +796,9 @@ fn text_pack_waits_out_a_fence() {
 }
 
 /// A server with `--text-pack` whose pack of `tx` (400 documents, two chunks) has done its
-/// first chunk and waits 1.5 s in its step before the second: the pack holds the node's
-/// slot. The steps' delay is back to 0 on return (only the step in flight still waits), so
-/// what the test runs next isn't slowed.
+/// first chunk and holds in its step before the second ([`hold_packs`]) until a client or
+/// a resume wants the node's slot, which the pack holds. A fixed wait there let the pack
+/// finish first on a slow runner (#2031's Windows job). Rebuilds aren't slowed.
 ///
 /// Also the counts of packs that had yielded, to a client and to a resume, when this took
 /// the steps' lock: hold the `SlowSteps` until the pack's yield is checked against them.
@@ -797,7 +808,7 @@ fn packing() -> (Server, Pigeonhole, SlowSteps, (usize, usize)) {
     let s = Server::start_custom("", limits(), 1, |s| s.text_pack(true));
     let db = s.shared.router.service.part().unwrap().db.clone();
     indexed(&db, 400);
-    let slow = slow_steps_ms(1500);
+    let slow = hold_packs(&db);
     let yielded = (
         crate::serve::texts::PACK_YIELDED_TO_CLIENT.load(Ordering::SeqCst),
         crate::serve::texts::PACK_YIELDED_TO_RESUME.load(Ordering::SeqCst),
@@ -809,9 +820,7 @@ fn packing() -> (Server, Pigeonhole, SlowSteps, (usize, usize)) {
         assert!(std::time::Instant::now() < until, "the pack never started");
         std::thread::sleep(Duration::from_millis(10));
     }
-    // The pack's step has read its delay by now: it runs right after the chunk's commit.
-    std::thread::sleep(Duration::from_millis(100));
-    crate::serve::texts::STEP_DELAY_MS.store(0, Ordering::Relaxed);
+    // The pack holds after that chunk until the test's client or resume wants the slot.
     assert!(packed_postings(&db) < 800, "the pack finished in one chunk");
     (s, db, slow, yielded)
 }

@@ -1438,11 +1438,19 @@ impl Pigeonhole {
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn internal_metrics(&self) -> Vec<(&'static str, u64)> {
-        crate::metrics::internal(
+        let mut v = crate::metrics::internal(
             &self.engine().metrics(),
             self.db.vfs.ring_stats().map(|s| s.pooled),
             self.db.vfs.nowait_reads(),
-        )
+        );
+        // D291's counter checkpoints, kept and dropped (memshapes requires none in its
+        // measured part).
+        let (kept, dropped) = self.engine().counter_checkpoints();
+        v.extend([
+            ("counter_checkpoints_kept", kept),
+            ("counter_checkpoints_dropped", dropped),
+        ]);
+        v
     }
 
     /// What the database holds and how it is stored: format version, file and free bytes,
@@ -1496,6 +1504,31 @@ impl Pigeonhole {
     pub fn flush(&self) -> Result<()> {
         self.db
             .retry_closed(|| self.engine().flush().map_err(Error::from))
+    }
+
+    /// Decides the transaction prepared as `xid` ([`Transaction::prepare`], D329, ICR 0140):
+    /// `commit` applies it, and answers its commit's seqno; otherwise it is dropped, and the
+    /// answer's seqno is its id. `None` when `xid` isn't in doubt here: decided already, or
+    /// never prepared. Idempotent. Hidden: not part of the API, outside the semver promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn decide(&self, xid: &[u8], commit: bool) -> Result<Option<crate::CommitInfo>> {
+        self.engine()
+            .decide(xid, commit)
+            .map(|c| c.map(crate::CommitInfo::from_engine))
+            .map_err(Error::from)
+    }
+
+    /// The transactions prepared here and still in doubt (D329): each xid, with how long
+    /// ago it was prepared. Hidden, as [`Pigeonhole::decide`].
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn in_doubt(&self) -> Vec<(Vec<u8>, std::time::Duration)> {
+        self.engine()
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, ns)| (xid, std::time::Duration::from_nanos(ns)))
+            .collect()
     }
 
     /// Compacts every table fully: flushes, then merges every level into the last one.

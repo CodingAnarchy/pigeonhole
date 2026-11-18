@@ -127,6 +127,12 @@ pub(crate) struct Fences {
     /// its grants at once rather than a lease later, so a planned move's new owner needn't
     /// wait them out.
     asked: std::sync::atomic::AtomicBool,
+    /// Peers whose build answers `Cluster.Lease` with `Unimplemented` (1.2, #2047), counted
+    /// as granting: kept so the log says so once per peer, and again if it comes back.
+    pre_lease: Mutex<BTreeSet<String>>,
+    /// Peers that report `leases` but whose `Cluster.Lease` answers `Unimplemented`
+    /// (audit120's S1 on #2048): counted as nothing, and logged once per peer.
+    unrouted: Mutex<BTreeSet<String>>,
 }
 
 /// [`Node::confirm_soon`]'s state.
@@ -220,9 +226,32 @@ pub(super) fn gate_state(gate: &WriteGate) -> (LocalPartitionState, FenceReason)
     }
 }
 
+/// Adds `peer` to `set` (`true` when it wasn't there) or removes it (`false`).
+fn mark(set: &Mutex<BTreeSet<String>>, peer: &str, is: bool) -> bool {
+    let mut set = set.lock().unwrap_or_else(PoisonError::into_inner);
+    if is {
+        set.insert(peer.to_owned())
+    } else {
+        set.remove(peer);
+        false
+    }
+}
+
 impl Fences {
     fn local(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Local>> {
         self.local.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Notes whether `peer` answered a lease request as a build before D326 (#2047); `true`
+    /// when that's news, so the log says it once.
+    fn pre_lease(&self, peer: &str, is: bool) -> bool {
+        mark(&self.pre_lease, peer, is)
+    }
+
+    /// The same for a peer that reports `leases` but whose `Cluster.Lease` answered
+    /// `Unimplemented` (audit120's S1 on #2048).
+    fn unrouted(&self, peer: &str, is: bool) -> bool {
+        mark(&self.unrouted, peer, is)
     }
 
     /// How many partitions have an entry (tests): one that is nothing here has none.
@@ -742,13 +771,70 @@ impl Node {
             let (node, peer, address, req) =
                 (Arc::clone(self), peer.clone(), address.clone(), req.clone());
             asks.spawn(async move {
-                let answer =
-                    tokio::time::timeout(node.peers.push_timeout, node.ask_lease(&address, req))
-                        .await;
+                let answer = tokio::time::timeout(
+                    node.peers.push_timeout,
+                    node.ask_lease(&address, req.clone()),
+                )
+                .await;
                 match answer {
-                    Ok(Ok(r)) => Some((peer, r)),
-                    Ok(Err(e)) => {
-                        eprintln!("phdb serve: node {peer}'s lease grant: {e}");
+                    Ok(Ok(r)) => {
+                        node.fences.pre_lease(&peer, false);
+                        node.fences.unrouted(&peer, false);
+                        Some((peer, r))
+                    }
+                    // `Unimplemented`: a build before D326 (1.2) in a rolling upgrade
+                    // (#2047), or a 1.3 node behind something that doesn't route the call
+                    // (an HTTP 404 reads as `Unimplemented`, audit120's S1 on #2048). Only the
+                    // first counts, and only once its `Status`, asked now rather than from
+                    // the cache, lacks `leases`: it holds the round's map (it answered with
+                    // it, or took it) and grants as 1.2 serves, on that map alone, so a mixed
+                    // cluster serves with D317's confirmation and the 1.3 nodes' grants. A
+                    // 1.2 node has no grant table and no start grace, so nothing is withheld.
+                    Ok(Err(s)) if s.code() == tonic::Code::Unimplemented => {
+                        let build = node
+                            .features_of(
+                                std::iter::once((peer.clone(), address.clone())),
+                                super::LEASES_FEATURE,
+                                false,
+                            )
+                            .await
+                            .pop()
+                            .map(|(_, v)| v);
+                        match build {
+                            Some(super::PeerFeature::Lacks) => {
+                                if node.fences.pre_lease(&peer, true) {
+                                    eprintln!(
+                                        "phdb serve: node {peer} runs a build without \
+                                         partition leases (before 1.3): counted as granting \
+                                         each lease this node asks, until it's upgraded"
+                                    );
+                                }
+                                let granted = req.parts.clone();
+                                Some((
+                                    peer,
+                                    super::proto::LeaseResponse {
+                                        granted,
+                                        ..Default::default()
+                                    },
+                                ))
+                            }
+                            Some(super::PeerFeature::Has) => {
+                                node.fences.pre_lease(&peer, false);
+                                if node.fences.unrouted(&peer, true) {
+                                    eprintln!(
+                                        "phdb serve: node {peer} reports leases, but its \
+                                         Cluster.Lease answered Unimplemented: check what \
+                                         sits between the nodes (a proxy that doesn't route \
+                                         /pigeonhole.v1.Cluster/Lease); counted as no grant"
+                                    );
+                                }
+                                None
+                            }
+                            _ => None,
+                        }
+                    }
+                    Ok(Err(s)) => {
+                        eprintln!("phdb serve: node {peer}'s lease grant: {}", s.message());
                         None
                     }
                     Err(_) => None,
@@ -816,7 +902,11 @@ impl Node {
                     node.send_release(&n.address, req),
                 )
                 .await;
-                if let Ok(Err(e)) = sent {
+                // A build before D326 (1.2, #2047) holds no grant to release.
+                if let Ok(Err(e)) = sent
+                    && e.code() != tonic::Code::Unimplemented
+                {
+                    let e = e.message();
                     eprintln!(
                         "phdb serve: releasing a partition's lease at node {}: {e}",
                         n.id
@@ -831,29 +921,30 @@ impl Node {
         &self,
         address: &str,
         req: super::proto::ReleaseRequest,
-    ) -> Result<(), String> {
-        let mut client = self.client(address).await?;
-        let req = self.request(req)?;
-        client
-            .release(req)
+    ) -> Result<(), tonic::Status> {
+        let mut client = self
+            .client(address)
             .await
-            .map(drop)
-            .map_err(|s| s.message().to_owned())
+            .map_err(tonic::Status::unavailable)?;
+        let req = self.request(req).map_err(tonic::Status::internal)?;
+        client.release(req).await.map(drop)
     }
 
-    /// Asks the node at `address` for a lease grant.
+    /// Asks the node at `address` for a lease grant: its answer, or its status (a build
+    /// before D326 answers `Unimplemented`). A failed connect is `Unavailable` and a request
+    /// that can't be built `Internal`, never `Unimplemented`, so neither can count as a 1.2
+    /// peer's grant.
     async fn ask_lease(
         &self,
         address: &str,
         req: LeaseRequest,
-    ) -> Result<super::proto::LeaseResponse, String> {
-        let mut client = self.client(address).await?;
-        let req = self.request(req)?;
-        client
-            .lease(req)
+    ) -> Result<super::proto::LeaseResponse, tonic::Status> {
+        let mut client = self
+            .client(address)
             .await
-            .map(tonic::Response::into_inner)
-            .map_err(|s| s.message().to_owned())
+            .map_err(tonic::Status::unavailable)?;
+        let req = self.request(req).map_err(tonic::Status::internal)?;
+        client.lease(req).await.map(tonic::Response::into_inner)
     }
 
     /// Gives each partition served here the lease `round` gives it (D326): until
@@ -1032,6 +1123,36 @@ impl Node {
 /// node then waits out the old node's grants.
 #[cfg(test)]
 pub(crate) static DROP_RELEASES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before D326 (1.2), by cluster directory:
+/// their `Cluster.Lease` and `Cluster.Release` answer `Unimplemented`, and their `Status`
+/// leaves `leases` out (#2047).
+#[cfg(test)]
+pub(crate) static PRE_LEASE: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn pre_lease(dir: &Path) -> bool {
+    PRE_LEASE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}
+
+/// A fault seam (tests): nodes whose `Cluster.Lease` and `Release` answer `Unimplemented`
+/// while their `Status` still reports `leases`: a 1.3 node behind a proxy that doesn't
+/// route the calls (audit120's S1 on #2048).
+#[cfg(test)]
+pub(crate) static LEASE_UNROUTED: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn lease_unrouted(dir: &Path) -> bool {
+    LEASE_UNROUTED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}
 
 #[cfg(test)]
 fn drop_releases(dir: &Path) -> bool {

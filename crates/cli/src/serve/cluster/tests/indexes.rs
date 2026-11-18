@@ -37,6 +37,20 @@ fn nodes(
     [u16; 3],
     Vec<PathBuf>,
 ) {
+    nodes_limited(rt, a_holds_p3, crate::serve::server_tests::limits())
+}
+
+/// [`nodes`], each node with `limits`.
+fn nodes_limited(
+    rt: &tokio::runtime::Runtime,
+    a_holds_p3: bool,
+    limits: crate::serve::config::Limits,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<pigeonhole::Pigeonhole>,
+    [u16; 3],
+    Vec<PathBuf>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -66,18 +80,7 @@ fn nodes(
         let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
         let locals = local.iter().map(|p| (*p, None)).collect();
         let (stop, d, _) = data_node_served(
-            rt,
-            dir,
-            id,
-            locals,
-            listener,
-            "",
-            crate::serve::server_tests::limits(),
-            false,
-            placement,
-            None,
-            None,
-            None,
+            rt, dir, id, locals, listener, "", limits, false, placement, None, None, None,
         );
         stops.push(stop);
         dbs.extend(d);
@@ -364,13 +367,9 @@ fn an_index_created_through_any_node_holds_each_partitions_range() {
             .unwrap_err();
         assert_eq!(code(&e), "TableNotFound", "{e}");
 
-        // Rebuilds across partitions come with PR 2.
-        let e = text.rebuild(ut()).await.unwrap_err();
-        assert_eq!(code(&e), "Unsupported", "{e}");
-        assert!(
-            e.message().contains("isn't supported on a cluster yet"),
-            "{e}"
-        );
+        // A rebuild runs on every partition, the counts summed (PR 2c): nothing to change.
+        let r = text.rebuild(ut()).await.unwrap().into_inner();
+        assert_eq!((r.documents, r.changed), (2, 0));
 
         // The followed table stays while its indexes do (#1916's rule).
         let mut schema = SchemaClient::new(channel(b).await);
@@ -668,5 +667,780 @@ fn a_node_owning_two_partitions_of_an_index_serves_each_part_on_its_own() {
                 .into_inner();
             assert_eq!(checked.vectors, 4, "through port {port}");
         }
+    });
+}
+
+/// How long a test waits for a new text index's background fill: far longer than a small
+/// source takes, for a loaded runner (audit120 on #2029).
+const FILL: Duration = Duration::from_secs(30);
+
+/// `Text.Put` through `port`, tried again while the partitions are still making the index
+/// at their reconcile.
+async fn put_text(port: u16, index: &str, id: &str, text: &str) {
+    let mut api = TextClient::new(channel(port).await);
+    let put = TextPutRequest {
+        index: index.into(),
+        id: id.as_bytes().to_vec().into(),
+        text: text.into(),
+    };
+    let mut tries = 0;
+    while let Err(e) = api.put(put.clone()).await {
+        tries += 1;
+        assert!(tries < 200, "{e}");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// A skewed corpus over `users`' two ranges (p1 below "m", p2 from it): `alpha` is rare in
+/// p1 and in most of p2, `beta` the other way round, and `zeta` is in p2's `z` documents
+/// only. With each partition's own statistics, the two would rank differently.
+fn skewed_corpus() -> Vec<(String, String)> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let mut docs = Vec::new();
+    let mut doc = |id: String, words: &[(&str, u64)], next: &mut dyn FnMut(u64) -> u64| {
+        let mut text = vec!["pad"; 4 + next(8) as usize];
+        for (word, in_100) in words {
+            for _ in 0..(1 + next(3)) {
+                if next(100) < *in_100 {
+                    text.push(word);
+                }
+            }
+        }
+        let last = text.len() - 1;
+        text.swap(0, last);
+        docs.push((id, text.join(" ")));
+    };
+    for i in 0..40 {
+        let words = [("alpha", 10), ("beta", 70), ("gamma", 40)];
+        doc(format!("a{i:03}"), &words, &mut next);
+    }
+    for i in 0..120 {
+        let words = [("alpha", 80), ("beta", 5), ("gamma", 40)];
+        doc(format!("n{i:03}"), &words, &mut next);
+    }
+    for i in 0..10 {
+        let words = [("alpha", 30), ("zeta", 90), ("beta", 50)];
+        doc(format!("z{i:03}"), &words, &mut next);
+    }
+    docs
+}
+
+/// #1722 PR 2b: a text search across an index's partitions gives the hits and scores one
+/// index holding every document gives (a reference index on a database of its own, made
+/// with the same options): terms, a phrase, a fuzzy term and mixes, with `id_prefix`
+/// inside one range and across both, a term only one partition holds, and a skewed corpus
+/// where each partition's own statistics would score differently. A fuzzy term cut at
+/// `max_expansions` is flagged. An index on one partition answers in one round. With a partition's node stopped, a search fails unless it
+/// has `allow_partial`, which scores with the partitions that answered, names what it
+/// missed, and sets `partial` whenever anything is missing.
+#[test]
+fn a_text_search_across_partitions_scores_as_one_index() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    // A new index fills from its source in the background, and a strict search on a
+    // partition still filling answers Unavailable, so each step waits for its fill.
+    let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.fill_pending().unwrap())
+    };
+    let reference = test_dir();
+    let db = pigeonhole::Pigeonhole::open(reference.join("ref.db"), pigeonhole::Options::default())
+        .unwrap();
+    let table = db
+        .table("users")
+        .unwrap()
+        .family("f", pigeonhole::Family::default())
+        .create_if_missing()
+        .unwrap();
+    let options = crate::serve::texts::options(&text_index("ut")).unwrap();
+    let one = pigeonhole_text::Index::create(
+        &db,
+        "ut",
+        pigeonhole_text::Source::new(&table, "f", b"body"),
+        options,
+    )
+    .unwrap();
+    // A fuzzy term with more than `max_expansions` (50) terms one edit from `abcd`, half of
+    // them in each partition.
+    let mut variants: Vec<String> = Vec::new();
+    for ch in b'a'..=b'z' {
+        let ch = char::from(ch);
+        if ch != 'c' {
+            variants.push(format!("ab{ch}d"));
+        }
+        if ch != 'd' {
+            variants.push(format!("abc{ch}"));
+        }
+    }
+    variants.push("abcde".into());
+    variants.push("abc".into());
+    assert!(variants.len() > 50);
+    let mut docs = skewed_corpus();
+    for (i, v) in variants.iter().enumerate() {
+        let id = if i % 2 == 0 { "c" } else { "q" };
+        docs.push((format!("{id}{i:03}"), format!("{v} pad pad")));
+    }
+    for (id, text) in &docs {
+        one.put(id.as_bytes(), text).unwrap();
+    }
+    rt.block_on(async {
+        users_family(a).await;
+        TextClient::new(channel(c).await)
+            .create_index(text_index("ut"))
+            .await
+            .unwrap();
+        eventually_within(FILL, "both partitions fill ut", async || {
+            filled(&p1, "ut") && filled(&p2, "ut")
+        })
+        .await;
+        for (id, text) in &docs {
+            put_text(c, "ut", id, text).await;
+        }
+        let mut api = TextClient::new(channel(c).await);
+        let search = |syntax: &str, prefix: &str| crate::serve::proto::TextSearchRequest {
+            index: "ut".into(),
+            query: Some(crate::serve::proto::text_search_request::Query::Syntax(
+                syntax.into(),
+            )),
+            k: 10,
+            id_prefix: prefix.as_bytes().to_vec().into(),
+            ..Default::default()
+        };
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+        for syntax in [
+            "alpha",
+            "beta",
+            "zeta",
+            "alpha beta gamma",
+            "zeta alpha",
+            "\"alpha beta\"",
+            "alhpa~1 gamma",
+            "zeta~1",
+        ] {
+            for prefix in ["", "a", "n", "z"] {
+                let got = api
+                    .search(search(syntax, prefix))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let mut s = one.search(syntax, 10);
+                if !prefix.is_empty() {
+                    s = s.id_prefix(prefix.as_bytes().to_vec());
+                }
+                let want = s.run().unwrap();
+                let ids = |h: &[crate::serve::proto::TextHit]| -> Vec<Vec<u8>> {
+                    h.iter().map(|h| h.id.to_vec()).collect()
+                };
+                let want_ids: Vec<Vec<u8>> = want.iter().map(|h| h.id.clone()).collect();
+                assert_eq!(ids(&got.hits), want_ids, "{syntax:?} under {prefix:?}");
+                for (g, w) in got.hits.iter().zip(&want) {
+                    assert!(
+                        close(g.score, w.score),
+                        "{syntax:?}: {} vs {}",
+                        g.score,
+                        w.score
+                    );
+                }
+                assert!(!got.partial && got.missing.is_empty() && got.cut_clauses.is_empty());
+                // Something to compare: every query matches across both ranges, and `zeta`
+                // (in p2's `z` documents only) under `z`.
+                if prefix.is_empty() || (syntax.starts_with("zeta") && prefix == "z") {
+                    assert!(!got.hits.is_empty(), "{syntax:?} under {prefix:?}");
+                }
+            }
+        }
+        // The round matters: p1's own statistics score its `alpha` documents otherwise.
+        let local = pigeonhole_text::Index::open(&p1, "ut")
+            .unwrap()
+            .search("alpha", 10)
+            .run()
+            .unwrap();
+        let global = api.search(search("alpha", "a")).await.unwrap().into_inner();
+        assert_eq!(local[0].id, global.hits[0].id.to_vec());
+        assert!(!close(local[0].score, global.hits[0].score));
+
+        // The cut: flagged on the cluster as on the one index (its expansions may differ).
+        let got = api.search(search("abcd~1", "")).await.unwrap().into_inner();
+        assert_eq!(got.cut_clauses, [0]);
+        let (_, one_stats) = one.search("abcd~1", 10).run_with_stats().unwrap();
+        assert!(one_stats.fuzzy[0].cut);
+
+        // An index on one partition: one round, its own statistics the whole index's.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "solo".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: Vec::new(),
+                    partitions: vec!["p1".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        TextClient::new(channel(c).await)
+            .create_index(CreateTextIndexRequest {
+                source_table: "solo".into(),
+                ..text_index("st")
+            })
+            .await
+            .unwrap();
+        eventually_within(FILL, "p1 fills st", async || filled(&p1, "st")).await;
+        for (id, text) in docs.iter().take(30) {
+            put_text(c, "st", id, text).await;
+        }
+        let got = api
+            .search(crate::serve::proto::TextSearchRequest {
+                index: "st".into(),
+                ..search("alpha beta", "")
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let own = pigeonhole_text::Index::open(&p1, "st")
+            .unwrap()
+            .search("alpha beta", 10)
+            .run()
+            .unwrap();
+        assert!(!own.is_empty());
+        assert_eq!(got.hits.len(), own.len());
+        for (g, w) in got.hits.iter().zip(&own) {
+            assert_eq!(g.id.to_vec(), w.id);
+            assert!(close(g.score, w.score));
+        }
+
+        // And one on p2 only, for a search that misses only its one round below.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "solo2".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: Vec::new(),
+                    partitions: vec!["p2".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        TextClient::new(channel(c).await)
+            .create_index(CreateTextIndexRequest {
+                source_table: "solo2".into(),
+                ..text_index("st2")
+            })
+            .await
+            .unwrap();
+        eventually_within(FILL, "p2 fills st2", async || filled(&p2, "st2")).await;
+        put_text(c, "st2", "x1", "alpha pad").await;
+
+        // b (p2, from "m") stops. A search needs every partition's statistics, so even one
+        // whose prefix is in p1 fails, unless it allows a partial answer.
+        stops.remove(1).send(()).unwrap();
+        let mut api = TextClient::new(channel(a).await);
+        let e = api.search(search("alpha", "a")).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("partition p2"), "{e}");
+        let partial = |syntax: &str, prefix: &str| crate::serve::proto::TextSearchRequest {
+            allow_partial: true,
+            ..search(syntax, prefix)
+        };
+        let got = api
+            .search(partial("alpha", "a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(got.partial);
+        assert!(got.missing.is_empty(), "{:?}", got.missing);
+        assert!(!got.hits.is_empty());
+        assert!(got.hits.iter().all(|h| h.id.starts_with(b"a")));
+        // Scored with p1's statistics alone: p1's own scores.
+        let own = pigeonhole_text::Index::open(&p1, "ut")
+            .unwrap()
+            .search("alpha", 10)
+            .id_prefix(b"a".to_vec())
+            .run()
+            .unwrap();
+        assert_eq!(got.hits.len(), own.len());
+        for (g, w) in got.hits.iter().zip(&own) {
+            assert_eq!(g.id.to_vec(), w.id);
+            assert!(close(g.score, w.score));
+        }
+        let got = api.search(partial("alpha", "")).await.unwrap().into_inner();
+        assert!(got.partial);
+        assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+        let m = &got.missing[0];
+        assert_eq!(
+            (
+                m.partition.as_str(),
+                m.table.as_str(),
+                &m.start[..],
+                &m.end[..]
+            ),
+            ("p2", "ut", &b"m"[..], &b""[..])
+        );
+        assert!(got.hits.iter().all(|h| h.id.as_ref() < &b"m"[..]));
+        // Missing only round 2 (an index on one partition has no round 1): `partial` too,
+        // so a client reading it alone never takes a short answer as whole.
+        let solo2 = |allow_partial| crate::serve::proto::TextSearchRequest {
+            index: "st2".into(),
+            allow_partial,
+            ..search("alpha", "")
+        };
+        let e = api.search(solo2(false)).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        let got = api.search(solo2(true)).await.unwrap().into_inner();
+        assert!(got.hits.is_empty());
+        assert!(got.partial);
+        assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+        assert_eq!(
+            (
+                got.missing[0].partition.as_str(),
+                got.missing[0].table.as_str()
+            ),
+            ("p2", "st2")
+        );
+    });
+}
+
+/// #1722 PR 2c: `Text.Rebuild` through any node rebuilds the index on every partition and
+/// sums the counts. The partitions one node serves rebuild in turn (a node's one rebuild
+/// slot refuses a second at once), and a rebuild leaves the index searchable, strictly. A
+/// partition that can't be reached fails the call, naming it.
+#[test]
+fn a_text_rebuild_runs_on_every_partition_of_its_index() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // a serves p1 and p3, b p2; the databases are p1's, p3's and p2's.
+    let (mut stops, dbs, [_a, b, c], _) = nodes(&rt, true);
+    let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index).is_ok_and(|i| !i.fill_pending().unwrap())
+    };
+    let documents = |db: &pigeonhole::Pigeonhole, index: &str| {
+        pigeonhole_text::Index::open(db, index)
+            .unwrap()
+            .verify()
+            .unwrap()
+            .documents
+    };
+    // Source rows written around the index, as a client writing the table directly does:
+    // only a rebuild indexes them.
+    let around = |db: &pigeonhole::Pigeonhole, table: &str, first: char| {
+        let t = db.table(table).unwrap().open().unwrap();
+        for i in 0..20 {
+            t.mutate(format!("{first}{i:02}").as_bytes())
+                .put("f", b"body", b"alpha pad")
+                .commit()
+                .unwrap();
+        }
+    };
+    rt.block_on(async {
+        users_family(c).await;
+        // `two`, split at "m" over p1 and p3: both a's.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "two".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: vec![b"m".to_vec().into()],
+                    partitions: vec!["p1".into(), "p3".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut api = TextClient::new(channel(c).await);
+        api.create_index(text_index("ut")).await.unwrap();
+        api.create_index(CreateTextIndexRequest {
+            source_table: "two".into(),
+            ..text_index("tt")
+        })
+        .await
+        .unwrap();
+        let [p1, p3, p2] = &dbs[..] else {
+            unreachable!()
+        };
+        eventually_within(FILL, "every partition fills ut and tt", async || {
+            filled(p1, "ut") && filled(p2, "ut") && filled(p1, "tt") && filled(p3, "tt")
+        })
+        .await;
+        around(p1, "users", 'a');
+        around(p2, "users", 'n');
+        around(p1, "two", 'a');
+        around(p3, "two", 'n');
+        assert_eq!((documents(p1, "ut"), documents(p2, "ut")), (0, 0));
+
+        // Across a's and b's partitions, through c.
+        let r = api
+            .rebuild(TextIndexRequest { index: "ut".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.documents, r.changed, r.invalid_utf8), (40, 40, 0));
+        assert_eq!((documents(p1, "ut"), documents(p2, "ut")), (20, 20));
+        let hits = api
+            .search(crate::serve::proto::TextSearchRequest {
+                index: "ut".into(),
+                query: Some(crate::serve::proto::text_search_request::Query::Syntax(
+                    "alpha".into(),
+                )),
+                k: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hits.hits.len(), 40);
+        assert!(!hits.partial);
+
+        // Both of tt's partitions on a, in turn, through b. Again, nothing changes.
+        let mut through_b = TextClient::new(channel(b).await);
+        let r = through_b
+            .rebuild(TextIndexRequest { index: "tt".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.documents, r.changed), (40, 40));
+        assert_eq!((documents(p1, "tt"), documents(p3, "tt")), (20, 20));
+        let r = api
+            .rebuild(TextIndexRequest { index: "tt".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((r.documents, r.changed), (40, 0));
+
+        // b (p2) stops: ut's rebuild fails, naming p2.
+        stops.remove(1).send(()).unwrap();
+        let e = api
+            .rebuild(TextIndexRequest { index: "ut".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("partition p2"), "{e}");
+    });
+}
+
+/// A BulkLoad message of `ids`' vectors (2 dimensions, the first element the id's
+/// position): the first message of a load names the index and `expected`.
+fn bulk(index: &str, expected: u64, ids: &[String]) -> crate::serve::proto::VectorBulkLoadRequest {
+    crate::serve::proto::VectorBulkLoadRequest {
+        index: index.into(),
+        expected,
+        items: ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| crate::serve::proto::VectorItem {
+                id: id.as_bytes().to_vec().into(),
+                vector: Some(Vector {
+                    element: Element::F32 as i32,
+                    dim: 2,
+                    data: [i as f32, 1.0]
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .into(),
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// `Vectors.BulkLoad` through `port` of `messages`.
+async fn load(
+    port: u16,
+    messages: Vec<crate::serve::proto::VectorBulkLoadRequest>,
+) -> Result<(), tonic::Status> {
+    VectorsClient::new(channel(port).await)
+        .bulk_load(tonic::codegen::tokio_stream::iter(messages))
+        .await
+        .map(drop)
+}
+
+/// #1722 PR 3: `Vectors.BulkLoad` through any node splits the client's stream by id, each
+/// vector landing in its id's partition: through a node serving neither partition, and
+/// through one serving one of them (a load of its own beside a forwarded one). A partition
+/// no id falls in is left alone. A load into an index that isn't empty fails, naming the
+/// partition; so does one with a partition's node stopped.
+#[test]
+fn a_bulk_load_through_any_node_splits_by_id_across_partitions() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    // Ids on both sides of `users`' split at "m", interleaved in every message.
+    let ids = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("a{i:03}")
+                } else {
+                    format!("n{i:03}")
+                }
+            })
+            .collect()
+    };
+    rt.block_on(async {
+        users_family(c).await;
+        let mut api = VectorsClient::new(channel(c).await);
+        for name in ["uv", "uv2", "uv3", "uv4"] {
+            let mut v = vector_index(name);
+            v.follows = "users".into();
+            api.create_index(v).await.unwrap();
+        }
+        eventually_within(FILL, "both partitions create the indexes", async || {
+            ["uv", "uv2", "uv3", "uv4"]
+                .iter()
+                .all(|n| has_table(&p1, n) && has_table(&p2, n))
+        })
+        .await;
+        let all = ids(80);
+        let messages = |index: &str| -> Vec<_> {
+            all.chunks(20)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut m = bulk(index, 80, chunk);
+                    if i > 0 {
+                        m.index.clear();
+                        m.expected = 0;
+                    }
+                    m
+                })
+                .collect()
+        };
+
+        // Through c, which serves neither partition: both parts forwarded. An empty message
+        // in the middle reaches no partition.
+        let mut with_empty = messages("uv");
+        with_empty.insert(2, crate::serve::proto::VectorBulkLoadRequest::default());
+        load(c, with_empty).await.unwrap();
+        assert_eq!((vectors(&p1, "uv"), vectors(&p2, "uv")), (40, 40));
+        let checked = api
+            .verify(VectorVerifyRequest { index: "uv".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(checked.vectors, 80);
+
+        // Through a, which serves p1: its part is a load of its own.
+        load(a, messages("uv2")).await.unwrap();
+        assert_eq!((vectors(&p1, "uv2"), vectors(&p2, "uv2")), (40, 40));
+
+        // Every id in p1: p2's index is never opened, and stays empty.
+        let low: Vec<String> = (0..30).map(|i| format!("b{i:03}")).collect();
+        load(c, vec![bulk("uv3", 30, &low)]).await.unwrap();
+        assert_eq!((vectors(&p1, "uv3"), vectors(&p2, "uv3")), (30, 0));
+
+        // Again into a loaded index: refused by its partitions, naming one.
+        let e = load(c, messages("uv")).await.unwrap_err();
+        assert!(e.message().contains("partition p"), "{e}");
+        assert_eq!((vectors(&p1, "uv"), vectors(&p2, "uv")), (40, 40));
+
+        // b (p2) stops. Its feature answer is still cached, so the load starts: p2's part
+        // can't connect, and the load fails naming it. p1's part, which took the first
+        // message's vectors, keeps them, and the error says so.
+        stops.remove(1).send(()).unwrap();
+        let e = load(a, messages("uv4")).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("partition p2"), "{e}");
+        let kept = vectors(&p1, "uv4");
+        assert!(kept <= 40, "{kept}");
+        assert_eq!(kept > 0, e.message().contains("loaded"), "{kept}: {e}");
+    });
+}
+
+/// #1722 PR 3: a node serving a part of the index that runs a build before
+/// `ForwardBulkLoad` (no `index_bulk_load` in its `Status`) makes the load `Unsupported`,
+/// naming it, before anything is read: the other partition takes nothing.
+#[test]
+fn a_bulk_load_with_an_older_node_holding_a_part_is_refused_up_front() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, [p1, p2], [a, _b, c], dirs) = three_nodes(&rt);
+    super::super::OLD_BULK_LOAD
+        .lock()
+        .unwrap()
+        .push(dirs[1].clone());
+    rt.block_on(async {
+        users_family(c).await;
+        let mut v = vector_index("uv");
+        v.follows = "users".into();
+        VectorsClient::new(channel(c).await)
+            .create_index(v)
+            .await
+            .unwrap();
+        eventually_within(FILL, "both partitions create uv", async || {
+            has_table(&p1, "uv") && has_table(&p2, "uv")
+        })
+        .await;
+        let ids: Vec<String> = ["a1", "a2", "n1", "n2"].map(str::to_owned).to_vec();
+        let e = load(a, vec![bulk("uv", 4, &ids)]).await.unwrap_err();
+        assert_eq!(code(&e), "Unsupported", "{e}");
+        assert!(e.message().contains("b (an older build)"), "{e}");
+        assert_eq!((vectors(&p1, "uv"), vectors(&p2, "uv")), (0, 0));
+    });
+    super::super::OLD_BULK_LOAD
+        .lock()
+        .unwrap()
+        .retain(|d| *d != dirs[1]);
+}
+
+/// #1722 PR 3 (audit120's S1, simp724's M1 on #2045): every part of a load reserves the
+/// whole load's worst case, so a node serving two partitions of the index whose
+/// `--bulk-load-bytes` holds only one part refuses the load at once, saying so, rather than
+/// waiting for the bytes its own other part holds. Through a node serving neither (the
+/// node's first part refused as it opens) and through the node itself (before anything is
+/// read): nothing is loaded either way, and the error isn't a partial load's.
+#[test]
+fn a_node_that_cant_hold_a_part_for_each_of_its_partitions_refuses_the_load_at_once() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // One part of 80 2-dim vectors holds its 50,000-vector sample, about 8.8 MB: room for
+    // one, not two.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.bulk_load_bytes = 12 << 20;
+    // a serves p1 and p3, b p2; the databases are p1's, p3's and p2's.
+    let (_stops, dbs, [a, _b, c], _) = nodes_limited(&rt, true, limits);
+    let [p1, p3, _p2] = &dbs[..] else {
+        unreachable!()
+    };
+    rt.block_on(async {
+        // `two`, split at "m" over p1 and p3: both a's.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "two".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: vec![b"m".to_vec().into()],
+                    partitions: vec!["p1".into(), "p3".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut v = vector_index("tv");
+        v.follows = "two".into();
+        VectorsClient::new(channel(c).await)
+            .create_index(v)
+            .await
+            .unwrap();
+        eventually_within(FILL, "a creates tv on p1 and p3", async || {
+            has_table(p1, "tv") && has_table(p3, "tv")
+        })
+        .await;
+        let ids: Vec<String> = (0..80)
+            .map(|i| format!("{}{i:03}", if i % 2 == 0 { 'a' } else { 'n' }))
+            .collect();
+        for port in [c, a] {
+            let started = std::time::Instant::now();
+            let e = load(port, vec![bulk("tv", 80, &ids)]).await.unwrap_err();
+            assert_eq!(code(&e), "InvalidArgument", "through {port}: {e}");
+            assert!(
+                e.message().contains("this node serves 2 of them"),
+                "through {port}: {e}"
+            );
+            assert!(!e.message().contains("loaded"), "through {port}: {e}");
+            // At once, not after the request timeout.
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "through {port}"
+            );
+            assert_eq!((vectors(p1, "tv"), vectors(p3, "tv")), (0, 0));
+        }
+    });
+}
+
+/// #1722 PR 3 (audit120's S2 on #2045): a part that fails mid-load (p2 meets a vector of
+/// another dimension) fails the load, naming p2 and saying vectors may have been loaded.
+/// p1 keeps what it took, and has stopped by the time the client has the error: a load
+/// right after finds its slot free. A part that fails with the client's last message,
+/// after its stream ended, does the same.
+#[test]
+fn a_part_that_fails_fails_the_load_and_the_others_keep_what_they_took() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, [p1, p2], [_a, _b, c], _) = three_nodes(&rt);
+    let ids = |prefix: char, from: usize, n: usize| -> Vec<String> {
+        (from..from + n)
+            .map(|i| format!("{prefix}{i:03}"))
+            .collect()
+    };
+    // `ids`' vectors, with the one at `bad` 3-dimensional.
+    let with_bad = |index: &str, ids: &[String], bad: usize| {
+        let mut m = bulk(index, 0, ids);
+        m.index.clear();
+        let v = m.items[bad].vector.as_mut().unwrap();
+        v.dim = 3;
+        v.data = [0.0f32, 1.0, 2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .into();
+        m
+    };
+    rt.block_on(async {
+        users_family(c).await;
+        let mut api = VectorsClient::new(channel(c).await);
+        for name in ["uf", "ug", "uh"] {
+            let mut v = vector_index(name);
+            v.follows = "users".into();
+            api.create_index(v).await.unwrap();
+        }
+        eventually_within(FILL, "both partitions create the indexes", async || {
+            ["uf", "ug", "uh"]
+                .iter()
+                .all(|n| has_table(&p1, n) && has_table(&p2, n))
+        })
+        .await;
+
+        // Mid-load: the second message's third vector, p2's, is 3-dimensional. p1's first
+        // part is large enough that its write takes a while.
+        let mut second = ids('a', 2000, 10);
+        second.extend(ids('n', 10, 10));
+        let messages = vec![
+            bulk("uf", 4000, &[ids('a', 0, 2000), ids('n', 0, 10)].concat()),
+            with_bad("uf", &second, 12),
+            bulk("", 0, &ids('a', 2010, 10)),
+        ];
+        let e = load(c, messages).await.unwrap_err();
+        assert!(e.message().contains("partition p2"), "{e}");
+        assert!(e.message().contains("loaded"), "{e}");
+        // p2 has its vectors before the bad one; p1 at least its first message's, all
+        // written by the time the client has the error (audit120's S4).
+        assert_eq!(vectors(&p2, "uf"), 12);
+        let kept = vectors(&p1, "uf");
+        assert!((2000..=2020).contains(&kept), "{kept}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(vectors(&p1, "uf"), kept, "p1's load was still running");
+        // p1's load has stopped: its slot is free for the next.
+        let started = std::time::Instant::now();
+        load(c, vec![bulk("ug", 10, &ids('a', 0, 10))])
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(vectors(&p1, "ug"), 10);
+
+        // At the end: the last message's last vector, p2's, is the bad one.
+        let last = [ids('a', 10, 5), ids('n', 10, 5)].concat();
+        let messages = vec![
+            bulk("uh", 100, &[ids('a', 0, 10), ids('n', 0, 10)].concat()),
+            with_bad("uh", &last, 9),
+        ];
+        let e = load(c, messages).await.unwrap_err();
+        assert!(e.message().contains("partition p2"), "{e}");
+        assert!(e.message().contains("loaded"), "{e}");
+        assert_eq!((vectors(&p1, "uh"), vectors(&p2, "uh")), (15, 14));
     });
 }

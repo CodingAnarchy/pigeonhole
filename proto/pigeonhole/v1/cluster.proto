@@ -57,6 +57,13 @@ service Cluster {
   // partition's lease lapses or it closes. The events are a single node's. Cluster scope,
   // gRPC only.
   rpc ForwardMemoryWatch(ForwardMemoryWatchRequest) returns (stream MemoryEvent);
+  // Node to node (#1722 PR 3, ICR 0138): one partition's part of a `Vectors.BulkLoad`
+  // into an index on several partitions, which the sending node splits by id. Served as
+  // this node's own `BulkLoad` of the partition, for the caller it names, only if its map
+  // gives it `partition`; each message reserves its share of the in-flight budget as a
+  // client's does, on connections of their own, outside the `Cluster` calls' limit.
+  // Cluster scope, gRPC only.
+  rpc ForwardBulkLoad(stream ForwardBulkLoadRequest) returns (Empty);
   // D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
   // (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
   // unfenced, or at its new node); its reads go on. Answers once every write admitted before
@@ -123,6 +130,15 @@ message StampRequest {
   bool restore = 5;
   // With `restore`: the cluster the file records, restored into this one as a new cluster.
   string restore_from_cluster_id = 6;
+  // A promotion of this node's replica copy of the partition (D328, `phdb cluster promote`):
+  // the file is a replica database at `replica_epoch` (the owner's epoch at its bootstrap),
+  // not at `from_epoch`. The node makes it a primary at the last commit it applied, then
+  // raises its epoch to `to_epoch`. Refused while the copy is open here. No staged set is
+  // installed.
+  bool promote = 7;
+  // With `promote`: the epoch the CLI found in the copy's identity row, which the file must
+  // still record, so the stamp acts on the copy that was checked.
+  uint64 replica_epoch = 8;
 }
 
 // A partition's state on its node (D317 ticket 6).
@@ -485,8 +501,17 @@ message ForwardRequest {
     CreateTextIndexRequest create_text_index = 27;
     TextPutRequest text_put = 28;
     TextDeleteRequest text_delete = 29;
+    // One partition's part of a rebuild across an index's partitions (#1722 PR 2c): the
+    // client's request as it is, on the partition `partition` names. A write, served as
+    // the partition's own `Text.Rebuild`.
+    TextIndexRequest text_rebuild = 30;
     // As `vector_verify`.
     TextIndexRequest text_verify = 31;
+    // The two rounds of a text search across an index's partitions (#1722 PR 2b): each
+    // partition's statistics for the query, then its part of the search scored with the
+    // partitions' merged statistics.
+    TextStatsRequest text_stats = 32;
+    TextSearchPartRequest text_search = 33;
     // Agent memory calls (#1915, ICR 0139), each the client's request, to the partition
     // that holds its namespace (21–33 are ICR 0138's index calls). A call whose namespaces
     // or ids are in several partitions never comes here whole.
@@ -501,6 +526,30 @@ message ForwardRequest {
     RecallPoolRequest recall_pool = 40;
     RecallBodiesRequest recall_bodies = 41;
   }
+}
+
+// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
+// partition's statistics for the query, read at one snapshot. Every partition of the index
+// is asked, whatever `id_prefix` says: a search's statistics cover the whole index.
+message TextStatsRequest {
+  // The client's search, as it is.
+  TextSearchRequest search = 1;
+}
+
+message TextStatsResponse {
+  // `pigeonhole_text::QueryStats`'s versioned bytes. A version the sending node doesn't
+  // read fails the search with `FailedPrecondition`: the nodes' builds differ.
+  bytes stats = 1;
+}
+
+// Round 2 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
+// partition's top `k`, scored with every partition's statistics merged.
+message TextSearchPartRequest {
+  // The client's search, as it is.
+  TextSearchRequest search = 1;
+  // The merged `QueryStats`' versioned bytes. Empty for an index on one partition, whose
+  // own statistics are the whole index's: that part reads them itself, in one round.
+  bytes stats = 2;
 }
 
 // One partition's step of a recall whose namespaces are on several partitions (#1915,
@@ -569,6 +618,18 @@ message ForwardScanRequest {
   uint64 min_primary_seqno = 6;
 }
 
+// One message of a forwarded `Vectors.BulkLoad` part (#1722 PR 3). The first carries
+// `map_version`, `caller` and `partition`, and its `load` the index and `expected` (the
+// client's, for the whole load); the later ones carry only `load.items`.
+message ForwardBulkLoadRequest {
+  // The sending node's map version, as in `ForwardRequest`.
+  uint64 map_version = 1;
+  ForwardedCaller caller = 2;
+  // The partition to load: it must be this node's.
+  string partition = 3;
+  VectorBulkLoadRequest load = 4;
+}
+
 // The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
 // forwarded.
 message ForwardedCaller {
@@ -605,7 +666,12 @@ message ForwardResponse {
     // One partition's part of an index search or check (#1722 PR 1b).
     VectorSearchResponse vector_search = 13;
     VectorVerifyResponse vector_verify = 14;
+    // A rebuild's part (#1722 PR 2c).
+    TextRebuildResponse text_rebuild = 15;
     TextVerifyResponse text_verify = 16;
+    // A text search's two rounds (#1722 PR 2b).
+    TextStatsResponse text_stats = 17;
+    TextSearchResponse text_search = 18;
     // The memory calls' (#1915, ICR 0139; 13–18 are ICR 0138's). `supersede` and `link`
     // answer `empty`.
     RememberResponse remember = 19;
