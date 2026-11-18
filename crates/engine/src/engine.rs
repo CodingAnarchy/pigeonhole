@@ -2405,7 +2405,8 @@ impl Engine {
     /// ([`FeedRetentionHold::lapsed`]) and retention trims as before. A range move takes one
     /// before its copy's first snapshot, so its catch-up from that snapshot's token finds the
     /// history there however long the copy takes, or the move learns it can't. The WAL
-    /// grows by the writes made while it holds. `InvalidArgument` without the change feed.
+    /// grows by the writes made while it holds. `InvalidArgument` without the change feed;
+    /// `Busy` before every stream has opened.
     /// Not part of the stable API.
     #[doc(hidden)]
     pub fn hold_feed_retention(&self, cap_bytes: u64) -> Result<FeedRetentionHold> {
@@ -2415,9 +2416,9 @@ impl Engine {
                 "a retention hold needs the change feed".to_owned(),
             ));
         };
-        let hold = feed.hold_retention(cap_bytes).ok_or_else(|| {
-            Error::InvalidArgument("the change feed's streams aren't all open yet".to_owned())
-        })?;
+        // Every stream opens with the database; one not open yet is a moment's wait
+        // (simp724's N1 on #2055).
+        let hold = feed.hold_retention(cap_bytes).ok_or(Error::Busy)?;
         Ok(FeedRetentionHold {
             shared: Arc::clone(shared),
             hold,

@@ -3551,18 +3551,28 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
 
 /// Lets `cursor` take feed-silent batches' mark (D331, ICR 0141) once the database has
 /// `incompat` bit 3: at once if it has now, else asked again when the cursor meets one (a
-/// writer sets the bit before appending the first). A reader process sees the bit once its
-/// pager has reloaded the superblock that carries it.
+/// writer sets the bit before appending the first). A reader process's pager doesn't see the
+/// bit until it reloads, and setting it commits no manifest, so the check reads the
+/// superblocks on disk again (simp724's S1 on #2055); a `true` is kept.
 fn silent_gate(shared: &Arc<Shared>, cursor: &mut FeedCursor) {
-    let flagged = |shared: &Shared| {
-        shared.silent_flagged.load(Ordering::Acquire)
-            || shared.pager.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0
-    };
+    let known = |shared: &Shared| shared.silent_flagged.load(Ordering::Acquire);
     let check = {
         let shared = Arc::clone(shared);
-        Arc::new(move || flagged(&shared)) as pigeonhole_wal::SilentCheck
+        Arc::new(move || {
+            if known(&shared) {
+                return true;
+            }
+            let on_disk = shared
+                .pager
+                .features_on_disk()
+                .is_ok_and(|f| f.incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0);
+            if on_disk {
+                shared.silent_flagged.store(true, Ordering::Release);
+            }
+            on_disk
+        }) as pigeonhole_wal::SilentCheck
     };
-    cursor.accept_silent(flagged(shared), Some(check));
+    cursor.accept_silent(known(shared), Some(check));
 }
 
 #[cfg(test)]

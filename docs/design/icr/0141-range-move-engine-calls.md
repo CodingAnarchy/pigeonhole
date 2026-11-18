@@ -16,7 +16,8 @@ A range move (D331) copies a key range from partition S to partition T, follows 
 - **Format** (FORMAT §10.3): bit 31 of a batch's `count u32` marks it feed-silent. The mutation count is bits 0–30. Every record that carries a batch can carry the mark: Batch (1), Prepare (2) and External Prepare (5).
 - **The bit** (FORMAT §8.2): `incompat` bit 3 is set in both superblock pages before the first silent batch is routed, and never cleared. A build without D331 refuses the file. Without the superblock bit, a marked batch is `Corrupt`: `WalRecord::decode` refuses it, and `decode_with(bytes, silent_ok)` takes it only when `silent_ok`. So a stray bit is never read as the mark.
   - Replay and `phdb check` take `silent_ok` from the superblock.
-  - A feed cursor takes it from the database's flag. A cursor that opened before the bit was set asks again when it meets a marked batch (`FeedCursor::accept_silent`).
+  - A feed cursor takes it from the database's flag. A cursor that opened before the bit was set asks again when it meets a marked batch (`FeedCursor::accept_silent`), and only on that refusal (`SILENT_WITHOUT_BIT`), never on other corruption.
+  - The check reads the superblocks on disk again (`Pager::features_on_disk`): a reader process's pager reloads only when the manifest version moves, and setting the bit moves none (simp724's S1 on #2055).
 - **Engine:**
   - `WriteBatch::mark_feed_silent()` (doc-hidden). Every commit path that rebuilds a batch keeps the mark: counter preparation, large-value separation, the cross-shard split, and a refused cross-shard round's retry.
   - On a replica database, a silent write of its own is refused, as any write of its own is, and sets no bit. A silent batch reaches a replica only as its primary's logged one.
@@ -42,7 +43,7 @@ A range move (D331) copies a key range from partition S to partition T, follows 
 - **The cap:** past it, the hold lapses. It's dropped, `lapsed()` turns true, and retention trims again, so a reader it was for finds its position gone and expires. A move then aborts with "the copy outran the source's feed retention".
 - **Mechanism:** `FeedMarks::set_hold(epoch)`. A stream's retention pass stops its floor below the held epoch, and never lowers it.
 - The engine keeps every hold in one leaf-locked list. Each shard's feed maintenance lapses holds past their cap, at one atomic load while none is held.
-- `InvalidArgument` without the change feed.
+- `InvalidArgument` without the change feed, and `Busy` before every stream has opened.
 - **Taken before the copy's first snapshot,** so the catch-up's token is always inside it.
 
 ## Callers
@@ -50,6 +51,8 @@ D331's range move (serve, later PRs) and D328/D315's replication. Nothing else.
 
 ## Tests
 - `crates/format/tests/validation.rs`: a silent batch round-trips, and is `Corrupt` to `decode` and to `decode_with(.., false)`. As a build before D331 reads it, the count runs past the batch's bytes.
+- `crates/format/tests/golden.rs`: frozen fixtures of a silent Batch, Prepare and External Prepare. `decode` refuses each, and `decode_with(.., true)` takes it (perf2's S1 and S2).
+- `crates/engine/tests/it/feed_reader_process.rs`: a reader process subscribed before the writer's first silent commit takes the mark, skips the commit, and sees it with `include_silent` (mutation-checked against the cached features).
 - `crates/engine/tests/it/feed_silent.rs`:
   - a subscriber sees the plain commits around single- and cross-shard silent ones, and a reader that includes them sees every commit, marked;
   - bit 3 is set by the first silent commit only, in both pages, and stays across a reopen and a process crash, after which replay applies the batch and a feed from the oldest still skips it;

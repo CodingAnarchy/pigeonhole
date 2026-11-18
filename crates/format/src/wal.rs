@@ -96,6 +96,11 @@ pub const INCOMPAT_FEED_SILENT: u64 = 1 << 3;
 /// replication. The mutation count is the low 31 bits.
 pub const SILENT_BATCH: u32 = 1 << 31;
 
+/// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch read without
+/// `incompat` bit 3 (D331): a reader that may have opened before the bit was set asks
+/// again on this one only.
+pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
+
 /// The header in frame 0 of every segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -976,7 +981,7 @@ impl WalRecord<'_> {
         let record = Self::decode_any(bytes)?;
         if !silent_ok && record.batch().is_some_and(|b| b.is_silent()) {
             return Err(Error::Corrupt {
-                what: "wal record: a feed-silent batch without incompat bit 3",
+                what: SILENT_WITHOUT_BIT,
             });
         }
         Ok(record)
@@ -1270,7 +1275,9 @@ impl<'a> BatchRef<'a> {
     ///
     /// Every mutation is parsed once here, and trailing bytes are rejected, so iterating a
     /// `BatchRef` built by this function never yields an error. A [`SILENT_BATCH`] mark is
-    /// taken as the mark: a WAL record's batch is gated by [`WalRecord::decode_with`] instead.
+    /// taken as the mark, so this is for batches built in memory: bytes read from a WAL file
+    /// go through [`WalRecord::decode_with`] (or the WAL crate's readers), which refuse the
+    /// mark without `incompat` bit 3, never straight through here (perf2's N2 on #2055).
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
         let mut r = Reader::new(bytes, "wal batch");
         let raw = r.u32()?;

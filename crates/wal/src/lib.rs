@@ -160,7 +160,10 @@ pub(crate) fn decode_gated<'r>(
         return Ok(WalRecord::decode_with(bytes, true)?);
     }
     match WalRecord::decode_with(bytes, false) {
-        Err(pigeonhole_format::Error::Corrupt { .. }) if check.is_some_and(|c| c()) => {
+        // Only the mark's own refusal asks again (simp724's N2 on #2055).
+        Err(pigeonhole_format::Error::Corrupt { what })
+            if what == pigeonhole_format::wal::SILENT_WITHOUT_BIT && check.is_some_and(|c| c()) =>
+        {
             *ok = true;
             Ok(WalRecord::decode_with(bytes, true)?)
         }

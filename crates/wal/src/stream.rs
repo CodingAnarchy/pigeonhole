@@ -538,7 +538,11 @@ impl FeedMarks {
     /// a range move's catch-up reads the source's history from its copy's first snapshot),
     /// from the stream's next retention pass on; `None` lets it go. Take it at an epoch the
     /// stream still has: the head's always is, since retention never trims the current
-    /// segment. A held stream's file grows by what its writes add meanwhile, so the holder
+    /// segment. Read the head and publish the hold with nothing between them that could let
+    /// a retention pass run: a head that rolled over meanwhile leaves the hold on a sealed
+    /// segment, which a pass could trim first only if retention keeps less than one segment
+    /// or ages it out at once (perf2's N1 on #2055); the hold's reader then expires, as
+    /// with a lapsed hold, and nothing is read wrong. A held stream's file grows by what its writes add meanwhile, so the holder
     /// bounds it ([`retained_bytes`](Self::retained_bytes)). Without retention, nothing is
     /// trimmed for a feed and the hold changes nothing.
     pub fn set_hold(&self, epoch: Option<u32>) {
