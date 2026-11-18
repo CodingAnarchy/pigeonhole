@@ -331,6 +331,17 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_lease_ms: u64,
+    /// The failover margin, in milliseconds (D330): how long the map's writer goes without
+    /// its writer lease before another node is elected in its place, while the map has
+    /// failover on (`phdb cluster set-map`). 0: twice `--cluster-lease-ms`.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0,
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub cluster_failover_after_ms: u64,
     /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
     /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
@@ -570,6 +581,7 @@ mod tests {
             ["--cluster-ca", "ca.pem"],
             ["--cluster-push-timeout-ms", "7"],
             ["--cluster-lease-ms", "21"],
+            ["--cluster-failover-after-ms", "40"],
         ] {
             if flag[0] != "--node-id" {
                 assert!(

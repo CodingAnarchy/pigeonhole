@@ -5052,6 +5052,25 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - *Non-blocking commit (3PC, Paxos Commit):* a partition with one owner blocks its own writes when down anyway. Revisit with replica failover (#1484).
 - *A cluster clock for one snapshot:* a large change to timestamps and visibility; later global-snapshot work.
 
+<a id="d330"></a>
+## D330 — Automatic failover of a cluster partition to its replica: the map's writer under a lease with terms, then partition failover by the writer (cli692, design; owner, 2026-11-16; reviewed by simp724; cli, #1484, ICR 0117) · D317, D326, D328, D329
+
+**Problem (#1484).** A partition whose owner is down stays down until an operator promotes a replica (D328 PR 3). Only the map's writer, the smallest id, changes the map. So while it's down, nothing can change the map except an operator's `set-map --force`, and force is unsafe to automate.
+
+**Decision (the owner's answers, 2026-11-16):** the design is `.coord/cli692-design-1484.md`, with its amendments 1 and 2. In short:
+- **The writer holds a lease as an owner does (W2, Q2).** `__writer` is a pseudo-partition in its D326 rounds, and maps are ordered by `(writer_term, map_version)`.
+  - With failover on, once the writer's lease has lapsed for the failover margin, a node gathers a majority's vote at a higher term. It then reads the newest map that majority holds, and writes it back at that term, naming itself.
+  - A node that voted for a term refuses every map and writer lease below it (amendment 1's M1). The vote is recorded durably before the node answers.
+- **Partition failover (PR 2):** the writer promotes a down owner's freshest replica through D328 PR 3's promote path. Each failover is recorded in the map, with what it lost.
+- **Off by default (Q1):** `ClusterMap.failover`, set with `set-map`. With it off, no node elects a writer or fails a partition over on its own. A forced map still raises the term, so it fences an old writer that comes back.
+- **Not in scope:** synchronous replication (Q3, later, in its own design), and an old owner rejoining automatically (Q4; `failover_rejoin` is reserved and always false).
+- **The default margin is 2·L (Q5).**
+
+**PRs:**
+1. The writer lease and terms, with elections behind `failover`. Its plan is `.coord/cli692-d330-pr1-plan.md`, with simp724's amendment.
+2. Partition failover, with its events, metrics and per-partition mode.
+3. The guide.
+
 <a id="d334"></a>
 ## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
 

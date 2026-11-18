@@ -611,9 +611,13 @@ impl Node {
     }
 }
 
-/// The map's writer (D317 amendment 1): the node with the smallest id. It alone changes the
-/// map, so two changes through two nodes can't both become the same version.
+/// The map's writer (D317 amendment 1): the node the map names (D330, from term 1), or else
+/// the node with the smallest id. It alone changes the map, so two changes through two nodes
+/// can't both become the same version.
 pub(crate) fn writer(map: &ClusterMap) -> &str {
+    if !map.writer.is_empty() {
+        return &map.writer;
+    }
     map.nodes
         .iter()
         .map(|n| n.id.as_str())

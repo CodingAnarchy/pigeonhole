@@ -523,6 +523,9 @@ mod tests {
                 partitions: (0..=splits.len()).map(|i| format!("p{}", i + 1)).collect(),
                 ..Default::default()
             }],
+            writer: String::new(),
+            writer_term: 0,
+            failover: false,
         }
     }
 
