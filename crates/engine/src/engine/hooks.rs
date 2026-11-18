@@ -531,6 +531,19 @@ impl Engine {
         n
     }
 
+    /// How many commit `Decide`s `Fault::HoldDecides` holds now (test hook): one held means
+    /// its coordinator decided, so every participant had prepared its share.
+    #[doc(hidden)]
+    pub fn held_decides(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .held_decides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// Sends the oldest `max` of the `Decide`s `Fault::HoldDecides` held, in the order they
     /// were held; returns how many (test hook). The rest stay held, so a test can let one
     /// decision land before another; switch `HoldDecides` off before the last release.
