@@ -1,3 +1,6 @@
+### Changed
+- `phdb serve --cluster`: `Replication.Follow` on a cluster node serves a partition only to a node the map lists in that partition's `replicas`. An outside follower is refused with `FailedPrecondition`. A cluster node already refused `--replica-of`, so no documented setup followed a cluster partition from outside its map.
+
 ### Added
 - **A cluster transaction can read and write rows of several partitions** (D329, ICR 0140), when it opts in with `BeginRequest.spans_partitions`. Its home is the partition its `route` names. Each other partition it touches is a branch on that partition's owner, and they all commit atomically through a two-phase commit whose commit point is a decision row on the home partition.
   - A commit that writes runs at `GroupSync` or stronger. `TxnCommitResponse.parts` lists each partition's share, the home first, and marks any that its partition hasn't applied yet.

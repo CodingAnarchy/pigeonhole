@@ -140,6 +140,13 @@ impl Cluster {
     }
 }
 
+tokio::task_local! {
+    /// A `Replication.Follow` call's node id (the request's node-id header), for
+    /// [`Router::follow_owned`]'s check that the follower is one of the partition's map
+    /// replicas. Set by the gRPC handler; unset (or `None`) for any other caller.
+    pub(crate) static FOLLOWER: Option<String>;
+}
+
 /// Where `partition` is served, by `routes`, as an entry node sees it: here, or the node the
 /// map gives it. Here only when the map gives this node the partition *and* this node has it
 /// open: a partition the map moved away is the new owner's, even if its file is still open
@@ -642,7 +649,11 @@ impl Router {
     }
 
     /// `Replication.Follow` on a cluster node (D328): a replica copy's follower, at the node
-    /// its map says owns the partition. The token is opaque, so it's tried on each partition
+    /// its map says owns the partition. Only the partition's map replicas follow it (D329 2b,
+    /// the coordinator's ruling): a cluster-scope caller whose node id ([`FOLLOWER`], from the
+    /// request's node-id header) is one of the partition's replicas. Anyone else, an outside
+    /// `phdb serve --replica-of` included, is refused `FailedPrecondition`, since only the
+    /// map's nodes are known to read every replicated event this build writes. The token is opaque, so it's tried on each partition
     /// this node owns and has open, and the one whose database it names serves it (another
     /// database's token is refused by the engine, `InvalidArgument`). None: `WrongPartition`
     /// with this node's map version, so the follower re-reads the map (Q5: never forwarded,
@@ -663,9 +674,32 @@ impl Router {
             ));
         };
         let me = cluster.node.id();
+        let follower = FOLLOWER.try_with(Clone::clone).ok().flatten();
+        // A cluster-scope token, or a cluster without tokens (loopback only), where every
+        // caller is the anonymous admin: the node id must still be a map replica's.
+        let cluster_caller = caller.scope == super::auth::Scope::Cluster
+            || caller.token == super::auth::TokenId::ANONYMOUS;
+        // The map's replicas, not the routing view's: that one lists none while a range move
+        // gates the partition's copies (D331), and they must go on following then.
+        let map = cluster.node.get_map().ok();
+        let replicas_of = |id: &str| {
+            map.as_ref()
+                .and_then(|m| m.partitions.iter().find(|p| p.id == id))
+                .map(|p| p.replicas.clone())
+                .unwrap_or_default()
+        };
         let parts = cluster.parts.load_full();
+        let mut refused = false;
         for (id, service) in parts.iter() {
             if routes.owner(id).is_none_or(|o| o.node != me) {
+                continue;
+            }
+            let replica = cluster_caller
+                && follower
+                    .as_deref()
+                    .is_some_and(|f| replicas_of(id).iter().any(|n| n == f));
+            if !replica {
+                refused = true;
                 continue;
             }
             match service
@@ -676,6 +710,13 @@ impl Router {
                 }
                 answer => return answer,
             }
+        }
+        if refused {
+            return Err(ApiError::failed_precondition(
+                "a cluster partition is followed only by its map replicas: this follower isn't \
+                 one of the partition's replicas in the cluster map (an outside --replica-of \
+                 can't follow a cluster node)",
+            ));
         }
         Err(ApiError::wrong_partition(
             routes.map_version(),

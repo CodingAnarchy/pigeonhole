@@ -166,7 +166,7 @@ pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
-const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
+pub(crate) const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
 /// Takes `dir`'s lock, or says another server or command has it.
 pub(crate) fn lock_dir(dir: &Path) -> Result<std::fs::File, Failure> {
@@ -568,7 +568,7 @@ impl Node {
     }
 
     /// The node's map, or `NotFound` before it has one.
-    fn get_map(&self) -> Result<ClusterMap, ApiError> {
+    pub(crate) fn get_map(&self) -> Result<ClusterMap, ApiError> {
         self.state()
             .map
             .as_ref()
