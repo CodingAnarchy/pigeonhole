@@ -275,12 +275,12 @@ impl Node {
     }
 }
 
-/// What a restored file's clip did ([`clip_restored`]): rows deleted, rows left because a
-/// D329 share in doubt holds them, and the newest timestamp it kept.
+/// What a restored file's clip did ([`clip_restored`]): rows deleted, D329 shares still in
+/// doubt (the clip runs again once they're decided), and the newest timestamp in the file.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Clipped {
     pub deleted: u64,
-    pub held: u64,
+    pub in_doubt: usize,
     pub newest_ts: u64,
 }
 
@@ -292,18 +292,22 @@ const CLIP_BATCH: usize = 256;
 /// move gave another (the restore rolls each in-flight move back or forward by its phase,
 /// and its map's placements say who holds what; a backup never spans a hand-over, since
 /// `backup::moved` refuses one). For each table the map places:
-/// - rows outside this partition's ranges are deleted, feed-silently (they're neither new
-///   history here nor anyone's to deliver), except a row a D329 share in doubt holds
-///   (`Busy`): left and counted, for the operator (simp724's C3);
+/// - first, the timestamp floor rises to the newest timestamp of **any** row (simp724's S1:
+///   a move's copied rows carry the source's timestamps, M1, and a delete written below a
+///   cell's would leave that cell visible);
+/// - then rows outside this partition's ranges, and outside any range an in-flight move
+///   names it the target of (simp724's N3: the move's copy), are deleted feed-silently
+///   (they're neither new history here nor anyone's to deliver);
 /// - moved-away rows covering a range the map gives it back are cut to the rest (the
 ///   restore asserts the map), and every one left drops its hand-over pair to (0, 0): a
 ///   backup's pairs are another cluster's numbering, so any later move back must count as
-///   newer (cli692);
-/// - its timestamp floor rises to the newest timestamp it kept (M1: a move's copied rows
-///   carry the source's timestamps).
+///   newer (cli692).
 ///
-/// Then the marker goes, unless a share held a row. Run before the partition serves; rerun from the start if it stops
-/// (cli692's F5): each step finds done what it did. **Blocking.**
+/// The marker goes only once no D329 share is in doubt here (simp724's S2): a blind delete
+/// isn't refused by one, and a share decided commit later would bring its rows back, so the
+/// clip runs again at the next open after it's decided. Run before the partition serves;
+/// rerun from the start if it stops (cli692's F5): each step finds done what it did.
+/// **Blocking.**
 pub(super) fn clip_restored(
     db: &Pigeonhole,
     map: &ClusterMap,
@@ -313,45 +317,70 @@ pub(super) fn clip_restored(
     let mut out = Clipped::default();
     let mut held: std::collections::HashMap<&str, Vec<ranges::KeyRange>> =
         std::collections::HashMap::new();
+    let mut tables = Vec::new();
     for t in &map.tables {
-        let mine: Vec<ranges::KeyRange> = map::table_ranges(t)
+        let mut mine: Vec<ranges::KeyRange> = map::table_ranges(t)
             .into_iter()
             .filter(|(_, _, p)| *p == partition)
             .map(|(a, b, _)| (a, b))
             .collect();
         held.insert(t.name.as_str(), mine.clone());
-        let table = match db.table(&t.name).and_then(|b| b.open()) {
-            Ok(table) => table,
-            Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => continue,
+        // An in-flight move's copy into this partition stays (simp724's N3).
+        for m in map
+            .moves
+            .iter()
+            .filter(|m| m.to == partition && m.table == t.name)
+        {
+            mine.push(map::move_range(m)?);
+        }
+        match db.table(&t.name).and_then(|b| b.open()) {
+            Ok(table) => tables.push((t.name.as_str(), table, mine)),
+            Err(e) if e.code() == pigeonhole::ErrorCode::TableNotFound => {}
             Err(e) => return Err(format!("open table {:?}: {e}", t.name)),
-        };
+        }
+    }
+    // 1. The floor, over every row (S1).
+    for (name, table, _) in &tables {
+        for row in table
+            .scan_bounds(Bound::Unbounded, Bound::Unbounded)
+            .iter()
+            .map_err(|e| format!("scan table {name:?}: {e}"))?
+        {
+            let row = row.map_err(|e| format!("scan table {name:?}: {e}"))?;
+            for c in row.view().iter() {
+                out.newest_ts = out.newest_ts.max(c.cell.timestamp());
+            }
+        }
+    }
+    if out.newest_ts > 0 {
+        db.raise_ts_floor(out.newest_ts)
+            .map_err(|e| format!("raise the timestamp floor: {e}"))?;
+    }
+    // 2. The deletes.
+    for (name, table, mine) in &tables {
         let inside = |k: &[u8]| {
             mine.iter()
                 .any(|(a, b)| a.as_slice() <= k && b.as_deref().is_none_or(|e| k < e))
         };
         let mut doomed: Vec<Vec<u8>> = Vec::with_capacity(CLIP_BATCH);
         // The scan reads at its own snapshot, so the deletes behind it don't disturb it.
-        let rows = table
+        for row in table
             .scan_bounds(Bound::Unbounded, Bound::Unbounded)
             .iter()
-            .map_err(|e| format!("scan table {:?}: {e}", t.name))?;
-        for row in rows {
-            let row = row.map_err(|e| format!("scan table {:?}: {e}", t.name))?;
-            if inside(row.key()) {
-                for c in row.view().iter() {
-                    out.newest_ts = out.newest_ts.max(c.cell.timestamp());
-                }
-            } else {
+            .map_err(|e| format!("scan table {name:?}: {e}"))?
+        {
+            let row = row.map_err(|e| format!("scan table {name:?}: {e}"))?;
+            if !inside(row.key()) {
                 doomed.push(row.key().to_vec());
                 if doomed.len() == CLIP_BATCH {
-                    delete_silently(db, &table, &doomed, &mut out)
-                        .map_err(|e| format!("clip table {:?}: {e}", t.name))?;
+                    out.deleted += delete_silently(db, table, &doomed)
+                        .map_err(|e| format!("clip table {name:?}: {e}"))?;
                     doomed.clear();
                 }
             }
         }
-        delete_silently(db, &table, &doomed, &mut out)
-            .map_err(|e| format!("clip table {:?}: {e}", t.name))?;
+        out.deleted +=
+            delete_silently(db, table, &doomed).map_err(|e| format!("clip table {name:?}: {e}"))?;
     }
     for r in ranges::read_moved(db)? {
         let Some(mine) = held.get(r.table.as_str()) else {
@@ -396,49 +425,38 @@ pub(super) fn clip_restored(
             .collect();
         ranges::rewrite_moved(db, &r, &pieces)?;
     }
-    if out.newest_ts > 0 {
-        db.raise_ts_floor(out.newest_ts)
-            .map_err(|e| format!("raise the timestamp floor: {e}"))?;
-    }
-    // Rows a share in doubt holds keep the marker: the next open, after it's decided,
-    // deletes them.
-    if out.held == 0 {
+    // A share in doubt keeps the marker: decided commit, its writes would come back.
+    out.in_doubt = db.in_doubt().len();
+    if out.in_doubt == 0 {
         ranges::clear_clip(db)?;
     }
     Ok(out)
 }
 
-/// Deletes rows `keys` of `table` feed-silently, in one batch; when a D329 share in doubt
-/// holds one (`Busy`), one at a time, counting the held ones in `out.held`.
+/// Deletes rows `keys` of `table` feed-silently, in one batch: how many. A `Busy` (a write
+/// stall) is retried a few times, then fails the clip, which runs again at the next open.
 fn delete_silently(
     db: &Pigeonhole,
     table: &pigeonhole::Table,
     keys: &[Vec<u8>],
-    out: &mut Clipped,
-) -> Result<(), pigeonhole::Error> {
+) -> Result<u64, pigeonhole::Error> {
     if keys.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    let delete = |keys: &[Vec<u8>]| {
+    let mut tries = 0;
+    loop {
         let mut batch = db.write_batch();
         batch.mark_feed_silent();
         for k in keys {
             batch.delete_row(table, k);
         }
-        batch.commit().map(drop)
-    };
-    match delete(keys) {
-        Ok(()) => out.deleted += keys.len() as u64,
-        Err(e) if e.code() == pigeonhole::ErrorCode::Busy => {
-            for k in keys {
-                match delete(std::slice::from_ref(k)) {
-                    Ok(()) => out.deleted += 1,
-                    Err(e) if e.code() == pigeonhole::ErrorCode::Busy => out.held += 1,
-                    Err(e) => return Err(e),
-                }
+        match batch.commit() {
+            Ok(_) => return Ok(keys.len() as u64),
+            Err(e) if e.code() == pigeonhole::ErrorCode::Busy && tries < 5 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50 << tries));
             }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     }
-    Ok(())
 }

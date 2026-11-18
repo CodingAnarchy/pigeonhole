@@ -928,7 +928,10 @@ impl Replica {
         let Some(node) = node.upgrade() else {
             return;
         };
-        self.ranges.load_rows(moved, serving);
+        // An older read than the one loaded already changes nothing (simp724's N1).
+        if !self.ranges.load_rows_at(moved, serving, visible) {
+            return;
+        }
         if let Ok(map) = node.get_map() {
             self.ranges.update(&map, partition, visible);
         }

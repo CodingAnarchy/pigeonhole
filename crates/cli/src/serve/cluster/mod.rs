@@ -3024,13 +3024,14 @@ fn clip_if_restored(
         "phdb serve: partition {partition}: the restored file is clipped to the map: {} rows \
          outside its ranges deleted{}",
         c.deleted,
-        if c.held == 0 {
+        if c.in_doubt == 0 {
             String::new()
         } else {
             format!(
-                ", {} left because a cluster transaction in doubt holds them (decide it with \
-                 phdb cluster txn decide, then reopen the partition)",
-                c.held
+                "; {} cluster transaction(s) in doubt here could still write outside them, so \
+                 the clip runs again at the next open: decide them (phdb cluster txn decide), \
+                 then reopen the partition",
+                c.in_doubt
             )
         }
     );

@@ -276,6 +276,10 @@ struct Span {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
     rule: Rule,
+    /// A target's span from a move at CLEANING, waiting for its serving row: kept when the
+    /// map drops the move until the row is here (simp724's S3 on PR 3a). An aborted move's
+    /// span never is: it never gets a row.
+    awaits_row: bool,
 }
 
 impl Span {
@@ -449,6 +453,8 @@ pub(crate) struct RangeGate {
     /// The state waits for a row the file doesn't hold yet: a replica copy's follower, which
     /// brings rows in, reloads them after each run it applies while this is set (PR 3).
     pending: std::sync::atomic::AtomicBool,
+    /// The visible seqno of the file when its rows here were read ([`load_rows_at`]).
+    rows_at: std::sync::atomic::AtomicU64,
 }
 
 impl RangeGate {
@@ -468,6 +474,27 @@ impl RangeGate {
     pub(crate) fn load_rows(&self, moved: Vec<Moved>, serving: Vec<Moved>) {
         *self.moved() = moved;
         *self.serving() = serving;
+    }
+
+    /// [`load_rows`](Self::load_rows) for rows read at the file's visible seqno `visible`,
+    /// unless rows read later are here already (simp724's N1 on PR 3a: a copy's follower and
+    /// a map install each read and load them, and an older read mustn't land last). Whether
+    /// it took them.
+    pub(crate) fn load_rows_at(
+        &self,
+        moved: Vec<Moved>,
+        serving: Vec<Moved>,
+        visible: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut m = self.moved();
+        if visible < self.rows_at.load(Ordering::Acquire) {
+            return false;
+        }
+        *m = moved;
+        *self.serving() = serving;
+        self.rows_at.store(visible, Ordering::Release);
+        true
     }
 
     fn serving(&self) -> std::sync::MutexGuard<'_, Vec<Moved>> {
@@ -546,6 +573,7 @@ fn derive(
             start,
             end,
             rule,
+            awaits_row: false,
         })
     };
     for m in &map.moves {
@@ -570,8 +598,12 @@ fn derive(
         {
             // Served from CLEANING on, once its serving row is in the file (written before
             // the gate opens it, so nothing of the range lands here below its `t_from`).
-            spans.extend(span(m, Rule::Unserved));
-            pending |= phase >= MovePhase::Cleaning;
+            let cleaning = phase >= MovePhase::Cleaning;
+            spans.extend(span(m, Rule::Unserved).map(|s| Span {
+                awaits_row: cleaning,
+                ..s
+            }));
+            pending |= cleaning;
         }
     }
     // The rows of moves the map no longer carries: each part of the range a later move
@@ -617,6 +649,7 @@ fn derive(
                         start: both.0.clone(),
                         end: both.1.clone(),
                         rule: Rule::Returned,
+                        awaits_row: false,
                     });
                     away = away.into_iter().flat_map(|a| subtract(&a, &both)).collect();
                 }
@@ -627,16 +660,21 @@ fn derive(
                 start,
                 end,
                 rule: Rule::Moved,
+                awaits_row: false,
             }));
         }
     }
-    // A source's span for a move the map dropped, whose row hasn't reached this file yet (a
-    // replica copy behind its owner): kept until it does.
+    // A move the map dropped whose row hasn't reached this file yet (a replica copy behind
+    // its owner): a source's span, or a target's from CLEANING (simp724's S3), kept until
+    // the row does.
     if let Some(prev) = prev {
         for s in prev.spans.iter().filter(|s| {
-            s.rule == Rule::Moved
-                && !map.moves.iter().any(|m| m.id == s.move_id)
-                && !moved.iter().any(|r| r.id == s.move_id)
+            !map.moves.iter().any(|m| m.id == s.move_id)
+                && match s.rule {
+                    Rule::Moved => !moved.iter().any(|r| r.id == s.move_id),
+                    Rule::Unserved => s.awaits_row && !serving.iter().any(|r| r.id == s.move_id),
+                    _ => false,
+                }
         }) {
             spans.push(s.clone());
             pending = true;
@@ -828,6 +866,7 @@ mod tests {
             start: b"c".to_vec(),
             end: Some(b"f".to_vec()),
             rule: Rule::Moved,
+            awaits_row: false,
         };
         assert!(s.overlaps(Touch::Row(b"c")));
         assert!(s.overlaps(Touch::Row(b"e\xff")));
@@ -1075,6 +1114,41 @@ mod tests {
         t.update(&cleaning, "p2", 11);
         assert!(!t.pending());
         assert!(t.state.load_full().is_none(), "serves it");
+    }
+
+    /// simp724's S3 on PR 3a: a target's copy at CLEANING without its serving row keeps
+    /// refusing the range when the map drops the move, until the row arrives; an aborted
+    /// move's target span is never kept (it never gets a row).
+    #[test]
+    fn a_targets_copy_waits_for_its_serving_row_after_the_map_drops_the_move() {
+        let g = gate(&map(Some(MovePhase::Cleaning)), "p2", Vec::new(), 10);
+        let mut done = map(None);
+        done.tables[0] = map::handed_over(&done.tables[0], b"c", Some(b"f"), "p2");
+        g.update(&done, "p2", 11);
+        assert!(g.pending());
+        let s = g.state.load_full().expect("still refusing");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        g.load_rows(
+            Vec::new(),
+            vec![Moved {
+                id: "mv1".into(),
+                table: "users".into(),
+                start: b"c".to_vec(),
+                end: Some(b"f".to_vec()),
+                term: 0,
+                version: 5,
+                seqno: 9,
+                at_ms: 0,
+            }],
+        );
+        g.update(&done, "p2", 12);
+        assert!(!g.pending());
+        assert!(g.state.load_full().is_none(), "serves it");
+        // Aborted at COPYING: the map drops it, and nothing waits.
+        let g = gate(&map(Some(MovePhase::Copying)), "p2", Vec::new(), 10);
+        g.update(&map(None), "p2", 11);
+        assert!(!g.pending());
+        assert!(g.state.load_full().is_none());
     }
 
     #[test]
