@@ -737,6 +737,10 @@ impl Router {
                 ServiceOp::Scan(_) => {
                     return self.fan_scan(cluster, op, caller, prepaid, None).await;
                 }
+                // A load split by id across the index's partitions (#1722 PR 3).
+                ServiceOp::VectorBulkLoad(_) => {
+                    return Box::pin(self.fan_bulk_load(cluster, op, caller, prepaid)).await;
+                }
                 // A search or check across an index's partitions (#1722 PR 1b), and a
                 // text index's rebuild (PR 2c).
                 ServiceOp::VectorSearch(_)
@@ -1736,17 +1740,16 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         ServiceOp::VectorDelete(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextPut(r) => index_route(routes, &r.index, &r.id),
         ServiceOp::TextDelete(r) => index_route(routes, &r.index, &r.id),
-        ServiceOp::VectorBulkLoad(_) => Err(ApiError::unsupported(
-            "Vectors.BulkLoad isn't supported on a cluster yet",
-        )),
         // Answered before this, by [`Router::dispatch`]'s own arms, and never forwarded: a
         // schema change (the map writer's), a schema read, a read that fans out, a
         // subscription and a backup.
         op if map_schema_change(op) => Err(unrouted()),
         // Fanned out across the index's partitions by `dispatch`, each part naming its
         // partition (#1722 PR 1b): [`index_part_route`].
-        // A text search's two rounds (#1722 PR 2b) too, and a rebuild (PR 2c).
-        ServiceOp::VectorSearch(_)
+        // A text search's two rounds (#1722 PR 2b) too, and a rebuild (PR 2c). A bulk load
+        // is split by id (PR 3).
+        ServiceOp::VectorBulkLoad(_)
+        | ServiceOp::VectorSearch(_)
         | ServiceOp::VectorVerify(_)
         | ServiceOp::TextVerify(_)
         | ServiceOp::TextRebuild(_)

@@ -37,6 +37,20 @@ fn nodes(
     [u16; 3],
     Vec<PathBuf>,
 ) {
+    nodes_limited(rt, a_holds_p3, crate::serve::server_tests::limits())
+}
+
+/// [`nodes`], each node with `limits`.
+fn nodes_limited(
+    rt: &tokio::runtime::Runtime,
+    a_holds_p3: bool,
+    limits: crate::serve::config::Limits,
+) -> (
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    Vec<pigeonhole::Pigeonhole>,
+    [u16; 3],
+    Vec<PathBuf>,
+) {
     let listeners: Vec<std::net::TcpListener> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -66,18 +80,7 @@ fn nodes(
         let placement = crate::serve::placement::Placement::routes_only(Some(2), Some(2));
         let locals = local.iter().map(|p| (*p, None)).collect();
         let (stop, d, _) = data_node_served(
-            rt,
-            dir,
-            id,
-            locals,
-            listener,
-            "",
-            crate::serve::server_tests::limits(),
-            false,
-            placement,
-            None,
-            None,
-            None,
+            rt, dir, id, locals, listener, "", limits, false, placement, None, None, None,
         );
         stops.push(stop);
         dbs.extend(d);
@@ -1128,5 +1131,316 @@ fn a_text_rebuild_runs_on_every_partition_of_its_index() {
             .unwrap_err();
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
         assert!(e.message().contains("partition p2"), "{e}");
+    });
+}
+
+/// A BulkLoad message of `ids`' vectors (2 dimensions, the first element the id's
+/// position): the first message of a load names the index and `expected`.
+fn bulk(index: &str, expected: u64, ids: &[String]) -> crate::serve::proto::VectorBulkLoadRequest {
+    crate::serve::proto::VectorBulkLoadRequest {
+        index: index.into(),
+        expected,
+        items: ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| crate::serve::proto::VectorItem {
+                id: id.as_bytes().to_vec().into(),
+                vector: Some(Vector {
+                    element: Element::F32 as i32,
+                    dim: 2,
+                    data: [i as f32, 1.0]
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .into(),
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// `Vectors.BulkLoad` through `port` of `messages`.
+async fn load(
+    port: u16,
+    messages: Vec<crate::serve::proto::VectorBulkLoadRequest>,
+) -> Result<(), tonic::Status> {
+    VectorsClient::new(channel(port).await)
+        .bulk_load(tonic::codegen::tokio_stream::iter(messages))
+        .await
+        .map(drop)
+}
+
+/// #1722 PR 3: `Vectors.BulkLoad` through any node splits the client's stream by id, each
+/// vector landing in its id's partition: through a node serving neither partition, and
+/// through one serving one of them (a load of its own beside a forwarded one). A partition
+/// no id falls in is left alone. A load into an index that isn't empty fails, naming the
+/// partition; so does one with a partition's node stopped.
+#[test]
+fn a_bulk_load_through_any_node_splits_by_id_across_partitions() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    // Ids on both sides of `users`' split at "m", interleaved in every message.
+    let ids = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("a{i:03}")
+                } else {
+                    format!("n{i:03}")
+                }
+            })
+            .collect()
+    };
+    rt.block_on(async {
+        users_family(c).await;
+        let mut api = VectorsClient::new(channel(c).await);
+        for name in ["uv", "uv2", "uv3", "uv4"] {
+            let mut v = vector_index(name);
+            v.follows = "users".into();
+            api.create_index(v).await.unwrap();
+        }
+        eventually_within(FILL, "both partitions create the indexes", async || {
+            ["uv", "uv2", "uv3", "uv4"]
+                .iter()
+                .all(|n| has_table(&p1, n) && has_table(&p2, n))
+        })
+        .await;
+        let all = ids(80);
+        let messages = |index: &str| -> Vec<_> {
+            all.chunks(20)
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let mut m = bulk(index, 80, chunk);
+                    if i > 0 {
+                        m.index.clear();
+                        m.expected = 0;
+                    }
+                    m
+                })
+                .collect()
+        };
+
+        // Through c, which serves neither partition: both parts forwarded. An empty message
+        // in the middle reaches no partition.
+        let mut with_empty = messages("uv");
+        with_empty.insert(2, crate::serve::proto::VectorBulkLoadRequest::default());
+        load(c, with_empty).await.unwrap();
+        assert_eq!((vectors(&p1, "uv"), vectors(&p2, "uv")), (40, 40));
+        let checked = api
+            .verify(VectorVerifyRequest { index: "uv".into() })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(checked.vectors, 80);
+
+        // Through a, which serves p1: its part is a load of its own.
+        load(a, messages("uv2")).await.unwrap();
+        assert_eq!((vectors(&p1, "uv2"), vectors(&p2, "uv2")), (40, 40));
+
+        // Every id in p1: p2's index is never opened, and stays empty.
+        let low: Vec<String> = (0..30).map(|i| format!("b{i:03}")).collect();
+        load(c, vec![bulk("uv3", 30, &low)]).await.unwrap();
+        assert_eq!((vectors(&p1, "uv3"), vectors(&p2, "uv3")), (30, 0));
+
+        // Again into a loaded index: refused by its partitions, naming one.
+        let e = load(c, messages("uv")).await.unwrap_err();
+        assert!(e.message().contains("partition p"), "{e}");
+        assert_eq!((vectors(&p1, "uv"), vectors(&p2, "uv")), (40, 40));
+
+        // b (p2) stops. Its feature answer is still cached, so the load starts: p2's part
+        // can't connect, and the load fails naming it. p1's part, which took the first
+        // message's vectors, keeps them, and the error says so.
+        stops.remove(1).send(()).unwrap();
+        let e = load(a, messages("uv4")).await.unwrap_err();
+        assert_eq!(code(&e), "PartitionUnavailable", "{e}");
+        assert!(e.message().contains("partition p2"), "{e}");
+        let kept = vectors(&p1, "uv4");
+        assert!(kept <= 40, "{kept}");
+        assert_eq!(kept > 0, e.message().contains("loaded"), "{kept}: {e}");
+    });
+}
+
+/// #1722 PR 3: a node serving a part of the index that runs a build before
+/// `ForwardBulkLoad` (no `index_bulk_load` in its `Status`) makes the load `Unsupported`,
+/// naming it, before anything is read: the other partition takes nothing.
+#[test]
+fn a_bulk_load_with_an_older_node_holding_a_part_is_refused_up_front() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, [p1, p2], [a, _b, c], dirs) = three_nodes(&rt);
+    super::super::OLD_BULK_LOAD
+        .lock()
+        .unwrap()
+        .push(dirs[1].clone());
+    rt.block_on(async {
+        users_family(c).await;
+        let mut v = vector_index("uv");
+        v.follows = "users".into();
+        VectorsClient::new(channel(c).await)
+            .create_index(v)
+            .await
+            .unwrap();
+        eventually_within(FILL, "both partitions create uv", async || {
+            has_table(&p1, "uv") && has_table(&p2, "uv")
+        })
+        .await;
+        let ids: Vec<String> = ["a1", "a2", "n1", "n2"].map(str::to_owned).to_vec();
+        let e = load(a, vec![bulk("uv", 4, &ids)]).await.unwrap_err();
+        assert_eq!(code(&e), "Unsupported", "{e}");
+        assert!(e.message().contains("b (an older build)"), "{e}");
+        assert_eq!((vectors(&p1, "uv"), vectors(&p2, "uv")), (0, 0));
+    });
+    super::super::OLD_BULK_LOAD
+        .lock()
+        .unwrap()
+        .retain(|d| *d != dirs[1]);
+}
+
+/// #1722 PR 3 (audit120's S1, simp724's M1 on #2045): every part of a load reserves the
+/// whole load's worst case, so a node serving two partitions of the index whose
+/// `--bulk-load-bytes` holds only one part refuses the load at once, saying so, rather than
+/// waiting for the bytes its own other part holds. Through a node serving neither (the
+/// node's first part refused as it opens) and through the node itself (before anything is
+/// read): nothing is loaded either way, and the error isn't a partial load's.
+#[test]
+fn a_node_that_cant_hold_a_part_for_each_of_its_partitions_refuses_the_load_at_once() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // One part of 80 2-dim vectors holds its 50,000-vector sample, about 8.8 MB: room for
+    // one, not two.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.bulk_load_bytes = 12 << 20;
+    // a serves p1 and p3, b p2; the databases are p1's, p3's and p2's.
+    let (_stops, dbs, [a, _b, c], _) = nodes_limited(&rt, true, limits);
+    let [p1, p3, _p2] = &dbs[..] else {
+        unreachable!()
+    };
+    rt.block_on(async {
+        // `two`, split at "m" over p1 and p3: both a's.
+        SchemaClient::new(channel(c).await)
+            .create_table(CreateTableRequest {
+                name: "two".into(),
+                families: vec![FamilySpec {
+                    name: "f".into(),
+                    ..Default::default()
+                }],
+                placement: Some(TablePlacementRequest {
+                    group: String::new(),
+                    splits: vec![b"m".to_vec().into()],
+                    partitions: vec!["p1".into(), "p3".into()],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut v = vector_index("tv");
+        v.follows = "two".into();
+        VectorsClient::new(channel(c).await)
+            .create_index(v)
+            .await
+            .unwrap();
+        eventually_within(FILL, "a creates tv on p1 and p3", async || {
+            has_table(p1, "tv") && has_table(p3, "tv")
+        })
+        .await;
+        let ids: Vec<String> = (0..80)
+            .map(|i| format!("{}{i:03}", if i % 2 == 0 { 'a' } else { 'n' }))
+            .collect();
+        for port in [c, a] {
+            let started = std::time::Instant::now();
+            let e = load(port, vec![bulk("tv", 80, &ids)]).await.unwrap_err();
+            assert_eq!(code(&e), "InvalidArgument", "through {port}: {e}");
+            assert!(
+                e.message().contains("this node serves 2 of them"),
+                "through {port}: {e}"
+            );
+            assert!(!e.message().contains("loaded"), "through {port}: {e}");
+            // At once, not after the request timeout.
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "through {port}"
+            );
+            assert_eq!((vectors(p1, "tv"), vectors(p3, "tv")), (0, 0));
+        }
+    });
+}
+
+/// #1722 PR 3 (audit120's S2 on #2045): a part that fails mid-load (p2 meets a vector of
+/// another dimension) fails the load, naming p2 and saying vectors may have been loaded.
+/// p1 keeps what it took, and has stopped by the time the client has the error: a load
+/// right after finds its slot free. A part that fails with the client's last message,
+/// after its stream ended, does the same.
+#[test]
+fn a_part_that_fails_fails_the_load_and_the_others_keep_what_they_took() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, [p1, p2], [_a, _b, c], _) = three_nodes(&rt);
+    let ids = |prefix: char, from: usize, n: usize| -> Vec<String> {
+        (from..from + n)
+            .map(|i| format!("{prefix}{i:03}"))
+            .collect()
+    };
+    // `ids`' vectors, with the one at `bad` 3-dimensional.
+    let with_bad = |index: &str, ids: &[String], bad: usize| {
+        let mut m = bulk(index, 0, ids);
+        m.index.clear();
+        let v = m.items[bad].vector.as_mut().unwrap();
+        v.dim = 3;
+        v.data = [0.0f32, 1.0, 2.0]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .into();
+        m
+    };
+    rt.block_on(async {
+        users_family(c).await;
+        let mut api = VectorsClient::new(channel(c).await);
+        for name in ["uf", "ug", "uh"] {
+            let mut v = vector_index(name);
+            v.follows = "users".into();
+            api.create_index(v).await.unwrap();
+        }
+        eventually_within(FILL, "both partitions create the indexes", async || {
+            ["uf", "ug", "uh"]
+                .iter()
+                .all(|n| has_table(&p1, n) && has_table(&p2, n))
+        })
+        .await;
+
+        // Mid-load: the second message's third vector, p2's, is 3-dimensional. p1's first
+        // part is large enough that its write takes a while.
+        let mut second = ids('a', 2000, 10);
+        second.extend(ids('n', 10, 10));
+        let messages = vec![
+            bulk("uf", 4000, &[ids('a', 0, 2000), ids('n', 0, 10)].concat()),
+            with_bad("uf", &second, 12),
+            bulk("", 0, &ids('a', 2010, 10)),
+        ];
+        let e = load(c, messages).await.unwrap_err();
+        assert!(e.message().contains("partition p2"), "{e}");
+        assert!(e.message().contains("loaded"), "{e}");
+        // p2 has its vectors before the bad one; p1 at least its first message's, all
+        // written by the time the client has the error (audit120's S4).
+        assert_eq!(vectors(&p2, "uf"), 12);
+        let kept = vectors(&p1, "uf");
+        assert!((2000..=2020).contains(&kept), "{kept}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(vectors(&p1, "uf"), kept, "p1's load was still running");
+        // p1's load has stopped: its slot is free for the next.
+        let started = std::time::Instant::now();
+        load(c, vec![bulk("ug", 10, &ids('a', 0, 10))])
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(vectors(&p1, "ug"), 10);
+
+        // At the end: the last message's last vector, p2's, is the bad one.
+        let last = [ids('a', 10, 5), ids('n', 10, 5)].concat();
+        let messages = vec![
+            bulk("uh", 100, &[ids('a', 0, 10), ids('n', 0, 10)].concat()),
+            with_bad("uh", &last, 9),
+        ];
+        let e = load(c, messages).await.unwrap_err();
+        assert!(e.message().contains("partition p2"), "{e}");
+        assert!(e.message().contains("loaded"), "{e}");
+        assert_eq!((vectors(&p1, "uh"), vectors(&p2, "uh")), (15, 14));
     });
 }

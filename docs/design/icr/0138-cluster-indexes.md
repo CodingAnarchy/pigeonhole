@@ -252,3 +252,55 @@ Every write touches shared rows. So each partition an index is placed on holds a
   - the check reading `rebuild_pending` again (the unit test);
   - every partition rebuilt at once, not grouped by node (the cluster test: `Overloaded` "already rebuilding");
   - a finished walk leaving the mark (the library tests).
+
+## PR 3: `Vectors.BulkLoad` across an index's partitions
+
+**proto (additive, numbers and names from `.coord/numbers.md`):**
+- `cluster.proto`: `rpc ForwardBulkLoad(stream ForwardBulkLoadRequest) returns (Empty)` on `Cluster` (the response `BulkLoad` answers), and a new message `ForwardBulkLoadRequest { map_version = 1; caller = 2; partition = 3; load = 4 }`. The first message carries the header and the load's `index` and `expected`; the later ones carry `load.items`.
+- **The feature:** `NodeStatus.map_features` reports `index_bulk_load`.
+
+**The load, at the node called (`cluster/bulkfan.rs`):**
+- **Up front:** the scope (write), the index's placement (`TableNotFound` if the map has none), and every node serving one of its partitions. One without `index_bulk_load` refuses the load with `Unsupported`, naming it (the coordinator's call, not `owners_keep`'s `FailedPrecondition`). One that doesn't answer refuses it with `PartitionUnavailable`, naming its partition. Nothing has been read yet.
+- **The split:** the client's messages are read as on a single node (each holds its share of the in-flight budget; each comes within `--stream-idle-ms`). Each message's vectors are grouped by `Routes::index_partition(index, id)`, in the order each partition first appears, and each group goes to its partition's part as one message. The message's budget share is held until every partition has room for its group.
+- **A part opens with its partition's first vector:**
+  - Here: a `BulkLoadOp` on the partition's own service (`call`), through a channel, as gRPC's front end does.
+  - Elsewhere: `ForwardBulkLoad` to the node serving it, on a stream connection of its own (`Forwarder::stream_channel`).
+
+  A partition no id falls in gets no part: its index isn't checked or touched.
+- **`expected`: the client's, on every part** (the coordinator's call, E1). A partition's share isn't known until the load has been read, and each part's load stops at about 2 × its `expected`, so only the whole load's value can't fail one part. The costs, in the guide:
+  - each part's lists are sized for the whole load, holding about 1/P of the target until later writes split or merge them (the rebalancer merges a list below `min_list_len` after a write to it);
+  - each part reserves the whole load's worst case from its node's `--bulk-load-bytes`. So each part's load checks its node's flag against the worst case times the partitions of the index that node serves (`bulk::fits`, `BulkLoadOp.siblings`), and refuses at once with `InvalidArgument` when it doesn't fit, rather than wait for the bytes the node's own other part holds and fail part way (audit120's S1, simp724's M1 on #2045). The entry node checks its own partitions before it reads anything (`Service::bulk_fits`). Another node checks as its first part opens: there's no acknowledgement on the stream before the end, so vectors other partitions took by then stay. Counting every partition the node serves, not those the load's ids reach, keeps the check up front and predictable.
+- **Budget:** a message's share of the in-flight budget is split by each group's share of its vectors (`OwnedSemaphorePermit::split`). A local group's piece goes into its batch, and the loader holds it until it takes the last vector, as on one node. A forwarded group's piece goes once the stream has it, since the serving node reserves it again as it arrives (audit120's S3, simp724's S1).
+- **Keep-alive:** a part's stream gets an empty `load` whenever the entry node has sent it nothing for a third of `--stream-idle-ms`. Another partition's slow loader can hold the entry node up (its 50,000-vector sample's k-means, say), and the serving node's idle bound would otherwise end a healthy part. The period is the entry node's flag, and the bound is the serving node's, so the guide says to give every node the same value.
+- **The end:** when the client ends its stream, a local part is told `End` and a forwarded stream ends. The call answers `Empty` once every part has, and fails with the first part's failure otherwise.
+- **Strict:** a part that fails, or ends before the client's stream, fails the load, naming its partition. A part's failure is seen while the entry node reads the client and while it waits for another part's room.
+  - **Every other part ends:** a local loader's input breaks off, and a forwarded stream ends, so each keeps the vectors it took.
+  - **The error waits for every part's answer,** as one node's comes once its loader has stopped, so a load sent right after finds the partitions' slots and bytes free (audit120's S4: the waiting, not the background, option).
+  - **`retry_safe: false`** ("some of the vectors before it may have been loaded") when any part may have taken a vector: it answered `Ok`, its error says it loaded, or its outcome is unknown. A load every part refused before taking anything keeps the error as it is.
+  - There's no `allow_partial`.
+  - A client that goes away drops the call: every part's input ends the same way, and the parts finish on their own.
+- **No total deadline:** a load runs for minutes by design, as on a single node. Each wait is bounded by `--stream-idle-ms`, and a forwarded part's failure is a write's (`OutcomeUnknown` when the stream breaks).
+
+**The part, at the node serving it:**
+- `Cluster.ForwardBulkLoad` is mounted on a route of its own, behind `prepay`, as `Vectors.BulkLoad` is: the token is checked first, and each message reserves its share of the in-flight budget from its header as it arrives (`Metered`). It sits outside the `Cluster` calls' limit of 16, since a load runs for minutes.
+- The handler checks cluster scope and catches up on the sender's map, then serves the first message's partition only if its map places the index there and gives it the partition (`WrongPartition` otherwise). The part runs as that partition's own `Vectors.BulkLoad` for the caller the message names: its one-load slot, its node's `--bulk-load-bytes`, its write gate and fence, and the index-must-be-empty check.
+
+**Tests:**
+- **Through three nodes** (`a_bulk_load_through_any_node_splits_by_id_across_partitions`): ids on both sides of `users`' split, interleaved in every message.
+  - Through c (both parts forwarded), each partition holds its 40, and `Verify` sums 80.
+  - Through a (its own part beside a forwarded one), the same.
+  - A load whose ids are all in p1 leaves p2's index empty.
+  - A second load into a loaded index fails, naming a partition, and changes nothing.
+  - With b stopped, a load fails with `PartitionUnavailable`, naming p2, before p1 takes anything.
+- **An older node** (`a_bulk_load_with_an_older_node_holding_a_part_is_refused_up_front`, the `OLD_BULK_LOAD` seam): `Unsupported`, naming b, and nothing loaded.
+- **Two partitions on one node** (`a_node_that_cant_hold_a_part_for_each_of_its_partitions_refuses_the_load_at_once`): `--bulk-load-bytes` sized for one part. Through c the node's first part is refused as it opens, and through a the load is refused before anything is read. Both answer `InvalidArgument` "this node serves 2 of them" within seconds, with nothing loaded and no partial-load wording.
+- **A failing part** (`a_part_that_fails_fails_the_load_and_the_others_keep_what_they_took`): p2 meets a 3-dimensional vector mid-load, and in a second load in the client's last message. Each load fails naming p2 and saying vectors were loaded. p2 keeps the vectors before the bad one, and p1 keeps what it took. A load right after finds p1's slot free.
+- **Unit:** `vector_of` reads back as the same elements for all five kinds.
+- **Unit:** a forwarded part's stream sends its header, each load as it comes, and an empty load after each `every` of silence, and ends when the entry node drops it.
+- **Mutations:**
+  - **Caught:**
+    - every vector sent to the index's first partition;
+    - a part's failure ignored at the end;
+    - the siblings multiplier dropped from `fits` (the two-partitions test);
+    - every failure marked partly loaded (the same test's wording check).
+  - **Survives: S4's wait dropped.** p1's part writes in milliseconds, before the client has the error. A deterministic test needs a hold seam on one partition's loader, which the cluster tests can't reach (they hold the partitions' databases, not their services). The test checks p1's count is final when the error arrives, which only catches a slow write.

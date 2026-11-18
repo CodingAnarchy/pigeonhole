@@ -7535,6 +7535,22 @@ pub struct ForwardScanRequest {
     #[prost(uint64, tag = "6")]
     pub min_primary_seqno: u64,
 }
+/// One message of a forwarded `Vectors.BulkLoad` part (#1722 PR 3). The first carries
+/// `map_version`, `caller` and `partition`, and its `load` the index and `expected` (the
+/// client's, for the whole load); the later ones carry only `load.items`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForwardBulkLoadRequest {
+    /// The sending node's map version, as in `ForwardRequest`.
+    #[prost(uint64, tag = "1")]
+    pub map_version: u64,
+    #[prost(message, optional, tag = "2")]
+    pub caller: ::core::option::Option<ForwardedCaller>,
+    /// The partition to load: it must be this node's.
+    #[prost(string, tag = "3")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub load: ::core::option::Option<VectorBulkLoadRequest>,
+}
 /// The caller a forwarded call is for: never `admin` or `cluster`, since only data calls are
 /// forwarded.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -8201,6 +8217,35 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardMemoryWatch"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Node to node (#1722 PR 3, ICR 0138): one partition's part of a `Vectors.BulkLoad`
+        /// into an index on several partitions, which the sending node splits by id. Served as
+        /// this node's own `BulkLoad` of the partition, for the caller it names, only if its map
+        /// gives it `partition`; each message reserves its share of the in-flight budget as a
+        /// client's does, on connections of their own, outside the `Cluster` calls' limit.
+        /// Cluster scope, gRPC only.
+        pub async fn forward_bulk_load(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::ForwardBulkLoadRequest,
+            >,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/ForwardBulkLoad",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "ForwardBulkLoad"));
+            self.inner.client_streaming(req, path, codec).await
+        }
         /// D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
@@ -8492,6 +8537,16 @@ pub mod cluster_server {
             tonic::Response<Self::ForwardMemoryWatchStream>,
             tonic::Status,
         >;
+        /// Node to node (#1722 PR 3, ICR 0138): one partition's part of a `Vectors.BulkLoad`
+        /// into an index on several partitions, which the sending node splits by id. Served as
+        /// this node's own `BulkLoad` of the partition, for the caller it names, only if its map
+        /// gives it `partition`; each message reserves its share of the in-flight budget as a
+        /// client's does, on connections of their own, outside the `Cluster` calls' limit.
+        /// Cluster scope, gRPC only.
+        async fn forward_bulk_load(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::ForwardBulkLoadRequest>>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
         /// D317 ticket 6: marks a partition open here fenced, a local flag persisted beside the map
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
@@ -8980,6 +9035,54 @@ pub mod cluster_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/ForwardBulkLoad" => {
+                    #[allow(non_camel_case_types)]
+                    struct ForwardBulkLoadSvc<T: Cluster>(pub Arc<T>);
+                    impl<
+                        T: Cluster,
+                    > tonic::server::ClientStreamingService<
+                        super::ForwardBulkLoadRequest,
+                    > for ForwardBulkLoadSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::ForwardBulkLoadRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::forward_bulk_load(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ForwardBulkLoadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

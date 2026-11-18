@@ -9,6 +9,7 @@
 //! partition's identity under it.
 
 mod backup;
+mod bulkfan;
 pub(crate) mod cli;
 pub(crate) mod close;
 pub(crate) mod fanout;
@@ -69,6 +70,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     NEAREST_QUALIFIERS_FEATURE,
     MEMORY_TOOL_FIELDS_FEATURE,
     REPLICAS_FEATURE,
+    INDEX_BULK_LOAD_FEATURE,
     LEASES_FEATURE,
 ];
 
@@ -84,6 +86,12 @@ pub(crate) const MEMORY_FEATURE: &str = "memory";
 /// [`MAP_FEATURES`]' name for `ClusterMap.indexes` (#1722, ICR 0138): a node without it
 /// would drop the field from the map it stores, and read as divergent.
 pub(crate) const INDEXES_FEATURE: &str = "indexes";
+
+/// [`MAP_FEATURES`]' name for a build that serves `Cluster.ForwardBulkLoad` (#1722 PR 3, ICR
+/// 0138): an entry node checks every node holding a part of the index for it before a
+/// `Vectors.BulkLoad` reads anything, so an older one refuses the load up front, not
+/// part way.
+pub(crate) const INDEX_BULK_LOAD_FEATURE: &str = "index_bulk_load";
 
 /// [`MAP_FEATURES`]' name for a build that applies `NearestRequest.qualifiers` (#1915 PR 3):
 /// a node without it would rank every qualifier.
@@ -191,6 +199,11 @@ pub(crate) static OLD_NEAREST: Mutex<Vec<(PathBuf, OldNearest)>> = Mutex::new(Ve
 /// by cluster directory: their `Status` leaves the feature out.
 #[cfg(test)]
 pub(crate) static OLD_MEMORY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests): nodes acting as a build before `ForwardBulkLoad` (#1722 PR 3), by
+/// cluster directory: their `Status` leaves `index_bulk_load` out.
+#[cfg(test)]
+pub(crate) static OLD_BULK_LOAD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// A fault seam (tests): nodes acting as a build before `ClusterMap.indexes` (#1722), by
 /// cluster directory: their `Status` leaves `indexes` out.
@@ -1368,6 +1381,16 @@ impl Node {
                         return false;
                     }
                     #[cfg(test)]
+                    if f == INDEX_BULK_LOAD_FEATURE
+                        && OLD_BULK_LOAD
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .any(|d| self.dir.starts_with(d))
+                    {
+                        return false;
+                    }
+                    #[cfg(test)]
                     if f == LEASES_FEATURE && fence::pre_lease(&self.dir) {
                         return false;
                     }
@@ -1928,6 +1951,49 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         )))
     }
 
+    /// Node to node: one partition's part of a `Vectors.BulkLoad` another node splits by id
+    /// (#1722 PR 3). Cluster scope; served for the caller it names, as this node's own load
+    /// of the partition, if this node's map gives it the partition. Mounted on a route of its
+    /// own behind `prepay`, outside the `Cluster` calls' small limit (a load runs for
+    /// minutes), so each message reserves its share of the in-flight budget as it arrives.
+    async fn forward_bulk_load(
+        &self,
+        req: Request<tonic::Streaming<proto::ForwardBulkLoadRequest>>,
+    ) -> Result<tonic::Response<proto::Empty>, Status> {
+        let peer = self.caller(&req, &[Scope::Cluster], "forward a bulk load")?;
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        self.0.catch_up(&peer, req.metadata()).await?;
+        let (budget, meter) = crate::serve::grpc::stream_budget(&req);
+        let limits = shared.limits;
+        let wait = crate::serve::grpc::grpc_timeout(req.metadata().as_ref())
+            .map_or(limits.request_timeout, |d| d.min(limits.request_timeout));
+        let mut stream = req.into_inner();
+        let Some(first) = stream.message().await? else {
+            return Err(ApiError::invalid(
+                "a forwarded BulkLoad's first message names its partition and index",
+            )
+            .into());
+        };
+        let caller = forward::caller_of(first.caller, &self.0.tokens)?;
+        let load = first
+            .load
+            .ok_or_else(|| ApiError::invalid("a forwarded BulkLoad carries no load"))?;
+        shared
+            .router
+            .serve_forwarded_bulk_load(
+                &first.partition,
+                load,
+                budget,
+                crate::serve::grpc::ForwardSource { stream, meter },
+                &caller,
+                wait,
+            )
+            .await?;
+        Ok(tonic::Response::new(proto::Empty {}))
+    }
+
     type ForwardScanStream =
         std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<proto::ScanPage, Status>> + Send>>;
 
@@ -2034,7 +2100,23 @@ pub(crate) fn routes(
             Some(Arc::clone(shared)),
         ))
         .max_decoding_message_size(max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE));
-        (feeds, watches)
+        // A BulkLoad's part (#1722 PR 3): a client stream, metered by `prepay` as a client's
+        // `Vectors.BulkLoad` is, and outside the limit below, since a load runs for minutes.
+        let loads = tower::ServiceBuilder::new()
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(shared),
+                crate::serve::grpc::prepay,
+            ))
+            .service(
+                proto::cluster_server::ClusterServer::new(ClusterGrpc(
+                    Arc::clone(&node),
+                    Some(Arc::clone(shared)),
+                ))
+                .max_decoding_message_size(
+                    max_request_bytes.saturating_add(forward::FORWARD_ENVELOPE),
+                ),
+            );
+        (feeds, watches, loads)
     });
     // A forward carries a call the entry node took within its `--max-request-bytes`, inside
     // an envelope (audit120's S-C2).
@@ -2054,9 +2136,10 @@ pub(crate) fn routes(
     }
     let app = app.layer(tower::limit::ConcurrencyLimitLayer::new(CLUSTER_CALLS));
     match streams {
-        Some((feeds, watches)) => app
+        Some((feeds, watches, loads)) => app
             .route_service(feed::FORWARD_SUBSCRIBE, feeds)
-            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches),
+            .route_service(memwatch::FORWARD_MEMORY_WATCH, watches)
+            .route_service(crate::serve::grpc::FORWARD_BULK_LOAD, loads),
         None => app,
     }
 }
