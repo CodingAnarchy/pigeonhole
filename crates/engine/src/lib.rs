@@ -41,6 +41,7 @@ mod flushed_roots;
 #[cfg(all(test, engine_loom))]
 mod flushed_through_loom;
 mod health;
+mod io_count;
 mod large;
 mod large_settle;
 mod load_slot;
@@ -75,7 +76,7 @@ pub use engine::{
     AppOwned, BackgroundWorker, CheckReturned, CommitInfo, CrossShardMetrics, DbInfo, Engine,
     EngineShard, FamilyInfo, FamilyStorage, FeedStorage, LatencyBuckets, LevelStorage, Metrics,
     PendingCheckReturning, PendingReturning, Previous, Returned, Role, ShardStats, TableInfo,
-    TableStorage,
+    TableStorage, TabletStats,
 };
 pub use error::{Error, Result};
 pub use feed_reader::all_tables_token_position;

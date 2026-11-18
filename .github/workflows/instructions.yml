@@ -33,6 +33,7 @@ on:
       - 'crates/bench/examples/feedshapes.rs'
       - 'crates/bench/examples/memshapes.rs'
       - 'crates/memory/**'
+      - 'crates/embed/**'
       - 'crates/bench/examples/serveshapes.rs'
       - 'crates/cli/src/serve/**'
       # The serve path is mostly third-party code (tonic, axum, hyper, h2): a dependency bump
@@ -208,10 +209,28 @@ jobs:
             hotrow: '-'
             shapes: >-
               serveshapes:serve-get,serve-read-row,serve-mutate,serve-scan
+          - name: embed instructions per text (callgrind)
+            # pigeonhole-embed's local model (#1828, crates/embed/examples/embedshapes.rs): a
+            # query and a batch of 2 passages, on the embedder's one pool thread, which the
+            # shape counts whole. An example of the embed crate, not the bench's, so the other
+            # jobs don't build candle. The model's files come from the embed-reference job's
+            # cache (ci.yml), or are downloaded once.
+            examples: embedshapes
+            package: pigeonhole-embed
+            exdir: crates/embed/examples
+            hotrow: '-'
+            shapes: >-
+              embedshapes:embed-query,embed-passages
     env:
       EXAMPLES: ${{ matrix.examples }}
       SHAPES: ${{ matrix.shapes }}
       HOTROW: ${{ matrix.hotrow }}
+      # The crate whose examples the job builds, and where they are (the bench's unless a job
+      # says otherwise: embedshapes is pigeonhole-embed's).
+      PACKAGE: ${{ matrix.package || 'pigeonhole-bench' }}
+      EXDIR: ${{ matrix.exdir || 'crates/bench/examples' }}
+      # pigeonhole-embed's model cache (the embed job's; unused by the others).
+      PIGEONHOLE_EMBED_CACHE: ${{ github.workspace }}/.embed-cache
     steps:
       - uses: actions/checkout@v5
         with:
@@ -248,6 +267,19 @@ jobs:
           DEBS_KEY: ${{ steps.debs-key.outputs.key }}
           DEBS_MATCHED: ${{ steps.debs.outputs.cache-matched-key }}
         run: scripts/install-valgrind.sh cached /tmp/valgrind-debs
+      # pigeonhole-embed's model files, for the embed job: the cache the embed-reference job
+      # (ci.yml) fills, under the same key (the model's pinned revision and file hashes), or
+      # a download through the crate's own test when there's none. Outside callgrind either way.
+      - name: the embed model's files
+        if: ${{ matrix.package == 'pigeonhole-embed' }}
+        id: embed-model
+        uses: actions/cache/restore@v5
+        with:
+          path: .embed-cache
+          key: embed-bge-small-en-v1.5-5c38ec7c-3c9f31665447-d241a60d5e8f-094f8e891b93
+      - name: download the embed model (no cache)
+        if: ${{ matrix.package == 'pigeonhole-embed' && steps.embed-model.outputs.cache-hit != 'true' }}
+        run: cargo test --release -p pigeonhole-embed --test download -- --ignored
       - name: build the examples (head and base)
         shell: bash
         run: |
@@ -263,7 +295,7 @@ jobs:
           flags=() srcs=()
           for e in $EXAMPLES; do
             flags+=(--example "$e")
-            srcs+=("crates/bench/examples/$e.rs")
+            srcs+=("$EXDIR/$e.rs")
           done
           mkdir -p /tmp/bin-head /tmp/bin-base
           # Default features of every crate, always: the counts must be what a user of the
@@ -273,22 +305,24 @@ jobs:
           # one exception is `pigeonhole-cli` (serveshapes): its defaults are the `phdb`
           # binary's allocator (`jemalloc`) and the embedding client (`embed`), neither part of
           # the library's serve path (crates/bench/Cargo.toml says why).
-          cargo build --release -p pigeonhole-bench "${flags[@]}"
+          cargo build --release -p "$PACKAGE" "${flags[@]}"
           for e in $EXAMPLES; do cp "target/release/examples/$e" /tmp/bin-head/; done
           git worktree add -q /tmp/base "$base"
-          cp "${srcs[@]}" /tmp/base/crates/bench/examples/
+          mkdir -p "/tmp/base/$EXDIR"
+          cp "${srcs[@]}" "/tmp/base/$EXDIR/"
           # Shared example modules (the `Measured` guard), also at the head's version.
           cp -R crates/bench/examples/support /tmp/base/crates/bench/examples/
           # A PR whose new shapes use an API it adds (D314's commit_returning) can't build the
           # head's examples against base: base then builds its own, and runs only the shapes it
           # has a ceiling for. The new shapes show as new, with no base count.
-          if ! (cd /tmp/base && cargo build --release -p pigeonhole-bench "${flags[@]}" \
+          if ! (cd /tmp/base && cargo build --release -p "$PACKAGE" "${flags[@]}" \
             --target-dir "$GITHUB_WORKSPACE/target"); then
             # Shapes whose example code differs from base's are then compared across different
             # code: name the files, and the count step marks their shapes not comparable.
-            git diff --name-only "$base" HEAD -- crates/bench/examples > /tmp/examples-differ
+            git diff --name-only "$base" HEAD -- crates/bench/examples "$EXDIR" > /tmp/examples-differ
             echo "::notice::base can't build the head's examples (they use an API this PR adds): base runs its own examples; files that differ: $(tr '\n' ' ' < /tmp/examples-differ)"
             git -C /tmp/base checkout -q -- crates/bench/examples
+            git -C /tmp/base checkout -q -- "$EXDIR" 2>/dev/null || true
             # Only the examples base has: an example new in this PR has no base count (its
             # shapes show as new), and the target directory still holds the head's binary of
             # it, which must not be copied as base's.
@@ -296,14 +330,14 @@ jobs:
             for e in $EXAMPLES; do
               # Base's tree, not its directory: the head's copy of a new example is still
               # there, untracked.
-              if git -C /tmp/base cat-file -e "HEAD:crates/bench/examples/$e.rs" 2>/dev/null; then
+              if git -C /tmp/base cat-file -e "HEAD:$EXDIR/$e.rs" 2>/dev/null; then
                 built+=("$e")
               fi
             done
             if [ "${#built[@]}" -gt 0 ]; then
               bflags=()
               for e in "${built[@]}"; do bflags+=(--example "$e"); done
-              (cd /tmp/base && cargo build --release -p pigeonhole-bench "${bflags[@]}" \
+              (cd /tmp/base && cargo build --release -p "$PACKAGE" "${bflags[@]}" \
                 --target-dir "$GITHUB_WORKSPACE/target")
             fi
             touch /tmp/base-own-examples
@@ -400,7 +434,8 @@ jobs:
             if grep -q '^crates/bench/examples/support/' /tmp/examples-differ; then
               echo ALL > /tmp/differ-bins
             else
-              sed -n 's|^crates/bench/examples/\([^/]*\)\.rs$|\1|p' /tmp/examples-differ > /tmp/differ-bins
+              sed -n -e 's|^crates/bench/examples/\([^/]*\)\.rs$|\1|p' \
+                -e "s|^$EXDIR/\\([^/]*\\)\\.rs\$|\\1|p" /tmp/examples-differ | sort -u > /tmp/differ-bins
             fi
           fi
           : > /tmp/shape-bins

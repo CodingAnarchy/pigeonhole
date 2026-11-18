@@ -544,3 +544,10 @@ serve-get 58736 0.3
 serve-read-row 579796 0.3
 serve-mutate 58700 0.3
 serve-scan 6766417 0.3
+# #1828 (#2060): pigeonhole-embed's local model (crates/embed/examples/embedshapes.rs), per text,
+# on the embedder's one pool thread with candle's own pool and core count pinned
+# (CANDLE_NUM_THREADS=1, RAYON_NUM_THREADS=1). From head 6f555e52e, run 44286545174, base and
+# head of identical code: embed-query 220823303 / 220832518, embed-passages 307248946 /
+# 307248952 (0.004% and 0.000%). The head's times 1.003.
+embed-query 221495016 0.3
+embed-passages 308170699 0.3

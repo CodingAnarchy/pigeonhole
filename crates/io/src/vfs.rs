@@ -45,6 +45,10 @@ pub struct ProcessId {
 ///
 /// Held as [`VfsRef`] (`Arc<dyn Vfs>`). Dynamic dispatch is fine here: every call is an I/O
 /// or a clock read, never a per-cell operation.
+///
+/// A method added here must also be forwarded by the engine's counting wrapper,
+/// `CountingVfs` (pigeonhole-engine's `io_count.rs`, D332): a defaulted method it doesn't
+/// forward would silently take the default under it (nowait reads off, no ring stats).
 pub trait Vfs: Send + Sync + Debug {
     /// Opens a file.
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef>;

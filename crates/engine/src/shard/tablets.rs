@@ -1350,7 +1350,7 @@ impl ShardState {
         trace!("shard {} tablet timer armed for {deadline}", self.id.0);
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             deadline,
             Arc::clone(&state),
             ctx.submitter(self.id).clone(),
@@ -1915,6 +1915,10 @@ impl ShardState {
             l.ewma = LOAD_ALPHA * l.writes as f64 + (1.0 - LOAD_ALPHA) * l.ewma;
             l.slow = SLOW_ALPHA * l.writes as f64 + (1.0 - SLOW_ALPHA) * l.slow;
         }
+        // Each tablet's load, for `Engine::tablets` (D332): stored whole, read by any thread.
+        self.shared.tablet_loads[usize::from(self.id.0)].store(Arc::new(
+            self.loads.iter().map(|(id, l)| (*id, l.ewma)).collect(),
+        ));
         self.note_arrivals(now);
         let (_, mem_per) = self.mem_bytes();
         self.measure_busy(now);
@@ -2740,7 +2744,7 @@ impl ShardState {
         }
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             self.next_balance,
             Arc::clone(&state),
             ctx.submitter(self.id).clone(),
@@ -3294,6 +3298,21 @@ fn row_of_key(key: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     Escaped::new(key.get(..n.checked_sub(2)?)?).unescape_into(&mut out);
     Some(out)
+}
+
+/// Bytes of SSTs `t` references, each shared one divided by the tablets referencing it
+/// (`Engine::tablets`, D332): summed over the tablets, every SST counts once.
+pub(crate) fn shared_bytes(view: &View, t: &TabletEntry, refs: &HashMap<SstId, usize>) -> u64 {
+    let mut bytes = 0;
+    for f in view.catalog.family_ids_of(t.table) {
+        if let Some(fam) = view.ssts.family(t.id, f) {
+            for sst in fam.iter() {
+                let n = refs.get(&sst.meta.id).copied().unwrap_or(1).max(1) as u64;
+                bytes += sst.meta.len / n;
+            }
+        }
+    }
+    bytes
 }
 
 /// Bytes of SSTs `t` references, and whether any of them is shared with another tablet.

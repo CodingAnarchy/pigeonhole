@@ -102,6 +102,10 @@ struct TimedFile {
 }
 
 impl File for TimedFile {
+    // Forwarded, so the engine's device-byte counting (D332) runs as in production.
+    fn count_into(&self, counters: std::sync::Arc<pigeonhole_io::IoCounters>) {
+        self.inner.count_into(counters);
+    }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.clock
             .0

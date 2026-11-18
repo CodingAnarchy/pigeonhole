@@ -119,6 +119,12 @@ impl File for InlineFile {
         self.inner.write_at(buf, offset)
     }
 
+    // Forwarded, so the engine's device-byte counting runs here as it does in production
+    // (D332): the callgrind shapes measure it.
+    fn count_into(&self, counters: std::sync::Arc<pigeonhole_io::IoCounters>) {
+        self.inner.count_into(counters);
+    }
+
     fn direct_align(&self) -> Option<usize> {
         self.inner.direct_align()
     }
