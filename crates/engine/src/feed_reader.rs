@@ -325,12 +325,15 @@ enum Item {
         seqno: Seqno,
         ts: Timestamp,
         changes: Raws,
+        /// Feed-silent, for a reader that includes them (D331): noted once it's kept.
+        silent: bool,
     },
     Prepare {
         id: Seqno,
         changes: Raws,
         /// An external share (D329): see [`Held::external`].
         external: bool,
+        silent: bool,
     },
     Decision {
         id: Seqno,
@@ -731,9 +734,10 @@ pub struct FeedReader {
     /// last commit delivered was one.
     include_silent: bool,
     out_silent: bool,
-    /// With `include_silent`, the silent commits read and not yet delivered: a single
+    /// With `include_silent`, the silent commits read, kept and not yet delivered: a single
     /// commit's seqno, a round's id. Kept beside the records, not in them, so a reader that
-    /// doesn't include them carries nothing for it (#2055's feed shapes).
+    /// doesn't include them carries nothing for it (#2055's feed shapes). Noted only where a
+    /// commit is kept (ready or held) and removed with it, so it's bounded by what's kept.
     silent_seen: HashSet<Seqno>,
     /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
     /// delivered, in order; the last one delivered (its root sequence, in the token); how far
@@ -1727,6 +1731,14 @@ impl FeedReader {
         self.out_silent
     }
 
+    /// The silent notes held now (test hook): bounded by the commits ready or held, so
+    /// empty once a feed has drained.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn notes(&self) -> usize {
+        self.silent_seen.len()
+    }
+
     /// The last delivered seqno: every commit at or below it was delivered (or precedes the
     /// feed's start).
     pub fn delivered(&self) -> Seqno {
@@ -2111,6 +2123,7 @@ impl FeedReader {
         }
         self.ready.clear();
         self.held.clear();
+        self.silent_seen.clear();
         self.starts = Starts::default();
         let a = &mut self.ahead;
         a.bytes = 0;
@@ -2370,7 +2383,12 @@ impl FeedReader {
                 self.raise_session(session);
             }
             match item {
-                Item::Single { seqno, ts, changes } => {
+                Item::Single {
+                    seqno,
+                    ts,
+                    changes,
+                    silent,
+                } => {
                     if seqno <= self.delivered {
                         let st = &mut self.streams[s];
                         st.delivered_end = st.delivered_end.max(end);
@@ -2383,6 +2401,11 @@ impl FeedReader {
                         }
                         self.expired = Some(gap(seqno));
                         return Ok(false);
+                    }
+                    // Noted only once it's kept: a commit re-read at or below what was
+                    // delivered, or skipped, leaves no note behind.
+                    if silent {
+                        self.silent_seen.insert(seqno);
                     }
                     self.insert_ready(
                         seqno,
@@ -2408,7 +2431,11 @@ impl FeedReader {
                     id,
                     changes,
                     external,
+                    silent,
                 } => {
+                    if silent {
+                        self.silent_seen.insert(id);
+                    }
                     let h = Held {
                         stream: s,
                         start,
@@ -2462,11 +2489,9 @@ impl FeedReader {
                 Item::Abort { id } => {
                     // Its shares are never delivered; the abort's own seqno holds nothing, so
                     // the frontier passes it as any seqno with no event (ICR 0140's E1).
+                    // Nor is it a silent commit to report (simp724's N2 on #2055): its note
+                    // goes with its shares.
                     self.remove_held(id);
-                    // Nor is it a silent commit to report (simp724's N2 on #2055).
-                    if self.include_silent {
-                        self.silent_seen.remove(&id);
-                    }
                 }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
@@ -2542,10 +2567,6 @@ impl FeedReader {
             | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
-        // D331: a reader that includes silent commits notes each one, for `emit`.
-        if include_silent {
-            note_silent(&record, &mut self.silent_seen);
-        }
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
             // Its round's apply seqno is above its id.
@@ -2567,11 +2588,13 @@ impl FeedReader {
                 seqno,
                 ts: commit_ts,
                 changes: filter(batch)?,
+                silent: include_silent && batch.is_silent(),
             },
             WalRecord::Prepare { seqno, batch, .. } => Item::Prepare {
                 id: seqno,
                 changes: filter(batch)?,
                 external: false,
+                silent: include_silent && batch.is_silent(),
             },
             // D329: an external share is held as a D263 one is, delivered at its Decision's
             // apply seqno, or dropped by its abort.
@@ -2580,6 +2603,7 @@ impl FeedReader {
                     id: seqno,
                     changes: filter(batch)?,
                     external: true,
+                    silent: include_silent && batch.is_silent(),
                 },
                 None => Item::Other,
             },
@@ -2635,6 +2659,9 @@ impl FeedReader {
             self.ahead.bytes -= held_bytes(&h);
             shares.push(h);
         }
+        // Its note goes with its shares: a round dropped, evicted or decided below what was
+        // delivered leaves none behind.
+        self.silent_seen.remove(&id);
         shares
     }
 
@@ -3563,27 +3590,6 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
         ));
     }
     Ok((h.db_id, h.delivered, h.catalog_seq))
-}
-
-/// Notes `record`'s key in `seen` if it's a feed-silent commit (D331): a single commit's
-/// seqno, a round's share by its id. Only for a reader that includes them, out of line.
-#[cold]
-#[inline(never)]
-fn note_silent(record: &WalRecord<'_>, seen: &mut HashSet<Seqno>) {
-    let key = match record {
-        WalRecord::Batch { seqno, batch, .. } | WalRecord::Prepare { seqno, batch, .. }
-            if batch.is_silent() =>
-        {
-            *seqno
-        }
-        WalRecord::ExternalPrepare { seqno, share, .. }
-            if share.batch().is_some_and(|b| b.is_silent()) =>
-        {
-            *seqno
-        }
-        _ => return,
-    };
-    seen.insert(key);
 }
 
 /// A feed-silent batch a feed read (D331, ICR 0141): `Corruption` unless the database has

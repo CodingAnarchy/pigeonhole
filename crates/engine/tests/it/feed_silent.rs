@@ -396,3 +396,36 @@ fn a_rebuilt_silent_batch_stays_silent() {
     assert!(has(&db, &a, b"big"));
     db.close().unwrap();
 }
+
+/// A reader that includes silent commits notes each one only where it keeps it, so its notes
+/// are bounded by what's ready or held: none once it has drained. Silent commits it reads
+/// but passes (at or below where it starts, or in a round it drops) leave no note behind,
+/// where #2055's reader kept one for good.
+#[test]
+fn silent_notes_are_bounded_by_what_the_reader_keeps() {
+    let vfs = SimVfs::new(3317);
+    let db = open(&vfs);
+    let (a, b) = tables(&db);
+    // Before the start: single commits and cross-shard rounds, silent, then a plain one.
+    for i in 0..4u8 {
+        commit(&db, &[(&a, &[b'p', i])], true);
+        commit(&db, &[(&a, &[b'x', i]), (&b, &[b'y', i])], true);
+    }
+    let start = commit(&db, &[(&a, b"start")], false);
+    let mut all = db.feed(spec(&[&a, &b], FeedStart::After(start))).unwrap();
+    all.include_silent();
+    assert!(drain(&mut all).is_empty());
+    assert_eq!(all.notes(), 0, "silent commits read below the start");
+    // After it: delivered silent commits, single and round, and one of another table only.
+    let c = db
+        .create_table("c", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let s1 = commit(&db, &[(&a, b"s1")], true);
+    let r1 = commit(&db, &[(&a, b"r-a"), (&b, b"r-b")], true);
+    commit(&db, &[(&c, b"other")], true);
+    let p = commit(&db, &[(&b, b"plain")], false);
+    assert_eq!(drain(&mut all), [(s1, true), (r1, true), (p, false)]);
+    assert_eq!(all.notes(), 0, "delivered and passed-over silent commits");
+    drop(all);
+    db.close().unwrap();
+}
