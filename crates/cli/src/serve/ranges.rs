@@ -484,6 +484,9 @@ pub(crate) struct RangeGate {
     pending: std::sync::atomic::AtomicBool,
     /// The visible seqno of the file when its rows here were read ([`load_rows_at`]).
     rows_at: std::sync::atomic::AtomicU64,
+    /// Bumped whenever the serving rows change (PR 3b): a running cluster component of the
+    /// partition looks for a new hand-over's barrier when it moves.
+    serving_version: std::sync::atomic::AtomicU64,
 }
 
 impl RangeGate {
@@ -503,6 +506,8 @@ impl RangeGate {
     pub(crate) fn load_rows(&self, moved: Vec<Moved>, serving: Vec<Moved>) {
         *self.moved() = moved;
         *self.serving() = serving;
+        self.serving_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// [`load_rows`](Self::load_rows) for rows read at the file's visible seqno `visible`,
@@ -523,6 +528,7 @@ impl RangeGate {
         *m = moved;
         *self.serving() = serving;
         self.rows_at.store(visible, Ordering::Release);
+        self.serving_version.fetch_add(1, Ordering::Release);
         true
     }
 
@@ -535,6 +541,15 @@ impl RangeGate {
         let mut serving = self.serving();
         serving.retain(|m| m.id != row.id);
         serving.push(row);
+        self.serving_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The serving rows' version ([`serving_version`]): one load.
+    #[inline]
+    pub(crate) fn serving_version(&self) -> u64 {
+        self.serving_version
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The moved-away rows the file holds, for a cluster component of a table moved away

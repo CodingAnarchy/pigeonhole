@@ -2284,6 +2284,16 @@ pub(crate) struct Barrier {
 struct Barriers {
     pending: std::collections::VecDeque<Barrier>,
     held: Option<Out>,
+    /// A cluster component of a cluster partition (PR 3b): its partition's gate and its
+    /// tables, so a hand-over the partition takes while the component runs (its serving
+    /// row written at CLEANING) adds that barrier too, not only those known at its open.
+    watch: Option<(Arc<super::gate::WriteGate>, Vec<String>)>,
+    /// The gate's serving rows' version last looked at, the moves already barriered, and the
+    /// last seqno handed out (a barrier at or past it still comes in time).
+    version: u64,
+    known: Vec<String>,
+    last: u64,
+
     /// A component of tables a range move took from its partition whole: it ends, cleanly
     /// for the merge (`MovedAway`), once it has handed out an event at or past this seqno.
     ends_at: Option<u64>,
@@ -2291,9 +2301,85 @@ struct Barriers {
     done: Option<bool>,
 }
 
+/// A hold seam (tests): a one-shot closure a component of the named partition runs between
+/// reading an event and loading its gate's serving-row version (D331 PR 3b, feed1248's
+/// point 1), so a test can take a hand-over exactly there. A no-op when unset.
+#[cfg(test)]
+pub(crate) static AFTER_READ: std::sync::Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(None);
+
 impl Barriers {
-    /// `out` is going out: past `ends_at`, the component ends next.
+    /// Runs [`AFTER_READ`]'s closure, if it's set for this component's partition.
+    #[cfg(test)]
+    fn after_read(&self) {
+        let Some((gate, _)) = &self.watch else {
+            return;
+        };
+        let hook = {
+            let mut slot = AFTER_READ
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match slot.take() {
+                Some((p, f)) if p == gate.partition() => Some(f),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
+        if let Some(f) = hook {
+            f();
+        }
+    }
+
+    /// The barriers a hand-over taken since the last look adds (one load while none was).
+    fn refresh(&mut self) {
+        let Some((gate, tables)) = &self.watch else {
+            return;
+        };
+        let version = gate.ranges().serving_version();
+        if version == self.version {
+            return;
+        }
+        self.version = version;
+        let mut added = false;
+        for m in gate.ranges().serving_rows() {
+            if m.token.is_empty() || !tables.contains(&m.table) || self.known.contains(&m.id) {
+                continue;
+            }
+            self.known.push(m.id.clone());
+            // Already past its `t_from` (events of the partition's other ranges, read between
+            // the hand-over's token and its row): the range takes writes only once the gate
+            // opens, after the row, so the barrier still comes before any of them, now, and
+            // without a token, so the merge's position for the component doesn't move
+            // (feed1248's point 2: a token past `t_from` checkpointed while held would let a
+            // resume start past the barrier).
+            let (t_from, token) = if m.seqno < self.last {
+                (self.last, Bytes::new())
+            } else {
+                (m.seqno, m.token.into())
+            };
+            self.pending.push_back(Barrier {
+                t_from,
+                token,
+                move_id: m.id,
+                source: m.source,
+                final_seqno: m.final_seqno,
+            });
+            added = true;
+        }
+        if added {
+            self.pending
+                .make_contiguous()
+                .sort_by(|a, b| (a.t_from, &a.move_id).cmp(&(b.t_from, &b.move_id)));
+        }
+    }
+
+    /// `out` is going out: past `ends_at`, the component ends next; and its position.
     fn passed(&mut self, out: &Out) {
+        if let Some(s) = crate::serve::cluster::token::token_seqno(out.token()) {
+            self.last = self.last.max(s);
+        }
         if let Some(end) = self.ends_at
             && crate::serve::cluster::token::token_seqno(out.token()).is_some_and(|s| s >= end)
         {
@@ -2304,8 +2390,9 @@ impl Barriers {
     /// The barrier due before `out`, if one is: the next one, when `out`'s token is past its
     /// `t_from`.
     fn due(&mut self, out: &Out) -> Option<Barrier> {
+        let next = self.pending.front()?;
         let seqno = crate::serve::cluster::token::token_seqno(out.token())?;
-        if self.pending.front().is_some_and(|b| seqno > b.t_from) {
+        if seqno > next.t_from {
             self.pending.pop_front()
         } else {
             None
@@ -2497,20 +2584,29 @@ impl FeedEvents {
     /// replaces a check once the subscribe is in place (feed1248's F3, `still_leased`), since
     /// a lease that lapsed between the subscribe's checks and its first poll ends it here.
     /// Carries `barriers` (D331 PR 3b): each handed out just before the first event past its
-    /// `t_from`. Sorted here.
-    /// And ends past `ends_at`, if set, with `MovedAway` (D331 PR 3b).
+    /// `t_from`. Sorted here. Ends past `ends_at`, if set, with `MovedAway`. With `watch`, a
+    /// cluster partition's gate and the component's tables, it takes a hand-over's barrier
+    /// while it runs too.
     pub(crate) fn with_barriers(
         mut self,
         mut barriers: Vec<Barrier>,
         ends_at: Option<u64>,
+        watch: Option<(Arc<super::gate::WriteGate>, Vec<String>)>,
     ) -> Self {
-        if barriers.is_empty() && ends_at.is_none() {
+        if barriers.is_empty() && ends_at.is_none() && watch.is_none() {
             return self;
         }
         barriers.sort_by(|a, b| (a.t_from, &a.move_id).cmp(&(b.t_from, &b.move_id)));
+        let version = watch
+            .as_ref()
+            .map_or(0, |(g, _)| g.ranges().serving_version());
         self.2 = Some(Box::new(Barriers {
+            known: barriers.iter().map(|b| b.move_id.clone()).collect(),
             pending: barriers.into(),
             held: None,
+            watch,
+            version,
+            last: 0,
             ends_at,
             done: None,
         }));
@@ -2551,6 +2647,14 @@ impl FeedEvents {
         let out = self.as_mut().poll_out_inner(cx);
         if let Poll::Ready(Some(Ok(event))) = out {
             let barriers = self.2.as_mut().expect("checked above");
+            // After the read, before the send (feed1248's point 1): the hand-over writes its
+            // serving row (bumping the version, Release) before its gate opens the range, so
+            // a commit of the range this read returned was published after it, and the
+            // reader's Acquire of that commit happens before this load (Acquire), which sees
+            // the row. A load before the read could miss it and send the commit unheld.
+            #[cfg(test)]
+            barriers.after_read();
+            barriers.refresh();
             return Poll::Ready(Some(Ok(match barriers.due(&event) {
                 Some(b) => {
                     barriers.held = Some(event);
@@ -2768,6 +2872,7 @@ mod tests {
                 barrier(5, "mv0"),
             ],
             Some(15),
+            None,
         );
         let mut seen = Vec::new();
         loop {
@@ -2803,6 +2908,63 @@ mod tests {
             ]
         );
         assert!(next_out(&mut events).await.is_none(), "and nothing after");
+    }
+
+    /// D331 PR 3b (feed1248's point 1): a hand-over taken between a running component's
+    /// read of an event and its look at the serving rows still puts the barrier before that
+    /// event. Mutant: load the version before the read, and this fails (the event goes out
+    /// unheld).
+    #[tokio::test]
+    async fn a_hand_over_taken_after_a_read_still_puts_its_barrier_first() {
+        use crate::serve::gate::{LeaseClock, WriteGate};
+        let token = |seqno: u64| {
+            let mut t = vec![1u8];
+            t.extend_from_slice(&[7u8; 16]);
+            t.extend_from_slice(&1u32.to_le_bytes());
+            t.extend_from_slice(&seqno.to_le_bytes());
+            Bytes::from(t)
+        };
+        let gate = WriteGate::opened("seam-p", false, Arc::new(LeaseClock::default()));
+        let (sink, events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        sink.put(Out::event(proto::FeedEvent {
+            token: token(20),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let mut events = events.with_barriers(
+            Vec::new(),
+            None,
+            Some((Arc::clone(&gate), vec!["users".into()])),
+        );
+        let hand_over = {
+            let gate = Arc::clone(&gate);
+            let token = token(10);
+            move || {
+                gate.ranges().add_serving(crate::serve::ranges::Moved {
+                    id: "mv1".into(),
+                    table: "users".into(),
+                    start: b"c".to_vec(),
+                    end: Some(b"f".to_vec()),
+                    seqno: 10,
+                    source: "p1".into(),
+                    final_seqno: 99,
+                    token: token.to_vec(),
+                    ..Default::default()
+                });
+            }
+        };
+        *AFTER_READ.lock().unwrap() = Some(("seam-p".into(), Box::new(hand_over)));
+        let first = next_out(&mut events).await.unwrap().unwrap().into_proto();
+        assert!(
+            matches!(first.event, Some(proto::feed_event::Event::MoveBarrier(_))),
+            "the barrier first: {first:?}"
+        );
+        let second = next_out(&mut events).await.unwrap().unwrap().into_proto();
+        assert_eq!(
+            crate::serve::cluster::token::token_seqno(&second.token),
+            Some(20)
+        );
     }
 
     /// D326 PR 2 (feed1248's F2, F3 and F5): a cluster partition's component delivers only

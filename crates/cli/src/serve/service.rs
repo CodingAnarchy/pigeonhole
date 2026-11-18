@@ -4737,13 +4737,22 @@ impl Service {
                 Some(gate) => events.leased(Arc::clone(gate)),
                 None => Ok(events),
             })
-            .map(|events| events.with_barriers(barriers, ends_at))
+            .map(|events| {
+                // A cluster component of a cluster partition watches for a hand-over it
+                // takes while running (D331 PR 3b).
+                let watch = self
+                    .gate
+                    .as_ref()
+                    .filter(|_| announce)
+                    .map(|g| (Arc::clone(g), names.clone()));
+                events.with_barriers(barriers, ends_at, watch)
+            })
     }
 
     /// The range moves' hand-overs a cluster component of `tables` here carries (D331 PR
-    /// 3b): one barrier for each serving row of these tables whose `t_from` is at or past the
-    /// component's start. `from_hand_over` first sets `r`'s start to the earliest of their
-    /// tokens. None on a partition no move gave a range.
+    /// 3b): one barrier for each serving row of these tables, whatever the start.
+    /// `from_hand_over` first sets `r`'s start to the earliest of their tokens. None on a
+    /// partition no move gave a range.
     fn hand_overs(
         &self,
         tables: &[String],
@@ -4769,17 +4778,25 @@ impl Service {
             })?;
             r.start = Some(S::Resume(first.token.clone().into()));
         }
+        // Every start gets each row's barrier, wherever it starts (feed1248's point 2: a
+        // start past `t_from` may come from a checkpoint taken while the merge held the part,
+        // with the source still below `final_seqno`). One past `t_from` (or from now) carries
+        // no token, so the merge's position for the component stays where it starts; the
+        // merge lifts it at once once the source's part is past `final_seqno`, gone or absent.
         let from = match &r.start {
-            None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => return Ok(Vec::new()),
+            None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => u64::MAX,
             Some(S::FromOldest(true)) => 0,
             Some(S::Resume(t)) => super::cluster::token::token_seqno(t).unwrap_or(0),
         };
         Ok(rows
             .into_iter()
-            .filter(|m| m.seqno >= from)
             .map(|m| super::feed::Barrier {
                 t_from: m.seqno,
-                token: m.token.into(),
+                token: if from <= m.seqno {
+                    m.token.into()
+                } else {
+                    prost::bytes::Bytes::new()
+                },
                 move_id: m.id,
                 source: m.source,
                 final_seqno: m.final_seqno,
