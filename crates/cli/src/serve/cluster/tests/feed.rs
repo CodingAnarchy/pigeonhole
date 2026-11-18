@@ -2038,3 +2038,174 @@ fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or
         exactly(&seen, &want);
     });
 }
+
+/// D331 PR 3b: `users` `[c, f)` moving from p1 to p2 at `phase` (none: done), as map
+/// `version`, with the move's last seqno `final_seqno` from HANDING_OVER on.
+fn moving_users(
+    ports: &[u16],
+    version: u64,
+    phase: Option<crate::serve::proto::MovePhase>,
+    final_seqno: u64,
+) -> ClusterMap {
+    use crate::serve::proto::{MoveKind, MovePhase, RangeMove};
+    let mut m = the_map(version, &[ports[0], ports[1], ports[2]]);
+    m.partitions.retain(|p| p.id != "p3");
+    let handed = phase.is_none_or(|p| p >= MovePhase::HandedOver);
+    if handed {
+        m.tables[0] = super::super::map::handed_over(&m.tables[0], b"c", Some(b"f"), "p2");
+        m.partitions[0].epoch = 2;
+    }
+    if let Some(phase) = phase {
+        m.moves.push(RangeMove {
+            id: "mv1".into(),
+            kind: MoveKind::Range as i32,
+            table: "users".into(),
+            start: Some(text("c")),
+            end: Some(text("f")),
+            from: "p1".into(),
+            to: "p2".into(),
+            phase: phase as i32,
+            final_seqno: if phase >= MovePhase::HandingOver {
+                final_seqno
+            } else {
+                0
+            },
+            handed_over_version: if handed { 5 } else { 0 },
+            ..Default::default()
+        });
+    }
+    m
+}
+
+/// D331 PR 3b (feed1248's race and point 2): a key's writes on a range's source come before
+/// its writes on the target in a cluster subscription across the hand-over, however the
+/// parts are read. A resume from a token before the source's last write, with the source's
+/// node down: the target's write after the hand-over isn't delivered (its part is held at
+/// the move's barrier) until the source comes back and delivers up to the move's last seqno.
+/// No barrier ever reaches the client. Mutant: give the target's component no barrier, and
+/// the target's write goes out while the source is down (the every-start rule's own mutant,
+/// a start past `t_from`, is `serve::service`'s `barriers_for` test).
+#[test]
+fn a_keys_writes_on_the_source_come_before_its_writes_on_the_target_across_a_hand_over() {
+    use crate::serve::proto::MovePhase;
+    bounded(Duration::from_secs(180), || {
+        let mut t = Three::start();
+        let ports = t.ports.clone();
+        let c = ports[2];
+        let (token, final_seqno) = t.rt.block_on(async {
+            let mut s = subscribe(
+                c,
+                SubscribeRequest {
+                    checkpoint_every: 1,
+                    ..users()
+                },
+            )
+            .await
+            .unwrap();
+            put_when_leased(c, "d").await;
+            let (first, _) = commits(&mut s, 1).await;
+            put(c, "d", "2").await;
+            let (last, _) = commits(&mut s, 1).await;
+            (first[0].token.clone().unwrap(), last[0].seqno)
+        });
+        t.rt.block_on(async {
+            for (version, phase) in [
+                (2, MovePhase::Copying),
+                (3, MovePhase::CatchingUp),
+                (4, MovePhase::HandingOver),
+                (5, MovePhase::HandedOver),
+                (6, MovePhase::Cleaning),
+            ] {
+                for port in &ports {
+                    client(*port)
+                        .await
+                        .push_map(crate::serve::proto::PushMapRequest {
+                            map: Some(moving_users(&ports, version, Some(phase), final_seqno)),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            // The range's write on p2 once it serves it.
+            eventually("p2 takes the range's writes", async || {
+                data(c)
+                    .await
+                    .mutate(MutateRequest {
+                        writes: Some(put_row("d", "3")),
+                        durability: 0,
+                    })
+                    .await
+                    .is_ok()
+            })
+            .await;
+        });
+        // The source's node goes down; the resume reads p2 alone for now.
+        t.stop(0);
+        t.rt.block_on(async {
+            let mut r = subscribe(
+                c,
+                SubscribeRequest {
+                    start: Some(Start::Resume(token.clone())),
+                    allow_partial: true,
+                    checkpoint_every: 1,
+                    ..users()
+                },
+            )
+            .await
+            .unwrap();
+            let mut early = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while let Ok(Ok(Some(e))) = tokio::time::timeout_at(deadline, r.message()).await {
+                assert!(
+                    !matches!(e.event, Some(Event::MoveBarrier(_))),
+                    "a barrier reached the client"
+                );
+                if let Some(Event::Commit(ch)) = &e.event {
+                    early.extend(
+                        ch.changes
+                            .iter()
+                            .map(|x| (e.partition.clone(), x.row.to_vec())),
+                    );
+                }
+            }
+            assert!(
+                !early.iter().any(|(_, row)| row == b"d"),
+                "p2's write to d went out with the source down: {early:?}"
+            );
+            drop(r);
+        });
+        t.restart(0);
+        t.rt.block_on(async {
+            let mut r = subscribe(
+                c,
+                SubscribeRequest {
+                    start: Some(Start::Resume(token)),
+                    allow_partial: true,
+                    checkpoint_every: 1,
+                    ..users()
+                },
+            )
+            .await
+            .unwrap();
+            let mut ds = Vec::new();
+            while ds.len() < 2 {
+                let e = tokio::time::timeout(Duration::from_secs(20), r.message())
+                    .await
+                    .expect("d's writes arrive")
+                    .unwrap()
+                    .expect("the stream goes on");
+                assert!(
+                    !matches!(e.event, Some(Event::MoveBarrier(_))),
+                    "a barrier reached the client"
+                );
+                if let Some(Event::Commit(ch)) = &e.event
+                    && ch.changes.iter().any(|x| x.row.as_ref() == b"d")
+                {
+                    ds.push((e.partition.clone(), ch.seqno));
+                }
+            }
+            assert_eq!(ds[0], ("p1".to_owned(), final_seqno), "{ds:?}");
+            assert_eq!(ds[1].0, "p2", "{ds:?}");
+        });
+    });
+}

@@ -688,6 +688,37 @@ impl<'a> Touch<'a> {
     }
 }
 
+/// The barriers a cluster component starting at `start` carries for serving rows `rows`
+/// (D331 PR 3b): every row's, wherever it starts (feed1248's point 2: a start past `t_from`
+/// may come from a checkpoint taken while the merge held the part, with the source still
+/// below `final_seqno`). One past `t_from` (or from now) carries no token, so the merge's
+/// position for the component stays where it starts; the merge lifts it at once once the
+/// source's part is past `final_seqno`, gone or absent.
+fn barriers_for(
+    rows: Vec<super::ranges::Moved>,
+    start: Option<&proto::subscribe_request::Start>,
+) -> Vec<super::feed::Barrier> {
+    use proto::subscribe_request::Start as S;
+    let from = match start {
+        None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => u64::MAX,
+        Some(S::FromOldest(true)) => 0,
+        Some(S::Resume(t)) => super::cluster::token::token_seqno(t).unwrap_or(0),
+    };
+    rows.into_iter()
+        .map(|m| super::feed::Barrier {
+            t_from: m.seqno,
+            token: if from <= m.seqno {
+                m.token.into()
+            } else {
+                prost::bytes::Bytes::new()
+            },
+            move_id: m.id,
+            source: m.source,
+            final_seqno: m.final_seqno,
+        })
+        .collect()
+}
+
 /// How a subscription of this server's database starts ([`Service::subscribe_part`]): a
 /// client's own on a single node (the default), or one partition's part of a cluster
 /// subscription.
@@ -4778,30 +4809,7 @@ impl Service {
             })?;
             r.start = Some(S::Resume(first.token.clone().into()));
         }
-        // Every start gets each row's barrier, wherever it starts (feed1248's point 2: a
-        // start past `t_from` may come from a checkpoint taken while the merge held the part,
-        // with the source still below `final_seqno`). One past `t_from` (or from now) carries
-        // no token, so the merge's position for the component stays where it starts; the
-        // merge lifts it at once once the source's part is past `final_seqno`, gone or absent.
-        let from = match &r.start {
-            None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => u64::MAX,
-            Some(S::FromOldest(true)) => 0,
-            Some(S::Resume(t)) => super::cluster::token::token_seqno(t).unwrap_or(0),
-        };
-        Ok(rows
-            .into_iter()
-            .map(|m| super::feed::Barrier {
-                t_from: m.seqno,
-                token: if from <= m.seqno {
-                    m.token.into()
-                } else {
-                    prost::bytes::Bytes::new()
-                },
-                move_id: m.id,
-                source: m.source,
-                final_seqno: m.final_seqno,
-            })
-            .collect())
+        Ok(barriers_for(rows, r.start.as_ref()))
     }
 
     /// The feed fan-out's limits: a cluster subscription's buffer and idle limit are a
@@ -5787,6 +5795,49 @@ mod text_part_tests {
             .unwrap();
         assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
         filled(&index, "x").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod barriers_for_tests {
+    use super::{barriers_for, proto};
+    use proto::subscribe_request::Start as S;
+
+    /// D331 PR 3b (feed1248's point 2): a component of a move's target gets the move's
+    /// barrier wherever it starts. At or before `t_from` it carries the hand-over's token;
+    /// past it (a checkpoint taken while the merge held the part) or from now, none, so the
+    /// merge's position doesn't move. Mutant: give only starts at or before `t_from` a
+    /// barrier, and the start past it gets none.
+    #[test]
+    fn every_start_gets_the_barrier() {
+        let token = |seqno: u64| {
+            let mut t = vec![1u8];
+            t.extend_from_slice(&[7u8; 16]);
+            t.extend_from_slice(&1u32.to_le_bytes());
+            t.extend_from_slice(&seqno.to_le_bytes());
+            t
+        };
+        let row = super::super::ranges::Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            seqno: 10,
+            source: "p1".into(),
+            final_seqno: 99,
+            token: token(10),
+            ..Default::default()
+        };
+        let at = |start: Option<S>| barriers_for(vec![row.clone()], start.as_ref());
+        let before = at(Some(S::Resume(token(5).into())));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].token.as_ref(), token(10).as_slice());
+        let exactly = at(Some(S::Resume(token(10).into())));
+        assert_eq!(exactly[0].token.as_ref(), token(10).as_slice());
+        for start in [Some(S::Resume(token(20).into())), None] {
+            let past = at(start);
+            assert_eq!(past.len(), 1, "a start past t_from still gets it");
+            assert!(past[0].token.is_empty());
+            assert_eq!((past[0].t_from, past[0].final_seqno), (10, 99));
+        }
     }
 }
 
