@@ -216,8 +216,6 @@ struct RawHead {
 struct Raws {
     heads: Box<[RawHead]>,
     bytes: Box<[u8]>,
-    /// From a feed-silent batch (D331), taken by a reader that includes them.
-    silent: bool,
 }
 
 /// A mutation of a [`Raws`].
@@ -269,17 +267,7 @@ fn alloc_size(n: usize) -> u64 {
 /// result's two allocations, the second fills them, so each is made once at its exact size
 /// and nothing outlives the call (a scratch buffer would keep the largest batch's size,
 /// outside the read-ahead's count: simp724's S1 on #1667).
-fn pack(
-    batch: BatchRef<'_>,
-    tables: &[TableId],
-    prefix: &[u8],
-    include_silent: bool,
-) -> Result<Raws> {
-    // A feed-silent batch (D331, ICR 0141) holds nothing for a subscription: its commit is
-    // passed over as one to other tables is, and the reader's position moves past it.
-    if batch.is_silent() && !include_silent {
-        return Ok(Raws::default());
-    }
+fn pack(batch: BatchRef<'_>, tables: &[TableId], prefix: &[u8]) -> Result<Raws> {
     let len = |b: &[u8]| {
         u32::try_from(b.len())
             .map_err(|_| Error::Corruption("a logged mutation's field is over 4 GiB".into()))
@@ -328,7 +316,6 @@ fn pack(
     Ok(Raws {
         heads: heads.into_boxed_slice(),
         bytes: bytes.into_boxed_slice(),
-        silent: batch.is_silent(),
     })
 }
 
@@ -744,6 +731,10 @@ pub struct FeedReader {
     /// last commit delivered was one.
     include_silent: bool,
     out_silent: bool,
+    /// With `include_silent`, the silent commits read and not yet delivered: a single
+    /// commit's seqno, a round's id. Kept beside the records, not in them, so a reader that
+    /// doesn't include them carries nothing for it (#2055's feed shapes).
+    silent_seen: HashSet<Seqno>,
     /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
     /// delivered, in order; the last one delivered (its root sequence, in the token); how far
     /// the sidecar is read; and the tables dropped by delivered changes, whose later changes
@@ -1301,6 +1292,7 @@ impl FeedReader {
             out: Commit::default(),
             include_silent: false,
             out_silent: false,
+            silent_seen: HashSet::new(),
             expired: None,
             failed: None,
             key,
@@ -2496,7 +2488,16 @@ impl FeedReader {
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        let filter = |batch: BatchRef<'_>| pack(batch, tables, prefix, include_silent);
+        // A feed-silent batch (D331, ICR 0141) holds nothing for a subscription: its commit is
+        // passed over as one to other tables is, and the reader's position moves past it.
+        // Checked here, not in `pack`, which stays as it was (#2055's feed shapes).
+        let filter = |batch: BatchRef<'_>| {
+            if !include_silent && batch.is_silent() {
+                Ok(Raws::default())
+            } else {
+                pack(batch, tables, prefix)
+            }
+        };
         let (start, end, session, record) = match self.streams[s].cursor.step()? {
             Step::Record {
                 start,
@@ -2534,6 +2535,24 @@ impl FeedReader {
             | WalRecord::ExternalPrepare { seqno, .. }
             | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
+        };
+        // D331: a reader that includes silent commits notes each one, for `emit`.
+        let silent_key = if include_silent {
+            match &record {
+                WalRecord::Batch { seqno, batch, .. } | WalRecord::Prepare { seqno, batch, .. }
+                    if batch.is_silent() =>
+                {
+                    Some(*seqno)
+                }
+                WalRecord::ExternalPrepare { seqno, share, .. }
+                    if share.batch().is_some_and(|b| b.is_silent()) =>
+                {
+                    Some(*seqno)
+                }
+                _ => None,
+            }
+        } else {
+            None
         };
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
@@ -2586,6 +2605,9 @@ impl FeedReader {
             },
             _ => Item::Other,
         };
+        if let Some(k) = silent_key {
+            self.silent_seen.insert(k);
+        }
         Ok(Some((start, end, session, key, item)))
     }
 
@@ -2752,6 +2774,7 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
+                    self.out_silent = self.include_silent && self.silent_seen.remove(&key);
                     (ts, Packs::One(changes))
                 }
                 Pending::Decided {
@@ -2765,6 +2788,7 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
+                    self.out_silent = self.include_silent && self.silent_seen.remove(&id);
                     match self.take_round(id, &participants, session) {
                         Round::Whole(raws) => (ts, Packs::Many(raws)),
                         Round::Dropped => {
@@ -2807,7 +2831,6 @@ impl FeedReader {
             self.out.seqno = key;
             self.out.ts = ts;
             self.out.changes.clear();
-            self.out_silent = packs.iter().any(|r| r.silent);
             // Takes change `$r` into the commit, or ends the reader (a blob gone, or an error).
             // One copy of the code in each loop below, so a feed of some tables runs exactly
             // the loop it ran before #1857's check.

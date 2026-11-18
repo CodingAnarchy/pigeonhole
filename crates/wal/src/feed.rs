@@ -536,11 +536,21 @@ impl FeedCursor {
                         let start = Lsn::new(epoch, last_end as u32);
                         let session = cur.session;
                         let cur = self.cur.as_ref().expect("checked above");
-                        let record = crate::decode_gated(
-                            cur.dec.record(),
-                            &mut self.silent_ok,
-                            self.silent_check.as_deref(),
-                        )?;
+                        let record = match WalRecord::decode_with(cur.dec.record(), self.silent_ok)
+                        {
+                            Ok(record) => record,
+                            // A feed-silent batch while the cursor doesn't take the mark: the
+                            // writer may have set `incompat` bit 3 since it opened, so ask
+                            // again, on this refusal only (simp724's N2 on #2055).
+                            Err(e)
+                                if pigeonhole_format::wal::is_silent_refusal(&e)
+                                    && self.silent_check.as_ref().is_some_and(|c| c()) =>
+                            {
+                                self.silent_ok = true;
+                                WalRecord::decode_with(cur.dec.record(), true)?
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
                         return Ok(Step::Record {
                             start,
                             end: Lsn::new(epoch, end as u32),

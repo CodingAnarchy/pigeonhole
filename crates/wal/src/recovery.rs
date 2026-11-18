@@ -328,7 +328,7 @@ impl Recovery {
             }
         }
         let cur = self.cur.as_ref().expect("a record was just decoded");
-        let record = crate::decode_gated(cur.dec.record(), &mut self.silent_ok, None)?;
+        let record = WalRecord::decode_with(cur.dec.record(), self.silent_ok)?;
         self.max_seqno = self.max_seqno.max(seqno_of(&record));
         Ok(Some((self.end, record)))
     }

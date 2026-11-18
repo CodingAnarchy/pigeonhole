@@ -5736,15 +5736,18 @@ impl Inner {
 
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
-        // A replica refuses its own writes first: a refused silent write sets no bit.
-        if !batch.logged() && self.replica.load(Ordering::Relaxed) {
+        if batch.logged() {
+            if batch.builder.is_silent() {
+                self.flag_silent()?;
+            }
+            return route_logged(batch, view);
+        }
+        // A replica refuses its own writes before a silent one's bit is set.
+        if self.replica.load(Ordering::Relaxed) {
             return Err(replica_refusal());
         }
         if batch.builder.is_silent() {
             self.flag_silent()?;
-        }
-        if batch.logged() {
-            return route_logged(batch, view);
         }
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
@@ -6035,6 +6038,8 @@ impl Inner {
     /// Sets `incompat` bit 3 in both superblock pages before the first feed-silent batch is
     /// routed (D331, ICR 0141), so every record carrying the mark is behind it: once per
     /// database, under the manifest writer's lock. Sticky (FORMAT §8.2).
+    #[cold]
+    #[inline(never)]
     fn flag_silent(&self) -> Result<()> {
         if self.shared.silent_flagged.load(Ordering::Acquire) {
             return Ok(());

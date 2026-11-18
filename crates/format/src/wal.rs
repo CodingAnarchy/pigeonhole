@@ -101,6 +101,22 @@ pub const SILENT_BATCH: u32 = 1 << 31;
 /// again on this one only.
 pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
 
+/// [`SILENT_WITHOUT_BIT`]'s error, out of the decoder's way.
+#[cold]
+#[inline(never)]
+fn silent_without_bit() -> Error {
+    Error::Corrupt {
+        what: SILENT_WITHOUT_BIT,
+    }
+}
+
+/// Whether `e` is [`WalRecord::decode_with`]'s refusal of a feed-silent batch's mark (and no
+/// other corruption): what a reader that may have opened before `incompat` bit 3 was set
+/// asks again on.
+pub fn is_silent_refusal(e: &Error) -> bool {
+    matches!(e, Error::Corrupt { what } if *what == SILENT_WITHOUT_BIT)
+}
+
 /// The header in frame 0 of every segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -970,6 +986,7 @@ impl WalRecord<'_> {
     /// A batch marked [`SILENT_BATCH`] is refused (`Corrupt`), as a build without D331 reads
     /// it: use [`decode_with`](Self::decode_with) where the superblock has
     /// [`INCOMPAT_FEED_SILENT`].
+    #[inline]
     pub fn decode(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
         Self::decode_with(bytes, false)
     }
@@ -977,14 +994,51 @@ impl WalRecord<'_> {
     /// As [`decode`](Self::decode), taking a batch's [`SILENT_BATCH`] mark when `silent_ok`
     /// (the database's superblock has [`INCOMPAT_FEED_SILENT`], D331). Without it a marked
     /// batch is `Corrupt`, so a stray bit is never read as the mark.
+    ///
+    /// The mark is checked where each batch is parsed, so a record costs what it did before
+    /// D331 but a flag test (#2055's feed-drain shape).
+    #[inline]
     pub fn decode_with(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
-        let record = Self::decode_any(bytes)?;
-        if !silent_ok && record.batch().is_some_and(|b| b.is_silent()) {
-            return Err(Error::Corrupt {
-                what: SILENT_WITHOUT_BIT,
-            });
+        let mut r = Reader::new(bytes, "wal record");
+        match r.u8()? {
+            1 => {
+                let (seqno, commit_ts) = (r.u64()?, r.u64()?);
+                let batch = BatchRef::new(r.rest())?;
+                if !silent_ok && batch.is_silent() {
+                    return Err(silent_without_bit());
+                }
+                Ok(WalRecord::Batch {
+                    seqno,
+                    commit_ts,
+                    batch,
+                })
+            }
+            2 => {
+                let (seqno, commit_ts, coordinator) = (r.u64()?, r.u64()?, StreamId(r.u32()?));
+                let batch = BatchRef::new(r.rest())?;
+                if !silent_ok && batch.is_silent() {
+                    return Err(silent_without_bit());
+                }
+                Ok(WalRecord::Prepare {
+                    seqno,
+                    commit_ts,
+                    coordinator,
+                    batch,
+                })
+            }
+            5 => {
+                let record = WalRecord::ExternalPrepare {
+                    seqno: r.u64()?,
+                    coordinator: StreamId(r.u32()?),
+                    share: ExternalShare::decode(r.rest(), true)?,
+                };
+                if !silent_ok && record.batch().is_some_and(|b| b.is_silent()) {
+                    return Err(silent_without_bit());
+                }
+                Ok(record)
+            }
+            _ => Self::decode_any(bytes),
         }
-        Ok(record)
     }
 
     /// The batch a record carries, if any: a Batch's, a Prepare's, or an external PREPARE's.
@@ -1149,8 +1203,9 @@ impl BatchBuilder {
     }
 
     /// Writes the encoded count: the mutations, with the silent mark.
+    #[inline]
     fn write_count(&mut self) {
-        let mark = if self.silent { SILENT_BATCH } else { 0 };
+        let mark = u32::from(self.silent) << 31;
         self.buf[..4].copy_from_slice(&(self.count | mark).to_le_bytes());
     }
 
@@ -1248,7 +1303,6 @@ impl BatchBuilder {
         BatchRef {
             bytes: &self.buf,
             count: self.count,
-            silent: self.silent,
         }
     }
 
@@ -1267,7 +1321,6 @@ impl BatchBuilder {
 pub struct BatchRef<'a> {
     bytes: &'a [u8],
     count: u32,
-    silent: bool,
 }
 
 impl<'a> BatchRef<'a> {
@@ -1278,10 +1331,10 @@ impl<'a> BatchRef<'a> {
     /// taken as the mark, so this is for batches built in memory: bytes read from a WAL file
     /// go through [`WalRecord::decode_with`] (or the WAL crate's readers), which refuse the
     /// mark without `incompat` bit 3, never straight through here (perf2's N2 on #2055).
+    #[inline]
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
         let mut r = Reader::new(bytes, "wal batch");
-        let raw = r.u32()?;
-        let (count, silent) = (raw & !SILENT_BATCH, raw & SILENT_BATCH != 0);
+        let count = r.u32()? & !SILENT_BATCH;
         let mut it = BatchIter {
             rest: r.rest(),
             remaining: count,
@@ -1295,11 +1348,7 @@ impl<'a> BatchRef<'a> {
                 what: "wal batch: trailing bytes",
             });
         }
-        Ok(Self {
-            bytes,
-            count,
-            silent,
-        })
+        Ok(Self { bytes, count })
     }
 
     /// The encoded bytes.
@@ -1317,9 +1366,11 @@ impl<'a> BatchRef<'a> {
         self.count == 0
     }
 
-    /// Whether the batch is feed-silent ([`SILENT_BATCH`], D331).
+    /// Whether the batch is feed-silent ([`SILENT_BATCH`], D331): read from its count's
+    /// top byte, so a `BatchRef` stays two words and a count (#2055's feed shapes).
+    #[inline]
     pub fn is_silent(&self) -> bool {
-        self.silent
+        self.bytes.get(3).is_some_and(|b| b & 0x80 != 0)
     }
 
     /// Iterates the mutations in insertion order.
