@@ -1137,6 +1137,12 @@ impl Node {
             self.fences
                 .retrying
                 .store(false, std::sync::atomic::Ordering::Release);
+            // Said, not silent (simp724's nit on D331 PR 2): a partition that asked for a
+            // lease here would otherwise hold it only until its first grant runs out.
+            eprintln!(
+                "phdb serve: the lease renewals can't start here (no runtime); the next \
+                 call from the node's runtime starts them"
+            );
             return;
         };
         let me = Arc::downgrade(self);
