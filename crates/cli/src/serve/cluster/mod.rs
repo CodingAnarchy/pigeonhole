@@ -37,6 +37,7 @@ mod tests;
 pub(crate) mod token;
 mod transfer;
 pub(crate) mod upload;
+pub(crate) mod writer;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +74,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     REPLICAS_FEATURE,
     INDEX_BULK_LOAD_FEATURE,
     LEASES_FEATURE,
+    WRITER_TERMS_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
 ];
 
@@ -137,6 +139,26 @@ pub(crate) fn has_replicas(map: &ClusterMap) -> bool {
 
 /// The map file in a node's directory.
 pub(crate) const MAP_FILE: &str = "cluster-map.json";
+/// The highest writer term this node voted for (D330), in decimal: written and synced before
+/// the vote is answered, so the term fence survives a restart (D330 amendment 1's M1).
+pub(crate) const WRITER_TERM_FILE: &str = "cluster-writer-term";
+
+/// The term in `dir`'s [`WRITER_TERM_FILE`]: 0 without one.
+pub(crate) fn read_voted(dir: &Path) -> Result<u64, String> {
+    match std::fs::read_to_string(dir.join(WRITER_TERM_FILE)) {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .map_err(|e| format!("{WRITER_TERM_FILE} isn't a writer term: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(format!("read {WRITER_TERM_FILE}: {e}")),
+    }
+}
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.writer`, `.writer_term` and `.failover` (D330): a
+/// node without it would drop them from its copy and read as divergent, so a map sets them
+/// only once every node reports it.
+pub(crate) const WRITER_TERMS_FEATURE: &str = "writer_terms";
 /// The lock file that keeps a directory to one server (or one `init-partition`).
 pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
@@ -296,6 +318,9 @@ struct Peers {
     push_timeout: Duration,
     /// `--cluster-lease-ms` (D326): how long a lease this node grants runs, on its clock.
     lease: Duration,
+    /// `--cluster-failover-after-ms` (D330): the margin a writer goes without its lease
+    /// before an election, 2·L by default.
+    failover_after: Duration,
 }
 
 /// A cluster node.
@@ -361,6 +386,15 @@ pub(crate) struct Node {
     /// that restarts, or another that takes over, checks again and waits from its own
     /// check.
     joint_seen: Mutex<Option<(u64, u64)>>,
+    /// This node's writer lease (D330), as its last round that granted it gave it: the term,
+    /// and when it ends on the lease clock (`(0, 0)`: none).
+    writer_lease: Mutex<(u64, u64)>,
+    /// The term this node was voted writer at, until its elected map lands (0: none): its
+    /// rounds renew that vote meanwhile.
+    candidate: std::sync::atomic::AtomicU64,
+    /// When this node first found an election due ([`Node::maybe_elect`]): it waits a margin
+    /// per smaller live id from there.
+    elect_since: Mutex<Option<tokio::time::Instant>>,
 }
 
 /// How long a node change's `SetMap` goes on pushing it, in push timeouts, for a majority of
@@ -425,15 +459,19 @@ impl Node {
         tokens: Tokens,
         peers: Peers,
         state: MapState,
+        voted: u64,
     ) -> Arc<Self> {
         let routes = state
             .map
             .as_ref()
             .map(|(m, _)| Arc::new(route::Routes::new(m)));
-        let grants = lease::Grants::new(Arc::default(), peers.lease);
+        let grants = lease::Grants::new(Arc::default(), peers.lease).with_voted(voted);
         Arc::new_cyclic(|me| Self {
             grants,
             joint_seen: Mutex::new(None),
+            writer_lease: Mutex::new((0, 0)),
+            candidate: std::sync::atomic::AtomicU64::new(0),
+            elect_since: Mutex::new(None),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -529,6 +567,16 @@ impl Node {
             if let Some(same) = check(&mut st)? {
                 return Ok(same);
             }
+            // The term fence (D330 amendment 1's M1): a map below a term this node voted for
+            // is from a writer that has been replaced.
+            let voted = self.grants.voted();
+            if map.writer_term < voted {
+                return Err(ApiError::failed_precondition(format!(
+                    "the map is at writer term {}, but this node voted for term {voted}: it's \
+                     from a writer that has been replaced (D330)",
+                    map.writer_term
+                )));
+            }
             match &st.map {
                 None if !map.nodes.iter().any(|n| n.id == self.id) => {
                     return Err(ApiError::invalid(format!(
@@ -597,7 +645,11 @@ impl Node {
         if let Some((m, _)) = &st.map {
             self.fences.lapse_unnamed(m, &self.id);
         }
+        let installed = st.map.as_ref().map(|(m, _)| m.clone());
         drop(st);
+        if let Some(m) = &installed {
+            self.release_writer_if_replaced(m);
+        }
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
         self.end_moved_feeds(version);
@@ -708,6 +760,15 @@ impl Node {
                     "this node is still taking its peers' maps after starting: try again",
                 ));
             }
+            // The writer and its term are the writer's to keep (D330): an operator's map
+            // can't change them, and from term 1 a change needs the writer lease.
+            map.writer = current.writer.clone();
+            map.writer_term = current.writer_term;
+            self.await_writer_lease(&current).await?;
+            if !current.failover && map.failover {
+                self.every_node_keeps(&map, WRITER_TERMS_FEATURE, "failover")
+                    .await?;
+            }
             if let Some(why) = map::moves_with_node_change(&current, &map) {
                 return Err(ApiError::failed_precondition(why));
             }
@@ -752,6 +813,10 @@ impl Node {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
                     .await?;
             }
+            if map.failover || map.writer_term > 0 {
+                self.every_node_keeps(&map, WRITER_TERMS_FEATURE, "failover or a writer term")
+                    .await?;
+            }
             map.previous_nodes.clear();
         }
         let changes_nodes = !map.previous_nodes.is_empty();
@@ -770,6 +835,24 @@ impl Node {
                 Ok(None)
             })
             .await?;
+        // The lease again before the push (D330). Past it, the change is installed here and
+        // not undone: it may still reach the cluster (this writer's next round, if it renews
+        // at the same term, pushes it) or be replaced by an elected map. So its outcome is
+        // unknown (simp724's S1 on #2056).
+        if let Ok(set) = self.get_map()
+            && let Err(e) = self.writer_may_change(&set)
+        {
+            return Err(ApiError::from_code(
+                ErrorCode::OutcomeUnknown,
+                &format!(
+                    "map version {version} is installed on this node, the writer, but its \
+                     writer lease ran out before the push ({}). It may still reach the \
+                     cluster, or be replaced by an elected map: read the map (phdb cluster \
+                     show-map) before setting it again",
+                    e.message
+                ),
+            ));
+        }
         let pushed = match self.get_map() {
             Ok(set) if changes_nodes && set.map_version == version => self.joint_wait(&set).await,
             _ => self.push_all().await,
@@ -1148,9 +1231,11 @@ impl Node {
             let Some((old, json)) = &st.map else {
                 return Ok(None);
             };
-            if map.map_version != old.map_version {
+            if (map.writer_term, map.map_version) != (old.writer_term, old.map_version) {
                 return Ok(None);
             }
+            // The same `(term, version)` and contents: a no-op (simp724's N3), as rounds push
+            // the same map again.
             if map::canonical_json(&map) == *json {
                 return Ok(Some(old.map_version));
             }
@@ -1357,7 +1442,20 @@ impl Node {
                 lp.lease_remaining_ms = millis(self.lease_remaining(&id));
             }
         }
+        let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
+            || (String::new(), self.grants.voted(), Duration::ZERO),
+            |m| {
+                (
+                    schema::writer(m).to_owned(),
+                    self.grants.term_floor(m),
+                    self.writer_lease_status(m),
+                )
+            },
+        );
         NodeStatus {
+            writer,
+            writer_term,
+            writer_lease_remaining_ms: millis(writer_lease),
             node_id: self.id.clone(),
             map_version: version,
             cluster_id,
@@ -1774,6 +1872,9 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 req.cluster_id, mine.cluster_id
             ))
             .into());
+        }
+        if self.0.is_vote(&mine, &req) {
+            return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
         }
         Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
     }
@@ -2271,6 +2372,7 @@ pub(crate) fn run(
         state.map = Some((map::canonical(&m), json));
     }
     let version = state.version();
+    let voted = read_voted(dir).map_err(|e| Failure::usage(&format!("{}: {e}", dir.display())))?;
     let node = Node::new(
         dir,
         &id,
@@ -2282,8 +2384,13 @@ pub(crate) fn run(
             ca,
             push_timeout: Duration::from_millis(args.cluster_push_timeout_ms.max(1)),
             lease: Duration::from_millis(args.cluster_lease_ms),
+            failover_after: Duration::from_millis(match args.cluster_failover_after_ms {
+                0 => args.cluster_lease_ms.saturating_mul(2),
+                ms => ms,
+            }),
         },
         state,
+        voted,
     );
     node.load_fences().map_err(|e| Failure::usage(&e))?;
     // The partitions the map gives this node, in id order, with their epochs: none before

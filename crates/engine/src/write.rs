@@ -308,6 +308,23 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Marks the batch feed-silent (D331, ICR 0141): logged, durable and applied as any
+    /// commit, replicated to a replica database, but never delivered to a change-feed
+    /// subscription. A range move's copy and its source's cleanup write so, as the range's
+    /// history isn't new there. The first silent commit sets `incompat` bit 3, which builds
+    /// without D331 refuse. On a replica database only a [`push_logged`](Self::push_logged)
+    /// batch may carry it (its primary's silent commit). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn mark_feed_silent(&mut self) {
+        self.builder.mark_silent();
+    }
+
+    /// Whether [`mark_feed_silent`](Self::mark_feed_silent) marked it.
+    #[doc(hidden)]
+    pub fn is_feed_silent(&self) -> bool {
+        self.builder.is_silent()
+    }
+
     /// Whether it holds a primary's logged mutations ([`push_logged`](Self::push_logged),
     /// D315 PR 3): routed as logged, never converted or prepared again. The mark is the
     /// builder's (`BatchBuilder::is_logged`), in its padding, so the batch doesn't grow.

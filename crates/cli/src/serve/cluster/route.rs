@@ -429,6 +429,9 @@ mod tests {
                     created: 0,
                 },
             ],
+            writer: String::new(),
+            writer_term: 0,
+            failover: false,
         }
     }
 

@@ -276,11 +276,16 @@ pub(crate) fn follow(
             "Follow needs the token of a replica's bootstrap or of its last apply",
         ));
     }
-    let feed = db
+    let mut feed = db
         .feed()
         .resume(&FeedToken::from_bytes(token))
         .open()
         .map_err(|e| ApiError::from_engine(&e).for_read())?;
+    // A replica follows every commit, a range move's feed-silent copy and cleanup too (D331,
+    // ICR 0141): always, since only a replica's follower calls Follow. Each crosses as a
+    // version 2 event, which a replica built before D331 refuses (its halt is the backstop
+    // behind the writer's `range_moves` gate, never something an operator should meet).
+    feed.include_silent();
     let (tx, rx) = mpsc::channel(2);
     let db = db.clone();
     std::thread::Builder::new()

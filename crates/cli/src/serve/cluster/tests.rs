@@ -51,8 +51,10 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             ca: None,
             push_timeout: Duration::from_millis(500),
             lease: TEST_LEASE,
+            failover_after: TEST_LEASE * 2,
         },
         state,
+        super::read_voted(dir).unwrap(),
     )
 }
 
@@ -128,6 +130,9 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             partitions: vec!["p1".into(), "p2".into()],
             created: 0,
         }],
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
     }
 }
 
@@ -594,6 +599,33 @@ fn a_node_that_missed_a_drop_and_a_recreate_still_catches_up() {
     let mut other = the_map(4, &ports);
     other.cluster_id = "c2".into();
     assert!(n.push_map(other, Some("b")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D330 amendment 1's M1, the term fence: a node that voted for a term refuses any map below
+/// it, though its own map is still older (the elected map hasn't reached it yet) and the
+/// pushed map is newer by version. The vote is in `cluster-writer-term`, so a restart keeps
+/// the fence.
+#[test]
+fn a_node_that_voted_for_a_term_refuses_a_lower_terms_map_across_a_restart() {
+    let dir = test_dir();
+    let ports = [7001, 7002, 7003];
+    let n = node(&dir, "b");
+    n.push_map(the_map(1, &ports), None).unwrap();
+    super::write_synced(&dir, super::WRITER_TERM_FILE, b"1\n").unwrap();
+    drop(n);
+    let n = node(&dir, "b");
+    let e = n.push_map(the_map(5, &ports), Some("a")).unwrap_err();
+    assert!(
+        e.message.contains("voted for term 1"),
+        "the old writer's late push: {}",
+        e.message
+    );
+    assert_eq!(n.get_map().unwrap().map_version, 1);
+    let mut elected = the_map(2, &ports);
+    elected.writer = "c".into();
+    elected.writer_term = 1;
+    assert_eq!(n.push_map(elected, Some("c")).unwrap().map_version, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1944,6 +1976,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-ca",
         "cluster-push-timeout-ms",
         "cluster-lease-ms",
+        "cluster-failover-after-ms",
         "tls-key",
         "tls-cert",
     ];
@@ -4135,6 +4168,9 @@ fn split_nodes(
             partitions: (0..n).map(|i| format!("q{i}")).collect(),
             created: 0,
         }],
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
     };
     let mut stops = Vec::new();
     let mut dbs = Vec::new();

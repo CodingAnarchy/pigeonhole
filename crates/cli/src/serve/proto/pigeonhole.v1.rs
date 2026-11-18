@@ -7009,6 +7009,21 @@ pub struct ClusterMap {
     /// partition named holds a whole store for the namespaces in its range.
     #[prost(message, optional, tag = "8")]
     pub memory: ::core::option::Option<MemoryPlacement>,
+    /// D330: the map's writer, the one node that changes it, and the term it was elected at.
+    /// Maps are ordered by `(writer_term, map_version)`: a node takes a map with a higher term
+    /// whatever its version, and refuses one with a lower term. Term 0 (no node named): the
+    /// writer is the node with the smallest id, as before D330, until the first election
+    /// writes term 1. Set only once every node keeps them (`map_features`: `writer_terms`).
+    #[prost(string, tag = "9")]
+    pub writer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "10")]
+    pub writer_term: u64,
+    /// D330: automatic failover, off by default (the owner's Q1), turned on with `set-map`.
+    /// Off: no node elects a new writer on its own; the writer changes only as before D330
+    /// (an operator's `set-map --force`, which raises the term). Set only once every node
+    /// keeps it (`map_features`: `writer_terms`).
+    #[prost(bool, tag = "11")]
+    pub failover: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -7226,6 +7241,18 @@ pub struct NodeStatus {
     ///   Empty from older nodes.
     #[prost(string, repeated, tag = "7")]
     pub map_features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// D330: the map's writer as this node's map names it (the smallest id at term 0), and
+    /// the highest writer term this node knows: its map's, or one it voted for. A map below it
+    /// is refused here, so `phdb cluster set-map --force` sets a term above every node's.
+    #[prost(string, tag = "8")]
+    pub writer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub writer_term: u64,
+    /// On the writer: the time left on its writer lease, as its last lease round gave it. On
+    /// another node: the time left on this node's grant of the writer lease to the writer. 0
+    /// once it has run out (or this node never granted it).
+    #[prost(uint64, tag = "10")]
+    pub writer_lease_remaining_ms: u64,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7775,6 +7802,11 @@ pub struct LeaseRequest {
     /// that starts holds no lease).
     #[prost(uint64, tag = "7")]
     pub start: u64,
+    /// D330: the asking node's map's writer term. This node grants only at the same
+    /// `(writer_term, map_version)`, and answers `newer_map_version` when its own sorts after
+    /// the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
+    #[prost(uint64, tag = "8")]
+    pub writer_term: u64,
 }
 /// A partition at an epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7783,6 +7815,10 @@ pub struct LeasePart {
     pub partition: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub epoch: u64,
+    /// D330: for the writer lease (`partition` "\_\_writer"), the writer term asked for or
+    /// granted; `epoch` is then 0. 0 for a partition.
+    #[prost(uint64, tag = "3")]
+    pub term: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseResponse {
@@ -7801,6 +7837,11 @@ pub struct LeaseResponse {
     /// otherwise.
     #[prost(uint64, tag = "4")]
     pub grace_remaining_ms: u64,
+    /// D330: the grantor's highest writer term, its map's or one it voted for, on an answer
+    /// to an election vote (a `__writer` part above its map's term). A candidate refused for a
+    /// term at or below it asks again above it. 0 otherwise.
+    #[prost(uint64, tag = "5")]
+    pub writer_term: u64,
 }
 /// A partition this node won't grant yet, and why.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

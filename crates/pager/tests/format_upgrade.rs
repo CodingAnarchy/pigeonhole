@@ -176,15 +176,15 @@ fn feature_bits_this_build_does_not_know() {
     set_features(
         &vfs,
         Features {
-            // Bits 0 to 2 are known (bit 2 is D329's).
-            incompat: 1 << 3,
+            // Bits 0 to 3 are known (bit 2 is D329's, bit 3 D331's).
+            incompat: 1 << 4,
             ..Features::default()
         },
     );
     for writable in [false, true] {
         assert!(matches!(
             refused(&vfs, writable),
-            pigeonhole_format::Error::UnsupportedFeature { value: 8, .. }
+            pigeonhole_format::Error::UnsupportedFeature { value: 16, .. }
         ));
     }
 

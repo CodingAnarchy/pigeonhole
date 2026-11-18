@@ -173,35 +173,87 @@ fn a_quiet_stream_still_moves_its_token() {
     assert_eq!(back, event);
 }
 
-// ---- `--embed-local`'s startup advice (#1345 PR 2) ----
+// ---- `--embed-local`'s startup warning (#1345 PR 2, #2061) ----
 
-/// The line comes only when the shards are pinned, and names only the variables still unset:
-/// the placement's CPU list for `CANDLE_CPU_MASK` and the embedder's thread count for
-/// `CANDLE_NUM_THREADS` (cli692's N1 and N2 on #1671). `RAYON_NUM_THREADS` alone places
-/// nothing, so it doesn't silence it.
+/// The gauge (#2061, audit120's nit on #2064): one line per variable, 1 for each unset, and
+/// nothing at all without `--embed-local` (the on bit clear).
 #[test]
-fn embed_local_advice_names_the_placements_cpus_until_both_are_set() {
+fn embed_env_unset_renders_per_variable_only_with_embed_local() {
+    let render = |bits| {
+        let mut out = String::new();
+        super::service::render_candle(&mut out, bits);
+        out
+    };
+    assert_eq!(render(0), "");
+    assert_eq!(render(0x01), "", "no on bit: nothing, whatever the rest");
+    assert_eq!(
+        render(0x81),
+        "# TYPE pigeonhole_serve_embed_env_unset gauge\n\
+         pigeonhole_serve_embed_env_unset{variable=\"CANDLE_NUM_THREADS\"} 1\n\
+         pigeonhole_serve_embed_env_unset{variable=\"CANDLE_CPU_MASK\"} 0\n"
+    );
+    assert!(render(0x80).contains("{variable=\"CANDLE_NUM_THREADS\"} 0"));
+    assert!(render(0x83).contains("{variable=\"CANDLE_CPU_MASK\"} 1"));
+}
+
+/// While either of candle's variables is unset, the warning names only the unset ones: the
+/// embedder's thread count for `CANDLE_NUM_THREADS`, and on Linux the given CPU list for
+/// `CANDLE_CPU_MASK` (cli692's N1 and N2 on #1671). `RAYON_NUM_THREADS` alone places nothing,
+/// so it doesn't silence it. The bits say which are unset, with the on bit always set.
+#[test]
+fn embed_local_warns_with_the_export_line_until_both_are_set() {
     use std::ffi::OsString;
     let env =
         |set: &'static [&'static str]| move |k: &str| set.contains(&k).then(|| OsString::from("1"));
-    let pinned = || Some("2-7,10".to_owned());
-    let advice = |set: &'static [&'static str]| super::candle_advice(pinned(), 4, &env(set));
+    let warn = |set: &'static [&'static str]| {
+        super::candle_warning(Some("2-7,10".to_owned()), 4, &env(set))
+    };
+    let linux = cfg!(target_os = "linux");
 
-    let line = advice(&[]).expect("pinned, nothing set: advice");
-    assert!(line.starts_with("phdb serve: --embed-local:"), "{line}");
+    let (line, bits) = warn(&[]);
+    let line = line.expect("nothing set: a warning");
     assert!(
-        line.ends_with("export CANDLE_CPU_MASK=2-7,10 CANDLE_NUM_THREADS=4"),
+        line.starts_with("phdb serve: WARN: --embed-local:"),
         "{line}"
     );
-    assert!(advice(&["RAYON_NUM_THREADS"]).is_some());
-    // The mask alone leaves the pool a thread per core: the count is still asked for.
-    let line = advice(&["CANDLE_CPU_MASK"]).expect("mask only: advice");
-    assert!(line.ends_with("export CANDLE_NUM_THREADS=4"), "{line}");
-    let line = advice(&["CANDLE_NUM_THREADS"]).expect("count only: advice");
-    assert!(line.ends_with("export CANDLE_CPU_MASK=2-7,10"), "{line}");
-    assert_eq!(advice(&["CANDLE_CPU_MASK", "CANDLE_NUM_THREADS"]), None);
-    // No placement (`--unpin`, or nothing pinned): nothing to say.
-    assert_eq!(super::candle_advice(None, 4, &env(&[])), None);
+    if linux {
+        assert!(
+            line.ends_with("export CANDLE_NUM_THREADS=4 CANDLE_CPU_MASK=2-7,10"),
+            "{line}"
+        );
+        assert_eq!(bits, 0x83);
+    } else {
+        assert!(line.ends_with("export CANDLE_NUM_THREADS=4"), "{line}");
+        assert_eq!(bits, 0x81);
+    }
+    assert!(warn(&["RAYON_NUM_THREADS"]).0.is_some());
+    // The count alone set: on Linux the mask is still asked for.
+    let (line, bits) = warn(&["CANDLE_NUM_THREADS"]);
+    if linux {
+        let line = line.expect("count only: a warning");
+        assert!(line.ends_with("export CANDLE_CPU_MASK=2-7,10"), "{line}");
+        assert_eq!(bits, 0x82);
+    } else {
+        assert_eq!((line, bits), (None, 0x80));
+    }
+    let (line, _) = warn(&["CANDLE_CPU_MASK"]);
+    assert!(
+        line.expect("mask only: a warning")
+            .ends_with("export CANDLE_NUM_THREADS=4")
+    );
+    assert_eq!(
+        warn(&["CANDLE_CPU_MASK", "CANDLE_NUM_THREADS"]),
+        (None, 0x80)
+    );
+    // No CPU list to offer: the mask is still named, never an empty `export`.
+    if linux {
+        let (line, _) = super::candle_warning(None, 4, &env(&["CANDLE_NUM_THREADS"]));
+        let line = line.expect("mask unset: a warning");
+        assert!(
+            line.ends_with("export CANDLE_CPU_MASK=<the CPUs to run it on>"),
+            "{line}"
+        );
+    }
     assert_eq!(super::embed_threads(0), 1);
     assert_eq!(super::embed_threads(3), 3);
     assert_eq!(super::embed_threads(30), 4);
