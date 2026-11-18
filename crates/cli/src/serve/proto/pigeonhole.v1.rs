@@ -1743,10 +1743,6 @@ pub mod feed_event {
         MoveBarrier(super::MoveBarrier),
     }
 }
-/// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
-/// which keeps the stream open; sent at the start for each partition unavailable then, and
-/// on each change), or available again. Its commits are delivered, in order and once each,
-/// when it comes back.
 /// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MoveBarrier {
@@ -1760,6 +1756,10 @@ pub struct MoveBarrier {
     #[prost(uint64, tag = "3")]
     pub final_seqno: u64,
 }
+/// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
+/// which keeps the stream open; sent at the start for each partition unavailable then, and
+/// on each change), or available again. Its commits are delivered, in order and once each,
+/// when it comes back.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PartitionState {
     #[prost(string, tag = "1")]
