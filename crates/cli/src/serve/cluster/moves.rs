@@ -122,7 +122,7 @@ impl Node {
         join();
         drop(_one);
         if raised {
-            self.confirm_soon();
+            self.ask_after_raise();
         }
         Ok(())
     }
@@ -152,8 +152,18 @@ impl Node {
             }
         }
         if raised {
-            self.confirm_soon();
+            self.ask_after_raise();
         }
+    }
+
+    /// A partition's epoch rose here (a hand-over): its renewals run, if they don't yet, and
+    /// it asks for its lease now, as a partition that opens does (`confirm_opened`), not at
+    /// the next renewal.
+    fn ask_after_raise(&self) {
+        if let Some(node) = self.me.upgrade() {
+            node.renew_leases();
+        }
+        self.confirm_soon();
     }
 
     /// Brings partition `id`, served here behind `gate`, up to `map`: puts up a new fence's

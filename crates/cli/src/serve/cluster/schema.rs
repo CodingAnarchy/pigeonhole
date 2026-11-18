@@ -142,10 +142,23 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
             return o;
         }
     };
+    // D331: a table is a partition's too while a range move names it as the move's source
+    // or target (the target makes it at COPYING, before the map gives it a range: design
+    // §3's plan), and while the file records a range of it moved away (the source serves it
+    // to a cluster feed up to the move's last seqno, PR 3b, and its cleanup is PR 5's):
+    // never dropped from under either.
+    let moved_away = crate::serve::ranges::read_moved(db).unwrap_or_default();
     let placed: BTreeMap<&str, &TablePlacement> = map
         .tables
         .iter()
-        .filter(|t| t.partitions.iter().any(|p| p == partition))
+        .filter(|t| {
+            t.partitions.iter().any(|p| p == partition)
+                || map
+                    .moves
+                    .iter()
+                    .any(|m| m.table == t.name && (m.from == partition || m.to == partition))
+                || moved_away.iter().any(|m| m.table == t.name)
+        })
         .map(|t| (t.name.as_str(), t))
         .collect();
     // The indexes placed here (#1722): by the table each follows, or by their own ranges.
