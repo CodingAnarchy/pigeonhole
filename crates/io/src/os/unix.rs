@@ -148,6 +148,10 @@ pub(crate) fn locality(_file: &fs::File) -> Result<Locality> {
 /// that never reached the disk. With `WRITE` alone the error stays for the next sync to see.
 #[cfg(target_os = "linux")]
 pub(crate) fn start_writeback(file: &fs::File, offset: u64, len: u64) -> Result<()> {
+    // scratch: the pre-gate's writeback-hint-off arm (D334's hint does nothing).
+    if std::hint::black_box(true) {
+        return Ok(());
+    }
     let start = off(offset, "start_writeback: offset too large")?;
     let count = off(len, "start_writeback: length too large")?;
     // SAFETY: plain syscall on an fd owned by `file`.
