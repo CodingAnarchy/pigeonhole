@@ -939,17 +939,24 @@ fn a_read_whose_tablet_moved_to_a_participant_after_it_validated_is_still_valida
     db.inject(Fault::HoldPrepares, true);
     let mut commit = txn.submit(Some(Durability::GroupSync)).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
-    // The coordinator's own share is admitted at once; let it be.
-    let settle = std::time::Instant::now() + std::time::Duration::from_millis(200);
-    while std::time::Instant::now() < settle {
+    // The PREPARE to `here` is held, and the coordinator admitted its own share, before the
+    // move: on conditions, not a clock (perf2's S1 on #2058: a move first would route the
+    // coordinator's share with the new map, which then validates `r` itself, and the test
+    // would pass without reaching the hole).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.held_prepares() == 0 || db.shares_tracked(other) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the coordinator's share was never admitted"
+        );
         assert!(std::pin::Pin::new(&mut commit).poll(&mut cx).is_pending());
         std::thread::yield_now();
     }
+    assert_eq!(db.shares_tracked(here), 0, "r's shard has seen nothing yet");
     finish(db.move_tablet_pending(t.id, b"r", other as u16).unwrap()).unwrap();
     assert_eq!(db.shard_of(t.id, b"r"), Some(other));
     db.inject(Fault::HoldPrepares, false);
     assert!(db.release_held_prepares() > 0, "no PREPARE was held");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let r = loop {
         if let Poll::Ready(r) = std::pin::Pin::new(&mut commit).poll(&mut cx) {
             break r;
