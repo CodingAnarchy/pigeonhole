@@ -92,6 +92,21 @@ struct Grant {
     until: u64,
 }
 
+/// What a node last granted of one partition (D330 PR 2), kept past the grant's end: the
+/// writer counts a partition's downtime from `until`, and names the in-doubt shares its
+/// owner last reported when it fails the partition over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LastGrant {
+    /// The node it was granted to, and at what epoch.
+    pub(crate) holder: String,
+    pub(crate) epoch: u64,
+    /// When the grant ends, on this node's lease clock.
+    pub(crate) until: u64,
+    /// The in-doubt xids and their count the holder sent with the request (F7).
+    pub(crate) in_doubt_xids: Vec<String>,
+    pub(crate) in_doubt_count: u64,
+}
+
 /// A node's grants: the leases it promised, by holder (itself included).
 #[derive(Debug)]
 pub(crate) struct Grants {
@@ -110,6 +125,9 @@ pub(crate) struct Grants {
     /// When the last writer lease granted here ends, on this node's clock: the start
     /// grace's end before any. How long the writer has gone without one is counted from it.
     writer_until: Mutex<u64>,
+    /// Each partition's last grant here (D330 PR 2), by partition id: never dropped when it
+    /// ends, only replaced by the next. Locked after `by_holder`, never before.
+    last: Mutex<BTreeMap<String, LastGrant>>,
 }
 
 impl Grants {
@@ -124,6 +142,7 @@ impl Grants {
             by_holder: Mutex::new(BTreeMap::new()),
             voted: Mutex::new(0),
             writer_until: Mutex::new(started.saturating_add(nanos(grace(lease)))),
+            last: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -131,6 +150,48 @@ impl Grants {
     pub(crate) fn with_voted(self, term: u64) -> Self {
         *self.voted.lock().unwrap_or_else(PoisonError::into_inner) = term;
         self
+    }
+
+    /// Every partition lease granted here that still runs, to whom, and for how long
+    /// (`NodeStatus.grants`, D330 PR 2): the writer asks before it fails a partition over.
+    /// Not the writer lease.
+    pub(crate) fn granted(&self) -> Vec<LeaseWithheld> {
+        let now = self.clock.now();
+        let by = self
+            .by_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut out = Vec::new();
+        for (holder, g) in by.iter().filter(|(_, g)| g.until > now) {
+            for partition in g.parts.keys().filter(|p| *p != WRITER_LEASE) {
+                out.push(LeaseWithheld {
+                    partition: partition.clone(),
+                    holder: holder.clone(),
+                    remaining_ms: millis(g.until - now).max(1),
+                });
+            }
+        }
+        out
+    }
+
+    /// When partition `id`'s last grant here ends (or ended), if it was to `holder` at
+    /// `epoch`: the failover check's per-round question, without cloning the grant.
+    pub(crate) fn last_grant_until(&self, id: &str, holder: &str, epoch: u64) -> Option<u64> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .filter(|g| g.holder == holder && g.epoch == epoch)
+            .map(|g| g.until)
+    }
+
+    /// Partition `id`'s last grant here, ended or not (D330 PR 2).
+    pub(crate) fn last_grant(&self, id: &str) -> Option<LastGrant> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
 
     /// The highest writer term this node voted for (0: none).
@@ -265,10 +326,14 @@ impl Grants {
         }
         let mut parts = BTreeMap::new();
         let voted = self.voted();
+        let until = now.saturating_add(nanos(self.lease));
+        let mut last = Vec::new();
         for LeasePart {
             partition,
             epoch,
             term,
+            in_doubt_xids,
+            in_doubt_count,
         } in &req.parts
         {
             let given = if partition == WRITER_LEASE {
@@ -315,9 +380,27 @@ impl Grants {
                 partition: partition.clone(),
                 epoch: *epoch,
                 term: *term,
+                ..LeasePart::default()
             });
+            if partition != WRITER_LEASE {
+                last.push((
+                    partition.clone(),
+                    LastGrant {
+                        holder: req.node_id.clone(),
+                        epoch: *epoch,
+                        until,
+                        in_doubt_xids: in_doubt_xids.clone(),
+                        in_doubt_count: *in_doubt_count,
+                    },
+                ));
+            }
         }
-        let until = now.saturating_add(nanos(self.lease));
+        if !last.is_empty() {
+            self.last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(last);
+        }
         if parts.contains_key(WRITER_LEASE) {
             self.writer_granted(until);
         }
@@ -349,6 +432,30 @@ impl Grants {
         &self,
         mine: &ClusterMap,
         req: &LeaseRequest,
+        persist: impl FnOnce(u64) -> std::io::Result<()>,
+    ) -> Result<LeaseResponse, ApiError> {
+        self.ballot(mine, req, None, persist)
+    }
+
+    /// An election's pre-vote (D330 PR 2, `LeaseRequest.pre_vote`): [`Grants::vote`]'s answer
+    /// without its effects. Nothing is recorded, granted or fenced. It's also refused while
+    /// the writer lease ran out here less than `margin` ago (simp724), so a node whose writer
+    /// is healthy doesn't help a candidate that merely can't reach it.
+    pub(crate) fn pre_vote(
+        &self,
+        mine: &ClusterMap,
+        req: &LeaseRequest,
+        margin: Duration,
+    ) -> Result<LeaseResponse, ApiError> {
+        self.ballot(mine, req, Some(margin), |_| Ok(()))
+    }
+
+    /// [`Grants::vote`], or with `pre_vote` (the failover margin) [`Grants::pre_vote`].
+    fn ballot(
+        &self,
+        mine: &ClusterMap,
+        req: &LeaseRequest,
+        pre_vote: Option<Duration>,
         persist: impl FnOnce(u64) -> std::io::Result<()>,
     ) -> Result<LeaseResponse, ApiError> {
         let [part] = req.parts.as_slice() else {
@@ -399,6 +506,21 @@ impl Grants {
                 remaining_ms: millis(g.until - now).max(1),
             });
             out.writer_term = floor;
+            return Ok(out);
+        }
+        if let Some(margin) = pre_vote {
+            let lapsed = self.writer_lapsed();
+            if lapsed < margin {
+                out.withheld.push(LeaseWithheld {
+                    partition: WRITER_LEASE.to_owned(),
+                    holder: super::schema::writer(mine).to_owned(),
+                    remaining_ms: millis(nanos(margin - lapsed)).max(1),
+                });
+                out.writer_term = floor;
+                return Ok(out);
+            }
+            out.granted.push(part.clone());
+            out.writer_term = part.term;
             return Ok(out);
         }
         persist(part.term)
@@ -460,6 +582,7 @@ impl Grants {
             partition,
             epoch,
             term,
+            ..
         } in &req.parts
         {
             // The writer lease is keyed by its term (D330).
@@ -515,12 +638,14 @@ mod tests {
             lease_ms: 10_000,
             start: 1,
             writer_term: 0,
+            pre_vote: false,
             parts: parts
                 .iter()
                 .map(|(p, e)| LeasePart {
                     partition: (*p).into(),
                     epoch: *e,
                     term: 0,
+                    ..LeasePart::default()
                 })
                 .collect(),
         }
@@ -701,6 +826,7 @@ mod tests {
                     partition: (*p).into(),
                     epoch: *e,
                     term: 0,
+                    ..LeasePart::default()
                 })
                 .collect(),
             start,
@@ -778,6 +904,7 @@ mod tests {
                 partition: WRITER_LEASE.into(),
                 epoch: 0,
                 term,
+                ..LeasePart::default()
             }],
             ..ask(node, version, round, &[])
         }
@@ -831,6 +958,53 @@ mod tests {
         // And a grantor behind the asker by term grants nothing, whatever the versions.
         let r = grant(&g, &termed(9, "a", 1), &ask_writer("b", 2, 5, 1, 2));
         assert!(r.granted.is_empty() && r.newer_map_version == 0, "{r:?}");
+    }
+
+    #[test]
+    fn a_pre_vote_records_nothing_and_waits_for_the_writer_lease_to_be_out_for_the_margin() {
+        // D330 PR 2: a pre-vote answers as the vote would, and changes nothing.
+        let (g, clock) = grants(Duration::from_secs(10));
+        let v1 = termed(4, "a", 1);
+        let margin = Duration::from_secs(5);
+        let pre = |req: LeaseRequest| LeaseRequest {
+            pre_vote: true,
+            ..req
+        };
+        // a's writer lease runs here: withheld.
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 1, 2)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty() && r.withheld[0].holder == "a", "{r:?}");
+        // Out, but for less than the margin: still withheld, the margin's rest as its time.
+        clock.advance(Duration::from_secs(12));
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 2, 2)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty(), "{r:?}");
+        assert!(r.withheld[0].remaining_ms > 0 && r.withheld[0].remaining_ms <= 5_000);
+        // Past the margin: it would vote, and nothing is recorded or granted.
+        clock.advance(margin);
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 3, 2)), margin)
+            .unwrap();
+        assert_eq!((granted(&r), r.writer_term), (vec![WRITER_LEASE], 2));
+        assert_eq!(g.voted(), 0);
+        assert!(g.writer_remaining("b").is_zero());
+        assert!(g.writer_lapsed() >= margin);
+        // c's pre-vote at the same term is answered alike: none was recorded for b.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("c", 1, 4, 1, 2)), margin)
+            .unwrap();
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        // A pre-vote at a term this node knows is refused with it.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("c", 1, 4, 2, 1)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty() && r.writer_term == 1, "{r:?}");
     }
 
     #[test]
@@ -924,6 +1098,7 @@ mod tests {
                 partition: WRITER_LEASE.into(),
                 epoch: 0,
                 term: 1,
+                ..LeasePart::default()
             }],
             ..release("a", 1, 2, &[])
         };

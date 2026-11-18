@@ -413,10 +413,9 @@ fn a_replica_copy_follows_a_moved_owner_without_bootstrapping_again() {
         .unwrap();
         let after = put_after_move(ports[0], "r", "k2").await;
         // The copy retried its old owner while the partition moved, its pause doubling up
-        // to the follower's MAX_BACKOFF (10 s), and a map change doesn't wake it: a wait
-        // past that, not `eventually`'s 5 s (#2015, a flake under a loaded full run).
-        eventually_within(
-            Duration::from_secs(30),
+        // to the follower's MAX_BACKOFF (10 s); the map that moved it wakes the copy (D330
+        // amendment 2), so `eventually`'s 5 s, not a wait past that pause (#2015).
+        eventually(
             "a's replica of p3 to follow b past a write there",
             async || {
                 copy_of(ports[0], "p3").await.is_some_and(|lp| {
@@ -460,10 +459,9 @@ fn a_replica_copy_bootstraps_again_after_a_relocate_without_copy() {
         assert_eq!(r.document["epoch"], 2, "{:?}", r.document);
         let after = put_after_move(ports[0], "r", "k2").await;
         // The copy retried its old owner while the partition moved, its pause doubling up
-        // to the follower's MAX_BACKOFF (10 s), and a map change doesn't wake it: a wait
-        // past that, not `eventually`'s 5 s (#2015, a flake under a loaded full run).
-        eventually_within(
-            Duration::from_secs(30),
+        // to the follower's MAX_BACKOFF (10 s); the map that moved it wakes the copy (D330
+        // amendment 2), so `eventually`'s 5 s, not a wait past that pause (#2015).
+        eventually(
             "a's replica of p3 to follow b past a write there",
             async || {
                 copy_of(ports[0], "p3").await.is_some_and(|lp| {

@@ -51,6 +51,7 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
     if map.map_version == 0 {
         return Err("map_version must be at least 1".into());
     }
+    validate_failover_fields(map)?;
     let mut nodes = HashSet::new();
     for n in &map.nodes {
         if !id_ok(&n.id) {
@@ -641,6 +642,156 @@ pub(crate) fn validate_catch_up(old: &ClusterMap, new: &ClusterMap) -> Result<()
             )
         });
     }
+    validate_pending_failovers(old, new)
+}
+
+/// How many done or abandoned failover events a map keeps (D330 §6); pending ones are
+/// kept besides, however many.
+pub(crate) const FAILOVER_EVENTS: usize = 16;
+
+/// The most bytes of in-doubt xids an event or a lease part carries (simp724 on the D330
+/// PR 2 plan's F7); the count stays exact.
+pub(crate) const IN_DOUBT_BYTES: usize = 4096;
+
+/// Whether `m` uses any of D330's failover fields: what needs `writer_terms` on every node.
+pub(crate) fn uses_failover(m: &ClusterMap) -> bool {
+    m.failover
+        || !m.failovers.is_empty()
+        || m.partitions.iter().any(|p| {
+            p.failover() != crate::serve::proto::FailoverMode::Unspecified || p.failover_count > 0
+        })
+}
+
+/// D330's failover fields in one map: no rejoin (the owner's Q4), at most
+/// [`FAILOVER_EVENTS`] finished events, at most one pending promote per partition and
+/// copy epoch, and in-doubt lists within [`IN_DOUBT_BYTES`].
+fn validate_failover_fields(map: &ClusterMap) -> Result<(), Refusal> {
+    use crate::serve::proto::{FailoverKind as K, FailoverState as S};
+    if map.failover_rejoin {
+        return Err(
+            "failover_rejoin isn't supported in this release: an old owner rejoins P as a \
+             replica only when the operator adds it to P's replicas (D330, the owner's Q4)"
+                .into(),
+        );
+    }
+    let finished = map
+        .failovers
+        .iter()
+        .filter(|e| e.state() != S::Pending)
+        .count();
+    if finished > FAILOVER_EVENTS {
+        return Err(format!(
+            "the map records {finished} finished failovers: it keeps the last \
+             {FAILOVER_EVENTS}"
+        ));
+    }
+    let mut pending = HashSet::new();
+    for e in &map.failovers {
+        let bytes: usize = e.in_doubt_xids.iter().map(String::len).sum();
+        if bytes > IN_DOUBT_BYTES || (e.in_doubt_xids.len() as u64) > e.in_doubt_count {
+            return Err(format!(
+                "a failover event of partition {:?} lists {} in-doubt xids ({bytes} bytes) \
+                 for a count of {}: at most {IN_DOUBT_BYTES} bytes, and no more than the count",
+                e.partition,
+                e.in_doubt_xids.len(),
+                e.in_doubt_count
+            ));
+        }
+        match (e.kind(), e.state()) {
+            (K::Partition, S::Pending) => {
+                if !pending.insert((e.partition.as_str(), e.to_epoch)) {
+                    return Err(format!(
+                        "two pending failovers of partition {:?} to epoch {}",
+                        e.partition, e.to_epoch
+                    ));
+                }
+            }
+            (K::Partition, S::Done | S::Abandoned) | (K::Writer, S::Done) => {}
+            (k, st) => {
+                return Err(format!(
+                    "a failover event of kind {k:?} can't be in state {st:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pending promotes of `old` still live (their partition's epoch below their
+/// `to_epoch`) must reach `new` unchanged, finished or abandoned, never dropped or altered
+/// (simp724's S2 follow-ups on the D330 PR 2 plan): their `to_epoch` is the floor every
+/// later promote of the partition stamps above, so a copy a half-done promote stamped is
+/// never taken for a new history. Finished means the map gives the partition the event's
+/// node at its `to_epoch`; abandoned, that a later promote of it is recorded above it.
+fn validate_pending_failovers(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    use crate::serve::proto::{FailoverKind as K, FailoverState as S};
+    let epoch_of = |m: &ClusterMap, id: &str| {
+        m.partitions
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.node.clone(), p.epoch))
+    };
+    for e in old.failovers.iter().filter(|e| {
+        e.kind() == K::Partition
+            && e.state() == S::Pending
+            && epoch_of(old, &e.partition).is_some_and(|(_, ep)| ep < e.to_epoch)
+    }) {
+        // A map that takes P past the pending epoch keeps its floor, so it may drop or close
+        // the event (a restore stamps above every recorded promote's epoch).
+        if epoch_of(new, &e.partition).is_some_and(|(_, ep)| ep > e.to_epoch) {
+            continue;
+        }
+        let now = new.failovers.iter().find(|n| {
+            n.kind() == K::Partition && n.partition == e.partition && n.to_epoch == e.to_epoch
+        });
+        let same = |n: &crate::serve::proto::FailoverEvent| {
+            let mut a = n.clone();
+            a.state = e.state;
+            a == *e
+        };
+        let ok = match now {
+            None => false,
+            Some(n) if !same(n) => false,
+            Some(n) => match n.state() {
+                S::Pending => true,
+                S::Done => epoch_of(new, &e.partition) == Some((e.to.clone(), e.to_epoch)),
+                S::Abandoned => new.failovers.iter().any(|l| {
+                    l.kind() == K::Partition
+                        && l.partition == e.partition
+                        && l.to_epoch > e.to_epoch
+                }),
+                S::Unspecified => false,
+            },
+        };
+        if !ok {
+            return Err(format!(
+                "the map drops or changes the pending failover of partition {:?} to node {:?} \
+                 at epoch {}: keep `failovers` as `phdb cluster get-map` shows them (a promote \
+                 may have stamped a copy at that epoch, D330)",
+                e.partition, e.to, e.to_epoch
+            ));
+        }
+        // No other move takes P to an epoch at or below the pending one's: a copy stamped
+        // there would pass for the new history. Only the promote's own map gives P that
+        // epoch (finished, above).
+        let finished = now.is_some_and(|n| n.state() == S::Done);
+        let (old_at, new_at) = (
+            epoch_of(old, &e.partition).map(|(_, ep)| ep),
+            epoch_of(new, &e.partition).map(|(_, ep)| ep),
+        );
+        if !finished
+            && let Some(at) = new_at
+            && Some(at) != old_at
+            && at <= e.to_epoch
+        {
+            return Err(format!(
+                "partition {:?} has a promote to node {:?} pending at epoch {}: a move must take \
+                 it above that epoch, or finish the promote first (phdb cluster promote {} --to \
+                 {}) (D330)",
+                e.partition, e.to, e.to_epoch, e.partition, e.to
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1059,6 +1210,8 @@ mod tests {
             epoch: 1,
             memory_bytes: 0,
             replicas: Vec::new(),
+            failover: 0,
+            failover_count: 0,
         };
         let table =
             |name: &str, group: &str, splits: Vec<SplitKey>, parts: &[&str]| TablePlacement {
@@ -1085,6 +1238,8 @@ mod tests {
             writer: String::new(),
             writer_term: 0,
             failover: false,
+            failover_rejoin: false,
+            failovers: Vec::new(),
             moves: Vec::new(),
         }
     }
@@ -1697,6 +1852,8 @@ mod tests {
             epoch: 1,
             memory_bytes: 0,
             replicas: Vec::new(),
+            failover: 0,
+            failover_count: 0,
         });
         ok.partitions[0].node = "c".into();
         ok.partitions[0].epoch = 2;
@@ -1801,6 +1958,8 @@ mod tests {
             memory_bytes: 0,
             history_epoch: 0,
             replicas: Vec::new(),
+            failover: 0,
+            failover_count: 0,
         });
         assert_eq!(
             history(&with_history(&old, &moved, &[]).unwrap(), "p4"),
@@ -1846,5 +2005,140 @@ mod tests {
         let mut a = map();
         a.tables[0].splits = vec![raw(b"m")];
         assert_eq!(canonical_json(&a), canonical_json(&map()));
+    }
+
+    /// A pending promote of `p` to `to` at `to_epoch` (D330 PR 2).
+    fn pending(p: &str, to: &str, to_epoch: u64) -> crate::serve::proto::FailoverEvent {
+        let mut e = crate::serve::proto::FailoverEvent {
+            partition: p.into(),
+            from: "b".into(),
+            to: to.into(),
+            to_epoch,
+            ..Default::default()
+        };
+        e.set_kind(crate::serve::proto::FailoverKind::Partition);
+        e.set_state(crate::serve::proto::FailoverState::Pending);
+        e
+    }
+
+    /// `m` one version on, with `f` applied.
+    fn next(m: &ClusterMap, f: impl FnOnce(&mut ClusterMap)) -> ClusterMap {
+        let mut n = m.clone();
+        n.map_version += 1;
+        f(&mut n);
+        n
+    }
+
+    fn p3(m: &mut ClusterMap) -> &mut Partition {
+        m.partitions.iter_mut().find(|p| p.id == "p3").unwrap()
+    }
+
+    #[test]
+    fn a_pending_promote_is_kept_until_it_finishes_or_a_later_one_takes_over() {
+        // simp724's S2 follow-ups on the D330 PR 2 plan: p3 (on b at epoch 1) has a promote
+        // to a pending at epoch 2.
+        use crate::serve::proto::FailoverState as S;
+        let mut old = map();
+        old.writer_term = 1;
+        old.failovers.push(pending("p3", "a", 2));
+        let says = "drops or changes the pending failover";
+        refused(
+            validate_catch_up(&old, &next(&old, |n| n.failovers.clear())),
+            says,
+        );
+        refused(
+            validate_catch_up(&old, &next(&old, |n| n.failovers[0].to_epoch = 3)),
+            says,
+        );
+        // Done only with the move it names.
+        refused(
+            validate_catch_up(&old, &next(&old, |n| n.failovers[0].set_state(S::Done))),
+            says,
+        );
+        let done = next(&old, |n| {
+            n.failovers[0].set_state(S::Done);
+            p3(n).node = "a".into();
+            p3(n).epoch = 2;
+        });
+        validate_catch_up(&old, &done).unwrap();
+        // No other move takes p3 to the pending epoch, or below it.
+        refused(
+            validate_catch_up(
+                &old,
+                &next(&old, |n| {
+                    p3(n).node = "a".into();
+                    p3(n).epoch = 2;
+                }),
+            ),
+            "has a promote to node \"a\" pending at epoch 2",
+        );
+        // Abandoned only for a later promote of p3, recorded above it.
+        refused(
+            validate_catch_up(
+                &old,
+                &next(&old, |n| n.failovers[0].set_state(S::Abandoned)),
+            ),
+            says,
+        );
+        validate_catch_up(
+            &old,
+            &next(&old, |n| {
+                n.failovers[0].set_state(S::Abandoned);
+                n.failovers.push(pending("p3", "b", 3));
+            }),
+        )
+        .unwrap();
+        // A map that takes p3 past the pending epoch (a restore's stamp) may drop it.
+        validate_catch_up(
+            &old,
+            &next(&old, |n| {
+                n.failovers.clear();
+                p3(n).epoch = 3;
+            }),
+        )
+        .unwrap();
+        // Once p3's epoch passed it, the event is no floor: a map may drop it.
+        let mut moved = old.clone();
+        p3(&mut moved).epoch = 2;
+        validate_catch_up(&moved, &next(&moved, |n| n.failovers.clear())).unwrap();
+    }
+
+    #[test]
+    fn a_maps_failover_fields_are_checked() {
+        let mut m = map();
+        m.failover_rejoin = true;
+        refused(validate(&m, true), "failover_rejoin");
+        let mut m = map();
+        m.failovers = vec![pending("p3", "a", 2), pending("p3", "a", 2)];
+        refused(validate(&m, true), "two pending failovers");
+        let mut m = map();
+        for i in 0..=FAILOVER_EVENTS {
+            let mut e = pending("p3", "a", 2 + i as u64);
+            e.set_state(crate::serve::proto::FailoverState::Done);
+            m.failovers.push(e);
+        }
+        refused(validate(&m, true), "finished failovers");
+        m.failovers.remove(0);
+        validate(&m, true).unwrap();
+        let mut m = map();
+        let mut e = pending("p3", "a", 2);
+        e.in_doubt_xids = vec!["ab".repeat(IN_DOUBT_BYTES)];
+        e.in_doubt_count = 1;
+        m.failovers.push(e);
+        refused(validate(&m, true), "in-doubt xids");
+    }
+
+    #[test]
+    fn uses_failover_sees_every_failover_field() {
+        assert!(!uses_failover(&map()));
+        let mut m = map();
+        m.failovers.push(pending("p3", "a", 2));
+        assert!(uses_failover(&m));
+        let mut m = map();
+        p3(&mut m).set_failover(crate::serve::proto::FailoverMode::Off);
+        assert!(uses_failover(&m));
+        let mut m = map();
+        p3(&mut m).failover_count = 1;
+        assert!(uses_failover(&m));
     }
 }

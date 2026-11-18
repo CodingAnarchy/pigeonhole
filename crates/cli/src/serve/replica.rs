@@ -555,6 +555,11 @@ pub(crate) struct Replica {
     /// `promote` (cli692's F4 on #1583).
     promoting: AtomicBool,
     stop: watch::Sender<bool>,
+    /// Cuts the loop's pause after a failed follow short (D330 amendment 2): a map that
+    /// changes the partition's owner, epoch or history wakes a cluster copy, so it finds the
+    /// new owner at once rather than after up to [`MAX_BACKOFF`]. A wake while it follows
+    /// skips the next pause.
+    wake: tokio::sync::Notify,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The primary's seqno applied through, as `Status::applied`, for reads waiting on it
     /// (#1577). It goes back to 0 only when a bootstrap swaps another copy in.
@@ -658,6 +663,7 @@ impl Replica {
             promoting: AtomicBool::new(false),
             unconfirmed: AtomicBool::new(false),
             stop: watch::channel(false).0,
+            wake: tokio::sync::Notify::new(),
             task: Mutex::new(None),
             applied: watch::channel(0).0,
         })
@@ -962,6 +968,12 @@ impl Replica {
         *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
     }
 
+    /// Cuts a failed follow's pause short and resets its backoff (D330 amendment 2): the
+    /// node's map changed the partition's owner, epoch or history.
+    pub(crate) fn wake(&self) {
+        self.wake.notify_one();
+    }
+
     /// Stops the loop and waits for it: an apply in flight finishes, and what arrived before
     /// the stop is applied.
     pub(crate) async fn stop(&self) {
@@ -1088,11 +1100,16 @@ impl Replica {
             if let Some(e) = failed {
                 self.fail(State::Retrying, e);
             }
-            tokio::select! {
-                () = tokio::time::sleep(backoff) => {}
+            let woken = tokio::select! {
+                () = tokio::time::sleep(backoff) => false,
+                () = self.wake.notified() => true,
                 _ = stop.changed() => return,
-            }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            };
+            backoff = if woken {
+                Duration::from_millis(100)
+            } else {
+                (backoff * 2).min(MAX_BACKOFF)
+            };
         }
     }
 

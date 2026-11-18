@@ -179,9 +179,18 @@ impl Node {
         if !super::map::id_ok(&p) {
             return Err(ApiError::invalid(format!("{p:?} isn't a partition id")));
         }
-        if req.to_epoch != req.from_epoch + 1 {
+        // A promote may skip epochs: it stamps above every pending promote's epoch of the
+        // partition, so a copy an unfinished one stamped is never taken for this history
+        // (D330 PR 2, simp724's S2). Every other stamp raises the epoch by one.
+        let ok = if req.promote {
+            req.to_epoch > req.from_epoch
+        } else {
+            req.to_epoch == req.from_epoch + 1
+        };
+        if !ok {
             return Err(ApiError::invalid(format!(
-                "a stamp raises the epoch by one: from {} to {}, not {}",
+                "a stamp raises the epoch by one{}: from {} to {}, not {}",
+                if req.promote { " or more" } else { "" },
                 req.from_epoch,
                 req.from_epoch + 1,
                 req.to_epoch

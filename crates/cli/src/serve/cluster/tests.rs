@@ -52,6 +52,7 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             push_timeout: Duration::from_millis(500),
             lease: TEST_LEASE,
             failover_after: TEST_LEASE * 2,
+            failover_max_lag: None,
             balance_window: Duration::from_secs(300),
             load_interval: Duration::from_millis(500),
         },
@@ -122,6 +123,8 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
                 epoch: 1,
                 memory_bytes: 0,
                 replicas: Vec::new(),
+                failover: 0,
+                failover_count: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -135,6 +138,8 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
         moves: Vec::new(),
     }
 }
@@ -1979,6 +1984,7 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-push-timeout-ms",
         "cluster-lease-ms",
         "cluster-failover-after-ms",
+        "cluster-failover-max-lag-ms",
         "balance-window",
         "tls-key",
         "tls-cert",
@@ -4209,6 +4215,8 @@ fn split_nodes(
                 epoch: 1,
                 memory_bytes: 0,
                 replicas: Vec::new(),
+                failover: 0,
+                failover_count: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -4222,6 +4230,8 @@ fn split_nodes(
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
         moves: Vec::new(),
     };
     let mut stops = Vec::new();

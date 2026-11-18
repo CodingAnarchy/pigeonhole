@@ -396,6 +396,7 @@ impl Fences {
                     partition: id.to_owned(),
                     epoch: s.epoch,
                     term: 0,
+                    ..LeasePart::default()
                 });
             }
         });
@@ -760,11 +761,56 @@ impl Node {
         Ok(round)
     }
 
+    /// Partition `id`'s in-doubt external shares here (D329), for its lease part (D330 PR
+    /// 2's F7): their xids as UTF-8 (hex if not), as many as fit in
+    /// [`super::map::IN_DOUBT_BYTES`], and how many there are. None while it isn't served
+    /// here.
+    fn in_doubt_of(&self, id: &str) -> (Vec<String>, u64) {
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
+            return (Vec::new(), 0);
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let parts = cluster.parts.load();
+        let Some(Ok(part)) = parts.get(id).map(|s| s.part()) else {
+            return (Vec::new(), 0);
+        };
+        let all = part.db.in_doubt();
+        let mut xids = Vec::new();
+        let mut bytes = 0;
+        for (xid, _) in &all {
+            // As the operator pastes it into `phdb cluster txn decide` (simp724's M1 on
+            // #2069): serve's xids are UTF-8; another's bytes go as hex.
+            let text = String::from_utf8(xid.clone()).unwrap_or_else(|_| {
+                use std::fmt::Write as _;
+                xid.iter()
+                    .fold(String::with_capacity(xid.len() * 2), |mut s, b| {
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    })
+            });
+            bytes += text.len();
+            if bytes > super::map::IN_DOUBT_BYTES {
+                break;
+            }
+            xids.push(text);
+        }
+        (xids, all.len() as u64)
+    }
+
     /// A round's lease requests (D326): to each node in `holding` (id, address), which hold
     /// the round's map, and to this node's own grants if the map names it; each bounded by
     /// the push timeout. Counts each partition's grants into `round`.
     async fn ask_leases(self: &Arc<Self>, round: &mut Round, holding: &[(String, String)]) {
         let mut parts = self.fences.askable(&round.map, &self.id);
+        // With failover on, each part carries the partition's in-doubt shares, so a writer
+        // that fails it over can name them (D330 PR 2's F7).
+        if round.map.failover {
+            for p in &mut parts {
+                (p.in_doubt_xids, p.in_doubt_count) = self.in_doubt_of(&p.partition);
+            }
+        }
         // The writer lease (D330): the map's writer asks for it at the map's term; a
         // candidate, at the term it was voted, until its map lands.
         if let Some(term) = self.writer_term_to_ask(&round.map) {
@@ -772,6 +818,7 @@ impl Node {
                 partition: super::lease::WRITER_LEASE.to_owned(),
                 epoch: 0,
                 term,
+                ..LeasePart::default()
             });
         }
         // Nothing to ask, and nothing asked last time: no grant here to end.
@@ -796,6 +843,7 @@ impl Node {
             lease_ms: self.grants.lease_ms(),
             start: self.grants.start(),
             writer_term: round.map.writer_term,
+            pre_vote: false,
         };
         let mut asks = tokio::task::JoinSet::new();
         for (peer, address) in holding {
@@ -911,6 +959,7 @@ impl Node {
             partition: id.to_owned(),
             epoch,
             term: 0,
+            ..LeasePart::default()
         });
     }
 
@@ -1166,8 +1215,9 @@ impl Node {
                     }
                     _ => false,
                 };
-                // An election of the map's writer, if one is due (D330).
-                node.maybe_elect().await;
+                // An election of the map's writer, then failovers, if due (D330), off this
+                // task.
+                node.spawn_duties();
                 drop(node);
                 let next = if missing {
                     let w = wait.min(period);

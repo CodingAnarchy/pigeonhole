@@ -502,6 +502,8 @@ mod tests {
                     epoch,
                     memory_bytes: 0,
                     replicas: Vec::new(),
+                    failover: 0,
+                    failover_count: 0,
                 },
                 Partition {
                     history_epoch: 0,
@@ -510,6 +512,8 @@ mod tests {
                     epoch: 1,
                     memory_bytes: 0,
                     replicas: Vec::new(),
+                    failover: 0,
+                    failover_count: 0,
                 },
             ],
             tables: vec![TablePlacement {
@@ -526,6 +530,8 @@ mod tests {
             writer: String::new(),
             writer_term: 0,
             failover: false,
+            failover_rejoin: false,
+            failovers: Vec::new(),
             moves: Vec::new(),
         }
     }
@@ -557,6 +563,8 @@ mod tests {
             epoch: 1,
             memory_bytes: 0,
             replicas: Vec::new(),
+            failover: 0,
+            failover_count: 0,
         });
         assert!(moved(&a, &added).is_some_and(|w| w.contains("added")));
         let mut resplit = map(9, 1, &["m"]);
