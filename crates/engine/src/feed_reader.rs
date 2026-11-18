@@ -2537,23 +2537,9 @@ impl FeedReader {
             _ => 0,
         };
         // D331: a reader that includes silent commits notes each one, for `emit`.
-        let silent_key = if include_silent {
-            match &record {
-                WalRecord::Batch { seqno, batch, .. } | WalRecord::Prepare { seqno, batch, .. }
-                    if batch.is_silent() =>
-                {
-                    Some(*seqno)
-                }
-                WalRecord::ExternalPrepare { seqno, share, .. }
-                    if share.batch().is_some_and(|b| b.is_silent()) =>
-                {
-                    Some(*seqno)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        if include_silent {
+            note_silent(&record, &mut self.silent_seen);
+        }
         let item = match record {
             WalRecord::Batch { seqno, .. } if seqno > cutoff && seqno > delivered => Item::Skipped,
             // Its round's apply seqno is above its id.
@@ -2605,9 +2591,6 @@ impl FeedReader {
             },
             _ => Item::Other,
         };
-        if let Some(k) = silent_key {
-            self.silent_seen.insert(k);
-        }
         Ok(Some((start, end, session, key, item)))
     }
 
@@ -3570,6 +3553,27 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
         ));
     }
     Ok((h.db_id, h.delivered, h.catalog_seq))
+}
+
+/// Notes `record`'s key in `seen` if it's a feed-silent commit (D331): a single commit's
+/// seqno, a round's share by its id. Only for a reader that includes them, out of line.
+#[cold]
+#[inline(never)]
+fn note_silent(record: &WalRecord<'_>, seen: &mut HashSet<Seqno>) {
+    let key = match record {
+        WalRecord::Batch { seqno, batch, .. } | WalRecord::Prepare { seqno, batch, .. }
+            if batch.is_silent() =>
+        {
+            *seqno
+        }
+        WalRecord::ExternalPrepare { seqno, share, .. }
+            if share.batch().is_some_and(|b| b.is_silent()) =>
+        {
+            *seqno
+        }
+        _ => return,
+    };
+    seen.insert(key);
 }
 
 /// Lets `cursor` take feed-silent batches' mark (D331, ICR 0141) once the database has

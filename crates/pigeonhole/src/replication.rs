@@ -21,8 +21,6 @@ pub struct ReplicatedEvent {
     pub(crate) after: StreamPosition,
     pub(crate) token: FeedToken,
     pub(crate) body: Body,
-    /// A feed-silent commit (D331, ICR 0141): a replica applies it silent too.
-    pub(crate) silent: bool,
 }
 
 /// What a [`ReplicatedEvent`] holds.
@@ -32,6 +30,10 @@ pub(crate) enum Body {
         seqno: u64,
         ts: u64,
         changes: Vec<ReplicatedChange>,
+        /// Feed-silent (D331, ICR 0141): a replica applies it silent too. Here, in the
+        /// commit's room under the catalog variant, so an event is no larger than before
+        /// (#2055's replicate-apply).
+        silent: bool,
     },
     Catalog(CatalogEvent),
 }
@@ -76,23 +78,22 @@ impl ReplicatedEvent {
                         }
                     })
                     .collect(),
+                silent,
             },
             FeedEvent::Catalog(change) => Body::Catalog(change.raw().clone()),
         };
-        let silent = silent && matches!(body, Body::Commit { .. });
         Self {
             before,
             after,
             token,
             body,
-            silent,
         }
     }
 
     /// Whether it is a feed-silent commit (D331, ICR 0141): a range move's copy or cleanup,
     /// which a replica applies silent so its own feed matches its primary's.
     pub fn is_silent(&self) -> bool {
-        self.silent
+        matches!(self.body, Body::Commit { silent: true, .. })
     }
 
     /// Whether it is a catalog change (applied with `apply_catalog`, between runs of commits).
@@ -118,7 +119,7 @@ impl ReplicatedEvent {
     /// a version 2 event rather than apply it as an ordinary write.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(if self.silent {
+        out.push(if self.is_silent() {
             SILENT_EVENT_VERSION
         } else {
             EVENT_VERSION
@@ -133,7 +134,9 @@ impl ReplicatedEvent {
         }
         put_bytes(&mut out, self.token.as_bytes());
         match &self.body {
-            Body::Commit { seqno, ts, changes } => {
+            Body::Commit {
+                seqno, ts, changes, ..
+            } => {
                 out.push(0);
                 out.extend_from_slice(&seqno.to_le_bytes());
                 out.extend_from_slice(&ts.to_le_bytes());
@@ -208,7 +211,12 @@ impl ReplicatedEvent {
                         stored: r.bytes()?.to_vec(),
                     });
                 }
-                Body::Commit { seqno, ts, changes }
+                Body::Commit {
+                    seqno,
+                    ts,
+                    changes,
+                    silent,
+                }
             }
             1 => {
                 let mut ev = CatalogEvent::default();
@@ -246,7 +254,6 @@ impl ReplicatedEvent {
             after,
             token,
             body,
-            silent,
         })
     }
 }
@@ -608,7 +615,7 @@ impl Pigeonhole {
             // first. One event is never split: a primary commit applies whole.
             if let Some(end) = part_end
                 && (part_bytes + bytes > cap
-                    || end.silent != event.silent
+                    || end.is_silent() != event.is_silent()
                     || changes.iter().any(|c| {
                         cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
                     }))
@@ -621,7 +628,7 @@ impl Pigeonhole {
             part_bytes += bytes;
             // A primary's silent commit stays silent here: the replica's own feed skips it as
             // the primary's does, and a promoted replica's feed is the primary's.
-            if event.silent {
+            if event.is_silent() {
                 batch.mark_feed_silent();
             }
             for c in changes {

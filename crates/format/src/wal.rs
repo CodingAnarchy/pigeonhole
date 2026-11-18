@@ -101,6 +101,29 @@ pub const SILENT_BATCH: u32 = 1 << 31;
 /// again on this one only.
 pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
 
+/// Whether a record's batch carries the [`SILENT_BATCH`] mark, read at its place in the
+/// record's bytes (FORMAT §10.3): a Batch's `count` ends at byte 21 (type, seqno and
+/// timestamp before it), a Prepare's at byte 25 (and the coordinator). An External Prepare's
+/// batch follows its variable-length share, so it's decoded (a rare record). A record too
+/// short to hold its count isn't marked here: decoding then reports it.
+#[inline]
+fn marked(bytes: &[u8]) -> bool {
+    let top = |at: usize| bytes.get(at).is_some_and(|b| b & 0x80 != 0);
+    match bytes.first() {
+        Some(1) => top(20),
+        Some(2) => top(24),
+        Some(5) => external_marked(bytes),
+        _ => false,
+    }
+}
+
+/// [`marked`] for an External Prepare: its share decoded, then its batch's mark.
+#[cold]
+#[inline(never)]
+fn external_marked(bytes: &[u8]) -> bool {
+    WalRecord::decode_any(bytes).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
+}
+
 /// [`SILENT_WITHOUT_BIT`]'s error, out of the decoder's way.
 #[cold]
 #[inline(never)]
@@ -995,50 +1018,15 @@ impl WalRecord<'_> {
     /// (the database's superblock has [`INCOMPAT_FEED_SILENT`], D331). Without it a marked
     /// batch is `Corrupt`, so a stray bit is never read as the mark.
     ///
-    /// The mark is checked where each batch is parsed, so a record costs what it did before
-    /// D331 but a flag test (#2055's feed-drain shape).
+    /// The mark is found at its fixed place in the record's bytes before the record is
+    /// decoded, and the decoding itself is what it was before D331, so a record costs a byte
+    /// test more (#2055's feed shapes).
     #[inline]
     pub fn decode_with(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
-        let mut r = Reader::new(bytes, "wal record");
-        match r.u8()? {
-            1 => {
-                let (seqno, commit_ts) = (r.u64()?, r.u64()?);
-                let batch = BatchRef::new(r.rest())?;
-                if !silent_ok && batch.is_silent() {
-                    return Err(silent_without_bit());
-                }
-                Ok(WalRecord::Batch {
-                    seqno,
-                    commit_ts,
-                    batch,
-                })
-            }
-            2 => {
-                let (seqno, commit_ts, coordinator) = (r.u64()?, r.u64()?, StreamId(r.u32()?));
-                let batch = BatchRef::new(r.rest())?;
-                if !silent_ok && batch.is_silent() {
-                    return Err(silent_without_bit());
-                }
-                Ok(WalRecord::Prepare {
-                    seqno,
-                    commit_ts,
-                    coordinator,
-                    batch,
-                })
-            }
-            5 => {
-                let record = WalRecord::ExternalPrepare {
-                    seqno: r.u64()?,
-                    coordinator: StreamId(r.u32()?),
-                    share: ExternalShare::decode(r.rest(), true)?,
-                };
-                if !silent_ok && record.batch().is_some_and(|b| b.is_silent()) {
-                    return Err(silent_without_bit());
-                }
-                Ok(record)
-            }
-            _ => Self::decode_any(bytes),
+        if !silent_ok && marked(bytes) {
+            return Err(silent_without_bit());
         }
+        Self::decode_any(bytes)
     }
 
     /// The batch a record carries, if any: a Batch's, a Prepare's, or an external PREPARE's.
@@ -1331,7 +1319,6 @@ impl<'a> BatchRef<'a> {
     /// taken as the mark, so this is for batches built in memory: bytes read from a WAL file
     /// go through [`WalRecord::decode_with`] (or the WAL crate's readers), which refuse the
     /// mark without `incompat` bit 3, never straight through here (perf2's N2 on #2055).
-    #[inline]
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
         let mut r = Reader::new(bytes, "wal batch");
         let count = r.u32()? & !SILENT_BATCH;
