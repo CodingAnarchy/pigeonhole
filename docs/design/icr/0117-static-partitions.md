@@ -727,7 +727,10 @@ Its steps:
 - One load per call while no move names the partition. Otherwise a cold walk of the keys the call names (`ServiceOp::touches`).
 - **The source, at HANDING_OVER:** a write touching the range answers `Fenced`, retry-safe (unlike the operator's fence). Reads go on.
 - **The source, from HANDED_OVER:** any call touching the range answers `WrongPartition` at the node's map version, whoever sent it, and the sender pulls the newer map.
-- **The target, until CLEANING:** any call touching the range answers `PartitionUnavailable`, retry-safe. The writer sets CLEANING only once the never-both rule holds (PR 5).
+- **The target, until it serves the range:** any call touching the range answers `PartitionUnavailable`, retry-safe.
+  - The writer sets CLEANING only once the never-both rule holds (PR 5).
+  - Taking that map, the target first records a **serving row** (`serving/<move id>`: the range, the hand-over pair, and `t_from`, its visible seqno just before), then serves the range.
+  - So nothing of the range lands on it at or below `t_from` except the move's feed-silent copy, and a replica copy of it serves the range once it has applied that row.
 - **Transactions on the source:** a commit that writes, of a transaction whose snapshot is below the fence's seqno or the latest hand-over's, answers `Fenced` or `Conflict`, retry-safe, whatever it read. Serve doesn't see a transaction's read set. A read-only commit passes, since its snapshot is consistent on its own.
 
 **The source's hand-over** (on the node holding it, at the HANDED_OVER map's install):
@@ -736,6 +739,10 @@ Its steps:
 3. It writes the new epoch into its identity row (until D331 only `Stamp` raised an epoch).
 4. It asks for its lease at the new epoch at once.
 
-A partition that opens gates its moved ranges from those rows before it serves. A row outlives the move record and is pruned by PR 5's writer, at the later of two bounds: every node holds a map at or after the hand-over, and the transaction lifetime plus the request timeout has passed. A later move giving the range back ungates it.
+A partition that opens gates its moved ranges from those rows before it serves.
+- A moved-away range is served again only where a serving row with a newer hand-over pair covers it: a later move gave it back, partly or whole.
+- Any other part a map places on the partition, such as a forced map with no move back, answers `PartitionUnavailable`, naming the move, because its rows there may have been cleaned.
+
+A moved-away row outlives the move record and is pruned by PR 5's writer, at the later of two bounds: every node holds a map at or after the hand-over, and the transaction lifetime plus the request timeout has passed. A serving row lives while it gates its target or clears an older moved-away row.
 
 **Not yet:** the copy and the range follower (PR 4); the driver, the drain and `final_seqno`, the never-both decision, cleanup and the CLI (PR 5); refusing D329 prepares and read holds on a fenced range (with D329 PR 2a); the cluster feed's hold, clipping and backups (PR 3).
