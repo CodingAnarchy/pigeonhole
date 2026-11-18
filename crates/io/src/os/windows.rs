@@ -585,17 +585,21 @@ fn thread_cycles() -> u64 {
     if ok == 0 { 0 } else { cycles }
 }
 
-/// Cycles per nanosecond, measured once: a 2 ms busy loop's thread cycles over the
-/// interrupt clock's nanoseconds (a scheduler preemption in it only lowers the rate a little).
+/// Cycles per nanosecond, measured once: a 10 ms busy loop's thread cycles over its
+/// wall-clock nanoseconds by `Instant` (QPC) (a scheduler preemption in it only lowers the
+/// rate a little).
 fn cycles_per_ns() -> f64 {
     static RATE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *RATE.get_or_init(|| {
-        let (c0, t0) = (thread_cycles(), boot_clock_ns());
-        while boot_clock_ns() - t0 < 2_000_000 {
+        // `Instant` is QPC, precise to well under a microsecond; the interrupt clock
+        // advances only once a system tick (~15.6 ms), which made the rate's error a random
+        // part of a tick (simp724's S4 on #2063).
+        let (c0, t0) = (thread_cycles(), std::time::Instant::now());
+        while t0.elapsed() < std::time::Duration::from_millis(10) {
             std::hint::spin_loop();
         }
-        let (c1, t1) = (thread_cycles(), boot_clock_ns());
-        let rate = (c1 - c0) as f64 / (t1 - t0).max(1) as f64;
+        let (c1, elapsed) = (thread_cycles(), t0.elapsed());
+        let rate = (c1 - c0) as f64 / (elapsed.as_nanos().max(1)) as f64;
         if rate > 0.0 { rate } else { 1.0 }
     })
 }

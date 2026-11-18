@@ -1974,8 +1974,11 @@ impl Service {
         }
         let mut reply = match load {
             Some(load) if super::cluster::load::sample_cpu() => {
-                super::cluster::load::Timed::new(self.answer(op, caller, budget), Arc::clone(load))
-                    .await
+                super::cluster::load::sampled_call(
+                    Arc::clone(load),
+                    self.answer(op, caller, budget),
+                )
+                .await
             }
             _ => self.answer(op, caller, budget).await,
         };
@@ -4914,10 +4917,12 @@ async fn held<T: Send + 'static>(
     _place: OwnedSemaphorePermit,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(|| {
+    // A sampled call's work is timed where it runs (D332, simp724's M1 on #2063).
+    let sampled = super::cluster::load::sampled();
+    tokio::task::spawn_blocking(move || {
         // A reused pool thread takes a mask published since it started (D317 ticket 6).
         super::placement::refresh();
-        f()
+        super::cluster::load::run_sampled(sampled.as_ref(), f)
     })
     .await
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?

@@ -52,7 +52,7 @@ pub fn sys::thread_cpu_nanos() -> u64;
 ```
 
 - Unix uses `CLOCK_THREAD_CPUTIME_ID`, a system call on Linux.
-- Windows uses `QueryThreadCycleTime`, scaled by a cycle rate measured once (perf287's S1, over `GetThreadTimes`' 15.6 ms ticks).
+- Windows uses `QueryThreadCycleTime`, scaled by a cycle rate measured once against `Instant` (QPC) (perf287's S1, over `GetThreadTimes`' 15.6 ms ticks; simp724's S4 on #2063).
 - `File` and `Vfs` each gain a doc line: a new method must also be forwarded by `CountingFile`/`CountingVfs`.
 
 **`pigeonhole`** (`__unstable-replication`, doc-hidden, in `replication.rs`):

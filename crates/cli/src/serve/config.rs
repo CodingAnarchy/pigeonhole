@@ -342,14 +342,16 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_failover_after_ms: u64,
-    /// The window a partition's load is averaged over, and the node's device ceiling taken
-    /// across, in seconds (D332): what the cluster balancer compares. Measured on every
+    /// The window a partition's load is averaged over (an exponential average, each 30 s
+    /// reading weighing `1 − e^(−30/window)`), and the node's device ceiling taken across,
+    /// in seconds, 30 to 86400 (D332): what the cluster balancer compares. Measured on every
     /// cluster node; read only by a balancer.
     #[arg(
         long,
         value_name = "SECS",
         default_value_t = 300,
-        value_parser = clap::value_parser!(u64).range(30..),
+        value_parser = clap::value_parser!(u64)
+            .range(30..=crate::serve::cluster::load::MAX_WINDOW_SECS),
         requires = "cluster",
         conflicts_with = "file"
     )]

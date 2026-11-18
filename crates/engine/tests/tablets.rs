@@ -449,6 +449,41 @@ fn tablets_reports_each_tablets_range_and_write_load() {
     }
 }
 
+#[test]
+fn tablets_counts_a_shared_ssts_bytes_once_divided_between_its_tablets() {
+    // D332 (ICR 0142; simp724's S5 on #2063): one flushed SST's bytes are the tablet's; a
+    // split leaves the SST shared by both halves until compaction rewrites it, and each
+    // reports half, so the sum stays the SST's.
+    let mut db = open(1, |o| o.balance_interval_nanos = u64::MAX);
+    for t in 0..2 {
+        for i in 0..200 {
+            db.put(&tablet_row(t, i), &[7u8; 64]);
+        }
+    }
+    db.flush();
+    let bytes = |db: &Db| -> Vec<u64> {
+        db.engine
+            .tablets()
+            .into_iter()
+            .filter(|t| t.table == "t")
+            .map(|t| t.bytes)
+            .collect()
+    };
+    let whole = bytes(&db);
+    assert_eq!(whole.len(), 1);
+    assert!(whole[0] > 0, "the flushed SST's bytes: {whole:?}");
+    let m = db.engine.split_tablet_pending(db.table.id, b"t01").unwrap();
+    db.drive(m).unwrap();
+    let halves = bytes(&db);
+    assert_eq!(halves.len(), 2, "{halves:?}");
+    assert!(halves.iter().all(|b| *b > 0), "{halves:?}");
+    assert!(
+        whole[0] - halves.iter().sum::<u64>() <= 1,
+        "the shared SST counts once: {whole:?} then {halves:?}"
+    );
+    db.close();
+}
+
 /// Row `i` of tablet `t` in [`tablets_on`]'s layout (split at `t01`, `t02`, ...).
 fn tablet_row(t: usize, i: u64) -> Vec<u8> {
     format!("t{t:02}-{i:08}").into_bytes()

@@ -322,6 +322,9 @@ struct Peers {
     failover_after: Duration,
     /// `--balance-window` (D332): the load averages' and the device ceiling's window.
     balance_window: Duration,
+    /// How often a partition's load averages take a reading ([`load::INTERVAL`]; shorter in
+    /// tests).
+    load_interval: Duration,
 }
 
 /// A cluster node.
@@ -2374,6 +2377,7 @@ pub(crate) fn run(
                 ms => ms,
             }),
             balance_window: Duration::from_secs(args.balance_window),
+            load_interval: load::INTERVAL,
         },
         state,
         voted,

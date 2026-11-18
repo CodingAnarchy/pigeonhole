@@ -292,10 +292,19 @@ mod tests {
         let back = f.submit_read(f.read_buf(30), 100);
         back.wait().unwrap();
         assert_eq!(counters.totals(), (90, 150));
+        // Readahead counts every buffer it issues.
+        for c in f.submit_reads_ahead(vec![(f.read_buf(20), 0), (f.read_buf(10), 40)]) {
+            c.wait().unwrap();
+        }
+        assert_eq!(counters.totals(), (120, 150));
+        // A read past the end, short or failed, counts the length asked for.
+        let mut far = [0; 40];
+        let _ = f.read_at(&mut far, 140);
+        assert_eq!(counters.totals(), (160, 150));
         // Syncs, lengths and punches count nothing.
         f.sync_data().unwrap();
         f.len().unwrap();
-        assert_eq!(counters.totals(), (90, 150));
+        assert_eq!(counters.totals(), (160, 150));
     }
 
     #[test]

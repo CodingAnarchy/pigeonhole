@@ -4150,17 +4150,18 @@ impl Engine {
     /// Every tablet's row range, SST bytes and write load (D332, ICR 0142): for a cluster
     /// balancer choosing a split key. The bytes of an SST two tablets share (after a split,
     /// until compaction rewrites it) count once, divided between them. The write load is
-    /// each tablet's moving average of rows written per balancer interval, as its shard last
-    /// published it (0 until it has, or with `tablet_changes` off). Not part of the stable
-    /// API.
+    /// each tablet's moving average of rows written per balancer interval, as the shard that
+    /// holds it now last published it: 0 until it has, after a move between shards too (the
+    /// source shard's entry, stale, is never read), or with `tablet_changes` off. Not part
+    /// of the stable API.
     #[doc(hidden)]
     pub fn tablets(&self) -> Vec<TabletStats> {
         let shared = &self.inner.shared;
         let view = shared.view.load();
-        let loads: HashMap<TabletId, f64> = shared
+        let loads: Vec<HashMap<TabletId, f64>> = shared
             .tablet_loads
             .iter()
-            .flat_map(|l| l.load().iter().copied().collect::<Vec<_>>())
+            .map(|l| l.load().iter().copied().collect())
             .collect();
         let refs = view.catalog.sst_refs();
         view.tablets
@@ -4174,9 +4175,21 @@ impl Engine {
                 start: t.start.clone(),
                 end: t.end.clone(),
                 bytes: crate::shard::shared_bytes(&view, t, &refs),
-                write_load: loads.get(&t.id).copied().unwrap_or(0.0),
+                write_load: loads
+                    .get(usize::from(t.shard.0))
+                    .and_then(|l| l.get(&t.id))
+                    .copied()
+                    .unwrap_or(0.0),
             })
             .collect()
+    }
+
+    /// Bytes this database's files have read and written since open, as its `CountingVfs`
+    /// counts them (D332, ICR 0142): `Metrics::device_read_bytes` and `device_write_bytes`
+    /// without the rest of [`Engine::metrics`]. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn device_bytes(&self) -> (u64, u64) {
+        self.inner.shared.io.totals()
     }
 
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,

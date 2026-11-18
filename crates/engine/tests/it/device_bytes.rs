@@ -14,8 +14,8 @@ fn bytes(db: &Engine) -> (u64, u64) {
 
 #[test]
 fn device_bytes_rise_with_writes_and_uncached_reads_and_not_when_idle() {
-    let dir = std::env::temp_dir().join(format!("phdb-device-bytes-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Fresh::new();
+    let dir = &dir.0;
     let mut o = EngineOptions::new(pigeonhole_io::pread::PreadVfs::new(0));
     o.create_if_missing = true;
     o.shards = 1;
@@ -75,5 +75,26 @@ fn device_bytes_rise_with_writes_and_uncached_reads_and_not_when_idle() {
     );
     drop(snap);
     db.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory of the test's own, never an earlier run's (pid and clock in its name),
+/// removed on drop, a failure's included.
+struct Fresh(std::path::PathBuf);
+
+impl Fresh {
+    fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let d =
+            std::env::temp_dir().join(format!("phdb-device-bytes-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        Self(d)
+    }
+}
+
+impl Drop for Fresh {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

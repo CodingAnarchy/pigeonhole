@@ -90,11 +90,15 @@ impl Lite {
             return Err(f);
         };
         let (tx, rx) = oneshot::channel();
+        // A sampled call's work is timed where it runs (D332, simp724's M1 on #2063).
+        let sampled = super::cluster::load::sampled();
         let job: Job = Box::new(move || {
             // A mask published since the thread started (D317 ticket 6).
             super::placement::refresh();
-            let out = catch_unwind(AssertUnwindSafe(f))
-                .unwrap_or_else(|_| Err(ApiError::internal("a call on the light pool panicked")));
+            let out = catch_unwind(AssertUnwindSafe(|| {
+                super::cluster::load::run_sampled(sampled.as_ref(), f)
+            }))
+            .unwrap_or_else(|_| Err(ApiError::internal("a call on the light pool panicked")));
             // The place first, so a caller that has its reply finds it free.
             drop(place);
             let _ = tx.send(out);

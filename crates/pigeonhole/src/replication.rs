@@ -361,16 +361,18 @@ impl Pigeonhole {
     /// Bytes this database's files have read and written since open, as the engine counts
     /// them at its files (D332, ICR 0142): on-disk sizes, readahead included, syncs not. An
     /// estimate for comparing databases on one node, since reads the OS page cache served
-    /// count too. Not part of the stable API.
+    /// count too. A reader instance (`open_reader`) counts nothing. Not part of the stable
+    /// API.
+    #[doc(hidden)]
     pub fn device_bytes(&self) -> (u64, u64) {
-        let m = self.engine().metrics();
-        (m.device_read_bytes, m.device_write_bytes)
+        self.engine().device_bytes()
     }
 
     /// Every tablet's row range, SST bytes and write load (D332, ICR 0142): what a cluster
     /// balancer splits a partition by. A shared SST's bytes are divided among its tablets;
     /// the write load is the engine's moving average of rows written per balancer interval
     /// (0 with `tablet_changes` off). Not part of the stable API.
+    #[doc(hidden)]
     pub fn tablets(&self) -> Vec<TabletLoad> {
         self.engine()
             .tablets()
