@@ -1019,6 +1019,18 @@ fn gained<'t>(
     })
 }
 
+/// Whether source part `s` has nothing to order a barrier's hold against (feed1248's S1,
+/// simp724's refinement): still at `Now` with no open live, because it's unavailable or was
+/// never tried. Any open of it from here on is started after the barrier exists, so at or
+/// past the move's `final_seqno`: a barrier comes only from the target's serving row,
+/// written at CLEANING, after `final_seqno` was fixed at HANDING_OVER from the source's
+/// visible seqno. Holding would only stall the target behind a down source for a finished
+/// move. A `Now` part opening or open with nothing from it yet still holds: its start may
+/// have been taken before HANDING_OVER, below `final_seqno`, with its first event in flight.
+fn idle_now(s: &Part) -> bool {
+    matches!(s.at, At::Now) && (s.unavailable || (s.events.is_none() && !s.opening))
+}
+
 /// Drops part `i`'s range move holds that no longer hold, and whether one still does: a
 /// hold holds while its source's part is below the move's `final_seqno`. A merge with no
 /// part for the source holds nothing (cli692's F4: a subscription that never read the
@@ -1028,17 +1040,10 @@ fn gained<'t>(
 /// source a hold lifts up to its quiet interval late (feed1248's S3).
 fn release(parts: &mut [Part], i: usize) -> bool {
     while let Some(h) = parts[i].holds.front() {
-        // A source part still at `Now` holds nothing (feed1248's S1): a barrier exists only
-        // from the target's serving row, written at CLEANING, after the move's
-        // `final_seqno` was fixed at HANDING_OVER from the source's visible seqno, so a
-        // start at the source's now is past it, and an unopened (down) source part would
-        // only stall the target for a finished move.
         let behind = parts
             .iter()
             .find(|p| p.partition == h.source)
-            .is_some_and(|s| {
-                !matches!(s.at, At::Now) && s.at.seqno().is_none_or(|at| at < h.final_seqno)
-            });
+            .is_some_and(|s| !idle_now(s) && s.at.seqno().is_none_or(|at| at < h.final_seqno));
         if behind {
             return true;
         }
@@ -1631,9 +1636,9 @@ pub(crate) async fn serve(
 /// and where it ends. A table the map places here is read. One it doesn't that a range move
 /// took from it whole is still its own to serve, up to the move's last seqno, while it holds
 /// the moved-away row. Any other is left out (feed1248's M1): it was never here, or PR 5
-/// pruned its row, which it does only once this partition's feed retention has passed the
-/// move's last seqno, so a position below that fails on retention here anyway (ICR 0117's
-/// D331 PR 3b section). None left: `WrongPartition` (a resume of it expires). When every
+/// pruned its row. Leaving a pruned one out is safe only by PR 5's rule that it prunes a row
+/// once this partition's feed retention has passed the move's last seqno, so a position
+/// below that fails on retention here anyway (cli692; ICR 0117's D331 PR 3b section). None left: `WrongPartition` (a resume of it expires). When every
 /// table kept is a moved one, the component ends past the latest of their last seqnos
 /// (`Some`); else it reads on (`None`: the moved tables' later events here are only
 /// feed-silent cleanup). A running component finds the same end when a move takes its last
@@ -1905,8 +1910,9 @@ pub(super) mod tests {
         assert!(!release(&mut parts, 1));
         assert!(parts[1].holds.is_empty());
         // A source with no position yet from its oldest or its hand-over holds; one still at
-        // its now doesn't (feed1248's S1: it opens past the move's last seqno), nor one the
-        // merge has no part of.
+        // its now holds while its open is live (its start may predate the hand-over:
+        // simp724), not while it's unavailable or was never tried (feed1248's S1: any open
+        // from here starts past the move's last seqno); nor one the merge has no part of.
         for at in [At::Oldest, At::HandOver] {
             parts[0].at = at;
             parts[1].holds.clear();
@@ -1914,7 +1920,21 @@ pub(super) mod tests {
             assert!(release(&mut parts, 1));
         }
         parts[0].at = At::Now;
-        assert!(!release(&mut parts, 1));
+        let held = |parts: &mut Vec<Part>| {
+            parts[1].holds.clear();
+            parts[1].holds.push_back(hold("p1", 1));
+            release(parts, 1)
+        };
+        assert!(!held(&mut parts), "never tried");
+        parts[0].opening = true;
+        assert!(held(&mut parts), "opening");
+        parts[0].opening = false;
+        parts[0].events = Some(super::tests::fed().1);
+        assert!(held(&mut parts), "open, nothing from it yet");
+        parts[0].events = None;
+        parts[0].unavailable = true;
+        assert!(!held(&mut parts), "unavailable");
+        parts[0].unavailable = false;
         parts[1].holds.clear();
         parts[1].holds.push_back(hold("p9", u64::MAX));
         assert!(!release(&mut parts, 1));

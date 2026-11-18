@@ -2373,9 +2373,10 @@ async fn move_orders_to(
     }
 }
 
-/// D331 PR 3b (Q2, feed1248's M2 and M3): a running subscription that doesn't read the
-/// partition a move gave its table a range of ends with a checkpoint, then `FeedRerouted`;
-/// its resume from that checkpoint reads the new partition from its hand-over on.
+/// D331 PR 3b (Q2, feed1248's M2 and M3, and S3 on the code): a running subscription that
+/// doesn't read the partition a move gave its table a range of ends with a checkpoint, then
+/// `FeedRerouted`, a hub member and a member on a merge of its own alike; each resume from
+/// its checkpoint reads the new partition from its hand-over on, with no barrier sent.
 #[test]
 fn a_move_to_a_partition_the_subscription_doesnt_read_reroutes_it_and_its_resume_reads_it() {
     bounded(Duration::from_secs(180), || {
@@ -2384,52 +2385,65 @@ fn a_move_to_a_partition_the_subscription_doesnt_read_reroutes_it_and_its_resume
         let (a, c) = (ports[0], ports[2]);
         t.rt.block_on(async {
             orders_on_p1(a).await;
-            let mut s = subscribe(
-                c,
-                SubscribeRequest {
-                    tables: vec!["orders".into()],
-                    checkpoint_every: 1,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-            let last = put_order(c, "a1").await;
+            let req = |start| SubscribeRequest {
+                tables: vec!["orders".into()],
+                checkpoint_every: 1,
+                start,
+                ..Default::default()
+            };
+            let mut s = subscribe(c, req(None)).await.unwrap();
+            put_order(c, "a1").await;
             let (seen, _) = commits(&mut s, 1).await;
             assert_eq!(seen[0].partition, "p1");
+            // A second subscriber from the first's token: a merge of its own (feed1248's S3),
+            // not the hub's.
+            let mut own = subscribe(c, req(Some(Start::Resume(seen[0].token.clone().unwrap()))))
+                .await
+                .unwrap();
+            let last = put_order(c, "a2").await;
+            let mut tokens = Vec::new();
+            for sub in [&mut s, &mut own] {
+                let (seen, _) = commits(sub, 1).await;
+                assert_eq!(seen[0].rows, ["a2"], "{seen:?}");
+                tokens.push(seen[0].token.clone().expect("a commit carries a token"));
+            }
             move_orders(&ports, "m", last).await;
-            // The stream ends: its last event carries a token, then FeedRerouted.
-            let mut token = seen[0].token.clone().unwrap();
-            let end = loop {
-                match tokio::time::timeout(Duration::from_secs(20), s.message())
-                    .await
-                    .expect("the merge notices the map")
-                {
-                    Ok(Some(e)) => {
-                        if !e.token.is_empty() {
-                            token = e.token.clone();
+            // Each stream ends: its last event carries a token, then FeedRerouted.
+            for (sub, token) in [&mut s, &mut own].into_iter().zip(tokens.iter_mut()) {
+                let end = loop {
+                    match tokio::time::timeout(Duration::from_secs(20), sub.message())
+                        .await
+                        .expect("the merge notices the map")
+                    {
+                        Ok(Some(e)) => {
+                            assert!(
+                                !matches!(e.event, Some(Event::MoveBarrier(_))),
+                                "a barrier reached the client"
+                            );
+                            if !e.token.is_empty() {
+                                *token = e.token.clone();
+                            }
                         }
+                        Ok(None) => panic!("ended without an error"),
+                        Err(e) => break e,
                     }
-                    Ok(None) => panic!("ended without an error"),
-                    Err(e) => break e,
-                }
-            };
-            assert_eq!(code(&end), "FeedRerouted", "{end}");
-            // p2's write after the hand-over reaches the resume.
+                };
+                assert_eq!(code(&end), "FeedRerouted", "{end}");
+            }
+            // p2's write after the hand-over reaches both resumes, with no barrier.
             put_order(c, "zz").await;
-            let mut r = subscribe_when_leased(
-                c,
-                SubscribeRequest {
-                    tables: vec!["orders".into()],
-                    checkpoint_every: 1,
-                    start: Some(Start::Resume(token)),
-                    ..Default::default()
-                },
-            )
-            .await;
-            let (seen, _) = commits(&mut r, 1).await;
-            assert_eq!(seen[0].partition, "p2", "{seen:?}");
-            assert_eq!(seen[0].rows, ["zz"]);
+            for token in tokens {
+                let mut r = subscribe_when_leased(c, req(Some(Start::Resume(token)))).await;
+                let (seen, other) = commits(&mut r, 1).await;
+                assert_eq!(seen[0].partition, "p2", "{seen:?}");
+                assert_eq!(seen[0].rows, ["zz"]);
+                assert!(
+                    !other
+                        .iter()
+                        .any(|e| matches!(e.event, Some(Event::MoveBarrier(_)))),
+                    "a barrier reached the client"
+                );
+            }
         });
     });
 }

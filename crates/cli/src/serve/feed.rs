@@ -2420,13 +2420,14 @@ impl Barriers {
     /// `t_from`.
     fn due(&mut self, out: &Out) -> Option<Barrier> {
         let next = self.pending.front()?;
-        // A component's events carry D310 tokens or none (feed1248's S2). Failing closed
-        // (handing the barrier out) isn't safe: its token would move the merge's position to
-        // `t_from` ahead of events still to come.
+        // A component's commits carry D310 tokens, and its other events one or none
+        // (feed1248's S2 and its nit: a tokenless commit past `t_from` is exactly what would
+        // slip by unheld). Failing closed (handing the barrier out) isn't safe: its token
+        // would move the merge's position to `t_from` ahead of events still to come.
         debug_assert!(
-            out.token().is_empty()
-                || crate::serve::cluster::token::token_seqno(out.token()).is_some(),
-            "a component event's token isn't a D310 token"
+            crate::serve::cluster::token::token_seqno(out.token()).is_some()
+                || (out.token().is_empty() && !out.is_commit()),
+            "a component's commit without a D310 token, or an event with another token"
         );
         let seqno = crate::serve::cluster::token::token_seqno(out.token())?;
         if seqno > next.t_from {
@@ -2503,6 +2504,15 @@ pub(crate) enum Out {
 impl Out {
     pub(crate) fn event(e: proto::FeedEvent) -> Self {
         Out::Event(Box::new(e))
+    }
+
+    /// Whether it's a commit (a ring entry always is). Only for the barriers' debug check.
+    fn is_commit(&self) -> bool {
+        match self {
+            Out::Event(e) => matches!(e.event, Some(proto::feed_event::Event::Commit(_))),
+            Out::Shared(_) => true,
+            Out::Spliced { .. } | Out::Merged(_) => false,
+        }
     }
 
     fn token(&self) -> &Bytes {
