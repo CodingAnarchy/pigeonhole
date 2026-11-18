@@ -335,6 +335,7 @@ impl FileInner {
     }
 
     fn sync_data(&self) -> Result<()> {
+        let _flight = crate::os::SyncFlight::new();
         self.file().sync_data().map_err(|e| Error::os("sync", e))
     }
 }

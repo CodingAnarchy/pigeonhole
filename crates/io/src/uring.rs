@@ -626,16 +626,19 @@ impl File for UringFile {
     }
 
     fn sync_data(&self) -> Result<()> {
+        let _flight = crate::os::SyncFlight::new();
         self.file.sync_data()
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
         if self.inline_here() {
+            let _flight = crate::os::SyncFlight::new();
             return Completion::ready(self.file.sync_data());
         }
         self.submit(|resolver| Kind::Sync {
             data_only: true,
             resolver,
+            _flight: crate::os::SyncFlight::new(),
         })
     }
 
@@ -650,6 +653,7 @@ impl File for UringFile {
         self.submit(|resolver| Kind::Sync {
             data_only: false,
             resolver,
+            _flight: crate::os::SyncFlight::new(),
         })
     }
 
@@ -725,6 +729,8 @@ enum Kind {
     Sync {
         data_only: bool,
         resolver: Resolver<()>,
+        /// Scratch (arm g): counted in flight until the op is dropped.
+        _flight: crate::os::SyncFlight,
     },
 }
 

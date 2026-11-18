@@ -146,10 +146,40 @@ pub(crate) fn locality(_file: &fs::File) -> Result<Locality> {
 /// writeback error sequence. A writeback error seen there would then be consumed, and the root
 /// commit's later `fdatasync` of the same file would not report it, declaring output durable
 /// that never reached the disk. With `WRITE` alone the error stays for the next sync to see.
+/// Scratch (perf2, 1.3.0 GroupSync p99.9 A/B, arm g): data syncs in flight in this process,
+/// any file (the WAL's group syncs and the root commit's).
+pub(crate) static SYNCS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Scratch (arm g): counts one sync in flight until dropped.
+pub(crate) struct SyncFlight(());
+
+impl SyncFlight {
+    pub(crate) fn new() -> Self {
+        SYNCS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(())
+    }
+}
+
+impl Drop for SyncFlight {
+    fn drop(&mut self) {
+        SYNCS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Scratch (arm g): the longest a hint waits for the syncs in flight to finish.
+const GATE: std::time::Duration = std::time::Duration::from_micros(500);
+
 #[cfg(target_os = "linux")]
 pub(crate) fn start_writeback(file: &fs::File, offset: u64, len: u64) -> Result<()> {
     let start = off(offset, "start_writeback: offset too large")?;
     let count = off(len, "start_writeback: length too large")?;
+    // Scratch (arm g): start the writeback between syncs, so a sync's small write doesn't
+    // queue behind it; at most GATE late.
+    let t0 = std::time::Instant::now();
+    while SYNCS_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0 && t0.elapsed() < GATE {
+        std::thread::sleep(std::time::Duration::from_micros(20));
+    }
     // SAFETY: plain syscall on an fd owned by `file`.
     if unsafe { libc::sync_file_range(file.as_raw_fd(), start, count, libc::SYNC_FILE_RANGE_WRITE) }
         == 0
