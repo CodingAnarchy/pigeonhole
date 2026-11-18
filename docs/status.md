@@ -46,6 +46,7 @@ What the public API does, and the first release with each piece. The [README's l
 | Durability | `Durability::{None, Buffered, GroupSync, Sync}`, `commit_with`, `Options::durability` | released, 1.0.0 |
 | | SST output starts its writeback as it is written, so `GroupSync` put latency holds through a long session (D334, #1991) | on `main`, 1.3.0 |
 | | blob files' output too (#2023) | on `main`, 1.3.0 |
+| Disk space | the data file's free space is given back to the filesystem by a background punch pass, on by default: `Options::punch_freed` (D333, ICR 0144, #2013) | on `main`, 1.3.0 |
 | Snapshots, backups, reader processes | `snapshot`, `durable_snapshot`, `backup`, `open_reader` | released, 1.0.0 |
 | | `Options::read_only` (an open that writes nothing to the files) | released, 1.1.0 |
 | | `backup_at`; read-only opens of read-only files (#1348) | released, 1.2.0 |
