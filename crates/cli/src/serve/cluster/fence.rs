@@ -31,8 +31,8 @@ const DRAIN_WAIT: Duration = Duration::from_secs(30);
 
 /// How often a node whose partition has no lease asks its peers again (cli692's S3): the
 /// first wait, doubled up to the last, and never more than a third of a lease.
-const RETRY_FIRST: Duration = Duration::from_millis(250);
-const RETRY_MAX: Duration = Duration::from_secs(5);
+pub(super) const RETRY_FIRST: Duration = Duration::from_millis(250);
+pub(super) const RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Reads `dir`'s fenced partitions; none when there's no file.
 pub(crate) fn read_fenced(dir: &Path) -> Result<BTreeSet<String>, String> {

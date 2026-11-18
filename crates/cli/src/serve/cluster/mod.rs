@@ -833,10 +833,23 @@ impl Node {
                 Ok(None)
             })
             .await?;
-        // The lease again before the push (D330): past it, the change stays here, on a
-        // minority, and an elected writer's map replaces it.
-        if let Ok(set) = self.get_map() {
-            self.writer_may_change(&set)?;
+        // The lease again before the push (D330). Past it, the change is installed here and
+        // not undone: it may still reach the cluster (this writer's next round, if it renews
+        // at the same term, pushes it) or be replaced by an elected map. So its outcome is
+        // unknown (simp724's S1 on #2056).
+        if let Ok(set) = self.get_map()
+            && let Err(e) = self.writer_may_change(&set)
+        {
+            return Err(ApiError::from_code(
+                ErrorCode::OutcomeUnknown,
+                &format!(
+                    "map version {version} is installed on this node, the writer, but its \
+                     writer lease ran out before the push ({}). It may still reach the \
+                     cluster, or be replaced by an elected map: read the map (phdb cluster \
+                     show-map) before setting it again",
+                    e.message
+                ),
+            ));
         }
         let pushed = match self.get_map() {
             Ok(set) if changes_nodes && set.map_version == version => self.joint_wait(&set).await,

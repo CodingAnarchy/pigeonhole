@@ -669,7 +669,7 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 **The writer lease:**
 - `__writer` is a reserved partition id. The writer asks for it in its lease rounds at the map's term.
 - A grantor grants it to the node its map names as writer, at the map's term, unless it voted for a higher one. It withholds it from any other node as it withholds a partition.
-- From term 1, `SetMap` needs it, checked before the install and again before the push. At term 0 it doesn't, so a cluster whose older nodes don't grant it can still change its map.
+- From term 1, `SetMap` needs it before the install, waiting up to `L·(1+ρ)` plus a push timeout for it, and again before the push. If it's gone by the push, the map stays installed on the writer and the answer is `OutcomeUnknown`: the map may still reach the cluster at the writer's next round, or be replaced by an elected map (simp724's S1 on #2056). At term 0 the lease isn't needed, so a cluster whose older nodes don't grant it can still change its map.
 - A plain `SetMap` keeps the current map's `writer` and `writer_term`, whatever the request says.
 - A node that installs a map naming another writer releases its writer lease to every node (`Cluster.Release`, keyed by the term).
 

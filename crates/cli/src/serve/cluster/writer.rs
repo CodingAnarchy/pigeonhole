@@ -19,7 +19,8 @@
 //!    it until a majority holds it.
 //!
 //! A change the old writer pushed to a majority is in the map step 2 reads; one that reached
-//! only a minority was never confirmed (D317 rule 3), so nothing served under it. A node that
+//! only a minority wasn't confirmed (D317 rule 3), so nothing served under it, until the
+//! writer pushes it again at its term (simp724's N3 on #2056); an elected map replaces it. A node that
 //! voted for a term refuses every map and writer lease below it (the term fence), so the old
 //! writer's late pushes can't reach a majority once the vote has.
 
@@ -124,6 +125,8 @@ impl Node {
         let until = tokio::time::Instant::now()
             + super::lease::grace(self.grants.lease())
             + self.peers.push_timeout;
+        // Backing off as the renewals do while a lease is missing (simp724's N2 on #2056).
+        let mut pause = super::fence::RETRY_FIRST;
         loop {
             match self.writer_may_change(current) {
                 Ok(()) => return Ok(()),
@@ -131,13 +134,20 @@ impl Node {
                 Err(_) => {}
             }
             self.confirm_round().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let left = until.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(pause.min(left)).await;
+            pause = (pause * 2).min(super::fence::RETRY_MAX);
         }
     }
 
     /// `Cluster.Lease` for an election vote: a request for the writer lease alone, above
     /// every term this node knows. Its term is synced to [`WRITER_TERM_FILE`] before the
     /// answer (the term fence).
+    ///
+    /// It also takes an elected writer's lone renewal at a grantor still behind its map
+    /// (simp724's N1 on #2056): that term is above the grantor's, so the grantor votes for it,
+    /// which is what the election asked of a majority already. Harmless, and the grantor's
+    /// next round takes the elected map.
     pub(crate) fn is_vote(&self, mine: &ClusterMap, req: &LeaseRequest) -> bool {
         matches!(req.parts.as_slice(), [p] if p.partition == super::lease::WRITER_LEASE
             && p.term > self.grants.term_floor(mine))
