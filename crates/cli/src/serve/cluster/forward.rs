@@ -247,10 +247,14 @@ impl Forwarder {
         if let Some(routes) = self.node.routes().as_ref() {
             peers.retain(|a, _| routes.has_address(a));
         }
+        // Pinged while a stream runs, as `Node::peer_channel` is, so a peer that dies silently
+        // ends its streams rather than holding them until the OS gives up on the connection:
+        // a forwarded BulkLoad part's answer is waited for (simp724's n2 on #2045).
         let endpoint = self
             .node
             .endpoint(address)
-            .map_err(|e| ApiError::partition_unavailable(format!("node at {address}: {e}")))?;
+            .map_err(|e| ApiError::partition_unavailable(format!("node at {address}: {e}")))?
+            .http2_keep_alive_interval(Duration::from_secs(30));
         let peer = Arc::new(StreamPeer {
             endpoint,
             idle: Mutex::new(Vec::new()),

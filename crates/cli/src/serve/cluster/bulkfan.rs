@@ -59,7 +59,13 @@ fn on(partition: &str, mut e: ApiError) -> ApiError {
 fn took(r: &Result<(), ApiError>) -> bool {
     match r {
         Ok(()) => true,
-        Err(e) => e.message.contains("loaded") || e.code == "OutcomeUnknown",
+        // `applied_partly`'s phrases and the loader's, not "loaded" alone, which "overloaded"
+        // has (simp724's n1 on #2045).
+        Err(e) => {
+            e.message.contains("were loaded")
+                || e.message.contains("may have been loaded")
+                || e.code == "OutcomeUnknown"
+        }
     }
 }
 
