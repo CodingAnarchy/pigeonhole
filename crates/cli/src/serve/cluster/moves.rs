@@ -1,23 +1,27 @@
-//! A node's side of D331's range moves (PR 2: the gates, no data moving yet): arming each
-//! partition's range gate as it opens, and, on each map install, deriving every open
-//! partition's gate again and taking the source's hand-over.
+//! A node's side of D331's range moves (PR 2: the gates, no data moving yet): bringing each
+//! partition it serves up to the map at every install and at open ([`Node::settle`]),
+//! which derives its range gate and finishes its hand-over as a source.
 //!
 //! **The source's hand-over (S1, as simp724 and cli692 agreed it).** The map that takes a
 //! move to HANDED_OVER raises its source S's epoch by one, on the same node, keeping S's
 //! history. The node holding S, taking that map:
-//! 1. its install has already ended S's lease (`lapse_unnamed`: the map no longer names this
-//!    node for S at its file's epoch), so S serves nothing from the install on, and every
-//!    D329 read hold taken under the old lease's term is lost (simp724's S2). The lapse is
+//! 1. ends S's lease (its install's `lapse_unnamed` already has: the map no longer names
+//!    this node for S at its file's epoch), so S serves nothing until the new lease, and
+//!    every D329 read hold under the old lease's term is lost (simp724's S2). The lapse is
 //!    repeated here, explicitly, so it doesn't rest on that rule;
-//! 2. records the moved-away range in S's file ([`super::super::ranges::Moved`]), so a
-//!    restart rebuilds the gate from it before serving;
+//! 2. records the moved-away range in S's file ([`Moved`]), so an open gates it from there;
 //! 3. writes the new epoch into S's identity row, a local write in its own partition (until
 //!    D331 only `Stamp` raised an epoch, on a closed file);
-//! 4. serves S at the new epoch, and asks for its lease at once (`confirm_soon`) rather than
-//!    at the next renewal: S's whole partition pauses for that one round, which the guide
-//!    states beside the range's pause.
-
-use std::sync::Arc;
+//! 4. derives S's range gate from the map, then serves S at the new epoch and asks for its
+//!    lease at once (`confirm_soon`), in that order, so a renewal can't lease S before its
+//!    gate says the range is gone. S's whole partition pauses for that one round, which
+//!    the guide states beside the range's pause.
+//!
+//! **Idempotent, keyed on epochs (simp724's B3).** Each step checks what's already done: the
+//! row by its move id, the identity row and the served epoch against the map's. So a step
+//! that failed is finished by the next install, and a crash between the map's persist and
+//! the stamp is finished by the open ([`finish_hand_over`], which `open_partition` runs on a
+//! file one epoch below the map's).
 
 use pigeonhole::Pigeonhole;
 
@@ -25,28 +29,100 @@ use super::Node;
 use super::identity;
 use super::map;
 use crate::serve::gate::WriteGate;
-use crate::serve::proto::{ClusterMap, MovePhase};
+use crate::serve::proto::{ClusterMap, MovePhase, RangeMove};
 use crate::serve::ranges::{self, Moved};
 
+/// The move `map` hands `partition` over in as its source, from HANDED_OVER on, if any.
+pub(super) fn handing_over<'m>(map: &'m ClusterMap, partition: &str) -> Option<&'m RangeMove> {
+    map.moves
+        .iter()
+        .find(|m| m.from == partition && map::phase(m) >= MovePhase::HandedOver)
+}
+
+/// Fault seam (tests): the node directory whose next hand-over stamp fails once.
+#[cfg(test)]
+pub(super) static FAIL_STAMP: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Steps 2 and 3 on partition `partition`'s file `db`, for move `m` of `map`, as far as
+/// they aren't done: the row when the file lacks it, and the map's epoch on this node,
+/// `epoch`, when the file is below it. The row it wrote, if any. Run by a node holding the
+/// partition open, and by `open_partition` on a file the map is one epoch past. `dir` is
+/// the node's directory (the fault seam's key).
+pub(super) fn finish_hand_over(
+    db: &Pigeonhole,
+    m: &RangeMove,
+    epoch: u64,
+    dir: &std::path::Path,
+) -> Result<Option<Moved>, String> {
+    #[cfg(not(test))]
+    let _ = dir;
+    let mut wrote = None;
+    if !ranges::read_moved(db)?.iter().any(|r| r.id == m.id) {
+        let (start, end) = map::move_range(m)?;
+        let row = Moved {
+            id: m.id.clone(),
+            table: m.table.clone(),
+            start,
+            end,
+            term: m.handed_over_term,
+            version: m.handed_over_version,
+            seqno: db.visible_seqno(),
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+        };
+        ranges::write_moved(db, &row)?;
+        wrote = Some(row);
+    }
+    let mut ident = identity::read(db)?.ok_or("the file has no identity row")?;
+    if ident.epoch < epoch {
+        #[cfg(test)]
+        if FAIL_STAMP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|d| d == dir)
+            .is_some()
+        {
+            return Err("the fault seam failed the stamp".into());
+        }
+        ident.epoch = epoch;
+        identity::write(db, &ident)?;
+    }
+    Ok(wrote)
+}
+
 impl Node {
-    /// Arms partition `id`'s range gate as it opens here, before it serves: its file's
-    /// moved-away rows, then the node's map. **Blocking** (a read of the file).
+    /// Arms partition `id`'s range gate as it opens here (its file's moved-away rows), then
+    /// settles it with the node's map, under the install lock, so an install either ran
+    /// before (and this sees its map) or runs after `join` (and sees the partition).
+    /// `join` publishes the partition (its service into the node's parts). **Blocking.**
     pub(crate) fn arm_ranges(
         &self,
         gate: &WriteGate,
         id: &str,
         db: &Pigeonhole,
+        join: impl FnOnce(),
     ) -> Result<(), String> {
+        let _one = self
+            .installing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         gate.ranges().load_moved(ranges::read_moved(db)?);
-        if let Ok(map) = self.get_map() {
-            gate.ranges().update(&map, id, db.visible_seqno());
+        let raised = match self.get_map() {
+            Ok(map) => self.settle(gate, id, db, &map)?,
+            Err(_) => false,
+        };
+        join();
+        drop(_one);
+        if raised {
+            self.confirm_soon();
         }
         Ok(())
     }
 
-    /// After an install publishes `map`: each partition served here derives its range gate
-    /// again, and a source whose move the map takes to HANDED_OVER takes its hand-over (the
-    /// module's doc). **Blocking** (writes to the source's file), on the install's thread.
+    /// After an install publishes `map` (under the install lock): every partition served
+    /// here settles to it. **Blocking**, on the install's thread.
     pub(super) fn apply_moves(&self, map: &ClusterMap) {
         let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
             return;
@@ -56,79 +132,92 @@ impl Node {
         };
         let mut raised = false;
         for (id, service) in cluster.parts.load().iter() {
-            let (Some((gate, epoch)), Ok(part)) = (self.fences.gate(id), service.part()) else {
+            let (Some((gate, _)), Ok(part)) = (self.fences.gate(id), service.part()) else {
                 continue;
             };
-            let handing = map.moves.iter().find(|m| {
-                m.from == *id
-                    && map::phase(m) >= MovePhase::HandedOver
-                    && !gate.ranges().has_moved(&m.id)
-            });
-            if let Some(m) = handing {
-                match self.hand_over(&gate, id, epoch, &part.db, map, m) {
-                    Ok(up) => raised |= up,
-                    Err(e) => eprintln!(
-                        "phdb serve: partition {id}'s hand-over of move {:?} didn't record: \
-                         {e}; it gates the range from the map meanwhile, and records it at \
-                         the next map or restart",
-                        m.id
-                    ),
-                }
+            match self.settle(&gate, id, &part.db, map) {
+                Ok(up) => raised |= up,
+                Err(e) => eprintln!(
+                    "phdb serve: partition {id} couldn't take map version {}'s range moves: \
+                     {e}; it gates them from the map meanwhile, and the next map or its next \
+                     open finishes them",
+                    map.map_version
+                ),
             }
-            gate.ranges().update(map, id, part.db.visible_seqno());
         }
         if raised {
             self.confirm_soon();
         }
     }
 
-    /// Takes move `m`'s hand-over on its source `id`, served here at `epoch` behind `gate`
-    /// (steps 1–4 of the module's doc). Whether it raised the epoch.
-    fn hand_over(
+    /// Brings partition `id`, served here behind `gate`, up to `map`: puts up a new fence's
+    /// marker, finishes a hand-over of a move from it (the module's doc), and derives its
+    /// range gate. Whether its served epoch rose. Each step is idempotent.
+    fn settle(
         &self,
-        gate: &Arc<WriteGate>,
+        gate: &WriteGate,
         id: &str,
-        epoch: u64,
         db: &Pigeonhole,
         map: &ClusterMap,
-        m: &crate::serve::proto::RangeMove,
     ) -> Result<bool, String> {
-        let (start, end) = map::move_range(m)?;
-        let to = map
+        let served = self.fences.gate(id).map_or(0, |(_, e)| e);
+        let mine = map
             .partitions
             .iter()
-            .find(|p| p.id == *id && p.node == self.id)
-            .map(|p| p.epoch);
-        // 1. No lease at the old epoch's term from here on.
-        gate.lapse();
-        // 2. The moved-away row, at S's seqno now: every transaction open now is open across
-        // the hand-over (M3).
-        let row = Moved {
-            id: m.id.clone(),
-            table: m.table.clone(),
-            start,
-            end,
-            term: m.handed_over_term,
-            version: m.handed_over_version,
-            seqno: db.visible_seqno(),
-        };
-        ranges::write_moved(db, &row)?;
-        gate.ranges().add_moved(row);
-        // 3–4. The new epoch, when the map gives it on this node (a later map may have moved
-        // S since, and its own open stamps it).
-        let Some(to) = to.filter(|e| *e > epoch) else {
+            .find(|p| p.id == id && p.node == self.id)
+            .map_or(0, |p| p.epoch);
+        // A new fence: its marker moves the visible seqno past the fence's (B2).
+        let fencing = map.moves.iter().find(|m| {
+            m.from == id
+                && map::phase(m) == MovePhase::HandingOver
+                && !gate
+                    .ranges()
+                    .load()
+                    .as_ref()
+                    .is_some_and(|s| s.fences(&m.id))
+        });
+        let mut visible = db.visible_seqno();
+        if let Some(m) = fencing {
+            visible = ranges::mark_fence(db, &m.id)?;
+        }
+        let Some(m) = handing_over(map, id).filter(|m| {
+            // The map's epoch for it here is past the one it's served at, or its file lacks
+            // the row: not yet (fully) taken.
+            mine > served || !gate.ranges().has_moved(&m.id)
+        }) else {
+            gate.ranges().update(map, id, visible);
             return Ok(false);
         };
-        let mut ident = identity::read(db)?
-            .ok_or_else(|| format!("partition {id}'s file has no identity row"))?;
-        ident.epoch = to;
-        identity::write(db, &ident)?;
-        self.fences.raise_epoch(id, to);
-        eprintln!(
-            "phdb serve: partition {id} handed table {:?}'s range over (move {:?}): its \
-             epoch is {to} now, and it asks for its lease at it",
-            m.table, m.id
-        );
-        Ok(true)
+        let raise = mine > served;
+        // 1.
+        if raise {
+            gate.lapse();
+        }
+        // 2–3. The gate follows the map whether or not they finish: a failed step leaves
+        // the range gated as the map says, the epoch unraised, and the next map or open to
+        // finish them.
+        let finished = finish_hand_over(db, m, mine, &self.dir).and_then(|row| match row {
+            Some(row) => {
+                gate.ranges().add_moved(row);
+                Ok(())
+            }
+            None if !gate.ranges().has_moved(&m.id) => {
+                gate.ranges().load_moved(ranges::read_moved(db)?);
+                Ok(())
+            }
+            None => Ok(()),
+        });
+        // 4.
+        gate.ranges().update(map, id, db.visible_seqno());
+        finished?;
+        if raise {
+            self.fences.raise_epoch(id, mine);
+            eprintln!(
+                "phdb serve: partition {id} handed table {:?}'s range over (move {:?}): its \
+                 epoch is {mine} now, and it asks for its lease at it",
+                m.table, m.id
+            );
+        }
+        Ok(raise)
     }
 }

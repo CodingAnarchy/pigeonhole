@@ -274,6 +274,9 @@ enum MovePhase {
   // T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
   // ended); S deletes its copy.
   MOVE_PHASE_CLEANING = 5;
+  // PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
+  // the merged-away source waits for its transaction outcomes before it's dropped. The
+  // phases stay in order, so "from HANDED_OVER on" includes it.
 }
 
 // D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).

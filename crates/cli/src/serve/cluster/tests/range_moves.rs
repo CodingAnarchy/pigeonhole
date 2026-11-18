@@ -95,9 +95,32 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
             try_put(c, "d", "2").await.unwrap();
             assert_eq!(get_row(c, "d").await.unwrap(), Some(b"2".to_vec()));
         }
+        // A transaction that writes, begun before the fence.
+        let early = begin(c, "alice", None).await.unwrap();
+        txn_write(c, &early, vec![put_row("alice", "0")], None)
+            .await
+            .unwrap();
         // HANDING_OVER: the range's writes are fenced, retry-safe; its reads and p1's other
         // keys go on.
         push(&ports, &moving(&v1, 4, Some(MovePhase::HandingOver))).await;
+        // simp724's B2: open across the fence, it's refused whatever it wrote.
+        let e = commit(c, &early, None).await.unwrap_err();
+        assert_eq!(code(&e), "Fenced", "{e}");
+        // simp724's B1: one begun after the fence, committing rows into the range, too; and
+        // nothing is written.
+        let late = begin(c, "alice", None).await.unwrap();
+        let e = txns(c)
+            .await
+            .commit(with(
+                crate::serve::proto::TxnCommitRequest {
+                    txn_id: late,
+                    rows: vec![put_row("d", "txn")],
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Fenced", "{e}");
         let e = try_put(c, "d", "3").await.unwrap_err();
         assert_eq!(code(&e), "Fenced", "{e}");
         assert!(e.message().contains("move \"mv1\""), "{e}");
@@ -105,6 +128,8 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
         try_put(c, "alice", "1").await.unwrap();
         try_put(c, "zed", "1").await.unwrap();
 
+        // simp724's B3: a's stamp fails once, so the hand-over stops after its row.
+        *super::super::moves::FAIL_STAMP.lock().unwrap() = Some(dirs[0].clone());
         // HANDED_OVER reaches a and b, not c. c routes `d` to p1 by its older map; a answers
         // `WrongPartition`, c pulls the newer map and routes to p2, which doesn't serve the
         // range until CLEANING.
@@ -114,15 +139,17 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
         assert_eq!(version(c).await, 5, "c pulled the hand-over map");
         let e = get_row(c, "d").await.unwrap_err();
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
-        // p1 asks for its lease at its new epoch at once, and serves its other keys again.
+        // Its lease lapsed, and it can't ask at epoch 2 with its file at 1: no writes.
+        assert!(try_put(c, "alice", "2").await.is_err());
+        // CLEANING: the next map finishes a's hand-over (the stamp, then the lease at
+        // epoch 2, asked at once), and p2 serves the range (empty here: PR 4 copies it) and
+        // takes its writes.
+        push(&ports, &moving(&v1, 6, Some(MovePhase::Cleaning))).await;
         eventually("p1 takes writes at epoch 2", async || {
             try_put(c, "alice", "2").await.is_ok()
         })
         .await;
         try_put(c, "zed", "2").await.unwrap();
-
-        // CLEANING: p2 serves the range (empty here: PR 4 copies it), and takes its writes.
-        push(&ports, &moving(&v1, 6, Some(MovePhase::Cleaning))).await;
         assert_eq!(get_row(c, "d").await.unwrap(), None);
         try_put(c, "d", "5").await.unwrap();
         // Done: the record goes, and the range stays p2's.
@@ -180,11 +207,12 @@ fn an_opening_partition_gates_a_moved_range_from_its_file() {
             term: 0,
             version: 5,
             seqno: 3,
+            at_ms: 0,
         },
     )
     .unwrap();
     let gate = n.open_gate("p1", 2);
-    n.arm_ranges(&gate, "p1", &db).unwrap();
+    n.arm_ranges(&gate, "p1", &db, || ()).unwrap();
     let state = (*gate.ranges().load())
         .clone()
         .expect("the row gates the range");
@@ -200,5 +228,70 @@ fn an_opening_partition_gates_a_moved_range_from_its_file() {
         "WrongPartition"
     );
     state.check(&get("a"), false).unwrap();
+    let _ = db.close();
+}
+
+/// simp724's B3, the crash case: the map at the hand-over's epoch persisted, the source's
+/// file still at the epoch before (a crash before the stamp). Its open finishes the
+/// hand-over: the row, then the stamp, and it opens at the map's epoch.
+#[test]
+fn an_open_finishes_a_hand_over_a_crash_cut_before_the_stamp() {
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    let handed = moving(&the_map(1, &ports), 5, Some(MovePhase::HandedOver));
+    super::super::write_map(&dir, &super::super::map::canonical_json(&handed)).unwrap();
+    let path = dir.join("p1.phdb");
+    let db = pigeonhole::Pigeonhole::open(&path, pigeonhole::Options::default().shards(1)).unwrap();
+    super::super::identity::write(
+        &db,
+        &super::super::identity::Identity {
+            cluster_id: "c1".into(),
+            partition_id: "p1".into(),
+            epoch: 1,
+        },
+    )
+    .unwrap();
+    db.close().unwrap();
+    let db = super::super::open_partition(
+        &dir,
+        "c1",
+        "p1",
+        2,
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap()
+    .expect("opened at the map's epoch");
+    assert_eq!(super::super::identity::read(&db).unwrap().unwrap().epoch, 2);
+    let moved = crate::serve::ranges::read_moved(&db).unwrap();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(moved[0].id, "mv1");
+    let _ = db.close();
+}
+
+/// simp724's S4: a source that opens while its move is HANDING_OVER (a restart) fences the
+/// range again before it serves.
+#[test]
+fn an_opening_source_fences_a_handing_over_range() {
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    let n = node(&dir, "a");
+    n.push_map(
+        moving(&the_map(1, &ports), 4, Some(MovePhase::HandingOver)),
+        None,
+    )
+    .unwrap();
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("p1.phdb"),
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap();
+    let gate = n.open_gate("p1", 1);
+    n.arm_ranges(&gate, "p1", &db, || ()).unwrap();
+    let state = (*gate.ranges().load()).clone().expect("fenced");
+    let put = crate::serve::service::ServiceOp::Mutate(crate::serve::proto::MutateRequest {
+        writes: Some(put_row("d", "x")),
+        durability: 0,
+    });
+    assert_eq!(state.check(&put, true).unwrap_err().code, "Fenced");
     let _ = db.close();
 }

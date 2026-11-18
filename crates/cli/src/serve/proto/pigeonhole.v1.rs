@@ -8034,6 +8034,10 @@ pub enum MovePhase {
     HandedOver = 4,
     /// T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
     /// ended); S deletes its copy.
+    ///
+    /// PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
+    /// the merged-away source waits for its transaction outcomes before it's dropped. The
+    /// phases stay in order, so "from HANDED_OVER on" includes it.
     Cleaning = 5,
 }
 impl MovePhase {

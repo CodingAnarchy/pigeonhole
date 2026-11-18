@@ -2079,8 +2079,10 @@ impl Service {
             _ => (None, None),
         };
         // D331: a range a move fences, moved away or doesn't serve here yet. One load while
-        // no move names the partition.
+        // no move names the partition. A transaction's `Commit` is checked where it's
+        // answered, its rows as writes, with its snapshot (`commit`).
         if let Some(gate) = &self.gate
+            && !matches!(op, ServiceOp::Commit(_))
             && let Some(ranges) = &*gate.ranges().load()
         {
             ranges.check(&op, op.writes())?;
@@ -4825,12 +4827,16 @@ impl Service {
             Some(gate) if g.wrote() || !rows.is_empty() => Some(gate.enter()?),
             _ => None,
         };
-        // D331's M3: a transaction open across a range's fence or hand-over, as simp724
-        // agreed it ([`super::ranges`]).
+        // D331: the rows it carries, as writes, and M3, a transaction open across a range's
+        // fence or hand-over, as simp724 agreed it ([`super::ranges`]); one load.
         if let Some(gate) = &self.gate
             && let Some(ranges) = &*gate.ranges().load()
         {
-            ranges.commit(g.txn().snapshot_seqno(), g.wrote() || !rows.is_empty())?;
+            ranges.commit(
+                &r.rows,
+                g.txn().snapshot_seqno(),
+                g.wrote() || !rows.is_empty(),
+            )?;
         }
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);

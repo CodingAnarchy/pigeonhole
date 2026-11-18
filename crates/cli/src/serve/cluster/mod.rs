@@ -2530,7 +2530,7 @@ pub(crate) fn run(
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
             let gate = node.open_gate(&o.id, epoch);
             // D331: its range gate, before it serves.
-            node.arm_ranges(&gate, &o.id, &o.db)
+            node.arm_ranges(&gate, &o.id, &o.db, || ())
                 .map_err(|e| Failure::usage(&format!("partition {}: {e}", o.id)))?;
             let config = super::service::PartitionConfig {
                 backups: Arc::clone(&backups),
@@ -2987,6 +2987,27 @@ fn open_partition(
         {
             let _ = db.close();
             Ok(None)
+        }
+        // D331 (simp724's B3): one epoch below a map that hands a range of it over, at that
+        // epoch: a crash after the map's persist and before the source's stamp. The open
+        // finishes the hand-over (the moved-away row, then the stamp) before it serves.
+        Ok(Some(id))
+            if id.cluster_id == want.cluster_id
+                && id.partition_id == want.partition_id
+                && id.epoch + 1 == epoch
+                && let Ok(Some(map)) = read_map(dir)
+                && let Some(m) = moves::handing_over(&map, partition) =>
+        {
+            match moves::finish_hand_over(&db, m, epoch, dir) {
+                Ok(_) => Ok(Some(db)),
+                Err(e) => {
+                    let _ = db.close();
+                    Err(Failure::usage(&format!(
+                        "partition {partition:?}: finishing move {:?}'s hand-over: {e}",
+                        m.id
+                    )))
+                }
+            }
         }
         found => {
             let _ = db.close();

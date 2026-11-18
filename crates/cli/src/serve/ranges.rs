@@ -68,9 +68,13 @@ pub(crate) struct Moved {
     /// The hand-over map's `(writer_term, map_version)`.
     pub term: u64,
     pub version: u64,
-    /// This partition's visible seqno when it recorded the hand-over: a transaction with an
-    /// older snapshot is open across it (M3).
+    /// This partition's visible seqno just before it recorded the hand-over: a transaction
+    /// with a snapshot at or below it is open across it (M3). The row's own write moves the
+    /// visible seqno past it.
     pub seqno: u64,
+    /// When this partition recorded it, in milliseconds since the Unix epoch on its clock:
+    /// the prune's time bound (the transaction lifetime plus the request timeout since).
+    pub at_ms: u64,
 }
 
 /// The moved-away rows in `db`.
@@ -106,6 +110,7 @@ pub(crate) fn read_moved(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
             term: number(b"term")?,
             version: number(b"version")?,
             seqno: number(b"seqno")?,
+            at_ms: number(b"at")?,
             id,
         });
     }
@@ -126,13 +131,31 @@ pub(crate) fn write_moved(db: &Pigeonhole, m: &Moved) -> Result<(), String> {
         .put(FAMILY, b"start", &m.start)
         .put(FAMILY, b"term", m.term.to_string().as_bytes())
         .put(FAMILY, b"version", m.version.to_string().as_bytes())
-        .put(FAMILY, b"seqno", m.seqno.to_string().as_bytes());
+        .put(FAMILY, b"seqno", m.seqno.to_string().as_bytes())
+        .put(FAMILY, b"at", m.at_ms.to_string().as_bytes());
     if let Some(end) = &m.end {
         w = w.put(FAMILY, b"end", end);
     }
     w.commit()
         .map(|_| ())
         .map_err(|e| format!("record the moved-away range of move {:?}: {e}", m.id))
+}
+
+/// Writes move `id`'s fence marker (`fenced/<move id>`) in `db`, and returns the visible
+/// seqno just before it: a transaction with a snapshot at or below that seqno is open
+/// across the fence. The marker's own write moves the visible seqno past it, so one begun
+/// after the fence on an idle partition isn't refused (simp724's B2).
+pub(crate) fn mark_fence(db: &Pigeonhole, id: &str) -> Result<u64, String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    let before = db.visible_seqno();
+    t.mutate(&[&b"fenced/"[..], id.as_bytes()].concat())
+        .put(FAMILY, b"seqno", before.to_string().as_bytes())
+        .commit()
+        .map_err(|e| format!("mark move {id:?}'s fence: {e}"))?;
+    Ok(before)
 }
 
 /// What a span refuses.
@@ -199,6 +222,9 @@ pub(crate) struct RangeState {
     handover_seqno: u64,
 }
 
+/// What walks a call's keys calls for each (table or index, key) ([`ServiceOp::touches`]).
+type KeyVisitor<'v> = &'v mut dyn FnMut(&str, Touch<'_>) -> ControlFlow<()>;
+
 impl RangeState {
     /// Checks `op`, a write when `write`, against the spans: `Ok` when it touches none it
     /// may not. Out of line: only a partition a move names, or one a range moved off, gets
@@ -206,8 +232,20 @@ impl RangeState {
     #[cold]
     #[inline(never)]
     pub(crate) fn check(&self, op: &ServiceOp, write: bool) -> Result<(), ApiError> {
+        self.check_keys(write, &mut |f| op.touches(f))
+    }
+
+    /// [`check`](Self::check) of the keys `walk` names, each as a write when `write`.
+    fn check_keys(
+        &self,
+        write: bool,
+        walk: &mut dyn FnMut(KeyVisitor<'_>) -> ControlFlow<()>,
+    ) -> Result<(), ApiError> {
         let mut refused = None;
-        let _ = op.touches(&mut |table, touch| {
+        // A touch's name is a table's or, for the index calls, an index's: no move names an
+        // index's followed table while `validate_moves` refuses them (#2066 must map an
+        // index to its table here when it lifts that).
+        let _ = walk(&mut |table, touch| {
             for s in &self.spans {
                 if s.table != table || !s.overlaps(touch) {
                     continue;
@@ -242,23 +280,36 @@ impl RangeState {
         refused.map_or(Ok(()), Err)
     }
 
-    /// A transaction's commit (M3, as simp724 agreed it; see the module's doc): one that
-    /// writes, with its snapshot at `snapshot`, is refused when it's open across the
-    /// fence or a hand-over. A read-only commit always passes.
+    /// A transaction's commit, with one load of the state: the rows the commit carries are
+    /// checked as writes (simp724's B1: `Commit` isn't a write op, so `call` leaves it here),
+    /// and then M3 (as simp724 agreed it; see the module's doc): one that writes, with its
+    /// snapshot at `snapshot`, is refused when it's open across the fence or a hand-over. A
+    /// read-only commit always passes.
     #[cold]
     #[inline(never)]
-    pub(crate) fn commit(&self, snapshot: u64, writes: bool) -> Result<(), ApiError> {
+    pub(crate) fn commit(
+        &self,
+        rows: &[super::proto::RowWrites],
+        snapshot: u64,
+        writes: bool,
+    ) -> Result<(), ApiError> {
+        self.check_keys(true, &mut |f| {
+            for k in rows.iter().filter_map(|r| r.row.as_ref()) {
+                f(&k.table, Touch::Row(&k.row))?;
+            }
+            ControlFlow::Continue(())
+        })?;
         if !writes {
             return Ok(());
         }
-        if self.fence_seqno != 0 && snapshot < self.fence_seqno {
+        if self.fence_seqno != 0 && snapshot <= self.fence_seqno {
             return Err(ApiError::range_moving(format!(
                 "partition {:?} began handing a range over after this transaction began, and \
                  its writes may be in it: nothing was written. Retry the transaction",
                 self.partition
             )));
         }
-        if snapshot < self.handover_seqno {
+        if self.handover_seqno != 0 && snapshot <= self.handover_seqno {
             return Err(ApiError::from_code(
                 ErrorCode::Conflict,
                 &format!(
@@ -270,6 +321,15 @@ impl RangeState {
             ));
         }
         Ok(())
+    }
+}
+
+impl RangeState {
+    /// Whether it fences move `id`'s range.
+    pub(crate) fn fences(&self, id: &str) -> bool {
+        self.spans
+            .iter()
+            .any(|s| s.rule == Rule::Fenced && s.move_id == id)
     }
 }
 
@@ -642,6 +702,7 @@ mod tests {
             term: 0,
             version: 5,
             seqno: 40,
+            at_ms: 0,
         };
         // The move is done and gone from the map, which gives `[c, f)` to p2.
         let mut done = map(None);
@@ -662,17 +723,34 @@ mod tests {
         let g = gate(&map(Some(MovePhase::HandingOver)), "p1", Vec::new(), 20);
         g.update(&map(Some(MovePhase::HandingOver)), "p1", 99);
         let s = g.state.load_full().expect("gated");
-        assert_eq!(s.commit(19, true).unwrap_err().code, "Fenced");
-        s.commit(20, true).unwrap();
+        // At or below the fence's seqno: open across it (simp724's B2); the marker's write
+        // moves the visible seqno past it, so a transaction begun after is above.
+        assert_eq!(s.commit(&[], 20, true).unwrap_err().code, "Fenced");
+        assert_eq!(s.commit(&[], 19, true).unwrap_err().code, "Fenced");
+        s.commit(&[], 21, true).unwrap();
         // A read-only commit always passes: one snapshot is consistent on its own.
-        s.commit(1, false).unwrap();
+        s.commit(&[], 1, false).unwrap();
+        // The rows a commit carries are writes (simp724's B1): into the range, `Fenced`,
+        // whatever the snapshot; elsewhere, fine.
+        let carried = |r: &str| proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: "users".into(),
+                row: r.to_owned().into(),
+            }),
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            s.commit(&[carried("d")], 99, true).unwrap_err().code,
+            "Fenced"
+        );
+        s.commit(&[carried("a")], 99, true).unwrap();
         // After the hand-over, before the row records its seqno, every older transaction
         // conflicts; then those below the row's seqno do.
         let s = gate(&map(Some(MovePhase::HandedOver)), "p1", Vec::new(), 30)
             .state
             .load_full()
             .expect("gated");
-        assert_eq!(s.commit(1_000, true).unwrap_err().code, "Conflict");
+        assert_eq!(s.commit(&[], 1_000, true).unwrap_err().code, "Conflict");
         let row = Moved {
             id: "mv1".into(),
             table: "users".into(),
@@ -681,14 +759,21 @@ mod tests {
             term: 0,
             version: 7,
             seqno: 40,
+            at_ms: 0,
         };
         let s = gate(&map(Some(MovePhase::HandedOver)), "p1", vec![row], 50)
             .state
             .load_full()
             .expect("gated");
-        assert_eq!(s.commit(39, true).unwrap_err().code, "Conflict");
-        s.commit(40, true).unwrap();
-        s.commit(39, false).unwrap();
+        assert_eq!(s.commit(&[], 40, true).unwrap_err().code, "Conflict");
+        assert_eq!(s.commit(&[], 39, true).unwrap_err().code, "Conflict");
+        s.commit(&[], 41, true).unwrap();
+        s.commit(&[], 39, false).unwrap();
+        // Rows into the moved range: `WrongPartition`, as any call's.
+        assert_eq!(
+            s.commit(&[carried("d")], 41, true).unwrap_err().code,
+            "WrongPartition"
+        );
     }
 
     #[test]
@@ -706,6 +791,7 @@ mod tests {
                 term: 2,
                 version: 7,
                 seqno: 40,
+                at_ms: 0,
             },
             Moved {
                 id: "mv2".into(),
@@ -715,6 +801,7 @@ mod tests {
                 term: 0,
                 version: 9,
                 seqno: 41,
+                at_ms: 0,
             },
         ];
         for r in &rows {

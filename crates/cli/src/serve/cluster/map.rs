@@ -397,31 +397,42 @@ pub(crate) fn handed_over(
     end: Option<&[u8]>,
     to: &str,
 ) -> TablePlacement {
-    let mut cuts: Vec<(Vec<u8>, String)> = Vec::new();
-    for (lo, hi, p) in table_ranges(t) {
+    // Each range's start: its split key as the table has it (none for the first), the
+    // move's new ones in canonical form (cli692's N3).
+    let mut cuts: Vec<(Vec<u8>, Option<SplitKey>, String)> = Vec::new();
+    for (i, (lo, hi, p)) in table_ranges(t).into_iter().enumerate() {
+        let own = i.checked_sub(1).map(|j| t.splits[j].clone());
+        let mut points = vec![(lo.clone(), own)];
         // Cut this range at the move's ends where they fall strictly inside it.
-        let mut points = vec![lo.clone()];
         for k in [Some(start), end].into_iter().flatten() {
             if k > lo.as_slice() && hi.as_deref().is_none_or(|h| k < h) {
-                points.push(k.to_vec());
+                points.push((k.to_vec(), Some(canonical_key(k))));
             }
         }
-        points.sort();
-        for pt in points {
+        points.sort_by(|x, y| x.0.cmp(&y.0));
+        for (pt, key) in points {
             let moved = pt.as_slice() >= start && end.is_none_or(|e| pt.as_slice() < e);
-            cuts.push((pt, if moved { to.to_owned() } else { p.to_owned() }));
+            cuts.push((pt, key, if moved { to.to_owned() } else { p.to_owned() }));
         }
     }
     let mut out = t.clone();
     out.splits = cuts
         .iter()
         .skip(1)
-        .map(|(k, _)| SplitKey {
-            key: Some(split_key::Key::Raw(k.clone().into())),
-        })
+        .filter_map(|(_, k, _)| k.clone())
         .collect();
-    out.partitions = cuts.into_iter().map(|(_, p)| p).collect();
+    out.partitions = cuts.into_iter().map(|(_, _, p)| p).collect();
     out
+}
+
+/// A split key for `bytes` in canonical form: `text` when they're UTF-8, else `raw`.
+fn canonical_key(bytes: &[u8]) -> SplitKey {
+    SplitKey {
+        key: Some(match std::str::from_utf8(bytes) {
+            Ok(s) => split_key::Key::Text(s.to_owned()),
+            Err(_) => split_key::Key::Raw(bytes.to_vec().into()),
+        }),
+    }
 }
 
 /// Checks the indexes' placements (#1722, ICR 0138): each a unique name that no table or
@@ -774,7 +785,10 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     validate_epochs(old, new)
 }
 
-/// D331: each move takes one step per map. One appears at COPYING; one kept keeps its
+/// D331: each move takes one step per map. A forced map (a recovery) skips these steps,
+/// so it may drop a move at any phase, HANDED_OVER included (cli692's N2): the table layer
+/// it carries says who holds the range then, and `validate` still holds it to a range its
+/// holder holds. One appears at COPYING; one kept keeps its
 /// range, partitions and kind and stays in its phase or goes to the next; one goes away
 /// before HANDED_OVER (an abort) or from CLEANING (done), never in HANDED_OVER. The step to
 /// HANDED_OVER names this map as the hand-over and raises the source's epoch by one, on
@@ -1480,6 +1494,12 @@ mod tests {
             },
             "isn't inside",
         );
+        // Across two adjacent ranges that p1 holds both of (simp724's nit): still not inside
+        // one.
+        let mut both = moving(MovePhase::Copying);
+        both.tables[0].partitions = vec!["p1".into(), "p1".into()];
+        both.moves[0].end = Some(text("p"));
+        refused(validate(&both, true), "isn't inside");
         bad(&|m| m.moves[0].final_seqno = 7, "final_seqno");
         bad(&|m| m.moves[0].handed_over_version = 1, "handed-over map");
         // One move per partition, as source or target.
@@ -1538,6 +1558,35 @@ mod tests {
         let h = handed_over(t, b"m", None, "p3");
         assert_eq!(keys(&h), [b"m".to_vec()]);
         assert_eq!(h.partitions, ["p1", "p3"]);
+        // The table's own keys keep their form; new ones are canonical (cli692's N3).
+        let mut raw_m = t.clone();
+        raw_m.splits = vec![raw(b"m")];
+        let h = handed_over(&raw_m, b"c", Some(b"f"), "p2");
+        assert_eq!(h.splits, [text("c"), text("f"), raw(b"m")]);
+        let h = handed_over(&raw_m, b"\xfe", Some(b"\xff"), "p1");
+        assert_eq!(h.splits, [raw(b"m"), raw(b"\xfe"), raw(b"\xff")]);
+    }
+
+    #[test]
+    fn a_forced_map_may_drop_a_handed_over_move_and_keeps_the_targets_placement() {
+        // cli692's N2: a recovery's forced map skips the step rules, so it can drop a move
+        // past its commit point; the placement it carries still names who holds the range,
+        // and `validate` still holds it to that.
+        let mut handed = moving(MovePhase::HandedOver);
+        handed.map_version = 5;
+        handed.moves[0].handed_over_version = 5;
+        handed.tables[0] = handed_over(&handed.tables[0], b"c", Some(b"f"), "p2");
+        handed.partitions[0].epoch = 2;
+        validate(&handed, true).unwrap();
+        let mut forced = handed.clone();
+        forced.map_version = 6;
+        forced.moves.clear();
+        validate(&forced, true).unwrap();
+        validate_catch_up(&handed, &forced).unwrap();
+        validate_epochs(&handed, &forced).unwrap();
+        assert_eq!(forced.tables[0].partitions, ["p1", "p2", "p1", "p2"]);
+        // A change through the writer couldn't.
+        refused(validate_change(&handed, &forced), "past its commit point");
     }
 
     #[test]
