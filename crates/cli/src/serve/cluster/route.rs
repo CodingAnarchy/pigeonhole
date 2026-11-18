@@ -418,6 +418,7 @@ mod tests {
             writer: String::new(),
             writer_term: 0,
             failover: false,
+            moves: Vec::new(),
         }
     }
 

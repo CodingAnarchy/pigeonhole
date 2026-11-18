@@ -75,7 +75,12 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     INDEX_BULK_LOAD_FEATURE,
     LEASES_FEATURE,
     WRITER_TERMS_FEATURE,
+    RANGE_MOVES_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
+/// field from its copy, read as divergent, and gate no moving range.
+pub(crate) const RANGE_MOVES_FEATURE: &str = "range_moves";
 
 /// [`MAP_FEATURES`]' name for a build that serves `Cluster.Lease` (D326 amendment 1, #2048):
 /// a peer whose `Lease` answers `Unimplemented` counts as granting only if its `Status`
@@ -162,6 +167,7 @@ pub(crate) const WRITER_TERMS_FEATURE: &str = "writer_terms";
 pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
+
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
 const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
@@ -799,6 +805,11 @@ impl Node {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
                     .await?;
             }
+            // So does the first range move (D331).
+            if current.moves.is_empty() && !map.moves.is_empty() {
+                self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -823,6 +834,10 @@ impl Node {
             }
             if !map.indexes.is_empty() {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
+                    .await?;
+            }
+            if !map.moves.is_empty() {
+                self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
                     .await?;
             }
             if map.failover || map.writer_term > 0 {

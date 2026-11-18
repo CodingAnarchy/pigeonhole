@@ -2972,6 +2972,9 @@ impl serde::Serialize for ClusterMap {
         if self.failover {
             len += 1;
         }
+        if !self.moves.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ClusterMap", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -3010,6 +3013,9 @@ impl serde::Serialize for ClusterMap {
         if self.failover {
             struct_ser.serialize_field("failover", &self.failover)?;
         }
+        if !self.moves.is_empty() {
+            struct_ser.serialize_field("moves", &self.moves)?;
+        }
         struct_ser.end()
     }
 }
@@ -3035,6 +3041,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             "writer_term",
             "writerTerm",
             "failover",
+            "moves",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -3050,6 +3057,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             Writer,
             WriterTerm,
             Failover,
+            Moves,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -3082,6 +3090,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             "writer" => Ok(GeneratedField::Writer),
                             "writerTerm" | "writer_term" => Ok(GeneratedField::WriterTerm),
                             "failover" => Ok(GeneratedField::Failover),
+                            "moves" => Ok(GeneratedField::Moves),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -3112,6 +3121,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                 let mut writer__ = None;
                 let mut writer_term__ = None;
                 let mut failover__ = None;
+                let mut moves__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -3184,6 +3194,12 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             }
                             failover__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Moves => {
+                            if moves__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moves"));
+                            }
+                            moves__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ClusterMap {
@@ -3198,6 +3214,7 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                     writer: writer__.unwrap_or_default(),
                     writer_term: writer_term__.unwrap_or_default(),
                     failover: failover__.unwrap_or_default(),
+                    moves: moves__.unwrap_or_default(),
                 })
             }
         }
@@ -6110,6 +6127,7 @@ impl serde::Serialize for FenceReason {
             Self::Operator => "FENCE_REASON_OPERATOR",
             Self::AwaitingPeerMap => "FENCE_REASON_AWAITING_PEER_MAP",
             Self::LeaseLapsed => "FENCE_REASON_LEASE_LAPSED",
+            Self::RangeMoving => "FENCE_REASON_RANGE_MOVING",
         };
         serializer.serialize_str(variant)
     }
@@ -6125,6 +6143,7 @@ impl<'de> serde::Deserialize<'de> for FenceReason {
             "FENCE_REASON_OPERATOR",
             "FENCE_REASON_AWAITING_PEER_MAP",
             "FENCE_REASON_LEASE_LAPSED",
+            "FENCE_REASON_RANGE_MOVING",
         ];
 
         struct GeneratedVisitor;
@@ -6169,6 +6188,7 @@ impl<'de> serde::Deserialize<'de> for FenceReason {
                     "FENCE_REASON_OPERATOR" => Ok(FenceReason::Operator),
                     "FENCE_REASON_AWAITING_PEER_MAP" => Ok(FenceReason::AwaitingPeerMap),
                     "FENCE_REASON_LEASE_LAPSED" => Ok(FenceReason::LeaseLapsed),
+                    "FENCE_REASON_RANGE_MOVING" => Ok(FenceReason::RangeMoving),
                     _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
                 }
             }
@@ -11264,6 +11284,12 @@ impl serde::Serialize for LocalPartition {
         if self.replica_state != 0 {
             len += 1;
         }
+        if !self.moves.is_empty() {
+            len += 1;
+        }
+        if self.move_follower_lag_ms != 0 {
+            len += 1;
+        }
         if self.load_cpu != 0. {
             len += 1;
         }
@@ -11354,6 +11380,14 @@ impl serde::Serialize for LocalPartition {
                 .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.replica_state)))?;
             struct_ser.serialize_field("replica_state", &v)?;
         }
+        if !self.moves.is_empty() {
+            struct_ser.serialize_field("moves", &self.moves)?;
+        }
+        if self.move_follower_lag_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("move_follower_lag_ms", ToString::to_string(&self.move_follower_lag_ms).as_str())?;
+        }
         if self.load_cpu != 0. {
             struct_ser.serialize_field("load_cpu", &self.load_cpu)?;
         }
@@ -11405,6 +11439,9 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "replicaLagMs",
             "replica_state",
             "replicaState",
+            "moves",
+            "move_follower_lag_ms",
+            "moveFollowerLagMs",
             "load_cpu",
             "loadCpu",
             "load_device",
@@ -11434,6 +11471,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             ReplicaPrimarySeqno,
             ReplicaLagMs,
             ReplicaState,
+            Moves,
+            MoveFollowerLagMs,
             LoadCpu,
             LoadDevice,
             Load,
@@ -11478,6 +11517,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "replicaPrimarySeqno" | "replica_primary_seqno" => Ok(GeneratedField::ReplicaPrimarySeqno),
                             "replicaLagMs" | "replica_lag_ms" => Ok(GeneratedField::ReplicaLagMs),
                             "replicaState" | "replica_state" => Ok(GeneratedField::ReplicaState),
+                            "moves" => Ok(GeneratedField::Moves),
+                            "moveFollowerLagMs" | "move_follower_lag_ms" => Ok(GeneratedField::MoveFollowerLagMs),
                             "loadCpu" | "load_cpu" => Ok(GeneratedField::LoadCpu),
                             "loadDevice" | "load_device" => Ok(GeneratedField::LoadDevice),
                             "load" => Ok(GeneratedField::Load),
@@ -11520,6 +11561,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut replica_primary_seqno__ = None;
                 let mut replica_lag_ms__ = None;
                 let mut replica_state__ = None;
+                let mut moves__ = None;
+                let mut move_follower_lag_ms__ = None;
                 let mut load_cpu__ = None;
                 let mut load_device__ = None;
                 let mut load__ = None;
@@ -11657,6 +11700,20 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             }
                             replica_state__ = Some(map_.next_value::<ReplicaState>()? as i32);
                         }
+                        GeneratedField::Moves => {
+                            if moves__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moves"));
+                            }
+                            moves__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::MoveFollowerLagMs => {
+                            if move_follower_lag_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moveFollowerLagMs"));
+                            }
+                            move_follower_lag_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                         GeneratedField::LoadCpu => {
                             if load_cpu__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("loadCpu"));
@@ -11704,6 +11761,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     replica_primary_seqno: replica_primary_seqno__.unwrap_or_default(),
                     replica_lag_ms: replica_lag_ms__.unwrap_or_default(),
                     replica_state: replica_state__.unwrap_or_default(),
+                    moves: moves__.unwrap_or_default(),
+                    move_follower_lag_ms: move_follower_lag_ms__.unwrap_or_default(),
                     load_cpu: load_cpu__.unwrap_or_default(),
                     load_device: load_device__.unwrap_or_default(),
                     load: load__.unwrap_or_default(),
@@ -13520,6 +13579,344 @@ impl<'de> serde::Deserialize<'de> for MissingRange {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.MissingRange", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for MoveKind {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Unspecified => "MOVE_KIND_UNSPECIFIED",
+            Self::Range => "MOVE_KIND_RANGE",
+            Self::Partition => "MOVE_KIND_PARTITION",
+            Self::Node => "MOVE_KIND_NODE",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for MoveKind {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "MOVE_KIND_UNSPECIFIED",
+            "MOVE_KIND_RANGE",
+            "MOVE_KIND_PARTITION",
+            "MOVE_KIND_NODE",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = MoveKind;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "MOVE_KIND_UNSPECIFIED" => Ok(MoveKind::Unspecified),
+                    "MOVE_KIND_RANGE" => Ok(MoveKind::Range),
+                    "MOVE_KIND_PARTITION" => Ok(MoveKind::Partition),
+                    "MOVE_KIND_NODE" => Ok(MoveKind::Node),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
+    }
+}
+impl serde::Serialize for MovePhase {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let variant = match self {
+            Self::Unspecified => "MOVE_PHASE_UNSPECIFIED",
+            Self::Copying => "MOVE_PHASE_COPYING",
+            Self::CatchingUp => "MOVE_PHASE_CATCHING_UP",
+            Self::HandingOver => "MOVE_PHASE_HANDING_OVER",
+            Self::HandedOver => "MOVE_PHASE_HANDED_OVER",
+            Self::Cleaning => "MOVE_PHASE_CLEANING",
+        };
+        serializer.serialize_str(variant)
+    }
+}
+impl<'de> serde::Deserialize<'de> for MovePhase {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "MOVE_PHASE_UNSPECIFIED",
+            "MOVE_PHASE_COPYING",
+            "MOVE_PHASE_CATCHING_UP",
+            "MOVE_PHASE_HANDING_OVER",
+            "MOVE_PHASE_HANDED_OVER",
+            "MOVE_PHASE_CLEANING",
+        ];
+
+        struct GeneratedVisitor;
+
+        impl serde::de::Visitor<'_> for GeneratedVisitor {
+            type Value = MovePhase;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "expected one of: {:?}", &FIELDS)
+            }
+
+            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
+                    })
+            }
+
+            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.try_into().ok())
+                    .ok_or_else(|| {
+                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
+                    })
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "MOVE_PHASE_UNSPECIFIED" => Ok(MovePhase::Unspecified),
+                    "MOVE_PHASE_COPYING" => Ok(MovePhase::Copying),
+                    "MOVE_PHASE_CATCHING_UP" => Ok(MovePhase::CatchingUp),
+                    "MOVE_PHASE_HANDING_OVER" => Ok(MovePhase::HandingOver),
+                    "MOVE_PHASE_HANDED_OVER" => Ok(MovePhase::HandedOver),
+                    "MOVE_PHASE_CLEANING" => Ok(MovePhase::Cleaning),
+                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
+                }
+            }
+        }
+        deserializer.deserialize_any(GeneratedVisitor)
+    }
+}
+impl serde::Serialize for MoveStatus {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.id.is_empty() {
+            len += 1;
+        }
+        if !self.table.is_empty() {
+            len += 1;
+        }
+        if self.phase != 0 {
+            len += 1;
+        }
+        if self.source {
+            len += 1;
+        }
+        if self.fenced {
+            len += 1;
+        }
+        if self.serving {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MoveStatus", len)?;
+        if !self.id.is_empty() {
+            struct_ser.serialize_field("id", &self.id)?;
+        }
+        if !self.table.is_empty() {
+            struct_ser.serialize_field("table", &self.table)?;
+        }
+        if self.phase != 0 {
+            let v = MovePhase::try_from(self.phase)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.phase)))?;
+            struct_ser.serialize_field("phase", &v)?;
+        }
+        if self.source {
+            struct_ser.serialize_field("source", &self.source)?;
+        }
+        if self.fenced {
+            struct_ser.serialize_field("fenced", &self.fenced)?;
+        }
+        if self.serving {
+            struct_ser.serialize_field("serving", &self.serving)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for MoveStatus {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "table",
+            "phase",
+            "source",
+            "fenced",
+            "serving",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Id,
+            Table,
+            Phase,
+            Source,
+            Fenced,
+            Serving,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "id" => Ok(GeneratedField::Id),
+                            "table" => Ok(GeneratedField::Table),
+                            "phase" => Ok(GeneratedField::Phase),
+                            "source" => Ok(GeneratedField::Source),
+                            "fenced" => Ok(GeneratedField::Fenced),
+                            "serving" => Ok(GeneratedField::Serving),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = MoveStatus;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.MoveStatus")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<MoveStatus, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut id__ = None;
+                let mut table__ = None;
+                let mut phase__ = None;
+                let mut source__ = None;
+                let mut fenced__ = None;
+                let mut serving__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Id => {
+                            if id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("id"));
+                            }
+                            id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Table => {
+                            if table__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("table"));
+                            }
+                            table__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Phase => {
+                            if phase__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("phase"));
+                            }
+                            phase__ = Some(map_.next_value::<MovePhase>()? as i32);
+                        }
+                        GeneratedField::Source => {
+                            if source__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("source"));
+                            }
+                            source__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Fenced => {
+                            if fenced__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fenced"));
+                            }
+                            fenced__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Serving => {
+                            if serving__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("serving"));
+                            }
+                            serving__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(MoveStatus {
+                    id: id__.unwrap_or_default(),
+                    table: table__.unwrap_or_default(),
+                    phase: phase__.unwrap_or_default(),
+                    source: source__.unwrap_or_default(),
+                    fenced: fenced__.unwrap_or_default(),
+                    serving: serving__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.MoveStatus", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for MultiGetRequest {
@@ -18510,6 +18907,308 @@ impl<'de> serde::Deserialize<'de> for QuantileReading {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.QuantileReading", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for RangeMove {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.id.is_empty() {
+            len += 1;
+        }
+        if self.kind != 0 {
+            len += 1;
+        }
+        if !self.table.is_empty() {
+            len += 1;
+        }
+        if self.start.is_some() {
+            len += 1;
+        }
+        if self.end.is_some() {
+            len += 1;
+        }
+        if !self.from.is_empty() {
+            len += 1;
+        }
+        if !self.to.is_empty() {
+            len += 1;
+        }
+        if self.phase != 0 {
+            len += 1;
+        }
+        if self.snapshot_seqno != 0 {
+            len += 1;
+        }
+        if self.final_seqno != 0 {
+            len += 1;
+        }
+        if self.handed_over_version != 0 {
+            len += 1;
+        }
+        if self.handed_over_term != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RangeMove", len)?;
+        if !self.id.is_empty() {
+            struct_ser.serialize_field("id", &self.id)?;
+        }
+        if self.kind != 0 {
+            let v = MoveKind::try_from(self.kind)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.kind)))?;
+            struct_ser.serialize_field("kind", &v)?;
+        }
+        if !self.table.is_empty() {
+            struct_ser.serialize_field("table", &self.table)?;
+        }
+        if let Some(v) = self.start.as_ref() {
+            struct_ser.serialize_field("start", v)?;
+        }
+        if let Some(v) = self.end.as_ref() {
+            struct_ser.serialize_field("end", v)?;
+        }
+        if !self.from.is_empty() {
+            struct_ser.serialize_field("from", &self.from)?;
+        }
+        if !self.to.is_empty() {
+            struct_ser.serialize_field("to", &self.to)?;
+        }
+        if self.phase != 0 {
+            let v = MovePhase::try_from(self.phase)
+                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.phase)))?;
+            struct_ser.serialize_field("phase", &v)?;
+        }
+        if self.snapshot_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("snapshot_seqno", ToString::to_string(&self.snapshot_seqno).as_str())?;
+        }
+        if self.final_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("final_seqno", ToString::to_string(&self.final_seqno).as_str())?;
+        }
+        if self.handed_over_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("handed_over_version", ToString::to_string(&self.handed_over_version).as_str())?;
+        }
+        if self.handed_over_term != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("handed_over_term", ToString::to_string(&self.handed_over_term).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for RangeMove {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "kind",
+            "table",
+            "start",
+            "end",
+            "from",
+            "to",
+            "phase",
+            "snapshot_seqno",
+            "snapshotSeqno",
+            "final_seqno",
+            "finalSeqno",
+            "handed_over_version",
+            "handedOverVersion",
+            "handed_over_term",
+            "handedOverTerm",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Id,
+            Kind,
+            Table,
+            Start,
+            End,
+            From,
+            To,
+            Phase,
+            SnapshotSeqno,
+            FinalSeqno,
+            HandedOverVersion,
+            HandedOverTerm,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "id" => Ok(GeneratedField::Id),
+                            "kind" => Ok(GeneratedField::Kind),
+                            "table" => Ok(GeneratedField::Table),
+                            "start" => Ok(GeneratedField::Start),
+                            "end" => Ok(GeneratedField::End),
+                            "from" => Ok(GeneratedField::From),
+                            "to" => Ok(GeneratedField::To),
+                            "phase" => Ok(GeneratedField::Phase),
+                            "snapshotSeqno" | "snapshot_seqno" => Ok(GeneratedField::SnapshotSeqno),
+                            "finalSeqno" | "final_seqno" => Ok(GeneratedField::FinalSeqno),
+                            "handedOverVersion" | "handed_over_version" => Ok(GeneratedField::HandedOverVersion),
+                            "handedOverTerm" | "handed_over_term" => Ok(GeneratedField::HandedOverTerm),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = RangeMove;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.RangeMove")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<RangeMove, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut id__ = None;
+                let mut kind__ = None;
+                let mut table__ = None;
+                let mut start__ = None;
+                let mut end__ = None;
+                let mut from__ = None;
+                let mut to__ = None;
+                let mut phase__ = None;
+                let mut snapshot_seqno__ = None;
+                let mut final_seqno__ = None;
+                let mut handed_over_version__ = None;
+                let mut handed_over_term__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Id => {
+                            if id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("id"));
+                            }
+                            id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Kind => {
+                            if kind__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("kind"));
+                            }
+                            kind__ = Some(map_.next_value::<MoveKind>()? as i32);
+                        }
+                        GeneratedField::Table => {
+                            if table__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("table"));
+                            }
+                            table__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Start => {
+                            if start__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("start"));
+                            }
+                            start__ = map_.next_value()?;
+                        }
+                        GeneratedField::End => {
+                            if end__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("end"));
+                            }
+                            end__ = map_.next_value()?;
+                        }
+                        GeneratedField::From => {
+                            if from__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("from"));
+                            }
+                            from__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::To => {
+                            if to__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("to"));
+                            }
+                            to__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Phase => {
+                            if phase__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("phase"));
+                            }
+                            phase__ = Some(map_.next_value::<MovePhase>()? as i32);
+                        }
+                        GeneratedField::SnapshotSeqno => {
+                            if snapshot_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("snapshotSeqno"));
+                            }
+                            snapshot_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::FinalSeqno => {
+                            if final_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("finalSeqno"));
+                            }
+                            final_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::HandedOverVersion => {
+                            if handed_over_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("handedOverVersion"));
+                            }
+                            handed_over_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::HandedOverTerm => {
+                            if handed_over_term__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("handedOverTerm"));
+                            }
+                            handed_over_term__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(RangeMove {
+                    id: id__.unwrap_or_default(),
+                    kind: kind__.unwrap_or_default(),
+                    table: table__.unwrap_or_default(),
+                    start: start__,
+                    end: end__,
+                    from: from__.unwrap_or_default(),
+                    to: to__.unwrap_or_default(),
+                    phase: phase__.unwrap_or_default(),
+                    snapshot_seqno: snapshot_seqno__.unwrap_or_default(),
+                    final_seqno: final_seqno__.unwrap_or_default(),
+                    handed_over_version: handed_over_version__.unwrap_or_default(),
+                    handed_over_term: handed_over_term__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.RangeMove", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for ReadRowRequest {

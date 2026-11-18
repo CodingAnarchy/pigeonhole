@@ -135,6 +135,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        moves: Vec::new(),
     }
 }
 
@@ -4221,6 +4222,7 @@ fn split_nodes(
         writer: String::new(),
         writer_term: 0,
         failover: false,
+        moves: Vec::new(),
     };
     let mut stops = Vec::new();
     let mut dbs = Vec::new();
