@@ -68,7 +68,7 @@ fn for_each_piece(
 
 /// How many written bytes a blob file gathers before it starts their writeback (#2023): the
 /// SST writer's chunk (D334).
-const HINT_BYTES: u64 = 1 << 20;
+const HINT_BYTES: u64 = 256 << 10; // scratch (perf2, 1.3.0 GroupSync tail): 1 MiB on main
 
 pub(crate) struct Writer {
     file: FileRef,

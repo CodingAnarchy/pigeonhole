@@ -17,7 +17,7 @@ use pigeonhole_io::FileRef;
 use crate::{Error, Result, SstWriterOptions};
 
 /// Pending bytes are written to the file once this much has accumulated.
-const FLUSH_BYTES: usize = 1 << 20;
+const FLUSH_BYTES: usize = 256 << 10; // scratch (perf2, 1.3.0 GroupSync tail): 1 MiB on main
 
 /// Largest target size of an index partition.
 const MAX_PARTITION_BYTES: usize = 4096;
