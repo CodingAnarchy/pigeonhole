@@ -532,13 +532,21 @@ impl ServiceOp {
     }
 
     /// Calls `f` with each (table, key) the call names, in request order, until `f` returns
-    /// `Break` (D331's range gates, D332's sampled read keys). The point reads report their
-    /// rows; a scan its range; the writes (`Mutate`, `MutateReturning`, `CheckAndMutate`,
-    /// `Batch`) and a transaction's reads, writes and commit their rows, a row named twice
-    /// twice. A write naming no row reports nothing: it's refused on its way in. A resumed
-    /// scan reports its whole range, not the rest after `after`. Every other call (the
-    /// schema, maintenance, a feed, the vector, text, graph and memory calls) never calls
-    /// `f`: their rows aren't in the request.
+    /// `Break` (D331's range gates, D332's sampled read keys).
+    ///
+    /// - **Rows:** the point reads report their rows; the writes (`Mutate`,
+    ///   `MutateReturning`, `CheckAndMutate`, `Batch`) and a transaction's reads, writes and
+    ///   commit theirs, a row named twice twice. A write naming no row reports nothing: it's
+    ///   refused on its way in.
+    /// - **Ranges:** a scan and a nearest search report their range (no range: the whole
+    ///   table), or a nearest search its keys. A resumed scan reports its whole range, not
+    ///   the rest after `after`: a superset, safe for a gate and harmless for a sample.
+    /// - **A traversal** reports its seeds. The rows its edges lead to aren't in the request:
+    ///   it reads them through the partitions' clipped fan-out, which D331 audits apart.
+    /// - **Nothing:** every other call, each arm saying why. None of them writes a table's
+    ///   rows, which are all a range move moves: the index and memory calls write an index's
+    ///   or the memory store's own placement, which no move names. So a gate passes a call
+    ///   that reports nothing; a new call must be sorted into an arm before it compiles.
     #[cfg_attr(
         not(test),
         expect(
@@ -567,27 +575,82 @@ impl ServiceOp {
                 }
                 ControlFlow::Continue(())
             }
-            Self::Scan(r) => {
-                use proto::key_range::Range;
-                let touch = match r.range.as_ref().and_then(|k| k.range.as_ref()) {
-                    Some(Range::Prefix(p)) => Touch::Prefix(p),
-                    Some(Range::Bounds(b)) => Touch::Range {
-                        start: convert::bound(b.start.as_ref()),
-                        end: convert::bound(b.end.as_ref()),
-                    },
-                    None => Touch::Range {
-                        start: Bound::Unbounded,
-                        end: Bound::Unbounded,
-                    },
-                };
-                f(&r.table, touch)
+            Self::Scan(r) => f(&r.table, Touch::of_range(r.range.as_ref())),
+            Self::Nearest(r) => match &r.source {
+                Some(proto::nearest_request::Source::Keys(keys)) => {
+                    for k in &keys.keys {
+                        f(&r.table, Touch::Row(k))?;
+                    }
+                    ControlFlow::Continue(())
+                }
+                Some(proto::nearest_request::Source::Range(range)) => {
+                    f(&r.table, Touch::of_range(Some(range)))
+                }
+                None => f(&r.table, Touch::of_range(None)),
+            },
+            Self::Traverse(r) => {
+                for k in &r.seeds {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
             }
             Self::Mutate(r) | Self::MutateReturning(r) => rows(r.writes.as_slice()),
             Self::CheckAndMutate(r) => rows(r.writes.as_slice()),
             Self::Batch(r) => rows(&r.rows),
             Self::TxnWrite(r) => rows(&r.rows),
             Self::Commit(r) => rows(&r.rows),
-            _ => ControlFlow::Continue(()),
+            // A transaction's or snapshot's start and end, a pinned snapshot's release: no rows
+            // (a transaction's routing key picks its home, it reads nothing).
+            Self::Begin(_)
+            | Self::Abort(_)
+            | Self::OpenSnapshot(_)
+            | Self::ReleaseSnapshot(_)
+            // The schema, maintenance and the node's own calls: whole tables or none, never a
+            // row's write.
+            | Self::ListTables(_)
+            | Self::CreateTable(_)
+            | Self::DropTable(_)
+            | Self::DescribeTable(_)
+            | Self::Info(_)
+            | Self::Flush(_)
+            | Self::Compact(_)
+            | Self::Backup(_)
+            | Self::BackupDownload(_)
+            | Self::Metrics(_)
+            | Self::Promote(_)
+            // Feeds: a subscription and a replica's follow read history, not rows; a feed
+            // clips by map range where it's served (D331 PR 3).
+            | Self::Subscribe(_)
+            | Self::Follow(_)
+            | Self::MemoryWatch(_)
+            // Vector indexes: ids in the index's own placement (`ClusterMap.indexes`), not a
+            // table's rows.
+            | Self::CreateIndex(_)
+            | Self::VectorInsert(_)
+            | Self::VectorDelete(_)
+            | Self::VectorSearch(_)
+            | Self::VectorVerify(_)
+            | Self::VectorBulkLoad(_)
+            // Text indexes: document ids in the index's own placement, and a rebuild or a
+            // search's rounds over the whole index.
+            | Self::TextCreateIndex(_)
+            | Self::TextPut(_)
+            | Self::TextDelete(_)
+            | Self::TextSearch(_)
+            | Self::TextRebuild(_)
+            | Self::TextVerify(_)
+            | Self::TextStats(_)
+            | Self::TextSearchPart(_)
+            // Agent memory: memory ids in the memory store's placement (`ClusterMap.memory`),
+            // which a range move never names (D331 Amendment 3).
+            | Self::Remember(_)
+            | Self::Recall(_)
+            | Self::MarkUsed(_)
+            | Self::Supersede(_)
+            | Self::Link(_)
+            | Self::Forget(_)
+            | Self::RecallPool(_)
+            | Self::RecallBodies(_) => ControlFlow::Continue(()),
         }
     }
 }
@@ -604,6 +667,24 @@ pub(crate) enum Touch<'a> {
     },
     /// Every row starting with these bytes.
     Prefix(&'a [u8]),
+}
+
+impl<'a> Touch<'a> {
+    /// A read's key range as its request gives it: no range is the whole table.
+    fn of_range(range: Option<&'a proto::KeyRange>) -> Self {
+        use proto::key_range::Range;
+        match range.and_then(|k| k.range.as_ref()) {
+            Some(Range::Prefix(p)) => Touch::Prefix(p),
+            Some(Range::Bounds(b)) => Touch::Range {
+                start: convert::bound(b.start.as_ref()),
+                end: convert::bound(b.end.as_ref()),
+            },
+            None => Touch::Range {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+        }
+    }
 }
 
 /// `Data.Scan`'s index in `RPCS`: its outcome is counted when its stream ends.
@@ -5666,18 +5747,51 @@ mod touches_tests {
     }
 
     #[test]
-    fn calls_without_rows_in_the_request_report_nothing() {
+    fn calls_without_a_tables_rows_report_nothing() {
         for op in [
             ServiceOp::Info(proto::Empty::default()),
             ServiceOp::Begin(proto::BeginRequest::default()),
-            ServiceOp::Traverse(proto::TraverseRequest {
-                table: "t".into(),
-                seeds: vec!["a".into()],
+            ServiceOp::Abort(proto::TxnAbortRequest::default()),
+            ServiceOp::VectorInsert(proto::VectorInsertRequest {
+                index: "v".into(),
+                id: "a".into(),
                 ..Default::default()
             }),
-            ServiceOp::Abort(proto::TxnAbortRequest::default()),
+            ServiceOp::Forget(proto::ForgetRequest {
+                ids: vec!["a".into()],
+            }),
         ] {
             assert!(touched(&op, usize::MAX).is_empty(), "{op:?}");
         }
+    }
+
+    #[test]
+    fn a_nearest_search_reports_its_rows_and_a_traversal_its_seeds() {
+        use proto::nearest_request::Source;
+        let nearest = |source| {
+            ServiceOp::Nearest(proto::NearestRequest {
+                table: "t".into(),
+                source,
+                ..Default::default()
+            })
+        };
+        let keys = nearest(Some(Source::Keys(proto::KeyList {
+            keys: vec!["b".into(), "a".into()],
+        })));
+        assert_eq!(touched(&keys, usize::MAX), pairs(&[("t", "b"), ("t", "a")]));
+        let range = nearest(Some(Source::Range(proto::KeyRange {
+            range: Some(proto::key_range::Range::Prefix("ab".into())),
+        })));
+        assert_eq!(touched(&range, usize::MAX), pairs(&[("t", "ab…")]));
+        assert_eq!(touched(&nearest(None), usize::MAX), pairs(&[("t", "*..*")]));
+        let traverse = ServiceOp::Traverse(proto::TraverseRequest {
+            table: "g".into(),
+            seeds: vec!["s1".into(), "s2".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&traverse, usize::MAX),
+            pairs(&[("g", "s1"), ("g", "s2")])
+        );
     }
 }
