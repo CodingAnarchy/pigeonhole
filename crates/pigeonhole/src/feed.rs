@@ -464,6 +464,7 @@ impl FeedBuilder {
             covered: pigeonhole_engine::FeedPosition::default(),
             span: (start, start),
             progress: FeedProgress::attach(reader_progress),
+            include_silent: false,
         })
     }
 }
@@ -562,6 +563,9 @@ pub struct Feed {
     span: (StreamPosition, StreamPosition),
     /// Its position, published by the reader as it moves ([`Feed::progress`]).
     progress: FeedProgress,
+    /// Feed-silent commits are delivered (D331: a replica's follower only), kept across a
+    /// resubscribe.
+    include_silent: bool,
 }
 
 /// Where a [`Feed`] is, readable from any thread ([`Feed::progress`], D316 A4, ICR 0116): a
@@ -815,7 +819,19 @@ impl Feed {
             event,
             self.span,
             self.token(),
+            self.reader.silent(),
         ))
+    }
+
+    /// Delivers the primary's feed-silent commits too (D331, ICR 0141), each marked in
+    /// [`replicated`](Self::replicated): for a replica's follower only, which applies them
+    /// silent. [`FeedBuilder`](crate::FeedBuilder) has no such option, so a client's
+    /// subscription never sees them. Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn include_silent(&mut self) {
+        self.include_silent = true;
+        self.reader.include_silent();
     }
 
     /// The digest of the catalog at the feed's position, for a feed of every table (#1853
@@ -902,6 +918,9 @@ impl Feed {
         // position, so it stays covered.
         self.covered = self.covered.join(self.reader.position());
         reader.set_progress(Arc::clone(&self.progress.covered));
+        if self.include_silent {
+            reader.include_silent();
+        }
         self.reader = reader;
         self.generation = generation;
         Ok(())

@@ -642,3 +642,60 @@ fn a_reader_process_feed_of_every_table_expires_on_the_stop_alone() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// D331 (simp724's S1 on #2055): a reader process's feed, subscribed before the writer's
+/// first feed-silent commit, takes the mark once it meets it. The bit is set after the
+/// reader opened, and setting it moves no manifest, so the reader reads the superblocks
+/// again rather than failing as corrupt. Its subscriber passes the silent commit over, and
+/// a reader that includes them sees it.
+#[test]
+fn a_reader_process_takes_a_silent_commit_made_after_it_opened() {
+    let vfs = SimVfs::new(4110);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let mut all = r.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    all.include_silent();
+
+    vfs.enter_process(WRITER);
+    let before = w.commit(&[(&a, b"before")]);
+    let mut wb = WriteBatch::new();
+    wb.mark_feed_silent();
+    wb.put(
+        a.id,
+        a.families[0].id,
+        b"quiet",
+        b"q",
+        None,
+        ValueRef::Bytes(b"quiet"),
+    )
+    .unwrap();
+    let mut pc = w.db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    let quiet = loop {
+        if let Poll::Ready(r) = poll_commit(&mut pc) {
+            break r.unwrap().seqno;
+        }
+        w.run();
+    };
+    w.settle();
+    let after = w.commit(&[(&a, b"after")]);
+
+    vfs.enter_process(READER);
+    let got = ready(&mut feed).unwrap();
+    assert_eq!(
+        got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        [before, after]
+    );
+    let got = ready(&mut all).unwrap();
+    assert_eq!(
+        got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        [before, quiet, after]
+    );
+    drop((feed, all, r));
+    vfs.enter_process(WRITER);
+    w.close();
+}

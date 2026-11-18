@@ -155,6 +155,8 @@ pub struct FeedCursor {
     tail_window: bool,
     /// A stop short of its successor's recorded end, deferred once (#1370): `(epoch, stop)`.
     deferred: Option<(u32, u64)>,
+    /// Whether a feed-silent batch's mark is taken (D331, [`FeedCursor::accept_silent`]).
+    silent_ok: bool,
 }
 
 #[derive(Debug)]
@@ -211,6 +213,7 @@ impl FeedCursor {
             fresh_end: 0,
             tail_window: false,
             deferred: None,
+            silent_ok: false,
         };
         this.cur = this.place(at);
         Ok(this)
@@ -243,6 +246,14 @@ impl FeedCursor {
     /// [`WalStream`]: crate::WalStream
     pub fn follow_head(&mut self, marks: Arc<FeedMarks>) {
         self.marks = Some(marks);
+    }
+
+    /// Takes feed-silent batches' mark (D331, ICR 0141); without it a marked batch is
+    /// corrupt. The engine's change feed takes it and checks `incompat` bit 3 itself where it
+    /// looks at each batch (a writer may set the bit after the cursor opened). The cursor only
+    /// decodes the mark: whether a silent commit is delivered is its reader's call.
+    pub fn accept_silent(&mut self, ok: bool) {
+        self.silent_ok = ok;
     }
 
     /// The stream's segments as their headers were last read, by epoch: `(epoch,
@@ -515,7 +526,7 @@ impl FeedCursor {
                         let start = Lsn::new(epoch, last_end as u32);
                         let session = cur.session;
                         let cur = self.cur.as_ref().expect("checked above");
-                        let record = WalRecord::decode(cur.dec.record())?;
+                        let record = WalRecord::decode_with(cur.dec.record(), self.silent_ok)?;
                         return Ok(Step::Record {
                             start,
                             end: Lsn::new(epoch, end as u32),

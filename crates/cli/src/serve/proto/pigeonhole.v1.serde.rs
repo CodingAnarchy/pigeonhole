@@ -2963,6 +2963,15 @@ impl serde::Serialize for ClusterMap {
         if self.memory.is_some() {
             len += 1;
         }
+        if !self.writer.is_empty() {
+            len += 1;
+        }
+        if self.writer_term != 0 {
+            len += 1;
+        }
+        if self.failover {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ClusterMap", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -2990,6 +2999,17 @@ impl serde::Serialize for ClusterMap {
         if let Some(v) = self.memory.as_ref() {
             struct_ser.serialize_field("memory", v)?;
         }
+        if !self.writer.is_empty() {
+            struct_ser.serialize_field("writer", &self.writer)?;
+        }
+        if self.writer_term != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("writer_term", ToString::to_string(&self.writer_term).as_str())?;
+        }
+        if self.failover {
+            struct_ser.serialize_field("failover", &self.failover)?;
+        }
         struct_ser.end()
     }
 }
@@ -3011,6 +3031,10 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             "previousNodes",
             "indexes",
             "memory",
+            "writer",
+            "writer_term",
+            "writerTerm",
+            "failover",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -3023,6 +3047,9 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
             PreviousNodes,
             Indexes,
             Memory,
+            Writer,
+            WriterTerm,
+            Failover,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -3052,6 +3079,9 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             "previousNodes" | "previous_nodes" => Ok(GeneratedField::PreviousNodes),
                             "indexes" => Ok(GeneratedField::Indexes),
                             "memory" => Ok(GeneratedField::Memory),
+                            "writer" => Ok(GeneratedField::Writer),
+                            "writerTerm" | "writer_term" => Ok(GeneratedField::WriterTerm),
+                            "failover" => Ok(GeneratedField::Failover),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -3079,6 +3109,9 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                 let mut previous_nodes__ = None;
                 let mut indexes__ = None;
                 let mut memory__ = None;
+                let mut writer__ = None;
+                let mut writer_term__ = None;
+                let mut failover__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -3131,6 +3164,26 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                             }
                             memory__ = map_.next_value()?;
                         }
+                        GeneratedField::Writer => {
+                            if writer__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writer"));
+                            }
+                            writer__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::WriterTerm => {
+                            if writer_term__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writerTerm"));
+                            }
+                            writer_term__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Failover => {
+                            if failover__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("failover"));
+                            }
+                            failover__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ClusterMap {
@@ -3142,6 +3195,9 @@ impl<'de> serde::Deserialize<'de> for ClusterMap {
                     previous_nodes: previous_nodes__.unwrap_or_default(),
                     indexes: indexes__.unwrap_or_default(),
                     memory: memory__,
+                    writer: writer__.unwrap_or_default(),
+                    writer_term: writer_term__.unwrap_or_default(),
+                    failover: failover__.unwrap_or_default(),
                 })
             }
         }
@@ -10058,6 +10114,9 @@ impl serde::Serialize for LeasePart {
         if self.epoch != 0 {
             len += 1;
         }
+        if self.term != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeasePart", len)?;
         if !self.partition.is_empty() {
             struct_ser.serialize_field("partition", &self.partition)?;
@@ -10066,6 +10125,11 @@ impl serde::Serialize for LeasePart {
             #[allow(clippy::needless_borrow)]
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("epoch", ToString::to_string(&self.epoch).as_str())?;
+        }
+        if self.term != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("term", ToString::to_string(&self.term).as_str())?;
         }
         struct_ser.end()
     }
@@ -10079,12 +10143,14 @@ impl<'de> serde::Deserialize<'de> for LeasePart {
         const FIELDS: &[&str] = &[
             "partition",
             "epoch",
+            "term",
         ];
 
         #[allow(clippy::enum_variant_names)]
         enum GeneratedField {
             Partition,
             Epoch,
+            Term,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10108,6 +10174,7 @@ impl<'de> serde::Deserialize<'de> for LeasePart {
                         match value {
                             "partition" => Ok(GeneratedField::Partition),
                             "epoch" => Ok(GeneratedField::Epoch),
+                            "term" => Ok(GeneratedField::Term),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -10129,6 +10196,7 @@ impl<'de> serde::Deserialize<'de> for LeasePart {
             {
                 let mut partition__ = None;
                 let mut epoch__ = None;
+                let mut term__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Partition => {
@@ -10145,11 +10213,20 @@ impl<'de> serde::Deserialize<'de> for LeasePart {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Term => {
+                            if term__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("term"));
+                            }
+                            term__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LeasePart {
                     partition: partition__.unwrap_or_default(),
                     epoch: epoch__.unwrap_or_default(),
+                    term: term__.unwrap_or_default(),
                 })
             }
         }
@@ -10185,6 +10262,9 @@ impl serde::Serialize for LeaseRequest {
         if self.start != 0 {
             len += 1;
         }
+        if self.writer_term != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseRequest", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -10215,6 +10295,11 @@ impl serde::Serialize for LeaseRequest {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("start", ToString::to_string(&self.start).as_str())?;
         }
+        if self.writer_term != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("writer_term", ToString::to_string(&self.writer_term).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -10236,6 +10321,8 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
             "lease_ms",
             "leaseMs",
             "start",
+            "writer_term",
+            "writerTerm",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -10247,6 +10334,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
             Parts,
             LeaseMs,
             Start,
+            WriterTerm,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10275,6 +10363,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                             "parts" => Ok(GeneratedField::Parts),
                             "leaseMs" | "lease_ms" => Ok(GeneratedField::LeaseMs),
                             "start" => Ok(GeneratedField::Start),
+                            "writerTerm" | "writer_term" => Ok(GeneratedField::WriterTerm),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -10301,6 +10390,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                 let mut parts__ = None;
                 let mut lease_ms__ = None;
                 let mut start__ = None;
+                let mut writer_term__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -10353,6 +10443,14 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::WriterTerm => {
+                            if writer_term__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writerTerm"));
+                            }
+                            writer_term__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LeaseRequest {
@@ -10363,6 +10461,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                     parts: parts__.unwrap_or_default(),
                     lease_ms: lease_ms__.unwrap_or_default(),
                     start: start__.unwrap_or_default(),
+                    writer_term: writer_term__.unwrap_or_default(),
                 })
             }
         }
@@ -10389,6 +10488,9 @@ impl serde::Serialize for LeaseResponse {
         if self.grace_remaining_ms != 0 {
             len += 1;
         }
+        if self.writer_term != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseResponse", len)?;
         if self.newer_map_version != 0 {
             #[allow(clippy::needless_borrow)]
@@ -10406,6 +10508,11 @@ impl serde::Serialize for LeaseResponse {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("grace_remaining_ms", ToString::to_string(&self.grace_remaining_ms).as_str())?;
         }
+        if self.writer_term != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("writer_term", ToString::to_string(&self.writer_term).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -10422,6 +10529,8 @@ impl<'de> serde::Deserialize<'de> for LeaseResponse {
             "withheld",
             "grace_remaining_ms",
             "graceRemainingMs",
+            "writer_term",
+            "writerTerm",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -10430,6 +10539,7 @@ impl<'de> serde::Deserialize<'de> for LeaseResponse {
             Granted,
             Withheld,
             GraceRemainingMs,
+            WriterTerm,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10455,6 +10565,7 @@ impl<'de> serde::Deserialize<'de> for LeaseResponse {
                             "granted" => Ok(GeneratedField::Granted),
                             "withheld" => Ok(GeneratedField::Withheld),
                             "graceRemainingMs" | "grace_remaining_ms" => Ok(GeneratedField::GraceRemainingMs),
+                            "writerTerm" | "writer_term" => Ok(GeneratedField::WriterTerm),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -10478,6 +10589,7 @@ impl<'de> serde::Deserialize<'de> for LeaseResponse {
                 let mut granted__ = None;
                 let mut withheld__ = None;
                 let mut grace_remaining_ms__ = None;
+                let mut writer_term__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::NewerMapVersion => {
@@ -10508,6 +10620,14 @@ impl<'de> serde::Deserialize<'de> for LeaseResponse {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::WriterTerm => {
+                            if writer_term__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writerTerm"));
+                            }
+                            writer_term__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LeaseResponse {
@@ -10515,6 +10635,7 @@ impl<'de> serde::Deserialize<'de> for LeaseResponse {
                     granted: granted__.unwrap_or_default(),
                     withheld: withheld__.unwrap_or_default(),
                     grace_remaining_ms: grace_remaining_ms__.unwrap_or_default(),
+                    writer_term: writer_term__.unwrap_or_default(),
                 })
             }
         }
@@ -15002,6 +15123,15 @@ impl serde::Serialize for NodeStatus {
         if !self.map_features.is_empty() {
             len += 1;
         }
+        if !self.writer.is_empty() {
+            len += 1;
+        }
+        if self.writer_term != 0 {
+            len += 1;
+        }
+        if self.writer_lease_remaining_ms != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.NodeStatus", len)?;
         if !self.node_id.is_empty() {
             struct_ser.serialize_field("node_id", &self.node_id)?;
@@ -15028,6 +15158,19 @@ impl serde::Serialize for NodeStatus {
         if !self.map_features.is_empty() {
             struct_ser.serialize_field("map_features", &self.map_features)?;
         }
+        if !self.writer.is_empty() {
+            struct_ser.serialize_field("writer", &self.writer)?;
+        }
+        if self.writer_term != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("writer_term", ToString::to_string(&self.writer_term).as_str())?;
+        }
+        if self.writer_lease_remaining_ms != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("writer_lease_remaining_ms", ToString::to_string(&self.writer_lease_remaining_ms).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -15050,6 +15193,11 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             "graceRemainingMs",
             "map_features",
             "mapFeatures",
+            "writer",
+            "writer_term",
+            "writerTerm",
+            "writer_lease_remaining_ms",
+            "writerLeaseRemainingMs",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15061,6 +15209,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             Divergent,
             GraceRemainingMs,
             MapFeatures,
+            Writer,
+            WriterTerm,
+            WriterLeaseRemainingMs,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -15089,6 +15240,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             "divergent" => Ok(GeneratedField::Divergent),
                             "graceRemainingMs" | "grace_remaining_ms" => Ok(GeneratedField::GraceRemainingMs),
                             "mapFeatures" | "map_features" => Ok(GeneratedField::MapFeatures),
+                            "writer" => Ok(GeneratedField::Writer),
+                            "writerTerm" | "writer_term" => Ok(GeneratedField::WriterTerm),
+                            "writerLeaseRemainingMs" | "writer_lease_remaining_ms" => Ok(GeneratedField::WriterLeaseRemainingMs),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -15115,6 +15269,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                 let mut divergent__ = None;
                 let mut grace_remaining_ms__ = None;
                 let mut map_features__ = None;
+                let mut writer__ = None;
+                let mut writer_term__ = None;
+                let mut writer_lease_remaining_ms__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::NodeId => {
@@ -15163,6 +15320,28 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             }
                             map_features__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Writer => {
+                            if writer__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writer"));
+                            }
+                            writer__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::WriterTerm => {
+                            if writer_term__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writerTerm"));
+                            }
+                            writer_term__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::WriterLeaseRemainingMs => {
+                            if writer_lease_remaining_ms__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writerLeaseRemainingMs"));
+                            }
+                            writer_lease_remaining_ms__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(NodeStatus {
@@ -15173,6 +15352,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                     divergent: divergent__.unwrap_or_default(),
                     grace_remaining_ms: grace_remaining_ms__.unwrap_or_default(),
                     map_features: map_features__.unwrap_or_default(),
+                    writer: writer__.unwrap_or_default(),
+                    writer_term: writer_term__.unwrap_or_default(),
+                    writer_lease_remaining_ms: writer_lease_remaining_ms__.unwrap_or_default(),
                 })
             }
         }

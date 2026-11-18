@@ -361,24 +361,20 @@ impl ShardState {
     fn routing_of(&self, m: &Member) -> Routing {
         let prepare = matches!(m.kind, MemberKind::Prepare { .. });
         let mut out = Routing::Owned;
-        // A share routed with an older tablet map may name rows this shard no longer owns,
-        // and its reads may now belong to a shard outside the commit (nobody would validate
-        // them): it runs again through the new map only then (#102). A read another
-        // participant owns now is validated there, under that shard's current map.
-        let participants: Option<&[ShardId]> = (prepare && m.map_version < self.tablets.version())
-            .then(|| {
-                self.prepared
-                    .get(&m.seqno)
-                    .map_or(&[][..], |s| s.participants.as_slice())
-            });
+        // A share routed before this shard last handed a tablet away (`lost_version`, D145)
+        // may name rows it no longer owns, and its reads may now belong to another shard: it
+        // runs again through the new map. That holds for a read now owned by another
+        // participant too (D145 amended): that participant may have admitted its own share,
+        // and skipped the read as not its row, before the tablet moved to it, and then nobody
+        // would validate it (found by #2054's test in #2056's CI). It's refused only in that
+        // window, so a commit retries once per tablet this shard gives away during its flight,
+        // not under churn elsewhere, which D145 was about.
+        let stale = prepare && m.map_version < self.lost_version;
         let mut look = |table: TableId, row: &[u8], read_by_others: bool| {
             if let Some((tablet, owner)) = self.tablets.route(table, row) {
                 if self.moving.contains(&tablet) {
                     out = Routing::Moving;
-                } else if owner != self.id
-                    && out == Routing::Owned
-                    && (!read_by_others || participants.is_some_and(|p| !p.contains(&owner)))
-                {
+                } else if owner != self.id && out == Routing::Owned && (!read_by_others || stale) {
                     out = Routing::Elsewhere;
                 }
             }
@@ -1235,6 +1231,10 @@ impl ShardState {
     /// Runs a refused cross-shard commit again through the current tablet map.
     pub(super) fn retry(&mut self, r: CoordinateReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         let mut builder = BatchBuilder::new();
+        // The parts of a feed-silent batch are all silent (D331): so is the batch again.
+        if r.parts.iter().any(|(_, p)| p.is_silent()) {
+            builder.mark_silent();
+        }
         let mut failed = None;
         for (_, part) in &r.parts {
             for mu in part.batch().iter() {
@@ -3391,8 +3391,17 @@ pub(crate) fn split_by_shard(
     builder: &BatchBuilder,
     shards: &[ShardId],
 ) -> Result<Vec<(ShardId, Arc<BatchBuilder>)>> {
-    let mut parts: Vec<(ShardId, BatchBuilder)> =
-        shards.iter().map(|s| (*s, BatchBuilder::new())).collect();
+    let mut parts: Vec<(ShardId, BatchBuilder)> = shards
+        .iter()
+        .map(|s| {
+            let mut part = BatchBuilder::new();
+            // Every share of a feed-silent batch is silent (D331).
+            if builder.is_silent() {
+                part.mark_silent();
+            }
+            (*s, part)
+        })
+        .collect();
     for m in builder.batch().iter() {
         let m = m?;
         let Some((_, shard)) = view.tablets.route(m.table, m.row) else {

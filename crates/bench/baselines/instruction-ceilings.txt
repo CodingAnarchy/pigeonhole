@@ -494,8 +494,14 @@ commit-if-returning-async 27864 0.3
 # feed-drain 6159 -> 6174 (+0.24%), feed-drain-all 6174 -> 6189 (+0.24%): +15 a commit, the
 # decoder's fresh-bytes bound and the cursor's fresh end, after a cut from +34 (one compare per
 # fragment on a fresh frame). The re-read was 47.5% of each hub thread (g111).
-feed-drain 5763 0.3
-feed-drain-all 5778 0.3
+# Raised by D195 for #2055 (D331 PR 1, ICR 0141: feed-silent batches; the coordinator's approval
+# of 2026-11-18, inside the standing 0.5%): CI's head counts on 9d3dca430 (run 44271720109).
+# feed-drain 5763 -> 5771 (+0.14%), feed-drain-all 5778 -> 5788 (+0.17%); +35 a commit against
+# base (+0.6%), after cuts from +138: the decoder is unchanged (the mark found by its byte), the
+# change feed tests each batch's mark once where it already looks at the batch, and the replica
+# bookkeeping is out of line. The rest is that test and the cursor step's result copy (x86).
+feed-drain 5771 0.3
+feed-drain-all 5788 0.3
 replicate-apply 6366 0.3
 # #1828 (#2024): agent memory's fused recall (memshapes.rs), per recall. From head 9152b788c on
 # ubuntu-26.04, two runs, base and head of identical engine code each (runs 44085631301 and

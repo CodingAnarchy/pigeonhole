@@ -5052,6 +5052,25 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - *Non-blocking commit (3PC, Paxos Commit):* a partition with one owner blocks its own writes when down anyway. Revisit with replica failover (#1484).
 - *A cluster clock for one snapshot:* a large change to timestamps and visibility; later global-snapshot work.
 
+<a id="d330"></a>
+## D330 — Automatic failover of a cluster partition to its replica: the map's writer under a lease with terms, then partition failover by the writer (cli692, design; owner, 2026-11-16; reviewed by simp724; cli, #1484, ICR 0117) · D317, D326, D328, D329
+
+**Problem (#1484).** A partition whose owner is down stays down until an operator promotes a replica (D328 PR 3). Only the map's writer, the smallest id, changes the map. So while it's down, nothing can change the map except an operator's `set-map --force`, and force is unsafe to automate.
+
+**Decision (the owner's answers, 2026-11-16):** the design is `.coord/cli692-design-1484.md`, with its amendments 1 and 2. In short:
+- **The writer holds a lease as an owner does (W2, Q2).** `__writer` is a pseudo-partition in its D326 rounds, and maps are ordered by `(writer_term, map_version)`.
+  - With failover on, once the writer's lease has lapsed for the failover margin, a node gathers a majority's vote at a higher term. It then reads the newest map that majority holds, and writes it back at that term, naming itself.
+  - A node that voted for a term refuses every map and writer lease below it (amendment 1's M1). The vote is recorded durably before the node answers.
+- **Partition failover (PR 2):** the writer promotes a down owner's freshest replica through D328 PR 3's promote path. Each failover is recorded in the map, with what it lost.
+- **Off by default (Q1):** `ClusterMap.failover`, set with `set-map`. With it off, no node elects a writer or fails a partition over on its own. A forced map still raises the term, so it fences an old writer that comes back.
+- **Not in scope:** synchronous replication (Q3, later, in its own design), and an old owner rejoining automatically (Q4; `failover_rejoin` is reserved and always false).
+- **The default margin is 2·L (Q5).**
+
+**PRs:**
+1. The writer lease and terms, with elections behind `failover`. Its plan is `.coord/cli692-d330-pr1-plan.md`, with simp724's amendment.
+2. Partition failover, with its events, metrics and per-partition mode.
+3. The guide.
+
 <a id="d334"></a>
 ## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)
 
@@ -5113,3 +5132,40 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **C2:** every user of the placeholder flag (`truncate`, the shrink plan, region clearing, `abandon`) treats a block mid-punch as allocated, with a test of a shrink while a pass holds a block at the tail.
 - **S1:** only whole filesystem blocks are punched; macOS's `EINVAL` is an error, never "unsupported".
 - **S3:** the simulator's punch survives a power loss zeroed or not, at random.
+
+<a id="d331"></a>
+## D331 — Splitting a partition and moving a key range online: phases in the map, a durable range fence, one map version as the commit point (cli692, design; owner, 2026-11-16; reviewed by simp724 and perf287; ai1249 builds it; engine, cli, #1499, ICR 0141, amends ICR 0117) · D317, D326, D328, D310, D329
+
+**Problem (#1499).** A cluster's table layer is fixed once a range holds data (D317): `move` and `relocate` move a whole partition file, and nothing moves keys between partitions. A hot or large partition can't be split, and a range can't go to a partition with room.
+
+**Decision.**
+- **A range move** takes rows `[a, b)` of one table from partition S to partition T, an existing partition or a new one (a split). Its phases are recorded in the map (`ClusterMap.moves`), so a rerun, the next writer or a crash recovery continues from them:
+  1. COPYING: T copies the range from S in chunks, each at its own snapshot;
+  2. CATCHING_UP: T follows S's feed for the range;
+  3. HANDING_OVER: S fences the range's writes, durably, and T catches up to S's visible seqno, by feed position;
+  4. HANDED_OVER: the commit point, one map version giving the range to T and raising S's epoch;
+  5. CLEANING: S deletes its copy.
+- **T serves the range** only once S acknowledged that map, or a lease (L·(1+ρ)) passed since a majority held it (the never-both rule).
+- **Writes:**
+  - The copy and the catch-up write each cell at S's timestamp. T raises its timestamp floor past them before it serves.
+  - S's moved ranges make a transaction that read them fail validation (`Conflict`), for the transaction lifetime.
+  - D329 shares that read or wrote the range block the hand-over.
+- **Feeds:**
+  - The copy, the catch-up and S's cleanup are **feed-silent**: logged, durable and replicated, never delivered to a subscription. S's feed ends the range's history at the hand-over, and T's starts it.
+  - The cluster feed's merge holds T's component while S's is behind the hand-over (it blocks, never buffers).
+  - A new partition's feed is read from its start.
+  - Replicas apply silent batches silent, so they stay copies.
+- **The source's change feed is required** (owner, Q2). The move holds S's feed retention from the copy's first snapshot, up to `--move-retention-cap`, and aborts past it.
+- **`split` and `move-range` both ship in 1.3.0** (owner, Q1). A **merge** (`phdb cluster merge S --into T`) is range moves plus dropping the emptied S.
+- **Backups clip on restore** (owner, Q3): restore deletes rows outside each partition's ranges and rolls an in-flight move back or forward.
+- **The guide documents the measured pause** (owner, Q4): the range's sub-second LAN pause, plus S's whole-partition pause of one lease round.
+
+**Engine (ICR 0141, PR 1).**
+- Feed-silent batches: bit 31 of a batch's count, behind `incompat` bit 3 (sticky). A reader refuses the mark without the bit.
+- `raise_ts_floor`.
+- A feed retention hold with a cap.
+- A silent commit crosses replication as a version 2 event, which builds before D331 refuse.
+
+**PRs.** 1, the engine; 2, the map record and the gates; 3, the paths that must clip, the cluster feed's hold, and backups; 4, the copy and the range follower; 5, the driver, hand-over, cleanup and CLI; 6, merge. Follow-ups #2052 (SST ingest for the copy) and #2053 (dropping whole SSTs on cleanup), both Post-1.0 unless perf287's box run says otherwise.
+
+**Design:** `.coord/cli692-design-1499.md` (with simp724's, perf287's and Amendment 5's reviews), `.coord/ai1249-plan-1499.md`.
