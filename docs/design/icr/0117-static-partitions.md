@@ -713,7 +713,8 @@ Its steps:
   The map keeps the last 16 finished events, and every pending one.
 - `Partition.failover = 8` (`FailoverMode`: INHERIT, OFF, ON). The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
 - `Partition.failover_count = 11`: P's failovers, ever; it never goes down.
-- `LeasePart.in_doubt_xids = 4` and `.in_doubt_count = 5`: an owner's in-doubt external shares of P, sent with its renewals while the map has failover on. They're empty in an answer.
+- `LeaseRequest.pre_vote = 9` (bool): an election's pre-vote (Raft's). A candidate asks for real votes, and records its own, only once a majority would vote. A node answers it as the vote, recording, granting and fencing nothing, and says yes only once the writer lease has been out there for the failover margin (simp724). Without it, a node cut off from every other ran an election it couldn't win; its recorded vote then fenced the live writer's lower-term maps from it for good once it rejoined (found by §8 test 2). A build without leases answers `Unimplemented`, as to a vote: no pre-vote. A vote that's really held and lost can still strand its candidate; the fix (the live writer adopts the higher term) is a 1.3.0 follow-up.
+- `LeasePart.in_doubt_xids = 4` and `.in_doubt_count = 5`: an owner's in-doubt external shares of P, sent with its renewals while the map has failover on, as the operator pastes them into `phdb cluster txn decide` (UTF-8; hex only for an xid that isn't). They're empty in an answer.
 - `NodeStatus.failover_blocked = 12`: on the writer, each down partition it doesn't fail over, and why.
 - `NodeStatus.grants = 13`: every partition lease the node grants that still runs (`LeaseWithheld`: partition, holder, time left). The writer's survey reads it.
 - `LocalPartition.failover_blocked_reason = 26` was assigned and isn't used: the owner of a down partition can't report it, so the writer's `failover_blocked` replaces it (simp724's F6).
@@ -727,15 +728,18 @@ Its steps:
   - the map's `failover` is off;
   - P is OFF;
   - P has no replicas;
-  - the owner answers and serves P, or the operator fenced or closed it there;
+  - the owner answers and serves P, or the operator fenced (`FENCE_REASON_OPERATOR`) or closed it there. An owner that answers but has lost its lease reports Fenced awaiting its peers, and counts as down;
   - any other node still grants P's lease to its owner (`NodeStatus.grants`: the owner is alive, cut off from the writer alone).
 - A node that doesn't answer the survey is unknown, not granting. The grant round still keeps two owners from serving at once.
+- A partition blocked after a survey is surveyed again only after the failover margin, or when the map changes (perf287 on #2069). A newly down partition is surveyed at once.
 
 **The replica:** of P's replicas, the one with the highest applied seqno (then map order) whose copy:
 - is FOLLOWING or BEHIND;
 - is at the writer's own map version and term;
 - is inside P's history;
 - is no staler than the owner's last renewal plus a heartbeat (1 s), and within `--cluster-failover-max-lag-ms`.
+
+The owner's last renewal is the writer's own last grant of P to it, less a lease. The writer is one of P's grantors, so it has this whatever its office time; a writer elected after the owner died still measures from the owner's real renewal (simp724's B1 on #2069). A writer that has seen no renewal of P's owner since it started has no baseline. It blocks P with a reason that says to promote by hand (`phdb cluster promote P --to <replica> --old-unreachable`).
 
 **The promote** is `phdb cluster promote`'s, shared code, run by the writer over its peers. One runs at a time.
 1. **A map** takes the copy's node out of P's replicas and, with writer terms or failover in the map, records the promote PENDING at its `to_epoch`.

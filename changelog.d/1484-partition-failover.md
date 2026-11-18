@@ -6,3 +6,4 @@
 
 ### Fixed
 - **A cluster node's election check no longer delays its own lease renewals** while a peer accepts connections and never answers (#2056, unreleased).
+- **A cluster node cut off from every other no longer stays fenced once it rejoins** (#2056, unreleased). It held a writer election it couldn't win, and its recorded vote then refused the live writer's maps. Elections now ask for a pre-vote first and record nothing unless a majority would vote.

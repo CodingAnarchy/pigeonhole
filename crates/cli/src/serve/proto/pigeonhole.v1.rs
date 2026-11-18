@@ -7040,7 +7040,8 @@ pub struct FailoverEvent {
     /// PARTITION: the primary seqno the promoted copy had applied through, and the owner's
     /// durable seqno as the copy last heard it. Their difference is the known part of what
     /// the failover lost; commits the owner acknowledged after the copy last heard from it
-    /// may be lost too (D330 §4).
+    /// may be lost too (D330 §4). `primary_seqno` 0: unknown (the copy's follower hadn't heard
+    /// the owner's frontier since it last reconnected).
     #[prost(uint64, tag = "8")]
     pub applied_seqno: u64,
     #[prost(uint64, tag = "9")]
@@ -7826,6 +7827,13 @@ pub struct LeaseRequest {
     /// the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
     #[prost(uint64, tag = "8")]
     pub writer_term: u64,
+    /// D330 PR 2: an election's pre-vote. The request asks for the writer lease alone, as a
+    /// vote does; the answer grants it only if this node would vote, and records nothing.
+    /// A candidate asks for real votes only once a majority would, so a node that can't win
+    /// never records a vote, whose term would fence the live writer's maps from it once it
+    /// rejoins.
+    #[prost(bool, tag = "9")]
+    pub pre_vote: bool,
 }
 /// A partition at an epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

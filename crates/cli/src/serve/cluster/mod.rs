@@ -1937,6 +1937,15 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             ))
             .into());
         }
+        // A pre-vote is answered as a ballot whatever its term: never as a lease request,
+        // which could grant the writer lease it names.
+        if req.pre_vote {
+            return Ok(tonic::Response::new(self.0.grants.pre_vote(
+                &mine,
+                &req,
+                self.0.peers.failover_after,
+            )?));
+        }
         if self.0.is_vote(&mine, &req) {
             return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
         }
@@ -3032,13 +3041,16 @@ fn open_partition(
 /// The partitions whose owner, epoch or history `new` changes from `old` (all of them for a
 /// first map): what a copy's follower must look up again (D330 amendment 2).
 fn moved_partitions(old: Option<&ClusterMap>, new: &ClusterMap) -> Vec<String> {
+    // By id, not a scan per partition (perf2's nit on #2069): this runs under the state lock.
+    let before: HashMap<&str, &crate::serve::proto::Partition> = old
+        .map(|o| o.partitions.iter().map(|q| (q.id.as_str(), q)).collect())
+        .unwrap_or_default();
     new.partitions
         .iter()
         .filter(|p| {
-            old.and_then(|o| o.partitions.iter().find(|q| q.id == p.id))
-                .is_none_or(|q| {
-                    q.node != p.node || q.epoch != p.epoch || q.history_epoch != p.history_epoch
-                })
+            before.get(p.id.as_str()).is_none_or(|q| {
+                q.node != p.node || q.epoch != p.epoch || q.history_epoch != p.history_epoch
+            })
         })
         .map(|p| p.id.clone())
         .collect()

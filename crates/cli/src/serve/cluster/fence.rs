@@ -751,7 +751,7 @@ impl Node {
     }
 
     /// Partition `id`'s in-doubt external shares here (D329), for its lease part (D330 PR
-    /// 2's F7): their xids in lowercase hex, as many as fit in
+    /// 2's F7): their xids as UTF-8 (hex if not), as many as fit in
     /// [`super::map::IN_DOUBT_BYTES`], and how many there are. None while it isn't served
     /// here.
     fn in_doubt_of(&self, id: &str) -> (Vec<String>, u64) {
@@ -769,12 +769,21 @@ impl Node {
         let mut xids = Vec::new();
         let mut bytes = 0;
         for (xid, _) in &all {
-            let hex: String = xid.iter().map(|b| format!("{b:02x}")).collect();
-            bytes += hex.len();
+            // As the operator pastes it into `phdb cluster txn decide` (simp724's M1 on
+            // #2069): serve's xids are UTF-8; another's bytes go as hex.
+            let text = String::from_utf8(xid.clone()).unwrap_or_else(|_| {
+                use std::fmt::Write as _;
+                xid.iter()
+                    .fold(String::with_capacity(xid.len() * 2), |mut s, b| {
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    })
+            });
+            bytes += text.len();
             if bytes > super::map::IN_DOUBT_BYTES {
                 break;
             }
-            xids.push(hex);
+            xids.push(text);
         }
         (xids, all.len() as u64)
     }
@@ -823,6 +832,7 @@ impl Node {
             lease_ms: self.grants.lease_ms(),
             start: self.grants.start(),
             writer_term: round.map.writer_term,
+            pre_vote: false,
         };
         let mut asks = tokio::task::JoinSet::new();
         for (peer, address) in holding {

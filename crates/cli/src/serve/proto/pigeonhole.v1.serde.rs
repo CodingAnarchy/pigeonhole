@@ -10898,6 +10898,9 @@ impl serde::Serialize for LeaseRequest {
         if self.writer_term != 0 {
             len += 1;
         }
+        if self.pre_vote {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LeaseRequest", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -10933,6 +10936,9 @@ impl serde::Serialize for LeaseRequest {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("writer_term", ToString::to_string(&self.writer_term).as_str())?;
         }
+        if self.pre_vote {
+            struct_ser.serialize_field("pre_vote", &self.pre_vote)?;
+        }
         struct_ser.end()
     }
 }
@@ -10956,6 +10962,8 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
             "start",
             "writer_term",
             "writerTerm",
+            "pre_vote",
+            "preVote",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -10968,6 +10976,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
             LeaseMs,
             Start,
             WriterTerm,
+            PreVote,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -10997,6 +11006,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                             "leaseMs" | "lease_ms" => Ok(GeneratedField::LeaseMs),
                             "start" => Ok(GeneratedField::Start),
                             "writerTerm" | "writer_term" => Ok(GeneratedField::WriterTerm),
+                            "preVote" | "pre_vote" => Ok(GeneratedField::PreVote),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -11024,6 +11034,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                 let mut lease_ms__ = None;
                 let mut start__ = None;
                 let mut writer_term__ = None;
+                let mut pre_vote__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -11084,6 +11095,12 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::PreVote => {
+                            if pre_vote__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("preVote"));
+                            }
+                            pre_vote__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(LeaseRequest {
@@ -11095,6 +11112,7 @@ impl<'de> serde::Deserialize<'de> for LeaseRequest {
                     lease_ms: lease_ms__.unwrap_or_default(),
                     start: start__.unwrap_or_default(),
                     writer_term: writer_term__.unwrap_or_default(),
+                    pre_vote: pre_vote__.unwrap_or_default(),
                 })
             }
         }

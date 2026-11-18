@@ -320,11 +320,59 @@ impl Node {
             lease_ms: self.grants.lease_ms(),
             start: self.grants.start(),
             writer_term: map.writer_term,
+            pre_vote: false,
         };
+        // 0. The pre-vote (Raft's, D330 PR 2): real votes are asked, and this node's own
+        // recorded, only once a majority would vote. A recorded vote fences maps below its
+        // term, so a node that can't win, cut off from the rest, would otherwise refuse the
+        // live writer's maps for good once it rejoins.
+        let pre = LeaseRequest {
+            pre_vote: true,
+            ..req.clone()
+        };
+        let own = self.grants.pre_vote(map, &pre, self.peers.failover_after);
+        let (would, why) = self.ballots(map, own, &pre).await;
+        if would.len() * 2 <= map.nodes.len() {
+            return Err(format!(
+                "its pre-vote: {} of {} nodes would vote for it ({})",
+                would.len(),
+                map.nodes.len(),
+                why.join("; ")
+            ));
+        }
         // 1. The vote, this node's own included.
+        let own = self.vote_async(map.clone(), req.clone()).await;
+        let (granted, why) = self.ballots(map, own, &req).await;
+        if granted.len() * 2 <= map.nodes.len() {
+            return Err(format!(
+                "{} of {} nodes voted for it ({})",
+                granted.len(),
+                map.nodes.len(),
+                why.join("; ")
+            ));
+        }
+        self.candidate
+            .store(term, std::sync::atomic::Ordering::Release);
+        let end = super::lease::holder_end(t0, self.grants.lease());
+        let result = self.take_office(term, end, &granted).await;
+        self.candidate
+            .store(0, std::sync::atomic::Ordering::Release);
+        result
+    }
+
+    /// Ballot `req` (a vote or a pre-vote) at every node of `map`: this node's answer `own`,
+    /// then each other node's within the push timeout. The nodes that granted it (each id,
+    /// and its address but for this node), and why each other one didn't. A build without
+    /// leases answers `Unimplemented`, so it neither votes nor pre-votes.
+    async fn ballots(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+        own: Result<LeaseResponse, ApiError>,
+        req: &LeaseRequest,
+    ) -> (Vec<(String, Option<String>)>, Vec<String>) {
         let mut granted = Vec::new();
         let mut why = Vec::new();
-        match self.vote_async(map.clone(), req.clone()).await {
+        match own {
             Ok(r) if !r.granted.is_empty() => granted.push((self.id.clone(), None)),
             Ok(r) => why.push(format!("{}: {}", self.id, refusal(&r))),
             Err(e) => why.push(format!("{}: {}", self.id, e.message)),
@@ -338,7 +386,6 @@ impl Node {
                 req.clone(),
             );
             asks.spawn(async move {
-                // A build without leases answers `Unimplemented`: no vote.
                 let r =
                     tokio::time::timeout(node.peers.push_timeout, node.ask_lease(&address, req))
                         .await
@@ -356,21 +403,7 @@ impl Node {
                 Err(e) => why.push(format!("{id}: {e}")),
             }
         }
-        if granted.len() * 2 <= map.nodes.len() {
-            return Err(format!(
-                "{} of {} nodes voted for it ({})",
-                granted.len(),
-                map.nodes.len(),
-                why.join("; ")
-            ));
-        }
-        self.candidate
-            .store(term, std::sync::atomic::Ordering::Release);
-        let end = super::lease::holder_end(t0, self.grants.lease());
-        let result = self.take_office(term, end, &granted).await;
-        self.candidate
-            .store(0, std::sync::atomic::Ordering::Release);
-        result
+        (granted, why)
     }
 
     /// Steps 2 and 3, as the writer voted at `term`, whose vote holds until `end` on the lease
@@ -638,6 +671,7 @@ mod model {
                 lease_ms: u64::try_from(LEASE.as_millis()).unwrap(),
                 start: self.nodes[i].grants.start(),
                 writer_term: m.writer_term,
+                pre_vote: false,
             };
             let mut granted = 0;
             for j in 0..NODES {
@@ -684,7 +718,25 @@ mod model {
         }
 
         /// An election by `i`, if due (the module doc's steps).
+        /// [`Self::ballot`], then the pre-vote's invariant (D330 PR 2, simp724): a node that
+        /// can't reach a majority records no vote, its own or another's, so isolation never
+        /// raises a term.
         fn elect(&mut self, i: usize, margin: Duration, seed: u64) {
+            let reachable = (0..NODES).filter(|&j| self.reach(i, j)).count();
+            let before: Vec<u64> = self.nodes.iter().map(|n| n.grants.voted()).collect();
+            self.ballot(i, margin, seed);
+            if reachable * 2 <= NODES {
+                let after: Vec<u64> = self.nodes.iter().map(|n| n.grants.voted()).collect();
+                assert_eq!(
+                    before, after,
+                    "seed {seed}: n{i}, reaching {reachable} of {NODES}, recorded a vote"
+                );
+            }
+        }
+
+        /// The election as `elect` runs it: the pre-vote, then the vote, through the grantors'
+        /// own [`Grants::pre_vote`] and [`Grants::vote`].
+        fn ballot(&mut self, i: usize, margin: Duration, seed: u64) {
             let mine = self.nodes[i].map.clone();
             if schema::writer(&mine) == id(i) || self.nodes[i].grants.writer_lapsed() < margin {
                 return;
@@ -707,7 +759,26 @@ mod model {
                 lease_ms: u64::try_from(LEASE.as_millis()).unwrap(),
                 start: self.nodes[i].grants.start(),
                 writer_term: mine.writer_term,
+                pre_vote: false,
             };
+            let pre = LeaseRequest {
+                pre_vote: true,
+                ..req.clone()
+            };
+            let would = (0..NODES)
+                .filter(|&j| self.reach(i, j))
+                .filter(|&j| {
+                    let n = &self.nodes[j];
+                    !n.grants
+                        .pre_vote(&n.map, &pre, margin)
+                        .unwrap()
+                        .granted
+                        .is_empty()
+                })
+                .count();
+            if would * 2 <= NODES {
+                return;
+            }
             let mut voters = Vec::new();
             for j in 0..NODES {
                 if !self.reach(i, j) {
