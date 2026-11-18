@@ -1190,6 +1190,7 @@ mod tests {
                 version: 3,
                 seqno: 1,
                 at_ms: 0,
+                ..Default::default()
             },
         )
         .unwrap();

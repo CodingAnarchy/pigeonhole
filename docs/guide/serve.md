@@ -161,6 +161,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 | `retry_safe: false` with any code, from a `Vectors.BulkLoad` that had taken vectors (its message says the vectors before it were loaded, or may have been) | part applied: the vectors before the failure, or some of them | no: `Insert` the rest, or drop the index and load again (a load needs an empty index) |
 | `TransactionFinished` | that call did nothing | no: send `Commit` for the transaction's outcome |
 | `FeedExpired` | (a read) | no: subscribe again from now |
+| `FeedRerouted` (503, `retry_safe`) | (a read) | yes: resume from the last token the stream sent, which it sent just before it ended. A cluster subscription ends so when a range move gives one of its tables a partition it didn't read (1.3.0, D331) |
 | A write's `OutcomeUnknown`, `Io`, `NoSpace`, `MergeFailed`, `Corruption` or `Internal`, or `NotFound` for a `txn_id` you sent `Commit` to | **maybe applied** | check an operation id the write committed ([Recovery](recovery.md)) |
 | No `ErrorDetail` at all: a dropped connection, or a bare gRPC `UNAVAILABLE` or HTTP 502/503/504 from a proxy | **maybe applied**, for a write | as above. A read may be sent again. |
 
@@ -866,6 +867,12 @@ to resume: Subscribe { resume: token, skip_through: last_seen as [{partition, se
   - A token can't resume after a partition it follows starts a new history: a `relocate` without `--copy` (`--old-unreachable` included) does, as a restore does, and so does a `set-map --force` that raises its epoch ([Running a cluster](#running-a-cluster)). `move` and `relocate --copy` copy the files whole and keep the history, so tokens resume across them ([Fencing and relocation](#fencing-and-relocation)).
   - It can't resume after the map changed which partitions the subscription covers either. That happens only when a new table joins a subscription of every table.
   - Both answer `FeedExpired`: subscribe again.
+- **Range moves (1.3.0, D331)** don't expire tokens. A key's events stay in order across a move: its last events on the old partition come before its first on the new one.
+  - **A subscription that reads the new partition already** holds back that partition's events from the hand-over on until its read of the old partition has passed the move's last commit. While held, the new partition's other ranges wait too.
+  - **A subscription that doesn't read it yet** ends with `FeedRerouted`, right after a checkpoint. Its resume from that token reads the new partition from the hand-over on.
+  - **A move that takes all of a table from a partition:** the old partition still serves the table to a token from before the move, up to the move's last commit, then drops out of the subscription.
+  - **Shared subscriptions:** the end reaches every member of a shared one at once. They resume unshared until the subscription resumes or a new shared merge opens (#2067).
+  - **A quiet old partition** releases a hold only at its next progress event, so up to its quiet interval late.
 - **After a restore:** a token from before it answers `FeedExpired`. Each restored partition is at a new epoch, and its history starts at the restore ([Backup and restore](#backup-and-restore)).
 - **Not supported:** a start from a snapshot isn't supported on a cluster subscription. A one-partition version is #1701.
 - **Positions:** a token's `seqno`s are partition-local. There's no cluster-wide position, so compare progress per partition.
