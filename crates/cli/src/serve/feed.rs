@@ -2305,8 +2305,11 @@ struct Barriers {
 /// reading an event and loading its gate's serving-row version (D331 PR 3b, feed1248's
 /// point 1), so a test can take a hand-over exactly there. A no-op when unset.
 #[cfg(test)]
-pub(crate) static AFTER_READ: std::sync::Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> =
-    std::sync::Mutex::new(None);
+pub(crate) static AFTER_READ: std::sync::Mutex<Option<AfterRead>> = std::sync::Mutex::new(None);
+
+/// [`AFTER_READ`]'s hook: the partition, and what runs there.
+#[cfg(test)]
+pub(crate) type AfterRead = (String, Box<dyn FnOnce() + Send>);
 
 impl Barriers {
     /// Runs [`AFTER_READ`]'s closure, if it's set for this component's partition.
