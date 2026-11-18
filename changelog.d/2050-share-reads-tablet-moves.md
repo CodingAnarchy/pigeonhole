@@ -1,0 +1,2 @@
+### Fixed
+- **A tablet change now waits for a cross-shard share that read a row on it** (#2050). Before, only the rows a share wrote held a tablet change back: a share that read a row on a tablet being moved or split let the change go ahead, and a write to that row on the tablet's new shard could land below the share's decision, so the transaction committed over a read that had changed. An undecided internal share's reads now hold the change until its decision, and an external share in doubt (D329) gives the change up with `Busy`, as its writes already did.

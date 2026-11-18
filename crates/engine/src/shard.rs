@@ -2291,6 +2291,10 @@ struct PreparedShare {
     /// The rows its commit reads here (`hash_row`), counted in `pending_reads` while
     /// tracked (D263).
     reads: Vec<u64>,
+    /// The tablets of this shard its commit reads (#2050), sorted: a tablet change touching
+    /// one waits for the decision, as for a row it writes (`shares_touch_moving`). Hashes
+    /// can't be routed to a tablet, so the reads are routed at admission (or reinstall).
+    read_tablets: Vec<TabletId>,
     /// `PrepareReq::participants`.
     participants: Vec<ShardId>,
     /// `PrepareReq::priority` (D249).
@@ -4414,6 +4418,7 @@ impl ShardState {
         xid: Arc<[u8]>,
     ) {
         let reads: Vec<u64> = read.iter().map(|(t, row)| hash_row(*t, row)).collect();
+        let read_tablets = self.read_tablets(read.iter().map(|(t, row)| (*t, row.as_slice())));
         let bytes = Arc::new(batch);
         // Its replayed PREPARE was logged with no slots (replay applied nothing of it): the
         // slots it writes here, as an appended PREPARE logs them, so once it is decided its
@@ -4451,6 +4456,7 @@ impl ShardState {
                 reserved: 0,
                 tracked: true,
                 reads,
+                read_tablets,
                 participants,
                 priority: (0, seqno),
                 submitted_at: 0,
@@ -7930,6 +7936,9 @@ impl ShardState {
                     .as_ref()
                     .map(|v| v.reads.iter().map(|r| hash_row(r.table, &r.row)).collect())
                     .unwrap_or_default();
+                let read_tablets = m.validate.as_ref().map_or_else(Vec::new, |v| {
+                    self.read_tablets(v.reads.iter().map(|r| (r.table, r.row.as_slice())))
+                });
                 // The share lands at its decision's timestamp, above every stamp handed out
                 // before it (D271), so above this shard's last: a lower bound for
                 // compaction's and flush's GC.
@@ -7940,6 +7949,7 @@ impl ShardState {
                     share.tracked = true;
                     share.commit_ts = floor;
                     share.reads = reads;
+                    share.read_tablets = read_tablets;
                     let bytes = Arc::clone(&share.bytes);
                     let reads = share.reads.clone();
                     self.track_share_rows(bytes.batch(), true);
@@ -9377,6 +9387,18 @@ impl ShardState {
         self.share_seqnos.get(&id).map_or(id, |s| s.0)
     }
 
+    /// The tablets of this shard `reads` route to, sorted and deduplicated (#2050).
+    fn read_tablets<'r>(&self, reads: impl Iterator<Item = (TableId, &'r [u8])>) -> Vec<TabletId> {
+        let mut tablets: Vec<TabletId> = reads
+            .filter_map(|(table, row)| self.tablets.route(table, row))
+            .filter(|(_, shard)| *shard == self.id)
+            .map(|(tablet, _)| tablet)
+            .collect();
+        tablets.sort_unstable();
+        tablets.dedup();
+        tablets
+    }
+
     fn track_share_reads(&mut self, reads: &[u64], add: bool) {
         for h in reads {
             if add {
@@ -9912,6 +9934,7 @@ impl ShardState {
                 reserved: 0,
                 tracked: false,
                 reads: Vec::new(),
+                read_tablets: Vec::new(),
                 participants: req.participants,
                 priority: req.priority,
                 submitted_at: req.submitted_at,

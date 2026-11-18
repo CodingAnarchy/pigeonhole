@@ -1650,11 +1650,14 @@ impl ShardState {
     fn shares_touch_moving(&self) -> Option<bool> {
         let mut touch = None;
         for share in self.prepared.values() {
-            let touches = share.bytes.batch().iter().flatten().any(|mu| {
-                self.tablets
-                    .route(mu.table, mu.row)
-                    .is_some_and(|(t, _)| self.moving.contains(&t))
-            });
+            // Its reads too (#2050): a write to a row it read, admitted on the tablet's new
+            // shard where no hold is, would land below the share's decision.
+            let touches = share.read_tablets.iter().any(|t| self.moving.contains(t))
+                || share.bytes.batch().iter().flatten().any(|mu| {
+                    self.tablets
+                        .route(mu.table, mu.row)
+                        .is_some_and(|(t, _)| self.moving.contains(&t))
+                });
             if touches {
                 if share.external.is_some() {
                     return Some(true);

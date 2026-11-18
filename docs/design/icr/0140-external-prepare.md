@@ -49,7 +49,7 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 - **Close and moves:**
   - A close doesn't wait for external shares; they stay in the WAL.
   - `nothing_in_flight` ignores them.
-  - A tablet change (packing, D217) touching an in-doubt share is given up with `Busy` and retried later. A layout change (shard count) or spill at open with shares in doubt is refused with `Unsupported`.
+  - A tablet change (packing, D217) touching an in-doubt share, a row it writes or reads (#2050), is given up with `Busy` and retried later. A layout change (shard count) or spill at open with shares in doubt is refused with `Unsupported`.
   - A transaction's PREPARE overlapping an in-doubt share fails at once with `Conflict` (any other write, which validates no reads, with `Busy`), rather than waiting on a decision that may take hours.
 - **Visibility:** an undecided share holds neither the visible watermark nor the feed's WRITTEN/SYNCED. Its id is reserved, never held, and its apply seqno is reserved at the decision.
 - **The abort's seqno (E1),** and its four conditions:
