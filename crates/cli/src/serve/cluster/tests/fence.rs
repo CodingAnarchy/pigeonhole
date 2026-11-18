@@ -1257,6 +1257,39 @@ fn in_a_rolling_upgrade_a_node_beside_builds_without_leases_serves_and_still_lap
 }
 
 #[test]
+fn a_peer_reporting_leases_whose_lease_call_answers_unimplemented_counts_as_no_grant() {
+    // audit120's S1 on #2048: a 1.3 node behind a proxy that doesn't route `Cluster.Lease`
+    // answers it `Unimplemented` (an HTTP 404) while its `Status` reports `leases`. It must
+    // count as nothing, not as a 1.2 node's grant: b and c are such nodes, so a, restarted,
+    // has at most its own grant, never a majority, and p1 stays fenced. Routed again, p1
+    // serves.
+    let mut t = Rig::start();
+    super::super::fence::LEASE_UNROUTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend([t.dirs[1].clone(), t.dirs[2].clone()]);
+    t.stop(0);
+    t.restart(0);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        // Past a's start grace, through several rounds.
+        tokio::time::sleep(2 * TEST_LEASE).await;
+        assert_eq!(state(a, "p1").await, LocalPartitionState::Fenced);
+        assert!(try_put(a, "alice", "1").await.is_err());
+    });
+    super::super::fence::LEASE_UNROUTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|d| *d != t.dirs[1] && *d != t.dirs[2]);
+    t.rt.block_on(async {
+        eventually("p1 to serve on a once b and c answer Lease", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+    });
+}
+
+#[test]
 fn a_restarted_node_grants_nothing_in_its_start_grace_and_a_majority_still_serves() {
     // D326: grants live in memory, so a node that starts grants no lease for L·(1+ρ), its
     // own included, and Status says how long is left. In a cluster of three, the other two
