@@ -440,7 +440,7 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 With `--embed-local`, the embedding model runs in the server, and two pools of threads do the work.
 - **The embedder's own pool:** at most 4 threads, placed where the network threads are, off the shards' CPUs. It runs the matrix products, the bulk of the cost.
 - **candle's process-wide pool:** the model runtime (candle 0.11) runs large element-wise steps, those of long texts and batches, on threads of its own. The server can't size or place them once it's running: candle reads two environment variables once, at its first use.
-  - **`CANDLE_NUM_THREADS`** sizes the pool. Unset, it starts one thread per physical core, less one.
+  - **`CANDLE_NUM_THREADS`** sizes the pool, less one. Unset, the size comes from `RAYON_NUM_THREADS`, else on Linux from the CPU count of `CANDLE_CPU_MASK`, else from the physical cores.
   - **`CANDLE_CPU_MASK`** (Linux) places it, given as a CPU list such as `2-7,10`. Unset, its threads run anywhere, the shards' CPUs included.
 
 **What it costs to leave them unset:**
@@ -495,7 +495,7 @@ Serve's own metrics, before the engine's:
 | `pigeonhole_serve_feed_cluster_rejoined_total` | counter | Cluster feed subscriptions that caught up and rejoined their shared merge. |
 | `pigeonhole_serve_feed_cluster_catch_up_waits_total` | counter | Cluster feed subscriptions that fell behind and waited for a `--max-catch-up` slot. |
 | `pigeonhole_serve_feed_hub_failures_total` | counter | Shared subscriptions that failed. Their streams end with the error. |
-| `pigeonhole_serve_embed_env_unset` | gauge | With `--embed-local`: 1 for each of candle's variables (`variable="CANDLE_NUM_THREADS"`, `"CANDLE_CPU_MASK"`) the server started without, as its startup warning says ([Embedding placement](#embedding-placement)). |
+| `pigeonhole_serve_embed_env_unset` | gauge | With `--embed-local`: 1 for each of candle's variables (`variable="CANDLE_NUM_THREADS"`, `"CANDLE_CPU_MASK"`) the server started without, as its startup warning says ([Embedding placement](#embedding-placement)). The mask's is always 0 off Linux, where the mask doesn't apply. |
 | `pigeonhole_serve_bulk_load_phase` | gauge | A `Vectors.BulkLoad`'s phase: 0 none, 1 receiving, 2 writing and rebalancing. |
 | `pigeonhole_serve_bulk_load_vectors`, `pigeonhole_serve_bulk_load_bytes` | gauge | The vectors and message bytes handed to the running load. |
 | `pigeonhole_serve_bulk_load_reserved_bytes` | gauge | What the running load reserved of `--bulk-load-bytes`: its worst case. |

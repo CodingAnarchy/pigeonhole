@@ -72,9 +72,10 @@ impl LoadOptions {
     /// Every call on one embedder queues for this pool, so `threads` bounds the CPU its
     /// matrix products take, however many threads call it. It doesn't bound candle's own
     /// process-wide pool, which runs large element-wise steps (long texts, batches) on threads
-    /// of its own: one per physical core unless the process sets `CANDLE_NUM_THREADS`, and on
-    /// Linux placed only by `CANDLE_CPU_MASK`. The process sets both before it starts (the
-    /// crate docs).
+    /// of its own: as many as `CANDLE_NUM_THREADS` says, else `RAYON_NUM_THREADS`, else on
+    /// Linux the CPUs of `CANDLE_CPU_MASK`, else the physical cores, less one; and on Linux
+    /// placed only by `CANDLE_CPU_MASK`. The process sets them before it starts (the crate
+    /// docs).
     ///
     /// More isn't faster for single texts: on a 16-core x86 server, 32 threads embedded a
     /// 16-token text in 9.4 ms against 6.4 ms on 4. Keep about 4 for interactive use.

@@ -174,6 +174,27 @@ fn a_quiet_stream_still_moves_its_token() {
 
 // ---- `--embed-local`'s startup warning (#1345 PR 2, #2061) ----
 
+/// The gauge (#2061, audit120's nit on #2064): one line per variable, 1 for each unset, and
+/// nothing at all without `--embed-local` (the on bit clear).
+#[test]
+fn embed_env_unset_renders_per_variable_only_with_embed_local() {
+    let render = |bits| {
+        let mut out = String::new();
+        super::service::render_candle(&mut out, bits);
+        out
+    };
+    assert_eq!(render(0), "");
+    assert_eq!(render(0x01), "", "no on bit: nothing, whatever the rest");
+    assert_eq!(
+        render(0x81),
+        "# TYPE pigeonhole_serve_embed_env_unset gauge\n\
+         pigeonhole_serve_embed_env_unset{variable=\"CANDLE_NUM_THREADS\"} 1\n\
+         pigeonhole_serve_embed_env_unset{variable=\"CANDLE_CPU_MASK\"} 0\n"
+    );
+    assert!(render(0x80).contains("{variable=\"CANDLE_NUM_THREADS\"} 0"));
+    assert!(render(0x83).contains("{variable=\"CANDLE_CPU_MASK\"} 1"));
+}
+
 /// While either of candle's variables is unset, the warning names only the unset ones: the
 /// embedder's thread count for `CANDLE_NUM_THREADS`, and on Linux the given CPU list for
 /// `CANDLE_CPU_MASK` (cli692's N1 and N2 on #1671). `RAYON_NUM_THREADS` alone places nothing,
@@ -223,6 +244,15 @@ fn embed_local_warns_with_the_export_line_until_both_are_set() {
         warn(&["CANDLE_CPU_MASK", "CANDLE_NUM_THREADS"]),
         (None, 0x80)
     );
+    // No CPU list to offer: the mask is still named, never an empty `export`.
+    if linux {
+        let (line, _) = super::candle_warning(None, 4, &env(&["CANDLE_NUM_THREADS"]));
+        let line = line.expect("mask unset: a warning");
+        assert!(
+            line.ends_with("export CANDLE_CPU_MASK=<the CPUs to run it on>"),
+            "{line}"
+        );
+    }
     assert_eq!(super::embed_threads(0), 1);
     assert_eq!(super::embed_threads(3), 3);
     assert_eq!(super::embed_threads(30), 4);

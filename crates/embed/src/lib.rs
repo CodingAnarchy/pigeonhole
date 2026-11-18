@@ -56,8 +56,9 @@
 //!   the application's global rayon pool, every call queues for it, and
 //!   [`LoadOptions::on_thread_start`] can place its threads.
 //! - **candle's process-wide pool** for large element-wise steps (64K elements and up: long
-//!   texts, or batches). It's started on first use with `CANDLE_NUM_THREADS` threads (by
-//!   default one per physical core, less one), which spin briefly before parking. On Linux,
+//!   texts, or batches). It's started on first use with `CANDLE_NUM_THREADS` threads, less
+//!   one (unset: `RAYON_NUM_THREADS`, else on Linux the CPUs of `CANDLE_CPU_MASK`, else the
+//!   physical cores), which spin briefly before parking. On Linux,
 //!   `CANDLE_CPU_MASK` (a CPU list, such as `16-31`) pins them. Set both in the process's
 //!   environment before it starts (they're read once, and a library can't set them safely).
 //!   [`LoadOptions::threads`] doesn't bound this pool, and `on_thread_start` doesn't place

@@ -284,10 +284,11 @@ const CANDLE_VARS: [&str; 2] = ["CANDLE_NUM_THREADS", "CANDLE_CPU_MASK"];
 /// With `--embed-local`: a warning naming the line to export, and [`CANDLE_UNSET`]'s bits, while
 /// either of candle's variables is unset; `None` (and only the on bit) once both are. candle
 /// runs large element-wise steps on a process-wide pool of its own, which
-/// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_NUM_THREADS` sizes it (one thread per
-/// core by default) and `CANDLE_CPU_MASK` places it (Linux). Unset, its threads can run on the
-/// shards' CPUs. Unsized, the mask alone crowds a thread per core onto the masked CPUs
-/// (cli692's N2 on #1671), so its size is the embedder's own, `threads` (N1). Without the mask
+/// `LoadOptions::on_thread_start` doesn't reach: `CANDLE_NUM_THREADS` sizes it, less one (unset:
+/// `RAYON_NUM_THREADS`, else on Linux the mask's CPU count, else the physical cores), and
+/// `CANDLE_CPU_MASK` places it (Linux). Unset, its threads can run on the shards' CPUs.
+/// Unsized, the mask alone gives it a thread per masked CPU, more than the embedder's own
+/// (cli692's N2 on #1671), so its size is the embedder's, `threads` (N1). Without the mask
 /// or `RAYON_NUM_THREADS`, candle 0.11 also re-reads `/proc/cpuinfo` on every matrix product
 /// (huggingface/candle#4070). They're read once, from the environment, and setting them here
 /// would need `unsafe` (D318), so the operator exports them before the start. `cpus` is the
@@ -307,9 +308,9 @@ fn candle_warning(
     }
     if cfg!(target_os = "linux") && env(CANDLE_VARS[1]).is_none() {
         bits |= 2;
-        if let Some(cpus) = cpus {
-            missing.push(format!("{}={cpus}", CANDLE_VARS[1]));
-        }
+        // With no CPU list to offer (the affinity unreadable), the line still names it.
+        let cpus = cpus.unwrap_or_else(|| "<the CPUs to run it on>".to_owned());
+        missing.push(format!("{}={cpus}", CANDLE_VARS[1]));
     }
     if bits == 0x80 {
         return (None, bits);
