@@ -37,6 +37,7 @@ fn writer_part(term: u64) -> LeasePart {
         partition: super::lease::WRITER_LEASE.to_owned(),
         epoch: 0,
         term,
+        ..LeasePart::default()
     }
 }
 
@@ -205,24 +206,24 @@ impl Node {
         // that answered.
         let mut live_smaller = 0u32;
         let mut top_term = self.grants.term_floor(&map);
-        for n in map.nodes.iter().filter(|n| n.id != self.id) {
-            let asked = tokio::time::timeout(self.peers.push_timeout, async {
-                let mut c = self.client(&n.address).await?;
-                c.status(self.request(StatusRequest {})?)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(|s| s.message().to_owned())
-            })
-            .await;
-            let Ok(Ok(st)) = asked else { continue };
+        for (id, st) in self.survey(&map).await {
+            let Some(st) = st else { continue };
             if st.writer_lease_remaining_ms > 0 {
                 *self.elect_since() = None;
                 return;
             }
             top_term = top_term.max(st.writer_term);
-            if n.id < self.id && n.id != schema::writer(&map) {
+            if id < self.id && id != schema::writer(&map) {
                 live_smaller += 1;
             }
+        }
+        // The survey took time: the election is still due by this node's own state now
+        // (simp724's (a)), or it waits for the next tick.
+        let still = self.get_map().is_ok_and(|m| !map::newer(&m, &map))
+            && self.grants.writer_lapsed() >= margin;
+        if !still {
+            *self.elect_since() = None;
+            return;
         }
         // Each smaller live id gets a margin to go first.
         let now = tokio::time::Instant::now();
@@ -236,6 +237,69 @@ impl Node {
                 top_term + 1
             );
         }
+    }
+
+    /// Every other node's `Status`, asked at once under one deadline (simp724's S1 on the D330
+    /// PR 2 plan): the push timeout, but at most a sixth of the lease, so one black-holed
+    /// node can't hold a survey, or the duties after it, for long. `None` for a node that
+    /// didn't answer in time.
+    pub(crate) async fn survey(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+    ) -> Vec<(String, Option<super::proto::NodeStatus>)> {
+        let deadline = self.peers.push_timeout.min(self.grants.lease() / 6);
+        let mut asks = tokio::task::JoinSet::new();
+        for n in map.nodes.iter().filter(|n| n.id != self.id) {
+            let (node, id, address) = (Arc::clone(self), n.id.clone(), n.address.clone());
+            asks.spawn(async move {
+                let st = tokio::time::timeout(deadline, async {
+                    let mut c = node.client(&address).await?;
+                    c.status(node.request(StatusRequest {})?)
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(|s| s.message().to_owned())
+                })
+                .await;
+                (id, st.ok().and_then(Result::ok))
+            });
+        }
+        asks.join_all().await
+    }
+
+    /// Runs the writer's duties after a lease round (an election if one is due, then the
+    /// failovers, D330), off the round's own task: a slow peer delays them, never this node's
+    /// renewals (simp724's S1 on the PR 2 plan). One run at a time; a tick that finds one
+    /// running leaves it.
+    pub(crate) fn spawn_duties(self: &Arc<Self>) {
+        if self.duties.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        /// Clears `duties` however the task ends, a panic included (simp724's (b)): a flag
+        /// left set would stop the duties for good.
+        struct Claimed(std::sync::Weak<Node>);
+        impl Drop for Claimed {
+            fn drop(&mut self) {
+                if let Some(node) = self.0.upgrade() {
+                    node.duties
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        let claimed = Claimed(Arc::downgrade(self));
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // The node only while a step runs, as the lease rounds hold it: one dropped (closed)
+        // meanwhile ends the duties.
+        rt.spawn(async move {
+            if let Some(node) = claimed.0.upgrade() {
+                node.maybe_elect().await;
+            }
+            if let Some(node) = claimed.0.upgrade() {
+                node.maybe_fail_over().await;
+            }
+            drop(claimed);
+        });
     }
 
     fn elect_since(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
@@ -334,11 +398,24 @@ impl Node {
                 newest.map_version
             ));
         }
-        // 3. That map at this term, naming this node.
+        // 3. That map at this term, naming this node, with the election recorded (D330 §6).
         let mut elected = newest.clone();
         elected.writer = self.id.clone();
         elected.writer_term = term;
         elected.map_version = newest.map_version + 1;
+        let mut event = super::proto::FailoverEvent {
+            from: schema::writer(&newest).to_owned(),
+            to: self.id.clone(),
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            writer: self.id.clone(),
+            writer_term: term,
+            ..Default::default()
+        };
+        event.set_kind(super::proto::FailoverKind::Writer);
+        event.set_state(super::proto::FailoverState::Done);
+        super::promote::push_event(&mut elected, event);
         if self.grants.clock().now() >= end {
             return Err("the vote's lease ran out before the map was written".to_owned());
         }
@@ -490,6 +567,7 @@ mod model {
             partition: WRITER_LEASE.into(),
             epoch: 0,
             term,
+            ..LeasePart::default()
         }
     }
 

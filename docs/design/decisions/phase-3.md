@@ -5068,7 +5068,7 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 
 **PRs:**
 1. The writer lease and terms, with elections behind `failover`. Its plan is `.coord/cli692-d330-pr1-plan.md`, with simp724's amendment.
-2. Partition failover, with its events, metrics and per-partition mode.
+2. Partition failover, with its events, metrics and per-partition mode. Its plan is `.coord/cli692-d330-pr2-plan.md`, with simp724's review (Amendment 1: finish-only resume, epochs above every pending promote's, the writer's survey asking each node's grants) and the fix for #2056's election stall (Amendment 2). ICR 0117's D330 PR 2 section.
 3. The guide.
 
 <a id="d332"></a>

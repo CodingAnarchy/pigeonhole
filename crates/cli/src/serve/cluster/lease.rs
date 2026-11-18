@@ -92,6 +92,21 @@ struct Grant {
     until: u64,
 }
 
+/// What a node last granted of one partition (D330 PR 2), kept past the grant's end: the
+/// writer counts a partition's downtime from `until`, and names the in-doubt shares its
+/// owner last reported when it fails the partition over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LastGrant {
+    /// The node it was granted to, and at what epoch.
+    pub(crate) holder: String,
+    pub(crate) epoch: u64,
+    /// When the grant ends, on this node's lease clock.
+    pub(crate) until: u64,
+    /// The in-doubt xids and their count the holder sent with the request (F7).
+    pub(crate) in_doubt_xids: Vec<String>,
+    pub(crate) in_doubt_count: u64,
+}
+
 /// A node's grants: the leases it promised, by holder (itself included).
 #[derive(Debug)]
 pub(crate) struct Grants {
@@ -110,6 +125,9 @@ pub(crate) struct Grants {
     /// When the last writer lease granted here ends, on this node's clock: the start
     /// grace's end before any. How long the writer has gone without one is counted from it.
     writer_until: Mutex<u64>,
+    /// Each partition's last grant here (D330 PR 2), by partition id: never dropped when it
+    /// ends, only replaced by the next. Locked after `by_holder`, never before.
+    last: Mutex<BTreeMap<String, LastGrant>>,
 }
 
 impl Grants {
@@ -124,6 +142,7 @@ impl Grants {
             by_holder: Mutex::new(BTreeMap::new()),
             voted: Mutex::new(0),
             writer_until: Mutex::new(started.saturating_add(nanos(grace(lease)))),
+            last: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -131,6 +150,37 @@ impl Grants {
     pub(crate) fn with_voted(self, term: u64) -> Self {
         *self.voted.lock().unwrap_or_else(PoisonError::into_inner) = term;
         self
+    }
+
+    /// Every partition lease granted here that still runs, to whom, and for how long
+    /// (`NodeStatus.grants`, D330 PR 2): the writer asks before it fails a partition over.
+    /// Not the writer lease.
+    pub(crate) fn granted(&self) -> Vec<LeaseWithheld> {
+        let now = self.clock.now();
+        let by = self
+            .by_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut out = Vec::new();
+        for (holder, g) in by.iter().filter(|(_, g)| g.until > now) {
+            for partition in g.parts.keys().filter(|p| *p != WRITER_LEASE) {
+                out.push(LeaseWithheld {
+                    partition: partition.clone(),
+                    holder: holder.clone(),
+                    remaining_ms: millis(g.until - now).max(1),
+                });
+            }
+        }
+        out
+    }
+
+    /// Partition `id`'s last grant here, ended or not (D330 PR 2).
+    pub(crate) fn last_grant(&self, id: &str) -> Option<LastGrant> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
 
     /// The highest writer term this node voted for (0: none).
@@ -265,10 +315,14 @@ impl Grants {
         }
         let mut parts = BTreeMap::new();
         let voted = self.voted();
+        let until = now.saturating_add(nanos(self.lease));
+        let mut last = Vec::new();
         for LeasePart {
             partition,
             epoch,
             term,
+            in_doubt_xids,
+            in_doubt_count,
         } in &req.parts
         {
             let given = if partition == WRITER_LEASE {
@@ -315,9 +369,27 @@ impl Grants {
                 partition: partition.clone(),
                 epoch: *epoch,
                 term: *term,
+                ..LeasePart::default()
             });
+            if partition != WRITER_LEASE {
+                last.push((
+                    partition.clone(),
+                    LastGrant {
+                        holder: req.node_id.clone(),
+                        epoch: *epoch,
+                        until,
+                        in_doubt_xids: in_doubt_xids.clone(),
+                        in_doubt_count: *in_doubt_count,
+                    },
+                ));
+            }
         }
-        let until = now.saturating_add(nanos(self.lease));
+        if !last.is_empty() {
+            self.last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(last);
+        }
         if parts.contains_key(WRITER_LEASE) {
             self.writer_granted(until);
         }
@@ -460,6 +532,7 @@ impl Grants {
             partition,
             epoch,
             term,
+            ..
         } in &req.parts
         {
             // The writer lease is keyed by its term (D330).
@@ -521,6 +594,7 @@ mod tests {
                     partition: (*p).into(),
                     epoch: *e,
                     term: 0,
+                    ..LeasePart::default()
                 })
                 .collect(),
         }
@@ -701,6 +775,7 @@ mod tests {
                     partition: (*p).into(),
                     epoch: *e,
                     term: 0,
+                    ..LeasePart::default()
                 })
                 .collect(),
             start,
@@ -778,6 +853,7 @@ mod tests {
                 partition: WRITER_LEASE.into(),
                 epoch: 0,
                 term,
+                ..LeasePart::default()
             }],
             ..ask(node, version, round, &[])
         }
@@ -924,6 +1000,7 @@ mod tests {
                 partition: WRITER_LEASE.into(),
                 epoch: 0,
                 term: 1,
+                ..LeasePart::default()
             }],
             ..release("a", 1, 2, &[])
         };
