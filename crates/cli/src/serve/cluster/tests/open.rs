@@ -354,6 +354,9 @@ fn opened_off_the_others_cores_alone() {
         }],
         indexes: Vec::new(),
         memory: None,
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -674,6 +677,9 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         indexes: Vec::new(),
         memory: None,
         previous_nodes: Vec::new(),
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     // One 1-shard partition: 64 MiB of memtables and 448 MiB of caches.
@@ -804,6 +810,9 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
             partitions: vec!["p1".into()],
             created: 0,
         }],
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     const BUDGET: u64 = 4 << 20;
@@ -1324,6 +1333,9 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
         previous_nodes: Vec::new(),
         indexes: Vec::new(),
         memory: None,
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let p1 = test_partition_with(&dir, "p1", pigeonhole::Options::default().shards(1));
