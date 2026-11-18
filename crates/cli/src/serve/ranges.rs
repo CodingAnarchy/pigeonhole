@@ -193,6 +193,65 @@ pub(crate) fn mark_fence(db: &Pigeonhole, id: &str) -> Result<u64, String> {
     Ok(before)
 }
 
+/// The clip marker's row (D331 PR 3): a restore's stamp leaves it in a restored file, and
+/// the file's open clips it to the map's ranges before it serves, then removes it. Left
+/// there by a clip that stopped, so the next open runs it again (cli692's F5).
+const CLIP: &[u8] = b"clip";
+
+/// Leaves the clip marker in `db` (a restore's stamp).
+pub(crate) fn mark_clip(db: &Pigeonhole) -> Result<(), String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    t.mutate(CLIP)
+        .put(FAMILY, b"at", db.visible_seqno().to_string().as_bytes())
+        .commit()
+        .map(|_| ())
+        .map_err(|e| format!("mark the restored file for its clip: {e}"))
+}
+
+/// Whether `db` holds the clip marker.
+pub(crate) fn clip_pending(db: &Pigeonhole) -> Result<bool, String> {
+    let t = match db.table(identity::TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(false),
+        Err(e) => return Err(format!("read {}: {e}", identity::TABLE)),
+    };
+    if !t.families().contains(&FAMILY) {
+        return Ok(false);
+    }
+    t.get(CLIP, FAMILY, b"at")
+        .map(|c| c.is_some())
+        .map_err(|e| format!("read the clip marker: {e}"))
+}
+
+/// Removes the clip marker from `db`, once the clip is done.
+pub(crate) fn clear_clip(db: &Pigeonhole) -> Result<(), String> {
+    delete_row(db, CLIP)
+}
+
+/// Replaces moved-away row `old` in `db` with the pieces `pieces` of its range (a restore's
+/// map gives the partition the rest), each as row `<id>~<n>`; none: just deleted.
+pub(crate) fn rewrite_moved(db: &Pigeonhole, old: &Moved, pieces: &[Moved]) -> Result<(), String> {
+    for p in pieces {
+        write_row(db, PREFIX, p)?;
+    }
+    delete_row(db, &[PREFIX, old.id.as_bytes()].concat())
+}
+
+fn delete_row(db: &Pigeonhole, row: &[u8]) -> Result<(), String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    t.mutate(row)
+        .delete_row()
+        .commit()
+        .map(|_| ())
+        .map_err(|e| format!("delete {}: {e}", String::from_utf8_lossy(row)))
+}
+
 /// What a span refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rule {
@@ -606,10 +665,10 @@ fn derive(
 }
 
 /// A key range, `[start, end)`; `end` `None`: to the table's end.
-type KeyRange = (Vec<u8>, Option<Vec<u8>>);
+pub(crate) type KeyRange = (Vec<u8>, Option<Vec<u8>>);
 
 /// `a` and `b`'s overlap, if they overlap.
-fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
+pub(crate) fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
     let start = a.0.clone().max(b.0.clone());
     let end = match (&a.1, &b.1) {
         (None, e) | (e, None) => e.clone(),
@@ -621,7 +680,7 @@ fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
 }
 
 /// What's left of `a` once `b` is taken out: none, one or two ranges.
-fn subtract(a: &KeyRange, b: &KeyRange) -> Vec<KeyRange> {
+pub(crate) fn subtract(a: &KeyRange, b: &KeyRange) -> Vec<KeyRange> {
     let Some(both) = intersect(a, b) else {
         return vec![a.clone()];
     };

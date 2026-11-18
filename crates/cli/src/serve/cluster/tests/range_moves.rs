@@ -295,3 +295,77 @@ fn an_opening_source_fences_a_handing_over_range() {
     assert_eq!(state.check(&put, true).unwrap_err().code, "Fenced");
     let _ = db.close();
 }
+
+/// D331 PR 3 (design §6): a restored file is clipped to its map's ranges. Rows outside the
+/// partition's ranges go, moved-away rows the map gives back are cut to the rest, the
+/// timestamp floor covers what it kept, and a rerun finds it done (cli692's F5).
+#[test]
+fn a_restored_file_is_clipped_to_the_maps_ranges_and_a_rerun_finds_it_done() {
+    use pigeonhole::Family;
+    let ports = [7001, 7002, 7003];
+    let dir = test_dir();
+    // The restored map: `users` split at "m", p1 holding `[.., m)`.
+    let map = the_map(1, &ports);
+    let db = pigeonhole::Pigeonhole::open(
+        dir.join("p1.phdb"),
+        pigeonhole::Options::default().shards(1),
+    )
+    .unwrap();
+    let t = db
+        .table("users")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    for row in ["alice", "dave", "mike", "zed"] {
+        t.mutate(row.as_bytes())
+            .put("f", b"q", row.as_bytes())
+            .commit()
+            .unwrap();
+    }
+    // An older move took `[c, f)` away; this map gives p1 `[.., m)`, so `[c, f)` is home.
+    crate::serve::ranges::write_moved(
+        &db,
+        &crate::serve::ranges::Moved {
+            id: "mv0".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"q".to_vec()),
+            term: 0,
+            version: 3,
+            seqno: 1,
+            at_ms: 0,
+        },
+    )
+    .unwrap();
+    crate::serve::ranges::mark_clip(&db).unwrap();
+    assert!(crate::serve::ranges::clip_pending(&db).unwrap());
+    let c = super::super::moves::clip_restored(&db, &map, "p1").unwrap();
+    assert_eq!((c.deleted, c.held), (2, 0), "{c:?}");
+    assert!(c.newest_ts > 0);
+    let keys: Vec<Vec<u8>> = t
+        .scan_bounds(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .iter()
+        .unwrap()
+        .map(|r| r.unwrap().key().to_vec())
+        .collect();
+    assert_eq!(keys, [b"alice".to_vec(), b"dave".to_vec()]);
+    // The moved-away row keeps only `[m, q)`, the part the map doesn't give p1.
+    let moved = crate::serve::ranges::read_moved(&db).unwrap();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(
+        (
+            moved[0].id.as_str(),
+            moved[0].start.as_slice(),
+            moved[0].end.as_deref()
+        ),
+        ("mv0~0", &b"m"[..], Some(&b"q"[..]))
+    );
+    assert!(!crate::serve::ranges::clip_pending(&db).unwrap());
+    // A rerun (a clip that stopped before its marker went) finds nothing to do.
+    crate::serve::ranges::mark_clip(&db).unwrap();
+    let again = super::super::moves::clip_restored(&db, &map, "p1").unwrap();
+    assert_eq!((again.deleted, again.held), (0, 0));
+    assert_eq!(crate::serve::ranges::read_moved(&db).unwrap(), moved);
+    let _ = db.close();
+}
