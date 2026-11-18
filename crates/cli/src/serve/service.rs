@@ -7,6 +7,7 @@
 //! or fails as it would have, and a lost reply is logged and counted.
 
 use std::collections::HashMap;
+use std::ops::{Bound, ControlFlow};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -529,6 +530,80 @@ impl ServiceOp {
     pub(crate) fn writes(&self) -> bool {
         self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
     }
+
+    /// Calls `f` with each (table, key) the call names, in request order, until `f` returns
+    /// `Break` (D331's range gates, D332's sampled read keys). The point reads report their
+    /// rows; a scan its range; the writes (`Mutate`, `MutateReturning`, `CheckAndMutate`,
+    /// `Batch`) and a transaction's reads, writes and commit their rows, a row named twice
+    /// twice. A write naming no row reports nothing: it's refused on its way in. A resumed
+    /// scan reports its whole range, not the rest after `after`. Every other call (the
+    /// schema, maintenance, a feed, the vector, text, graph and memory calls) never calls
+    /// `f`: their rows aren't in the request.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "read by D331's range gates and D332's load sample"
+        )
+    )]
+    pub(crate) fn touches(
+        &self,
+        f: &mut dyn FnMut(&str, Touch<'_>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let mut rows = |rows: &[proto::RowWrites]| {
+            for k in rows.iter().filter_map(|r| r.row.as_ref()) {
+                f(&k.table, Touch::Row(&k.row))?;
+            }
+            ControlFlow::Continue(())
+        };
+        match self {
+            Self::Get(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::ReadRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::TxnGet(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::TxnGetRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::MultiGet(r) => {
+                for k in &r.keys {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Scan(r) => {
+                use proto::key_range::Range;
+                let touch = match r.range.as_ref().and_then(|k| k.range.as_ref()) {
+                    Some(Range::Prefix(p)) => Touch::Prefix(p),
+                    Some(Range::Bounds(b)) => Touch::Range {
+                        start: convert::bound(b.start.as_ref()),
+                        end: convert::bound(b.end.as_ref()),
+                    },
+                    None => Touch::Range {
+                        start: Bound::Unbounded,
+                        end: Bound::Unbounded,
+                    },
+                };
+                f(&r.table, touch)
+            }
+            Self::Mutate(r) | Self::MutateReturning(r) => rows(r.writes.as_slice()),
+            Self::CheckAndMutate(r) => rows(r.writes.as_slice()),
+            Self::Batch(r) => rows(&r.rows),
+            Self::TxnWrite(r) => rows(&r.rows),
+            Self::Commit(r) => rows(&r.rows),
+            _ => ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// A key a call names ([`ServiceOp::touches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Touch<'a> {
+    /// One row.
+    Row(&'a [u8]),
+    /// The rows within these bounds, as the scan's request gives them.
+    Range {
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
+    },
+    /// Every row starting with these bytes.
+    Prefix(&'a [u8]),
 }
 
 /// `Data.Scan`'s index in `RPCS`: its outcome is counted when its stream ends.
@@ -5417,5 +5492,192 @@ mod text_part_tests {
             .unwrap();
         assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
         filled(&index, "x").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod touches_tests {
+    use std::ops::{Bound, ControlFlow};
+
+    use super::{ServiceOp, Touch, proto};
+
+    /// What `op.touches` reports, owned, stopping after `limit` keys.
+    fn touched(op: &ServiceOp, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let _ = op.touches(&mut |table: &str, touch: Touch<'_>| {
+            let show = |b: Bound<&[u8]>| match b {
+                Bound::Included(k) => format!("[{}", String::from_utf8_lossy(k)),
+                Bound::Excluded(k) => format!("({}", String::from_utf8_lossy(k)),
+                Bound::Unbounded => "*".to_owned(),
+            };
+            let key = match touch {
+                Touch::Row(k) => String::from_utf8_lossy(k).into_owned(),
+                Touch::Prefix(p) => format!("{}…", String::from_utf8_lossy(p)),
+                Touch::Range { start, end } => format!("{}..{}", show(start), show(end)),
+            };
+            out.push((table.to_owned(), key));
+            if out.len() == limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        out
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|&(t, k)| (t.to_owned(), k.to_owned()))
+            .collect()
+    }
+
+    fn row(table: &str, row: &'static str) -> proto::RowWrites {
+        proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: table.into(),
+                row: row.into(),
+            }),
+            writes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn point_reads_report_their_rows_in_request_order() {
+        let get = ServiceOp::Get(proto::GetRequest {
+            table: "t".into(),
+            row: "a".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&get, usize::MAX), pairs(&[("t", "a")]));
+        let multi = ServiceOp::MultiGet(proto::MultiGetRequest {
+            table: "t".into(),
+            keys: vec!["c".into(), "a".into(), "c".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&multi, usize::MAX),
+            pairs(&[("t", "c"), ("t", "a"), ("t", "c")])
+        );
+        let txn = ServiceOp::TxnGetRow(proto::TxnGetRowRequest {
+            table: "u".into(),
+            row: "r".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&txn, usize::MAX), pairs(&[("u", "r")]));
+    }
+
+    #[test]
+    fn a_scan_reports_its_range_as_given() {
+        use proto::key_range::Range;
+        let scan = |range| {
+            ServiceOp::Scan(proto::ScanRequest {
+                table: "t".into(),
+                range,
+                ..Default::default()
+            })
+        };
+        let prefix = scan(Some(proto::KeyRange {
+            range: Some(Range::Prefix("ab".into())),
+        }));
+        assert_eq!(touched(&prefix, usize::MAX), pairs(&[("t", "ab…")]));
+        let bounds = scan(Some(proto::KeyRange {
+            range: Some(Range::Bounds(proto::Bounds {
+                start: Some(proto::Bound {
+                    key: "b".into(),
+                    inclusive: false,
+                }),
+                end: Some(proto::Bound {
+                    key: "m".into(),
+                    inclusive: true,
+                }),
+            })),
+        }));
+        assert_eq!(touched(&bounds, usize::MAX), pairs(&[("t", "(b..[m")]));
+        let open_end = scan(Some(proto::KeyRange {
+            range: Some(Range::Bounds(proto::Bounds {
+                start: Some(proto::Bound {
+                    key: "b".into(),
+                    inclusive: true,
+                }),
+                end: None,
+            })),
+        }));
+        assert_eq!(touched(&open_end, usize::MAX), pairs(&[("t", "[b..*")]));
+        assert_eq!(touched(&scan(None), usize::MAX), pairs(&[("t", "*..*")]));
+    }
+
+    #[test]
+    fn writes_report_each_row_with_its_own_table() {
+        let batch = ServiceOp::Batch(proto::BatchRequest {
+            rows: vec![
+                row("t", "a"),
+                proto::RowWrites::default(),
+                row("u", "b"),
+                row("t", "a"),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&batch, usize::MAX),
+            pairs(&[("t", "a"), ("u", "b"), ("t", "a")])
+        );
+        let mutate = ServiceOp::MutateReturning(proto::MutateRequest {
+            writes: Some(row("t", "x")),
+            ..Default::default()
+        });
+        assert_eq!(touched(&mutate, usize::MAX), pairs(&[("t", "x")]));
+        let no_row = ServiceOp::Mutate(proto::MutateRequest::default());
+        assert!(touched(&no_row, usize::MAX).is_empty());
+        let check = ServiceOp::CheckAndMutate(proto::CheckAndMutateRequest {
+            writes: Some(row("t", "y")),
+            ..Default::default()
+        });
+        assert_eq!(touched(&check, usize::MAX), pairs(&[("t", "y")]));
+        let write = ServiceOp::TxnWrite(proto::TxnWriteRequest {
+            rows: vec![row("t", "p")],
+            ..Default::default()
+        });
+        assert_eq!(touched(&write, usize::MAX), pairs(&[("t", "p")]));
+        let commit = ServiceOp::Commit(proto::TxnCommitRequest {
+            rows: vec![row("u", "q"), row("t", "p")],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&commit, usize::MAX),
+            pairs(&[("u", "q"), ("t", "p")])
+        );
+    }
+
+    #[test]
+    fn break_stops_the_walk() {
+        let batch = ServiceOp::Batch(proto::BatchRequest {
+            rows: vec![row("t", "a"), row("t", "b"), row("t", "c")],
+            ..Default::default()
+        });
+        assert_eq!(touched(&batch, 1), pairs(&[("t", "a")]));
+        assert_eq!(
+            batch.touches(&mut |_, _| ControlFlow::Break(())),
+            ControlFlow::Break(())
+        );
+        assert_eq!(
+            batch.touches(&mut |_, _| ControlFlow::Continue(())),
+            ControlFlow::Continue(())
+        );
+    }
+
+    #[test]
+    fn calls_without_rows_in_the_request_report_nothing() {
+        for op in [
+            ServiceOp::Info(proto::Empty::default()),
+            ServiceOp::Begin(proto::BeginRequest::default()),
+            ServiceOp::Traverse(proto::TraverseRequest {
+                table: "t".into(),
+                seeds: vec!["a".into()],
+                ..Default::default()
+            }),
+            ServiceOp::Abort(proto::TxnAbortRequest::default()),
+        ] {
+            assert!(touched(&op, usize::MAX).is_empty(), "{op:?}");
+        }
     }
 }
