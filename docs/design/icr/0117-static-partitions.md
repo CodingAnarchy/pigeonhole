@@ -644,3 +644,56 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **Not in 1.3.0:** making the old owner a replica automatically (the owner's #1484 call: the operator rejoins it).
 - **`Admin.Promote` on a cluster node** answers `FailedPrecondition`, naming `phdb cluster promote`.
 - **S4, now done for you:** `move`, `relocate` and `restore --partition` with `--to` a node in `P.replicas` first set a map without it there, and wait for it to close its copy. The set installed replaces the copy's file, which goes aside. The node still refuses `Stamp` while a copy of P is open, as the safety net.
+
+## D330 PR 1: the map's writer under a lease, with terms (1.3.0, #1484)
+**The map's writer holds a lease as a partition's owner does, and maps are ordered by a writer term.** With failover on, a node is elected in a down writer's place. Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ClusterMap.writer = 9`, `.writer_term = 10`: the writer the map names, and the term it was elected or forced at. A map names a writer from term 1 on, and only then. At term 0 the writer is the smallest id, as before.
+- `ClusterMap.failover = 11`: off by default (the owner's Q1). Turned on with `set-map`. Off, no node elects a writer.
+- `LeasePart.term = 3`: the writer lease's term (`partition` `__writer`, `epoch` 0).
+- `LeaseRequest.writer_term = 8`: the asking node's map term.
+- `LeaseResponse.writer_term = 5`: the grantor's highest term, on an answer to a vote.
+- `NodeStatus.writer = 8`, `.writer_term = 9`, `.writer_lease_remaining_ms = 10`.
+  - `writer_term` is the node's highest term: its map's, or one it voted for.
+  - `writer_lease_remaining_ms` is, on the writer, its own lease; elsewhere, the node's grant of it to the writer.
+- **Map feature `writer_terms`:** `writer`, `writer_term` and `failover` go into a map only once every node reports it.
+
+**Flag:** `phdb serve --cluster-failover-after-ms` (default 0, which means 2 × `--cluster-lease-ms`): the failover margin.
+
+**Ordering:** maps are ordered by `(writer_term, map_version)`.
+- A node takes a map with a higher term, whatever its version, and refuses one with a lower term.
+- An equal pair with other contents is divergent. An equal pair with the same contents is a no-op install.
+- A lease round orders peers' maps the same way. So does a grantor, for its version check and `newer_map_version`.
+
+**The writer lease:**
+- `__writer` is a reserved partition id. The writer asks for it in its lease rounds at the map's term.
+- A grantor grants it to the node its map names as writer, at the map's term, unless it voted for a higher one. It withholds it from any other node as it withholds a partition.
+- From term 1, `SetMap` needs it, checked before the install and again before the push. At term 0 it doesn't, so a cluster whose older nodes don't grant it can still change its map.
+- A plain `SetMap` keeps the current map's `writer` and `writer_term`, whatever the request says.
+- A node that installs a map naming another writer releases its writer lease to every node (`Cluster.Release`, keyed by the term).
+
+**The term fence:**
+- A node refuses any map below the highest term it voted for: on a push, a set, a forced set or a round's catch-up.
+- The vote is synced to `cluster-writer-term` in the node's cluster directory before it's answered, so the fence survives a restart.
+
+**An election** runs only while the map has `failover` on. It starts on a node once:
+- its grant of the writer lease has been out for the failover margin;
+- every node it reaches reports no writer lease;
+- each smaller live id (one that answered) has had a margin to go first.
+
+Its steps:
+1. **A vote:** `Cluster.Lease` with the writer lease alone, at one above every term it has seen. A grantor grants it, whatever the request's map version, when:
+   - its start grace is over;
+   - no other node's writer lease runs there;
+   - the term is above its map's and above any term it has voted for.
+
+   The grantor records the term, then answers. The vote joins the candidate's grant there rather than replacing it.
+2. **The newest map** by `(term, version)` that the voting majority holds.
+3. **That map** at the new term, naming the candidate, at the next version. It's pushed until a majority holds it, while the vote's lease runs.
+
+**`set-map --force`:** once every reachable node keeps `writer_terms`, the forced map takes a term above every one they know (simp724's S2), naming its writer: the map's `writer` if set, else the smallest id. It must be reachable. A node that knows a higher term refuses it. If a node knows a term but runs a build without terms, the force is refused.
+
+**`phdb cluster status`** adds `writer`, `writer_term`, `writer_lease_remaining_ms` (the writer's own) and `failover`.
+
+**Not yet:** partition failover, its events and metrics (D330 PR 2), and the guide's failure model and timeline (PR 3).

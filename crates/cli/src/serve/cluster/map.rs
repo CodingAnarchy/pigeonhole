@@ -70,11 +70,32 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
             ));
         }
     }
+    // D330: a named writer is one of the map's nodes, and only an elected map (term 1 on)
+    // names one.
+    if (map.writer_term == 0) != map.writer.is_empty() {
+        return Err(format!(
+            "writer {:?} at writer_term {}: a map names its writer from term 1 on, and only \
+             then",
+            map.writer, map.writer_term
+        ));
+    }
+    if !map.writer.is_empty() && !nodes.contains(map.writer.as_str()) {
+        return Err(format!(
+            "the map's writer {:?} isn't one of its nodes",
+            map.writer
+        ));
+    }
     let mut partitions = HashMap::new();
     for p in &map.partitions {
         if !id_ok(&p.id) {
             return Err(format!(
                 "partition id {:?} must be 1-64 of [a-z0-9_-]",
+                p.id
+            ));
+        }
+        if p.id == super::lease::WRITER_LEASE {
+            return Err(format!(
+                "partition id {:?} is reserved: it names the map writer's lease (D330)",
                 p.id
             ));
         }
@@ -394,13 +415,28 @@ pub(crate) fn validate_catch_up(old: &ClusterMap, new: &ClusterMap) -> Result<()
             new.cluster_id, old.cluster_id
         ));
     }
-    if new.map_version <= old.map_version {
-        return Err(format!(
-            "map_version {} isn't newer than this node's {}",
-            new.map_version, old.map_version
-        ));
+    // D330: ordered by `(writer_term, map_version)`. A higher term is taken whatever its
+    // version: an elected writer's map replaces one the old writer pushed to a minority.
+    if (new.writer_term, new.map_version) <= (old.writer_term, old.map_version) {
+        return Err(if new.writer_term < old.writer_term {
+            format!(
+                "the map is at writer term {}, below this node's {}: it's from a writer that \
+                 has since been replaced (D330)",
+                new.writer_term, old.writer_term
+            )
+        } else {
+            format!(
+                "map_version {} isn't newer than this node's {}",
+                new.map_version, old.map_version
+            )
+        });
     }
     Ok(())
+}
+
+/// Whether `a` sorts after `b`: `(writer_term, map_version)` (D330).
+pub(crate) fn newer(a: &ClusterMap, b: &ClusterMap) -> bool {
+    (a.writer_term, a.map_version) > (b.writer_term, b.map_version)
 }
 
 /// Checks that `new` may replace `old` (both valid) as one step, where a map is set: the
@@ -724,6 +760,9 @@ mod tests {
                 table("orders", "o", vec![], &["p3"]),
                 table("orders_idx", "o", vec![], &["p3"]),
             ],
+            writer: String::new(),
+            writer_term: 0,
+            failover: false,
         }
     }
 

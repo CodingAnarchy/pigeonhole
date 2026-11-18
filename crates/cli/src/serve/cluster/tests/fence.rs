@@ -1617,3 +1617,210 @@ fn a_paused_old_owner_never_commits_once_a_new_owner_took_writes() {
     });
     drop(child);
 }
+
+/// Node `port`'s map.
+async fn map_of(port: u16) -> crate::serve::proto::ClusterMap {
+    client(port)
+        .await
+        .get_map(crate::serve::proto::GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// Node `port`'s status.
+async fn status_of(port: u16) -> crate::serve::proto::NodeStatus {
+    client(port)
+        .await
+        .status(StatusRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// Sets `map` at node `port` (the writer), over its current version.
+async fn set_at(port: u16, map: crate::serve::proto::ClusterMap) -> Result<u64, tonic::Status> {
+    let expected = map.map_version - 1;
+    client(port)
+        .await
+        .set_map(crate::serve::proto::SetMapRequest {
+            map: Some(map),
+            expected_map_version: expected,
+            copies: Vec::new(),
+            force: false,
+        })
+        .await
+        .map(|r| r.into_inner().map_version)
+}
+
+/// The map at node `port`, one version on, with failover `on`.
+async fn with_failover(port: u16, on: bool) -> crate::serve::proto::ClusterMap {
+    let mut m = map_of(port).await;
+    m.map_version += 1;
+    m.failover = on;
+    m
+}
+
+/// Restarts every node, so each runs its lease rounds as `run` starts them (a fresh rig
+/// node doesn't), and waits until a writes and b grants a's writer lease (D330): the term-0
+/// writer, the smallest id, asks for it in its lease rounds.
+fn writer_leased(t: &mut Rig) {
+    for i in 0..3 {
+        t.stop(i);
+        t.restart(i);
+    }
+    let [a, b, _] = t.ports;
+    t.rt.block_on(writer_lease_held(a, b));
+}
+
+async fn writer_lease_held(a: u16, b: u16) {
+    eventually("p1 to serve on a", async || {
+        state(a, "p1").await == LocalPartitionState::Serving
+    })
+    .await;
+    eventually("b to grant a's writer lease", async || {
+        status_of(b).await.writer_lease_remaining_ms > 0
+    })
+    .await;
+    let st = status_of(a).await;
+    assert_eq!((st.writer.as_str(), st.writer_term), ("a", 0), "{st:?}");
+    assert!(st.writer_lease_remaining_ms > 0, "{st:?}");
+}
+
+#[test]
+fn with_failover_on_a_cut_off_writer_is_replaced_and_rejoins_behind_the_elected_map() {
+    // D330 PR 1, tests 3 and 4: the writer a is cut off; once its writer lease has been out
+    // for the margin, b (the smallest live id) is elected at term 1 from the majority's
+    // newest map. a's own change meanwhile, at term 0, stays on a: a late push of it is
+    // refused by the term fence, and once a rejoins it takes the elected map, with every
+    // partition serving again (simp724's S1 on the plan).
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        let on = with_failover(a, true).await;
+        set_at(a, on).await.unwrap();
+        eventually("c to hold failover on", async || map_of(c).await.failover).await;
+    });
+    let held = t.rt.block_on(map_of(c));
+    cut(&t, 0, true);
+    t.rt.block_on(async {
+        // L for a's lease, the margin (2·L), and a round or two.
+        eventually_within(Duration::from_secs(30), "b to be elected", async || {
+            let m = map_of(c).await;
+            m.writer == "b" && m.writer_term == 1
+        })
+        .await;
+        let elected = map_of(b).await;
+        assert_eq!(
+            (
+                elected.writer.as_str(),
+                elected.writer_term,
+                elected.map_version
+            ),
+            ("b", 1, held.map_version + 1),
+            "{elected:?}"
+        );
+        assert!(elected.failover);
+        let st = status_of(c).await;
+        assert_eq!((st.writer.as_str(), st.writer_term), ("b", 1), "{st:?}");
+        eventually("b to hold its writer lease", async || {
+            status_of(b).await.writer_lease_remaining_ms > 0
+        })
+        .await;
+        // a, cut off, changes its own map at term 0, which needs no writer lease: a
+        // minority change.
+        let mut minority = map_of(a).await;
+        assert_eq!(minority.writer_term, 0);
+        minority.map_version += 1;
+        minority.partitions[0].memory_bytes = 1 << 20;
+        set_at(a, minority).await.unwrap();
+        // Its push, arriving late at a node that voted for term 1, is refused.
+        let late = map_of(a).await;
+        let e = client(c)
+            .await
+            .push_map(crate::serve::proto::PushMapRequest { map: Some(late) })
+            .await
+            .unwrap_err();
+        assert!(e.message().contains("term"), "{e:?}");
+    });
+    cut(&t, 0, false);
+    t.rt.block_on(async {
+        eventually_within(
+            Duration::from_secs(15),
+            "a to take the elected map",
+            async || map_of(a).await.writer_term == 1,
+        )
+        .await;
+        // No two maps at one (term, version): every node holds the same one.
+        let want = super::super::map::canonical_json(&map_of(b).await);
+        for port in t.ports {
+            assert_eq!(super::super::map::canonical_json(&map_of(port).await), want);
+        }
+        assert_eq!(
+            map_of(a).await.partitions[0].memory_bytes,
+            0,
+            "a's change is lost"
+        );
+        // Every partition serves again, a's included.
+        eventually_within(
+            Duration::from_secs(10),
+            "p1 to serve on a again",
+            async || state(a, "p1").await == LocalPartitionState::Serving,
+        )
+        .await;
+        for port in t.ports {
+            for row in ["alice", "mike", "zed"] {
+                try_put(port, row, "v").await.unwrap();
+            }
+        }
+        // b now sets maps; a refuses one, naming b.
+        let e = set_at(a, with_failover(a, true).await).await.unwrap_err();
+        assert!(e.message().contains("node b"), "{e:?}");
+        set_at(b, with_failover(b, false).await).await.unwrap();
+    });
+}
+
+#[test]
+fn with_failover_off_no_node_takes_over_and_a_forced_map_fences_the_old_writer() {
+    // D330 C2 (the coordinator's rule): with failover off, nothing elects a writer. The
+    // operator's forced map raises the term (simp724's S2), so the old writer, back, takes
+    // it and can't change the map.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, b, c] = t.ports;
+    cut(&t, 0, true);
+    t.rt.block_on(async {
+        // Well past L and the margin.
+        tokio::time::sleep(TEST_LEASE * 5).await;
+        for port in [b, c] {
+            let m = map_of(port).await;
+            assert_eq!((m.writer.as_str(), m.writer_term), ("", 0), "{m:?}");
+        }
+        let mut forced = map_of(b).await;
+        forced.writer = "b".into();
+        super::super::cli::set_map(&super::backup::args(b), forced, true, Vec::new())
+            .await
+            .unwrap();
+        for port in [b, c] {
+            eventually("the forced map", async || {
+                let m = map_of(port).await;
+                m.writer == "b" && m.writer_term == 1
+            })
+            .await;
+        }
+    });
+    cut(&t, 0, false);
+    t.rt.block_on(async {
+        eventually_within(
+            Duration::from_secs(15),
+            "a to take the forced map",
+            async || map_of(a).await.writer_term == 1,
+        )
+        .await;
+        let e = set_at(a, with_failover(a, false).await).await.unwrap_err();
+        assert!(e.message().contains("node b"), "{e:?}");
+        let st = status_of(a).await;
+        assert_eq!((st.writer.as_str(), st.writer_term), ("b", 1), "{st:?}");
+    });
+}

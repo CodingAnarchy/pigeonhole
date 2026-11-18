@@ -194,6 +194,18 @@ message ClusterMap {
   // The agent memory store's placement (#1915, ICR 0139), if the cluster serves one: each
   // partition named holds a whole store for the namespaces in its range.
   MemoryPlacement memory = 8;
+  // D330: the map's writer, the one node that changes it, and the term it was elected at.
+  // Maps are ordered by `(writer_term, map_version)`: a node takes a map with a higher term
+  // whatever its version, and refuses one with a lower term. Term 0 (no node named): the
+  // writer is the node with the smallest id, as before D330, until the first election
+  // writes term 1. Set only once every node keeps them (`map_features`: `writer_terms`).
+  string writer = 9;
+  uint64 writer_term = 10;
+  // D330: automatic failover, off by default (the owner's Q1), turned on with `set-map`.
+  // Off: no node elects a new writer on its own; the writer changes only as before D330
+  // (an operator's `set-map --force`, which raises the term). Set only once every node
+  // keeps it (`map_features`: `writer_terms`).
+  bool failover = 11;
 }
 
 message Node {
@@ -354,6 +366,15 @@ message NodeStatus {
   //   refuses a request that needs one while a node holding a part of it doesn't report it.
   // Empty from older nodes.
   repeated string map_features = 7;
+  // D330: the map's writer as this node's map names it (the smallest id at term 0), and
+  // the highest writer term this node knows: its map's, or one it voted for. A map below it
+  // is refused here, so `phdb cluster set-map --force` sets a term above every node's.
+  string writer = 8;
+  uint64 writer_term = 9;
+  // On the writer: the time left on its writer lease, as its last lease round gave it. On
+  // another node: the time left on this node's grant of the writer lease to the writer. 0
+  // once it has run out (or this node never granted it).
+  uint64 writer_lease_remaining_ms = 10;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -726,12 +747,19 @@ message LeaseRequest {
   // again, so the round order doesn't apply, and the request replaces the grant (a node
   // that starts holds no lease).
   uint64 start = 7;
+  // D330: the asking node's map's writer term. This node grants only at the same
+  // `(writer_term, map_version)`, and answers `newer_map_version` when its own sorts after
+  // the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
+  uint64 writer_term = 8;
 }
 
 // A partition at an epoch.
 message LeasePart {
   string partition = 1;
   uint64 epoch = 2;
+  // D330: for the writer lease (`partition` "__writer"), the writer term asked for or
+  // granted; `epoch` is then 0. 0 for a partition.
+  uint64 term = 3;
 }
 
 message LeaseResponse {
@@ -746,6 +774,10 @@ message LeaseResponse {
   // This node is in its start grace and grants nothing until it ends: the time left. 0
   // otherwise.
   uint64 grace_remaining_ms = 4;
+  // D330: the grantor's highest writer term, its map's or one it voted for, on an answer
+  // to an election vote (a `__writer` part above its map's term). A candidate refused for a
+  // term at or below it asks again above it. 0 otherwise.
+  uint64 writer_term = 5;
 }
 
 // A partition this node won't grant yet, and why.
