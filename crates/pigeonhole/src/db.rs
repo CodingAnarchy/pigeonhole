@@ -1438,11 +1438,19 @@ impl Pigeonhole {
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn internal_metrics(&self) -> Vec<(&'static str, u64)> {
-        crate::metrics::internal(
+        let mut v = crate::metrics::internal(
             &self.engine().metrics(),
             self.db.vfs.ring_stats().map(|s| s.pooled),
             self.db.vfs.nowait_reads(),
-        )
+        );
+        // D291's counter checkpoints, kept and dropped (memshapes requires none in its
+        // measured part).
+        let (kept, dropped) = self.engine().counter_checkpoints();
+        v.extend([
+            ("counter_checkpoints_kept", kept),
+            ("counter_checkpoints_dropped", dropped),
+        ]);
+        v
     }
 
     /// What the database holds and how it is stored: format version, file and free bytes,

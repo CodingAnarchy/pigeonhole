@@ -526,6 +526,8 @@ struct Shared {
     /// The IVF index's rebalancer, kept for [`Store::take_rebalancer`] when opened with
     /// [`OpenOptions::own_rebalancer`].
     rebalancer: Mutex<Option<pigeonhole_vector::Rebalancer>>,
+    /// The namespace counts the store's recalls read, by snapshot (#2040).
+    ns_counts: crate::ivf::NsCounts,
 }
 
 impl std::fmt::Debug for Store {
@@ -761,6 +763,7 @@ impl Store {
                 own,
                 ivf_pending: Mutex::new(std::collections::VecDeque::new()),
                 rebalancer: Mutex::new(None),
+                ns_counts: crate::ivf::NsCounts::default(),
             }),
         }
     }
@@ -865,6 +868,7 @@ impl Store {
             Rows::W(&self.table),
             Idx::W(&self.index),
             self.ivf.as_ref(),
+            Some(&self.shared.ns_counts),
             self.model.as_ref().filter(|_| self.embeds),
             Snap::W(&self.db),
             namespaces,
@@ -1327,6 +1331,16 @@ impl Store {
         }
     }
 
+    /// The namespace counter reads the store's recalls made (an inspection helper for
+    /// `hooks`, #2040).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ns_count_reads(&self) -> u64 {
+        self.shared
+            .ns_counts
+            .reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The IVF records waiting to settle (an inspection helper for `hooks`).
     #[cfg(feature = "__unstable-hooks")]
     pub(crate) fn ivf_pending_len(&self) -> usize {
@@ -1640,6 +1654,7 @@ impl ReadStore {
             Rows::R(&self.table),
             Idx::R(&self.index),
             self.ivf.as_ref(),
+            None,
             self.model.as_ref().filter(|_| self.embeds),
             Snap::R(&self.reader),
             namespaces,

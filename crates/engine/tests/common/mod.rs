@@ -554,6 +554,8 @@ pub struct Stats {
     /// D329: plain commits that gave up with `Busy` while no external share in doubt (or
     /// maybe in doubt) held one of their rows: on a fault-free run nothing else explains one.
     pub busy_unheld: usize,
+    /// Free blocks the engines punched (D333), summed over the runs a crash ended.
+    pub punches: u64,
     pub flushes: u64,
     pub compactions: u64,
     pub purges: usize,
@@ -816,6 +818,18 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     // default, the largest extent), so crash runs cover those growths too. A block holds a
     // flush's extent at the budgets these tests use.
     o.grow_ahead = Some((4 << 20, 4 << 20));
+    // Free space is punched (D333) once 64 KiB past the reserve is not yet a hole, so
+    // crash and model runs cover punches between commits, reclaims, shrinks and crashes.
+    // The simulator does not pace them. `PIGEONHOLE_PUNCH=0` turns it off.
+    if std::env::var("PIGEONHOLE_PUNCH").as_deref() != Ok("0") {
+        o.punch_freed = true;
+        let mut tuning = pigeonhole_engine::PunchTuning::default();
+        tuning.min_reserve = 0;
+        tuning.trigger_bytes = 64 << 10;
+        o.punch_tuning = Some(tuning);
+    } else {
+        o.punch_freed = false;
+    }
     o
 }
 
@@ -2903,6 +2917,9 @@ impl World {
         // The crashed run's epoch: every later drain of the dead engine keys its records
         // to it (#876).
         let crashed = self.stats.crashes;
+        if let Some(store) = self.store.as_ref() {
+            self.stats.punches += store.engine.metrics().file_punches.0;
+        }
         self.stats.crashes += 1;
         if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
@@ -6935,7 +6952,10 @@ fn run_with(
     }
     w.stats.mutating_ops = vfs.mutating_ops();
     if let Some(store) = w.store.as_ref() {
-        (w.stats.returning_fast, w.stats.returning_full) = store.engine.returning_folds();
+        let folds = store.engine.returning_folds();
+        let punches = store.engine.metrics().file_punches.0;
+        (w.stats.returning_fast, w.stats.returning_full) = folds;
+        w.stats.punches += punches;
     }
     if w.failure.is_none() {
         // Finish with one more crash so the tail of every run is checked.

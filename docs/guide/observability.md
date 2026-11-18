@@ -164,6 +164,12 @@ Counters are cumulative from registration. They stay monotonic across an automat
 | `pigeonhole.file.free` | `pigeonhole_file_free_bytes` | gauge | `By` |  | Bytes of the file free for reuse. |
 | `pigeonhole.file.growths` | `pigeonhole_file_growths_total` | counter | `{growth}` |  | Times the file grew because the page allocator ran out of free space. |
 | `pigeonhole.file.growth.time` | `pigeonhole_file_growth_time_seconds_total` | counter | `s` |  | Time those growths held the page allocator. |
+| `pigeonhole.file.punches` | `pigeonhole_file_punches_total` | counter | `{punch}` |  | Free blocks given back to the filesystem as holes (Options::punch_freed). |
+| `pigeonhole.file.punch.time` | `pigeonhole_file_punch_time_seconds_total` | counter | `s` |  | Time those punches took. |
+| `pigeonhole.file.punched` | `pigeonhole_file_punched_bytes_total` | counter | `By` |  | Bytes those punches gave back. |
+| `pigeonhole.file.holes` | `pigeonhole_file_holes_bytes` | gauge | `By` |  | Free bytes of the file that are holes now; the file's length less this is about what it occupies on disk. |
+| `pigeonhole.file.punch.passes` | `pigeonhole_file_punch_passes_total` | counter | `{pass}` |  | Punch passes started. |
+| `pigeonhole.file.punch.refusals` | `pigeonhole_file_punch_refusals_total` | counter | `{refusal}` |  | Punches that failed; a filesystem that cannot punch fails once, and punching stops until the next open. |
 | `pigeonhole.sst.count` | `pigeonhole_sst_count` | gauge | `{sst}` | `pigeonhole.level`, `pigeonhole.table`, `pigeonhole.family` | SSTs per LSM level; level 0's count is the compaction-debt signal. Table and family only with Config::storage_by_table. |
 | `pigeonhole.sst.size` | `pigeonhole_sst_size_bytes` | gauge | `By` | `pigeonhole.level`, `pigeonhole.table`, `pigeonhole.family` | SST bytes per LSM level. Table and family only with Config::storage_by_table. |
 | `pigeonhole.blob.size` | `pigeonhole_blob_size_bytes` | gauge | `By` | `pigeonhole.blob.state`, `pigeonhole.table`, `pigeonhole.family` | Blob file bytes (state total) and the live bytes in them (state live); the gap is what blob GC can reclaim. |

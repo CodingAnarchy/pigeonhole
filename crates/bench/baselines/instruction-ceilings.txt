@@ -501,7 +501,12 @@ replicate-apply 6366 0.3
 # ubuntu-26.04, two runs, base and head of identical engine code each (runs 44085631301 and
 # 44085642059): 11293924, 11295466, 11308932, 11297931 (0.13% spread; a memory's id carries
 # random bytes, so fusion ties may fall differently). The highest times 1.003.
-memory-recall 11342859 0.3
+# #2042 re-baseline (not a restore): setup now recalls every measured query once and waits for
+# the D291 counter checkpoints to land, so the measured recalls fold no long counter chain and
+# start with warm caches and postings. Before, 11.29-11.30M on most runners and 11.44-12.00M
+# when the checkpoints landed late (#2007, #2029, #2033); from head 5ac5c919f on image
+# 20261111.196.1 (run 44185022456): 11279643. Times 1.003.
+memory-recall 11313482 0.3
 # #1828 PR 2 (#1864): `phdb serve`'s gRPC calls through its router in process (serveshapes.rs).
 # From the head c15a2d547 (main 2fbe79079), three identical-code runs, 43612351230, 43612356459
 # and 43616030543 (ubuntu-24.04). The highest count of each shape times 1.003. Spread across these
