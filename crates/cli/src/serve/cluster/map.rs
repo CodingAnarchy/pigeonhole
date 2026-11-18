@@ -936,6 +936,22 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
     validate_epochs(old, new)
 }
 
+/// D330's pending promote of partition `p` in `map`, if one is live: a PARTITION event
+/// still PENDING whose `to_epoch` is above the partition's epoch.
+fn pending_promote<'m>(
+    map: &'m ClusterMap,
+    p: &str,
+) -> Option<&'m crate::serve::proto::FailoverEvent> {
+    use crate::serve::proto::{FailoverKind, FailoverState};
+    let epoch = map.partitions.iter().find(|q| q.id == p)?.epoch;
+    map.failovers.iter().find(|e| {
+        e.kind() == FailoverKind::Partition
+            && e.partition == p
+            && e.state() == FailoverState::Pending
+            && e.to_epoch > epoch
+    })
+}
+
 /// D331: each move takes one step per map. A forced map (a recovery) skips these steps,
 /// so it may drop a move at any phase, HANDED_OVER included (cli692's N2): the table layer
 /// it carries says who holds the range then, and `validate` still holds it to a range its
@@ -961,6 +977,18 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
         let Some(o) = before.get(id.as_str()) else {
             if phase(m) != MovePhase::Copying {
                 return Err(format!("move {id:?} must start at COPYING"));
+            }
+            // Not while a promote of its source or target is pending (cli692's N1 on PR 2):
+            // the promote's map moves the partition to another node and epoch under the
+            // copy, and the move's hand-over raises the same epoch.
+            for p in [&m.from, &m.to] {
+                if let Some(e) = pending_promote(new, p) {
+                    return Err(format!(
+                        "move {id:?} can't start while partition {p:?} has a pending promote \
+                         (to node {:?} at epoch {}): finish or abandon it first",
+                        e.to, e.to_epoch
+                    ));
+                }
             }
             continue;
         };
@@ -1742,6 +1770,26 @@ mod tests {
         assert_eq!(forced.tables[0].partitions, ["p1", "p2", "p1", "p2"]);
         // A change through the writer couldn't.
         refused(validate_change(&handed, &forced), "past its commit point");
+    }
+
+    /// cli692's N1 on PR 2: a move doesn't start while its source or target has a pending
+    /// promote (D330); one already finished (its partition at the promote's epoch) is no bar.
+    #[test]
+    fn a_move_doesnt_start_while_its_source_or_target_has_a_pending_promote() {
+        for p in ["p1", "p2"] {
+            let epoch = map().partitions.iter().find(|q| q.id == p).unwrap().epoch;
+            let mut old = map();
+            old.failovers.push(pending(p, "c", epoch + 1));
+            let mut new = moving(MovePhase::Copying);
+            new.map_version = old.map_version + 1;
+            new.failovers = old.failovers.clone();
+            refused(validate_change(&old, &new), "pending promote");
+            // Finished: the partition is at the promote's epoch.
+            let mut old = map();
+            old.failovers.push(pending(p, "c", epoch));
+            new.failovers = old.failovers.clone();
+            validate_change(&old, &new).unwrap();
+        }
     }
 
     #[test]
