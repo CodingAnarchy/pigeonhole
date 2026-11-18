@@ -2521,10 +2521,9 @@ fn between_the_hand_over_and_cleaning_a_resume_waits_rather_than_expiring() {
                 "rerouted before CLEANING"
             );
             // A resume gaining p2 now asks again, retry-safe.
-            let e = subscribe(c, req(Some(Start::Resume(token.clone()))))
-                .await
-                .err()
-                .expect("refused before CLEANING");
+            let Err(e) = subscribe(c, req(Some(Start::Resume(token.clone())))).await else {
+                panic!("refused before CLEANING");
+            };
             assert_eq!(code(&e), "PartitionUnavailable", "{e}");
             // CLEANING: rerouted, and the resume reads p2.
             let m = client(a)
