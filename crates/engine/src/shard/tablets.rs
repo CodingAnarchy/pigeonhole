@@ -822,6 +822,31 @@ impl ShardState {
         }
     }
 
+    /// After a read hold's release (D329, perf2's S1 on #2062): wakes the coordinators refused
+    /// with no older commit ahead (`behind: None`) whose rows no undecided share and no hold
+    /// here covers now, as [`release_overlaps`](Self::release_overlaps) does at a decision.
+    /// Without it, one refused over a row a hold also read would wait, once the share it met
+    /// was decided and the hold released, for D241's retry timeout.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_overlaps_cleared(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let mut i = 0;
+        while i < self.overlap_refused.len() {
+            let r = &self.overlap_refused[i];
+            let go = r.single == 0
+                && r.behind.is_none()
+                && !r.rows.iter().any(|h| {
+                    self.pending_rows.contains_key(h) || self.pending_reads.contains_key(h)
+                });
+            if go {
+                let r = self.overlap_refused.swap_remove(i);
+                self.wake_overlap(r, ctx);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// A share of the commit of `priority`, writing `written` (`hash_row`, sorted), committed
     /// here (D276): a refused commit that reads one of those rows and now fails validation
     /// on it would fail its retry the same way (its snapshot stays, and a version above it

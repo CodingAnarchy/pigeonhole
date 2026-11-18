@@ -1172,13 +1172,20 @@ pub struct ReadHold {
 
 impl ReadHold {
     /// Ends the hold, answering whether it was still in place on every shard (`true`), or
-    /// was lost to a close or a recovery (`false`). On a thread that drives a shard it can't
-    /// wait, and answers `false`.
-    pub fn release(mut self) -> bool {
+    /// was lost to a close or a recovery (`false`): `false` only ever means lost. It waits
+    /// for the shards' answers, so on a thread that drives a shard (application-owned mode)
+    /// it's refused (`InvalidArgument`) rather than guess: the hold is then released as it's
+    /// dropped, without an answer (perf2's S2 on #2062).
+    pub fn release(mut self) -> crate::Result<bool> {
+        let Some(engine) = self.engine.upgrade() else {
+            self.done = true;
+            return Ok(false);
+        };
+        engine
+            .shared
+            .refuse_blocking_on_driver("releasing a read hold")?;
         self.done = true;
-        self.engine
-            .upgrade()
-            .is_some_and(|e| e.release_reads(self.token, &self.shards, true))
+        Ok(engine.release_reads(self.token, &self.shards, true))
     }
 }
 

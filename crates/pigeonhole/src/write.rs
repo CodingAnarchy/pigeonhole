@@ -2231,8 +2231,11 @@ pub struct ReadHold(pigeonhole_engine::ReadHold);
 impl ReadHold {
     /// Ends the hold: `true` if it was in place until now, `false` if it was lost to a close
     /// or a recovery (the transaction's reads are then no longer known to be current).
-    pub fn release(self) -> bool {
-        self.0.release()
+    /// `false` only ever means lost. It waits for the answer, so on a thread that drives a
+    /// shard (application-owned mode) it's refused (`InvalidArgument`), and the hold is
+    /// released as it's dropped, with no answer.
+    pub fn release(self) -> Result<bool> {
+        self.0.release().map_err(Error::from)
     }
 }
 

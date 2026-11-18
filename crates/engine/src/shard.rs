@@ -12645,6 +12645,10 @@ impl ShardState {
                 let held = self.read_holds.remove(&token);
                 if let Some(h) = &held {
                     self.track_share_reads(&h.rows, false);
+                    // A commit refused over a row the hold also read may now go.
+                    if !self.overlap_refused.is_empty() {
+                        self.release_overlaps_cleared(ctx);
+                    }
                 }
                 if let Some(reply) = reply {
                     reply.notify(held.is_some());

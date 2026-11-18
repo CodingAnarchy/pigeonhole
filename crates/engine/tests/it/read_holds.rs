@@ -219,7 +219,7 @@ fn run(seed: u64) -> (usize, usize, usize, usize) {
                 };
                 std::thread::sleep(Duration::from_micros(rng.below(1500)));
                 let released_at = Instant::now();
-                let lasted = hold.release();
+                let lasted = hold.release().unwrap();
                 held.lock().unwrap().push(Held {
                     cells,
                     snapshot,

@@ -5885,11 +5885,14 @@ impl Inner {
         type Routed = (Vec<crate::write::ReadKey>, Vec<TabletId>);
         let mut by_shard: BTreeMap<ShardId, Routed> = BTreeMap::new();
         for r in &validate.reads {
-            if let Some((tablet, shard)) = view.tablets().route(r.table, &r.row) {
-                let (reads, tablets) = by_shard.entry(shard).or_default();
-                reads.push(r.clone());
-                tablets.push(tablet);
-            }
+            // A read the view can't route is of a table dropped since it was read: changed,
+            // so nothing can hold it (perf2's nit on #2062).
+            let Some((tablet, shard)) = view.tablets().route(r.table, &r.row) else {
+                return Err(Error::Conflict);
+            };
+            let (reads, tablets) = by_shard.entry(shard).or_default();
+            reads.push(r.clone());
+            tablets.push(tablet);
         }
         drop(view);
         let token = self.shared.external.reserve_hold()?;
@@ -5938,11 +5941,13 @@ impl Inner {
 
     /// Ends read hold `token` on `shards` (ICR 0140 amendment 1); with `wait`, answers
     /// whether every shard still held it (`false` once the hold was lost to a close or a
-    /// recovery). Without `wait`, or on a thread that drives a shard, it doesn't wait and
-    /// answers `false`. The hold stops counting against the limit either way.
+    /// recovery). With `wait`, never called on a thread that drives a shard
+    /// ([`ReadHold::release`](crate::ReadHold::release) refuses that first). Without it (a
+    /// dropped hold), it doesn't wait, and its answer means nothing. The hold stops counting
+    /// against the limit either way.
     pub(crate) fn release_reads(&self, token: u64, shards: &[ShardId], wait: bool) -> bool {
         self.shared.external.release_hold();
-        let wait = wait && !self.shared.drivers.current_drives();
+        debug_assert!(!wait || !self.shared.drivers.current_drives());
         let mut held = true;
         let mut waiting = Vec::new();
         for &shard in shards {
