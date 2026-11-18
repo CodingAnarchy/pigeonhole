@@ -39,6 +39,20 @@ pub(super) fn handing_over<'m>(map: &'m ClusterMap, partition: &str) -> Option<&
         .find(|m| m.from == partition && map::phase(m) >= MovePhase::HandedOver)
 }
 
+/// `db`'s D310 feed token now for a feed of `table` (D331 PR 3b's `t_from`), `None` when
+/// its change feed is off.
+fn hand_over_token(db: &Pigeonhole, table: &str) -> Result<Option<Vec<u8>>, String> {
+    let t = db
+        .table(table)
+        .and_then(|b| b.open())
+        .map_err(|e| format!("open table {table:?}: {e}"))?;
+    match t.feed().open() {
+        Ok(feed) => Ok(Some(feed.token().as_bytes().to_vec())),
+        Err(e) if e.code() == pigeonhole::ErrorCode::InvalidArgument => Ok(None),
+        Err(e) => Err(format!("a feed of table {table:?}: {e}")),
+    }
+}
+
 /// Now, in milliseconds since the Unix epoch, on this node's clock (a row's time).
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -76,6 +90,9 @@ pub(super) fn finish_hand_over(
             version: m.handed_over_version,
             seqno: db.visible_seqno(),
             at_ms: now_ms(),
+            // PR 3b: a cluster component of a table moved away whole reads up to here.
+            final_seqno: m.final_seqno,
+            ..Default::default()
         };
         ranges::write_moved(db, &row)?;
         wrote = Some(row);
@@ -219,6 +236,14 @@ impl Node {
             m.to == id && map::phase(m) >= MovePhase::Cleaning && !gate.ranges().has_serving(&m.id)
         }) {
             let (start, end) = map::move_range(m)?;
+            // `t_from` as a D310 token (PR 3b): a feed of the table opened now, before the
+            // gate opens the range, so every event of it here past that token is new.
+            // Without the change feed, none: no cluster subscription reads this partition.
+            let token = hand_over_token(db, &m.table)?;
+            let seqno = token
+                .as_deref()
+                .and_then(super::token::token_seqno)
+                .unwrap_or_else(|| db.visible_seqno());
             let row = Moved {
                 id: m.id.clone(),
                 table: m.table.clone(),
@@ -226,8 +251,11 @@ impl Node {
                 end,
                 term: m.handed_over_term,
                 version: m.handed_over_version,
-                seqno: db.visible_seqno(),
+                seqno,
                 at_ms: now_ms(),
+                source: m.from.clone(),
+                final_seqno: m.final_seqno,
+                token: token.unwrap_or_default(),
             };
             ranges::write_serving(db, &row)?;
             gate.ranges().add_serving(row);

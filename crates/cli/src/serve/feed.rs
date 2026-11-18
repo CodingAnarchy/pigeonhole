@@ -2030,6 +2030,7 @@ impl Sink {
                 start: Some(start_rx),
             },
             None,
+            None,
         );
         (sink, events, end_tx)
     }
@@ -2254,7 +2255,77 @@ fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
 /// A client's events, then its error if it failed: a single node's, from its [`Sink`]; or
 /// a cluster subscription's, merged as the client polls ([`crate::serve::cluster::feed`],
 /// #1758's B).
-pub(crate) struct FeedEvents(EventSource, Option<Box<DeliveryLease>>);
+pub(crate) struct FeedEvents(
+    EventSource,
+    Option<Box<DeliveryLease>>,
+    /// A range move's target's component: the barriers it carries (D331 PR 3b).
+    Option<Box<Barriers>>,
+);
+
+/// A range move's hand-over in its target's cluster component (D331 PR 3b, cli692's (d)):
+/// the component hands it out just before its first event past `t_from` (feed1248's M4: any
+/// event that moves its position there, progress included), so the entry node's merge holds
+/// the component until the source's has passed `final_seqno`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Barrier {
+    /// The target's seqno at the hand-over: its feed token's, `token`.
+    pub t_from: u64,
+    /// The target's D310 feed token at `t_from`: the barrier event's token, so the merge's
+    /// position for the component stays there while it holds it (feed1248's M6).
+    pub token: Bytes,
+    pub move_id: String,
+    pub source: String,
+    pub final_seqno: u64,
+}
+
+/// A component's barriers still to hand out, in `(t_from, move id)` order (feed1248's S4),
+/// and an event held back behind one.
+#[derive(Default)]
+struct Barriers {
+    pending: std::collections::VecDeque<Barrier>,
+    held: Option<Out>,
+    /// A component of tables a range move took from its partition whole: it ends, cleanly
+    /// for the merge (`MovedAway`), once it has handed out an event at or past this seqno.
+    ends_at: Option<u64>,
+    /// It has: `MovedAway` next, then nothing.
+    done: Option<bool>,
+}
+
+impl Barriers {
+    /// `out` is going out: past `ends_at`, the component ends next.
+    fn passed(&mut self, out: &Out) {
+        if let Some(end) = self.ends_at
+            && crate::serve::cluster::token::token_seqno(out.token()).is_some_and(|s| s >= end)
+        {
+            self.done = Some(true);
+        }
+    }
+
+    /// The barrier due before `out`, if one is: the next one, when `out`'s token is past its
+    /// `t_from`.
+    fn due(&mut self, out: &Out) -> Option<Barrier> {
+        let seqno = crate::serve::cluster::token::token_seqno(out.token())?;
+        if self.pending.front().is_some_and(|b| seqno > b.t_from) {
+            self.pending.pop_front()
+        } else {
+            None
+        }
+    }
+}
+
+impl Barrier {
+    fn out(self) -> Out {
+        Out::event(proto::FeedEvent {
+            token: self.token,
+            event: Some(proto::feed_event::Event::MoveBarrier(proto::MoveBarrier {
+                move_id: self.move_id,
+                source: self.source,
+                final_seqno: self.final_seqno,
+            })),
+            partition: String::new(),
+        })
+    }
+}
 
 impl EventSource {
     /// The take clock the sink's idle limit reads.
@@ -2425,7 +2496,76 @@ impl FeedEvents {
     /// On a cluster partition, the lease is checked on every poll ([`DeliveryLease`]): that
     /// replaces a check once the subscribe is in place (feed1248's F3, `still_leased`), since
     /// a lease that lapsed between the subscribe's checks and its first poll ends it here.
+    /// Carries `barriers` (D331 PR 3b): each handed out just before the first event past its
+    /// `t_from`. Sorted here.
+    /// And ends past `ends_at`, if set, with `MovedAway` (D331 PR 3b).
+    pub(crate) fn with_barriers(
+        mut self,
+        mut barriers: Vec<Barrier>,
+        ends_at: Option<u64>,
+    ) -> Self {
+        if barriers.is_empty() && ends_at.is_none() {
+            return self;
+        }
+        barriers.sort_by(|a, b| (a.t_from, &a.move_id).cmp(&(b.t_from, &b.move_id)));
+        self.2 = Some(Box::new(Barriers {
+            pending: barriers.into(),
+            held: None,
+            ends_at,
+            done: None,
+        }));
+        self
+    }
+
+    /// The next event, a due barrier first (D331 PR 3b): one load while the component
+    /// carries none.
     pub(crate) fn poll_out(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Out, ApiError>>> {
+        if self.2.is_none() {
+            return self.poll_out_inner(cx);
+        }
+        if let Some(barriers) = self.2.as_mut() {
+            match barriers.done {
+                Some(true) => {
+                    barriers.done = Some(false);
+                    return Poll::Ready(Some(Err(ApiError::moved_away(
+                        "this component's tables moved to other partitions: it has read up \
+                         to their range moves' last seqno",
+                    ))));
+                }
+                Some(false) => return Poll::Ready(None),
+                None => {}
+            }
+            if let Some(held) = barriers.held.take() {
+                // Another barrier may be due before the same event.
+                if let Some(b) = barriers.due(&held) {
+                    barriers.held = Some(held);
+                    return Poll::Ready(Some(Ok(b.out())));
+                }
+                barriers.passed(&held);
+                return Poll::Ready(Some(Ok(held)));
+            }
+        }
+        let out = self.as_mut().poll_out_inner(cx);
+        if let Poll::Ready(Some(Ok(event))) = out {
+            let barriers = self.2.as_mut().expect("checked above");
+            return Poll::Ready(Some(Ok(match barriers.due(&event) {
+                Some(b) => {
+                    barriers.held = Some(event);
+                    b.out()
+                }
+                None => {
+                    barriers.passed(&event);
+                    event
+                }
+            })));
+        }
+        out
+    }
+
+    fn poll_out_inner(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Out, ApiError>>> {
@@ -2588,6 +2728,81 @@ mod tests {
     /// The next of `events`' items.
     async fn next_out(events: &mut FeedEvents) -> Option<Result<Out, ApiError>> {
         std::future::poll_fn(|cx| Pin::new(&mut *events).poll_out(cx)).await
+    }
+
+    /// D331 PR 3b: a range move's target's component hands out each barrier just before
+    /// its first event past the barrier's `t_from` (feed1248's M4), several in `(t_from, id)`
+    /// order (S4), none before an event at exactly `t_from` (M5's start there), and a
+    /// component of tables moved away whole ends with `MovedAway` once it has handed out an
+    /// event at or past its end, then nothing.
+    #[tokio::test]
+    async fn a_targets_component_hands_out_its_barriers_before_the_events_past_them() {
+        let token = |seqno: u64| {
+            let mut t = vec![1u8];
+            t.extend_from_slice(&[7u8; 16]);
+            t.extend_from_slice(&1u32.to_le_bytes());
+            t.extend_from_slice(&seqno.to_le_bytes());
+            Bytes::from(t)
+        };
+        let (sink, events, _end) = Sink::new(&limits_solo_after(SOLO_AFTER));
+        for seqno in [5, 10, 15, 20] {
+            sink.put(Out::event(proto::FeedEvent {
+                token: token(seqno),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        }
+        let barrier = |t_from, id: &str| Barrier {
+            t_from,
+            token: token(t_from),
+            move_id: id.into(),
+            source: "p1".into(),
+            final_seqno: 99,
+        };
+        let mut events = events.with_barriers(
+            vec![
+                barrier(12, "mv2"),
+                barrier(8, "mv1"),
+                barrier(12, "mv1"),
+                barrier(5, "mv0"),
+            ],
+            Some(15),
+        );
+        let mut seen = Vec::new();
+        loop {
+            match next_out(&mut events).await {
+                Some(Ok(out)) => {
+                    let e = out.into_proto();
+                    let seqno = crate::serve::cluster::token::token_seqno(&e.token).unwrap();
+                    seen.push(match e.event {
+                        Some(proto::feed_event::Event::MoveBarrier(b)) => {
+                            format!("{}@{seqno}", b.move_id)
+                        }
+                        _ => format!("{seqno}"),
+                    });
+                }
+                Some(Err(e)) => {
+                    seen.push(e.code);
+                    break;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "5",
+                "mv0@5",
+                "mv1@8",
+                "10",
+                "mv1@12",
+                "mv2@12",
+                "15",
+                "MovedAway"
+            ]
+        );
+        assert!(next_out(&mut events).await.is_none(), "and nothing after");
     }
 
     /// D326 PR 2 (feed1248's F2, F3 and F5): a cluster partition's component delivers only

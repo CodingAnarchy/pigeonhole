@@ -59,7 +59,7 @@ const SERVING: &[u8] = b"serving/";
 /// request timeout since it"; a node that never comes back keeps it. It's a plain logged
 /// write, so it's in the partition's feed and reaches its replica copies, and a promoted
 /// copy keeps answering for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Moved {
     /// The move's id (`RangeMove.id`).
     pub id: String,
@@ -77,6 +77,15 @@ pub(crate) struct Moved {
     /// When this partition recorded it, in milliseconds since the Unix epoch on its clock:
     /// the prune's time bound (the transaction lifetime plus the request timeout since).
     pub at_ms: u64,
+    /// The move's `final_seqno` from the map's record (D331 PR 3b, both kinds); a serving
+    /// row's (empty on a moved-away row): the move's source, and this partition's D310 feed
+    /// token at
+    /// `t_from` (`seqno`), taken from a feed of the table before the gate opened the range.
+    /// A cluster component that starts at or before it carries a barrier there
+    /// ([`super::feed::Barrier`]), and a resume that gained this partition starts there.
+    pub source: String,
+    pub final_seqno: u64,
+    pub token: Vec<u8>,
 }
 
 /// The moved-away rows in `db`.
@@ -142,6 +151,11 @@ fn read_rows(db: &Pigeonhole, prefix: &[u8]) -> Result<Vec<Moved>, String> {
             version: number(b"version")?,
             seqno: number(b"seqno")?,
             at_ms: number(b"at")?,
+            source: String::from_utf8(bytes(b"source").unwrap_or_default()).unwrap_or_default(),
+            final_seqno: bytes(b"final")
+                .and_then(|b| std::str::from_utf8(&b).ok()?.parse().ok())
+                .unwrap_or(0),
+            token: bytes(b"token").unwrap_or_default(),
             id,
         });
     }
@@ -170,6 +184,14 @@ fn write_row(db: &Pigeonhole, prefix: &[u8], m: &Moved) -> Result<(), String> {
         .put(FAMILY, b"at", m.at_ms.to_string().as_bytes());
     if let Some(end) = &m.end {
         w = w.put(FAMILY, b"end", end);
+    }
+    if m.final_seqno != 0 {
+        w = w.put(FAMILY, b"final", m.final_seqno.to_string().as_bytes());
+    }
+    if !m.source.is_empty() {
+        w = w
+            .put(FAMILY, b"source", m.source.as_bytes())
+            .put(FAMILY, b"token", &m.token);
     }
     w.commit()
         .map(|_| ())
@@ -513,6 +535,17 @@ impl RangeGate {
         let mut serving = self.serving();
         serving.retain(|m| m.id != row.id);
         serving.push(row);
+    }
+
+    /// The moved-away rows the file holds, for a cluster component of a table moved away
+    /// whole (PR 3b).
+    pub(crate) fn moved_rows(&self) -> Vec<Moved> {
+        self.moved().clone()
+    }
+
+    /// The serving rows the file holds, for a cluster component's start and barriers.
+    pub(crate) fn serving_rows(&self) -> Vec<Moved> {
+        self.serving().clone()
     }
 
     /// Whether the file records that it serves move `id`'s range.
@@ -945,6 +978,7 @@ mod tests {
             version: 5,
             seqno: 30,
             at_ms: 0,
+            ..Default::default()
         };
         let cleaning = map(Some(MovePhase::Cleaning));
         assert!(
@@ -1012,6 +1046,7 @@ mod tests {
             version,
             seqno: 40,
             at_ms: 0,
+            ..Default::default()
         };
         // The move is done and gone from the map, which gives `[c, f)` to p2.
         let mut done = map(None);
@@ -1100,6 +1135,7 @@ mod tests {
             version: 5,
             seqno: 9,
             at_ms: 0,
+            ..Default::default()
         };
         g.load_rows(vec![row.clone()], Vec::new());
         g.update(&done, "p1", 12);
@@ -1224,6 +1260,7 @@ mod tests {
             version: 7,
             seqno: 40,
             at_ms: 0,
+            ..Default::default()
         };
         let s = gate(&map(Some(MovePhase::HandedOver)), "p1", vec![row], 50)
             .state
@@ -1256,6 +1293,7 @@ mod tests {
                 version: 7,
                 seqno: 40,
                 at_ms: 0,
+                ..Default::default()
             },
             Moved {
                 id: "mv2".into(),
@@ -1266,6 +1304,7 @@ mod tests {
                 version: 9,
                 seqno: 41,
                 at_ms: 0,
+                ..Default::default()
             },
         ];
         for r in &rows {

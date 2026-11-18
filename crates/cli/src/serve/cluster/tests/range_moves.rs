@@ -208,6 +208,7 @@ fn an_opening_partition_gates_a_moved_range_from_its_file() {
             version: 5,
             seqno: 3,
             at_ms: 0,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -335,6 +336,7 @@ fn a_restored_file_is_clipped_to_the_maps_ranges_and_a_rerun_finds_it_done() {
             version: 3,
             seqno: 1,
             at_ms: 0,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -378,6 +380,7 @@ fn a_restored_file_is_clipped_to_the_maps_ranges_and_a_rerun_finds_it_done() {
             version: 1,
             seqno: 5,
             at_ms: 0,
+            ..Default::default()
         }],
     );
     gate.update(&back, "p1", 6);

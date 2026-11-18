@@ -430,6 +430,35 @@ impl ApiError {
         )
     }
 
+    /// D331 PR 3b: a cluster subscription's merge ended because the map gave a range of its
+    /// tables to a partition it doesn't read (a range move). Its last event was a checkpoint:
+    /// resuming from that token reads the new partition from its hand-over on. Not a public
+    /// `ErrorCode` (the coordinator's call): carried as `ReplicaBehind` is. Retry-safe.
+    pub(crate) fn feed_rerouted(message: impl Into<String>) -> Self {
+        Self::new(
+            "FeedRerouted",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
+    /// D331 PR 3b, internal to a cluster subscription: a source's component of tables a
+    /// range move took from it whole has read up to the move's last seqno, and ends here.
+    /// The merge retires the part; a client never sees it.
+    pub(crate) fn moved_away(message: impl Into<String>) -> Self {
+        Self::new(
+            "MovedAway",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    }
+
     /// D331: a write touching a range its partition is handing over to another (reason
     /// `RANGE_MOVING`), refused before anything is written. Unlike the operator's fence it's
     /// retry-safe and short: the range takes writes again at its target once the hand-over's
