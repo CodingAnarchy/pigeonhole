@@ -605,7 +605,11 @@ fn cycles_per_ns() -> f64 {
 }
 
 pub(crate) fn thread_cpu_nanos() -> u64 {
-    (thread_cycles() as f64 / cycles_per_ns()) as u64
+    // The rate first: the process's first call measures it with a 10 ms busy loop on this
+    // thread, and a cycle count read before that loop would put its 10 ms into whatever span
+    // this reading starts (#2063's Windows red: a sampled call measured 10 ms over its work).
+    let rate = cycles_per_ns();
+    (thread_cycles() as f64 / rate) as u64
 }
 
 /// The cached process id ([`crate::sys::process_id`]). Windows has no `fork`, so the id never
