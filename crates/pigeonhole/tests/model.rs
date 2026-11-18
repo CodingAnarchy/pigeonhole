@@ -3522,7 +3522,11 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 let verdict = match rx.try_recv() {
                     Ok(Ok(_)) => "slow: the seed finished after the deadline".to_owned(),
                     Ok(Err(e)) => format!("slow: the seed failed after the deadline: {e}"),
-                    Err(_) => {
+                    // Its thread ended without sending: it panicked after the deadline.
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        "slow: the seed's thread panicked after the deadline".to_owned()
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
                         let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
                         if p.steps == steps {
                             format!(
