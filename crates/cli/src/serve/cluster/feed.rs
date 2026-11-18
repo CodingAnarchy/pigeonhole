@@ -1020,15 +1020,17 @@ fn gained<'t>(
 }
 
 /// Whether source part `s` has nothing to order a barrier's hold against (feed1248's S1,
-/// simp724's refinement): still at `Now` with no open live, because it's unavailable or was
-/// never tried. Any open of it from here on is started after the barrier exists, so at or
+/// simp724's refinement): still at `Now` with no open live, neither opening nor open: it
+/// was never tried, or it's unavailable and waiting for its retry timer. An unavailable
+/// part whose retry is in flight holds (simp724): that open may have started before the
+/// hand-over. Any open of it from here on is started after the barrier exists, so at or
 /// past the move's `final_seqno`: a barrier comes only from the target's serving row,
 /// written at CLEANING, after `final_seqno` was fixed at HANDING_OVER from the source's
 /// visible seqno. Holding would only stall the target behind a down source for a finished
 /// move. A `Now` part opening or open with nothing from it yet still holds: its start may
 /// have been taken before HANDING_OVER, below `final_seqno`, with its first event in flight.
 fn idle_now(s: &Part) -> bool {
-    matches!(s.at, At::Now) && (s.unavailable || (s.events.is_none() && !s.opening))
+    matches!(s.at, At::Now) && !s.opening && s.events.is_none()
 }
 
 /// Drops part `i`'s range move holds that no longer hold, and whether one still does: a
@@ -1933,7 +1935,10 @@ pub(super) mod tests {
         assert!(held(&mut parts), "open, nothing from it yet");
         parts[0].events = None;
         parts[0].unavailable = true;
-        assert!(!held(&mut parts), "unavailable");
+        assert!(!held(&mut parts), "unavailable, waiting to retry");
+        parts[0].opening = true;
+        assert!(held(&mut parts), "unavailable, its retry in flight");
+        parts[0].opening = false;
         parts[0].unavailable = false;
         parts[1].holds.clear();
         parts[1].holds.push_back(hold("p9", u64::MAX));
