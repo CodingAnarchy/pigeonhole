@@ -238,6 +238,17 @@ pub struct EngineOptions {
     /// the simulator, which keeps whole files in memory, so they reach it.
     #[doc(hidden)]
     pub grow_ahead: Option<(u64, u64)>,
+    /// Gives the data file's free space back to the filesystem (D333, #2013): after a
+    /// reclaim leaves enough free space past a reserve, a background pass punches holes in
+    /// it, one free block at a time and paced ([`PunchTuning`](crate::PunchTuning)). The
+    /// file keeps its length but occupies about its live data on disk. Linux and macOS only
+    /// (elsewhere, or on a filesystem that cannot punch, nothing happens). On by default
+    /// (D333, from the g152/g153 box runs).
+    pub punch_freed: bool,
+    /// Overrides how a punch pass runs (D333's defaults otherwise). For tests, which
+    /// shrink the reserve and lift the pacing.
+    #[doc(hidden)]
+    pub punch_tuning: Option<crate::PunchTuning>,
     /// Overrides how many balancer passes (or as many base intervals of clock) a tablet must
     /// go unwritten, and have been on its shard, before it counts as cold for merges and
     /// consolidation (100 by default, D224). For tests of merges, which shorten it.
@@ -333,6 +344,8 @@ impl EngineOptions {
             write_stall_timeout_nanos: 30_000_000_000,
             arena_chunk_bytes: None,
             grow_ahead: None,
+            punch_freed: true,
+            punch_tuning: None,
             balance_cold_passes: None,
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,

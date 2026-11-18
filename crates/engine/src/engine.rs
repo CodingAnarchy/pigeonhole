@@ -195,6 +195,18 @@ pub struct Metrics {
     /// submitted to the I/O backend), and the nanoseconds their `fallocate`s took on the
     /// allocating thread.
     pub file_growths_ahead: (u64, u64),
+    /// Free blocks punched (given back to the filesystem, D333) since open, and the
+    /// nanoseconds the punches took on the background worker.
+    pub file_punches: (u64, u64),
+    /// Bytes those punches gave back.
+    pub file_punch_bytes: u64,
+    /// Gauge: free bytes that are holes now. The file's length less this is about what it
+    /// occupies on disk.
+    pub file_punched_bytes: u64,
+    /// Punch passes started, and punches that failed. A filesystem that cannot punch fails
+    /// once, and punching stops until the next open; any other failure ends its pass, and the
+    /// next waits for new free space.
+    pub file_punch_passes: (u64, u64),
     /// File reads made synchronously inside async reads: a separated value too large to
     /// cache (D196, #398), a block the cache could not keep, or a read that missed too
     /// often. Zero when async reads never block their executor thread.
@@ -4278,6 +4290,15 @@ impl Engine {
         );
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.file_growths_ahead = (pager.growths_ahead, pager.ahead_nanos);
+        m.file_punches = (pager.punches, pager.punch_nanos);
+        m.file_punch_bytes = pager.punch_bytes;
+        m.file_punched_bytes = pager.punched_bytes;
+        if let Some(p) = &shared.punch {
+            m.file_punch_passes = (
+                p.passes.load(Ordering::Relaxed),
+                p.refusals.load(Ordering::Relaxed),
+            );
+        }
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
         m.default_ts_lead_micros = shared.clock.lead(shared.vfs.now_micros());
         m.block_cache = shared.cache.hits_and_misses();
@@ -7712,6 +7733,13 @@ impl Shared {
             manifest_queue: Default::default(),
             manifest_busy: AtomicBool::new(false),
             pager: Arc::clone(pager),
+            punch: options.punch_freed.then(|| {
+                crate::punch::Punch::new(
+                    options.punch_tuning.unwrap_or_default(),
+                    options.memtable_budget,
+                    shards,
+                )
+            }),
             cache: Arc::clone(cache),
             row_cache: None,
             row_epochs: None,

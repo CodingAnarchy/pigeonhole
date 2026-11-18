@@ -44,7 +44,32 @@ pub struct PagerStats {
 }
 ```
 
-**`pigeonhole-engine` and `pigeonhole` (PR 2):** `Options::punch_freed(bool)`, off by default, which runs the background pass below. Its metrics are the pager's counters, plus refusals.
+**`pigeonhole-engine` and `pigeonhole` (PR 2):**
+
+```rust
+impl pigeonhole::Options {
+    pub fn punch_freed(self, yes: bool) -> Self; // on by default (D333, after g153)
+}
+
+pub struct EngineOptions {
+    // ...
+    pub punch_freed: bool,
+    #[doc(hidden)]
+    pub punch_tuning: Option<PunchTuning>, // tests: smaller reserve and trigger
+}
+
+#[non_exhaustive]
+pub struct PunchTuning {
+    pub min_reserve: u64,   // 64 MiB
+    pub pass_bytes: u64,    // 256 MiB
+    pub bytes_per_sec: u64, // 64 MiB/s
+    pub trigger_bytes: u64, // 64 MiB
+}
+```
+
+- **Metrics** (engine `Metrics`, and public `EngineMetrics` fields, so operators see them; the coordinator, 2026-11-17): `file_punches`, `file_punch_nanos`, `file_punch_bytes`, `file_punched_bytes` (a gauge), `file_punch_passes` and `file_punch_refusals`. `pigeonhole-otel` (and so `phdb serve`'s `/metrics`) exports them as `pigeonhole.file.punches`, `.punch.time`, `.punched` (bytes), `.holes` (the gauge), `.punch.passes` and `.punch.refusals`.
+- **When a pass runs:** after a manifest commit's reclaim (or a shrink's), if the free space that isn't a hole yet is at least the reserve plus `trigger_bytes`, and no pass is running. A pass that finds nothing sets an idle mark: the next waits until that free space grows by `trigger_bytes` (simp724, on #2033).
+- **A pass:** a background task, offloaded to a worker when there is one. It punches one block per slice and stops at `pass_bytes` or at the first `None`, sleeping between blocks to hold `bytes_per_sec` (a simulated clock does not pace). `Unsupported` stops passes until reopen; any other error ends the pass, counted as a refusal.
 
 ## Why
 

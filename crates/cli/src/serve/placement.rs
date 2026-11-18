@@ -1393,8 +1393,7 @@ mod tests {
 
     #[test]
     fn a_plan_leaves_threads_for_the_network_side() {
-        let dir = std::env::temp_dir().join(format!("phdb-placement-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::fresh("phdb-placement-");
         let db = Pigeonhole::open(
             dir.join("p.phdb"),
             Options::default().create_if_missing(true).shards(1),

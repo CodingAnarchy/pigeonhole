@@ -486,6 +486,8 @@ pub(crate) struct Shared {
     /// Held by whoever is committing a manifest batch.
     pub manifest_busy: AtomicBool,
     pub pager: Arc<Pager>,
+    /// Punching free space (D333): `None` when `EngineOptions::punch_freed` is off.
+    pub punch: Option<crate::punch::Punch>,
     pub cache: Arc<BlockCache>,
     /// The row cache (D201): writer process only, `None` when off.
     pub row_cache: Option<crate::row_cache::RowCaches>,
@@ -914,6 +916,25 @@ impl Shared {
     /// Frees extents no view can reach any more (decision D61 clamps to the durable root).
     pub(crate) fn reclaim(&self) {
         self.pager.reclaim(self.oldest_live_manifest());
+        self.maybe_punch();
+    }
+
+    /// Starts a punch pass (D333) if punching is on, none is running and enough free space
+    /// past the reserve is not yet a hole. On the first shard: the pass is offloaded to a
+    /// background worker when there is one.
+    pub(crate) fn maybe_punch(&self) {
+        let Some(punch) = &self.punch else { return };
+        if !punch.should_start(self) {
+            return;
+        }
+        let sent = self
+            .submitters
+            .get()
+            .and_then(|s| s.first())
+            .is_some_and(|s| s.submit(ShardMsg::Punch).is_ok());
+        if !sent {
+            punch.finished();
+        }
     }
 
     /// As [`Shared::reclaim`], skipped if the pager is busy (it may be mid-`fsync`): for the
@@ -1809,6 +1830,8 @@ pub(crate) enum ShardMsg {
     },
     /// Run a manifest pump (a request was queued).
     PumpManifest,
+    /// Run a punch pass (D333; `Shared::maybe_punch` marked one running).
+    Punch,
     /// A table was dropped: forget its tablets' memtables.
     DropTablets {
         tablets: Vec<TabletId>,
@@ -12599,6 +12622,11 @@ impl ShardState {
             }
             ShardMsg::PumpManifest => {
                 ctx.spawn(Box::new(ManifestPump::new(Arc::clone(&self.shared))));
+            }
+            ShardMsg::Punch => {
+                ctx.spawn(Box::new(crate::punch::PunchPass::new(Arc::clone(
+                    &self.shared,
+                ))));
             }
             ShardMsg::DropTablets { tablets } => {
                 if self.drop_tablets(&tablets).is_err() {

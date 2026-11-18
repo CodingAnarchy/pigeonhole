@@ -78,12 +78,13 @@ const OPEN_WAIT: Duration = Duration::from_secs(60);
 /// The restore's progress, in the backup's directory.
 const PROGRESS: &str = "restore-progress.json";
 
-/// A test's fault seam: the next restore from this directory fails at this step
+/// A test's fault seam: the next restore from each of these directories fails at its step
 /// (`"stamped"`: after every stamp, before the map; `"mapped"`: after the map, before the
-/// unfences), as a crash there would leave it.
+/// unfences), as a crash there would leave it. A list, keyed by the directory, so tests
+/// running at once don't take or overwrite each other's (#2015).
 #[cfg(test)]
-pub(crate) static FAIL_AT: std::sync::Mutex<Option<(PathBuf, &'static str)>> =
-    std::sync::Mutex::new(None);
+pub(crate) static FAIL_AT: std::sync::Mutex<Vec<(PathBuf, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn fault(dir: &Path, step: &'static str) -> Result<(), Failure> {
     #[cfg(test)]
@@ -91,8 +92,8 @@ fn fault(dir: &Path, step: &'static str) -> Result<(), Failure> {
         let mut armed = FAIL_AT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if armed.as_ref().is_some_and(|(d, s)| d == dir && *s == step) {
-            *armed = None;
+        if let Some(i) = armed.iter().position(|(d, s)| d == dir && *s == step) {
+            armed.swap_remove(i);
             return Err(Failure::usage(&format!("the test's fault after {step}")));
         }
     }
