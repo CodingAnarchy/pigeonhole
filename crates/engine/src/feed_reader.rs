@@ -3745,7 +3745,6 @@ fn set_out_xid(out: &mut Option<Arc<[u8]>>, xids: &mut HashMap<Seqno, Arc<[u8]>>
     *out = xids.remove(&key);
 }
 
-
 /// The count's flags (`BatchRef::count_flags`): the silent mark and the xid trailer's bit.
 const SILENT_FLAG: u8 = (pigeonhole_format::wal::SILENT_BATCH >> 24) as u8;
 const XID_FLAG: u8 = (pigeonhole_format::wal::XID_BATCH >> 24) as u8;
@@ -3760,6 +3759,7 @@ fn set_read_xid_of(slot: &mut Option<Arc<[u8]>>, batch: BatchRef<'_>) {
     }
 }
 
+/// Sets the reader's slot to an external share's xid (D329 2b), out of line.
 #[cold]
 #[inline(never)]
 fn set_read_xid(slot: &mut Option<Arc<[u8]>>, xid: &[u8]) {
