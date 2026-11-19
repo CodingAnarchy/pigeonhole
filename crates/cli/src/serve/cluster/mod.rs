@@ -3143,15 +3143,17 @@ fn open_partition(
             let _ = db.close();
             Ok(None)
         }
-        // D331 (simp724's B3): below a map that hands a range of it over, at that epoch (one
-        // above, or past a promote's floor: #2070): a crash after the map's persist and
-        // before the source's stamp. The open finishes the hand-over (the moved-away row,
-        // then the stamp) before it serves.
+        // D331 (simp724's B3): just below a map that hands a range of it over, at that epoch:
+        // a crash after the map's persist and before the source's stamp. The open finishes
+        // the hand-over (the moved-away row, then the stamp) before it serves. The map's
+        // epoch is exactly the hand-over's from the file's: one above, or past a promote's
+        // floor (#2070, ai1249's review), so a file staler than that isn't served.
         Ok(Some(id))
             if id.cluster_id == want.cluster_id
                 && id.partition_id == want.partition_id
                 && id.epoch < epoch
                 && let Ok(Some(map)) = read_map(dir)
+                && epoch == id.epoch.max(promote::promote_floor(&map, partition)) + 1
                 && let Some(m) = moves::handing_over(&map, partition) =>
         {
             match moves::finish_hand_over(&db, m, epoch, dir) {

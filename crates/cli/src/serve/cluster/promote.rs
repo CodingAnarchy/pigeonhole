@@ -336,16 +336,21 @@ pub(crate) fn next_epoch(m: &proto::ClusterMap, p: &proto::Partition) -> u64 {
 
 /// Whether `e` is kept in `m` whatever the event count: pending, or abandoned while its
 /// partition's epoch is at or below its `to_epoch`, where it's the floor (#2070,
-/// simp724). Past it, P's epoch is the floor itself.
+/// simp724), or while a hand-over of the partition is in flight. Past that, P's epoch is
+/// the floor itself.
 pub(crate) fn pinned(m: &proto::ClusterMap, e: &proto::FailoverEvent) -> bool {
     use proto::{FailoverKind as K, FailoverState as St};
     match e.state() {
         St::Pending => true,
+        // While a hand-over of its partition is in flight, too: a source that crashed before
+        // its stamp checks its file against the floor when it opens (ai1249's review).
         St::Abandoned => {
             e.kind() == K::Partition
-                && m.partitions
+                && (m
+                    .partitions
                     .iter()
                     .any(|p| p.id == e.partition && p.epoch <= e.to_epoch)
+                    || super::moves::handing_over(m, &e.partition).is_some())
         }
         _ => false,
     }

@@ -2266,6 +2266,38 @@ mod tests {
         assert!(!m.failovers.iter().any(|e| e.partition == "p3"), "pruned");
     }
 
+    /// #2070 (ai1249's review): an abandoned promote's event stays pinned while a hand-over
+    /// of its partition is in flight, though the hand-over took the partition past it: a
+    /// source that crashed before its stamp checks its file against that floor when it opens.
+    #[test]
+    fn an_abandoned_promote_stays_pinned_while_a_hand_over_of_its_partition_is_in_flight() {
+        use crate::serve::proto::FailoverState as S;
+        let mut m = moving(MovePhase::HandedOver);
+        m.partitions[0].epoch = 3;
+        let mut e = pending("p1", "c", 2);
+        e.set_state(S::Abandoned);
+        m.failovers.push(e);
+        let done = |i: u64| {
+            let mut d = pending("p2", "a", 10 + i);
+            d.set_state(S::Done);
+            d
+        };
+        for i in 0..=FAILOVER_EVENTS as u64 {
+            super::super::promote::push_event(&mut m, done(i));
+        }
+        assert!(
+            m.failovers.iter().any(|e| e.partition == "p1"),
+            "pinned while p1's hand-over is in flight"
+        );
+        // The move done (PR 5 removes it once the source stamped): the floor is p1's epoch.
+        m.moves.clear();
+        super::super::promote::push_event(&mut m, done(99));
+        assert!(
+            !m.failovers.iter().any(|e| e.partition == "p1"),
+            "pruned once the hand-over is done"
+        );
+    }
+
     /// #2070: a hand-over after an abandoned promote never lands on the orphan's stamped
     /// epoch; it takes the source past it.
     #[test]

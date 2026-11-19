@@ -1912,6 +1912,17 @@ fn failover_rig_with(on: bool, replicas: &[&str]) -> Rig {
             map_of(c).await.failover == on
         })
         .await;
+        // The writer has seen c renew p3 since it started (after its start grace): without
+        // that, it fails nothing over by design (simp724's B1 on #2069), and a test that cuts
+        // c sooner raced it (a macOS CI failure on #2087).
+        eventually_within(Duration::from_secs(10), "a to grant c's p3", async || {
+            status_of(a)
+                .await
+                .grants
+                .iter()
+                .any(|g| g.partition == "p3" && g.holder == "c")
+        })
+        .await;
     });
     t
 }
