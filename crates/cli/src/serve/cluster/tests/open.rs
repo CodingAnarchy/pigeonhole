@@ -361,6 +361,7 @@ fn opened_off_the_others_cores_alone() {
         failover: false,
         failover_rejoin: false,
         failovers: Vec::new(),
+        moves: Vec::new(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
