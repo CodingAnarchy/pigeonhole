@@ -298,6 +298,17 @@ impl Fences {
         self.local().entry(id.to_owned()).or_default().is = Is::Served(Served { gate, epoch });
     }
 
+    /// Partition `id`, served here, is at `epoch` now (D331's hand-over raised it on its
+    /// own node): its lease rounds ask at it.
+    pub(super) fn raise_epoch(&self, id: &str, epoch: u64) {
+        if let Some(Local {
+            is: Is::Served(s), ..
+        }) = self.local().get_mut(id)
+        {
+            s.epoch = s.epoch.max(epoch);
+        }
+    }
+
     pub(super) fn gate(&self, id: &str) -> Option<(Arc<WriteGate>, u64)> {
         match &self.local().get(id)?.is {
             Is::Served(s) => Some((Arc::clone(&s.gate), s.epoch)),
@@ -1175,6 +1186,12 @@ impl Node {
             self.fences
                 .retrying
                 .store(false, std::sync::atomic::Ordering::Release);
+            // Said, not silent (simp724's nit on D331 PR 2): a partition that asked for a
+            // lease here would otherwise hold it only until its first grant runs out.
+            eprintln!(
+                "phdb serve: the lease renewals can't start here (no runtime); the next \
+                 call from the node's runtime starts them"
+            );
             return;
         };
         let me = Arc::downgrade(self);

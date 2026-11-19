@@ -422,6 +422,7 @@ mod tests {
             failover: false,
             failover_rejoin: false,
             failovers: Vec::new(),
+            moves: Vec::new(),
         }
     }
 

@@ -25,6 +25,7 @@ pub(crate) mod load;
 pub(crate) mod map;
 mod memfan;
 pub(crate) mod memwatch;
+mod moves;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
@@ -76,7 +77,12 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     INDEX_BULK_LOAD_FEATURE,
     LEASES_FEATURE,
     WRITER_TERMS_FEATURE,
+    RANGE_MOVES_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
+/// field from its copy, read as divergent, and gate no moving range.
+pub(crate) const RANGE_MOVES_FEATURE: &str = "range_moves";
 
 /// [`MAP_FEATURES`]' name for a build that serves `Cluster.Lease` (D326 amendment 1, #2048):
 /// a peer whose `Lease` answers `Unimplemented` counts as granting only if its `Status`
@@ -163,6 +169,7 @@ pub(crate) const WRITER_TERMS_FEATURE: &str = "writer_terms";
 pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
+
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
 const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
@@ -689,6 +696,10 @@ impl Node {
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
         self.end_moved_feeds(version);
+        // D331: each partition's range gate, and a source's hand-over.
+        if let Some(m) = &installed {
+            self.apply_moves(m);
+        }
         self.wake_copies(&moved);
         Ok(version)
     }
@@ -844,6 +855,11 @@ impl Node {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
                     .await?;
             }
+            // So does the first range move (D331).
+            if current.moves.is_empty() && !map.moves.is_empty() {
+                self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -868,6 +884,10 @@ impl Node {
             }
             if !map.indexes.is_empty() {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
+                    .await?;
+            }
+            if !map.moves.is_empty() {
+                self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
                     .await?;
             }
             if map::uses_failover(&map) || map.writer_term > 0 {
@@ -1502,6 +1522,10 @@ impl Node {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
                 }
+            }
+            // D331: the moves naming it (the follower's lag comes with PR 4's follower).
+            if let Some(m) = &map {
+                lp.moves = crate::serve::ranges::statuses(m, &id);
             }
         }
         let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
@@ -2559,10 +2583,13 @@ pub(crate) fn run(
         .map_err(|e| Failure::usage(&e))?;
     let parts: Vec<(String, super::service::Service)> = opened
         .iter()
-        .map(|o| {
+        .map(|o| -> Result<_, Failure> {
             // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
             let gate = node.open_gate(&o.id, epoch);
+            // D331: its range gate, before it serves.
+            node.arm_ranges(&gate, &o.id, &o.db, || ())
+                .map_err(|e| Failure::usage(&format!("partition {}: {e}", o.id)))?;
             let config = super::service::PartitionConfig {
                 backups: Arc::clone(&backups),
                 placement: Some(Arc::clone(&placement)),
@@ -2573,9 +2600,9 @@ pub(crate) fn run(
             // A text index rebuild a fence or a shutdown stopped carries on once the
             // partition takes writes (#1756).
             part.resume_text_rebuilds();
-            (o.id.clone(), part)
+            Ok((o.id.clone(), part))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let serving = if mine.is_empty() {
         format!(
             "no partition, routing only, as cluster node {id} of {}; map version {version}",
@@ -3018,6 +3045,27 @@ fn open_partition(
         {
             let _ = db.close();
             Ok(None)
+        }
+        // D331 (simp724's B3): one epoch below a map that hands a range of it over, at that
+        // epoch: a crash after the map's persist and before the source's stamp. The open
+        // finishes the hand-over (the moved-away row, then the stamp) before it serves.
+        Ok(Some(id))
+            if id.cluster_id == want.cluster_id
+                && id.partition_id == want.partition_id
+                && id.epoch + 1 == epoch
+                && let Ok(Some(map)) = read_map(dir)
+                && let Some(m) = moves::handing_over(&map, partition) =>
+        {
+            match moves::finish_hand_over(&db, m, epoch, dir) {
+                Ok(_) => Ok(Some(db)),
+                Err(e) => {
+                    let _ = db.close();
+                    Err(Failure::usage(&format!(
+                        "partition {partition:?}: finishing move {:?}'s hand-over: {e}",
+                        m.id
+                    )))
+                }
+            }
         }
         found => {
             let _ = db.close();

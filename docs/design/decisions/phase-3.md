@@ -5190,6 +5190,13 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - A feed retention hold with a cap.
 - A silent commit crosses replication as a version 2 event, which builds before D331 refuse.
 
+**PR 2 (the map record and the gates, ICR 0117's D331 PR 2 section):**
+- **Tables an index follows don't move in 1.3.0** (coordinator, 2026-11-18). A text index's postings and a vector index's lists hold ids from both sides of any range. A move, split or merge of such a table is refused, naming the index; #2066 lifts it.
+- **T serves the range from CLEANING:** the writer sets CLEANING once the never-both rule holds, so T's gate reads only the phase.
+- **S records each moved range in its file** and answers it `WrongPartition`, whoever sends the call, until a later move gives it back. Its row is pruned at the later of every node holding the hand-over map and the transaction lifetime plus the request timeout.
+- **Transactions open across a hand-over** answer `Conflict` when they write, whatever they read, because serve doesn't see their read sets. Read-only commits pass.
+- **The hand-over raises S's epoch in place:** a lapse, the identity row and a new lease at once, keeping S's history.
+
 **PRs.** 1, the engine; 2, the map record and the gates; 3, the paths that must clip, the cluster feed's hold, and backups; 4, the copy and the range follower; 5, the driver, hand-over, cleanup and CLI; 6, merge. Follow-ups #2052 (SST ingest for the copy) and #2053 (dropping whole SSTs on cleanup), both Post-1.0 unless perf287's box run says otherwise.
 
 **Design:** `.coord/cli692-design-1499.md` (with simp724's, perf287's and Amendment 5's reviews), `.coord/ai1249-plan-1499.md`.

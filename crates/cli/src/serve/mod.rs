@@ -44,6 +44,7 @@ mod mcp_backend;
 mod memory;
 mod memslot;
 mod placement;
+mod ranges;
 mod replica;
 mod router;
 mod service;
