@@ -1719,7 +1719,7 @@ pub struct FeedEvent {
     /// On a cluster subscription, the partition the event came from; empty on a single node.
     #[prost(string, tag = "5")]
     pub partition: ::prost::alloc::string::String,
-    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6")]
+    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
 /// Nested message and enum types in `FeedEvent`.
@@ -1735,7 +1735,26 @@ pub mod feed_event {
         /// A cluster subscription's partition became unavailable or available again.
         #[prost(message, tag = "6")]
         PartitionState(super::PartitionState),
+        /// D331: internal to a cluster subscription, never sent to a client. A move's target
+        /// emits it in its component just before the first event past the move's hand-over:
+        /// the entry node's merge holds the component there until the source's has passed the
+        /// move's last seqno (per-key order across the hand-over). 7 is D329's.
+        #[prost(message, tag = "8")]
+        MoveBarrier(super::MoveBarrier),
     }
+}
+/// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveBarrier {
+    #[prost(string, tag = "1")]
+    pub move_id: ::prost::alloc::string::String,
+    /// The move's source partition.
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    /// The source's last seqno of the range: the target's component waits until the source's
+    /// has passed it.
+    #[prost(uint64, tag = "3")]
+    pub final_seqno: u64,
 }
 /// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
 /// which keeps the stream open; sent at the start for each partition unavailable then, and
@@ -7860,6 +7879,12 @@ pub struct ForwardSubscribeRequest {
     /// most 64 of them; 0: none.
     #[prost(uint64, tag = "5")]
     pub skip_through: u64,
+    /// D331: start the component at this partition's hand-over position for the request's
+    /// tables (the earliest of its serving rows' tokens), not `request`'s start: a cluster
+    /// resume whose token lacks this partition because a range move gave it the tables since.
+    /// `FeedExpired` if no move did, or its feed has trimmed past that position.
+    #[prost(bool, tag = "6")]
+    pub from_hand_over: bool,
 }
 /// D326: a node's lease round asks each node of its map, itself included, for a grant.
 #[derive(Clone, PartialEq, ::prost::Message)]

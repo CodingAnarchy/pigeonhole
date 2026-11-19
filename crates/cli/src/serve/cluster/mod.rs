@@ -600,7 +600,7 @@ impl Node {
     }
 
     /// The node's map, or `NotFound` before it has one.
-    fn get_map(&self) -> Result<ClusterMap, ApiError> {
+    pub(crate) fn get_map(&self) -> Result<ClusterMap, ApiError> {
         self.state()
             .map
             .as_ref()
@@ -3065,6 +3065,37 @@ fn open_replica_copy(
     Ok(db)
 }
 
+/// D331 PR 3: a restored file (its stamp left the clip marker) is clipped to the map in
+/// `dir` before it serves ([`moves::clip_restored`]); the marker stays until the clip is done,
+/// so a clip that stopped runs again at the next open.
+fn clip_if_restored(
+    dir: &Path,
+    db: &pigeonhole::Pigeonhole,
+    partition: &str,
+) -> Result<(), String> {
+    if !crate::serve::ranges::clip_pending(db)? {
+        return Ok(());
+    }
+    let map = read_map(dir)?.ok_or("no cluster map to clip to")?;
+    let c = moves::clip_restored(db, &map, partition)?;
+    eprintln!(
+        "phdb serve: partition {partition}: the restored file is clipped to the map: {} rows \
+         outside its ranges deleted{}",
+        c.deleted,
+        if c.in_doubt == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {} cluster transaction(s) in doubt here could still write outside them, so \
+                 the clip runs again at the next open: decide them (phdb cluster txn decide), \
+                 then reopen the partition",
+                c.in_doubt
+            )
+        }
+    );
+    Ok(())
+}
+
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
@@ -3095,7 +3126,15 @@ fn open_partition(
         epoch,
     };
     match identity::read(&db) {
-        Ok(Some(id)) if id == want => Ok(Some(db)),
+        Ok(Some(id)) if id == want => match clip_if_restored(dir, &db, partition) {
+            Ok(()) => Ok(Some(db)),
+            Err(e) => {
+                let _ = db.close();
+                Err(Failure::usage(&format!(
+                    "partition {partition:?}: clipping the restored file to the map: {e}"
+                )))
+            }
+        },
         Ok(Some(id))
             if id.cluster_id == want.cluster_id
                 && id.partition_id == want.partition_id

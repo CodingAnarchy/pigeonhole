@@ -16,8 +16,13 @@ use pigeonhole_io::FileRef;
 
 use crate::{Error, Result, SstWriterOptions};
 
-/// Pending bytes are written to the file once this much has accumulated.
-const FLUSH_BYTES: usize = 1 << 20;
+/// Pending bytes are written to the file once this much has accumulated, and each write's
+/// writeback started (D334). 256 KiB, not 1 MiB (the 1.3.0 pre-gate): a hint queues its
+/// whole range at the device at once, and a WAL group sync's small write that lands behind
+/// a megabyte of data writes waited ~100 µs more at p99.9 on the contended GroupSync rows.
+/// A quarter of that keeps #1991's trickle (the root commit's sync still finds the output
+/// written back) without the tail.
+const FLUSH_BYTES: usize = 256 << 10;
 
 /// Largest target size of an index partition.
 const MAX_PARTITION_BYTES: usize = 4096;

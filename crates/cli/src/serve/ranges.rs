@@ -59,7 +59,7 @@ const SERVING: &[u8] = b"serving/";
 /// request timeout since it"; a node that never comes back keeps it. It's a plain logged
 /// write, so it's in the partition's feed and reaches its replica copies, and a promoted
 /// copy keeps answering for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Moved {
     /// The move's id (`RangeMove.id`).
     pub id: String,
@@ -77,6 +77,15 @@ pub(crate) struct Moved {
     /// When this partition recorded it, in milliseconds since the Unix epoch on its clock:
     /// the prune's time bound (the transaction lifetime plus the request timeout since).
     pub at_ms: u64,
+    /// The move's `final_seqno` from the map's record (D331 PR 3b, both kinds); a serving
+    /// row's (empty on a moved-away row): the move's source, and this partition's D310 feed
+    /// token at
+    /// `t_from` (`seqno`), taken from a feed of the table before the gate opened the range.
+    /// A cluster component that starts at or before it carries a barrier there
+    /// ([`super::feed::Barrier`]), and a resume that gained this partition starts there.
+    pub source: String,
+    pub final_seqno: u64,
+    pub token: Vec<u8>,
 }
 
 /// The moved-away rows in `db`.
@@ -142,6 +151,11 @@ fn read_rows(db: &Pigeonhole, prefix: &[u8]) -> Result<Vec<Moved>, String> {
             version: number(b"version")?,
             seqno: number(b"seqno")?,
             at_ms: number(b"at")?,
+            source: String::from_utf8(bytes(b"source").unwrap_or_default()).unwrap_or_default(),
+            final_seqno: bytes(b"final")
+                .and_then(|b| std::str::from_utf8(&b).ok()?.parse().ok())
+                .unwrap_or(0),
+            token: bytes(b"token").unwrap_or_default(),
             id,
         });
     }
@@ -171,6 +185,14 @@ fn write_row(db: &Pigeonhole, prefix: &[u8], m: &Moved) -> Result<(), String> {
     if let Some(end) = &m.end {
         w = w.put(FAMILY, b"end", end);
     }
+    if m.final_seqno != 0 {
+        w = w.put(FAMILY, b"final", m.final_seqno.to_string().as_bytes());
+    }
+    if !m.source.is_empty() {
+        w = w
+            .put(FAMILY, b"source", m.source.as_bytes())
+            .put(FAMILY, b"token", &m.token);
+    }
     w.commit()
         .map(|_| ())
         .map_err(|e| format!("record the moved-away range of move {:?}: {e}", m.id))
@@ -191,6 +213,65 @@ pub(crate) fn mark_fence(db: &Pigeonhole, id: &str) -> Result<u64, String> {
         .commit()
         .map_err(|e| format!("mark move {id:?}'s fence: {e}"))?;
     Ok(before)
+}
+
+/// The clip marker's row (D331 PR 3): a restore's stamp leaves it in a restored file, and
+/// the file's open clips it to the map's ranges before it serves, then removes it. Left
+/// there by a clip that stopped, so the next open runs it again (cli692's F5).
+const CLIP: &[u8] = b"clip";
+
+/// Leaves the clip marker in `db` (a restore's stamp).
+pub(crate) fn mark_clip(db: &Pigeonhole) -> Result<(), String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    t.mutate(CLIP)
+        .put(FAMILY, b"at", db.visible_seqno().to_string().as_bytes())
+        .commit()
+        .map(|_| ())
+        .map_err(|e| format!("mark the restored file for its clip: {e}"))
+}
+
+/// Whether `db` holds the clip marker.
+pub(crate) fn clip_pending(db: &Pigeonhole) -> Result<bool, String> {
+    let t = match db.table(identity::TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(false),
+        Err(e) => return Err(format!("read {}: {e}", identity::TABLE)),
+    };
+    if !t.families().contains(&FAMILY) {
+        return Ok(false);
+    }
+    t.get(CLIP, FAMILY, b"at")
+        .map(|c| c.is_some())
+        .map_err(|e| format!("read the clip marker: {e}"))
+}
+
+/// Removes the clip marker from `db`, once the clip is done.
+pub(crate) fn clear_clip(db: &Pigeonhole) -> Result<(), String> {
+    delete_row(db, CLIP)
+}
+
+/// Replaces moved-away row `old` in `db` with the pieces `pieces` of its range (a restore's
+/// map gives the partition the rest), each as row `<id>~<n>`; none: just deleted.
+pub(crate) fn rewrite_moved(db: &Pigeonhole, old: &Moved, pieces: &[Moved]) -> Result<(), String> {
+    for p in pieces {
+        write_row(db, PREFIX, p)?;
+    }
+    delete_row(db, &[PREFIX, old.id.as_bytes()].concat())
+}
+
+fn delete_row(db: &Pigeonhole, row: &[u8]) -> Result<(), String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    t.mutate(row)
+        .delete_row()
+        .commit()
+        .map(|_| ())
+        .map_err(|e| format!("delete {}: {e}", String::from_utf8_lossy(row)))
 }
 
 /// What a span refuses.
@@ -217,6 +298,17 @@ struct Span {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
     rule: Rule,
+    /// A target's span from a move at CLEANING, waiting for its serving row: kept when the
+    /// map drops the move until the row is here (simp724's S3 on PR 3a). An aborted move's
+    /// span never is: it never gets a row.
+    ///
+    /// In memory only, so a copy that restarts after the map dropped the move, and before
+    /// the row reached it, rebuilds without the wait. That's safe only through D328's
+    /// freshness rule (cli692): the serving row is written at CLEANING, long before PR 5
+    /// drops the record after the source's cleanup, so a copy fresh enough to serve already
+    /// has the row, and a stale one sends its reads to the owner. Loosening either rule
+    /// needs this one to be persisted.
+    awaits_row: bool,
 }
 
 impl Span {
@@ -372,6 +464,38 @@ impl RangeState {
 }
 
 impl RangeState {
+    /// Whether every key of `table` is in a range this partition moved away (feed1248's M3
+    /// on PR 3b): its `Moved` spans cover the table from its first key on, unbroken.
+    pub(crate) fn moved_whole(&self, table: &str) -> bool {
+        let mut spans: Vec<&Span> = self
+            .spans
+            .iter()
+            .filter(|s| s.rule == Rule::Moved && s.table == table)
+            .collect();
+        spans.sort_by(|a, b| a.start.cmp(&b.start));
+        let mut reached: Vec<u8> = Vec::new();
+        for s in spans {
+            if s.start > reached {
+                return false;
+            }
+            match &s.end {
+                None => return true,
+                Some(e) if *e > reached => reached = e.clone(),
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a move into this partition still withholds a range of `table` (its target,
+    /// before CLEANING or before its serving row is here): a resume that gained the
+    /// partition asks again shortly rather than expiring (cli692's M1 on PR 3b).
+    pub(crate) fn awaits_hand_over(&self, table: &str) -> bool {
+        self.spans
+            .iter()
+            .any(|s| s.rule == Rule::Unserved && s.table == table)
+    }
+
     /// Whether it fences move `id`'s range.
     pub(crate) fn fences(&self, id: &str) -> bool {
         self.spans
@@ -387,6 +511,15 @@ pub(crate) struct RangeGate {
     state: ArcSwapOption<RangeState>,
     moved: Mutex<Vec<Moved>>,
     serving: Mutex<Vec<Moved>>,
+    /// The state waits for a row the file doesn't hold yet: a replica copy's follower, which
+    /// brings rows in, reloads them after each run it applies while this is set (PR 3).
+    pending: std::sync::atomic::AtomicBool,
+    /// The visible seqno of the file when its rows here were read ([`load_rows_at`]).
+    rows_at: std::sync::atomic::AtomicU64,
+    /// Bumped whenever the serving or moved-away rows or the state change (PR 3b): a running
+    /// cluster component of the partition looks for a new hand-over's barrier, or for its
+    /// tables having moved away whole (feed1248's M3 on PR 3b), when it moves.
+    rows_version: std::sync::atomic::AtomicU64,
 }
 
 impl RangeGate {
@@ -406,6 +539,30 @@ impl RangeGate {
     pub(crate) fn load_rows(&self, moved: Vec<Moved>, serving: Vec<Moved>) {
         *self.moved() = moved;
         *self.serving() = serving;
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// [`load_rows`](Self::load_rows) for rows read at the file's visible seqno `visible`,
+    /// unless rows read later are here already (simp724's N1 on PR 3a: a copy's follower and
+    /// a map install each read and load them, and an older read mustn't land last). Whether
+    /// it took them.
+    pub(crate) fn load_rows_at(
+        &self,
+        moved: Vec<Moved>,
+        serving: Vec<Moved>,
+        visible: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut m = self.moved();
+        if visible < self.rows_at.load(Ordering::Acquire) {
+            return false;
+        }
+        *m = moved;
+        *self.serving() = serving;
+        self.rows_at.store(visible, Ordering::Release);
+        self.rows_version.fetch_add(1, Ordering::Release);
+        true
     }
 
     fn serving(&self) -> std::sync::MutexGuard<'_, Vec<Moved>> {
@@ -417,6 +574,25 @@ impl RangeGate {
         let mut serving = self.serving();
         serving.retain(|m| m.id != row.id);
         serving.push(row);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The rows' and state's version ([`rows_version`]): one load.
+    #[inline]
+    pub(crate) fn rows_version(&self) -> u64 {
+        self.rows_version.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The moved-away rows the file holds, for a cluster component of a table moved away
+    /// whole (PR 3b).
+    pub(crate) fn moved_rows(&self) -> Vec<Moved> {
+        self.moved().clone()
+    }
+
+    /// The serving rows the file holds, for a cluster component's start and barriers.
+    pub(crate) fn serving_rows(&self) -> Vec<Moved> {
+        self.serving().clone()
     }
 
     /// Whether the file records that it serves move `id`'s range.
@@ -429,6 +605,8 @@ impl RangeGate {
         let mut moved = self.moved();
         moved.retain(|m| m.id != row.id);
         moved.push(row);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether the file already records move `id`'s hand-over.
@@ -440,7 +618,7 @@ impl RangeGate {
     /// it in; `visible` is the partition's visible seqno now, a new fence's seqno.
     pub(crate) fn update(&self, map: &ClusterMap, partition: &str, visible: u64) {
         let prev = self.state.load_full();
-        let next = derive(
+        let (next, pending) = derive(
             map,
             partition,
             &self.moved(),
@@ -449,12 +627,24 @@ impl RangeGate {
             visible,
         );
         self.state.store(next.map(Arc::new));
+        self.pending
+            .store(pending, std::sync::atomic::Ordering::Release);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the state waits for a row the file doesn't hold yet (see `pending`).
+    pub(crate) fn pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/// `partition`'s state under `map`, with its moved-away rows `moved`; `prev` its state
-/// before (a fence keeps its seqno while it stands), `visible` its visible seqno now.
-/// `None` when nothing gates it.
+/// `partition`'s state under `map`, with its moved-away rows `moved` and serving rows
+/// `serving`; `prev` its state before (a fence keeps its seqno while it stands), `visible`
+/// its visible seqno now. `None` when nothing gates it; and whether it waits for a row the
+/// file doesn't hold yet (a replica copy whose follower hasn't applied it: a target's
+/// serving row at CLEANING, or a source's moved-away row once the map dropped its move,
+/// whose span it keeps from `prev` meanwhile).
 fn derive(
     map: &ClusterMap,
     partition: &str,
@@ -462,9 +652,10 @@ fn derive(
     serving: &[Moved],
     prev: Option<&RangeState>,
     visible: u64,
-) -> Option<RangeState> {
+) -> (Option<RangeState>, bool) {
     let mut spans = Vec::new();
     let mut handover_seqno = 0;
+    let mut pending = false;
     let span = |m: &super::proto::RangeMove, rule| {
         let (start, end) = map::move_range(m).ok()?;
         Some(Span {
@@ -473,6 +664,7 @@ fn derive(
             start,
             end,
             rule,
+            awaits_row: false,
         })
     };
     for m in &map.moves {
@@ -497,7 +689,12 @@ fn derive(
         {
             // Served from CLEANING on, once its serving row is in the file (written before
             // the gate opens it, so nothing of the range lands here below its `t_from`).
-            spans.extend(span(m, Rule::Unserved));
+            let cleaning = phase >= MovePhase::Cleaning;
+            spans.extend(span(m, Rule::Unserved).map(|s| Span {
+                awaits_row: cleaning,
+                ..s
+            }));
+            pending |= cleaning;
         }
     }
     // The rows of moves the map no longer carries: each part of the range a later move
@@ -543,6 +740,7 @@ fn derive(
                         start: both.0.clone(),
                         end: both.1.clone(),
                         rule: Rule::Returned,
+                        awaits_row: false,
                     });
                     away = away.into_iter().flat_map(|a| subtract(&a, &both)).collect();
                 }
@@ -553,11 +751,28 @@ fn derive(
                 start,
                 end,
                 rule: Rule::Moved,
+                awaits_row: false,
             }));
         }
     }
+    // A move the map dropped whose row hasn't reached this file yet (a replica copy behind
+    // its owner): a source's span, or a target's from CLEANING (simp724's S3), kept until
+    // the row does.
+    if let Some(prev) = prev {
+        for s in prev.spans.iter().filter(|s| {
+            !map.moves.iter().any(|m| m.id == s.move_id)
+                && match s.rule {
+                    Rule::Moved => !moved.iter().any(|r| r.id == s.move_id),
+                    Rule::Unserved => s.awaits_row && !serving.iter().any(|r| r.id == s.move_id),
+                    _ => false,
+                }
+        }) {
+            spans.push(s.clone());
+            pending = true;
+        }
+    }
     if spans.is_empty() {
-        return None;
+        return (None, pending);
     }
     let fenced = |s: &RangeState| s.spans.iter().any(|x| x.rule == Rule::Fenced);
     let fence_seqno = if spans.iter().any(|s| s.rule == Rule::Fenced) {
@@ -566,20 +781,23 @@ fn derive(
     } else {
         0
     };
-    Some(RangeState {
-        partition: partition.to_owned(),
-        map_version: map.map_version,
-        spans,
-        fence_seqno,
-        handover_seqno,
-    })
+    (
+        Some(RangeState {
+            partition: partition.to_owned(),
+            map_version: map.map_version,
+            spans,
+            fence_seqno,
+            handover_seqno,
+        }),
+        pending,
+    )
 }
 
 /// A key range, `[start, end)`; `end` `None`: to the table's end.
-type KeyRange = (Vec<u8>, Option<Vec<u8>>);
+pub(crate) type KeyRange = (Vec<u8>, Option<Vec<u8>>);
 
 /// `a` and `b`'s overlap, if they overlap.
-fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
+pub(crate) fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
     let start = a.0.clone().max(b.0.clone());
     let end = match (&a.1, &b.1) {
         (None, e) | (e, None) => e.clone(),
@@ -591,7 +809,7 @@ fn intersect(a: &KeyRange, b: &KeyRange) -> Option<KeyRange> {
 }
 
 /// What's left of `a` once `b` is taken out: none, one or two ranges.
-fn subtract(a: &KeyRange, b: &KeyRange) -> Vec<KeyRange> {
+pub(crate) fn subtract(a: &KeyRange, b: &KeyRange) -> Vec<KeyRange> {
     let Some(both) = intersect(a, b) else {
         return vec![a.clone()];
     };
@@ -739,6 +957,7 @@ mod tests {
             start: b"c".to_vec(),
             end: Some(b"f".to_vec()),
             rule: Rule::Moved,
+            awaits_row: false,
         };
         assert!(s.overlaps(Touch::Row(b"c")));
         assert!(s.overlaps(Touch::Row(b"e\xff")));
@@ -810,6 +1029,7 @@ mod tests {
             version: 5,
             seqno: 30,
             at_ms: 0,
+            ..Default::default()
         };
         let cleaning = map(Some(MovePhase::Cleaning));
         assert!(
@@ -877,6 +1097,7 @@ mod tests {
             version,
             seqno: 40,
             at_ms: 0,
+            ..Default::default()
         };
         // The move is done and gone from the map, which gives `[c, f)` to p2.
         let mut done = map(None);
@@ -940,6 +1161,89 @@ mod tests {
             .load_full()
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_copy_waits_for_the_rows_its_follower_brings() {
+        // A copy of the source, whose map already dropped the move but whose file hasn't
+        // got the moved-away row: it keeps the span it had, and waits for the row.
+        let mut handed = map(Some(MovePhase::HandedOver));
+        handed.tables[0] = map::handed_over(&handed.tables[0], b"c", Some(b"f"), "p2");
+        let g = gate(&handed, "p1", Vec::new(), 10);
+        let mut done = map(None);
+        done.tables[0] = handed.tables[0].clone();
+        g.update(&done, "p1", 11);
+        assert!(g.pending(), "waits for its row");
+        let s = g.state.load_full().expect("still gated");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("WrongPartition"));
+        // The row arrives: no longer waiting, still gated, now from the row.
+        let row = Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"f".to_vec()),
+            term: 0,
+            version: 5,
+            seqno: 9,
+            at_ms: 0,
+            ..Default::default()
+        };
+        g.load_rows(vec![row.clone()], Vec::new());
+        g.update(&done, "p1", 12);
+        assert!(!g.pending());
+        let s = g.state.load_full().expect("gated");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("WrongPartition"));
+        // A copy of the target at CLEANING waits for its serving row, then serves.
+        let cleaning = map(Some(MovePhase::Cleaning));
+        let t = gate(&cleaning, "p2", Vec::new(), 10);
+        assert!(t.pending());
+        assert!(t.state.load_full().is_some());
+        t.load_rows(
+            Vec::new(),
+            vec![Moved {
+                id: "mv1".into(),
+                ..row
+            }],
+        );
+        t.update(&cleaning, "p2", 11);
+        assert!(!t.pending());
+        assert!(t.state.load_full().is_none(), "serves it");
+    }
+
+    /// simp724's S3 on PR 3a: a target's copy at CLEANING without its serving row keeps
+    /// refusing the range when the map drops the move, until the row arrives; an aborted
+    /// move's target span is never kept (it never gets a row).
+    #[test]
+    fn a_targets_copy_waits_for_its_serving_row_after_the_map_drops_the_move() {
+        let g = gate(&map(Some(MovePhase::Cleaning)), "p2", Vec::new(), 10);
+        let mut done = map(None);
+        done.tables[0] = map::handed_over(&done.tables[0], b"c", Some(b"f"), "p2");
+        g.update(&done, "p2", 11);
+        assert!(g.pending());
+        let s = g.state.load_full().expect("still refusing");
+        assert_eq!(code(&s, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        g.load_rows(
+            Vec::new(),
+            vec![Moved {
+                id: "mv1".into(),
+                table: "users".into(),
+                start: b"c".to_vec(),
+                end: Some(b"f".to_vec()),
+                term: 0,
+                version: 5,
+                seqno: 9,
+                at_ms: 0,
+                ..Default::default()
+            }],
+        );
+        g.update(&done, "p2", 12);
+        assert!(!g.pending());
+        assert!(g.state.load_full().is_none(), "serves it");
+        // Aborted at COPYING: the map drops it, and nothing waits.
+        let g = gate(&map(Some(MovePhase::Copying)), "p2", Vec::new(), 10);
+        g.update(&map(None), "p2", 11);
+        assert!(!g.pending());
+        assert!(g.state.load_full().is_none());
     }
 
     #[test]
@@ -1008,6 +1312,7 @@ mod tests {
             version: 7,
             seqno: 40,
             at_ms: 0,
+            ..Default::default()
         };
         let s = gate(&map(Some(MovePhase::HandedOver)), "p1", vec![row], 50)
             .state
@@ -1040,6 +1345,7 @@ mod tests {
                 version: 7,
                 seqno: 40,
                 at_ms: 0,
+                ..Default::default()
             },
             Moved {
                 id: "mv2".into(),
@@ -1050,6 +1356,7 @@ mod tests {
                 version: 9,
                 seqno: 41,
                 at_ms: 0,
+                ..Default::default()
             },
         ];
         for r in &rows {

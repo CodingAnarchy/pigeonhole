@@ -839,3 +839,60 @@ A partition that opens gates its moved ranges from those rows before it serves.
 A moved-away row outlives the move record and is pruned by PR 5's writer, at the later of two bounds: every node holds a map at or after the hand-over, and the transaction lifetime plus the request timeout has passed. A serving row lives while it gates its target or clears an older moved-away row.
 
 **Not yet:** the copy and the range follower (PR 4); the driver, the drain and `final_seqno`, the never-both decision, cleanup and the CLI (PR 5); refusing D329 prepares and read holds on a fenced range (with D329 PR 2a); the cluster feed's hold, clipping and backups (PR 3).
+
+## D331 PR 3a: replica copies' range gates, and restoring across a move (1.3.0, #1499)
+**Replica copies gate a moving range as their owners do, and a restore leaves each row in one partition.** No wire change.
+
+**Replica copies (D328):**
+- A copy has no `WriteGate`, so it gets its own range gate, held by its follower.
+  - It's armed when the copy opens and at each map install, under the install lock.
+  - It's checked on the copy's calls, fan-out parts and scans.
+- A copy of a target serves the range once it has applied the target's serving row. A copy of a source refuses a moved range from the source's moved-away row.
+- A copy whose file lacks a row it needs waits, keeping its previous span for a source, and its follower reads the rows again after each run it applies.
+- While a move names a partition as its target, or as its source from HANDED_OVER on, the routing view lists no copies for it, so bounded reads go to the owner. A gated copy never counts as behind or unreachable.
+  - The cost (cli692's note on the 3a review): for the move's length, CLEANING included, the partition's bounded reads of every table, not only the moved one, are its owner's. Moves are short, and narrowing it would need per-table copy lists in the routing view. PR 5's guide states it.
+
+**Restore:**
+- A cluster backup never spans a hand-over: `backup::moved` refuses a backup during which a placement or epoch changed.
+- So a restore drops its map's moves. Each is rolled back or forward by its phase, since the map's placements already say who held the range. Its stamp marks each restored file.
+- The file's open clips it to the map before it serves:
+  - rows outside the partition's ranges are deleted, feed-silently;
+  - a row a D329 share in doubt holds is left, counted and logged, and the marker stays, so the next open after the share is decided deletes it;
+  - moved-away rows covering a range the map gives back are cut to the rest, and every one left drops its hand-over pair to (0, 0), so a later move back in the restored cluster counts as newer;
+  - the timestamp floor rises to the newest timestamp kept (`raise_ts_floor`).
+- A clip that stops runs again at the next open.
+- A single-partition restore is refused while a move names the partition.
+
+## D331 PR 3b: the cluster feed across a range move (1.3.0, #1499)
+**A key's events stay in order across a hand-over, a subscription that misses the new partition is rerouted, and no token expires because of a move.** The design is cli692's (d), reviewed by simp724, cli692 and feed1248.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `FeedEvent.move_barrier = 8`, `MoveBarrier { move_id = 1; source = 2; final_seqno = 3; }`: internal to a cluster subscription, never sent to a client. 7 is D329's `FeedEvent.xid`.
+- `ForwardSubscribeRequest.from_hand_over = 6` (bool): start the component at the partition's hand-over for the request's tables.
+- A serve-level error, `FeedRerouted`: UNAVAILABLE/503, retry-safe, not a public `ErrorCode`. The stream ends right after a checkpoint, so its last token resumes it.
+
+**The target's serving row** (PR 2's, extended) carries the move's source, its `final_seqno` from the map's record, and a D310 feed token at `t_from`. The token comes from a feed of the table opened before the gate opens the range.
+
+**The barrier:**
+- A cluster component of a move's target carries a barrier for each of its serving rows of the component's tables, whatever its start.
+- A start at or before `t_from` carries the hand-over's token; one past it carries none, so the merge's position doesn't move.
+- The barrier goes out just before the first event past `t_from`, quiet progress included.
+- A running component also watches its gate's serving-row version (one load per event, after the event's read and before its send), so a hand-over taken while it runs adds its barrier.
+
+**The merge's hold:**
+- A part that passed a barrier isn't polled while the source's part is below `final_seqno`. Holds lift in barrier order.
+- The merge has no part of the source: no hold. A source part still at its own now holds nothing either (feed1248's S1): a barrier exists only from the target's serving row, written after `final_seqno` was fixed, so the source's now is past it. The source's part can't get there: the subscription expires (`FeedExpired`), never reorders.
+
+**Rerouting:**
+- A merge whose node's map gives one of its tables a partition it has no live part for (a retired part doesn't count, feed1248's M2) ends with a checkpoint, then `FeedRerouted`. It's checked when the map's version changes, and only from the move's CLEANING: before it the target serves none of the range and has no hand-over position (cli692's M1 on the code). A resume that gains the target before then gets a retry-safe `PartitionUnavailable` from it.
+- A resume whose token lacks a partition the map now places the tables on starts it at that partition's hand-over (`from_hand_over`). The partition resolves the position from its serving rows, or answers `FeedExpired`.
+- A token partition the map still lists is asked for every subscription table, whatever the map places there, and its node decides (feed1248's M1): it reads the tables it serves and those it holds a moved-away row of, and leaves out the rest. With none left, `WrongPartition`.
+
+**A source of a whole-table move:**
+- It serves a component of the table while its file has the moved-away row: up to the move's `final_seqno`, then it ends with an internal `MovedAway`. A component already running when the move takes its last table there finds the same end through the gate's version, which moved-away rows and state changes bump too (feed1248's M3).
+- The merge retires the part and leaves it out of later checkpoints.
+- Without the row, it answers `WrongPartition`, and a resume of it expires.
+
+**Pruning, for PR 5:**
+- A target's serving row goes only once its own feed floor has passed `t_from`.
+- A source's moved-away row goes only once its feed retention has passed `final_seqno`, plus PR 2's bounds.

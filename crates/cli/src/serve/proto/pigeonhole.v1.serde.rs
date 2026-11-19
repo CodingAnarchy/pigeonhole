@@ -6585,6 +6585,9 @@ impl serde::Serialize for FeedEvent {
                 feed_event::Event::PartitionState(v) => {
                     struct_ser.serialize_field("partition_state", v)?;
                 }
+                feed_event::Event::MoveBarrier(v) => {
+                    struct_ser.serialize_field("move_barrier", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -6603,6 +6606,8 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
             "progress",
             "partition_state",
             "partitionState",
+            "move_barrier",
+            "moveBarrier",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -6612,6 +6617,7 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
             Commit,
             Progress,
             PartitionState,
+            MoveBarrier,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -6638,6 +6644,7 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
                             "commit" => Ok(GeneratedField::Commit),
                             "progress" => Ok(GeneratedField::Progress),
                             "partitionState" | "partition_state" => Ok(GeneratedField::PartitionState),
+                            "moveBarrier" | "move_barrier" => Ok(GeneratedField::MoveBarrier),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -6695,6 +6702,13 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
                                 return Err(serde::de::Error::duplicate_field("partitionState"));
                             }
                             event__ = map_.next_value::<::std::option::Option<_>>()?.map(feed_event::Event::PartitionState)
+;
+                        }
+                        GeneratedField::MoveBarrier => {
+                            if event__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moveBarrier"));
+                            }
+                            event__ = map_.next_value::<::std::option::Option<_>>()?.map(feed_event::Event::MoveBarrier)
 ;
                         }
                     }
@@ -8789,6 +8803,9 @@ impl serde::Serialize for ForwardSubscribeRequest {
         if self.skip_through != 0 {
             len += 1;
         }
+        if self.from_hand_over {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.ForwardSubscribeRequest", len)?;
         if self.map_version != 0 {
             #[allow(clippy::needless_borrow)]
@@ -8809,6 +8826,9 @@ impl serde::Serialize for ForwardSubscribeRequest {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("skip_through", ToString::to_string(&self.skip_through).as_str())?;
         }
+        if self.from_hand_over {
+            struct_ser.serialize_field("from_hand_over", &self.from_hand_over)?;
+        }
         struct_ser.end()
     }
 }
@@ -8826,6 +8846,8 @@ impl<'de> serde::Deserialize<'de> for ForwardSubscribeRequest {
             "request",
             "skip_through",
             "skipThrough",
+            "from_hand_over",
+            "fromHandOver",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -8835,6 +8857,7 @@ impl<'de> serde::Deserialize<'de> for ForwardSubscribeRequest {
             Partition,
             Request,
             SkipThrough,
+            FromHandOver,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -8861,6 +8884,7 @@ impl<'de> serde::Deserialize<'de> for ForwardSubscribeRequest {
                             "partition" => Ok(GeneratedField::Partition),
                             "request" => Ok(GeneratedField::Request),
                             "skipThrough" | "skip_through" => Ok(GeneratedField::SkipThrough),
+                            "fromHandOver" | "from_hand_over" => Ok(GeneratedField::FromHandOver),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -8885,6 +8909,7 @@ impl<'de> serde::Deserialize<'de> for ForwardSubscribeRequest {
                 let mut partition__ = None;
                 let mut request__ = None;
                 let mut skip_through__ = None;
+                let mut from_hand_over__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::MapVersion => {
@@ -8921,6 +8946,12 @@ impl<'de> serde::Deserialize<'de> for ForwardSubscribeRequest {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::FromHandOver => {
+                            if from_hand_over__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fromHandOver"));
+                            }
+                            from_hand_over__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(ForwardSubscribeRequest {
@@ -8929,6 +8960,7 @@ impl<'de> serde::Deserialize<'de> for ForwardSubscribeRequest {
                     partition: partition__.unwrap_or_default(),
                     request: request__,
                     skip_through: skip_through__.unwrap_or_default(),
+                    from_hand_over: from_hand_over__.unwrap_or_default(),
                 })
             }
         }
@@ -14230,6 +14262,137 @@ impl<'de> serde::Deserialize<'de> for MissingRange {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.MissingRange", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for MoveBarrier {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.move_id.is_empty() {
+            len += 1;
+        }
+        if !self.source.is_empty() {
+            len += 1;
+        }
+        if self.final_seqno != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MoveBarrier", len)?;
+        if !self.move_id.is_empty() {
+            struct_ser.serialize_field("move_id", &self.move_id)?;
+        }
+        if !self.source.is_empty() {
+            struct_ser.serialize_field("source", &self.source)?;
+        }
+        if self.final_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("final_seqno", ToString::to_string(&self.final_seqno).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for MoveBarrier {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "move_id",
+            "moveId",
+            "source",
+            "final_seqno",
+            "finalSeqno",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            MoveId,
+            Source,
+            FinalSeqno,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "moveId" | "move_id" => Ok(GeneratedField::MoveId),
+                            "source" => Ok(GeneratedField::Source),
+                            "finalSeqno" | "final_seqno" => Ok(GeneratedField::FinalSeqno),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = MoveBarrier;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.MoveBarrier")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<MoveBarrier, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut move_id__ = None;
+                let mut source__ = None;
+                let mut final_seqno__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::MoveId => {
+                            if move_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moveId"));
+                            }
+                            move_id__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Source => {
+                            if source__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("source"));
+                            }
+                            source__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::FinalSeqno => {
+                            if final_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("finalSeqno"));
+                            }
+                            final_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(MoveBarrier {
+                    move_id: move_id__.unwrap_or_default(),
+                    source: source__.unwrap_or_default(),
+                    final_seqno: final_seqno__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.MoveBarrier", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for MoveKind {
