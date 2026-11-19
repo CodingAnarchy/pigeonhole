@@ -84,6 +84,7 @@ mod poisoned_flush_barrier;
 mod punch;
 mod purge_bound;
 mod purge_race;
+mod read_holds;
 mod read_only_fallback;
 mod reader_backup;
 mod reader_crash_matrix;

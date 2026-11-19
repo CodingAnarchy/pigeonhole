@@ -546,6 +546,11 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::Forget(r) => ServiceOp::Forget(r),
             Op::RecallPool(r) => ServiceOp::RecallPool(r),
             Op::RecallBodies(r) => ServiceOp::RecallBodies(r),
+            // A spanning transaction's branch calls (D329) are no client's call: the owner
+            // serves them before this (`spanning::serve_branch`).
+            Op::BranchBegin(_) | Op::BranchPrepare(_) | Op::BranchDecide(_) => {
+                return Err(ApiError::invalid("a branch's call isn't a client's"));
+            }
         },
     )
 }
@@ -630,6 +635,11 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Forget(r) => ServiceReply::Forget(r),
             Reply::RecallPool(r) => ServiceReply::RecallPool(r),
             Reply::RecallBodies(r) => ServiceReply::RecallBodies(r),
+            Reply::BranchPrepare(_) => {
+                return Err(ApiError::internal(
+                    "a branch's prepare isn't a client's reply",
+                ));
+            }
         },
     )
 }

@@ -2234,6 +2234,25 @@ pub struct Transaction {
     failed_read: Option<Error>,
 }
 
+/// A read-only transaction's reads, held in memory ([`Transaction::hold_reads`], D329,
+/// ICR 0140 amendment 1). Dropping it releases the hold. Hidden, as `hold_reads`.
+#[cfg(feature = "__unstable-txn-prepare")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ReadHold(pigeonhole_engine::ReadHold);
+
+#[cfg(feature = "__unstable-txn-prepare")]
+impl ReadHold {
+    /// Ends the hold: `true` if it was in place until now, `false` if it was lost to a close
+    /// or a recovery (the transaction's reads are then no longer known to be current).
+    /// `false` only ever means lost. It waits for the answer, so on a thread that drives a
+    /// shard (application-owned mode) it's refused (`InvalidArgument`), and the hold is
+    /// released as it's dropped, with no answer.
+    pub fn release(self) -> Result<bool> {
+        self.0.release().map_err(Error::from)
+    }
+}
+
 impl Transaction {
     pub(crate) fn new(db: Arc<Db>, txn: Txn, generation: u64) -> Self {
         Self {
@@ -2351,6 +2370,23 @@ impl Transaction {
             .prepare(xid, durability.engine())
             .map(CommitInfo::from_engine)
             .map_err(|e| commit_error(e, largest, max))
+    }
+
+    /// Validates the transaction's reads and holds them in memory (D329, ICR 0140
+    /// amendment 1): a read-only transaction's part of a commit across partitions. Nothing
+    /// is logged, and nothing is ever in doubt. While the [`ReadHold`] lives, a write to a
+    /// held row is refused at once (`Conflict` for a transaction, `Busy` otherwise).
+    /// `InvalidArgument` for a transaction with writes or without reads, `Conflict` if a
+    /// read changed since the snapshot, `Busy` past the in-doubt limit. Hidden: not part of
+    /// the API, outside the semver promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn hold_reads(self) -> Result<ReadHold> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        self.db.check_generation(self.generation)?;
+        self.txn.hold_reads().map(ReadHold).map_err(Error::from)
     }
 
     /// The sequence number of the snapshot the transaction reads at (ICR 0118): every read

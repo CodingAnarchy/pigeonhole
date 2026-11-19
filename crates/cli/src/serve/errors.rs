@@ -350,9 +350,14 @@ impl ApiError {
     /// A call other than `Commit` on a transaction that has received `Commit`: the session
     /// is its tombstone (D313 B1), and `Commit` answers the recorded outcome, which this
     /// error's message names too. Not retry-safe: whatever the call wanted is past.
-    pub(crate) fn transaction_finished(outcome: &Result<pigeonhole::CommitInfo, Self>) -> Self {
+    pub(crate) fn transaction_finished(
+        outcome: &Result<super::proto::TxnCommitResponse, Self>,
+    ) -> Self {
         let what = match outcome {
-            Ok(c) => format!("committed at seqno {}", c.seqno),
+            Ok(c) => format!(
+                "committed at seqno {}",
+                c.commit.as_ref().map_or(0, |c| c.seqno)
+            ),
             Err(e) => format!("its Commit failed with {}", e.code),
         };
         Self::new(
