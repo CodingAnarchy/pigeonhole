@@ -500,9 +500,19 @@ commit-if-returning-async 27864 0.3
 # base (+0.6%), after cuts from +138: the decoder is unchanged (the mark found by its byte), the
 # change feed tests each batch's mark once where it already looks at the batch, and the replica
 # bookkeeping is out of line. The rest is that test and the cursor step's result copy (x86).
-feed-drain 5771 0.3
-feed-drain-all 5788 0.3
-replicate-apply 6366 0.3
+# Raised by D195 for #2076 (D329 PR 2b: a spanning commit's xid on the change feed and on
+# replication; the coordinator's ceilings window of 2026-11-19, inside the standing 0.5%): CI's
+# head counts on 59cdd5b86 (main 222f82da5, run 44516011262), the highest sample times 1.003.
+# feed-drain 5771 -> 5805 (5765 -> 5787 against base, +0.38%), feed-drain-all 5788 -> 5822
+# (5782 -> 5804, +0.38%): +22 a commit, after four rounds from +1.5%. The xid rides beside the
+# commit, never in it; an untagged record pays one test of the count's flag byte (read once
+# for both its bits) in the reader's poll, one emptiness test at delivery in emit, and the
+# step's and decoder's share of those; every tagged path is out of line. replicate-apply 6366
+# -> 6415 (6365 -> 6395, +0.46%): ReplicatedEvent v3's xid field, decoded and dropped per event.
+# The commit shapes are flat or lower (commit-one 8499 -> 8493).
+feed-drain 5805 0.3
+feed-drain-all 5822 0.3
+replicate-apply 6415 0.3
 # #1828 (#2024): agent memory's fused recall (memshapes.rs), per recall. From head 9152b788c on
 # ubuntu-26.04, two runs, base and head of identical engine code each (runs 44085631301 and
 # 44085642059): 11293924, 11295466, 11308932, 11297931 (0.13% spread; a memory's id carries
