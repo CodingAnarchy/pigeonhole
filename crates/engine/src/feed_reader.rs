@@ -352,6 +352,9 @@ enum Item {
     Abort {
         id: Seqno,
     },
+    /// A range drop (D331, type 7), at a seqno of its own, which applies nothing: the
+    /// frontier passes it, and no subscription is delivered anything for it.
+    RangeDrop,
     Other,
 }
 
@@ -2512,6 +2515,9 @@ impl FeedReader {
                     // goes with its shares.
                     self.remove_held(id);
                 }
+                // Feed-silent (D331): nothing to deliver, and its seqno holds nothing, so
+                // the frontier passes it as any seqno with no event.
+                Item::RangeDrop => {}
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
                     // build writes feed marks); any other type is newer than this build.
@@ -2583,7 +2589,8 @@ impl FeedReader {
             WalRecord::Prepare { seqno, .. }
             | WalRecord::Decision { seqno, .. }
             | WalRecord::ExternalPrepare { seqno, .. }
-            | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
+            | WalRecord::ExternalAbort { seqno, .. }
+            | WalRecord::RangeDrop { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
         let item = match record {
@@ -2627,6 +2634,7 @@ impl FeedReader {
                 None => Item::Other,
             },
             WalRecord::ExternalAbort { seqno, .. } => Item::Abort { id: seqno },
+            WalRecord::RangeDrop { .. } => Item::RangeDrop,
             WalRecord::Decision {
                 seqno,
                 apply_seqno,
@@ -3150,6 +3158,7 @@ impl FeedReader {
                         WalRecord::ExternalAbort {
                             seqno, abort_seqno, ..
                         } => seqno.min(abort_seqno),
+                        WalRecord::RangeDrop { seqno, .. } => seqno,
                         // A kind this build can't key: the session can't be started in.
                         _ => continue 'sessions,
                     },

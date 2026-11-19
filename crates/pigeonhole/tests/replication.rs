@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pigeonhole::replication::ReplicatedEvent;
-use pigeonhole::{ErrorCode, Family, Feed, FeedEvent, FeedRetention, Options, Pigeonhole, Value};
+use pigeonhole::{
+    ErrorCode, Family, Feed, FeedEvent, FeedRetention, FeedToken, Options, Pigeonhole, Value,
+};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 
 fn options(vfs: &Arc<SimVfs>) -> Options {
@@ -1010,6 +1012,63 @@ fn a_range_drop_refuses_a_bad_range() {
         assert_eq!(
             db.drop_range(&t, start, Some(end)).unwrap_err().code(),
             ErrorCode::InvalidArgument
+        );
+    }
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a (perf2's condition 5): a range drop is feed-silent, and a subscription open
+/// across it goes on: its seqno passes with no event, the commits on both sides of it
+/// arrive once each, and tokens taken just before and just after it resume, also after a
+/// crash.
+#[test]
+fn a_feed_passes_a_range_drop_and_its_tokens_resume() {
+    let vfs = SimVfs::new(45);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let commit = |t: &pigeonhole::Table, row: &[u8]| {
+        t.mutate(row).put("a", b"q", b"v").commit().unwrap().seqno
+    };
+    let next_seqno = |feed: &mut Feed| match feed.next_event(Duration::from_secs(5)).unwrap() {
+        Some(FeedEvent::Commit(c)) => c.seqno(),
+        other => panic!("expected a commit, got {other:?}"),
+    };
+    let mut feed = t.feed().open().unwrap();
+    let one = commit(&t, b"r1");
+    commit(&t, b"r6");
+    assert_eq!(next_seqno(&mut feed), one);
+    next_seqno(&mut feed);
+    let before = FeedToken::from_bytes(feed.token().as_bytes().to_vec());
+    db.drop_range(&t, b"r5", Some(b"r9")).unwrap();
+    assert!(
+        feed.next_event(Duration::from_millis(200))
+            .unwrap()
+            .is_none(),
+        "a range drop delivers nothing"
+    );
+    let after = FeedToken::from_bytes(feed.token().as_bytes().to_vec());
+    let two = commit(&t, b"r2");
+    assert_eq!(next_seqno(&mut feed), two);
+    drop(feed);
+
+    vfs.crash(CrashKind::Process);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    for token in [&before, &after] {
+        let mut feed = t.feed().resume(token).open().unwrap();
+        assert_eq!(next_seqno(&mut feed), two);
+        assert!(
+            feed.next_event(Duration::from_millis(200))
+                .unwrap()
+                .is_none()
         );
     }
     drop(t);
