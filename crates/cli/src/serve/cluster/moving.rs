@@ -7,12 +7,12 @@
 //! 2. **Copy** each file from OLD (`Admin.BackupDownload`'s `fenced_file`) into an upload
 //!    on NEW (`Admin.PartitionUpload`, `RELOCATE`, the epoch `e` the copy is of). Each
 //!    upload's id comes from the file's name and hash, so a rerun resumes what arrived.
-//! 3. **Stamp** NEW from `e` to `e + 1` and compare the set it installed with OLD's closed
+//! 3. **Stamp** NEW from `e` to its next epoch (`e + 1`, or past a promote's floor: #2070) and compare the set it installed with OLD's closed
 //!    set, file by file: name, size and SHA-256. A mismatch stops the move before the map
 //!    changes, so OLD keeps P.
 //! 4. **The map:** `relocate --copy`, which keeps P's `history_epoch`. Its stamp is then a
 //!    no-op.
-//! 5. **Serving:** wait for NEW to serve P at `e + 1`.
+//! 5. **Serving:** wait for NEW to serve P at that epoch.
 //! 6. **`--drop-source`:** only after a comparison that matched, OLD's files move aside
 //!    (`drop-partition`). Nothing is deleted.
 //!
@@ -308,6 +308,8 @@ pub(super) async fn run(
     let old = At::new(args, &p.node, &old_address).await?;
     let new = At::new(args, to, &new_address).await?;
     let e = p.epoch;
+    // One above P's epoch and every epoch a promote of it recorded (#2070).
+    let next = super::promote::next_epoch(&m, &p);
 
     // 1. Fenced and closed on OLD, its files hashed.
     let started = Instant::now();
@@ -366,7 +368,7 @@ pub(super) async fn run(
     stop_after(args, Step::Copied)?;
     #[cfg(test)]
     hold_before_stamp(args).await;
-    let installed = stamp(&new, &m.cluster_id, partition, e).await?;
+    let installed = stamp(&new, &m.cluster_id, partition, e, next).await?;
     if installed.is_empty() {
         // The set this run staged is gone: another run's stamp took it.
         return Err(Failure::usage(&format!(
@@ -409,7 +411,7 @@ pub(super) async fn run(
     stop_after(args, Step::Mapped)?;
 
     // 5. Serving on NEW.
-    serving(&new, partition, e + 1, timeout).await?;
+    serving(&new, partition, next, timeout).await?;
     let serving_at = Instant::now();
     stop_after(args, Step::Serving)?;
 
@@ -430,7 +432,7 @@ pub(super) async fn run(
         ("partition", json!(partition)),
         ("from", json!(old.id)),
         ("node", json!(to)),
-        ("epoch", json!(e + 1)),
+        ("epoch", json!(next)),
         ("files", json!(files.len())),
         ("bytes", json!(bytes)),
         ("verified", json!(true)),
@@ -855,15 +857,22 @@ pub(super) async fn copy_file(
     Ok(sent)
 }
 
-/// Stamps NEW from `e` to `e + 1`: the set it installed, none if it found no set staged.
-async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<PartitionFile>, Failure> {
+/// Stamps NEW from `e` to `next` ([`super::promote::next_epoch`]): the set it installed,
+/// none if it found no set staged.
+async fn stamp(
+    new: &At,
+    cluster: &str,
+    p: &str,
+    e: u64,
+    next: u64,
+) -> Result<Vec<PartitionFile>, Failure> {
     let (mut c, _) = connect(&new.args, &new.args.node).await?;
     Ok(c.stamp(request(
         proto::StampRequest {
             cluster_id: cluster.to_owned(),
             partition: p.to_owned(),
             from_epoch: e,
-            to_epoch: e + 1,
+            to_epoch: next,
             restore: false,
             restore_from_cluster_id: String::new(),
             promote: false,

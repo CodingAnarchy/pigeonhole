@@ -791,6 +791,50 @@ No other move takes P to an epoch at or below a pending one's.
 
 The seeded model loses a real vote now and then. In a settle phase at the end, every node holds the writer's map and has no vote above it. It also checks that no vote is recorded while another node holds a live writer lease.
 
+#### A promote left pending whose owner came back (#2070, simp724's ruling)
+**The problem** (found by the seeded model's partition half):
+1. A failover records its promote PENDING and stamps the copy, then its writer dies before the map.
+2. P's owner comes back and serves P again.
+3. Nothing then finishes or clears the promote:
+   - the writer waits on the serving owner;
+   - validation refused ABANDONED unless a later promote's event was above it.
+
+It stayed pending for good, and with D331's N1 it refused every range move of P.
+
+**The fix:**
+- **The writer abandons it.** Its failover check (`failover::check` returns `Abandon`) applies when P's owner renewed P with the writer since it took office and that grant still runs. Once the survey finds the owner serving P at its epoch, the writer sets the promote ABANDONED. It can't safely finish while the old owner holds a lease.
+  - Validation accepts PENDING → ABANDONED when P stays on the event's `from` at its epoch.
+  - A promote run that finds its own event abandoned since its first step stops, naming the orphan copy (for a manual promote racing the writer).
+- **The floor binds every epoch change of P.** A promote's `to_epoch`, in any state, may have a copy stamped at it.
+  - No map takes P to that epoch or below it, unless it's that promote finishing.
+  - A relocation, a move and D331's hand-over take P to `promote::next_epoch`, `max(epoch, floor) + 1`. Stamps may skip epochs.
+  - An abandoned event stays pinned, like a pending one, while P's epoch is at or below its `to_epoch`. It doesn't count toward the 16 finished events kept, so pruning never drops the floor.
+- **Status:** while an abandoned promote pins the floor, P's `failover_blocked` names the copy it stamped: "an unfinished promote stamped node X at epoch E: drop that copy".
+- **The orphan:** the copy an abandoned promote stamped stays an owner's file at that epoch. Re-added to P's replicas, its node refuses to open it until the operator drops it (`phdb cluster drop-partition`). On the next map that lists it, the node bootstraps a fresh copy from P's owner.
+
+#### The seeded model's partition half (#2070, design §8 test 5)
+**What it extends:** the writer half's model (5 nodes, drifting clocks, the real `Grants`).
+- **What it adds:**
+  - 2 partitions with replicas, each node's lease round asking for all its leases at once;
+  - owner writes under the partition lease, and replicas following;
+  - failover by the writer through the real `failover::check`, `failover::qualify` and `promote::run`, over the model's `Promoter`;
+  - restarts that keep the vote and lose the grants;
+  - writers that die after their stamp.
+- **Every map** its writer sets passes the real catch-up validation.
+- **It asserts:**
+  - at most one holder of the writer lease and of each partition's lease (at any epoch), on true time;
+  - §4's loss bound at each stamp: the copy holds every acknowledged write at or below the seqno the writer saw;
+  - no write acknowledged by an old owner after its successor's lease began;
+  - no epoch stamped twice;
+  - no orphan copy ever holding a lease;
+  - no map giving P an epoch a promote stamped, except that promote finishing;
+  - each map that moves P raising its `failover_count` by one;
+  - no failover by a writer that saw no renewal, except to finish a pending one.
+- **A settle phase** ends with:
+  - one serving owner per partition;
+  - following replicas;
+  - no promote left pending.
+
 ## D331 PR 2: range moves in the map, and the range gates (1.3.0, #1499)
 **The map records each range move in flight, and every partition a move names gates the range's calls.** No data moves yet: the copy is PR 4, and the driver and CLI are PR 5. Additive on the wire.
 
@@ -814,7 +858,7 @@ The seeded model loses a real vote now and then. In a settle phase at the end, e
 - A move appears at COPYING, keeps its table, range, partitions and kind, and goes forward one phase per map. It may be removed before HANDED_OVER (an abort) and from CLEANING (done), never at HANDED_OVER.
 - **The HANDING_OVER → HANDED_OVER step is the one reshape a table placement takes:** the range's ends become split keys where they aren't, and the range goes to the target. The same map:
   - names itself as the hand-over (`handed_over_term`, `handed_over_version` = its own `(writer_term, map_version)`);
-  - raises the source's epoch by one on the same node, keeping its `history_epoch`, so its replica copies and feed tokens go on.
+  - raises the source's epoch on the same node, keeping its `history_epoch`, so its replica copies and feed tokens go on. The new epoch is `max(epoch, promote floor) + 1` (#2070), never one a promote stamped a copy at.
 
 **The range gate** (a partition's state beside its `WriteGate`, derived at every map install and at open):
 - One load per call while no move names the partition. Otherwise a cold walk of the keys the call names (`ServiceOp::touches`).

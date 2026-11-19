@@ -120,8 +120,9 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
         // Nothing staged and no file: refused.
         let e = stamp(c, 1, 2, false).await.unwrap_err();
         assert_eq!(code(&e), "FailedPrecondition", "{e}");
-        // An epoch skipped: refused.
-        let e = stamp(c, 1, 3, false).await.unwrap_err();
+        // No epoch raised: refused. (Skipping epochs is allowed since #2070: every change
+        // goes above a promote's floor.)
+        let e = stamp(c, 1, 1, false).await.unwrap_err();
         assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e}");
         // Staged, then an install that fails after its first rename, as a crash would
         // leave it: the marker stays, and the next stamp finishes it.
