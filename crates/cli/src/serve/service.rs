@@ -357,8 +357,11 @@ impl ServiceOp {
                     | Self::RecallPool(_)
                     | Self::RecallBodies(_)
             ),
+            // A node's own token for what a node does to a peer: a replica's follow, and a
+            // download of a partition (a replica's bootstrap, and a move's copy of a closed
+            // set, which the map's writer runs: D332, D331 PR 5).
             peer: matches!(self, Self::Follow(_))
-                || matches!(self, Self::BackupDownload(r) if r.replica && !r.partition.is_empty()),
+                || matches!(self, Self::BackupDownload(r) if !r.partition.is_empty()),
         }
     }
 

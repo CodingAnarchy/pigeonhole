@@ -1,0 +1,2 @@
+### Changed
+- **The cluster token can fence, close, copy and drop partitions on a peer** (D332, #1485). `Cluster.Fence`, `Close` and `DropPartition`, and `Admin.BackupDownload` (of a named partition) and `PartitionUpload` now accept the `cluster` scope beside `admin`, so the map's writer can run moves. A client's token is still refused. Protect the cluster token as you protect an admin token; `serve.md` says why.

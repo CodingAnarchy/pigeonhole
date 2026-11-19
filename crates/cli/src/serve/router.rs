@@ -327,7 +327,10 @@ impl Router {
         if caller.memory_only() {
             return Err(super::service::namespaced_denied("call PartitionUpload"));
         }
-        if !caller.scope.allows(super::auth::Scope::Admin) {
+        // Admin, or a node's own token: the map's writer runs a move's copy (D332, D331 PR 5).
+        if !caller.scope.allows(super::auth::Scope::Admin)
+            && caller.scope != super::auth::Scope::Cluster
+        {
             return Err(ApiError::permission_denied("call PartitionUpload"));
         }
         match &self.cluster {

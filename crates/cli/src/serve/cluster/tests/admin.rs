@@ -182,3 +182,77 @@ fn info_flush_and_compact_cover_the_nodes_own_partitions() {
     });
     drop(stops);
 }
+
+#[test]
+fn a_moves_calls_take_a_nodes_cluster_token_and_still_refuse_a_clients() {
+    // The coordinator's scope ruling (D332 PR 3, D331 PR 5): the map's writer runs a move
+    // with its own cluster token, so Fence, Close, DropPartition, BackupDownload and
+    // PartitionUpload take Scope::Cluster beside Admin. A client's write token is still
+    // refused each one.
+    let tokens = format!("write t0ken-w\nadmin t0ken-adm\ncluster {NODE_TOKEN}\n");
+    let t = Three::start([&tokens, &tokens, &tokens]);
+    let a = t.ports[0];
+    let req = || PartitionRequest {
+        partition: "p9".into(),
+        ..Default::default()
+    };
+    t.rt.block_on(async {
+        for token in [NODE_TOKEN, "t0ken-w"] {
+            let refused = |r: Result<(), tonic::Status>, what: &str| {
+                let denied = r
+                    .as_ref()
+                    .is_err_and(|e| e.code() == tonic::Code::PermissionDenied);
+                assert_eq!(
+                    denied,
+                    token == "t0ken-w",
+                    "{what} with {}: {r:?}",
+                    if token == NODE_TOKEN {
+                        "the cluster token"
+                    } else {
+                        "a write token"
+                    }
+                );
+            };
+            let c = || client(a);
+            refused(
+                c().await.fence(with(req(), Some(token))).await.map(drop),
+                "Fence",
+            );
+            refused(
+                c().await.close(with(req(), Some(token))).await.map(drop),
+                "Close",
+            );
+            refused(
+                c().await
+                    .drop_partition(with(req(), Some(token)))
+                    .await
+                    .map(drop),
+                "DropPartition",
+            );
+            refused(
+                admin(a)
+                    .await
+                    .backup_download(with(
+                        crate::serve::proto::BackupDownloadRequest {
+                            partition: "p1".into(),
+                            ..Default::default()
+                        },
+                        Some(token),
+                    ))
+                    .await
+                    .map(drop),
+                "BackupDownload",
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(tx);
+            refused(
+                admin(a)
+                    .await
+                    .partition_upload(with(super::upload::Chunks(rx), Some(token)))
+                    .await
+                    .map(drop),
+                "PartitionUpload",
+            );
+        }
+    });
+}

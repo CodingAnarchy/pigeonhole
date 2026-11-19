@@ -1931,7 +1931,8 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "fence a partition")?;
+        // An operator's, or the map's writer's in a move it runs (D332, D331 PR 5).
+        self.caller(&req, &[Scope::Admin, Scope::Cluster], "fence a partition")?;
         let id = req.into_inner().partition;
         self.0.fence(&id).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
@@ -1954,7 +1955,7 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "close a partition")?;
+        self.caller(&req, &[Scope::Admin, Scope::Cluster], "close a partition")?;
         let id = req.into_inner().partition;
         self.0.close(&id).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
@@ -1965,7 +1966,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "drop a partition's files")?;
+        self.caller(
+            &req,
+            &[Scope::Admin, Scope::Cluster],
+            "drop a partition's files",
+        )?;
         let id = req.into_inner().partition;
         Ok(tonic::Response::new(self.0.drop_partition(&id).await?))
     }
