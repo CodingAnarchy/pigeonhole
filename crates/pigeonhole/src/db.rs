@@ -766,6 +766,9 @@ impl Pigeonhole {
     /// exclusive byte-range locks, which POSIX grants only on a writable descriptor (the same
     /// requirement as SQLite in WAL mode). A file on read-only media, or one the reader's
     /// user cannot write, cannot be opened this way (decision D36).
+    ///
+    /// An open while the writer restarts can fail with
+    /// [`ErrorCode::Busy`](crate::ErrorCode::Busy): open again.
     pub fn open_reader(path: impl AsRef<Path>, options: ReaderOptions) -> Result<PigeonholeReader> {
         let engine_options = options.to_engine()?;
         let vfs = Arc::clone(&engine_options.vfs);
