@@ -1090,7 +1090,7 @@ Any node still takes any call, before, during and after.
 - **While P is down:**
   - A call for P answers `PartitionUnavailable` when its node can't be reached. Nothing was sent, so it's safe to retry, writes included.
   - An owner that's alive but cut off from the majority answers `Fenced` to writes and `PartitionUnavailable` to reads once its lease has run out. A write whose commit returned after the lease ended answers `OutcomeUnknown`: read it back before you retry.
-  - Reads that allow staleness (`x-pigeonhole-read-replica-max-lag-ms`) go on from P's replicas for as long as the bound allows. The replicas hear nothing new, so a read with a bound of N ms stops being served about N ms after the owner went.
+  - Reads that allow staleness (`x-pigeonhole-read-replica-max-lag-ms`) go on from P's replicas for as long as the bound allows. The replicas hear nothing new, so a read with a bound of N ms stops being served about N ms after the owner went. The replica being promoted stops serving reads when the promote starts, at about L + A, whatever the bound.
   - Feed streams of P end with `PartitionUnavailable`, or a `partition_state` event with `allow_partial` ([When a partition's node is down](#when-a-partitions-node-is-down)).
   - Other partitions aren't affected.
 - **Once P serves on its new owner:**
@@ -1127,7 +1127,7 @@ Any node still takes any call, before, during and after.
 
 #### Two cases that settle themselves
 - **A node that lost an election.** A candidate can pass its pre-vote and then lose the vote itself, for example when it's cut off between the two. It has recorded its own vote, so it refuses every map of the lower term the cluster is still on.
-  - **What you see:** that node's partitions stay fenced and it routes by an old map, for about a lease after it's reachable again. The other nodes go on serving and renewing.
+  - **What you see:** that node's partitions stay fenced and it routes by an old map, for up to about a lease after it's reachable again, and usually only a lease round or two. The other nodes go on serving and renewing.
   - **What ends it:** the live writer notices a node that stays behind, reads the term it voted for, and holds an election of its own at one term above. It wins, since every node already grants it the writer lease, and the stranded node takes that map. `failovers` shows a writer event from the writer to itself.
   - Nothing for the operator to do.
 - **A promote that didn't finish.** If the writer stops after stamping the replica it promotes and before the map, the promote stays pending in the map.
