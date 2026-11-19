@@ -5828,13 +5828,14 @@ impl Inner {
     /// for a manifest commit when there is one; the waiting thread drives that commit
     /// itself (`manifest::commit_from_thread`, as `shrink` does), so it may drive a shard.
     /// Tags routed batch `builder` with `xid`, a spanning commit's (D329 2b), as its last
-    /// step, behind `incompat` bit 2. Rebuilds after it (large values, counters, the split
-    /// into shares) carry it. Nothing for an untagged batch.
+    /// step, behind `incompat` bit 2. Rebuilds after it (large values, the split into
+    /// shares, a retry) carry it; the counter pass in `route` runs before it, on a batch with
+    /// no trailer yet. Nothing for an untagged batch.
     #[inline]
-    fn tag_routed(&self, xid: Option<Arc<[u8]>>, builder: &mut BatchBuilder) -> Result<()> {
+    fn tag_routed(&self, xid: Option<&[u8]>, builder: &mut BatchBuilder) -> Result<()> {
         if let Some(xid) = xid {
             self.flag_external()?;
-            builder.tag_xid(&xid)?;
+            builder.tag_xid(xid)?;
         }
         Ok(())
     }
@@ -6326,7 +6327,7 @@ impl Inner {
         let mut batch = batch;
         let xid = batch.xid.take();
         let (mut builder, mut shards) = self.route(batch, &view)?;
-        self.tag_routed(xid, &mut builder)?;
+        self.tag_routed(xid.as_deref().map(Vec::as_slice), &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
@@ -6532,7 +6533,7 @@ impl Inner {
         let mut batch = batch;
         let xid = batch.xid.take();
         let (mut builder, shards) = self.route(batch, &view)?;
-        self.tag_routed(xid, &mut builder)?;
+        self.tag_routed(xid.as_deref().map(Vec::as_slice), &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         let shard = match shards.as_slice() {
             [] => view
@@ -7384,10 +7385,20 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// batch.
 #[inline]
 pub(crate) fn carry_xid(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
-    if let Some(xid) = from.batch().xid() {
-        to.tag_xid(xid)?;
+    // One byte's test for an untagged batch (perf2's N1 on #2076); the copy out of line.
+    if from.is_tagged() {
+        return carry_xid_cold(from, to);
     }
     Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn carry_xid_cold(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    match from.batch().xid() {
+        Some(xid) => Ok(to.tag_xid(xid)?),
+        None => Ok(()),
+    }
 }
 
 /// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
@@ -7400,6 +7411,8 @@ fn prepare_counter_writes(
     catalog: &Catalog,
     combines: bool,
 ) -> Result<BatchBuilder> {
+    // Runs inside `route`, before `tag_routed`: the batch has no xid trailer to carry yet.
+    debug_assert!(!batch.is_tagged(), "a tagged batch before routing");
     // Each write may gain an 8-byte timestamp.
     let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
     if batch.is_silent() {
@@ -7422,7 +7435,6 @@ fn prepare_counter_writes(
             );
             out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
         }
-        carry_xid(batch, &mut out)?;
         return Ok(out);
     }
     struct Write<'a> {
@@ -7528,7 +7540,6 @@ fn prepare_counter_writes(
         let value = w.value.as_deref().unwrap_or(m.value);
         out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, value)?;
     }
-    carry_xid(batch, &mut out)?;
     Ok(out)
 }
 

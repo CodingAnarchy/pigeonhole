@@ -55,7 +55,13 @@ pub struct WriteBatch {
     /// a shard's commit message doesn't grow (perf2 on the 2b design).
     ///
     /// [`tag_xid`]: WriteBatch::tag_xid
-    pub(crate) xid: Option<std::sync::Arc<[u8]>>,
+    /// Boxed, so it costs the batch one pointer (88 bytes, not 96): a `WriteBatch` moves by
+    /// value through every commit's routing (perf2's N1 on #2076).
+    #[expect(
+        clippy::box_collection,
+        reason = "one pointer in a WriteBatch, not a Vec's three words: it moves by value through every commit"
+    )]
+    pub(crate) xid: Option<Box<Vec<u8>>>,
 }
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
@@ -136,7 +142,7 @@ impl WriteBatch {
     /// a replica's apply of one.
     #[doc(hidden)]
     pub fn tag_xid(&mut self, xid: &[u8]) {
-        self.xid = Some(xid.into());
+        self.xid = Some(Box::new(xid.to_vec()));
     }
 
     /// An empty batch.

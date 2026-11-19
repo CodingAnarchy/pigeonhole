@@ -2708,11 +2708,7 @@ fn a_spanning_commits_shares_carry_its_xid_on_the_feed() {
     let mut seen = Vec::new();
     for _ in 0..4 {
         let c = next(&mut r);
-        seen.push((
-            c.seqno,
-            rows(&c).len(),
-            c.xid.as_deref().map(<[u8]>::to_vec),
-        ));
+        seen.push((c.seqno, rows(&c).len(), r.xid().map(|x| x.to_vec())));
     }
     assert_eq!(seen[0], (one, 1, Some(b"p1:h1-aa".to_vec())));
     assert_eq!(seen[1], (plain, 1, None));
@@ -2736,8 +2732,8 @@ fn a_spanning_commits_shares_carry_its_xid_on_the_feed() {
     let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
     let mut xids = Vec::new();
     loop {
-        let c = next(&mut r);
-        if let Some(x) = &c.xid {
+        next(&mut r);
+        if let Some(x) = r.xid() {
             xids.push(x.to_vec());
         }
         if xids.len() == 3 {

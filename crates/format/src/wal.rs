@@ -1282,6 +1282,14 @@ impl BatchBuilder {
     }
 
     /// Whether [`tag_xid`](Self::tag_xid) tagged it (since the last `clear`).
+    /// Whether [`tag_xid`](Self::tag_xid) tagged it: one byte's test, for callers that copy
+    /// the tag through a rebuild (D329 2b).
+    #[inline]
+    pub fn is_tagged(&self) -> bool {
+        self.tagged()
+    }
+
+    #[inline]
     fn tagged(&self) -> bool {
         self.buf
             .get(3)

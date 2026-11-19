@@ -861,6 +861,14 @@ impl Feed {
     fn note_delivery(&mut self) {
         let after = stream_position(&self.reader);
         self.span = (self.span.1, after);
+        // A spanning commit's xid (D329 2b), which the engine's reader keeps beside the
+        // commit: into the commit just delivered, as an event or on its own.
+        let xid = self.reader.xid();
+        match &mut self.out.event {
+            Some(FeedEvent::Commit(c)) => c.xid = xid.cloned(),
+            Some(_) => {}
+            None => self.out.commit.xid = xid.cloned(),
+        }
     }
 
     /// The error that ended the feed, again.
@@ -1079,7 +1087,6 @@ fn catalog_change(names: &mut Names, ev: &CatalogEvent) -> CatalogChange {
 fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Commit) -> Result<()> {
     out.seqno = c.seqno;
     out.ts = c.ts;
-    out.xid.clone_from(&c.xid);
     // The commit's `Change`s are reused: their buffers keep their capacity across commits.
     out.changes.truncate(c.changes.len());
     for (i, ch) in c.changes.iter().enumerate() {
@@ -1187,7 +1194,6 @@ mod tests {
         let bad = pigeonhole_engine::Commit {
             seqno: 9,
             ts: 1,
-            xid: None,
             changes: vec![pigeonhole_engine::Change {
                 table: info.id,
                 family: info.families[0].id,

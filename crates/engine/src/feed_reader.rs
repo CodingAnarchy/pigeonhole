@@ -122,9 +122,6 @@ pub struct Commit {
     /// Its mutations in the feed's tables and prefix, in record order (shares in their
     /// participants' order).
     pub changes: Vec<Change>,
-    /// The transaction it is a share of, when it's a spanning commit's (D329 2b): every share
-    /// of one commit has the same.
-    pub xid: Option<Arc<[u8]>>,
 }
 
 /// Why a feed ended (§2.6): the feed can't deliver what follows its position.
@@ -330,8 +327,6 @@ enum Item {
         changes: Raws,
         /// Feed-silent, for a reader that includes them (D331): noted once it's kept.
         silent: bool,
-        /// A spanning commit's xid (D329 2b): noted once it's kept, as `silent`.
-        xid: Option<Arc<[u8]>>,
     },
     Prepare {
         id: Seqno,
@@ -339,7 +334,6 @@ enum Item {
         /// An external share (D329): see [`Held::external`].
         external: bool,
         silent: bool,
-        xid: Option<Arc<[u8]>>,
     },
     Decision {
         id: Seqno,
@@ -744,6 +738,14 @@ pub struct FeedReader {
     /// seqno, a round's by its id. Beside the records, not in them, as `silent_seen`: a
     /// commit without one pays a bit test when read and an emptiness test when delivered.
     xids: HashMap<Seqno, Arc<[u8]>>,
+    /// The xid of the record just read, if it's a spanning commit's share: set as the record
+    /// is read and taken by the item that keeps it, not carried in the item, which every
+    /// record read moves (perf2's N2 on #2076).
+    read_xid: Option<Arc<[u8]>>,
+    /// The xid of the commit last delivered ([`xid`](Self::xid)): beside the commit, not in
+    /// it, as `out_silent` is, so `Commit` keeps its fields (semver: an exhaustively
+    /// constructible public struct can't gain one).
+    out_xid: Option<Arc<[u8]>>,
     /// With `include_silent`, the silent commits read, kept and not yet delivered: a single
     /// commit's seqno, a round's id. Kept beside the records, not in them, so a reader that
     /// doesn't include them carries nothing for it (#2055's feed shapes). Noted only where a
@@ -1307,6 +1309,8 @@ impl FeedReader {
             include_silent: false,
             out_silent: false,
             xids: HashMap::new(),
+            read_xid: None,
+            out_xid: None,
             silent_seen: HashSet::new(),
             expired: None,
             failed: None,
@@ -1740,6 +1744,14 @@ impl FeedReader {
     #[doc(hidden)]
     pub fn silent(&self) -> bool {
         self.out_silent
+    }
+
+    /// The transaction the commit last delivered is a share of, when it's a spanning
+    /// commit's (D329 2b): every share of one commit has the same. Not part of the stable
+    /// API.
+    #[doc(hidden)]
+    pub fn xid(&self) -> Option<&Arc<[u8]>> {
+        self.out_xid.as_ref()
     }
 
     /// The silent and xid notes held now (test hook), each checked against what the reader
@@ -2417,8 +2429,9 @@ impl FeedReader {
                     ts,
                     changes,
                     silent,
-                    xid,
                 } => {
+                    // Taken first, so no early exit leaves it for the next record.
+                    let xid = self.read_xid.take();
                     if seqno <= self.delivered {
                         let st = &mut self.streams[s];
                         st.delivered_end = st.delivered_end.max(end);
@@ -2465,8 +2478,8 @@ impl FeedReader {
                     changes,
                     external,
                     silent,
-                    xid,
                 } => {
+                    let xid = self.read_xid.take();
                     if silent {
                         self.silent_seen.insert(id);
                     }
@@ -2640,28 +2653,34 @@ impl FeedReader {
                 commit_ts,
                 batch,
             } => Item::Single {
-                seqno,
+                seqno: {
+                    note_read_xid(&mut self.read_xid, batch.xid());
+                    seqno
+                },
                 ts: commit_ts,
                 changes: filter(batch)?,
                 silent: include_silent && batch.is_silent(),
-                xid: batch.xid().map(Arc::from),
             },
             WalRecord::Prepare { seqno, batch, .. } => Item::Prepare {
-                id: seqno,
+                id: {
+                    note_read_xid(&mut self.read_xid, batch.xid());
+                    seqno
+                },
                 changes: filter(batch)?,
                 external: false,
                 silent: include_silent && batch.is_silent(),
-                xid: batch.xid().map(Arc::from),
             },
             // D329: an external share is held as a D263 one is, delivered at its Decision's
             // apply seqno, or dropped by its abort.
             WalRecord::ExternalPrepare { seqno, share, .. } => match share.batch() {
                 Some(batch) => Item::Prepare {
-                    id: seqno,
+                    id: {
+                        note_read_xid(&mut self.read_xid, Some(share.xid()));
+                        seqno
+                    },
                     changes: filter(batch)?,
                     external: true,
                     silent: include_silent && batch.is_silent(),
-                    xid: Some(share.xid().into()),
                 },
                 None => Item::Other,
             },
@@ -2852,7 +2871,7 @@ impl FeedReader {
                     if self.include_silent {
                         self.out_silent = self.silent_seen.remove(&key);
                     }
-                    self.out.xid = if self.xids.is_empty() {
+                    self.out_xid = if self.xids.is_empty() {
                         None
                     } else {
                         self.xids.remove(&key)
@@ -2873,7 +2892,7 @@ impl FeedReader {
                     if self.include_silent {
                         self.out_silent = self.silent_seen.remove(&id);
                     }
-                    self.out.xid = if self.xids.is_empty() {
+                    self.out_xid = if self.xids.is_empty() {
                         None
                     } else {
                         self.xids.remove(&id)
@@ -3694,6 +3713,21 @@ fn silent_batch(
     } else {
         Ok(Raws::default())
     }
+}
+
+/// Sets the reader's slot for the record just read to `xid` (D329 2b): one test for an
+/// untagged record, the copy out of line.
+#[inline(always)]
+fn note_read_xid(slot: &mut Option<Arc<[u8]>>, xid: Option<&[u8]>) {
+    if let Some(x) = xid {
+        set_read_xid(slot, x);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn set_read_xid(slot: &mut Option<Arc<[u8]>>, xid: &[u8]) {
+    *slot = Some(Arc::from(xid));
 }
 
 /// Notes `xid` under `key` for delivery. Every share of a round has the same xid, and a
