@@ -1441,3 +1441,73 @@ fn a_range_copied_at_a_snapshot_reads_as_its_source() {
     target.close().unwrap();
     source.close().unwrap();
 }
+
+/// D331 PR 4a (simp724 on B2): a set family's copy is its settled state, never the fold's
+/// 0xFF working form (D298), and the target reads as the source: adds and removes, some
+/// flushed and some in the memtable, across several chunks.
+#[test]
+fn a_copied_set_family_is_settled() {
+    use pigeonhole::Aggregation;
+    let (sv, tv) = (SimVfs::new(54), SimVfs::new(55));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("set", Family::aggregate(Aggregation::Set))
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    for i in 0..30u32 {
+        let row = format!("r{i:02}");
+        for x in 0..20u32 {
+            s.mutate(row.as_bytes())
+                .set_add("set", b"q", x * 1000 + i)
+                .commit()
+                .unwrap();
+        }
+        s.mutate(row.as_bytes())
+            .set_remove("set", b"q", 3000 + i)
+            .commit()
+            .unwrap();
+        if i == 15 {
+            source.flush().unwrap();
+        }
+    }
+    let snap = source.snapshot().unwrap();
+    let mut after = Vec::new();
+    let mut chunks = 0;
+    loop {
+        let chunk = source.copy_range(&snap, &s, &after, None, 400).unwrap();
+        let mut wb = target.logged_batch();
+        for c in &chunk.cells {
+            assert_ne!(
+                c.stored.first(),
+                Some(&0xFF),
+                "row {:?}: a set copied in its working form",
+                c.row
+            );
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        if !wb.is_empty() {
+            wb.commit().unwrap();
+        }
+        chunks += 1;
+        match chunk.next {
+            Some(n) => after = n,
+            None => break,
+        }
+    }
+    assert!(chunks > 2, "{chunks} chunks");
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t"))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    drop((snap, s, t));
+    target.close().unwrap();
+    source.close().unwrap();
+}
