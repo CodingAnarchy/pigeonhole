@@ -940,3 +940,50 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 **Pruning, for PR 5:**
 - A target's serving row goes only once its own feed floor has passed `t_from`.
 - A source's moved-away row goes only once its feed retention has passed `final_seqno`, plus PR 2's bounds.
+
+## D332 PR 2: whole-partition moves recorded in the map (1.3.0, #1485)
+**`phdb cluster move P --to N` keeps a record of itself in `ClusterMap.moves`,** so a move stopped by a crash, of the CLI or of the writer, is seen. `status` shows it, failover takes it into account, and a rerun finishes it.
+
+**Proto:** `RangeMove.from_epoch = 13`, P's epoch when the move entered COPYING (coordinator-assigned; D331 may use it with the same meaning). `MOVE_KIND_NODE = 3` was declared by D331 PR 2.
+
+**The record:** `{ id: node-<ms>, kind: NODE, from: P, to: <node>, from_epoch, phase }`, with no table or range.
+
+| phase | NODE meaning | written |
+|---|---|---|
+| COPYING | the move started: P is fenced and closed on its node and copied to `to` | before the fence |
+| HANDING_OVER | `to` stamped P and its set matched the closed one | after the match |
+| HANDED_OVER | the commit point: the relocation map itself, P on `to` at `promote::next_epoch`, with `copies` and the hand-over pair | the map step |
+| CLEANING | `to` serves P | after it serves |
+| (gone) | done, after `--drop-source` if given | at the end |
+
+**Validation:**
+- **A NODE record (`validate_node_move`):**
+  - no table or range;
+  - a listed partition, and `to` a listed node;
+  - never at CATCHING_UP (simp724's Q1);
+  - `from_epoch` set, and no seqnos.
+- **Where P must be:** before HANDED_OVER, still on its node at `from_epoch`; from it, on `to` past it. So a map that moves P any other way, a failover's promote among them, has to drop the record (simp724's M2). `promote::run` drops it in its map.
+- **The steps:** COPYING goes straight to HANDING_OVER. HANDED_OVER must be the relocation to `to` at `max(epoch, floor) + 1` from `from_epoch`, naming itself.
+- **One move per partition, whatever the kind.**
+
+**Attempts (simp724's M1):** each run writes a fresh record, replacing an earlier attempt's not yet at its commit point, and copies, stamps and matches the old node's closed set again. A rerun past the commit point finishes the record it finds.
+
+**`phdb cluster move P --abort`:**
+- before HANDED_OVER, it removes the record and moves the target's copy aside (`drop-partition`). P stays on its node, closed and fenced: `unfence` serves it there.
+- at or past HANDED_OVER, it's refused, naming the phase: run the move again to finish it.
+
+**Failover:** at COPYING and HANDING_OVER, P is closed on its node, so the failover check reports it closed by the operator while that node answers. If the node is down, a promote goes ahead and drops the record. From HANDED_OVER the check blocks with "move <id> (relocating it to node X) is past its commit point: let it finish, or use a forced map".
+
+**Every reader of `moves` that acts on a range skips NODE** (`map::node_move`):
+- the range gates and the open's gates;
+- the hand-over and its crash-finish;
+- the feed's barriers and reroutes;
+- reconcile's keep;
+- routing's replica check: copies keep serving reads during a relocation;
+- the restore's clip, which needs nothing for NODE because the backup map's placement decides it;
+- `#2087`'s pinning.
+
+`LocalPartition.moves` shows a NODE record with no table. `restore_partition` stays refused while one names P.
+
+**Mixed versions:** a record needs the `range_moves` feature on every node, which is what keeps `moves` in a node's map. Without it, the move runs unrecorded and its report says so (`recorded`). Every node reporting `range_moves` runs 1.3.0, which validates NODE.
+

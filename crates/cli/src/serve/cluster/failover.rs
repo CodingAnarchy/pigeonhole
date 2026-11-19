@@ -309,6 +309,19 @@ pub(crate) fn qualify(
             _ => {}
         }
     }
+    // A whole-partition move of P past its commit point (D332 PR 2): P is on the move's
+    // target, and only finishing the move serves it.
+    if let Some(m) = map.moves.iter().find(|m| {
+        super::map::node_move(m)
+            && m.from == p.id
+            && super::map::phase(m) >= proto::MovePhase::HandedOver
+    }) {
+        return Err(format!(
+            "move {} (relocating it to node {}) is past its commit point: let it finish, or \
+             use a forced map",
+            m.id, m.to
+        ));
+    }
     // A promote of P left pending (its writer stopped after the stamp): finished on the
     // copy it stamped, if that node answers with it (finish only, F4).
     if let Some(e) = map

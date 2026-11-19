@@ -661,7 +661,8 @@ impl Merge {
         let moves = self.ctx.node.get_map().map(|m| m.moves).unwrap_or_default();
         let handing = |table: &str, p: &str| {
             moves.iter().any(|m| {
-                m.table == table
+                !super::map::node_move(m)
+                    && m.table == table
                     && m.to == p
                     && super::map::phase(m) < crate::serve::proto::MovePhase::Cleaning
             })

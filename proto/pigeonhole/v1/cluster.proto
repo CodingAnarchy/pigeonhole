@@ -253,6 +253,10 @@ message RangeMove {
   // move's commit point.
   uint64 handed_over_version = 11;
   uint64 handed_over_term = 12;
+  // The source partition's epoch when the move entered COPYING (D332 PR 2, #1485). A NODE
+  // move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
+  // promoted it mid-move). 0 on a record from before this field.
+  uint64 from_epoch = 13;
 }
 
 // D331: what a range move is for.
@@ -263,7 +267,7 @@ enum MoveKind {
   // `phdb cluster split`: to a partition the split added.
   MOVE_KIND_PARTITION = 2;
   // D332: a whole partition relocated to another node (no table or range; `to` names the
-  // node). Validated by D332's balancer PR; refused until then.
+  // node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
   MOVE_KIND_NODE = 3;
   // PR 6 (merge) adds MOVE_KIND_MERGE = 4.
 }

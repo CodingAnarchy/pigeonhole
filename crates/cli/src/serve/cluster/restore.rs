@@ -528,7 +528,8 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     // past a restore. A backup never spans a hand-over (`backup::moved`), so its map's
     // placements already say who held each moved range then: a move before HANDED_OVER is
     // rolled back (the source's), one at or after it forward (the target's). Each restored
-    // file is clipped to those placements when it opens (its stamp marked it).
+    // file is clipped to those placements when it opens (its stamp marked it). A NODE move
+    // (D332 PR 2) needs neither: the backup's map already places the whole partition.
     m.moves.clear();
     for p in &mut m.partitions {
         p.epoch = jobs
@@ -791,7 +792,7 @@ async fn restore_partition(
         )));
     };
     // D331 PR 3: not while a range move names it: its ranges are changing, and the move
-    // would go on over a file from before it.
+    // would go on over a file from before it. Nor while a NODE move relocates it (D332 PR 2).
     if let Some(m) = live
         .moves
         .iter()
@@ -935,6 +936,7 @@ async fn restore_partition(
             from_epoch: e,
             stamped,
         }),
+        None,
     )
     .await?;
     let version = set

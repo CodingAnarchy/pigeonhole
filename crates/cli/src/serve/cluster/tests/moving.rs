@@ -99,6 +99,14 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
                 "{step:?}: {}",
                 e.message()
             );
+            // The map records the move where it stopped (D332 PR 2).
+            let at = match step {
+                Step::Closed | Step::Copied => MovePhase::Copying,
+                Step::Stamped => MovePhase::HandingOver,
+                Step::Mapped => MovePhase::HandedOver,
+                Step::Serving => MovePhase::Cleaning,
+            };
+            assert_eq!(record(b).await.map(|r| r.1), Some(at), "{step:?}");
 
             let r = within(super::super::moving::run(&t.args, "p1", "c", true, None))
                 .await
@@ -154,8 +162,166 @@ fn a_move_stopped_after_any_step_finishes_when_run_again() {
                 ("c", 2, 0),
                 "{step:?}"
             );
+            assert!(
+                m.moves.is_empty(),
+                "{step:?}: the record went: {:?}",
+                m.moves
+            );
         });
     }
+}
+
+use crate::serve::proto::MovePhase;
+
+/// p1's move record in the map node `port` holds (D332 PR 2): its id and phase.
+async fn record(port: u16) -> Option<(String, MovePhase)> {
+    let m = client(port)
+        .await
+        .get_map(crate::serve::proto::GetMapRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    super::super::moving::record_of(&m, "p1").map(|r| (r.id.clone(), super::super::map::phase(r)))
+}
+
+#[test]
+fn an_aborted_moves_copy_is_never_taken_by_a_later_one() {
+    // simp724's M1 on the D332 PR 2 plan: a move stamps c's copy and stops before the map.
+    // `--abort` removes its record and moves c's copy aside; the operator unfences a, which
+    // takes a write. A later move is a new attempt with a new record: it copies a's closed
+    // set again, so the write is on c once c serves p1.
+    let t = Cluster::start();
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("stopped after the stamp");
+        let (first, _) = record(b).await.expect("recorded");
+        let r = within(super::super::moving::abort(&t.args, "p1"))
+            .await
+            .unwrap_or_else(|e| panic!("the abort: {}", e.message()));
+        assert!(record(b).await.is_none(), "{:?}", r.document);
+        assert!(
+            r.document["target_copy_aside"].as_str().is_some(),
+            "{:?}",
+            r.document
+        );
+        assert!(!t.dirs[2].join("p1.phdb").exists(), "c's copy went aside");
+        client(a)
+            .await
+            .unfence(crate::serve::proto::PartitionRequest {
+                partition: "p1".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        put(b, "bob", "2").await;
+        let r = within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the later move: {}", e.message()));
+        assert_ne!(
+            r.document["recorded"],
+            serde_json::json!(first),
+            "a fresh record"
+        );
+        assert_eq!(get_row(b, "bob").await.unwrap(), Some(b"2".to_vec()));
+        let _ = c;
+    });
+}
+
+#[test]
+fn an_abort_past_the_moves_commit_point_is_refused() {
+    let t = Cluster::start();
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Mapped));
+        within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("stopped after the map");
+        let e = within(super::super::moving::abort(&t.args, "p1"))
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            e.message().contains("past its commit point")
+                && e.message()
+                    .contains("run phdb cluster move p1 --to c again"),
+            "{}",
+            e.message()
+        );
+        assert_eq!(record(b).await.map(|r| r.1), Some(MovePhase::HandedOver));
+        within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .unwrap_or_else(|e| panic!("the rerun: {}", e.message()));
+        assert!(record(b).await.is_none(), "finished");
+    });
+}
+
+#[test]
+fn a_promote_before_a_moves_commit_point_ends_the_move_in_its_map() {
+    // simp724's M2 on the D332 PR 2 plan: a move of p1 to c stops after its stamp
+    // (HANDING_OVER). The operator promotes b's replica copy instead: the promote's map,
+    // which gives p1 another node and epoch, removes the move's record, and a rerun of the
+    // move doesn't take up the old one.
+    let t = Cluster::start();
+    let [a, b, _] = t.ports;
+    t.rt.block_on(async {
+        let mut m = client(b)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        m.map_version += 1;
+        m.partitions[0].replicas = vec!["b".into()];
+        super::super::cli::set_map(&t.args, m, false, Vec::new())
+            .await
+            .unwrap();
+        eventually("b's copy of p1 to follow a", async || {
+            client(b)
+                .await
+                .status(crate::serve::proto::StatusRequest {})
+                .await
+                .is_ok_and(|s| {
+                    s.into_inner().partitions.iter().any(|lp| {
+                        lp.id == "p1"
+                            && lp.role() == crate::serve::proto::PartitionRole::Replica
+                            && lp.replica_state() == crate::serve::proto::ReplicaState::Following
+                            && lp.replica_applied_seqno > 0
+                    })
+                })
+        })
+        .await;
+        STOP.lock()
+            .unwrap()
+            .push((t.args.node.clone(), Step::Stamped));
+        within(super::super::moving::run(&t.args, "p1", "c", false, None))
+            .await
+            .err()
+            .expect("stopped after the stamp");
+        assert_eq!(record(b).await.map(|r| r.1), Some(MovePhase::HandingOver));
+        within(super::super::promote::promote(
+            &t.args, "p1", "b", false, None,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("the promote: {}", e.message()));
+        assert!(
+            record(b).await.is_none(),
+            "the promote's map removed the record"
+        );
+        eventually("b to serve p1", async || {
+            get_row(b, "alice").await.ok().flatten() == Some(b"1".to_vec())
+        })
+        .await;
+        let _ = a;
+    });
 }
 
 #[test]
@@ -452,6 +618,8 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
             q.epoch += 1;
         }
         m.map_version += 1;
+        // A map set by hand in place of the move's own drops its record (D332 PR 2).
+        m.moves.clear();
         client(a)
             .await
             .set_map(SetMapRequest {
@@ -547,6 +715,7 @@ fn a_moves_map_step_refuses_once_the_old_node_was_reopened_since_its_check() {
             "c",
             false,
             super::super::cli::CopyCheck::Checked(checked),
+            None,
             None,
         ))
         .await
@@ -679,6 +848,8 @@ async fn give_p1_to(writer: u16, node: &str) {
         q.epoch += 1;
     }
     m.map_version += 1;
+    // A map set by hand in place of the move's own drops its record (D332 PR 2).
+    m.moves.clear();
     client(writer)
         .await
         .set_map(SetMapRequest {
@@ -999,6 +1170,8 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
             p.node = "c".into();
             p.epoch += 1;
         }
+        // A map made by hand in place of the move's own drops its record (D332 PR 2).
+        m.moves.clear();
         m
     });
     for i in [0, 1] {
