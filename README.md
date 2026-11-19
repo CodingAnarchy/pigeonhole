@@ -78,9 +78,11 @@ One line per family of operations, with the calls that do it, a guide page that 
   - **agent memory and `/mcp` on a cluster node:** `--memory` with a `memory` placement in the map; `Recall`, `Watch`, `MarkUsed` and `Forget` across partitions. Guide: [Agent memory on a cluster](docs/guide/serve.md#agent-memory-on-a-cluster);
   - **leases:** a partition serves only while a majority of the map's nodes grant it a lease (`--cluster-lease-ms`), so a node cut off from the majority stops serving. Guide: [Fencing and relocation](docs/guide/serve.md#fencing-and-relocation);
   - **`phdb cluster restore --partition`** puts one partition back from a cluster backup. Guide: [Backup and restore](docs/guide/serve.md#backup-and-restore);
+  - **transactions across partitions** (D329, #1483): a transaction begun with `spans_partitions` reads and writes rows of several partitions and commits them atomically. A share left in doubt by a failure is settled by its node's resolver, `Transactions.Outcome` answers what became of a transaction, and `phdb cluster txn decide` decides a share by hand. Guide: [Transactions across partitions](docs/guide/serve.md#transactions-across-partitions);
+  - **automatic failover, off by default** (D330, #1484): with the map's `failover` on, the map's writer promotes a down partition's freshest replica, and a down writer is replaced by an elected one. It can lose the commits the replica hadn't applied. Guide: [Automatic failover](docs/guide/serve.md#automatic-failover);
   - **`Admin.Info`, `Flush` and `Compact`** on a cluster node.
 
-  Planned for 1.3.0 and not yet on `main`: transactions across partitions (D329, #1483; the engine's part is on `main`, the cluster side is to come), automatic failover (D330, #1484), online split and range move (D331, #1499) and a balancer (D332, #1485). [`docs/status.md`](docs/status.md#capabilities) has each one's state.
+  Planned for 1.3.0 and not finished on `main`: online split and range move (D331, #1499) and a balancer (D332, #1485). Their map records, gates and measurements are on `main`; the commands and the balancer itself are to come. [`docs/status.md`](docs/status.md#capabilities) has each one's state.
 
   Guide: [Clusters](docs/guide/serve.md#clusters). Reference: [`phdb serve`](docs/guide/agent-reference.md#phdb-serve-120).
 
