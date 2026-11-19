@@ -2871,11 +2871,11 @@ impl FeedReader {
                     if self.include_silent {
                         self.out_silent = self.silent_seen.remove(&key);
                     }
-                    self.out_xid = if self.xids.is_empty() {
-                        None
-                    } else {
-                        self.xids.remove(&key)
-                    };
+                    // One test for a commit that isn't a spanning one's share, as `out_silent`
+                    // is (#2076's feed shapes).
+                    if !self.xids.is_empty() || self.out_xid.is_some() {
+                        set_out_xid(&mut self.out_xid, &mut self.xids, key);
+                    }
                     (ts, Packs::One(changes))
                 }
                 Pending::Decided {
@@ -2892,11 +2892,9 @@ impl FeedReader {
                     if self.include_silent {
                         self.out_silent = self.silent_seen.remove(&id);
                     }
-                    self.out_xid = if self.xids.is_empty() {
-                        None
-                    } else {
-                        self.xids.remove(&id)
-                    };
+                    if !self.xids.is_empty() || self.out_xid.is_some() {
+                        set_out_xid(&mut self.out_xid, &mut self.xids, id);
+                    }
                     match self.take_round(id, &participants, session) {
                         Round::Whole(raws) => (ts, Packs::Many(raws)),
                         Round::Dropped => {
@@ -3713,6 +3711,14 @@ fn silent_batch(
     } else {
         Ok(Raws::default())
     }
+}
+
+/// The delivered commit's xid: its note under `key`, or none. Out of line: only once a
+/// spanning commit's share has been read.
+#[cold]
+#[inline(never)]
+fn set_out_xid(out: &mut Option<Arc<[u8]>>, xids: &mut HashMap<Seqno, Arc<[u8]>>, key: Seqno) {
+    *out = xids.remove(&key);
 }
 
 /// Sets the reader's slot for the record just read to `xid` (D329 2b): one test for an

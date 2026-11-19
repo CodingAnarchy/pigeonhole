@@ -792,8 +792,29 @@ fn a_replica_applies_silent_commits_silent() {
     primary.close().unwrap();
 }
 
+/// `row`'s put on `t`: feed-silent, or a spanning commit's share tagged with `xid` (a
+/// transaction, as `phdb serve` tags one), or plain.
+fn commit(db: &Pigeonhole, t: &pigeonhole::Table, row: &[u8], silent: bool, xid: Option<&[u8]>) {
+    match xid {
+        Some(x) => {
+            let mut txn = db.transaction().unwrap();
+            txn.put(t, row, "a", b"q", b"v");
+            txn.tag_xid(x);
+            txn.commit().unwrap();
+        }
+        None => {
+            let mut wb = db.write_batch();
+            if silent {
+                wb.mark_feed_silent();
+            }
+            wb.put(t, row, "a", b"q", b"v");
+            wb.commit().unwrap();
+        }
+    }
+}
+
 /// D329 2b (ICR 0140 amendment 2): a spanning commit's share replicates as a version 3
-/// event, a flags byte and the xid before version 1's fields, silent or not. The replica
+/// event, a flags byte and the xid before version 1's fields. The replica
 /// applies it tagged, so its own feed carries the xid; an untagged commit stays version 1
 /// or 2, byte for byte. Unknown flag bits, and an empty xid, are refused.
 #[test]
@@ -811,23 +832,15 @@ fn a_replica_applies_a_spanning_share_with_its_xid() {
         .create_if_missing()
         .unwrap();
     let xid = b"p0:h3-0123456789abcdef0123456789abcdef";
-    // (row, silent, tagged)
-    let steps: [(&[u8], bool, bool); 4] = [
+    // (row, silent, tagged): a spanning commit's share is a tagged transaction (no producer
+    // makes one silent too; the flags' combination is replication.rs's unit test).
+    let steps: [(&[u8], bool, bool); 3] = [
         (b"plain", false, false),
         (b"tagged", false, true),
-        (b"quiet-tagged", true, true),
         (b"quiet", true, false),
     ];
     for (row, silent, tagged) in steps {
-        let mut wb = primary.write_batch();
-        if silent {
-            wb.mark_feed_silent();
-        }
-        if tagged {
-            wb.tag_xid(xid);
-        }
-        wb.put(&t, row, "a", b"q", b"v");
-        wb.commit().unwrap();
+        commit(&primary, &t, row, silent, tagged.then_some(&xid[..]));
         let events = ready(&mut feed);
         let commits: Vec<_> = events.iter().filter(|e| !e.is_catalog()).collect();
         assert_eq!(commits.len(), 1);
@@ -887,12 +900,7 @@ fn a_replica_applies_a_spanning_share_with_its_xid() {
         (b"m3", None),
         (b"m4", Some(&xid[..])),
     ] {
-        let mut wb = primary.write_batch();
-        if let Some(x) = x {
-            wb.tag_xid(x);
-        }
-        wb.put(&t, row, "a", b"q", b"v");
-        wb.commit().unwrap();
+        commit(&primary, &t, row, false, x);
     }
     let events = ready(&mut feed);
     apply(&replica, &events, events.len());

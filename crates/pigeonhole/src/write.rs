@@ -1475,15 +1475,6 @@ impl WriteBatch {
         self
     }
 
-    /// Tags the batch with a spanning commit's xid (D329 2b), as a replica applying the
-    /// primary's share does, so its own feed carries it. Not part of the stable API.
-    #[cfg(feature = "__unstable-replication")]
-    #[doc(hidden)]
-    pub fn tag_xid(&mut self, xid: &[u8]) -> &mut Self {
-        self.builder.batch.tag_xid(xid);
-        self
-    }
-
     /// Adds one mutation of `row` in `table`'s `family` (`qualifier` and `value` only size
     /// errors).
     fn op(

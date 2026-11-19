@@ -1059,25 +1059,6 @@ impl WalRecord<'_> {
     /// test more (#2055's feed shapes).
     #[inline]
     pub fn decode_with(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
-        Self::decode_flags(bytes, silent_ok, true)
-    }
-
-    /// [`decode_with`](Self::decode_with), refusing a batch's [`XID_BATCH`] trailer unless
-    /// `xid_ok` (the superblock has [`INCOMPAT_EXTERNAL_PREPARE`], D329 2b): a reader that
-    /// knows the database's bits passes both (recovery, the check tool), so a stray bit is
-    /// never read as a trailer. An External Prepare's batch refuses the bit whatever
-    /// `xid_ok` says.
-    #[inline]
-    pub fn decode_flags(
-        bytes: &[u8],
-        silent_ok: bool,
-        xid_ok: bool,
-    ) -> crate::Result<WalRecord<'_>> {
-        if !xid_ok && xid_marked(bytes) {
-            return Err(Error::Corrupt {
-                what: XID_WITHOUT_BIT,
-            });
-        }
         if !silent_ok && marked(bytes) {
             return Err(silent_without_bit());
         }
@@ -1091,6 +1072,27 @@ impl WalRecord<'_> {
             "a feed-silent mark at a place the decoder doesn't read"
         );
         record
+    }
+
+    /// [`decode_with`](Self::decode_with), refusing a batch's [`XID_BATCH`] trailer unless
+    /// `xid_ok` (the superblock has [`INCOMPAT_EXTERNAL_PREPARE`], D329 2b): a reader that
+    /// knows the database's bits passes both (recovery, the check tool), so a stray bit is
+    /// never read as a trailer. An External Prepare's batch refuses the bit whatever
+    /// `xid_ok` says.
+    #[inline]
+    pub fn decode_flags(
+        bytes: &[u8],
+        silent_ok: bool,
+        xid_ok: bool,
+    ) -> crate::Result<WalRecord<'_>> {
+        // Only a reader that knows the database lacks bit 2 asks: the feed's cursor, the
+        // hottest reader, goes straight to `decode_with` (#2076's feed shapes).
+        if !xid_ok && xid_marked(bytes) {
+            return Err(Error::Corrupt {
+                what: XID_WITHOUT_BIT,
+            });
+        }
+        Self::decode_with(bytes, silent_ok)
     }
 
     /// Whether the encoded record `bytes` carries a batch marked [`SILENT_BATCH`] (D331),

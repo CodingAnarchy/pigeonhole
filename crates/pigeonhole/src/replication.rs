@@ -721,10 +721,6 @@ impl Pigeonhole {
             if event.is_silent() {
                 batch.mark_feed_silent();
             }
-            // A spanning commit's share is applied with its xid (D329 2b).
-            if let Some(xid) = event.xid() {
-                batch.tag_xid(xid);
-            }
             for c in changes {
                 batch.push_logged(
                     c.table,
@@ -784,8 +780,10 @@ impl Pigeonhole {
             after: end.after,
             token: Some(end.token.clone()),
         };
+        // A part holds one spanning commit's share or none (the split above), so its last
+        // event's xid is the whole part's (D329 2b).
         self.engine()
-            .apply_replicated(batch, &state.encode(), max_ts)?;
+            .apply_replicated_with(batch, &state.encode(), max_ts, end.xid())?;
         Ok(())
     }
 
@@ -831,4 +829,44 @@ pub struct TabletLoad {
     pub bytes: u64,
     /// Rows written to it per balancer interval, a moving average.
     pub write_load: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_spanning_share_round_trips_as_version_3() {
+        // D329 2b: version 3's flags carry both marks; no producer makes such a commit today
+        // (a range move's copy is silent, a spanning commit's share is tagged), but the
+        // encoding keeps them apart and a replica would apply it silent and tagged.
+        let xid: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"p1:h2-aa"[..]);
+        let e = ReplicatedEvent {
+            before: StreamPosition {
+                seqno: 1,
+                catalog: 0,
+            },
+            after: StreamPosition {
+                seqno: 2,
+                catalog: 0,
+            },
+            token: FeedToken::from_bytes(b"t"),
+            body: Body::Commit {
+                seqno: 2,
+                ts: 5,
+                changes: Vec::new(),
+                silent: true,
+                xid: Some(xid),
+            },
+        };
+        let bytes = e.encode();
+        assert_eq!(
+            (bytes[0], bytes[1]),
+            (FLAGS_EVENT_VERSION, FLAG_SILENT | FLAG_XID)
+        );
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert!(back.is_silent());
+        assert_eq!(back.xid(), Some(&b"p1:h2-aa"[..]));
+        assert_eq!(back.encode(), bytes, "it round-trips");
+    }
 }

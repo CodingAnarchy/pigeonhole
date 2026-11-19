@@ -476,6 +476,7 @@ impl FeedBuilder {
             },
             covered: pigeonhole_engine::FeedPosition::default(),
             span: (start, start),
+            xid_out: false,
             progress: FeedProgress::attach(reader_progress),
             include_silent: false,
         })
@@ -574,6 +575,9 @@ pub struct Feed {
     /// The stream's position before and after the last delivery (D315 PR 3): a replica checks
     /// that the runs it applies chain, each starting where the last ended.
     span: (StreamPosition, StreamPosition),
+    /// The commit last delivered carried an xid (D329 2b): the next delivery clears it. With
+    /// none now and none before, a delivery's xid costs one test (#2076's feed shapes).
+    xid_out: bool,
     /// Its position, published by the reader as it moves ([`Feed::progress`]).
     progress: FeedProgress,
     /// Feed-silent commits are delivered (D331: a replica's follower only), kept across a
@@ -863,11 +867,22 @@ impl Feed {
         self.span = (self.span.1, after);
         // A spanning commit's xid (D329 2b), which the engine's reader keeps beside the
         // commit: into the commit just delivered, as an event or on its own.
-        let xid = self.reader.xid();
+        if self.xid_out || self.reader.xid().is_some() {
+            self.deliver_xid();
+        }
+    }
+
+    /// [`note_delivery`](Self::note_delivery)'s xid, out of line: only once a spanning
+    /// commit's share has been delivered.
+    #[cold]
+    #[inline(never)]
+    fn deliver_xid(&mut self) {
+        let xid = self.reader.xid().cloned();
+        self.xid_out = xid.is_some();
         match &mut self.out.event {
-            Some(FeedEvent::Commit(c)) => c.xid = xid.cloned(),
+            Some(FeedEvent::Commit(c)) => c.xid = xid,
             Some(_) => {}
-            None => self.out.commit.xid = xid.cloned(),
+            None => self.out.commit.xid = xid,
         }
     }
 

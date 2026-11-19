@@ -2680,13 +2680,14 @@ fn a_spanning_commits_shares_carry_its_xid_on_the_feed() {
     let db = open(&vfs, Some(feed(1 << 20)));
     let (a, b) = tables(&db);
     let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    // A spanning commit's home share: a transaction tagged with its xid.
     let tagged = |rows: &[(&Arc<TableInfo>, &[u8])], xid: &[u8]| {
-        let mut wb = WriteBatch::new();
+        let mut txn = db.begin().unwrap();
         for (t, row) in rows {
-            put(&mut wb, t, row, b"v");
+            put(txn.batch(), t, row, b"v");
         }
-        wb.tag_xid(xid);
-        db.commit(wb, Some(Durability::GroupSync)).unwrap().seqno
+        txn.tag_xid(xid);
+        txn.commit(Some(Durability::GroupSync)).unwrap().seqno
     };
     let one = tagged(&[(&a, b"t1")], b"p1:h1-aa");
     let plain = single(&db, &b, b"plain", Durability::GroupSync);

@@ -50,18 +50,6 @@ pub struct WriteBatch {
     pub(crate) row_deletes: Vec<RowDelete>,
     /// Scratch for value encoding (kept between calls).
     value_buf: Vec<u8>,
-    /// The transaction a spanning commit's share belongs to (D329 2b, [`tag_xid`]): written
-    /// into each shard's share as its last step, once routed. Here, not on the builder, so
-    /// a shard's commit message doesn't grow (perf2 on the 2b design).
-    ///
-    /// [`tag_xid`]: WriteBatch::tag_xid
-    /// Boxed, so it costs the batch one pointer (88 bytes, not 96): a `WriteBatch` moves by
-    /// value through every commit's routing (perf2's N1 on #2076).
-    #[expect(
-        clippy::box_collection,
-        reason = "one pointer in a WriteBatch, not a Vec's three words: it moves by value through every commit"
-    )]
-    pub(crate) xid: Option<Box<Vec<u8>>>,
 }
 
 /// Bytes a new batch has room for before it grows: a few small mutations (#320).
@@ -116,7 +104,6 @@ impl Default for WriteBatch {
             builder,
             row_deletes: Vec::new(),
             value_buf: Vec::new(),
-            xid: None,
         }
     }
 }
@@ -136,15 +123,6 @@ fn check_operand(operand: ValueRef<'_>) -> crate::Result<()> {
 }
 
 impl WriteBatch {
-    /// Tags the batch with the transaction it is a share of (D329 2b): its records carry
-    /// `xid` (`XID_BATCH`), and its change-feed events deliver it. 1–255 bytes; checked when
-    /// the batch is committed. Hidden: `phdb serve` tags a spanning commit's home share and
-    /// a replica's apply of one.
-    #[doc(hidden)]
-    pub fn tag_xid(&mut self, xid: &[u8]) {
-        self.xid = Some(Box::new(xid.to_vec()));
-    }
-
     /// An empty batch.
     pub fn new() -> Self {
         Self::default()
@@ -1197,6 +1175,9 @@ pub struct Txn {
     pub(crate) snapshot: Snapshot,
     pub(crate) reads: Vec<ReadKey>,
     pub(crate) batch: WriteBatch,
+    /// A spanning commit's xid (D329 2b, [`tag_xid`](Txn::tag_xid)): passed with the commit,
+    /// not carried on the batch (perf2's N1 on #2076).
+    pub(crate) xid: Option<Box<[u8]>>,
 }
 
 /// A read-only transaction's reads, validated and held in memory ([`Txn::hold_reads`],
@@ -1342,11 +1323,12 @@ impl Txn {
         &mut self.batch
     }
 
-    /// Tags the transaction's commit with `xid` (D329 2b, [`WriteBatch::tag_xid`]): a
-    /// spanning commit's home share. Hidden.
+    /// Tags the transaction's commit with `xid` (D329 2b): a spanning commit's home share.
+    /// Its records carry it (`XID_BATCH`), and its change-feed events deliver it. 1–255
+    /// bytes; checked when the commit is routed. Hidden.
     #[doc(hidden)]
     pub fn tag_xid(&mut self, xid: &[u8]) {
-        self.batch.tag_xid(xid);
+        self.xid = Some(xid.into());
     }
 
     /// The commit of a transaction that writes nothing (#694, ICR 0060): it needs no
@@ -1392,6 +1374,7 @@ impl Txn {
                     snapshot,
                     reads,
                     batch,
+                    xid,
                 } = self;
                 let validate = Validate::new(snapshot, reads);
                 return Ok(PendingCommit::waiting(
@@ -1399,7 +1382,7 @@ impl Txn {
                     admit,
                     Box::new(move || {
                         engine
-                            .submit(batch, durability, Some(validate), None)
+                            .submit_with(batch, durability, Some(validate), None, xid.as_deref())
                             .map(PendingCommit::from)
                     }),
                 ));
@@ -1428,12 +1411,14 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid,
         } = self;
-        engine.submit(
+        engine.submit_with(
             batch,
             durability,
             Some(Validate::new(snapshot, reads)),
             None,
+            xid.as_deref(),
         )
     }
 
@@ -1449,14 +1434,16 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid,
         } = self;
         engine.shared.refuse_blocking_on_driver("Txn::commit")?;
         engine
-            .submit(
+            .submit_with(
                 batch,
                 durability,
                 Some(Validate::new(snapshot, reads)),
                 None,
+                xid.as_deref(),
             )?
             .wait()
     }
@@ -1477,7 +1464,9 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid: tag,
         } = self;
+        refuse_tagged(tag.as_deref())?;
         engine.shared.refuse_blocking_on_driver("Txn::prepare")?;
         engine.prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
     }
@@ -1497,6 +1486,7 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid: _,
         } = self;
         if !batch.is_empty() {
             return Err(crate::Error::InvalidArgument(
@@ -1528,10 +1518,23 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid: tag,
         } = self;
+        refuse_tagged(tag.as_deref())?;
         engine
             .submit_prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
             .map(|(sub, _)| PendingCommit::from(sub))
+    }
+}
+
+/// An External Prepare names its xid in its record: a transaction tagged for a spanning
+/// commit's home share ([`Txn::tag_xid`]) has no place there (feed1248's point 6 on 2b).
+fn refuse_tagged(tag: Option<&[u8]>) -> crate::Result<()> {
+    match tag {
+        Some(_) => Err(crate::Error::InvalidArgument(
+            "an external prepare can't carry an xid tag: its share names its xid".to_owned(),
+        )),
+        None => Ok(()),
     }
 }
 
