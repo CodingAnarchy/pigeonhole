@@ -677,7 +677,7 @@ fn validate_failover_fields(map: &ClusterMap) -> Result<(), Refusal> {
     let finished = map
         .failovers
         .iter()
-        .filter(|e| e.state() != S::Pending)
+        .filter(|e| !super::promote::pinned(map, e))
         .count();
     if finished > FAILOVER_EVENTS {
         return Err(format!(
@@ -755,11 +755,17 @@ fn validate_pending_failovers(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
             Some(n) => match n.state() {
                 S::Pending => true,
                 S::Done => epoch_of(new, &e.partition) == Some((e.to.clone(), e.to_epoch)),
-                S::Abandoned => new.failovers.iter().any(|l| {
-                    l.kind() == K::Partition
-                        && l.partition == e.partition
-                        && l.to_epoch > e.to_epoch
-                }),
+                // Abandoned: a later promote of P recorded above it, or (#2070, simp724) P
+                // kept by the owner it would have replaced, at its epoch, which came back
+                // and serves. Either way the event stays, pinned, and keeps its floor.
+                S::Abandoned => {
+                    new.failovers.iter().any(|l| {
+                        l.kind() == K::Partition
+                            && l.partition == e.partition
+                            && l.to_epoch > e.to_epoch
+                    }) || epoch_of(new, &e.partition) == epoch_of(old, &e.partition)
+                        && epoch_of(old, &e.partition).is_some_and(|(node, _)| node == e.from)
+                }
                 S::Unspecified => false,
             },
         };
@@ -789,6 +795,35 @@ fn validate_pending_failovers(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
                  it above that epoch, or finish the promote first (phdb cluster promote {} --to \
                  {}) (D330)",
                 e.partition, e.to, e.to_epoch, e.partition, e.to
+            ));
+        }
+    }
+    // The floor binds every epoch change of P (#2070, simp724): a promote's `to_epoch`, in
+    // any state, may have a copy stamped at it, so no map gives P that epoch or one below
+    // it except that promote finishing. A hand-over, a relocation or a move takes
+    // `max(epoch, floor) + 1` ([`super::promote::next_epoch`]).
+    for p in &new.partitions {
+        let Some((_, was)) = epoch_of(old, &p.id) else {
+            continue;
+        };
+        let floor = super::promote::promote_floor(old, &p.id);
+        if p.epoch == was || p.epoch > floor {
+            continue;
+        }
+        let finishing = new.failovers.iter().any(|e| {
+            e.kind() == K::Partition
+                && e.partition == p.id
+                && e.state() == S::Done
+                && e.to == p.node
+                && e.to_epoch == p.epoch
+        });
+        if !finishing {
+            return Err(format!(
+                "partition {:?} goes to epoch {}, at or below epoch {floor}, which a promote of \
+                 it recorded: a copy may be stamped there. Take it to epoch {} (D330, #2070)",
+                p.id,
+                p.epoch,
+                was.max(floor) + 1
             ));
         }
     }
@@ -958,7 +993,7 @@ fn pending_promote<'m>(
 /// holder holds. One appears at COPYING; one kept keeps its
 /// range, partitions and kind and stays in its phase or goes to the next; one goes away
 /// before HANDED_OVER (an abort) or from CLEANING (done), never in HANDED_OVER. The step to
-/// HANDED_OVER names this map as the hand-over and raises the source's epoch by one, on
+/// HANDED_OVER names this map as the hand-over and raises the source's epoch (by one, or past a promote's floor: [`super::promote::next_epoch`]), on
 /// the same node (S1).
 fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
     let before: HashMap<&str, &RangeMove> = old.moves.iter().map(|m| (m.id.as_str(), m)).collect();
@@ -1020,12 +1055,16 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
                     .find(|p| p.id == m.from)
                     .map(|p| (p.node.clone(), p.epoch))
             };
+            // By one, or past the epoch a promote of it recorded (#2070, simp724): never onto
+            // a copy an abandoned promote stamped.
+            let floor = super::promote::promote_floor(old, &m.from);
             match (epoch(old), epoch(new)) {
-                (Some((a, e)), Some((b, f))) if a == b && f == e + 1 => {}
+                (Some((a, e)), Some((b, f))) if a == b && f == e.max(floor) + 1 => {}
                 _ => {
                     return Err(format!(
-                        "move {id:?}'s hand-over raises its source {:?}'s epoch by one, on the \
-                         same node (D331's S1)",
+                        "move {id:?}'s hand-over raises its source {:?}'s epoch to one above \
+                         both its epoch and every epoch a promote of it recorded, on the same \
+                         node (D331's S1, #2070)",
                         m.from
                     ));
                 }
@@ -1105,7 +1144,8 @@ pub(crate) fn validate_epochs(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
 /// - **An epoch kept:** `old`'s, whatever `new` says.
 /// - **An epoch raised:** the new epoch (a promotion or a restore starts another history),
 ///   unless `copies` names the partition (`relocate --copy`): then `old`'s, since its files
-///   were copied whole. A copy must move to another node at exactly `old`'s epoch + 1.
+///   were copied whole. A copy must move to another node at exactly `old`'s next epoch
+///   ([`super::promote::next_epoch`]).
 /// - **A new partition:** its epoch. So a first map, derived over an empty `old`, starts
 ///   every history at its epoch.
 ///
@@ -1120,11 +1160,13 @@ pub(crate) fn with_history(
     for c in copies {
         let moved = new.partitions.iter().find(|p| &p.id == c);
         match (before.get(c.as_str()), moved) {
-            (Some(o), Some(n)) if n.epoch == o.epoch + 1 && n.node != o.node => {}
+            (Some(o), Some(n))
+                if n.epoch == o.epoch.max(super::promote::promote_floor(old, c)) + 1
+                    && n.node != o.node => {}
             _ => {
                 return Err(format!(
                     "partition {c:?} is marked as copied, but this change doesn't move it to \
-                     another node at its epoch + 1"
+                     another node at its next epoch (D330's floor included)"
                 ));
             }
         }
@@ -2120,11 +2162,19 @@ mod tests {
             ),
             "has a promote to node \"a\" pending at epoch 2",
         );
-        // Abandoned only for a later promote of p3, recorded above it.
+        // Abandoned for a later promote of p3, recorded above it; or (#2070, simp724) with p3
+        // kept by the owner it would have replaced (b), at its epoch: it came back.
+        validate_catch_up(
+            &old,
+            &next(&old, |n| n.failovers[0].set_state(S::Abandoned)),
+        )
+        .unwrap();
+        let mut elsewhere = old.clone();
+        elsewhere.failovers[0].from = "c".into();
         refused(
             validate_catch_up(
-                &old,
-                &next(&old, |n| n.failovers[0].set_state(S::Abandoned)),
+                &elsewhere,
+                &next(&elsewhere, |n| n.failovers[0].set_state(S::Abandoned)),
             ),
             says,
         );
@@ -2149,6 +2199,104 @@ mod tests {
         let mut moved = old.clone();
         p3(&mut moved).epoch = 2;
         validate_catch_up(&moved, &next(&moved, |n| n.failovers.clear())).unwrap();
+    }
+
+    /// #2070 (simp724): a promote's `to_epoch`, in any state, is a floor for every epoch
+    /// change of its partition: an abandoned promote's orphan copy, stamped there, never
+    /// passes for a later history.
+    #[test]
+    fn an_abandoned_promotes_epoch_stays_a_floor_for_every_epoch_change() {
+        use crate::serve::proto::FailoverState as S;
+        // p3 on b at epoch 1; a promote to a at epoch 2 abandoned (b came back).
+        let mut old = map();
+        old.writer_term = 1;
+        old.writer = "a".into();
+        let mut e = pending("p3", "a", 2);
+        e.set_state(S::Abandoned);
+        old.failovers.push(e);
+        assert_eq!(
+            super::super::promote::next_epoch(&old, p3(&mut old.clone())),
+            3
+        );
+        // A relocation onto the orphan's epoch is refused; one above it isn't.
+        let says = "at or below epoch 2, which a promote of it recorded";
+        refused(
+            validate_catch_up(
+                &old,
+                &next(&old, |n| {
+                    p3(n).node = "c".into();
+                    p3(n).epoch = 2;
+                }),
+            ),
+            says,
+        );
+        validate_catch_up(
+            &old,
+            &next(&old, |n| {
+                p3(n).node = "c".into();
+                p3(n).epoch = 3;
+            }),
+        )
+        .unwrap();
+        // A relocation by copy goes to the next epoch past the floor (with_history).
+        let copied = next(&old, |n| {
+            p3(n).node = "c".into();
+            p3(n).epoch = 3;
+        });
+        with_history(&old, &copied, &["p3".into()]).unwrap();
+        let onto = next(&old, |n| {
+            p3(n).node = "c".into();
+            p3(n).epoch = 2;
+        });
+        assert!(with_history(&old, &onto, &["p3".into()]).is_err());
+        // The event stays pinned while p3's epoch is at or below it, whatever the count; past
+        // it, it's an ordinary finished event.
+        let mut m = old.clone();
+        for i in 0..FAILOVER_EVENTS {
+            let mut d = pending("p1", "a", 2 + i as u64);
+            d.set_state(S::Done);
+            super::super::promote::push_event(&mut m, d);
+        }
+        assert!(m.failovers.iter().any(|e| e.partition == "p3"), "pinned");
+        validate(&m, true).unwrap();
+        p3(&mut m).epoch = 3;
+        let mut d = pending("p1", "a", 99);
+        d.set_state(S::Done);
+        super::super::promote::push_event(&mut m, d);
+        assert!(!m.failovers.iter().any(|e| e.partition == "p3"), "pruned");
+    }
+
+    /// #2070: a hand-over after an abandoned promote never lands on the orphan's stamped
+    /// epoch; it takes the source past it.
+    #[test]
+    fn a_hand_over_after_an_abandoned_promote_goes_past_its_epoch() {
+        use crate::serve::proto::FailoverState as S;
+        let at = |phase: MovePhase, version: u64| {
+            let mut m = moving(phase);
+            m.map_version = version;
+            let mut e = pending("p1", "c", 2);
+            e.set_state(S::Abandoned);
+            m.failovers.push(e);
+            m
+        };
+        let before = at(MovePhase::HandingOver, 4);
+        let mut after = at(MovePhase::HandedOver, 5);
+        after.moves[0].handed_over_version = 5;
+        after.tables[0] = handed_over(&after.tables[0], b"c", Some(b"f"), "p2");
+        // One above p1's epoch (1) is the orphan's: refused.
+        after.partitions[0].epoch = 2;
+        refused(
+            validate_change(&before, &after),
+            "at or below epoch 2, which a promote of it recorded",
+        );
+        // Past it: max(epoch, floor) + 1.
+        after.partitions[0].epoch = 3;
+        validate_change(&before, &after).unwrap();
+        let derived = with_history(&before, &after, &[]).unwrap();
+        assert_eq!(
+            derived.partitions[0].history_epoch, 0,
+            "the history goes on"
+        );
     }
 
     #[test]

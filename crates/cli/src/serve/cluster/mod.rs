@@ -3143,13 +3143,14 @@ fn open_partition(
             let _ = db.close();
             Ok(None)
         }
-        // D331 (simp724's B3): one epoch below a map that hands a range of it over, at that
-        // epoch: a crash after the map's persist and before the source's stamp. The open
-        // finishes the hand-over (the moved-away row, then the stamp) before it serves.
+        // D331 (simp724's B3): below a map that hands a range of it over, at that epoch (one
+        // above, or past a promote's floor: #2070): a crash after the map's persist and
+        // before the source's stamp. The open finishes the hand-over (the moved-away row,
+        // then the stamp) before it serves.
         Ok(Some(id))
             if id.cluster_id == want.cluster_id
                 && id.partition_id == want.partition_id
-                && id.epoch + 1 == epoch
+                && id.epoch < epoch
                 && let Ok(Some(map)) = read_map(dir)
                 && let Some(m) = moves::handing_over(&map, partition) =>
         {

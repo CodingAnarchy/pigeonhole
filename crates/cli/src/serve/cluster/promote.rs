@@ -327,14 +327,41 @@ pub(crate) fn promote_floor(m: &proto::ClusterMap, partition: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// P's next epoch for any change that raises it (a relocation, a move, a hand-over): one
+/// above both its epoch and every epoch a promote of it recorded, so it never lands on a
+/// copy an unfinished or abandoned promote stamped (#2070, simp724).
+pub(crate) fn next_epoch(m: &proto::ClusterMap, p: &proto::Partition) -> u64 {
+    p.epoch.max(promote_floor(m, &p.id)) + 1
+}
+
+/// Whether `e` is kept in `m` whatever the event count: pending, or abandoned while its
+/// partition's epoch is at or below its `to_epoch`, where it's the floor (#2070,
+/// simp724). Past it, P's epoch is the floor itself.
+pub(crate) fn pinned(m: &proto::ClusterMap, e: &proto::FailoverEvent) -> bool {
+    use proto::{FailoverKind as K, FailoverState as St};
+    match e.state() {
+        St::Pending => true,
+        St::Abandoned => {
+            e.kind() == K::Partition
+                && m.partitions
+                    .iter()
+                    .any(|p| p.id == e.partition && p.epoch <= e.to_epoch)
+        }
+        _ => false,
+    }
+}
+
 /// Appends `e` to `m`'s failover events, then drops the oldest finished ones past
-/// [`super::map::FAILOVER_EVENTS`]; pending ones are never dropped.
+/// [`super::map::FAILOVER_EVENTS`]; [`pinned`] ones are never dropped.
 pub(crate) fn push_event(m: &mut proto::ClusterMap, e: proto::FailoverEvent) {
     m.failovers.push(e);
-    let pending = |e: &proto::FailoverEvent| e.state() == proto::FailoverState::Pending;
-    let mut finished = m.failovers.iter().filter(|e| !pending(e)).count();
-    m.failovers.retain(|e| {
-        if finished > super::map::FAILOVER_EVENTS && !pending(e) {
+    let keep: Vec<bool> = m.failovers.iter().map(|e| pinned(m, e)).collect();
+    let mut finished = keep.iter().filter(|k| !**k).count();
+    let mut i = 0;
+    m.failovers.retain(|_| {
+        let pin = keep[i];
+        i += 1;
+        if finished > super::map::FAILOVER_EVENTS && !pin {
             finished -= 1;
             false
         } else {
@@ -486,6 +513,23 @@ pub(crate) async fn run(
             m2.map_version
         )));
     };
+    // The writer abandoned this promote since step 1: P's owner came back and serves
+    // (#2070, simp724). The stamped copy is an orphan to drop.
+    if m2.failovers.iter().any(|e| {
+        e.kind() == K::Partition
+            && e.partition == partition
+            && e.to == to
+            && e.to_epoch == target
+            && e.state() == St::Abandoned
+    }) {
+        return Err(Failure::usage(&format!(
+            "the promote of {partition} to node {to:?} at epoch {target} was abandoned: its \
+             owner, node {:?}, came back and serves it. Node {to:?}'s copy stamped at epoch \
+             {target} must be dropped there (phdb cluster drop-partition {partition} on node \
+             {to:?})",
+            p.node
+        )));
+    }
     if now.node != p.node || now.epoch != p.epoch || now.replicas.iter().any(|r| r == to) {
         return Err(Failure::usage(&format!(
             "the map changed during the promote: {partition} is on node {:?} at epoch {} in \

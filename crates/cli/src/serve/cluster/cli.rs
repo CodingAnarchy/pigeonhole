@@ -661,6 +661,13 @@ pub(super) async fn relocate_as(
         None
     };
     let from = restoring.map_or(p.epoch, |r| r.from_epoch.max(p.epoch));
+    // A restore's `from_epoch` already counts the promote floor; a relocation goes one above
+    // P's epoch and that floor (#2070).
+    let to_epoch = if restoring.is_some() {
+        from + 1
+    } else {
+        super::promote::next_epoch(&m, &p)
+    };
     // A restore reusing an earlier run's stamp at `from_epoch + 1` needs the map still
     // below it: a map moved on since gives P a later epoch than that file's.
     if let Some(r) = restoring
@@ -681,7 +688,7 @@ pub(super) async fn relocate_as(
                 cluster_id: m.cluster_id.clone(),
                 partition: partition.to_owned(),
                 from_epoch: from,
-                to_epoch: from + 1,
+                to_epoch,
                 restore: restoring.is_some(),
                 restore_from_cluster_id: String::new(),
                 promote: false,
@@ -720,7 +727,7 @@ pub(super) async fn relocate_as(
     }
     for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
-        q.epoch = from + 1;
+        q.epoch = to_epoch;
     }
     m.map_version += 1;
     // Last, just before the map: OLD still holds P closed with exactly the files the copy
@@ -778,7 +785,7 @@ pub(super) async fn relocate_as(
             ("partition", json!(partition)),
             ("from", json!(p.node)),
             ("node", json!(to)),
-            ("epoch", json!(from + 1)),
+            ("epoch", json!(to_epoch)),
             ("copied", json!(copy)),
             ("installed_files", json!(stamped.files.len())),
             (
