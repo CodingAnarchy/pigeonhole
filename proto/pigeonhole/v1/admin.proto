@@ -21,7 +21,9 @@ service Admin {
   rpc Backup(BackupRequest) returns (BackupResponse);
   // A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
   // keeps the backup for a few minutes after the stream ends or breaks, so a download can
-  // resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+  // resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4). On a
+  // cluster node, a node's cluster token may also download a named partition's closed set
+  // (`fenced_file`) or a replica's bootstrap (D328), as the map's writer's move does (D332).
   rpc BackupDownload(BackupDownloadRequest) returns (stream BackupChunk);
   // The metrics in Prometheus text format, under D316's names (read scope).
   rpc Metrics(Empty) returns (MetricsResponse);
@@ -32,9 +34,12 @@ service Admin {
   rpc Promote(Empty) returns (PromoteResponse);
   // On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
   // relocation by file copy. It's staged aside, never served; the stamp that relocates or
-  // restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+  // restores the partition here installs the complete set (D317 ticket 6). gRPC only. A
+  // node's cluster token may upload a relocation's set (a move the map's writer runs, D332),
+  // never a restore's.
   rpc PartitionUpload(stream PartitionUploadChunk) returns (PartitionUploadReply);
-  // How many bytes of an upload the node holds, to resume it.
+  // How many bytes of an upload the node holds, to resume it. Admin scope, or a node's
+  // cluster token.
   rpc PartitionUploadStatus(PartitionUploadStatusRequest) returns (PartitionUploadStatusReply);
 }
 
