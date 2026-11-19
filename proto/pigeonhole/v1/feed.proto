@@ -72,6 +72,10 @@ message FeedEvent {
   }
   // On a cluster subscription, the partition the event came from; empty on a single node.
   string partition = 5;
+  // A commit of a transaction across partitions (D329, `BeginRequest.spans_partitions`): its
+  // id, the same on every partition's share of it, so a subscriber can group them. Empty
+  // for any other commit.
+  bytes xid = 7;
 }
 
 // D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).

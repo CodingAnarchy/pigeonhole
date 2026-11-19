@@ -32,6 +32,11 @@ service Cluster {
   // This node: its id, its map version and the partitions in its directory. Read, admin or
   // cluster scope.
   rpc Status(StatusRequest) returns (NodeStatus);
+  // `phdb cluster txn decide` (D329): decides a share held in doubt on this node's partition,
+  // for a transaction whose home will never answer. Admin or cluster scope. It can break the
+  // transaction's atomicity, so without `force` it's refused while the home answers. Answers
+  // the partition's status line.
+  rpc DecideTxn(DecideTxnRequest) returns (LocalPartition);
   // Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
   // the caller it names, whose scope and namespaces this node checks again. This node
   // serves it only if its own map gives it the key; otherwise `WrongPartition` with its
@@ -257,6 +262,10 @@ message RangeMove {
   // move's commit point.
   uint64 handed_over_version = 11;
   uint64 handed_over_term = 12;
+  // The source partition's epoch when the move entered COPYING (D332 PR 2, #1485). A NODE
+  // move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
+  // promoted it mid-move). 0 on a record from before this field.
+  uint64 from_epoch = 13;
 }
 
 // D331: what a range move is for.
@@ -267,7 +276,7 @@ enum MoveKind {
   // `phdb cluster split`: to a partition the split added.
   MOVE_KIND_PARTITION = 2;
   // D332: a whole partition relocated to another node (no table or range; `to` names the
-  // node). Validated by D332's balancer PR; refused until then.
+  // node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
   MOVE_KIND_NODE = 3;
   // PR 6 (merge) adds MOVE_KIND_MERGE = 4.
 }
@@ -593,6 +602,14 @@ message LocalPartition {
   uint64 replica_lag_ms = 19;
   // For a replica copy: where its follower is.
   ReplicaState replica_state = 20;
+  // D329: shares of transactions across partitions held here in doubt (prepared, their
+  // decision not yet known here), the oldest's xid and age, and the WAL bytes they keep.
+  uint32 in_doubt = 21;
+  string in_doubt_oldest_xid = 22;
+  uint64 in_doubt_oldest_age_ms = 23;
+  uint64 in_doubt_wal_bytes = 24;
+  // Each, with why it's still in doubt (its home unreachable, or its home's history changed).
+  repeated InDoubtShare in_doubt_shares = 25;
   // D331: the range moves naming this partition, as source or target.
   repeated MoveStatus moves = 27;
   // D331: for a move's target, its range follower's lag behind the source, in milliseconds
@@ -613,6 +630,13 @@ message LocalPartition {
   double load_cpu = 29;
   double load_device = 30;
   double load = 31;
+}
+
+// A share held in doubt (D329).
+message InDoubtShare {
+  string xid = 1;
+  uint64 age_ms = 2;
+  string reason = 3;
 }
 
 // D328: how a node holds a partition.
@@ -741,6 +765,12 @@ message ForwardRequest {
     BranchBegin branch_begin = 45;
     BranchPrepare branch_prepare = 46;
     BranchDecide branch_decide = 47;
+    // A branch's node asks its transaction's home what was decided, for a share it holds in
+    // doubt (D329's resolver): the node's own call, cluster scope only.
+    ResolveTxn resolve_txn = 48;
+    // A client's `Transactions.Outcome` for a transaction whose home this node isn't
+    // (D329): the client's caller rides `caller`, write scope.
+    TxnOutcomeRequest txn_outcome = 52;
   }
 }
 
@@ -887,6 +917,31 @@ message BranchDecide {
   uint64 term = 4;
 }
 
+// `phdb cluster txn decide` (D329): an operator decides a share held in doubt on this node's
+// `partition`, for a home that will never answer. Without `force`, refused while the home
+// answers `ResolveTxn`.
+message DecideTxnRequest {
+  string partition = 1;
+  string xid = 2;
+  bool commit = 3;
+  bool force = 4;
+}
+
+// What a share in doubt asks its home (D329): the transaction's xid. With `acked` (the
+// branch's partition), the branch reports it has applied the commit its home answered, for
+// the decision record's GC; the answer is then the decision again.
+message ResolveTxn {
+  string xid = 1;
+  string acked = 2;
+}
+
+// The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
+// `UNKNOWN` leave it in doubt (`reason` says why).
+message TxnResolution {
+  TxnOutcomeState state = 1;
+  string reason = 2;
+}
+
 // A prepared branch (D329): for a read-only one, its hold and the lease term it was taken in.
 message BranchPrepared {
   uint64 hold = 1;
@@ -929,6 +984,8 @@ message ForwardResponse {
     RecallPoolResponse recall_pool = 23;
     RecallBodiesResponse recall_bodies = 24;
     BranchPrepared branch_prepare = 25;
+    TxnResolution resolve_txn = 26;
+    TxnOutcomeResponse txn_outcome = 30;
   }
   // The seqno the serving node read at, in the owner's numbering (D328's
   // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the

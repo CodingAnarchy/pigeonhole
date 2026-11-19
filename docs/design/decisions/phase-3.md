@@ -5091,7 +5091,12 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 
 **PRs:**
 1. The measurements: ICR 0142 and the `LocalPartition` load fields.
-2. Whole-partition moves recorded in `moves`.
+2. Whole-partition moves recorded in `moves` (ICR 0117's D332 PR 2 section).
+   - `phdb cluster move` writes a `MOVE_KIND_NODE` record before it fences, and advances it: COPYING, HANDING_OVER (stamped and matched), HANDED_OVER (the relocation map itself, the commit point) and CLEANING (the target serves). Then the record goes.
+   - NODE has no CATCHING_UP.
+   - `RangeMove.from_epoch = 13` holds P's epoch at COPYING. A map that moves P otherwise (a failover's promote) drops the record, and HANDED_OVER is refused if the epoch changed (simp724's M2).
+   - Each attempt has a fresh record, so an aborted attempt's copy is never trusted (M1).
+   - `--abort` ends one before its commit point.
 3. The policy, the loop, the map fields, the CLI and the `Forward` tablets arm.
 4. The guide.
 

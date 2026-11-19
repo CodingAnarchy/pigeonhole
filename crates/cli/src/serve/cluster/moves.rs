@@ -34,9 +34,9 @@ use crate::serve::ranges::{self, Moved};
 
 /// The move `map` hands `partition` over in as its source, from HANDED_OVER on, if any.
 pub(super) fn handing_over<'m>(map: &'m ClusterMap, partition: &str) -> Option<&'m RangeMove> {
-    map.moves
-        .iter()
-        .find(|m| m.from == partition && map::phase(m) >= MovePhase::HandedOver)
+    map.moves.iter().find(|m| {
+        !map::node_move(m) && m.from == partition && map::phase(m) >= MovePhase::HandedOver
+    })
 }
 
 /// `db`'s D310 feed token now for a feed of `table` (D331 PR 3b's `t_from`), `None` when
@@ -215,7 +215,8 @@ impl Node {
             .map_or(0, |p| p.epoch);
         // A new fence: its marker moves the visible seqno past the fence's (B2).
         let fencing = map.moves.iter().find(|m| {
-            m.from == id
+            !map::node_move(m)
+                && m.from == id
                 && map::phase(m) == MovePhase::HandingOver
                 && !gate
                     .ranges()
@@ -233,7 +234,10 @@ impl Node {
         // copy, and a later map that gives a range back to its old owner is told apart
         // from one that returns it with no copy (cli692's point on the PR 2 review).
         for m in map.moves.iter().filter(|m| {
-            m.to == id && map::phase(m) >= MovePhase::Cleaning && !gate.ranges().has_serving(&m.id)
+            !map::node_move(m)
+                && m.to == id
+                && map::phase(m) >= MovePhase::Cleaning
+                && !gate.ranges().has_serving(&m.id)
         }) {
             let (start, end) = map::move_range(m)?;
             // `t_from` as a D310 token (PR 3b): a feed of the table opened now, before the
@@ -357,7 +361,7 @@ pub(super) fn clip_restored(
         for m in map
             .moves
             .iter()
-            .filter(|m| m.to == partition && m.table == t.name)
+            .filter(|m| !map::node_move(m) && m.to == partition && m.table == t.name)
         {
             mine.push(map::move_range(m)?);
         }

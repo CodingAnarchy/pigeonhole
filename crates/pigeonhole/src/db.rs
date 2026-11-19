@@ -1534,6 +1534,19 @@ impl Pigeonhole {
             .collect()
     }
 
+    /// [`in_doubt`](Self::in_doubt) with each share's WAL bytes (its batches, as the
+    /// in-doubt limit counts them): what `phdb serve`'s `Status` shows. Hidden, as
+    /// [`Pigeonhole::decide`].
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn in_doubt_shares(&self) -> Vec<(Vec<u8>, std::time::Duration, u64)> {
+        self.engine()
+            .in_doubt_shares()
+            .into_iter()
+            .map(|(xid, ns, bytes)| (xid, std::time::Duration::from_nanos(ns), bytes))
+            .collect()
+    }
+
     /// Compacts every table fully: flushes, then merges every level into the last one.
     /// Versions beyond a family's `max_versions`, expired cells and tombstones that no
     /// snapshot can still need are dropped. Compaction otherwise runs in the background;

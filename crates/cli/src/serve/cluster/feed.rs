@@ -661,7 +661,8 @@ impl Merge {
         let moves = self.ctx.node.get_map().map(|m| m.moves).unwrap_or_default();
         let handing = |table: &str, p: &str| {
             moves.iter().any(|m| {
-                m.table == table
+                !super::map::node_move(m)
+                    && m.table == table
                     && m.to == p
                     && super::map::phase(m) < crate::serve::proto::MovePhase::Cleaning
             })
@@ -947,6 +948,7 @@ impl Merge {
             },
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
+            xid: Default::default(),
         }
     }
 
@@ -1212,6 +1214,7 @@ fn state_event(partition: &str, e: Option<&ApiError>) -> proto::FeedEvent {
             },
         )),
         partition: partition.to_owned(),
+        xid: Default::default(),
     }
 }
 
@@ -2136,6 +2139,7 @@ pub(super) mod tests {
                 None => proto::feed_event::Event::Progress(proto::Progress {}),
             }),
             partition: String::new(),
+            xid: Default::default(),
         };
         Bytes::from(prost::Message::encode_to_vec(&e))
     }

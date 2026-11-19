@@ -288,9 +288,86 @@ pub(crate) fn followed_by<'m>(map: &'m ClusterMap, table: &str) -> Vec<&'m str> 
         .collect()
 }
 
+/// Whether `m` is a whole partition's relocation (D332 PR 2's `MOVE_KIND_NODE`), not a
+/// range move: it gates no range, sends no barrier and hands nothing over, so every reader
+/// of the map's moves that acts on a range skips it.
+pub(crate) fn node_move(m: &RangeMove) -> bool {
+    m.kind == crate::serve::proto::MoveKind::Node as i32
+}
+
+/// Checks a NODE move (D332 PR 2): no table or range; a listed partition, relocating to
+/// another of the map's nodes; never at CATCHING_UP (nothing to catch up: P is closed on
+/// its node while it copies, simp724's Q1). Before HANDED_OVER P is still on its node at
+/// `from_epoch`; from it, on `to` past it. So any map that moves P otherwise drops the
+/// record (simp724's M2), a failover's included.
+fn validate_node_move(map: &ClusterMap, m: &RangeMove) -> Result<(), Refusal> {
+    let id = &m.id;
+    if !m.table.is_empty() || m.start.is_some() || m.end.is_some() {
+        return Err(format!(
+            "move {id:?} relocates a whole partition: it names no table or range"
+        ));
+    }
+    let Some(p) = map.partitions.iter().find(|p| p.id == m.from) else {
+        return Err(format!(
+            "move {id:?} names partition {:?}, which the map doesn't list",
+            m.from
+        ));
+    };
+    if !map.nodes.iter().any(|n| n.id == m.to) {
+        return Err(format!(
+            "move {id:?} relocates {:?} to node {:?}, which the map doesn't list",
+            m.from, m.to
+        ));
+    }
+    let phase = phase(m);
+    if phase == MovePhase::CatchingUp {
+        return Err(format!(
+            "move {id:?} relocates a whole partition, which has no CATCHING_UP phase"
+        ));
+    }
+    if m.from_epoch == 0 || m.snapshot_seqno != 0 || m.final_seqno != 0 {
+        return Err(format!(
+            "move {id:?} relocates a whole partition: it records its epoch at COPYING \
+             (from_epoch), and no seqnos"
+        ));
+    }
+    let handed = phase >= MovePhase::HandedOver;
+    let at = if handed {
+        p.node == m.to && p.epoch > m.from_epoch
+    } else {
+        p.node != m.to && p.epoch == m.from_epoch
+    };
+    if !at {
+        return Err(format!(
+            "move {id:?} relocates {:?} from epoch {} to node {:?}, but the map has it on node \
+             {:?} at epoch {}: {} (a map that moves the partition otherwise drops the record)",
+            m.from,
+            m.from_epoch,
+            m.to,
+            p.node,
+            p.epoch,
+            if handed {
+                "from HANDED_OVER it's on the target past that epoch"
+            } else {
+                "before HANDED_OVER it's on its node at that epoch"
+            }
+        ));
+    }
+    let pair = (m.handed_over_term, m.handed_over_version);
+    if handed != (pair != (0, 0)) || pair > (map.writer_term, map.map_version) {
+        return Err(format!(
+            "move {id:?}'s handed-over map (term {}, version {}) must be set from HANDED_OVER \
+             on, only then, and not after this map",
+            m.handed_over_term, m.handed_over_version
+        ));
+    }
+    Ok(())
+}
+
 /// Checks the range moves (D331): each well formed, on a placed, ungrouped table no index
 /// follows, between two listed partitions, inside a range of its source before the
-/// hand-over and of its target from it; and each partition in at most one move.
+/// hand-over and of its target from it; and each partition in at most one move, a NODE
+/// move's included ([`validate_node_move`]).
 fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
     let tables: HashMap<&str, &TablePlacement> =
         map.tables.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -308,6 +385,17 @@ fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
         let phase = phase(m);
         if phase == MovePhase::Unspecified {
             return Err(format!("move {id:?} has no phase this build knows"));
+        }
+        if node_move(m) {
+            validate_node_move(map, m)?;
+            if let Some(other) = busy.insert(m.from.as_str(), id.as_str()) {
+                return Err(format!(
+                    "partition {:?} is in moves {other:?} and {id:?}: a partition is in one \
+                     move at a time",
+                    m.from
+                ));
+            }
+            continue;
         }
         if !matches!(
             crate::serve::proto::MoveKind::try_from(m.kind),
@@ -857,7 +945,8 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         if keys(t) != keys(n) || t.partitions != n.partitions {
             // D331: the one change a placement takes, a move's hand-over.
             let handover = new.moves.iter().find(|m| {
-                m.table == t.name
+                !node_move(m)
+                    && m.table == t.name
                     && phase(m) == MovePhase::HandedOver
                     && old
                         .moves
@@ -1016,7 +1105,9 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
             // Not while a promote of its source or target is pending (cli692's N1 on PR 2):
             // the promote's map moves the partition to another node and epoch under the
             // copy, and the move's hand-over raises the same epoch.
-            for p in [&m.from, &m.to] {
+            // A NODE move's `to` is a node, not a partition.
+            let parts = if node_move(m) { 1 } else { 2 };
+            for p in [&m.from, &m.to].into_iter().take(parts) {
                 if let Some(e) = pending_promote(new, p) {
                     return Err(format!(
                         "move {id:?} can't start while partition {p:?} has a pending promote \
@@ -1027,7 +1118,8 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
             }
             continue;
         };
-        if (o.kind, &o.table, &o.from, &o.to) != (m.kind, &m.table, &m.from, &m.to)
+        if (o.kind, &o.table, &o.from, &o.to, o.from_epoch)
+            != (m.kind, &m.table, &m.from, &m.to, m.from_epoch)
             || move_range(o)? != move_range(m)?
         {
             return Err(format!(
@@ -1035,7 +1127,10 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
             ));
         }
         let (was, now) = (phase(o) as i32, phase(m) as i32);
-        if now != was && now != was + 1 {
+        // A NODE move has no CATCHING_UP: it goes from COPYING to HANDING_OVER (D332 PR 2).
+        let skip =
+            node_move(m) && phase(o) == MovePhase::Copying && phase(m) == MovePhase::HandingOver;
+        if now != was && now != was + 1 && !skip {
             return Err(format!(
                 "move {id:?} went from phase {:?} to {:?}: a move goes forward one phase per map",
                 phase(o),
@@ -1048,6 +1143,30 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
                     "move {id:?}'s hand-over map must be this map (term {}, version {})",
                     new.writer_term, new.map_version
                 ));
+            }
+            // A NODE move's commit point is P's relocation (D332 PR 2): to `to`, at its next
+            // epoch past any promote's floor, from the epoch it started at.
+            if node_move(m) {
+                let of = |map: &ClusterMap| {
+                    map.partitions
+                        .iter()
+                        .find(|p| p.id == m.from)
+                        .map(|p| (p.node.clone(), p.epoch))
+                };
+                let floor = super::promote::promote_floor(old, &m.from);
+                match (of(old), of(new)) {
+                    (Some((a, e)), Some((b, f)))
+                        if a != m.to && e == m.from_epoch && b == m.to && f == e.max(floor) + 1 => {
+                    }
+                    _ => {
+                        return Err(format!(
+                            "move {id:?}'s HANDED_OVER map relocates partition {:?} from epoch \
+                             {} to node {:?} at its next epoch (D332 PR 2)",
+                            m.from, m.from_epoch, m.to
+                        ));
+                    }
+                }
+                continue;
             }
             let epoch = |map: &ClusterMap| {
                 map.partitions
@@ -1177,7 +1296,8 @@ pub(crate) fn with_history(
         .moves
         .iter()
         .filter(|m| {
-            phase(m) == MovePhase::HandedOver
+            !node_move(m)
+                && phase(m) == MovePhase::HandedOver
                 && old
                     .moves
                     .iter()
@@ -2329,6 +2449,97 @@ mod tests {
             derived.partitions[0].history_epoch, 0,
             "the history goes on"
         );
+    }
+
+    /// D332 PR 2: a NODE move's record, `phdb cluster move`'s: p3 (on b at epoch 1)
+    /// relocating to node a.
+    fn node_move(phase: MovePhase, version: u64) -> ClusterMap {
+        let mut m = map();
+        m.map_version = version;
+        let mut r = RangeMove {
+            id: "node-1".into(),
+            kind: crate::serve::proto::MoveKind::Node as i32,
+            from: "p3".into(),
+            to: "a".into(),
+            from_epoch: 1,
+            ..Default::default()
+        };
+        r.set_phase(phase);
+        m.moves.push(r);
+        m
+    }
+
+    #[test]
+    fn a_node_moves_record_is_checked_and_goes_forward_with_the_relocation() {
+        validate(&node_move(MovePhase::Copying, 2), true).unwrap();
+        let bad = |f: &dyn Fn(&mut ClusterMap), says: &str| {
+            let mut m = node_move(MovePhase::Copying, 2);
+            f(&mut m);
+            refused(validate(&m, true), says);
+        };
+        bad(
+            &|m| m.moves[0].table = "users".into(),
+            "names no table or range",
+        );
+        bad(
+            &|m| m.moves[0].to = "z".into(),
+            "which the map doesn't list",
+        );
+        bad(
+            &|m| m.moves[0].from = "p9".into(),
+            "which the map doesn't list",
+        );
+        bad(
+            &|m| m.moves[0].set_phase(MovePhase::CatchingUp),
+            "no CATCHING_UP phase",
+        );
+        bad(&|m| m.moves[0].from_epoch = 0, "from_epoch");
+        // A map that moves p3 elsewhere with the record left (a failover's promote) drops it
+        // instead (simp724's M2).
+        bad(
+            &|m| {
+                p3(m).node = "b".into();
+                p3(m).epoch = 2;
+            },
+            "drops the record",
+        );
+        // One move per partition, whatever the kind.
+        bad(
+            &|m| {
+                let mut r = m.moves[0].clone();
+                r.id = "node-2".into();
+                m.moves.push(r);
+            },
+            "one move at a time",
+        );
+
+        // COPYING to HANDING_OVER directly: no CATCHING_UP.
+        validate_change(&map(), &node_move(MovePhase::Copying, 2)).unwrap();
+        validate_change(
+            &node_move(MovePhase::Copying, 2),
+            &node_move(MovePhase::HandingOver, 3),
+        )
+        .unwrap();
+        // The commit point: the map relocating p3 to a at its next epoch, naming itself.
+        let before = node_move(MovePhase::HandingOver, 3);
+        let mut after = node_move(MovePhase::HandedOver, 4);
+        after.moves[0].handed_over_version = 4;
+        p3(&mut after).node = "a".into();
+        p3(&mut after).epoch = 2;
+        validate_change(&before, &after).unwrap();
+        let mut wrong = after.clone();
+        p3(&mut wrong).epoch = 3;
+        refused(validate_change(&before, &wrong), "at its next epoch");
+        // Removed before the commit point (an abort, or a failover's map), not at it.
+        let mut gone = map();
+        gone.map_version = 4;
+        validate_change(&before, &gone).unwrap();
+        let mut gone = after.clone();
+        gone.map_version = 5;
+        gone.moves.clear();
+        refused(validate_change(&after, &gone), "past its commit point");
+        // A NODE record gates no range and hands no table over.
+        assert!(super::node_move(&after.moves[0]));
     }
 
     #[test]

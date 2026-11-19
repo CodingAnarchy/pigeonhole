@@ -134,6 +134,11 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "ID", requires = "partition")]
         to: Option<String>,
     },
+    /// Transactions across partitions (D329): `txn decide`.
+    Txn {
+        #[command(subcommand)]
+        command: TxnCommand,
+    },
     /// Fence a partition on the node that serves it (`--node`): its writes answer `Fenced`
     /// through every node until it's unfenced, relocated or closed; reads go on. Answers
     /// once the writes admitted before the fence have finished. Kept across a restart.
@@ -222,12 +227,19 @@ pub(crate) enum ClusterCommand {
     /// Writes answer `Fenced` from the fence until the map moves; reads are down from the
     /// close until `--to` serves. Both grow with the files' size, so with the feed's
     /// retention. Run it again to resume one that stopped. The old node's files stay
-    /// unless `--drop-source`.
+    /// unless `--drop-source`. The map records the move while it runs (`status` shows it),
+    /// so a stopped one is seen; `--abort` ends one before its commit point.
     Move {
         partition: String,
         /// The node id it moves to.
-        #[arg(long, value_name = "ID")]
-        to: String,
+        #[arg(long, value_name = "ID", required_unless_present = "abort")]
+        to: Option<String>,
+        /// End the partition's recorded move before its commit point (the map giving the
+        /// partition to `--to`): its record goes, and the copy it made on the target moves
+        /// aside. The partition stays on its node, closed and fenced as the move left it:
+        /// `unfence` serves it there again. Refused once the map gives it to the target.
+        #[arg(long, conflicts_with_all = ["to", "drop_source", "timeout"])]
+        abort: bool,
         #[command(flatten)]
         node: NodeArgs,
         /// Once the copy is checked and `--to` serves the partition, move the old node's
@@ -334,6 +346,17 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 to: to.clone(),
             },
         )),
+        ClusterCommand::Txn {
+            command:
+                TxnCommand::Decide {
+                    xid,
+                    partition,
+                    commit,
+                    abort: _,
+                    force,
+                    node,
+                },
+        } => runtime()?.block_on(txn_decide(node, partition, xid, *commit, *force)),
         ClusterCommand::Fence { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Fence))
         }
@@ -347,14 +370,21 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
         }
         ClusterCommand::Move {
             partition,
+            abort: true,
+            node,
+            ..
+        } => runtime()?.block_on(super::moving::abort(node, partition)),
+        ClusterCommand::Move {
+            partition,
             to,
             node,
             drop_source,
             timeout,
+            ..
         } => runtime()?.block_on(super::moving::run(
             node,
             partition,
-            to,
+            to.as_deref().unwrap_or_default(),
             *drop_source,
             timeout.map(Duration::from_secs),
         )),
@@ -385,6 +415,59 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
 }
 
 /// One of the per-partition calls on a node (D317 ticket 6).
+/// `phdb cluster txn ...` (D329).
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(crate) enum TxnCommand {
+    /// Decide a transaction's share held in doubt on partition `--partition`, on the node
+    /// that serves it (`--node`), for a transaction whose home will never settle it. Refused
+    /// while the home can (it answers committed, aborted or in progress) unless `--force`,
+    /// which can break the transaction's atomicity; a home that answers unknown can't.
+    /// Answers the partition's line.
+    Decide {
+        /// The transaction's id (as `phdb cluster status` lists it).
+        xid: String,
+        #[arg(long, value_name = "P")]
+        partition: String,
+        /// Commit the share.
+        #[arg(long, conflicts_with = "abort", required_unless_present = "abort")]
+        commit: bool,
+        /// Abort the share.
+        #[arg(long)]
+        abort: bool,
+        /// Decide even though the home answers.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+}
+
+/// `phdb cluster txn decide`: the share's decide on `--node`, and the partition's line there.
+async fn txn_decide(
+    args: &NodeArgs,
+    partition: &str,
+    xid: &str,
+    commit: bool,
+    force: bool,
+) -> Result<Report, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    let req = request(
+        proto::DecideTxnRequest {
+            partition: partition.to_owned(),
+            xid: xid.to_owned(),
+            commit,
+            force,
+        },
+        token.as_deref(),
+    )?;
+    let lp = c
+        .decide_txn(req)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    Ok(local_report("cluster txn decide", &args.node, &lp))
+}
+
 #[derive(Clone, Copy)]
 enum Call {
     Fence,
@@ -487,7 +570,7 @@ pub(crate) async fn relocate(
     } else {
         CopyCheck::No
     };
-    relocate_as(args, partition, to, old_unreachable, copy, None).await
+    relocate_as(args, partition, to, old_unreachable, copy, None, None).await
 }
 
 /// A test's fault seam: the next one-partition restore through this `--node` URL stops
@@ -519,6 +602,7 @@ pub(super) async fn relocate_as(
     old_unreachable: bool,
     copy: CopyCheck,
     restoring: Option<Restoring>,
+    record: Option<&str>,
 ) -> Result<Report, Failure> {
     if restoring.is_some() && copy != CopyCheck::No {
         return Err(Failure::usage(
@@ -730,6 +814,16 @@ pub(super) async fn relocate_as(
         q.epoch = to_epoch;
     }
     m.map_version += 1;
+    // `phdb cluster move`'s record (D332 PR 2): this map is its commit point, HANDED_OVER.
+    if let Some(id) = record {
+        let (term, version) = (m.writer_term, m.map_version);
+        let Some(r) = m.moves.iter_mut().find(|r| r.id == id) else {
+            return Err(super::moving::record_gone(id, partition, &p.node, p.epoch));
+        };
+        r.set_phase(proto::MovePhase::HandedOver);
+        r.handed_over_term = term;
+        r.handed_over_version = version;
+    }
     // Last, just before the map: OLD still holds P closed with exactly the files the copy
     // was checked against. A reopen rewrites them (FORMAT §10.1, §10.4), so an unfence and
     // a fence again on OLD since the check, with writes acknowledged between, is caught
@@ -1216,7 +1310,17 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     rows.push(node_row("", String::new(), ""));
                 }
                 for lp in &s.partitions {
-                    rows.push(node_row(&lp.id, state_text(lp), &lp.error));
+                    // D329: shares held in doubt there, and how long the oldest has waited
+                    // (each one's xid and reason are in the JSON).
+                    let state = match lp.in_doubt {
+                        0 => state_text(lp),
+                        n => format!(
+                            "{}, {n} in doubt (oldest {}s)",
+                            state_text(lp),
+                            lp.in_doubt_oldest_age_ms / 1000
+                        ),
+                    };
+                    rows.push(node_row(&lp.id, state, &lp.error));
                 }
                 nodes.push(serde_json::to_value(&s).expect("NodeStatus serializes"));
             }
