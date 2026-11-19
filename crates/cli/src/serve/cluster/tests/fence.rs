@@ -2466,11 +2466,12 @@ fn a_blocked_partition_is_surveyed_again_only_when_its_block_can_have_ended() {
         let held = TEST_LEASE * 4;
         tokio::time::sleep(held).await;
         let more = surveys() - before;
-        // b renews its grant to c each round, so it has up to L left at each survey: about
-        // one survey per L, plus one at an edge. A lease round every L/3 would have made
-        // twelve.
+        // b renews its grant to c every third of a lease, so at each survey it has between
+        // 2L/3 and L left: one survey per 2L/3 at most, six in 4L, plus one at an edge (a
+        // Linux CI run on #2087 saw six against the bound of five #2073 set). A survey on
+        // every lease round would have made twelve.
         assert!(
-            more <= 5,
+            more <= 7,
             "{more} surveys in {held:?} of a blocked partition"
         );
         assert!(blocked_for(a, "waiting: node b").await, "still reported");
