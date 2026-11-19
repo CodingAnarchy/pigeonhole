@@ -1152,7 +1152,7 @@ impl WalRecord<'_> {
         }
     }
 
-    fn decode_any(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
+    fn decode_any(bytes: &[u8], has_bit3: bool) -> crate::Result<WalRecord<'_>> {
         let mut r = Reader::new(bytes, "wal record");
         match r.u8()? {
             1 => Ok(WalRecord::Batch {
@@ -1188,7 +1188,7 @@ impl WalRecord<'_> {
             }),
             // D331's bit gates it, as it gates the silent mark: without the bit, a 7 is a
             // record this file can't hold.
-            7 if silent_ok => Ok(WalRecord::RangeDrop {
+            7 if has_bit3 => Ok(WalRecord::RangeDrop {
                 seqno: r.u64()?,
                 range: DroppedRange::decode(r.rest())?,
             }),
