@@ -2455,6 +2455,8 @@ impl Barrier {
                 final_seqno: self.final_seqno,
             })),
             partition: String::new(),
+            // A barrier isn't a commit: no transaction's id (D329 2b).
+            xid: Default::default(),
         })
     }
 }
