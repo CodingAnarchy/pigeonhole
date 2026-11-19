@@ -82,12 +82,6 @@ impl Change {
         self.ids
     }
 
-    /// The stored value, its tag byte first; empty for deletes.
-    #[cfg(feature = "__unstable-replication")]
-    pub(crate) fn stored(&self) -> &[u8] {
-        &self.stored
-    }
-
     /// The table's name. Empty only for a family created after the feed opened whose table
     /// was dropped before the feed reached this change: its name went with the table.
     pub fn table(&self) -> &str {
@@ -117,6 +111,16 @@ impl Change {
     /// Its timestamp: the one the write gave, or else its commit's.
     pub fn timestamp(&self) -> u64 {
         self.ts
+    }
+
+    /// The value as the engine stored it, tag byte first (empty for the deletes): what a
+    /// range move's target writes again with
+    /// [`LoggedBatch::push`](crate::replication::LoggedBatch::push) (D331 PR 4). Not part of
+    /// the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn stored(&self) -> &[u8] {
+        &self.stored
     }
 
     /// The value written or merged, as the read API types it; `None` for the deletes.

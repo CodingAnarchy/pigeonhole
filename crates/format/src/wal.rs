@@ -121,7 +121,7 @@ fn marked(bytes: &[u8]) -> bool {
 #[cold]
 #[inline(never)]
 fn external_marked(bytes: &[u8]) -> bool {
-    WalRecord::decode_any(bytes).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
+    WalRecord::decode_any(bytes, true).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
 }
 
 /// [`SILENT_WITHOUT_BIT`]'s error, out of the decoder's way.
@@ -633,6 +633,8 @@ pub enum RecordType {
     ExternalPrepare = 5,
     /// An externally prepared transaction aborted, at a seqno of its own (D329).
     ExternalAbort = 6,
+    /// A table's key range dropped, at a seqno of its own (D331, `incompat` bit 3).
+    RangeDrop = 7,
 }
 
 /// A decoded WAL record, borrowing its batch bytes. Non-exhaustive: a later format may add
@@ -704,6 +706,96 @@ pub enum WalRecord<'a> {
         /// The xid and the participants (no read set, no mutations).
         share: ExternalShare<'a>,
     },
+    /// A table's key range dropped (D331, ICR 0141; `incompat` bit 3): every entry of the
+    /// range at or below `seqno` is gone, from the memtables and the SSTs alike, with no
+    /// delete markers, so a later write of the range at an older timestamp is visible. A
+    /// range move's source writes it at its cleanup, and its target at an abort. Written on
+    /// every stream at one seqno, which nothing else applies at; a replica runs the same drop
+    /// on its own tablets. Feed-silent.
+    RangeDrop {
+        /// The drop's seqno.
+        seqno: Seqno,
+        /// The table and the range.
+        range: DroppedRange<'a>,
+    },
+}
+
+/// A [`WalRecord::RangeDrop`]'s range (FORMAT §10.3): table `u32 LE`, the range's first
+/// row (varint-length bytes), then the end: `0` for the table's end, or `1` followed by
+/// the row after the range (varint-length bytes). Rows are at most [`MAX_KEY_PART`], and a
+/// bounded end is after the start. Kept as its body, read on access, so the record stays
+/// [`WalRecord`]'s size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedRange<'a> {
+    body: &'a [u8],
+}
+
+impl<'a> DroppedRange<'a> {
+    /// Encodes a range into `out`. `InvalidArgument` for a row over [`MAX_KEY_PART`] or an
+    /// end at or before the start.
+    pub fn encode(
+        out: &mut Vec<u8>,
+        table: TableId,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> crate::Result<()> {
+        if start.len() > MAX_KEY_PART || end.is_some_and(|e| e.len() > MAX_KEY_PART) {
+            return Err(Error::KeyTooLarge);
+        }
+        if end.is_some_and(|e| e <= start) {
+            return Err(Error::InvalidArgument {
+                what: "a dropped range's end is after its start",
+            });
+        }
+        out.extend_from_slice(&table.0.to_le_bytes());
+        crate::varint::put_bytes(out, start);
+        match end {
+            None => out.push(0),
+            Some(e) => {
+                out.push(1);
+                crate::varint::put_bytes(out, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes and checks a body. Never panics.
+    pub fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
+        Self::parse(bytes)?;
+        Ok(Self { body: bytes })
+    }
+
+    fn parse(bytes: &'a [u8]) -> crate::Result<(TableId, &'a [u8], Option<&'a [u8]>)> {
+        let corrupt = |what| Error::Corrupt { what };
+        let mut r = Reader::new(bytes, "wal range drop");
+        let table = TableId(r.u32()?);
+        let start = r.bytes()?;
+        let end = match r.u8()? {
+            0 => None,
+            1 => Some(r.bytes()?),
+            _ => return Err(corrupt("wal range drop end flag")),
+        };
+        if r.remaining() != 0 {
+            return Err(corrupt("wal range drop length"));
+        }
+        if start.len() > MAX_KEY_PART || end.is_some_and(|e| e.len() > MAX_KEY_PART) {
+            return Err(corrupt("wal range drop row length"));
+        }
+        if end.is_some_and(|e| e <= start) {
+            return Err(corrupt("wal range drop bounds"));
+        }
+        Ok((table, start, end))
+    }
+
+    /// The fields: table, first row, and the row after the range (`None`: the table's end).
+    pub fn fields(&self) -> (TableId, &'a [u8], Option<&'a [u8]>) {
+        Self::parse(self.body).expect("checked when decoded")
+    }
+
+    /// The encoded body, re-encoded unchanged by [`WalRecord::split`].
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.body
+    }
 }
 
 /// An external share's encoded fields (D329, FORMAT §10.3): `xid` (varint-length bytes),
@@ -981,6 +1073,11 @@ impl WalRecord<'_> {
                 head[9..17].copy_from_slice(&abort_seqno.to_le_bytes());
                 (17, share.as_bytes())
             }
+            WalRecord::RangeDrop { seqno, range } => {
+                head[0] = RecordType::RangeDrop as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                (9, range.as_bytes())
+            }
         };
         (&head[..len], body)
     }
@@ -1019,7 +1116,7 @@ impl WalRecord<'_> {
         if !silent_ok && marked(bytes) {
             return Err(silent_without_bit());
         }
-        let record = Self::decode_any(bytes);
+        let record = Self::decode_any(bytes, silent_ok);
         // The mark's places in the bytes agree with the decoded batch (perf2's nit on #2055).
         debug_assert!(
             record
@@ -1046,11 +1143,12 @@ impl WalRecord<'_> {
             WalRecord::ExternalPrepare { share, .. } => share.batch(),
             WalRecord::Commit { .. }
             | WalRecord::Decision { .. }
-            | WalRecord::ExternalAbort { .. } => None,
+            | WalRecord::ExternalAbort { .. }
+            | WalRecord::RangeDrop { .. } => None,
         }
     }
 
-    fn decode_any(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
+    fn decode_any(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
         let mut r = Reader::new(bytes, "wal record");
         match r.u8()? {
             1 => Ok(WalRecord::Batch {
@@ -1083,6 +1181,15 @@ impl WalRecord<'_> {
                 seqno: r.u64()?,
                 abort_seqno: r.u64()?,
                 share: ExternalShare::decode(r.rest(), false)?,
+            }),
+            // D331's bit gates it, as it gates the silent mark: without the bit, a 7 is a
+            // record this file can't hold.
+            7 if silent_ok => Ok(WalRecord::RangeDrop {
+                seqno: r.u64()?,
+                range: DroppedRange::decode(r.rest())?,
+            }),
+            7 => Err(Error::Corrupt {
+                what: "wal range drop in a file without incompat bit 3",
             }),
             t => Err(Error::UnsupportedFeature {
                 what: "wal record type",

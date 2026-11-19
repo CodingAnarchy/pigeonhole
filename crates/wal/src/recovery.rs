@@ -134,6 +134,9 @@ fn seqno_of(rec: &WalRecord<'_>) -> Seqno {
         WalRecord::ExternalAbort {
             seqno, abort_seqno, ..
         } => (*seqno).max(*abort_seqno),
+        // A range drop's own seqno (D331): nothing applies there, and a reopen never hands it
+        // out again.
+        WalRecord::RangeDrop { seqno, .. } => *seqno,
         // `WalRecord::decode` returns no other type in this build (a newer one is corrupt).
         _ => 0,
     }

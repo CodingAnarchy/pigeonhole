@@ -1724,6 +1724,19 @@ impl Engine {
                             kind: ReplayedRecordKind::Commit,
                         });
                     }
+                    // A range drop (D331): nothing to apply. A drop whose manifest commit is
+                    // durable put a fresh tablet over the range, flushed through its seqno,
+                    // so the range's earlier writes replay into nothing; one whose commit
+                    // isn't is run again by its caller, which keeps the range unserved and
+                    // its drop-pending row until the drop completes. Never needed past a
+                    // checkpoint: the re-run writes its own record.
+                    WalRecord::RangeDrop { seqno, .. } => {
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Commit,
+                        });
+                    }
                     // `WalRecord::decode` returns no other type in this build.
                     _ => return Err(Error::Corruption("wal record type".into())),
                 }
@@ -2433,6 +2446,30 @@ impl Engine {
         self.push_replication_state(&mut batch, state)?;
         self.inner.shared.clock.seed_ts(max_ts);
         self.commit(batch, Some(Durability::GroupSync))
+    }
+
+    /// Commits `batch`, every mutation [`push_logged`](WriteBatch::push_logged), on a
+    /// primary (D331 PR 4, ICR 0141): a range move's target writes the source's changes
+    /// exactly as the source logged them, with the source's kinds, timestamps and stored
+    /// values, in its own ids. The timestamp floor isn't raised: the target raises it once,
+    /// before it serves the range ([`raise_ts_floor`](Self::raise_ts_floor)). Refused on a
+    /// replica (`ReadOnly`), which takes logged mutations only through
+    /// [`apply_replicated`](Self::apply_replicated), and, `InvalidArgument`, for a batch that
+    /// is empty, isn't logged or deletes rows.
+    pub fn commit_logged(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<CommitInfo> {
+        if self.inner.replica.load(Ordering::Relaxed) {
+            return Err(replica_refusal());
+        }
+        if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a logged commit is a non-empty batch of logged mutations".to_owned(),
+            ));
+        }
+        self.commit(batch, durability)
     }
 
     /// Holds the change feed's retained history from now on (D331, ICR 0141): retention

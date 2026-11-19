@@ -789,3 +789,115 @@ fn a_replica_applies_silent_commits_silent() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+/// D331 PR 4 (ICR 0141): a range move's target writes the source's changes as the source
+/// logged them, by name into its own ids, feed-silently: puts at explicit timestamps, a
+/// column delete that hides an older `put_at` written after it, counter increments and a
+/// counter delete, in commit order. The target then reads as the source does, its own feed
+/// carries none of it, and a family the target lacks fails the whole batch.
+#[test]
+fn a_logged_batch_writes_another_databases_changes_by_name() {
+    let (sv, tv) = (SimVfs::new(41), SimVfs::new(42));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let mut feed = source.feed().open().unwrap();
+    // The target's ids differ from the source's: another table and family come first.
+    target
+        .table("other")
+        .unwrap()
+        .family("x", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("z", Family::default())
+            .family("a", Family::default())
+            .family("n", Family::counter())
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    let mut own = target.feed().open().unwrap();
+
+    s.mutate(b"r1")
+        .put_at("a", b"q", 10, b"v10")
+        .commit()
+        .unwrap();
+    s.mutate(b"r1")
+        .put_at("a", b"q", 20, b"v20")
+        .commit()
+        .unwrap();
+    s.mutate(b"r2").put("a", b"q", b"now").commit().unwrap();
+    s.mutate(b"r2").delete_column("a", b"q").commit().unwrap();
+    // Older than the delete: hidden on the source, and must be on the target too.
+    s.mutate(b"r2")
+        .put_at("a", b"q", 5, b"old")
+        .commit()
+        .unwrap();
+    s.mutate(b"c").incr("n", b"q", 3).commit().unwrap();
+    s.mutate(b"c").delete_column("n", b"q").commit().unwrap();
+    s.mutate(b"c").incr("n", b"q", 4).commit().unwrap();
+
+    while let Some(ev) = feed.next_event(Duration::from_millis(200)).unwrap() {
+        let FeedEvent::Commit(c) = ev else { continue };
+        let mut wb = target.logged_batch();
+        wb.mark_feed_silent();
+        for ch in c.changes() {
+            wb.push(
+                &t,
+                ch.row(),
+                ch.family(),
+                ch.kind(),
+                ch.qualifier(),
+                ch.timestamp(),
+                ch.stored(),
+            );
+        }
+        wb.commit().unwrap();
+    }
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t"))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    assert_eq!(
+        t.get(b"c", "n", b"q").unwrap().map(|c| c.as_i64()),
+        Some(Some(4))
+    );
+    assert!(t.get(b"r2", "a", b"q").unwrap().is_none());
+    assert!(
+        own.next_event(Duration::from_millis(200))
+            .unwrap()
+            .is_none(),
+        "the target's own feed carries none of the source's changes"
+    );
+
+    // A family the target lacks fails the batch whole: nothing of it commits.
+    let mut wb = target.logged_batch();
+    wb.push(
+        &t,
+        b"r3",
+        "a",
+        pigeonhole::ChangeKind::Put,
+        b"q",
+        7,
+        b"\x00x",
+    );
+    wb.push(
+        &t,
+        b"r3",
+        "missing",
+        pigeonhole::ChangeKind::Put,
+        b"q",
+        7,
+        b"\x00x",
+    );
+    assert_eq!(wb.commit().unwrap_err().code(), ErrorCode::FamilyNotFound);
+    assert!(t.get(b"r3", "a", b"q").unwrap().is_none());
+    drop((feed, own));
+    target.close().unwrap();
+    source.close().unwrap();
+}

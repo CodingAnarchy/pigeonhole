@@ -713,6 +713,20 @@ impl Pigeonhole {
         Ok(self.engine().hold_feed_retention(cap_bytes)?)
     }
 
+    /// A batch of changes written exactly as another database logged them (D331 PR 4, ICR
+    /// 0141): a range move's target writes the source's copy and catch-up so, with the
+    /// source's kinds, timestamps and stored values, named by table and family (the target's
+    /// ids aren't the source's). It holds logged changes only, so it never mixes with
+    /// ordinary writes. Refused at commit on a replica. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn logged_batch(&self) -> LoggedBatch<'_> {
+        LoggedBatch {
+            db: self,
+            batch: WriteBatch::new(),
+            error: None,
+        }
+    }
+
     fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {
         let state = State {
             primary: primary_of(&end.token),
@@ -749,6 +763,81 @@ impl Pigeonhole {
         };
         self.engine().store_replication_state(&state.encode())?;
         Ok(())
+    }
+}
+
+/// [`Pigeonhole::logged_batch`]'s batch. Errors (a table of another database, a family
+/// the table lacks, a key too large) surface at [`commit`](Self::commit), and the first
+/// one wins. Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct LoggedBatch<'a> {
+    db: &'a Pigeonhole,
+    batch: WriteBatch,
+    error: Option<Error>,
+}
+
+impl LoggedBatch<'_> {
+    /// Adds one change as its source logged it: its kind, timestamp and stored value (the
+    /// tag byte first, as [`ReplicatedEvent`]s and raw reads carry it; empty for a delete).
+    /// A family `table` lacks is an error (`FamilyNotFound`), never a dropped change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(
+        &mut self,
+        table: &crate::Table,
+        row: &[u8],
+        family: &str,
+        kind: ChangeKind,
+        qualifier: &[u8],
+        ts: u64,
+        stored: &[u8],
+    ) -> &mut Self {
+        if self.error.is_some() {
+            return self;
+        }
+        let r = crate::write::check_table(&self.db.db, table)
+            .and_then(|()| table.core.family_id(family))
+            .and_then(|family| {
+                Ok(self.batch.push_logged(
+                    table.core.info.id,
+                    family,
+                    logged_kind(kind),
+                    row,
+                    qualifier,
+                    ts,
+                    stored,
+                )?)
+            });
+        if let Err(e) = r {
+            self.error = Some(e);
+        }
+        self
+    }
+
+    /// Marks the batch feed-silent: committed, durable and replicated, but never delivered
+    /// to a change-feed subscription.
+    pub fn mark_feed_silent(&mut self) -> &mut Self {
+        self.batch.mark_feed_silent();
+        self
+    }
+
+    /// The changes added so far.
+    pub fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    /// No change added yet.
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    /// Commits the batch atomically. `ReadOnly` on a replica; `InvalidArgument` when empty.
+    pub fn commit(self) -> Result<crate::CommitInfo> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let info = self.db.engine().commit_logged(self.batch, None)?;
+        Ok(crate::CommitInfo::from_engine(info))
     }
 }
 

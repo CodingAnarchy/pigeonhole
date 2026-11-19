@@ -327,3 +327,38 @@ fn a_silent_batch_is_read_only_with_its_bit() {
     .encode(&mut rec);
     assert!(WalRecord::decode(&rec).is_ok());
 }
+
+/// D331 PR 4a: a range drop's bounds are checked on both sides: an end at or before the
+/// start, or a row over `MAX_KEY_PART`, is refused when encoding and `Corrupt` when
+/// decoding (a hand-built body), and a body with bytes left over is `Corrupt`.
+#[test]
+fn a_dropped_range_checks_its_bounds() {
+    use pigeonhole_format::key::MAX_KEY_PART;
+    use pigeonhole_format::wal::DroppedRange;
+    use pigeonhole_format::{Error, TableId};
+    let mut out = Vec::new();
+    for (start, end) in [(&b"m"[..], &b"m"[..]), (b"m", b"a")] {
+        assert!(matches!(
+            DroppedRange::encode(&mut out, TableId(1), start, Some(end)),
+            Err(Error::InvalidArgument { .. })
+        ));
+    }
+    let long = vec![b'k'; MAX_KEY_PART + 1];
+    assert!(matches!(
+        DroppedRange::encode(&mut out, TableId(1), &long, None),
+        Err(Error::KeyTooLarge)
+    ));
+    assert!(out.is_empty(), "a refused range writes nothing");
+    // Hand-built: table, start "m", end flag 1, end "a" (before the start).
+    let backwards = [1, 0, 0, 0, 1, b'm', 1, 1, b'a'];
+    let flag = [1, 0, 0, 0, 0, 2];
+    let mut trailing = Vec::new();
+    DroppedRange::encode(&mut trailing, TableId(1), b"a", None).unwrap();
+    trailing.push(0);
+    for body in [&backwards[..], &flag[..], &trailing[..]] {
+        assert!(
+            matches!(DroppedRange::decode(body), Err(Error::Corrupt { .. })),
+            "{body:?}"
+        );
+    }
+}
