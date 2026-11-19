@@ -266,6 +266,10 @@ impl ReplicatedEvent {
                 }
             }
             1 => {
+                // A catalog change is never a spanning commit's share: never version 3.
+                if xid.is_some() {
+                    return Err(invalid("a catalog change in a flagged event".to_owned()));
+                }
                 let mut ev = CatalogEvent::default();
                 ev.seqno_ceiling = r.u64()?;
                 ev.timestamp = r.u64()?;
@@ -290,9 +294,6 @@ impl ReplicatedEvent {
         };
         if silent && matches!(body, Body::Catalog(_)) {
             return Err(invalid("a feed-silent catalog change".to_owned()));
-        }
-        if matches!(body, Body::Catalog(_)) && bytes.first() == Some(&FLAGS_EVENT_VERSION) {
-            return Err(invalid("a catalog change in a flagged event".to_owned()));
         }
         if !r.0.is_empty() {
             return Err(invalid(

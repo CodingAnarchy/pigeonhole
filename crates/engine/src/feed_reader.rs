@@ -1750,6 +1750,7 @@ impl FeedReader {
     /// commit's (D329 2b): every share of one commit has the same. Not part of the stable
     /// API.
     #[doc(hidden)]
+    #[inline]
     pub fn xid(&self) -> Option<&Arc<[u8]>> {
         self.out_xid.as_ref()
     }
@@ -2430,9 +2431,11 @@ impl FeedReader {
                     changes,
                     silent,
                 } => {
-                    // Taken first, so no early exit leaves it for the next record.
-                    let xid = self.read_xid.take();
                     if seqno <= self.delivered {
+                        // A re-read: its xid, if any, isn't kept, nor left for the next record.
+                        if self.read_xid.is_some() {
+                            self.read_xid = None;
+                        }
                         let st = &mut self.streams[s];
                         st.delivered_end = st.delivered_end.max(end);
                         continue;
@@ -2450,8 +2453,10 @@ impl FeedReader {
                     if silent {
                         self.silent_seen.insert(seqno);
                     }
-                    if let Some(xid) = xid {
-                        note_xid(&mut self.xids, seqno, xid);
+                    // One test for an untagged commit; the note out of line (#2076's feed
+                    // shapes).
+                    if self.read_xid.is_some() {
+                        take_read_xid(&mut self.read_xid, &mut self.xids, seqno);
                     }
                     self.insert_ready(
                         seqno,
@@ -2479,11 +2484,10 @@ impl FeedReader {
                     external,
                     silent,
                 } => {
-                    let xid = self.read_xid.take();
                     if silent {
                         self.silent_seen.insert(id);
                     }
-                    match xid {
+                    match self.read_xid.take() {
                         Some(xid) => {
                             // A round's shares are all tagged or all not: a tagged share with
                             // an untagged one held first (feed1248's check, both orders).
@@ -3710,6 +3714,16 @@ fn silent_batch(
         pack(batch, tables, prefix)
     } else {
         Ok(Raws::default())
+    }
+}
+
+/// The record just read's xid into its note under `key` (D329 2b), out of line: only for a
+/// spanning commit's share.
+#[cold]
+#[inline(never)]
+fn take_read_xid(slot: &mut Option<Arc<[u8]>>, xids: &mut HashMap<Seqno, Arc<[u8]>>, key: Seqno) {
+    if let Some(xid) = slot.take() {
+        note_xid(xids, key, xid);
     }
 }
 
