@@ -30,6 +30,7 @@ pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod promote;
+pub(crate) mod range_copy;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -1581,6 +1582,12 @@ impl Node {
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).
             if let Some(m) = &map {
                 lp.moves = crate::serve::ranges::statuses(m, &id);
+                // PR 4b: a source whose move's retention hold lapsed.
+                if let Some(copies) = self.range_copies() {
+                    for s in lp.moves.iter_mut().filter(|s| s.source) {
+                        s.retention_lapsed = copies.lapsed(&s.id);
+                    }
+                }
             }
         }
         let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
@@ -2262,6 +2269,20 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .await?;
             return Ok(tonic::Response::new(reply));
         }
+        // D331 PR 4b: a range move's copy chunk, answered by the source's copy server.
+        if let Some(proto::forward_request::Op::RangeCopy(r)) = msg.op {
+            let Some(cluster) = shared.router.cluster.as_ref() else {
+                return Err(ApiError::unsupported("this node isn't a cluster node").into());
+            };
+            let chunk = cluster
+                .range_copies
+                .serve(cluster, &msg.partition, r)
+                .await?;
+            return Ok(tonic::Response::new(proto::ForwardResponse {
+                reply: Some(proto::forward_response::Reply::RangeCopy(chunk)),
+                ..Default::default()
+            }));
+        }
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
         // node's own token entry (D317 amendment 1).
@@ -2832,6 +2853,11 @@ pub(crate) fn run(
     let shared = Arc::new(super::Shared {
         router: super::router::Router::cluster(service, Arc::clone(&node), parts)
             .max_uploads(args.max_uploads)
+            .range_moves(
+                args.move_rate_bytes,
+                args.move_retention_cap,
+                args.max_move_followers,
+            )
             .memory_recipe(recipe),
         // The data calls' tokens: the same file the node's own calls read.
         tokens: super::tokens(args)?,

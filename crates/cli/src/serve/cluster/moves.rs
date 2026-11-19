@@ -144,6 +144,16 @@ impl Node {
         Ok(())
     }
 
+    /// The range copies this node serves as a source (D331 PR 4b), once it serves.
+    pub(super) fn range_copies(&self) -> Option<std::sync::Arc<super::range_copy::Sources>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        shared
+            .router
+            .cluster
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.range_copies))
+    }
+
     /// After an install publishes `map` (under the install lock): every partition served
     /// here settles to it. **Blocking**, on the install's thread.
     pub(super) fn apply_moves(&self, map: &ClusterMap) {
@@ -153,6 +163,8 @@ impl Node {
         let Some(cluster) = shared.router.cluster.as_ref() else {
             return;
         };
+        // D331 PR 4b: copies this node no longer serves as their source let go.
+        cluster.range_copies.release_gone(map, &self.id);
         let mut raised = false;
         for (id, service) in cluster.parts.load().iter() {
             let (Some((gate, _)), Ok(part)) = (self.fences.gate(id), service.part()) else {

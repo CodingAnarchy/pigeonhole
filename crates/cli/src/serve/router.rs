@@ -41,6 +41,8 @@ pub(crate) struct Cluster {
     /// The spanning transactions this node coordinates, and the read-only holds its
     /// partitions keep for others' (D329).
     pub(crate) spanning: Arc<spanning::Spanning>,
+    /// The range moves' copies this node serves as their source (D331 PR 4b).
+    pub(crate) range_copies: Arc<super::cluster::range_copy::Sources>,
 }
 
 impl Cluster {
@@ -249,6 +251,11 @@ impl Router {
                 replicas: Arc::default(),
                 replica_backoff: Arc::default(),
                 spanning: spanning::Spanning::new(),
+                range_copies: Arc::new(super::cluster::range_copy::Sources::new(
+                    64 << 20,
+                    4 << 30,
+                    2,
+                )),
             }),
         }
     }
@@ -257,6 +264,17 @@ impl Router {
     pub(crate) fn memory_recipe(mut self, recipe: Option<super::memslot::Recipe>) -> Self {
         if let Some(c) = self.cluster.as_mut() {
             c.memory = recipe.map(Arc::new);
+        }
+        self
+    }
+
+    /// `--move-rate-bytes`, `--move-retention-cap` and `--max-move-followers` (D331 PR 4b):
+    /// the range copies this node serves as a source.
+    pub(crate) fn range_moves(mut self, rate: u64, cap: u64, followers: usize) -> Self {
+        if let Some(c) = self.cluster.as_mut() {
+            c.range_copies = Arc::new(super::cluster::range_copy::Sources::new(
+                rate, cap, followers,
+            ));
         }
         self
     }

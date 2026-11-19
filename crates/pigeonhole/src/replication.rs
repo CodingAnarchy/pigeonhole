@@ -7,7 +7,12 @@ use pigeonhole_engine::{CatalogEvent, FamilyId, TableId, WriteBatch};
 use pigeonhole_format::Kind;
 
 use crate::feed::StreamPosition;
+
 use crate::{ChangeKind, Error, ErrorCode, FeedEvent, FeedToken, Pigeonhole, Result};
+/// A range move's feed retention hold ([`Pigeonhole::hold_feed_retention`], D331): kept
+/// while it lives. Not part of the stable API.
+#[doc(hidden)]
+pub use pigeonhole_engine::FeedRetentionHold;
 
 /// One event of a primary's feed, as a replica applies it ([`Feed::replicated`]): a commit's
 /// changes with the primary's table and family ids, or a catalog change with its ids; the
