@@ -108,7 +108,8 @@ impl Sources {
 
     /// Drops the holds and slots of copies this node no longer serves: the move left
     /// COPYING through HANDING_OVER, or the map, or names another source; this node no
-    /// longer owns the source (M2); or the target stopped asking ([`IDLE`]). Each map
+    /// longer owns the source, or owns it at another epoch than `from_epoch` (M2); or the
+    /// target stopped asking ([`IDLE`]). Each map
     /// install calls it.
     pub(crate) fn release_gone(&self, map: &proto::ClusterMap, me: &str) {
         let now = Instant::now();
@@ -116,18 +117,23 @@ impl Sources {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|id, s| {
+                // Owned here, at the epoch the move began copying at (0: not recorded).
+                let owned = |m: &proto::RangeMove| {
+                    map.partitions.iter().any(|p| {
+                        p.id == s.partition
+                            && p.node == me
+                            && (m.from_epoch == 0 || p.epoch == m.from_epoch)
+                    })
+                };
                 let live = map.moves.iter().any(|m| {
                     &m.id == id
-                        && !node_move(m)
+                        && !super::map::node_move(m)
                         && m.from == s.partition
                         && (MovePhase::Copying..=MovePhase::HandingOver)
                             .contains(&super::map::phase(m))
+                        && owned(m)
                 });
-                let owned = map
-                    .partitions
-                    .iter()
-                    .any(|p| p.id == s.partition && p.node == me);
-                live && owned && now.duration_since(s.asked) < IDLE
+                live && now.duration_since(s.asked) < IDLE
             });
     }
 
@@ -142,7 +148,7 @@ impl Sources {
         let Some(m) = map
             .moves
             .iter()
-            .find(|m| m.id == r.move_id && !node_move(m) && m.from == partition)
+            .find(|m| m.id == r.move_id && !super::map::node_move(m) && m.from == partition)
         else {
             return Err(ApiError::wrong_partition(
                 map.map_version,
@@ -160,11 +166,23 @@ impl Sources {
                 super::map::phase(m)
             )));
         }
-        // M3: this node owns the source in its map, and has it open.
-        let owned = map
-            .partitions
-            .iter()
-            .any(|p| p.id == partition && p.node == cluster.node.id());
+        // M3: this node owns the source in its map, and has it open. A source whose epoch
+        // moved since COPYING (a failover mid-move) serves no more chunks: `from_epoch`, 0
+        // on a record written before it existed (then not compared).
+        let Some(p) = map.partitions.iter().find(|p| p.id == partition) else {
+            return Err(ApiError::wrong_partition(
+                map.map_version,
+                format!("no partition {partition:?} in the map"),
+            ));
+        };
+        if m.from_epoch != 0 && p.epoch != m.from_epoch {
+            return Err(ApiError::failed_precondition(format!(
+                "range move {:?}'s source {partition:?} is at epoch {}, not {} as it was when \
+                 copying began",
+                m.id, p.epoch, m.from_epoch
+            )));
+        }
+        let owned = p.node == cluster.node.id();
         let Some(service) = cluster.here(partition).filter(|_| owned) else {
             return Err(ApiError::wrong_partition(
                 map.map_version,
@@ -279,12 +297,6 @@ impl Sources {
         );
         Ok(token)
     }
-}
-
-/// A whole partition's relocation (D332's NODE), which has no range to copy. (D332 PR 2
-/// adds `map::node_move`; this goes once both are on main.)
-fn node_move(m: &proto::RangeMove) -> bool {
-    m.kind == proto::MoveKind::Node as i32
 }
 
 /// A change kind's logged number (FORMAT §2), as `RangeCopyCell.kind` carries it.
