@@ -352,6 +352,12 @@ pub(crate) struct Spanning {
     holds: Mutex<HashMap<u64, Hold>>,
     /// The resolver's last word on a share it couldn't settle: (partition, xid) → reason.
     reasons: Mutex<HashMap<(String, Vec<u8>), String>>,
+    /// Acks still owed to a home (#2078): (xid, branch partition) → (when to send it, the
+    /// backoff's step). A branch that applied a commit, by its resolver or by an operator's
+    /// `txn decide --commit`, tells the home so its record can be collected; the resolver
+    /// sends each due one, and keeps it only while the home doesn't answer or answers in
+    /// progress. In memory: a restart loses it, and the home's record then stays (#2078).
+    acks: Mutex<HashMap<(String, String), (Instant, Duration)>>,
     /// The high half of every hold id: random per process, so a hold id from before a
     /// restart never names one taken after it (audit120's condition 1).
     nonce: u64,
@@ -380,9 +386,53 @@ impl Spanning {
         Arc::new(Self {
             holds: Mutex::new(HashMap::new()),
             reasons: Mutex::new(HashMap::new()),
+            acks: Mutex::new(HashMap::new()),
             nonce: nonce << 32,
             next: AtomicU64::new(1),
         })
+    }
+
+    fn acks(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), (Instant, Duration)>> {
+        self.acks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Owes `xid`'s home the ack of branch `partition`'s applied commit, due now (#2078).
+    /// Past [`MAX_ACKS`] owed, it's dropped and said so: the home's record then stays.
+    pub(crate) fn queue_ack(&self, xid: &str, partition: &str) {
+        let mut acks = self.acks();
+        if acks.len() >= MAX_ACKS && !acks.contains_key(&(xid.to_owned(), partition.to_owned())) {
+            eprintln!(
+                "phdb serve: {MAX_ACKS} acks already owed to transactions' homes: {partition}'s \
+                 for {xid} is dropped, and that home's record stays"
+            );
+            return;
+        }
+        acks.insert(
+            (xid.to_owned(), partition.to_owned()),
+            (Instant::now(), Duration::ZERO),
+        );
+    }
+
+    /// The acks due at `now`, as (xid, partition).
+    fn due_acks(&self, now: Instant) -> Vec<(String, String)> {
+        self.acks()
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// An ack sent: kept for another try after a backoff (`keep`), or done.
+    fn ack_sent(&self, key: (String, String), keep: bool) {
+        let mut acks = self.acks();
+        if !keep {
+            acks.remove(&key);
+            return;
+        }
+        if let Some((at, step)) = acks.get_mut(&key) {
+            *step = (*step * 2).clamp(Duration::from_secs(1), Duration::from_secs(60));
+            *at = Instant::now() + *step;
+        }
     }
 
     fn holds(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Hold>> {
@@ -1220,6 +1270,77 @@ pub(crate) mod seams {
     }
 }
 
+/// The most acks a node keeps owing to transactions' homes (#2078): about a hundred bytes
+/// each.
+const MAX_ACKS: usize = 4096;
+
+/// How many homes a resolver pass asks at once (#2078): a dead home costs its task one
+/// request timeout, and the others go on beside it.
+const RESOLVE_HOMES: usize = 8;
+
+/// One ask a resolver pass makes of a home (#2078): what a share in doubt here should be,
+/// or the ack of a commit a branch here applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Ask {
+    Share { partition: String, xid: String },
+    Ack { partition: String, xid: String },
+}
+
+/// Whether `e` says the home gave no answer (its node unreachable or too slow, or no owner
+/// for it in the map), as against its own answer about that one transaction (audit120's
+/// Q1 on #2078): only the first skips the home's other asks this pass.
+pub(crate) fn unanswered(e: &ApiError) -> bool {
+    matches!(
+        e.code.as_str(),
+        "PartitionUnavailable" | "DeadlineExceeded" | "Unavailable" | "WrongPartition"
+    )
+}
+
+/// A resolver pass's asks, one home's in turn and up to `limit` homes at once (#2078), each
+/// through `ask`. Once a home gives no answer ([`unanswered`]), its remaining asks this
+/// pass aren't made (`None`), so a dead home costs one request timeout, not one per share,
+/// and every other home's asks go on beside it. All are joined before it returns.
+pub(crate) async fn ask_homes<F, Fut>(
+    homes: Vec<Vec<Ask>>,
+    limit: usize,
+    ask: F,
+) -> Vec<(Ask, Option<Result<proto::TxnResolution, ApiError>>)>
+where
+    F: Fn(Ask) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<proto::TxnResolution, ApiError>> + Send + 'static,
+{
+    let mut homes = homes.into_iter();
+    let mut set = tokio::task::JoinSet::new();
+    let mut out = Vec::new();
+    loop {
+        while set.len() < limit.max(1)
+            && let Some(asks) = homes.next()
+        {
+            let ask = ask.clone();
+            set.spawn(async move {
+                let mut done = Vec::with_capacity(asks.len());
+                let mut silent = false;
+                for a in asks {
+                    if silent {
+                        done.push((a, None));
+                        continue;
+                    }
+                    let r = ask(a.clone()).await;
+                    silent = r.as_ref().is_err_and(unanswered);
+                    done.push((a, Some(r)));
+                }
+                done
+            });
+        }
+        match set.join_next().await {
+            Some(Ok(done)) => out.extend(done),
+            // A home's task that panicked: its asks are made again next pass.
+            Some(Err(e)) => eprintln!("phdb serve: a resolver ask failed: {e}"),
+            None => return out,
+        }
+    }
+}
+
 /// D329's resolver, started once the node serves: each partition's shares held in doubt
 /// longer than `delay` (default: the request timeout, so it never fires on a healthy
 /// commit) ask their home what was decided (`ResolveTxn`), and are decided by the answer.
@@ -1254,7 +1375,25 @@ pub(crate) fn start_resolver(
                 };
                 let timeout = shared.limits.request_timeout;
                 let parts = cluster.parts.load_full();
+                // The decision records past retention on the partitions this node owns (GC),
+                // every `retention / 24`, between one and ten minutes: first, so it never
+                // waits on a pass's asks (#2078).
+                if last_sweep.elapsed() >= sweep_every {
+                    last_sweep = Instant::now();
+                    for service in parts.values() {
+                        if let Err(e) = service.sweep_decisions(now_ms()).await
+                            && e.code != "Fenced"
+                        {
+                            eprintln!("phdb serve: sweeping decision records: {}", e.message);
+                        }
+                    }
+                }
+                // This pass's asks, by home: each due share in doubt, and each ack owed.
                 let mut seen = std::collections::HashSet::new();
+                let mut by_home: HashMap<String, Vec<Ask>> = HashMap::new();
+                let home_of = |xid: &str| {
+                    super::super::sessions::spanning_parts(xid).map(|(h, _, _)| h.to_owned())
+                };
                 for (partition, service) in parts.iter() {
                     let Ok(part) = service.part() else {
                         continue;
@@ -1266,86 +1405,136 @@ pub(crate) fn start_resolver(
                         {
                             continue;
                         }
-                        let Ok(text) = String::from_utf8(xid.clone()) else {
+                        let Ok(text) = String::from_utf8(xid) else {
                             continue;
                         };
-                        let asked = ask_home(
-                            &cluster.node,
-                            &cluster.parts,
-                            &cluster.forwarder,
-                            &cluster.spanning,
-                            &text,
-                            None,
-                            timeout,
-                        )
-                        .await;
-                        use proto::TxnOutcomeState as St;
-                        let why = match asked {
-                            Ok(r) => match St::try_from(r.state).unwrap_or(St::Unspecified) {
-                                St::Committed | St::Aborted => {
-                                    let commit = r.state == St::Committed as i32;
-                                    match service
-                                        .decide_branch(
-                                            &text,
-                                            commit,
-                                            0,
-                                            0,
-                                            &cluster.spanning,
-                                            partition,
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            // A commit applied here: its home's record may
-                                            // go once every branch said so (GC).
-                                            if commit {
-                                                let _ = ask_home(
-                                                    &cluster.node,
-                                                    &cluster.parts,
-                                                    &cluster.forwarder,
-                                                    &cluster.spanning,
-                                                    &text,
-                                                    Some(partition),
-                                                    timeout,
-                                                )
-                                                .await;
-                                            }
-                                            None
-                                        }
-                                        Err(e) => {
-                                            Some(format!("deciding it failed: {}", e.message))
-                                        }
-                                    }
-                                }
-                                St::InProgress => Some("its home is still committing it".into()),
-                                St::Unknown | St::Unspecified => Some(r.reason),
-                            },
-                            Err(e) => Some(format!("its home didn't answer: {}", e.message)),
+                        let Some(home) = home_of(&text) else {
+                            continue;
                         };
-                        match &why {
-                            None => {
-                                next.remove(&key);
-                            }
-                            Some(_) => {
-                                let step = next
-                                    .get(&key)
-                                    .map_or(Duration::from_secs(1), |(_, s)| *s * 2)
-                                    .min(Duration::from_secs(60));
-                                next.insert(key.clone(), (Instant::now() + step, step));
-                            }
-                        }
-                        cluster.spanning.note(partition, &xid, why);
+                        by_home.entry(home).or_default().push(Ask::Share {
+                            partition: partition.clone(),
+                            xid: text,
+                        });
                     }
                 }
-                // The decision records past retention on the partitions this node owns (GC),
-                // every `retention / 24`, between one and ten minutes.
-                if last_sweep.elapsed() >= sweep_every {
-                    last_sweep = Instant::now();
-                    for service in parts.values() {
-                        if let Err(e) = service.sweep_decisions(now_ms()).await
-                            && e.code != "Fenced"
-                        {
-                            eprintln!("phdb serve: sweeping decision records: {}", e.message);
+                for (xid, partition) in cluster.spanning.due_acks(Instant::now()) {
+                    match home_of(&xid) {
+                        Some(home) => by_home
+                            .entry(home)
+                            .or_default()
+                            .push(Ask::Ack { partition, xid }),
+                        None => cluster.spanning.ack_sent((xid, partition), false),
+                    }
+                }
+                let asked = {
+                    let shared = Arc::clone(&shared);
+                    ask_homes(by_home.into_values().collect(), RESOLVE_HOMES, move |a| {
+                        let shared = Arc::clone(&shared);
+                        async move {
+                            let Some(cluster) = shared.router.cluster.as_ref() else {
+                                return Err(ApiError::unavailable("this node isn't serving"));
+                            };
+                            let (xid, acked) = match &a {
+                                Ask::Share { xid, .. } => (xid, None),
+                                Ask::Ack { xid, partition } => (xid, Some(partition.as_str())),
+                            };
+                            ask_home(
+                                &cluster.node,
+                                &cluster.parts,
+                                &cluster.forwarder,
+                                &cluster.spanning,
+                                xid,
+                                acked,
+                                timeout,
+                            )
+                            .await
+                        }
+                    })
+                    .await
+                };
+                use proto::TxnOutcomeState as St;
+                for (a, answer) in asked {
+                    match a {
+                        Ask::Ack { partition, xid } => {
+                            // Kept only while the home gives no answer, or is still
+                            // committing: a COMMITTED answer took the ack, and an aborted or
+                            // unknown record never will (audit120's Q2 on #2078).
+                            let keep = match &answer {
+                                None => true,
+                                Some(Ok(r)) => r.state == St::InProgress as i32,
+                                Some(Err(e)) => unanswered(e),
+                            };
+                            cluster.spanning.ack_sent((xid, partition), keep);
+                        }
+                        Ask::Share { partition, xid } => {
+                            let key = (partition.clone(), xid.clone().into_bytes());
+                            let why = match answer {
+                                None => Some(
+                                    "its home didn't answer (asked about another of its \
+                                     transactions this pass)"
+                                        .to_owned(),
+                                ),
+                                Some(Err(e)) if unanswered(&e) => {
+                                    Some(format!("its home didn't answer: {}", e.message))
+                                }
+                                Some(Err(e)) => {
+                                    Some(format!("its home answered {}: {}", e.code, e.message))
+                                }
+                                Some(Ok(r)) => {
+                                    match St::try_from(r.state).unwrap_or(St::Unspecified) {
+                                        St::Committed | St::Aborted => {
+                                            let commit = r.state == St::Committed as i32;
+                                            match parts.get(&partition) {
+                                                None => Some("its partition closed here".into()),
+                                                Some(service) => match service
+                                                    .decide_branch(
+                                                        &xid,
+                                                        commit,
+                                                        0,
+                                                        0,
+                                                        &cluster.spanning,
+                                                        &partition,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        // A commit applied here: its home's
+                                                        // record may go once every branch has
+                                                        // said so (GC), told next pass.
+                                                        if commit {
+                                                            cluster
+                                                                .spanning
+                                                                .queue_ack(&xid, &partition);
+                                                        }
+                                                        None
+                                                    }
+                                                    Err(e) => Some(format!(
+                                                        "deciding it failed: {}",
+                                                        e.message
+                                                    )),
+                                                },
+                                            }
+                                        }
+                                        St::InProgress => {
+                                            Some("its home is still committing it".into())
+                                        }
+                                        St::Unknown | St::Unspecified => Some(r.reason),
+                                    }
+                                }
+                            };
+                            match &why {
+                                None => {
+                                    next.remove(&key);
+                                }
+                                Some(_) => {
+                                    let step = next
+                                        .get(&key)
+                                        .map_or(Duration::from_secs(1), |(_, s)| *s * 2)
+                                        .min(Duration::from_secs(60));
+                                    next.insert(key.clone(), (Instant::now() + step, step));
+                                }
+                            }
+                            cluster.spanning.note(&partition, &key.1, why);
                         }
                     }
                 }
@@ -1364,7 +1553,89 @@ pub(crate) fn start_resolver(
 
 #[cfg(test)]
 mod tests {
-    use super::{collectable, with_acks};
+    use super::{ApiError, Ask, ask_homes, collectable, proto, with_acks};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_home_costs_one_ask_a_pass_and_the_other_homes_go_on_beside_it() {
+        // #2078 (audit120's S3 on #2076, Q1 on the plan): three shares of a home that never
+        // answers cost one ask and one wait, not three; a live home's share is answered
+        // beside it; and a home that answers an error about one transaction (its record
+        // gone) is still asked about its next. Two homes at a time, three homes.
+        let share = |home: &str, n: u32| Ask::Share {
+            partition: "p1".into(),
+            xid: format!("{home}:h1-{n:032x}"),
+        };
+        let homes = vec![
+            vec![share("dead", 1), share("dead", 2), share("dead", 3)],
+            vec![share("live", 1)],
+            vec![share("odd", 1), share("odd", 2)],
+        ];
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = Arc::clone(&asked);
+        let wait = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let out = ask_homes(homes, 2, move |a| {
+            let log = Arc::clone(&log);
+            async move {
+                let Ask::Share { xid, .. } = &a else {
+                    unreachable!("only shares here")
+                };
+                log.lock().unwrap().push(xid.clone());
+                if xid.starts_with("dead") {
+                    tokio::time::sleep(wait).await;
+                    return Err(ApiError::deadline_exceeded());
+                }
+                if xid.starts_with("odd") && xid.ends_with('1') {
+                    return Err(ApiError::not_found("no record of the transaction"));
+                }
+                Ok(proto::TxnResolution {
+                    state: proto::TxnOutcomeState::Committed as i32,
+                    reason: String::new(),
+                })
+            }
+        })
+        .await;
+        let took = started.elapsed();
+        assert!(
+            took < wait * 2,
+            "a pass took {took:?}, more than one dead home's wait"
+        );
+        let asked = asked.lock().unwrap().clone();
+        let count = |home: &str| asked.iter().filter(|x| x.starts_with(home)).count();
+        assert_eq!(
+            (count("dead"), count("live"), count("odd")),
+            (1, 1, 2),
+            "{asked:?}"
+        );
+        let answer = |home: &str, n: u32| {
+            out.iter()
+                .find(|(a, _)| *a == share(home, n))
+                .map(|(_, r)| r.as_ref().map(|r| r.as_ref().map_err(|e| e.code.clone())))
+                .unwrap_or_else(|| panic!("{home} {n} missing"))
+        };
+        assert_eq!(
+            answer("dead", 1).map(|r| r.err()),
+            Some(Some("DeadlineExceeded".into()))
+        );
+        assert_eq!(
+            answer("dead", 2),
+            None,
+            "not asked: its home didn't answer this pass"
+        );
+        assert_eq!(answer("dead", 3), None);
+        assert!(matches!(answer("live", 1), Some(Ok(_))));
+        assert_eq!(
+            answer("odd", 1).map(|r| r.err()),
+            Some(Some("NotFound".into()))
+        );
+        assert!(
+            matches!(answer("odd", 2), Some(Ok(_))),
+            "a home that answered is asked again"
+        );
+        assert_eq!(out.len(), 6);
+    }
 
     #[test]
     fn a_decision_row_is_collected_only_past_retention_and_once_every_branch_acked() {

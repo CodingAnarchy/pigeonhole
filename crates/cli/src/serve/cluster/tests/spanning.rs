@@ -708,3 +708,51 @@ fn a_cluster_partition_refuses_a_follower_outside_its_map_replicas() {
         }
     });
 }
+
+#[test]
+fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
+    // #2078 (audit120's nit on #2076, Q3 on the plan): the home is lost after its commit
+    // point, so its row is COMMITTED and p1's share waits in doubt. The resolver waits an
+    // hour here, so the operator decides it by hand (`--force`: the home still answers).
+    // The decide returns at once; the resolver's next pass sends the ack it owes, and the
+    // home's row then holds p1's ack line, so GC can collect it.
+    use crate::serve::cluster::spanning::seams::Step;
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_resolve_delay = Duration::from_secs(3600);
+    let t = Three::start_limits(["", "", ""], limits);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let (pause, commit) = paused_commit(c, &id, Step::Decide).await;
+        pause.go.send(true).unwrap();
+        assert_eq!(code(&commit.await.unwrap().unwrap_err()), "OutcomeUnknown");
+        assert!(in_doubt(&t, &id));
+        let row = decision_row(&t.dbs[1], &id).unwrap();
+        assert!(!row.ends_with(b"\n+p1"), "not acked yet: {row:?}");
+        decide(a, "p1", &id, true, true).await.unwrap();
+        assert!(!in_doubt(&t, &id));
+        assert_eq!(get_row(a, "alice").await.unwrap(), Some(b"1".to_vec()));
+        // Sent by the resolver's next pass (every five seconds with this delay).
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let row = decision_row(&t.dbs[1], &id).unwrap();
+            if row.ends_with(b"\n+p1") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the home's row never took p1's ack: {}",
+                String::from_utf8_lossy(&row)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+}

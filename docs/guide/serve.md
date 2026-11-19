@@ -777,6 +777,8 @@ Transactions and pinned snapshots run in one partition, on its node.
 - **Every node** must run a build that keeps the `spanning_txns` map feature, and `--txn-max-branches` (16) bounds the branches of one transaction. Without the opt-in, a row of another partition is still `CrossPartition`.
 - **In doubt.** If the home fails during a commit, a branch may hold its share prepared, its outcome unknown. It's still readable as before the commit, and a write over the same cell waits for the outcome.
   - Each node's resolver asks the home once a share has been in doubt for `--txn-resolve-delay` (default: the request timeout), and decides it by the answer.
+  - It asks up to eight homes at once, each home's shares in turn. A home that gives no answer (its node down or too slow) is asked once a pass, and its other shares wait for the next one, so one dead home doesn't hold up the others or the collection of decided records.
+  - A branch that applies a commit, by its resolver or by `txn decide --commit`, then tells the home, so the home's record can be collected after `--txn-outcome-retention`. The branch's node keeps that ack in memory and retries it until the home takes it. If that node restarts first, the home's committed record stays: about a hundred bytes, never collected for now (#2098).
   - With no decision recorded and the home's history unchanged, the home records an abort first, so a late commit can't follow.
   - Across a change of the home's history (a restore, a relocate without `--copy`, a promotion), the answer is unknown, and the share stays in doubt with that reason.
   - `phdb cluster status` shows how many shares each partition holds in doubt and the oldest's age; with `--format json` it lists each one's xid, age and why it's waiting.
