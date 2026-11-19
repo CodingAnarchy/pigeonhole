@@ -59,7 +59,7 @@ const SERVING: &[u8] = b"serving/";
 /// request timeout since it"; a node that never comes back keeps it. It's a plain logged
 /// write, so it's in the partition's feed and reaches its replica copies, and a promoted
 /// copy keeps answering for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Moved {
     /// The move's id (`RangeMove.id`).
     pub id: String,
@@ -77,6 +77,15 @@ pub(crate) struct Moved {
     /// When this partition recorded it, in milliseconds since the Unix epoch on its clock:
     /// the prune's time bound (the transaction lifetime plus the request timeout since).
     pub at_ms: u64,
+    /// The move's `final_seqno` from the map's record (D331 PR 3b, both kinds); a serving
+    /// row's (empty on a moved-away row): the move's source, and this partition's D310 feed
+    /// token at
+    /// `t_from` (`seqno`), taken from a feed of the table before the gate opened the range.
+    /// A cluster component that starts at or before it carries a barrier there
+    /// ([`super::feed::Barrier`]), and a resume that gained this partition starts there.
+    pub source: String,
+    pub final_seqno: u64,
+    pub token: Vec<u8>,
 }
 
 /// The moved-away rows in `db`.
@@ -142,6 +151,11 @@ fn read_rows(db: &Pigeonhole, prefix: &[u8]) -> Result<Vec<Moved>, String> {
             version: number(b"version")?,
             seqno: number(b"seqno")?,
             at_ms: number(b"at")?,
+            source: String::from_utf8(bytes(b"source").unwrap_or_default()).unwrap_or_default(),
+            final_seqno: bytes(b"final")
+                .and_then(|b| std::str::from_utf8(&b).ok()?.parse().ok())
+                .unwrap_or(0),
+            token: bytes(b"token").unwrap_or_default(),
             id,
         });
     }
@@ -170,6 +184,14 @@ fn write_row(db: &Pigeonhole, prefix: &[u8], m: &Moved) -> Result<(), String> {
         .put(FAMILY, b"at", m.at_ms.to_string().as_bytes());
     if let Some(end) = &m.end {
         w = w.put(FAMILY, b"end", end);
+    }
+    if m.final_seqno != 0 {
+        w = w.put(FAMILY, b"final", m.final_seqno.to_string().as_bytes());
+    }
+    if !m.source.is_empty() {
+        w = w
+            .put(FAMILY, b"source", m.source.as_bytes())
+            .put(FAMILY, b"token", &m.token);
     }
     w.commit()
         .map(|_| ())
@@ -442,6 +464,38 @@ impl RangeState {
 }
 
 impl RangeState {
+    /// Whether every key of `table` is in a range this partition moved away (feed1248's M3
+    /// on PR 3b): its `Moved` spans cover the table from its first key on, unbroken.
+    pub(crate) fn moved_whole(&self, table: &str) -> bool {
+        let mut spans: Vec<&Span> = self
+            .spans
+            .iter()
+            .filter(|s| s.rule == Rule::Moved && s.table == table)
+            .collect();
+        spans.sort_by(|a, b| a.start.cmp(&b.start));
+        let mut reached: Vec<u8> = Vec::new();
+        for s in spans {
+            if s.start > reached {
+                return false;
+            }
+            match &s.end {
+                None => return true,
+                Some(e) if *e > reached => reached = e.clone(),
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a move into this partition still withholds a range of `table` (its target,
+    /// before CLEANING or before its serving row is here): a resume that gained the
+    /// partition asks again shortly rather than expiring (cli692's M1 on PR 3b).
+    pub(crate) fn awaits_hand_over(&self, table: &str) -> bool {
+        self.spans
+            .iter()
+            .any(|s| s.rule == Rule::Unserved && s.table == table)
+    }
+
     /// Whether it fences move `id`'s range.
     pub(crate) fn fences(&self, id: &str) -> bool {
         self.spans
@@ -462,6 +516,10 @@ pub(crate) struct RangeGate {
     pending: std::sync::atomic::AtomicBool,
     /// The visible seqno of the file when its rows here were read ([`load_rows_at`]).
     rows_at: std::sync::atomic::AtomicU64,
+    /// Bumped whenever the serving or moved-away rows or the state change (PR 3b): a running
+    /// cluster component of the partition looks for a new hand-over's barrier, or for its
+    /// tables having moved away whole (feed1248's M3 on PR 3b), when it moves.
+    rows_version: std::sync::atomic::AtomicU64,
 }
 
 impl RangeGate {
@@ -481,6 +539,8 @@ impl RangeGate {
     pub(crate) fn load_rows(&self, moved: Vec<Moved>, serving: Vec<Moved>) {
         *self.moved() = moved;
         *self.serving() = serving;
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// [`load_rows`](Self::load_rows) for rows read at the file's visible seqno `visible`,
@@ -501,6 +561,7 @@ impl RangeGate {
         *m = moved;
         *self.serving() = serving;
         self.rows_at.store(visible, Ordering::Release);
+        self.rows_version.fetch_add(1, Ordering::Release);
         true
     }
 
@@ -513,6 +574,25 @@ impl RangeGate {
         let mut serving = self.serving();
         serving.retain(|m| m.id != row.id);
         serving.push(row);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The rows' and state's version ([`rows_version`]): one load.
+    #[inline]
+    pub(crate) fn rows_version(&self) -> u64 {
+        self.rows_version.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The moved-away rows the file holds, for a cluster component of a table moved away
+    /// whole (PR 3b).
+    pub(crate) fn moved_rows(&self) -> Vec<Moved> {
+        self.moved().clone()
+    }
+
+    /// The serving rows the file holds, for a cluster component's start and barriers.
+    pub(crate) fn serving_rows(&self) -> Vec<Moved> {
+        self.serving().clone()
     }
 
     /// Whether the file records that it serves move `id`'s range.
@@ -525,6 +605,8 @@ impl RangeGate {
         let mut moved = self.moved();
         moved.retain(|m| m.id != row.id);
         moved.push(row);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether the file already records move `id`'s hand-over.
@@ -547,6 +629,8 @@ impl RangeGate {
         self.state.store(next.map(Arc::new));
         self.pending
             .store(pending, std::sync::atomic::Ordering::Release);
+        self.rows_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether the state waits for a row the file doesn't hold yet (see `pending`).
@@ -945,6 +1029,7 @@ mod tests {
             version: 5,
             seqno: 30,
             at_ms: 0,
+            ..Default::default()
         };
         let cleaning = map(Some(MovePhase::Cleaning));
         assert!(
@@ -1012,6 +1097,7 @@ mod tests {
             version,
             seqno: 40,
             at_ms: 0,
+            ..Default::default()
         };
         // The move is done and gone from the map, which gives `[c, f)` to p2.
         let mut done = map(None);
@@ -1100,6 +1186,7 @@ mod tests {
             version: 5,
             seqno: 9,
             at_ms: 0,
+            ..Default::default()
         };
         g.load_rows(vec![row.clone()], Vec::new());
         g.update(&done, "p1", 12);
@@ -1146,6 +1233,7 @@ mod tests {
                 version: 5,
                 seqno: 9,
                 at_ms: 0,
+                ..Default::default()
             }],
         );
         g.update(&done, "p2", 12);
@@ -1224,6 +1312,7 @@ mod tests {
             version: 7,
             seqno: 40,
             at_ms: 0,
+            ..Default::default()
         };
         let s = gate(&map(Some(MovePhase::HandedOver)), "p1", vec![row], 50)
             .state
@@ -1256,6 +1345,7 @@ mod tests {
                 version: 7,
                 seqno: 40,
                 at_ms: 0,
+                ..Default::default()
             },
             Moved {
                 id: "mv2".into(),
@@ -1266,6 +1356,7 @@ mod tests {
                 version: 9,
                 seqno: 41,
                 at_ms: 0,
+                ..Default::default()
             },
         ];
         for r in &rows {

@@ -906,6 +906,11 @@ message ForwardSubscribeRequest {
   // Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
   // most 64 of them; 0: none.
   uint64 skip_through = 5;
+  // D331: start the component at this partition's hand-over position for the request's
+  // tables (the earliest of its serving rows' tokens), not `request`'s start: a cluster
+  // resume whose token lacks this partition because a range move gave it the tables since.
+  // `FeedExpired` if no move did, or its feed has trimmed past that position.
+  bool from_hand_over = 6;
 }
 
 // D326: a node's lease round asks each node of its map, itself included, for a grant.
