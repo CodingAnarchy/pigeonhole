@@ -6596,12 +6596,12 @@ impl Inner {
         if self.shared.external_flagged.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut writer = self
-            .shared
-            .manifest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE)?;
+        // Through the writer, under its exclusion: never beside a root commit in flight
+        // (the race #2089's crash sweep found for bit 3).
+        manifest::commit_from_thread(
+            &self.shared,
+            manifest::ReqKind::Incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE),
+        )?;
         self.shared.external_flagged.store(true, Ordering::Release);
         Ok(())
     }
@@ -6615,12 +6615,11 @@ impl Inner {
         if self.shared.silent_flagged.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut writer = self
-            .shared
-            .manifest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_FEED_SILENT)?;
+        // Through the writer, under its exclusion: never beside a root commit in flight.
+        manifest::commit_from_thread(
+            &self.shared,
+            manifest::ReqKind::Incompat(pigeonhole_format::wal::INCOMPAT_FEED_SILENT),
+        )?;
         self.shared.silent_flagged.store(true, Ordering::Release);
         Ok(())
     }

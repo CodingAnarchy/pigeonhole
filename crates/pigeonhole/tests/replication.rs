@@ -1858,3 +1858,38 @@ fn a_range_drop_after_a_tagged_commit_carries_no_xid() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+/// D331 PR 4a (#2089's crash sweep on macOS, "root commits overlap"): a database's first
+/// feed-silent commit sets `incompat` bit 3 under the manifest writer's exclusion, as a
+/// manifest commit does, never beside a root commit in flight. While a hold has the
+/// exclusion, the commit waits for it; it goes through once the hold is dropped.
+#[test]
+fn the_first_silent_commit_flags_its_bit_under_the_writers_exclusion() {
+    let vfs = SimVfs::new(62);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let hold = db.hold_root_commits(Duration::from_secs(5)).unwrap();
+    std::thread::scope(|sc| {
+        let silent = sc.spawn(|| {
+            let mut wb = db.write_batch();
+            wb.mark_feed_silent();
+            wb.put(&t, b"r", "a", b"q", b"v");
+            wb.commit()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !silent.is_finished(),
+            "the bit is set only under the writer's exclusion"
+        );
+        drop(hold);
+        silent.join().unwrap().unwrap();
+    });
+    assert!(t.get(b"r", "a", b"q").unwrap().is_some());
+    drop(t);
+    db.close().unwrap();
+}
