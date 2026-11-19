@@ -66,7 +66,8 @@ pub enum ErrorCode {
     /// that fails with it was not committed. Transient: back off and retry. A batch that can
     /// never fit gets [`ErrorCode::BatchTooLarge`] instead. A reader process's `snapshot()`
     /// also returns it when the writer has not published a manifest change for about a
-    /// second.
+    /// second, and [`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader) when the
+    /// writer restarted while the reader was opening: open again.
     Busy = 24,
     /// A reader process's snapshot was taken before a writer restart, which may have reused
     /// the space it reads. Take a new snapshot and redo the read.

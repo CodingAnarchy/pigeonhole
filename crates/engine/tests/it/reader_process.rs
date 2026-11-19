@@ -587,3 +587,122 @@ fn a_reader_open_while_the_first_min_family_appears_reads_it() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// #2085: a reader open read the root, then its manifest, with nothing pinning that root's
+/// manifest version in between. A writer committing meanwhile could retire and reuse the
+/// root's manifest extents, and the open failed with `Corruption("manifest block")` (seen
+/// in `reader_crash_matrix`, seed 7, on #2081's CI).
+#[test]
+fn a_reader_open_while_the_writer_reuses_the_roots_manifest_extents_opens() {
+    let vfs = SimVfs::new(2085);
+    vfs.enter_process(WRITER);
+    let w = Arc::new(Mutex::new(Writer::open(&vfs)));
+    let t = {
+        let mut w = w.lock().unwrap();
+        let t =
+            w.db.create_table("t", &[("f".into(), FamilyOptions::default())])
+                .unwrap();
+        write_rows(&mut w, &t, "row", "old", 0..200);
+        t
+    };
+    // Between the open's root read and its manifest load, the writer commits on: enough
+    // manifest versions that the root's extents are retired, freed and written over.
+    let (hw, hv, ht) = (Arc::clone(&w), Arc::clone(&vfs), Arc::clone(&t));
+    Engine::on_next_reader_open(
+        &vfs,
+        Box::new(move || {
+            hv.enter_process(WRITER);
+            let mut w = hw.lock().unwrap();
+            // Small rounds: the open's pin keeps every memtable flushed meanwhile (as a
+            // snapshot's would), so the writes stay well inside the arena.
+            for round in 0..12u32 {
+                write_rows(&mut w, &ht, "zzz", "NEW", round * 40..round * 40 + 40);
+                w.compact();
+            }
+            hv.enter_process(READER);
+        }),
+    );
+    vfs.enter_process(READER);
+    let reader = Engine::open_reader(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20))
+        .unwrap_or_else(|e| panic!("open_reader: {e:?}"));
+    let rt = reader.table("t").unwrap();
+    let snap = reader.snapshot().unwrap();
+    for i in [0u32, 199] {
+        assert_eq!(
+            get(&reader, &snap, &rt, &format!("row{i:05}")).unwrap(),
+            Some(value("old", i)),
+            "row{i:05}"
+        );
+    }
+    assert_eq!(
+        get(&reader, &snap, &rt, "zzz00479").unwrap(),
+        Some(value("NEW", 479))
+    );
+    drop(snap);
+    reader.close().unwrap();
+    vfs.enter_process(WRITER);
+    Arc::try_unwrap(w)
+        .ok()
+        .unwrap()
+        .into_inner()
+        .unwrap()
+        .close();
+}
+
+/// #2085: a writer restart between a reader open's root read and its manifest load. The new
+/// writer doesn't see the old generation's pin and rewrites everything, reusing the root's
+/// extents: the open fails `Busy` (retryable), never `Corruption`, and a retry opens.
+#[test]
+fn a_writer_restart_during_a_reader_opens_manifest_load_is_busy_not_corruption() {
+    let vfs = SimVfs::new(2086);
+    vfs.enter_process(WRITER);
+    let w = Arc::new(Mutex::new(Some(Writer::open(&vfs))));
+    {
+        let mut g = w.lock().unwrap();
+        let w = g.as_mut().unwrap();
+        let t =
+            w.db.create_table("t", &[("f".into(), FamilyOptions::default())])
+                .unwrap();
+        write_rows(w, &t, "row", "old", 0..200);
+    }
+    let (hw, hv) = (Arc::clone(&w), Arc::clone(&vfs));
+    Engine::on_next_reader_open(
+        &vfs,
+        Box::new(move || {
+            hv.enter_process(WRITER);
+            let mut g = hw.lock().unwrap();
+            g.take().unwrap().close();
+            let mut nw = Writer::open(&hv);
+            let t = nw.db.table("t").unwrap();
+            nw.compact();
+            for round in 0..6u32 {
+                write_rows(&mut nw, &t, "zzz", "NEW", round * 200..round * 200 + 200);
+            }
+            nw.compact();
+            *g = Some(nw);
+            hv.enter_process(READER);
+        }),
+    );
+    vfs.enter_process(READER);
+    let options = || common::options(Arc::clone(&vfs), 1, 4 << 20);
+    match Engine::open_reader(Path::new(DB), options()) {
+        Ok(reader) => reader.close().unwrap(),
+        Err(Error::Busy) => {}
+        Err(e) => panic!("open_reader across a writer restart: {e:?}"),
+    }
+    let reader = Engine::open_reader(Path::new(DB), options()).unwrap();
+    let rt = reader.table("t").unwrap();
+    let snap = reader.snapshot().unwrap();
+    assert_eq!(
+        get(&reader, &snap, &rt, "row00150").unwrap(),
+        Some(value("old", 150))
+    );
+    assert_eq!(
+        get(&reader, &snap, &rt, "zzz01199").unwrap(),
+        Some(value("NEW", 1199))
+    );
+    drop(snap);
+    reader.close().unwrap();
+    vfs.enter_process(WRITER);
+    w.lock().unwrap().take().unwrap().close();
+}
