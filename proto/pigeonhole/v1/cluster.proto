@@ -235,6 +235,90 @@ message ClusterMap {
   // partitions' range gates from them. A partition is in at most one at a time, as source
   // or target. Set only once every node keeps them (`map_features`: `range_moves`).
   repeated RangeMove moves = 14;
+  // D332: the balancer, run by the map's writer (off by default). PAUSED finishes the action
+  // in flight and starts no other. Set only once every node keeps it (`balancer`).
+  BalancerMode balancer = 15;
+  // D332: the balancer's bounds; a 0 field is its default.
+  BalanceBounds balance = 16;
+  // D332: the balancer's last 32 actions, and each change of its reason for none.
+  repeated BalancerEvent balancer_events = 17;
+}
+
+// D332: whether the map's writer runs the balancer.
+enum BalancerMode {
+  BALANCER_MODE_UNSPECIFIED = 0;
+  BALANCER_MODE_OFF = 1;
+  BALANCER_MODE_ON = 2;
+  BALANCER_MODE_PAUSED = 3;
+}
+
+// D332: the balancer's bounds. A field at 0 takes the default given.
+message BalanceBounds {
+  // The largest node's size per unit of weight over the mean (1.25).
+  double size_ratio = 1;
+  // The same for load (1.25).
+  double load_ratio = 2;
+  // A partition past it is split (32 GiB).
+  uint64 partition_max_bytes = 3;
+  // A partition past this share of a node's capacity is split (0.5).
+  double partition_max_load = 4;
+  // A partition under it, and under a tenth of its node's mean load, is merged
+  // (partition_max_bytes / 8).
+  uint64 partition_min_bytes = 5;
+  // Consecutive 30 s passes a condition holds before the balancer acts on it (10).
+  uint32 passes = 6;
+  // How long what an action touched rests after it, in ms (30 min).
+  uint64 dwell_ms = 7;
+  // Moves within `bounce_window_ms` that auto-pin a partition (3).
+  uint32 max_moves = 8;
+  // The window for `max_moves`, and how long an auto-pin lasts, in ms (24 h).
+  uint64 bounce_window_ms = 9;
+}
+
+// D332: what a balancer event records.
+enum BalancerEventKind {
+  BALANCER_EVENT_KIND_UNSPECIFIED = 0;
+  BALANCER_EVENT_KIND_MOVE = 1;
+  BALANCER_EVENT_KIND_SPLIT = 2;
+  BALANCER_EVENT_KIND_MERGE = 3;
+  BALANCER_EVENT_KIND_PIN = 4;
+  // No action, and why: written only when the reason changes.
+  BALANCER_EVENT_KIND_SKIP = 5;
+  // A new writer ended an earlier writer's action before its commit point.
+  BALANCER_EVENT_KIND_ABORT = 6;
+}
+
+// D332: one balancer action, or a change of its reason for none.
+message BalancerEvent {
+  BalancerEventKind kind = 1;
+  string partition = 2;
+  // A move's source node; a merge's source partition.
+  string from = 3;
+  // A move's target node; a split's new partition's node; a merge's target partition.
+  string to = 4;
+  // A split's key.
+  SplitKey split_key = 5;
+  string reason = 6;
+  uint64 at_ms = 7;
+  // The `moves` record the action started, if any.
+  string move_id = 8;
+  // A split's table.
+  string table = 9;
+}
+
+// D332: one entry of a partition's balancer history (`Partition.moves_history`).
+message MoveHistory {
+  BalancerEventKind kind = 1;
+  uint64 at_ms = 2;
+}
+
+// A half-open key range of a table, `[start, end)` in split keys: D332's
+// `TablePlacement.pinned_ranges`, and any other split-key range.
+message SplitRange {
+  // Absent: the table's first key.
+  SplitKey start = 1;
+  // Absent: to the table's end.
+  SplitKey end = 2;
 }
 
 // D331: one range move, `[start, end)` of `table` from partition `from` to partition `to`.
@@ -370,6 +454,8 @@ message Node {
   string id = 1;
   // The node's listener, `host:port` (TLS unless the cluster runs without it).
   string address = 2;
+  // D332: the node's capacity relative to the others, for the balancer (0 counts as 1).
+  uint32 weight = 3;
 }
 
 message Partition {
@@ -400,6 +486,12 @@ message Partition {
   // D330: how many times P has failed over, ever: monotonic, unlike the map's last-16
   // events (`pigeonhole_cluster_failovers_total`).
   uint64 failover_count = 11;
+  // D332: the balancer leaves P on its node. Set by an operator (`phdb cluster balancer
+  // pin`), or by the balancer for a partition that bounced, with a PIN entry in
+  // `moves_history`; the balancer's own pin expires after the bounce window.
+  bool pinned = 9;
+  // D332: the balancer's last 8 actions on P (moves, splits, merges, its pins).
+  repeated MoveHistory moves_history = 10;
 }
 
 enum FailoverMode {
@@ -425,6 +517,8 @@ message TablePlacement {
   // again under its name gets a new one, which tells a node that missed both to drop the
   // old table and create the new.
   uint64 created = 6;
+  // D332: ranges the balancer never splits inside or moves (an operator's pins).
+  repeated SplitRange pinned_ranges = 7;
 }
 
 // Where an agent memory store's namespaces are (#1915, ICR 0139). A store keeps its data in
@@ -514,7 +608,12 @@ message PushMapResponse {
   uint64 map_version = 1;
 }
 
-message StatusRequest {}
+message StatusRequest {
+  // D332: only the partitions open here, with their file bytes from the file system: the
+  // balancer's survey, which skips reading every closed file's identity. Older nodes ignore
+  // it and answer in full.
+  bool open_only = 1;
+}
 
 message NodeStatus {
   string node_id = 1;
@@ -553,6 +652,10 @@ message NodeStatus {
   // holder, and the time left on this node's clock (not the writer lease). The writer asks
   // before it fails a partition over: an owner some node still grants is alive.
   repeated LeaseWithheld grants = 13;
+  // D332: the balancer's state on the map's writer: its last decision, or why it takes
+  // none, and how many passes the next action has waited. For people to read, not a format
+  // to parse. Empty on any other node, or with the balancer off.
+  string balancer = 14;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -630,6 +733,9 @@ message LocalPartition {
   double load_cpu = 29;
   double load_device = 30;
   double load = 31;
+  // D332: the partition file's size here, from the file system (the database is one file,
+  // WAL included), for the balancer. Open partitions only; 0 when closed.
+  uint64 file_bytes = 32;
 }
 
 // A share held in doubt (D329).

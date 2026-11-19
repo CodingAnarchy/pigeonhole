@@ -44,7 +44,7 @@ async fn unfence(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
 async fn local(port: u16, p: &str) -> LocalPartition {
     let s = client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner();
@@ -76,6 +76,7 @@ fn a_fenced_partition_refuses_writes_through_every_node_and_unfence_lifts_it() {
         assert_eq!(lp.fence_reason(), FenceReason::Operator, "{lp:?}");
         // `phdb cluster status`: a row per partition, with its state on its node.
         let args = super::super::cli::NodeArgs {
+            own: None,
             node: format!("http://127.0.0.1:{c}"),
             token_file: None,
             ca: None,
@@ -949,6 +950,7 @@ fn a_map_that_changes_the_nodes_cant_also_move_a_partition() {
     };
     let add_d = |m: &mut ClusterMap| {
         m.nodes.push(MapNode {
+            weight: Default::default(),
             id: "d".into(),
             address: "127.0.0.1:9".into(),
         });
@@ -1038,6 +1040,7 @@ fn a_node_change_holds_back_every_later_map_until_a_majority_before_and_after_it
         grown.map_version += 1;
         for (id, port) in ["d", "e"].into_iter().zip(&new_ports) {
             grown.nodes.push(MapNode {
+                weight: Default::default(),
                 id: id.into(),
                 address: format!("127.0.0.1:{port}"),
             });
@@ -1224,7 +1227,7 @@ fn in_a_rolling_upgrade_a_node_beside_builds_without_leases_serves_and_still_lap
         .await;
         let grace = client(a)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -1300,7 +1303,7 @@ fn a_restarted_node_grants_nothing_in_its_start_grace_and_a_majority_still_serve
     t.rt.block_on(async {
         let status = client(b)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -1316,7 +1319,7 @@ fn a_restarted_node_grants_nothing_in_its_start_grace_and_a_majority_still_serve
         eventually("b's grace to end", async || {
             client(b)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -1572,6 +1575,7 @@ fn a_paused_old_owner_never_commits_once_a_new_owner_took_writes() {
     // c gets p2 from a copy (the lost-node recipe), and takes writes.
     test_partition(&dirs[2], "p2").close().unwrap();
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{a}"),
         token_file: None,
         ca: None,
@@ -1630,7 +1634,7 @@ async fn map_of(port: u16) -> crate::serve::proto::ClusterMap {
 async fn status_of(port: u16) -> crate::serve::proto::NodeStatus {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -2859,6 +2863,7 @@ fn a_new_writer_finishes_or_aborts_a_whole_partition_move_its_old_writer_left() 
         let mut t = failover_rig(true);
         let [_, b, c] = t.ports;
         let args = super::super::cli::NodeArgs {
+            own: None,
             node: format!("http://127.0.0.1:{c}"),
             token_file: None,
             ca: None,
@@ -2931,4 +2936,140 @@ fn a_new_writer_finishes_or_aborts_a_whole_partition_move_its_old_writer_left() 
             }
         });
     }
+}
+
+/// Sets the map's balancer to `mode` at the writer `a` (retrying while its lease comes
+/// back), with the balancer's pass at 100 ms on every node (D332 PR 3's tests). The new
+/// map's version.
+async fn balancer_mode(t: &Rig, mode: crate::serve::proto::BalancerMode) -> u64 {
+    for dir in &t.dirs {
+        let mut pass = super::super::balancing::PASS_FOR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !pass.iter().any(|(d, _)| d == dir) {
+            pass.push((dir.clone(), Duration::from_millis(100)));
+        }
+    }
+    let a = t.ports[0];
+    let mut last = None;
+    for _ in 0..100 {
+        let mut m = map_of(a).await;
+        m.map_version += 1;
+        m.set_balancer(mode);
+        match set_at(a, m).await {
+            Ok(v) => return v,
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("set the balancer: {last:?}");
+}
+
+/// Waits until the writer at `port` reports a balancer state `ok` takes, up to `limit`;
+/// the panic names the last one.
+async fn balancer_until(port: u16, limit: Duration, ok: impl Fn(&str) -> bool) {
+    let until = tokio::time::Instant::now() + limit;
+    loop {
+        let st = status_of(port).await.balancer;
+        if ok(&st) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the writer's balancer state: {st:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[test]
+fn a_paused_or_idle_balancer_changes_no_map() {
+    // simp724's M2 and perf287's should-fix 1 on the D332 PR 3 plan: a pass that does
+    // nothing writes nothing to the map; its reason is in the writer's status. Paused, it
+    // says so; on, an even cluster is within bounds, and ten passes and more leave the
+    // map's version where it was.
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    t.rt.block_on(async {
+        balancer_mode(&t, crate::serve::proto::BalancerMode::Paused).await;
+        balancer_until(a, Duration::from_secs(15), |s| s == "paused").await;
+        let v = balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
+        balancer_until(a, Duration::from_secs(15), |s| s.starts_with("skip: ")).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let m = map_of(a).await;
+        assert_eq!(
+            m.map_version,
+            v,
+            "the balancer changed the map: {:?}",
+            status_of(a).await.balancer
+        );
+    });
+}
+
+#[test]
+fn a_balancer_move_an_earlier_writer_left_before_its_commit_point_is_aborted() {
+    // simp724's M1 on the D332 PR 3 plan: a `bal-` move of p1 to c stopped after its stamp
+    // (HANDING_OVER), as an earlier writer would leave it. The writer's balancer doesn't take
+    // it up: it aborts it. The record goes, c's copy goes aside, p1 is unfenced and serves on
+    // a again, and an ABORT event is recorded.
+    use crate::serve::cluster::moving::{STOP, Step};
+    use crate::serve::proto::{BalancerEventKind, MovePhase};
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, _, c] = t.ports;
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{c}"),
+        token_file: None,
+        ca: None,
+        own: None,
+    };
+    t.rt.block_on(async {
+        try_put(a, "alice", "1").await.unwrap();
+        STOP.lock()
+            .unwrap()
+            .push((args.node.clone(), Step::Stamped));
+        within(super::super::moving::run_as(
+            &args, "p1", "c", false, None, "bal",
+        ))
+        .await
+        .err()
+        .expect("stopped after the stamp");
+        let record = async || {
+            super::super::moving::record_of(&map_of(a).await, "p1")
+                .map(|r| (r.id.clone(), super::super::map::phase(r)))
+        };
+        let (id, phase) = record().await.expect("recorded");
+        assert!(id.starts_with("bal-"), "{id}");
+        assert_eq!(phase, MovePhase::HandingOver);
+        balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
+        // The map's record of it, not the writer's state: "aborted" lasts one pass, and the
+        // next pass's reason replaces it.
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let m = map_of(a).await;
+            let aborted = m
+                .balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id);
+            if aborted && record().await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the writer's balancer state: {:?}; moves {:?}; events {:?}",
+                status_of(a).await.balancer,
+                m.moves,
+                m.balancer_events
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!t.dirs[2].join("p1.phdb").exists(), "c's copy went aside");
+        eventually_within(
+            Duration::from_secs(10),
+            "p1 to serve on a again",
+            async || state(a, "p1").await == LocalPartitionState::Serving,
+        )
+        .await;
+    });
 }

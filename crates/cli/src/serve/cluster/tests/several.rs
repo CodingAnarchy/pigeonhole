@@ -660,7 +660,7 @@ fn a_schema_change_reconciles_every_partition_on_a_node() {
         assert!(!has(&dbs[2], "orders"), "p2 on b");
         let status = client(ports[0])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -964,7 +964,9 @@ async fn add_counter(ports: &[u16], port: u16) {
         eventually("every partition to take the map with n", async || {
             client(p)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest {
+                    open_only: Default::default(),
+                })
                 .await
                 .unwrap()
                 .into_inner()

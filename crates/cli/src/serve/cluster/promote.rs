@@ -38,7 +38,7 @@ async fn row_on(
     partition: &str,
 ) -> Result<Option<proto::LocalPartition>, Failure> {
     let (mut c, token) = connect(args, url).await?;
-    c.status(request(StatusRequest {}, token.as_deref())?)
+    c.status(request(StatusRequest::default(), token.as_deref())?)
         .await
         .map(|r| {
             r.into_inner()

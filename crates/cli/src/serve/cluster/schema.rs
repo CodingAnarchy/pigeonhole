@@ -938,6 +938,7 @@ impl Router {
                         partitions = g.partitions.clone();
                     }
                     new.tables.push(TablePlacement {
+                        pinned_ranges: Default::default(),
                         name: r.name.clone(),
                         group: p.group.clone(),
                         families: r.families.clone(),

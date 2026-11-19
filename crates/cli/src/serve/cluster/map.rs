@@ -224,6 +224,7 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
     }
     validate_indexes(map, &partitions, &tables)?;
     validate_moves(map)?;
+    validate_balancer(map)?;
     Ok(())
 }
 
@@ -286,6 +287,108 @@ pub(crate) fn followed_by<'m>(map: &'m ClusterMap, table: &str) -> Vec<&'m str> 
         .filter(|i| i.follows == table)
         .map(|i| i.name.as_str())
         .collect()
+}
+
+/// Whether `map` uses any of D332's fields: the balancer on or paused, bounds, events, a
+/// pin, a history or a weight.
+pub(crate) fn uses_balancer(map: &ClusterMap) -> bool {
+    use crate::serve::proto::BalancerMode;
+    !matches!(
+        map.balancer(),
+        BalancerMode::Unspecified | BalancerMode::Off
+    ) || map.balance.is_some()
+        || !map.balancer_events.is_empty()
+        || map.nodes.iter().any(|n| n.weight != 0)
+        || map
+            .partitions
+            .iter()
+            .any(|p| p.pinned || !p.moves_history.is_empty())
+        || map.tables.iter().any(|t| !t.pinned_ranges.is_empty())
+}
+
+/// How many balancer events a map keeps (D332), and how many history entries a partition.
+pub(crate) const BALANCER_EVENTS: usize = 32;
+pub(crate) const MOVES_HISTORY: usize = 8;
+
+/// Checks D332's fields: bounds in range, events and histories within their caps, and each
+/// table's pinned ranges non-empty, sorted and disjoint.
+fn validate_balancer(map: &ClusterMap) -> Result<(), Refusal> {
+    if let Some(b) = &map.balance {
+        for (name, r) in [("size_ratio", b.size_ratio), ("load_ratio", b.load_ratio)] {
+            if r != 0.0 && !(r > 1.0 && r.is_finite()) {
+                return Err(format!(
+                    "balance.{name} is {r}: above 1, or 0 for its default"
+                ));
+            }
+        }
+        if b.partition_max_load != 0.0
+            && !(b.partition_max_load > 0.0 && b.partition_max_load <= 1.0)
+        {
+            return Err(format!(
+                "balance.partition_max_load is {}: a share of a node, in (0, 1], or 0",
+                b.partition_max_load
+            ));
+        }
+        if b.partition_min_bytes != 0
+            && b.partition_max_bytes != 0
+            && b.partition_min_bytes * 4 > b.partition_max_bytes
+        {
+            return Err(
+                "balance.partition_min_bytes must stay under a quarter of partition_max_bytes, \
+                 so a merge never sets up a split"
+                    .into(),
+            );
+        }
+    }
+    if map.balancer_events.len() > BALANCER_EVENTS {
+        return Err(format!(
+            "the map records {} balancer events: it keeps the last {BALANCER_EVENTS}",
+            map.balancer_events.len()
+        ));
+    }
+    for p in &map.partitions {
+        if p.moves_history.len() > MOVES_HISTORY {
+            return Err(format!(
+                "partition {:?} records {} balancer history entries: it keeps the last \
+                 {MOVES_HISTORY}",
+                p.id,
+                p.moves_history.len()
+            ));
+        }
+    }
+    for t in &map.tables {
+        // The end of the range before (`Some(None)`: it ran to the table's end).
+        let mut last: Option<Option<Vec<u8>>> = None;
+        for r in &t.pinned_ranges {
+            let start = r
+                .start
+                .as_ref()
+                .map(split_key_bytes)
+                .transpose()
+                .map_err(|e| format!("table {:?}'s pinned range: {e}", t.name))?
+                .unwrap_or_default();
+            let end = r
+                .end
+                .as_ref()
+                .map(split_key_bytes)
+                .transpose()
+                .map_err(|e| format!("table {:?}'s pinned range: {e}", t.name))?;
+            if end.as_ref().is_some_and(|e| *e <= start) {
+                return Err(format!("table {:?} pins an empty range", t.name));
+            }
+            if last
+                .as_ref()
+                .is_some_and(|l| l.as_ref().is_none_or(|l| start < *l))
+            {
+                return Err(format!(
+                    "table {:?}'s pinned ranges must be sorted and not overlap",
+                    t.name
+                ));
+            }
+            last = Some(end);
+        }
+    }
+    Ok(())
 }
 
 /// Whether `m` is a whole partition's relocation (D332 PR 2's `MOVE_KIND_NODE`), not a
@@ -1390,10 +1493,13 @@ mod tests {
     /// index table co-located on p3.
     fn map() -> ClusterMap {
         let node = |id: &str, port: u16| Node {
+            weight: Default::default(),
             id: id.into(),
             address: format!("127.0.0.1:{port}"),
         };
         let part = |id: &str, node: &str| Partition {
+            moves_history: Default::default(),
+            pinned: Default::default(),
             history_epoch: 0,
             id: id.into(),
             node: node.into(),
@@ -1405,6 +1511,7 @@ mod tests {
         };
         let table =
             |name: &str, group: &str, splits: Vec<SplitKey>, parts: &[&str]| TablePlacement {
+                pinned_ranges: Default::default(),
                 name: name.into(),
                 group: group.into(),
                 families: Vec::new(),
@@ -1413,6 +1520,9 @@ mod tests {
                 created: 0,
             };
         ClusterMap {
+            balance: Default::default(),
+            balancer: Default::default(),
+            balancer_events: Default::default(),
             cluster_id: "c1".into(),
             map_version: 1,
             previous_nodes: Vec::new(),
@@ -2052,10 +2162,13 @@ mod tests {
         // Adding a node, a partition and a table placement; relocating with a new epoch.
         let mut ok = next();
         ok.nodes.push(Node {
+            weight: Default::default(),
             id: "c".into(),
             address: "127.0.0.1:7003".into(),
         });
         ok.partitions.push(Partition {
+            moves_history: Default::default(),
+            pinned: Default::default(),
             history_epoch: 0,
             id: "p4".into(),
             node: "c".into(),
@@ -2068,6 +2181,7 @@ mod tests {
         ok.partitions[0].node = "c".into();
         ok.partitions[0].epoch = 2;
         ok.tables.push(TablePlacement {
+            pinned_ranges: Default::default(),
             name: "events".into(),
             group: String::new(),
             families: Vec::new(),
@@ -2162,6 +2276,8 @@ mod tests {
         assert_eq!(history(&promoted, "p1"), (4, 4));
         // A new partition's history starts at its epoch.
         moved.partitions.push(Partition {
+            moves_history: Default::default(),
+            pinned: Default::default(),
             id: "p4".into(),
             node: "a".into(),
             epoch: 5,

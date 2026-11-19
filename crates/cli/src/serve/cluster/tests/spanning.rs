@@ -612,7 +612,9 @@ async fn decide(
 async fn line(port: u16, p: &str) -> super::super::proto::LocalPartition {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest {
+            open_only: Default::default(),
+        })
         .await
         .unwrap()
         .into_inner()

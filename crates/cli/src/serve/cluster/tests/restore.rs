@@ -141,7 +141,7 @@ fn a_restore_puts_the_backup_back_at_new_epochs_and_old_tokens_expire() {
             eventually(&format!("{p} to serve again"), async || {
                 client(*port)
                     .await
-                    .status(StatusRequest {})
+                    .status(StatusRequest::default())
                     .await
                     .unwrap()
                     .into_inner()
@@ -370,7 +370,7 @@ fn a_restore_run_again_skips_what_an_earlier_run_did() {
         for (port, (_, p)) in ports.iter().zip(NODES) {
             let serving = client(*port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -484,7 +484,7 @@ async fn on(port: u16, p: &str, call: &str) -> Result<(), tonic::Status> {
 async fn serves(port: u16, p: &str) -> bool {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -782,7 +782,7 @@ fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
         eventually("p3 not opening on c", async || {
             client(c)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()

@@ -29,6 +29,52 @@ pub(crate) struct NodeArgs {
     /// A PEM file of CA certificates to trust beside the system's roots.
     #[arg(long, value_name = "PEM")]
     pub ca: Option<PathBuf>,
+    /// A node's own credentials, in memory: the map's writer running a move (D332). Never
+    /// from the command line. Boxed: the subcommands' sizes stay even (clippy's
+    /// `large_enum_variant` on Windows).
+    #[arg(skip)]
+    pub own: Option<Box<Own>>,
+}
+
+/// A node's own cluster token and CA, for the moves its writer runs (D332).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Own {
+    pub token: Option<String>,
+    pub ca: Option<tonic::transport::Certificate>,
+}
+
+/// `phdb cluster balancer`'s subcommands (D332).
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(crate) enum BalancerCommand {
+    /// The balancer's mode and bounds, what the writer's last pass decided and why, the
+    /// pinned partitions and the last events.
+    Status {
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+    /// Finish the action in flight, then start no other (the map's `balancer` PAUSED).
+    Pause {
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+    /// Turn the balancer on (the map's `balancer` ON), from paused or off.
+    Resume {
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+    /// Keep a partition on its node: the balancer never moves, splits or merges it. An
+    /// operator's pin never expires (a pin the balancer set for a bouncing partition does).
+    Pin {
+        partition: String,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+    /// Let the balancer act on a partition again.
+    Unpin {
+        partition: String,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
 }
 
 /// `phdb cluster`'s subcommands.
@@ -83,6 +129,11 @@ pub(crate) enum ClusterCommand {
     Status {
         #[command(flatten)]
         node: NodeArgs,
+    },
+    /// The balancer (D332): its state, and its controls.
+    Balancer {
+        #[command(subcommand)]
+        command: BalancerCommand,
     },
     /// Back up every partition, each through the node the map gives it, plus the map, into
     /// DIR: `map.json`, `manifest.json` and `<partition>.phdb`. Each copy is its own
@@ -294,6 +345,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 }
                 (None, Some(node)) => {
                     let args = NodeArgs {
+                        own: None,
                         node: node.clone(),
                         token_file: token_file.clone(),
                         ca: ca.clone(),
@@ -319,6 +371,7 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             Ok(report("cluster show-map", summary, doc))
         }
         ClusterCommand::Status { node } => runtime()?.block_on(status(node)),
+        ClusterCommand::Balancer { command } => runtime()?.block_on(balancer(command)),
         ClusterCommand::Backup {
             dir,
             node,
@@ -653,7 +706,7 @@ pub(super) async fn relocate_as(
     // in-place restore (the same node) needs it closed.
     let probe = async {
         let (mut c, token) = connect(args, &old_url).await?;
-        c.status(request(StatusRequest {}, token.as_deref())?)
+        c.status(request(StatusRequest::default(), token.as_deref())?)
             .await
             .map(|r| {
                 r.into_inner()
@@ -835,7 +888,7 @@ pub(super) async fn relocate_as(
         );
         let now = {
             let (mut c, token) = connect(args, &old_url).await?;
-            c.status(request(StatusRequest {}, token.as_deref())?)
+            c.status(request(StatusRequest::default(), token.as_deref())?)
                 .await
                 .map_err(|s| Failure::usage(&format!("{old_url}: {}", s.message())))?
                 .into_inner()
@@ -997,14 +1050,16 @@ pub(super) async fn channel(
     args: &NodeArgs,
     url: &str,
 ) -> Result<(tonic::transport::Channel, Option<String>), Failure> {
-    let token = match &args.token_file {
-        Some(path) => Some(
+    let own = args.own.as_deref();
+    let token = match (own.and_then(|o| o.token.as_ref()), &args.token_file) {
+        (Some(t), _) => Some(t.clone()),
+        (None, Some(path)) => Some(
             std::fs::read_to_string(path)
                 .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?
                 .trim()
                 .to_owned(),
         ),
-        None => std::env::var("PHDB_TOKEN").ok(),
+        (None, None) => std::env::var("PHDB_TOKEN").ok(),
     }
     .filter(|t| !t.is_empty());
     let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_owned())
@@ -1016,6 +1071,9 @@ pub(super) async fn channel(
             let pem = std::fs::read(path)
                 .map_err(|e| Failure::io(&format!("read {}", path.display()), &e))?;
             tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+        }
+        if let Some(cert) = own.and_then(|o| o.ca.as_ref()) {
+            tls = tls.ca_certificate(cert.clone());
         }
         endpoint = endpoint
             .tls_config(tls)
@@ -1097,7 +1155,7 @@ pub(crate) async fn set_map(
             let got = async {
                 let (mut c, token) = connect(args, &url_of(args, address)).await?;
                 let s = c
-                    .status(request(StatusRequest {}, token.as_deref())?)
+                    .status(request(StatusRequest::default(), token.as_deref())?)
                     .await
                     .map_err(|s| Failure::usage(s.message()))?
                     .into_inner();
@@ -1273,7 +1331,7 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
         let url = format!("{scheme}://{}", n.address);
         let got = async {
             let (mut c, token) = connect(args, &url).await?;
-            c.status(request(StatusRequest {}, token.as_deref())?)
+            c.status(request(StatusRequest::default(), token.as_deref())?)
                 .await
                 .map(tonic::Response::into_inner)
                 .map_err(|s| Failure::usage(s.message()))
@@ -1371,4 +1429,151 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
     .collect();
     r.rows = rows;
     Ok(r)
+}
+
+/// A change `phdb cluster balancer` makes to the map, and what it says it did.
+type MapChange = Box<dyn Fn(&mut ClusterMap) -> Result<String, Failure>>;
+
+/// `phdb cluster balancer` (D332).
+async fn balancer(command: &BalancerCommand) -> Result<Report, Failure> {
+    use proto::{BalancerEventKind, BalancerMode};
+    let (args, change): (&NodeArgs, Option<MapChange>) = match command {
+        BalancerCommand::Status { node } => (node, None),
+        BalancerCommand::Pause { node } => (
+            node,
+            Some(Box::new(|m: &mut ClusterMap| {
+                m.set_balancer(BalancerMode::Paused);
+                Ok("paused: the action in flight finishes, and no other starts".into())
+            })),
+        ),
+        BalancerCommand::Resume { node } => (
+            node,
+            Some(Box::new(|m: &mut ClusterMap| {
+                m.set_balancer(BalancerMode::On);
+                Ok("on".into())
+            })),
+        ),
+        BalancerCommand::Pin { partition, node } | BalancerCommand::Unpin { partition, node } => {
+            let pin = matches!(command, BalancerCommand::Pin { .. });
+            let partition = partition.clone();
+            (
+                node,
+                Some(Box::new(move |m: &mut ClusterMap| {
+                    let Some(p) = m.partitions.iter_mut().find(|p| p.id == partition) else {
+                        return Err(Failure::usage(&format!(
+                            "the map has no partition {partition:?}"
+                        )));
+                    };
+                    p.pinned = pin;
+                    // An operator's pin, or unpin, is never the balancer's own: its PIN
+                    // entries go, so no auto-expiry overrides it (simp724's S2).
+                    p.moves_history
+                        .retain(|h| h.kind() != BalancerEventKind::Pin);
+                    Ok(format!(
+                        "{} {partition}",
+                        if pin { "pinned" } else { "unpinned" }
+                    ))
+                })),
+            )
+        }
+    };
+    let (mut c, token) = connect(args, &args.node).await?;
+    let mut m = c
+        .get_map(request(GetMapRequest {}, token.as_deref())?)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    if let Some(change) = change {
+        let done = change(&mut m)?;
+        m.map_version += 1;
+        let set = set_map(args, m, false, Vec::new()).await?;
+        return Ok(report(
+            "cluster balancer",
+            vec![
+                ("done", json!(done)),
+                (
+                    "map_version",
+                    set.document
+                        .get("map_version")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                ),
+            ],
+            Value::Null,
+        ));
+    }
+    // The writer's state: its `Status`.
+    let writer = super::schema::writer(&m).to_owned();
+    let writer_state = match m.nodes.iter().find(|n| n.id == writer) {
+        Some(n) => {
+            let url = url_of(args, &n.address);
+            match connect(args, &url).await {
+                Ok((mut w, t)) => w
+                    .status(request(StatusRequest::default(), t.as_deref())?)
+                    .await
+                    .map_or_else(
+                        |s| format!("unknown: {}", s.message()),
+                        |r| r.into_inner().balancer,
+                    ),
+                Err(f) => format!("unknown: {}", f.message()),
+            }
+        }
+        None => "unknown: the map names no writer".into(),
+    };
+    let b = super::balancing::bounds_of(&m);
+    let events: Vec<Value> = m
+        .balancer_events
+        .iter()
+        .map(|e| {
+            json!({
+                "kind": format!("{:?}", e.kind()),
+                "partition": e.partition,
+                "from": e.from,
+                "to": e.to,
+                "table": e.table,
+                "reason": e.reason,
+                "at_ms": e.at_ms,
+                "move_id": e.move_id,
+            })
+        })
+        .collect();
+    let pinned: Vec<Value> = m
+        .partitions
+        .iter()
+        .filter(|p| p.pinned)
+        .map(|p| {
+            json!({
+                "partition": p.id,
+                "by": if p.moves_history.iter().any(|h| h.kind() == BalancerEventKind::Pin) {
+                    "the balancer (it bounced; expires after the bounce window)"
+                } else {
+                    "an operator"
+                },
+            })
+        })
+        .collect();
+    Ok(report(
+        "cluster balancer status",
+        vec![
+            ("mode", json!(format!("{:?}", m.balancer()))),
+            ("writer", json!(writer)),
+            ("state", json!(writer_state)),
+            ("pinned", json!(pinned.len())),
+        ],
+        json!({
+            "bounds": {
+                "size_ratio": b.size_ratio,
+                "load_ratio": b.load_ratio,
+                "partition_max_bytes": b.partition_max_bytes,
+                "partition_max_load": b.partition_max_load,
+                "partition_min_bytes": b.partition_min_bytes,
+                "passes": b.passes,
+                "dwell_ms": b.dwell_ms,
+                "max_moves": b.max_moves,
+                "bounce_window_ms": b.bounce_window_ms,
+            },
+            "pinned": pinned,
+            "events": events,
+        }),
+    ))
 }

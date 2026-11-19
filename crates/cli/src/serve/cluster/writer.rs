@@ -251,6 +251,16 @@ impl Node {
         self: &Arc<Self>,
         map: &ClusterMap,
     ) -> Vec<(String, Option<super::proto::NodeStatus>)> {
+        self.survey_with(map, false).await
+    }
+
+    /// [`Self::survey`]; with `open_only`, each node lists only its open partitions, with no
+    /// read of a closed file (the balancer's, D332; older nodes answer in full).
+    pub(crate) async fn survey_with(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+        open_only: bool,
+    ) -> Vec<(String, Option<super::proto::NodeStatus>)> {
         let deadline = self.peers.push_timeout.min(self.grants.lease() / 6);
         let mut asks = tokio::task::JoinSet::new();
         for n in map.nodes.iter().filter(|n| n.id != self.id) {
@@ -258,7 +268,7 @@ impl Node {
             asks.spawn(async move {
                 let st = tokio::time::timeout(deadline, async {
                     let mut c = node.client(&address).await?;
-                    c.status(node.request(StatusRequest {})?)
+                    c.status(node.request(StatusRequest { open_only })?)
                         .await
                         .map(tonic::Response::into_inner)
                         .map_err(|s| s.message().to_owned())
@@ -304,6 +314,9 @@ impl Node {
             }
             if let Some(node) = claimed.0.upgrade() {
                 node.maybe_fail_over().await;
+            }
+            if let Some(node) = claimed.0.upgrade() {
+                node.maybe_balance().await;
             }
             drop(claimed);
         });
@@ -885,6 +898,7 @@ mod model {
             failover: true,
             nodes: (0..NODES)
                 .map(|i| MapNode {
+                    weight: Default::default(),
                     id: id(i),
                     address: format!("127.0.0.1:{}", 1000 + i),
                 })

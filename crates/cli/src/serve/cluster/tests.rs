@@ -101,6 +101,9 @@ fn text(s: &str) -> SplitKey {
 /// at "m" over p1 and p2.
 fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
     ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
@@ -110,6 +113,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             .iter()
             .zip(ports)
             .map(|(id, port)| MapNode {
+                weight: Default::default(),
                 id: (*id).into(),
                 address: format!("127.0.0.1:{port}"),
             })
@@ -117,6 +121,8 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         partitions: [("p1", "a"), ("p2", "b"), ("p3", "c")]
             .iter()
             .map(|(id, node)| Partition {
+                moves_history: Default::default(),
+                pinned: Default::default(),
                 history_epoch: 0,
                 id: (*id).into(),
                 node: (*node).into(),
@@ -128,6 +134,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             })
             .collect(),
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
@@ -158,7 +165,7 @@ async fn client(
 async fn version(port: u16) -> u64 {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -431,7 +438,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         assert!(e.message().contains(super::DIVERGENT), "{e:?}");
         let s = client(ports[1])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -457,7 +464,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         assert!(
             client(ports[1])
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -852,7 +859,7 @@ fn a_family_added_to_a_cached_table_reads_with_its_aggregate_view() {
         eventually("a's p1 to reconcile to the map with q", async || {
             client(a)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -2325,7 +2332,7 @@ fn status_reports_each_partitions_load_and_a_read_only_partitions_sampled_cpu() 
     let row_of = async |port: u16, p: &str| {
         client(port)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -4231,6 +4238,9 @@ fn split_nodes(
         .map(|l| l.local_addr().unwrap().port())
         .collect();
     let map = ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
@@ -4240,12 +4250,15 @@ fn split_nodes(
             .iter()
             .enumerate()
             .map(|(i, port)| MapNode {
+                weight: Default::default(),
                 id: format!("n{i}"),
                 address: format!("127.0.0.1:{port}"),
             })
             .collect(),
         partitions: (0..n)
             .map(|i| Partition {
+                moves_history: Default::default(),
+                pinned: Default::default(),
                 history_epoch: 0,
                 id: format!("q{i}"),
                 node: format!("n{i}"),
@@ -4257,6 +4270,7 @@ fn split_nodes(
             })
             .collect(),
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
@@ -4438,7 +4452,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             for &port in &ports {
                 let s = client(port)
                     .await
-                    .status(StatusRequest {})
+                    .status(StatusRequest::default())
                     .await
                     .unwrap()
                     .into_inner();
@@ -4592,7 +4606,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
         settled().await;
         let status = client(ports[1])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -4629,7 +4643,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
                 .into_inner();
             let s = client(port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner();
@@ -4739,6 +4753,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
         super::proto::schema_client::SchemaClient::new(channel)
     };
     let args = |port: u16| super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,
@@ -4905,7 +4920,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .await;
             let s = client(port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner();
@@ -4937,6 +4952,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, _dbs) = three_nodes(&rt);
     let args = |port: u16| super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,
