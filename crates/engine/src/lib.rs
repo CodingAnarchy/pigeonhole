@@ -52,6 +52,7 @@ mod options;
 mod position;
 mod punch;
 mod purge_guard;
+mod range_copy;
 mod read;
 mod row_cache;
 mod shard;
@@ -89,6 +90,7 @@ pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};
 pub use position::ColumnPosition;
 pub use punch::PunchTuning;
+pub use range_copy::{CopiedCell, RangeChunk};
 pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, NEAREST_POLL_CELLS, PendingNearest, Score};
 pub use read::reduce::{

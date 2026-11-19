@@ -123,6 +123,28 @@ impl StreamGc {
         family: &FamilyOptions,
         merge: Option<Arc<dyn MergeOperator>>,
     ) -> Self {
+        Self::with(policy, family, merge, false, None)
+    }
+
+    /// GC as a compaction job runs it: also folding a counter family's operands into the
+    /// base below them (D298 §4.2), reading a separated base through `base_blobs`. A range
+    /// move's copy writes exactly what a compaction would (D331, simp724).
+    pub fn folding(
+        policy: &GcPolicy,
+        family: &FamilyOptions,
+        merge: Option<Arc<dyn MergeOperator>>,
+        base_blobs: Option<Arc<dyn BlobFetch>>,
+    ) -> Self {
+        Self::with(policy, family, merge, true, base_blobs)
+    }
+
+    fn with(
+        policy: &GcPolicy,
+        family: &FamilyOptions,
+        merge: Option<Arc<dyn MergeOperator>>,
+        fold_bases: bool,
+        base_blobs: Option<Arc<dyn BlobFetch>>,
+    ) -> Self {
         Self {
             gc: Gc::new(GcConfig {
                 snapshots: policy.snapshots.clone(),
@@ -135,8 +157,8 @@ impl StreamGc {
                 counter: family.kind.is_aggregate(),
                 other_sources: policy.other_sources.clone(),
                 no_outside_deletes: policy.no_outside_deletes,
-                fold_bases: false,
-                base_blobs: None,
+                fold_bases,
+                base_blobs,
             }),
             out: OutBuf::default(),
         }

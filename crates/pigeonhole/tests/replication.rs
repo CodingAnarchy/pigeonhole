@@ -1334,3 +1334,110 @@ fn a_catalog_change_right_after_a_range_drop_is_delivered_as_itself() {
     replica.close().unwrap();
     primary.close().unwrap();
 }
+
+/// D331 PR 4a (B2): a range copied chunk by chunk from one snapshot, and written back by
+/// name into another database, reads there as the source did at the snapshot, in every
+/// family kind: versions (a capped family too), a column delete hiding an older `put_at`
+/// written after it, a TTL family, a counter with a delete and increments after it, and
+/// sum, max and HLL aggregates, some of each in SSTs and some in the memtable. A write after
+/// the snapshot isn't copied, and every chunk holds whole rows.
+#[test]
+fn a_range_copied_at_a_snapshot_reads_as_its_source() {
+    use pigeonhole::Aggregation;
+    let (sv, tv) = (SimVfs::new(52), SimVfs::new(53));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("a", Family::default())
+            .family("v", Family::default().max_versions(2))
+            .family("l", Family::default().ttl(Duration::from_secs(3600)))
+            .family("n", Family::counter())
+            .family("s", Family::aggregate(Aggregation::Sum))
+            .family("m", Family::aggregate(Aggregation::Max))
+            .family("h", Family::aggregate(Aggregation::Hll))
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    for i in 0..40u32 {
+        let row = format!("r{i:02}");
+        let r = row.as_bytes();
+        s.mutate(r)
+            .put_at("a", b"q", 100 + u64::from(i), b"first")
+            .put_at("a", b"q", 200 + u64::from(i), b"second")
+            .put_at("v", b"q", 10, b"v10")
+            .put_at("v", b"q", 20, b"v20")
+            .put_at("v", b"q", 30, b"v30")
+            .put("l", b"q", b"lives")
+            .incr("n", b"c", 3)
+            .aggregate("s", b"q", i64::from(i))
+            .aggregate("m", b"q", i64::from(i % 7))
+            .aggregate_bytes("h", b"q", r)
+            .commit()
+            .unwrap();
+        if i % 3 == 0 {
+            s.mutate(r).delete_column("a", b"q").commit().unwrap();
+            s.mutate(r)
+                .put_at("a", b"q", 50, b"hidden")
+                .commit()
+                .unwrap();
+            s.mutate(r).delete_column("n", b"c").commit().unwrap();
+        }
+        s.mutate(r)
+            .incr("n", b"c", 4)
+            .aggregate("s", b"q", 1)
+            .aggregate("m", b"q", 9)
+            .aggregate_bytes("h", b"q", b"shared")
+            .commit()
+            .unwrap();
+        if i == 20 {
+            source.flush().unwrap();
+        }
+    }
+    let snap = source.snapshot().unwrap();
+    s.mutate(b"zz").put("a", b"q", b"after").commit().unwrap();
+
+    let mut after = Vec::new();
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
+    loop {
+        let chunk = source.copy_range(&snap, &s, &after, None, 300).unwrap();
+        let mut rows: Vec<Vec<u8>> = chunk.cells.iter().map(|c| c.row.clone()).collect();
+        rows.dedup();
+        let mut wb = target.logged_batch();
+        wb.mark_feed_silent();
+        for c in &chunk.cells {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        if !wb.is_empty() {
+            wb.commit().unwrap();
+        }
+        chunks.push(rows);
+        match chunk.next {
+            Some(n) => after = n,
+            None => break,
+        }
+    }
+    assert!(chunks.len() > 3, "{} chunks", chunks.len());
+    let mut seen = std::collections::HashSet::new();
+    for rows in &chunks {
+        for r in rows {
+            assert!(seen.insert(r.clone()), "row {r:?} in two chunks");
+        }
+    }
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t") && !l.contains(&format!("\t{}\t", hex(b"zz"))))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    assert!(
+        t.get(b"zz", "a", b"q").unwrap().is_none(),
+        "a write after the snapshot"
+    );
+    drop((snap, s, t));
+    target.close().unwrap();
+    source.close().unwrap();
+}

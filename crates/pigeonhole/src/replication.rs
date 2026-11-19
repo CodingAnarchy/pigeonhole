@@ -865,6 +865,50 @@ impl Pigeonhole {
         Ok(())
     }
 
+    /// One chunk of rows `[after, end)` of `table` at `snapshot`, for a range move's copy
+    /// (D331 PR 4a, ICR 0141): exactly what a compaction would write for them there (every
+    /// version and marker a reader at the snapshot could need; a counter or aggregate
+    /// family's operands folded into their base), named by family, for
+    /// [`LoggedBatch::push`]. It ends at a row boundary once it holds `max_bytes`; its
+    /// `next` is the row to ask for next, `None` once the range is done. Reads without
+    /// filling the block cache. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn copy_range(
+        &self,
+        snapshot: &crate::Snapshot,
+        table: &crate::Table,
+        after: &[u8],
+        end: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<CopiedChunk> {
+        crate::write::check_table(&self.db, table)?;
+        let chunk =
+            self.engine()
+                .copy_range(&snapshot.inner, table.core.info.id, after, end, max_bytes)?;
+        let info = table.core.current_info();
+        let mut cells = Vec::with_capacity(chunk.cells.len());
+        for c in chunk.cells {
+            let Some(family) = info.families.iter().find(|f| f.id == c.family) else {
+                return Err(Error::new(
+                    ErrorCode::FamilyNotFound,
+                    format!("family {} of table {:?}", c.family.0, info.name),
+                ));
+            };
+            cells.push(CopiedCell {
+                family: family.name.clone(),
+                kind: ChangeKind::of(c.kind),
+                row: c.row,
+                qualifier: c.qualifier,
+                ts: c.ts,
+                stored: c.stored,
+            });
+        }
+        Ok(CopiedChunk {
+            cells,
+            next: chunk.next,
+        })
+    }
+
     fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {
         let state = State {
             primary: primary_of(&end.token),
@@ -902,6 +946,35 @@ impl Pigeonhole {
         self.engine().store_replication_state(&state.encode())?;
         Ok(())
     }
+}
+
+/// One chunk of a range copy ([`Pigeonhole::copy_range`]). Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopiedChunk {
+    /// Its cells, in row order, each row whole.
+    pub cells: Vec<CopiedCell>,
+    /// The row to ask for next; `None`: the range is done.
+    pub next: Option<Vec<u8>>,
+}
+
+/// One cell of a range copy, as its source logged it, for [`LoggedBatch::push`]. Not part
+/// of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopiedCell {
+    /// The family's name.
+    pub family: String,
+    /// A put (a counter or aggregate family's folded base too), a merge, or a delete.
+    pub kind: ChangeKind,
+    /// The row.
+    pub row: Vec<u8>,
+    /// The qualifier; empty for a family delete.
+    pub qualifier: Vec<u8>,
+    /// The timestamp.
+    pub ts: u64,
+    /// The stored value, tag byte first; empty for a delete.
+    pub stored: Vec<u8>,
 }
 
 /// [`Pigeonhole::logged_batch`]'s batch. Errors (a table of another database, a family

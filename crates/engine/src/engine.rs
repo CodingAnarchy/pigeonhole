@@ -2435,6 +2435,26 @@ impl Engine {
         self.inner.drop_range(table, start, end)
     }
 
+    /// One chunk of rows `[after, end)` of `table` (`end` `None`: to the table's end) at
+    /// `snapshot`, for a range move's copy (D331 PR 4a, ICR 0141): exactly what a
+    /// compaction would write for them at the snapshot, every version and marker a reader
+    /// there could need, a counter or aggregate family's operands folded into their base.
+    /// The chunk ends at a row boundary once it holds `max_bytes`; its `next` is the row to
+    /// ask for next, `None` once the range is done. Reads without filling the block cache.
+    /// A target writes it back with [`WriteBatch::push_logged`] in one commit.
+    pub fn copy_range(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        after: &[u8],
+        end: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<crate::RangeChunk> {
+        self.inner.check_open()?;
+        let now = self.inner.shared.clock_vfs.now_micros();
+        crate::range_copy::copy_range(snapshot, now, table, after, end, max_bytes)
+    }
+
     /// [`drop_range`](Self::drop_range) on a replica (D331): its primary's drop, which its
     /// follower applies in feed order. `InvalidArgument` on a primary.
     pub fn apply_range_drop(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
