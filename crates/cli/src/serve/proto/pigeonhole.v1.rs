@@ -8769,7 +8769,8 @@ pub mod cluster_client {
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
         /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
+        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+        /// PR 5).
         pub async fn fence(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -8819,7 +8820,8 @@ pub mod cluster_client {
         /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
         /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
         /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
+        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+        /// move: D332, D331 PR 5).
         pub async fn close(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -8843,7 +8845,8 @@ pub mod cluster_client {
         }
         /// Moves a partition's files left on this node, after it moved away, into
         /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-        /// node's map names it as the partition's node, or while it's open. Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
+        /// node's map names it as the partition's node, or while it's open. Admin scope, or a
+        /// node's cluster token (the map's writer running a move: D332, D331 PR 5).
         pub async fn drop_partition(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -9071,7 +9074,8 @@ pub mod cluster_server {
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
         /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
+        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+        /// PR 5).
         async fn fence(
             &self,
             request: tonic::Request<super::PartitionRequest>,
@@ -9087,14 +9091,16 @@ pub mod cluster_server {
         /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
         /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
         /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
+        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+        /// move: D332, D331 PR 5).
         async fn close(
             &self,
             request: tonic::Request<super::PartitionRequest>,
         ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Moves a partition's files left on this node, after it moved away, into
         /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-        /// node's map names it as the partition's node, or while it's open. Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
+        /// node's map names it as the partition's node, or while it's open. Admin scope, or a
+        /// node's cluster token (the map's writer running a move: D332, D331 PR 5).
         async fn drop_partition(
             &self,
             request: tonic::Request<super::PartitionRequest>,

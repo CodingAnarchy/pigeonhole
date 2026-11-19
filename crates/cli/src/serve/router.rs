@@ -265,7 +265,8 @@ impl Router {
     }
 
     /// `Admin.PartitionUpload` (D317): `stream`'s file of a partition this node doesn't
-    /// have open, staged for the stamp that installs it. Admin scope, or a node's cluster token for a relocation's set (D332); a cluster node only.
+    /// have open, staged for the stamp that installs it. Admin scope, or a node's cluster
+    /// token for a relocation's set (D332); a cluster node only.
     pub(crate) async fn partition_upload(
         &self,
         caller: &Caller,

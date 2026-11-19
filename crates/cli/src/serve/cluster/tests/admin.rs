@@ -293,6 +293,44 @@ fn a_moves_calls_take_a_nodes_cluster_token_and_still_refuse_a_clients() {
             tonic::Code::PermissionDenied,
             "a whole download: {e}"
         );
+        // A named partition's download that's neither a closed set nor a replica's bootstrap
+        // (audit120's N1), and a forced unfence (simp724): admin only.
+        let e = admin(a)
+            .await
+            .backup_download(with(
+                crate::serve::proto::BackupDownloadRequest {
+                    partition: "p1".into(),
+                    ..Default::default()
+                },
+                Some(NODE_TOKEN),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.code(),
+            tonic::Code::PermissionDenied,
+            "a named whole download: {e}"
+        );
+        let e = client(a)
+            .await
+            .unfence(with(
+                PartitionRequest {
+                    partition: "p1".into(),
+                    force: true,
+                },
+                Some(NODE_TOKEN),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.code(),
+            tonic::Code::PermissionDenied,
+            "a forced unfence: {e}"
+        );
+        assert!(
+            e.message().contains("a forced unfence is an admin's"),
+            "{e}"
+        );
         // A restore is an admin's upload: the cluster token is refused one (simp724's S1).
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(crate::serve::proto::PartitionUploadChunk {

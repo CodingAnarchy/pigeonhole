@@ -1946,8 +1946,16 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
         // A move the writer runs lifts its own fence on abort (the coordinator, #2094).
-        self.caller(&req, &[Scope::Admin, Scope::Cluster], "unfence a partition")?;
+        let caller = self.caller(&req, &[Scope::Admin, Scope::Cluster], "unfence a partition")?;
         let req = req.into_inner();
+        // `force` skips the check that the peers' newest map still names this node: never
+        // a move's abort, so an admin's only (simp724's should on #2094).
+        if req.force && caller.scope == Scope::Cluster {
+            return Err(ApiError::permission_denied(
+                "unfence with --force: a forced unfence is an admin's",
+            )
+            .into());
+        }
         let id = req.partition;
         self.0.unfence(&id, req.force).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
