@@ -4963,9 +4963,10 @@ pub struct TxnOutcomeRequest {
 /// from the decision (and, for a commit, until every branch acknowledged it). A read-only
 /// spanning commit has no decision row: it's answered COMMITTED only while its session's
 /// record lasts (one --txn-idle-ms after its Commit, not across a restart of its home's
-/// node), then ABORTED, then NotFound. It wrote nothing either way, so Commit's own answer
-/// is the one to rely on for whether its reads held. From a full retention after a
-/// transaction began, a missing row is NotFound, never a presumed abort.
+/// node), then ABORTED (the first ask records it, for a retention), then NotFound. It wrote
+/// nothing either way, so Commit's own answer is the one to rely on for whether its reads
+/// held. From a full retention after a transaction began, a missing row is NotFound, never
+/// a presumed abort.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnOutcomeResponse {
     #[prost(enumeration = "TxnOutcomeState", tag = "1")]
