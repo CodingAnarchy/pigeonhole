@@ -1057,7 +1057,7 @@ fn the_writer_starts_each_chunks_writeback_as_it_writes_it() {
     let mut w = SstWriter::new(hinted.clone(), EXTENT, SstId(3), options(&l));
     let mut key = Vec::new();
     let value = vec![7u8; 1000];
-    // About 3 MiB of blocks: several 1 MiB chunks and a partial last one.
+    // About 3 MiB of blocks: many 256 KiB chunks and a partial last one.
     for i in 0u32..3000 {
         key.clear();
         encode_key(&mut key, &i.to_be_bytes(), b"q", 1, 1, Kind::Put).unwrap();
@@ -1065,11 +1065,11 @@ fn the_writer_starts_each_chunks_writeback_as_it_writes_it() {
     }
     let meta = w.finish().unwrap();
     let hints = hinted.hints.lock().unwrap().clone();
-    assert!(hints.len() >= 3, "{hints:?}");
+    assert!(hints.len() >= 11, "{hints:?}");
     let mut at = EXTENT.offset();
     for &(offset, len) in &hints {
         assert_eq!(offset, at, "a hint out of order or with a gap: {hints:?}");
-        assert!(len > 0 && len <= 2 << 20, "{hints:?}");
+        assert!(len > 0 && len <= 512 << 10, "{hints:?}");
         at += len;
     }
     // The hinted data reaches the footer's region; the SST still reads back whole.
@@ -1170,20 +1170,23 @@ fn blobs_read_back(
     }
 }
 
-/// Many small values: a hint for each megabyte as it fills, then the tail at `finish`.
-/// Adjacent extents make one range, headers included, so a megabyte is one call, not one
-/// per 64 KiB extent.
+/// Many small values: a hint for each 256 KiB chunk as it fills, then the tail at `finish`.
+/// Adjacent extents make one range, headers included, so a chunk is one call, not one per
+/// 64 KiB extent.
 #[test]
-fn a_blob_file_starts_each_megabytes_writeback_as_it_fills() {
+fn a_blob_file_starts_each_chunks_writeback_as_it_fills() {
     let values: Vec<Vec<u8>> = (0..3300u32).map(|i| vec![(i % 251) as u8; 1000]).collect();
     let (file, extents, ptrs, before_finish) = hinted_blob(&values, 16);
     let hints = check_hints(&file);
-    // About 3.3 MiB of records: three full megabytes while writing, the rest at the end.
-    assert_eq!(before_finish, 3, "{hints:?}");
-    assert_eq!(hints.len(), 4, "{hints:?}");
-    for &(_, len) in &hints[..3] {
-        // A megabyte of payload and the headers of the extents it lies in.
-        assert!((1 << 20..=(1 << 20) + 17 * 64).contains(&len), "{hints:?}");
+    // About 3.3 MiB of records: twelve full chunks while writing, the rest at the end.
+    assert_eq!(before_finish, 12, "{hints:?}");
+    assert_eq!(hints.len(), 13, "{hints:?}");
+    for &(_, len) in &hints[..12] {
+        // A chunk of payload and the headers of the extents it lies in.
+        assert!(
+            (256 << 10..=(256 << 10) + 5 * 64).contains(&len),
+            "{hints:?}"
+        );
     }
     // In file order, each starting where the last ended: nothing between them unhinted.
     let mut at = extents[0].offset();
@@ -1194,7 +1197,7 @@ fn a_blob_file_starts_each_megabytes_writeback_as_it_fills() {
     blobs_read_back(&file, extents, &ptrs, &values);
 }
 
-/// One long value is hinted as it is written, a megabyte at a time, not all at its end
+/// One long value is hinted as it is written, a chunk at a time, not all at its end
 /// (which would send it to the device in the burst the hint is there to avoid).
 #[test]
 fn a_long_blob_starts_its_writeback_while_it_is_still_being_written() {
@@ -1205,7 +1208,7 @@ fn a_long_blob_starts_its_writeback_while_it_is_still_being_written() {
     ];
     let (file, extents, ptrs, before_finish) = hinted_blob(&values, 16);
     let hints = check_hints(&file);
-    assert_eq!(before_finish, 5, "{hints:?}");
+    assert_eq!(before_finish, 20, "{hints:?}");
     let events = file.events.lock().unwrap().clone();
     let first_hint = events.iter().position(|e| e.0).unwrap();
     let last_write = events.iter().rposition(|e| !e.0).unwrap();
@@ -1213,8 +1216,8 @@ fn a_long_blob_starts_its_writeback_while_it_is_still_being_written() {
         first_hint < last_write,
         "no hint before the value's last write"
     );
-    // Each megabyte's hint comes before the next megabyte's writes: at most a megabyte and
-    // an extent of written bytes is ever waiting for its hint.
+    // Each chunk's hint comes before the next chunk's writes: at most a chunk and an extent
+    // of written bytes is ever waiting for its hint.
     let (mut written, mut hinted) = (0u64, 0u64);
     for &(is_hint, _, len) in &events {
         match is_hint {
@@ -1222,17 +1225,17 @@ fn a_long_blob_starts_its_writeback_while_it_is_still_being_written() {
             false => written += len,
         }
         assert!(
-            written - hinted <= (1 << 20) + (64 << 10),
+            written - hinted <= (256 << 10) + (64 << 10),
             "{written} {hinted}"
         );
     }
     blobs_read_back(&file, extents, &ptrs, &values);
 }
 
-/// simp724's M2 on D334: a megabyte that lies in extents apart in the file is hinted as the
+/// simp724's M2 on D334: a chunk that lies in extents apart in the file is hinted as the
 /// ranges it really wrote, one per extent, each with the extent's header.
 #[test]
-fn a_blob_megabyte_across_separate_extents_is_hinted_extent_by_extent() {
+fn a_blob_chunk_across_separate_extents_is_hinted_extent_by_extent() {
     let values: Vec<Vec<u8>> = (0..1200u32).map(|i| vec![(i % 249) as u8; 1000]).collect();
     // An extent's worth of gap after each extent.
     let (file, extents, ptrs, _) = hinted_blob(&values, 32);
