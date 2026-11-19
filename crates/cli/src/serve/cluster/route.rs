@@ -126,10 +126,12 @@ impl Routes {
         // mustn't count against a copy's health (cli692's F6). The copies' own gates still
         // refuse a read sent by a node with an older map.
         let moving = |id: &str| {
+            // A NODE move (a whole relocation, D332 PR 2) leaves the copies serving reads.
             map.moves.iter().any(|m| {
-                m.to == id
-                    || (m.from == id
-                        && super::map::phase(m) >= crate::serve::proto::MovePhase::HandedOver)
+                !super::map::node_move(m)
+                    && (m.to == id
+                        || (m.from == id
+                            && super::map::phase(m) >= crate::serve::proto::MovePhase::HandedOver))
             })
         };
         let owners = map

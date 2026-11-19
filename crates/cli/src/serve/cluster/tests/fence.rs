@@ -2846,3 +2846,91 @@ fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
         }
     });
 }
+
+#[test]
+fn a_new_writer_finishes_or_aborts_a_whole_partition_move_its_old_writer_left() {
+    // D332 PR 2 (the coordinator's test): `phdb cluster move p3 --to b` stops at COPYING,
+    // then (a second run) at HANDING_OVER, and a, the writer, is stopped each time, so a new
+    // writer is elected (D330). Its map still holds the NODE record. Through the new
+    // writer, a rerun of the move from COPYING finishes it (a fresh record, the copy and
+    // match again); from HANDING_OVER `--abort` ends it, and p3 serves on c again once
+    // unfenced. p3 stays closed on c throughout, so no failover takes it.
+    use crate::serve::cluster::moving::{STOP, Step};
+    use crate::serve::proto::MovePhase;
+    for (step, finish) in [(Step::Closed, true), (Step::Stamped, false)] {
+        let mut t = failover_rig(true);
+        let [_, b, c] = t.ports;
+        let args = super::super::cli::NodeArgs {
+            node: format!("http://127.0.0.1:{c}"),
+            token_file: None,
+            ca: None,
+        };
+        let record = async |port: u16| {
+            super::super::moving::record_of(&map_of(port).await, "p3")
+                .map(|r| (r.id.clone(), super::super::map::phase(r)))
+        };
+        let at = if finish {
+            MovePhase::Copying
+        } else {
+            MovePhase::HandingOver
+        };
+        let first = t.rt.block_on(async {
+            STOP.lock().unwrap().push((args.node.clone(), step));
+            within(super::super::moving::run(&args, "p3", "b", false, None))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{step:?}: not stopped"));
+            let r = record(c).await.expect("recorded");
+            assert_eq!(r.1, at, "{step:?}");
+            r.0
+        });
+        t.stop(0);
+        t.rt.block_on(async {
+            eventually_within(FAILOVER_WINDOW, "a new writer", async || {
+                let m = map_of(c).await;
+                m.writer != "a" && m.writer_term > 0
+            })
+            .await;
+            assert_eq!(
+                record(c).await.map(|r| r.0),
+                Some(first.clone()),
+                "{step:?}: the elected map keeps the record"
+            );
+            if finish {
+                let r = within(super::super::moving::run(&args, "p3", "b", false, None))
+                    .await
+                    .unwrap_or_else(|e| panic!("{step:?}: the rerun: {}", e.message()));
+                assert_ne!(
+                    r.document["recorded"],
+                    serde_json::json!(first),
+                    "a fresh record"
+                );
+                let m = map_of(c).await;
+                let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+                assert_eq!(p3.node, "b", "{step:?}");
+                assert!(record(c).await.is_none(), "{step:?}: the record went");
+                eventually_within(Duration::from_secs(10), "p3 to serve on b", async || {
+                    state(b, "p3").await == LocalPartitionState::Serving
+                })
+                .await;
+            } else {
+                within(super::super::moving::abort(&args, "p3"))
+                    .await
+                    .unwrap_or_else(|e| panic!("{step:?}: the abort: {}", e.message()));
+                assert!(record(c).await.is_none(), "{step:?}: the record went");
+                client(c)
+                    .await
+                    .unfence(crate::serve::proto::PartitionRequest {
+                        partition: "p3".into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+                    state(c, "p3").await == LocalPartitionState::Serving
+                })
+                .await;
+            }
+        });
+    }
+}

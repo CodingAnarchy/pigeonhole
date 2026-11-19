@@ -20851,6 +20851,9 @@ impl serde::Serialize for RangeMove {
         if self.handed_over_term != 0 {
             len += 1;
         }
+        if self.from_epoch != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RangeMove", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -20900,6 +20903,11 @@ impl serde::Serialize for RangeMove {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("handed_over_term", ToString::to_string(&self.handed_over_term).as_str())?;
         }
+        if self.from_epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("from_epoch", ToString::to_string(&self.from_epoch).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -20926,6 +20934,8 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
             "handedOverVersion",
             "handed_over_term",
             "handedOverTerm",
+            "from_epoch",
+            "fromEpoch",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -20942,6 +20952,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
             FinalSeqno,
             HandedOverVersion,
             HandedOverTerm,
+            FromEpoch,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -20975,6 +20986,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                             "finalSeqno" | "final_seqno" => Ok(GeneratedField::FinalSeqno),
                             "handedOverVersion" | "handed_over_version" => Ok(GeneratedField::HandedOverVersion),
                             "handedOverTerm" | "handed_over_term" => Ok(GeneratedField::HandedOverTerm),
+                            "fromEpoch" | "from_epoch" => Ok(GeneratedField::FromEpoch),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -21006,6 +21018,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                 let mut final_seqno__ = None;
                 let mut handed_over_version__ = None;
                 let mut handed_over_term__ = None;
+                let mut from_epoch__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -21088,6 +21101,14 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::FromEpoch => {
+                            if from_epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fromEpoch"));
+                            }
+                            from_epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(RangeMove {
@@ -21103,6 +21124,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                     final_seqno: final_seqno__.unwrap_or_default(),
                     handed_over_version: handed_over_version__.unwrap_or_default(),
                     handed_over_term: handed_over_term__.unwrap_or_default(),
+                    from_epoch: from_epoch__.unwrap_or_default(),
                 })
             }
         }
