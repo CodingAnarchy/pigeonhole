@@ -1115,14 +1115,12 @@ async fn try_get(port: u16, row: &str) -> Result<(), tonic::Status> {
 
 /// Cuts node `i` of `t` off from its peers (both ways), or joins it again.
 fn cut(t: &Rig, i: usize, off: bool) {
-    let entry = (t.dirs[i].clone(), format!("127.0.0.1:{}", t.ports[i]));
-    let mut cut = super::super::CUT_OFF
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cut.retain(|e| *e != entry);
-    if off {
-        cut.push(entry);
-    }
+    super::super::cut_node(
+        &t.dirs[i],
+        &format!("127.0.0.1:{}", t.ports[i]),
+        &t.dirs,
+        off,
+    );
 }
 
 #[test]

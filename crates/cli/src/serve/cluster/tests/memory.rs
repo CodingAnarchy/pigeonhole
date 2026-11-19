@@ -1300,21 +1300,15 @@ mod on_mcp {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (_stops, _dbs, [a, b, _c], dirs) =
             three_nodes_with(&rt, "", &crate::serve::server_tests::limits());
-        let entry = (dirs[1].clone(), format!("127.0.0.1:{b}"));
-        super::super::super::CUT_OFF
-            .lock()
-            .unwrap()
-            .push(entry.clone());
+        let b_at = format!("127.0.0.1:{b}");
+        super::super::super::cut_node(&dirs[1], &b_at, &dirs, true);
         let (e, err) = tool(
             a,
             None,
             "memory_recall",
             json!({"namespaces": ["alice", "zed"], "text": "lunch"}),
         );
-        super::super::super::CUT_OFF
-            .lock()
-            .unwrap()
-            .retain(|x| *x != entry);
+        super::super::super::cut_node(&dirs[1], &b_at, &dirs, false);
         assert!(err, "{e}");
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
         assert!(e.to_string().contains("p2"), "{e}");

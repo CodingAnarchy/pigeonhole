@@ -152,14 +152,12 @@ impl Three {
     /// Cuts node `i` off from its peers both ways (its lease rounds and pushes), or joins it
     /// again; its clients still reach it.
     fn cut(&self, i: usize, off: bool) {
-        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
-        let mut cut = super::super::CUT_OFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cut.retain(|e| *e != entry);
-        if off {
-            cut.push(entry);
-        }
+        super::super::cut_node(
+            &self.dirs[i],
+            &format!("127.0.0.1:{}", self.ports[i]),
+            &self.dirs,
+            off,
+        );
     }
 }
 
