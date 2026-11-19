@@ -1184,3 +1184,88 @@ fn a_flagged_range_drop_event_is_refused() {
     drop((feed, t));
     db.close().unwrap();
 }
+
+/// D331 PR 4a (perf2's conditions 2 and 3): a crash at any step of a range drop leaves the
+/// range whole or gone, never partly, with the rows outside it untouched, and the drop run
+/// again (the caller's rule) finishes it. The crash comes after the drop's `k`th mutating
+/// operation, for every `k` until the drop completes first: after its splits, after the
+/// record reached some streams or all, before and after its manifest commit, with power and
+/// process crashes in turn. Each reopen then takes a write at a lower seqno than nothing
+/// (a commit), the drop again, and a write of the range at an older timestamp, visible.
+#[test]
+fn a_range_drop_cut_by_a_crash_finishes_when_run_again() {
+    let outside = ["r0=v0", "r1=v1", "r2=v2", "r7=v7", "r8=v8", "r9=v9"];
+    let whole = [
+        "r0=v0", "r1=v1", "r2=v2", "r3=v3", "r4=v4", "r5=v5", "r6=v6", "r7=v7", "r8=v8", "r9=v9",
+    ];
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("a", Family::default())
+            .create_if_missing()
+            .unwrap()
+    };
+    let mut finished = false;
+    let mut k = 1u64;
+    while !finished {
+        assert!(k < 500, "the drop never finished before its crash point");
+        let vfs = SimVfs::new(1000 + k);
+        let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+        let t = make(&db);
+        for i in 0..10u8 {
+            t.mutate(&[b'r', b'0' + i])
+                .put_at("a", b"q", 100, format!("v{i}").as_bytes())
+                .commit()
+                .unwrap();
+            if i == 4 {
+                db.flush().unwrap();
+            }
+        }
+        let mut plan = FaultPlan::none();
+        plan.crash_after_ops = Some(vfs.mutating_ops() + k);
+        vfs.set_faults(plan);
+        finished = db.drop_range(&t, b"r3", Some(b"r7")).is_ok();
+        vfs.set_faults(FaultPlan::none());
+        vfs.crash(if k % 2 == 0 {
+            CrashKind::Power
+        } else {
+            CrashKind::Process
+        });
+        drop(t);
+        drop(db);
+
+        let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let rows = rows_of(&t, None);
+        assert!(
+            rows == whole || rows == outside,
+            "k {k}: a crashed drop left the range partly: {rows:?}"
+        );
+        assert!(
+            !finished || rows == outside,
+            "k {k}: a drop that returned came back after a crash: {rows:?}"
+        );
+        t.mutate(b"r0")
+            .put_at("a", b"q", 100, b"v0")
+            .commit()
+            .unwrap();
+        db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+        assert_eq!(rows_of(&t, None), outside, "k {k}: run again");
+        t.mutate(b"r4")
+            .put_at("a", b"q", 50, b"old")
+            .commit()
+            .unwrap();
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let mut expect = outside.to_vec();
+        expect.insert(3, "r4=old");
+        assert_eq!(rows_of(&t, None), expect, "k {k}: after the re-run");
+        drop(t);
+        db.close().unwrap();
+        k += 1;
+    }
+    // The sweep crossed the drop's steps: its splits, a record per stream (2 here) and
+    // its manifest commit each took at least one mutating operation.
+    assert!(k > 4, "the drop finished at its {}th operation", k - 1);
+    eprintln!("the drop finished at operation {}", k - 1);
+}
