@@ -668,6 +668,10 @@ fn derive(
         })
     };
     for m in &map.moves {
+        // A NODE move (D332 PR 2) gates no range: the partition's own state does.
+        if map::node_move(m) {
+            continue;
+        }
         let phase = map::phase(m);
         if m.from == partition {
             match phase {
@@ -833,13 +837,18 @@ pub(crate) fn statuses(map: &ClusterMap, partition: &str) -> Vec<MoveStatus> {
         .map(|m| {
             let phase = map::phase(m);
             let source = m.from == partition;
+            // A NODE move (D332 PR 2) fences no range: the partition is closed on its node
+            // while it copies, and serves on the target from CLEANING.
+            let node = map::node_move(m);
             MoveStatus {
                 id: m.id.clone(),
                 table: m.table.clone(),
                 phase: m.phase,
                 source,
-                fenced: source && phase == MovePhase::HandingOver,
-                serving: if source {
+                fenced: !node && source && phase == MovePhase::HandingOver,
+                serving: if node {
+                    phase >= MovePhase::Cleaning
+                } else if source {
                     phase < MovePhase::HandedOver
                 } else {
                     phase >= MovePhase::Cleaning

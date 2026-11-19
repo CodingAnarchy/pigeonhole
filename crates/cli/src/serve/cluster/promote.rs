@@ -545,6 +545,14 @@ pub(crate) async fn run(
         )));
     }
     m2.map_version += 1;
+    // A whole-partition move of P not yet at its commit point stops here (D332 PR 2,
+    // simp724's M2): this map gives P another node and epoch, so its copy on the target is
+    // stale. Its record goes in the same map.
+    m2.moves.retain(|r| {
+        !(super::map::node_move(r)
+            && r.from == partition
+            && super::map::phase(r) < proto::MovePhase::HandedOver)
+    });
     for q in m2.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
         q.epoch = target;

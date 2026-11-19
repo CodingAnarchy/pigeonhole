@@ -7250,6 +7250,11 @@ pub struct RangeMove {
     pub handed_over_version: u64,
     #[prost(uint64, tag = "12")]
     pub handed_over_term: u64,
+    /// The source partition's epoch when the move entered COPYING (D332 PR 2, #1485). A NODE
+    /// move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
+    /// promoted it mid-move). 0 on a record from before this field.
+    #[prost(uint64, tag = "13")]
+    pub from_epoch: u64,
 }
 /// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -8401,7 +8406,7 @@ pub enum MoveKind {
     /// `phdb cluster split`: to a partition the split added.
     Partition = 2,
     /// D332: a whole partition relocated to another node (no table or range; `to` names the
-    /// node). Validated by D332's balancer PR; refused until then.
+    /// node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
     ///
     /// PR 6 (merge) adds MOVE_KIND_MERGE = 4.
     Node = 3,
