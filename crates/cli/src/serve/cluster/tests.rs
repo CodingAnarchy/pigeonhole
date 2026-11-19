@@ -140,6 +140,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         failover: false,
         failover_rejoin: false,
         failovers: Vec::new(),
+        moves: Vec::new(),
     }
 }
 
@@ -4233,6 +4234,7 @@ fn split_nodes(
         failover: false,
         failover_rejoin: false,
         failovers: Vec::new(),
+        moves: Vec::new(),
     };
     let mut stops = Vec::new();
     let mut dbs = Vec::new();
@@ -5003,6 +5005,7 @@ mod memory;
 mod metrics;
 mod moving;
 mod open;
+mod range_moves;
 mod replicas;
 mod restore;
 mod several;

@@ -570,6 +570,29 @@ pub(crate) struct Replica {
     /// copy and its batches), so another copy wouldn't fix it: the loop retries instead of
     /// downloading the database again (cli692's S1 on #1878).
     unconfirmed: AtomicBool,
+    /// A cluster replica copy's range gate (D331 PR 3): the ranges a move gates on the
+    /// partition it copies, from the node's map and the rows its file holds. Never set on a
+    /// single node's replica.
+    ranges: super::ranges::RangeGate,
+}
+
+/// A copy's range rows and its file's visible seqno ([`Replica::arm_ranges`]).
+type RangeRows = (Vec<super::ranges::Moved>, Vec<super::ranges::Moved>, u64);
+
+/// The range rows in `db` (D331 PR 3). **Blocking.**
+fn range_rows(db: &Pigeonhole) -> Result<RangeRows, String> {
+    let rows = (
+        super::ranges::read_moved(db)?,
+        super::ranges::read_serving(db)?,
+        db.visible_seqno(),
+    );
+    #[cfg(test)]
+    ARMED.lock().unwrap_or_else(PoisonError::into_inner).push((
+        db.path().to_path_buf(),
+        rows.0.len(),
+        rows.1.len(),
+    ));
+    Ok(rows)
 }
 
 /// The fault seam: in the tests, a promote of the database at this path fails after the
@@ -588,6 +611,12 @@ pub(crate) static HOLD_APPLIES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// one that bootstrapped again (D328).
 #[cfg(test)]
 pub(crate) static BOOTSTRAPS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Each replica copy's range rows as its gate last read them (D331 PR 3): its file's path
+/// and how many moved-away and serving rows it held, so a test can tell the rows reached a
+/// copy through its follower.
+#[cfg(test)]
+pub(crate) static ARMED: Mutex<Vec<(PathBuf, usize, usize)>> = Mutex::new(Vec::new());
 
 /// `Admin.Promote`'s answer before the first bootstrap has finished.
 fn not_bootstrapped() -> ApiError {
@@ -662,6 +691,7 @@ impl Replica {
             promoted: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
             unconfirmed: AtomicBool::new(false),
+            ranges: super::ranges::RangeGate::default(),
             stop: watch::channel(false).0,
             wake: tokio::sync::Notify::new(),
             task: Mutex::new(None),
@@ -874,6 +904,37 @@ impl Replica {
             self.partition().unwrap_or_default(),
             s.state.as_str()
         )))
+    }
+
+    /// The copy's range gate (D331 PR 3).
+    pub(crate) fn ranges(&self) -> &super::ranges::RangeGate {
+        &self.ranges
+    }
+
+    /// Derives the copy's range gate again from the node's map and the rows in `db`, the
+    /// copy's file: at its open, at each map install, and after a run it applied while the
+    /// gate waited for a row. **Blocking.**
+    pub(crate) fn arm_ranges(&self, db: &Pigeonhole) -> Result<(), String> {
+        self.take_rows(range_rows(db)?);
+        Ok(())
+    }
+
+    /// [`arm_ranges`](Self::arm_ranges) with the rows read: the moved-away and serving rows
+    /// and the file's visible seqno.
+    fn take_rows(&self, (moved, serving, visible): RangeRows) {
+        let Upstream::Owner { node, partition } = &self.upstream else {
+            return;
+        };
+        let Some(node) = node.upgrade() else {
+            return;
+        };
+        // An older read than the one loaded already changes nothing (simp724's N1).
+        if !self.ranges.load_rows_at(moved, serving, visible) {
+            return;
+        }
+        if let Ok(map) = node.get_map() {
+            self.ranges.update(&map, partition, visible);
+        }
     }
 
     /// The owner's seqno this copy has applied through, for [`SERVED_SEQNO`].
@@ -1381,6 +1442,7 @@ impl Replica {
         let events = std::mem::take(&mut run.events);
         run.bytes = 0;
         let db = db.clone();
+        let rearm = self.ranges.pending().then(|| db.clone());
         tokio::task::spawn_blocking(move || {
             let token = events.last().map(|e| e.token().clone());
             match token {
@@ -1392,6 +1454,19 @@ impl Replica {
         .map_err(|e| Halt::Failed(format!("applying a run: {e}")))?
         .map_err(|e| applying("applying a run", &e))?;
         self.set_applied(applied);
+        // D331 PR 3: a gate waiting for a row (a target's serving row, a source's moved-away
+        // one) looks again once the run that may have brought it is in.
+        if let Some(db) = rearm {
+            let rows = tokio::task::spawn_blocking(move || range_rows(&db))
+                .await
+                .map_err(|e| Halt::Failed(format!("re-arming the range gate: {e}")))?;
+            match rows {
+                Ok(rows) => self.take_rows(rows),
+                Err(e) => {
+                    eprintln!("phdb serve: a replica copy's range gate: {e}; it keeps the last");
+                }
+            }
+        }
         Ok(())
     }
 

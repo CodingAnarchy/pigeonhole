@@ -388,7 +388,14 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
         } else {
             identity::restore(&db, &id, &req.restore_from_cluster_id)
         }
-        .map_err(ApiError::internal)
+        .map_err(ApiError::internal)?;
+        // D331 PR 3: a restored file is clipped to its map's ranges when it opens, before it
+        // serves (a cluster backup has no common point, so a moved range's rows may be in two
+        // partitions' copies).
+        if req.restore {
+            crate::serve::ranges::mark_clip(&db).map_err(ApiError::internal)?;
+        }
+        Ok(())
     })();
     let closed = db.close();
     stamped?;

@@ -698,10 +698,11 @@ impl Node {
             pinning: opened.pinning,
             engine_memory: Some(opened.memory),
         };
-        let service = shared
-            .router
-            .service
-            .for_partition(opened.db.clone(), id, gate, config);
+        let service =
+            shared
+                .router
+                .service
+                .for_partition(opened.db.clone(), id, Arc::clone(&gate), config);
         // A text index rebuild stopped here or before a move carries on once it takes writes
         // (#1756).
         service.resume_text_rebuilds();
@@ -713,7 +714,23 @@ impl Node {
         let mut parts = (*cluster.parts.load_full()).clone();
         parts.insert(std::mem::take(&mut opened.id), Arc::new(service));
         remask_off_async(&server.placement, &parts, format!("partition {id} opened")).await;
-        cluster.parts.store(Arc::new(parts));
+        // D331: its range gate, from its file's moved-away rows and the map, then it joins
+        // the node's parts, both under the install lock (simp724's S1): an install either
+        // ran before (its map is the one armed) or runs after (it sees the partition).
+        {
+            let (node, db, id, slot) = (
+                Arc::clone(self),
+                opened.db.clone(),
+                id.to_owned(),
+                Arc::clone(&cluster.parts),
+            );
+            let parts = Arc::new(parts);
+            tokio::task::spawn_blocking(move || {
+                node.arm_ranges(&gate, &id, &db, || slot.store(parts))
+            })
+            .await?
+            .map_err(|e| ApiError::internal(format!("partition's range gate: {e}")))?;
+        }
         // Opened: the shrinks stand, and any cache the re-split grew grows now (#1761).
         shrunk.keep();
         Resized::grow(&resplit, &format!("partition {id} opened")).await;
@@ -783,7 +800,27 @@ impl Node {
                 follower: Arc::clone(&follower),
             },
         );
-        cluster.replicas.store(Arc::new(copies));
+        // D331 PR 3: its range gate, from its file's rows and the map, then it joins the
+        // node's copies, under the install lock, as an owner's open does (simp724's S1).
+        {
+            let (node, follower, db, slot) = (
+                Arc::clone(self),
+                Arc::clone(&follower),
+                opened.db.clone(),
+                Arc::clone(&cluster.replicas),
+            );
+            tokio::task::spawn_blocking(move || {
+                let _one = node
+                    .installing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                follower.arm_ranges(&db)?;
+                slot.store(Arc::new(copies));
+                Ok::<_, String>(())
+            })
+            .await?
+            .map_err(|e| ApiError::internal(format!("the replica copy's range gate: {e}")))?;
+        }
         shrunk.keep();
         Resized::grow(resplit, &format!("replica of {id} opened")).await;
         follower.spawn_on(service, shared.limits.stream_idle);

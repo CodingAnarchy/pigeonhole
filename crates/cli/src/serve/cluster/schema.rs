@@ -142,10 +142,33 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
             return o;
         }
     };
+    // D331: a table is a partition's too while a range move names it as the move's source
+    // or target (the target makes it at COPYING, before the map gives it a range: design
+    // §3's plan), and while the file records a range of it moved away (the source serves it
+    // to a cluster feed up to the move's last seqno, PR 3b, and its cleanup is PR 5's):
+    // never dropped from under either.
+    // A failed read keeps every table this time (simp724's and cli692's R1): taken as no
+    // rows, it would drop exactly the table this protects. The next install tries again.
+    let (moved_away, drops) = match crate::serve::ranges::read_moved(db) {
+        Ok(rows) => (rows, true),
+        Err(e) => {
+            o.errors.push(format!(
+                "read the moved-away ranges, so no table is dropped this time: {e}"
+            ));
+            (Vec::new(), false)
+        }
+    };
     let placed: BTreeMap<&str, &TablePlacement> = map
         .tables
         .iter()
-        .filter(|t| t.partitions.iter().any(|p| p == partition))
+        .filter(|t| {
+            t.partitions.iter().any(|p| p == partition)
+                || map
+                    .moves
+                    .iter()
+                    .any(|m| m.table == t.name && (m.from == partition || m.to == partition))
+                || moved_away.iter().any(|m| m.table == t.name)
+        })
         .map(|t| (t.name.as_str(), t))
         .collect();
     // The indexes placed here (#1722): by the table each follows, or by their own ranges.
@@ -165,6 +188,7 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
     };
     let gone: Vec<String> = recorded
         .iter()
+        .filter(|_| drops)
         .filter(|(name, created)| created_here(name).is_none_or(|c| c != **created))
         .map(|(name, _)| name.clone())
         .collect();
@@ -1146,6 +1170,52 @@ mod tests {
             .collect();
         t.sort();
         t
+    }
+
+    /// D331: a table a move took from the partition stays while the file records a range of
+    /// it moved away, and a failed read of those rows drops nothing (simp724's and cli692's
+    /// R1 on PR 2), reported, for the next install to try again.
+    #[test]
+    fn a_moved_tables_row_keeps_it_and_a_failed_read_drops_nothing() {
+        let db = db();
+        reconcile(&db, "p1", &map(2, &[("orders", 2, &["f"], "p1")]));
+        crate::serve::ranges::write_moved(
+            &db,
+            &crate::serve::ranges::Moved {
+                id: "mv1".into(),
+                table: "orders".into(),
+                start: Vec::new(),
+                end: None,
+                term: 0,
+                version: 3,
+                seqno: 1,
+                at_ms: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The map now places orders on p2 alone: the row keeps it here.
+        let o = reconcile(&db, "p1", &map(3, &[("orders", 2, &["f"], "p2")]));
+        assert!(o.dropped.is_empty() && o.errors.is_empty(), "{o:?}");
+        assert!(tables(&db).contains(&"orders".to_owned()));
+        // A malformed row (its seqno gone): the read fails, and nothing is dropped.
+        let t = db
+            .table(crate::serve::cluster::identity::TABLE)
+            .unwrap()
+            .open()
+            .unwrap();
+        t.mutate(b"moved/mv1")
+            .delete_column("moved", b"seqno")
+            .commit()
+            .unwrap();
+        drop(t);
+        let o = reconcile(&db, "p1", &map(4, &[("orders", 2, &["f"], "p2")]));
+        assert!(o.dropped.is_empty(), "{o:?}");
+        assert!(
+            o.errors.iter().any(|e| e.contains("no table is dropped")),
+            "{o:?}"
+        );
+        assert!(tables(&db).contains(&"orders".to_owned()));
     }
 
     #[test]

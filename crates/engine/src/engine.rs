@@ -2212,7 +2212,8 @@ impl Engine {
     }
 
     /// Opens a read-only handle in another process (Phase 4): attaches to the live region,
-    /// claims a reader slot, loads the manifest named in the region header.
+    /// claims a reader slot, loads the manifest named in the region header, under a pin of
+    /// that slot (#2085). [`Error::Busy`] if the writer restarted while it loaded: open again.
     ///
     /// The handle is read-only, but the process opens the database file **read-write**
     /// (decision D36): the shm-init and last-one-out presence locks are exclusive byte-range
@@ -2242,10 +2243,35 @@ impl Engine {
         let shards = shm.shard_count() as usize;
         let opened_in = pigeonhole_io::sys::process_id();
         let slot = claim_slot(&shm, vfs.current_process(), &file, opened_in)?;
-        let (catalog, _) = manifest::load(&opened, shards, Arc::clone(&registry))?;
-        let manifest_version = opened.root().manifest_version;
-        let manifest_file = opened.file().clone();
-        let pager = Arc::new(opened.finish([])?);
+        let pins = crate::snapshot::ReaderPins::new(slot);
+        // The manifest is read under a pin, as a snapshot reads one (#2085): the root
+        // `Pager::open` read named extents a writer committing since could already have
+        // retired, freed and written over. Pinned first, the root read again is at or above
+        // the pinned view's manifest version, so the writer keeps its extents until the
+        // release below.
+        let (_, key) = pins.take(&shm, false);
+        let loaded = (|| -> Result<_> {
+            let pager = Arc::new(opened.finish([])?);
+            pager.reload_root()?;
+            let root = pager.root();
+            #[cfg(feature = "test-hooks")]
+            hooks::run_reader_open(&vfs);
+            let (catalog, _) = manifest::load_root(
+                pager.file(),
+                &root,
+                pager.features().incompat,
+                shards,
+                Arc::clone(&registry),
+            )?;
+            Ok((pager, catalog, root.manifest_version))
+        })();
+        pins.release(key);
+        // A writer that restarted meanwhile (a new region generation) doesn't see this
+        // generation's pin and may have reused the extents anyway: retryable, as a reader
+        // snapshot that finds its writer gone re-attaches, never `Corruption` (#2085).
+        let (pager, catalog, manifest_version) =
+            loaded.map_err(|e| if shm.is_stale() { Error::Busy } else { e })?;
+        let manifest_file = pager.file().clone();
         open_data_file(&vfs, path, &pager, options.direct_io, false)?;
         let cache = block_cache(options.block_cache_bytes, shards);
         // The read-only pager is kept by the manifest writer (which never commits here).
@@ -2269,7 +2295,7 @@ impl Engine {
             shm: Mutex::new(Attachment {
                 row_cache: reader_row_cache(&options, &shm),
                 shm,
-                pins: crate::snapshot::ReaderPins::new(slot),
+                pins,
             }),
             catalog: Mutex::new((manifest_version, Arc::new(catalog), manifest_file)),
             view: Mutex::new(None),

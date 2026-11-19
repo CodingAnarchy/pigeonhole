@@ -1719,7 +1719,7 @@ pub struct FeedEvent {
     /// On a cluster subscription, the partition the event came from; empty on a single node.
     #[prost(string, tag = "5")]
     pub partition: ::prost::alloc::string::String,
-    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6")]
+    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
 /// Nested message and enum types in `FeedEvent`.
@@ -1735,7 +1735,26 @@ pub mod feed_event {
         /// A cluster subscription's partition became unavailable or available again.
         #[prost(message, tag = "6")]
         PartitionState(super::PartitionState),
+        /// D331: internal to a cluster subscription, never sent to a client. A move's target
+        /// emits it in its component just before the first event past the move's hand-over:
+        /// the entry node's merge holds the component there until the source's has passed the
+        /// move's last seqno (per-key order across the hand-over). 7 is D329's.
+        #[prost(message, tag = "8")]
+        MoveBarrier(super::MoveBarrier),
     }
+}
+/// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveBarrier {
+    #[prost(string, tag = "1")]
+    pub move_id: ::prost::alloc::string::String,
+    /// The move's source partition.
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    /// The source's last seqno of the range: the target's component waits until the source's
+    /// has passed it.
+    #[prost(uint64, tag = "3")]
+    pub final_seqno: u64,
 }
 /// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
 /// which keeps the stream open; sent at the start for each partition unavailable then, and
@@ -7036,6 +7055,70 @@ pub struct ClusterMap {
     /// that drops or alters a pending one is refused.
     #[prost(message, repeated, tag = "13")]
     pub failovers: ::prost::alloc::vec::Vec<FailoverEvent>,
+    /// D331: the range moves in flight, each a table's key range going from one partition to
+    /// another through `MovePhase`s. The map's writer advances them; every node derives its
+    /// partitions' range gates from them. A partition is in at most one at a time, as source
+    /// or target. Set only once every node keeps them (`map_features`: `range_moves`).
+    #[prost(message, repeated, tag = "14")]
+    pub moves: ::prost::alloc::vec::Vec<RangeMove>,
+}
+/// D331: one range move, `[start, end)` of `table` from partition `from` to partition `to`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RangeMove {
+    /// The move's id: 1-64 of `\[a-z0-9_-\]`, unique among `moves`.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MoveKind", tag = "2")]
+    pub kind: i32,
+    #[prost(string, tag = "3")]
+    pub table: ::prost::alloc::string::String,
+    /// The range's first key; absent: the table's first key.
+    #[prost(message, optional, tag = "4")]
+    pub start: ::core::option::Option<SplitKey>,
+    /// The key after the range; absent: to the table's end.
+    #[prost(message, optional, tag = "5")]
+    pub end: ::core::option::Option<SplitKey>,
+    /// The source partition, S.
+    #[prost(string, tag = "6")]
+    pub from: ::prost::alloc::string::String,
+    /// The target partition, T (for a split, the partition the split added).
+    #[prost(string, tag = "7")]
+    pub to: ::prost::alloc::string::String,
+    #[prost(enumeration = "MovePhase", tag = "8")]
+    pub phase: i32,
+    /// S's seqno the copy was taken at, once T reported the copy done; 0 before.
+    #[prost(uint64, tag = "9")]
+    pub snapshot_seqno: u64,
+    /// S's visible seqno once its range fence drained (from HANDING_OVER): every write to the
+    /// range S took is at or below it. 0 until S reports it.
+    #[prost(uint64, tag = "10")]
+    pub final_seqno: u64,
+    /// The `(writer_term, map_version)` of the map that gave the range to T, set in that map
+    /// itself (from HANDED_OVER): a node holding it, or any map ordered after it, is past the
+    /// move's commit point.
+    #[prost(uint64, tag = "11")]
+    pub handed_over_version: u64,
+    #[prost(uint64, tag = "12")]
+    pub handed_over_term: u64,
+}
+/// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveStatus {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(enumeration = "MovePhase", tag = "3")]
+    pub phase: i32,
+    /// This partition is the move's source (else its target).
+    #[prost(bool, tag = "4")]
+    pub source: bool,
+    /// The source fences the range's writes.
+    #[prost(bool, tag = "5")]
+    pub fenced: bool,
+    /// The partition serves the range here.
+    #[prost(bool, tag = "6")]
+    pub serving: bool,
 }
 /// D330: one failover of a partition to a replica, or one writer election, as the writer
 /// that made it recorded it in the map.
@@ -7401,6 +7484,13 @@ pub struct LocalPartition {
     /// For a replica copy: where its follower is.
     #[prost(enumeration = "ReplicaState", tag = "20")]
     pub replica_state: i32,
+    /// D331: the range moves naming this partition, as source or target.
+    #[prost(message, repeated, tag = "27")]
+    pub moves: ::prost::alloc::vec::Vec<MoveStatus>,
+    /// D331: for a move's target, its range follower's lag behind the source, in milliseconds
+    /// (0 when it has none).
+    #[prost(uint64, tag = "28")]
+    pub move_follower_lag_ms: u64,
     /// D332: the partition's load on this node, for the cluster balancer, each an exponential
     /// average over `--balance-window` (each 30 s reading weighing `1 − e^(−30/window)`). 0 for a
     /// replica copy, and until the first interval ends.
@@ -7866,6 +7956,12 @@ pub struct ForwardSubscribeRequest {
     /// most 64 of them; 0: none.
     #[prost(uint64, tag = "5")]
     pub skip_through: u64,
+    /// D331: start the component at this partition's hand-over position for the request's
+    /// tables (the earliest of its serving rows' tokens), not `request`'s start: a cluster
+    /// resume whose token lacks this partition because a range move gave it the tables since.
+    /// `FeedExpired` if no move did, or its feed has trimmed past that position.
+    #[prost(bool, tag = "6")]
+    pub from_hand_over: bool,
 }
 /// D326: a node's lease round asks each node of its map, itself included, for a grant.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8045,6 +8141,11 @@ pub enum FenceReason {
     /// The partition's lease ran out on this node (D326): its renewals stopped reaching a
     /// majority of the map's nodes, so it stopped serving until a renewal does.
     LeaseLapsed = 3,
+    /// A range of the partition is being handed over to another partition (D331): writes
+    /// touching it answer `Fenced` until the move's map gives it to the target, then
+    /// `WrongPartition`. The partition's other keys take writes; this is reported only in
+    /// `MoveStatus.fenced`, never as the partition's `fence_reason`. Retry-safe.
+    RangeMoving = 4,
 }
 impl FenceReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -8057,6 +8158,7 @@ impl FenceReason {
             Self::Operator => "FENCE_REASON_OPERATOR",
             Self::AwaitingPeerMap => "FENCE_REASON_AWAITING_PEER_MAP",
             Self::LeaseLapsed => "FENCE_REASON_LEASE_LAPSED",
+            Self::RangeMoving => "FENCE_REASON_RANGE_MOVING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -8066,6 +8168,97 @@ impl FenceReason {
             "FENCE_REASON_OPERATOR" => Some(Self::Operator),
             "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
             "FENCE_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
+            "FENCE_REASON_RANGE_MOVING" => Some(Self::RangeMoving),
+            _ => None,
+        }
+    }
+}
+/// D331: what a range move is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MoveKind {
+    Unspecified = 0,
+    /// `phdb cluster move-range`: to an existing partition.
+    Range = 1,
+    /// `phdb cluster split`: to a partition the split added.
+    Partition = 2,
+    /// D332: a whole partition relocated to another node (no table or range; `to` names the
+    /// node). Validated by D332's balancer PR; refused until then.
+    ///
+    /// PR 6 (merge) adds MOVE_KIND_MERGE = 4.
+    Node = 3,
+}
+impl MoveKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MOVE_KIND_UNSPECIFIED",
+            Self::Range => "MOVE_KIND_RANGE",
+            Self::Partition => "MOVE_KIND_PARTITION",
+            Self::Node => "MOVE_KIND_NODE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MOVE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MOVE_KIND_RANGE" => Some(Self::Range),
+            "MOVE_KIND_PARTITION" => Some(Self::Partition),
+            "MOVE_KIND_NODE" => Some(Self::Node),
+            _ => None,
+        }
+    }
+}
+/// D331: where a range move is. A move goes forward one phase per map; before HANDED_OVER it
+/// may be removed (an abort), and from CLEANING it is removed once S's copy is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MovePhase {
+    Unspecified = 0,
+    /// T copies the range from S's snapshots. S serves it; T answers it `PartitionUnavailable`.
+    Copying = 1,
+    /// T follows S's feed for the range.
+    CatchingUp = 2,
+    /// S fences the range's writes (`Fenced`, RANGE_MOVING) and drains them; reads go on.
+    HandingOver = 3,
+    /// The commit point: the map gives the range to T and raises S's epoch. S answers the
+    /// range `WrongPartition`; T still answers it `PartitionUnavailable` until CLEANING.
+    HandedOver = 4,
+    /// T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
+    /// ended); S deletes its copy.
+    ///
+    /// PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
+    /// the merged-away source waits for its transaction outcomes before it's dropped. The
+    /// phases stay in order, so "from HANDED_OVER on" includes it.
+    Cleaning = 5,
+}
+impl MovePhase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MOVE_PHASE_UNSPECIFIED",
+            Self::Copying => "MOVE_PHASE_COPYING",
+            Self::CatchingUp => "MOVE_PHASE_CATCHING_UP",
+            Self::HandingOver => "MOVE_PHASE_HANDING_OVER",
+            Self::HandedOver => "MOVE_PHASE_HANDED_OVER",
+            Self::Cleaning => "MOVE_PHASE_CLEANING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MOVE_PHASE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MOVE_PHASE_COPYING" => Some(Self::Copying),
+            "MOVE_PHASE_CATCHING_UP" => Some(Self::CatchingUp),
+            "MOVE_PHASE_HANDING_OVER" => Some(Self::HandingOver),
+            "MOVE_PHASE_HANDED_OVER" => Some(Self::HandedOver),
+            "MOVE_PHASE_CLEANING" => Some(Self::Cleaning),
             _ => None,
         }
     }

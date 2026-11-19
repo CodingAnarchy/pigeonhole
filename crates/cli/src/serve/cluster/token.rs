@@ -31,6 +31,11 @@ const COMPACT: u8 = 1;
 const NOW: u8 = 2;
 /// A component with no position yet, which starts at its oldest commit.
 const OLDEST: u8 = 3;
+/// A component with no position yet, which starts at its partition's hand-over position for
+/// the subscription's tables (D331 PR 3b: a resume that gained it through a range move). A
+/// map carries moves only once every node reports `range_moves`, so every node that could
+/// read such a token knows the form.
+const HAND_OVER: u8 = 4;
 
 /// Where a component is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,37 @@ pub(crate) enum At {
     Oldest,
     /// The partition's own feed token, as its node gave it.
     Token(Bytes),
+    /// Nothing delivered yet, from the partition's hand-over position for the
+    /// subscription's tables (D331 PR 3b): a component a resume gained through a range move,
+    /// opened with `ForwardSubscribeRequest.from_hand_over`.
+    HandOver,
+}
+
+impl At {
+    /// Its seqno, as a D310 token's ([`token_seqno`]): `None` for `Now`, `Oldest` or bytes
+    /// that aren't a D310 token.
+    pub(crate) fn seqno(&self) -> Option<u64> {
+        match self {
+            At::Token(t) => token_seqno(t),
+            _ => None,
+        }
+    }
+}
+
+/// A D310 feed token's last seqno delivered or passed over, from its fixed header (the
+/// engine's `FeedReader::token`: a version byte 1 to 3, the database id, the stream count,
+/// then that seqno): the one place serve reads it (cli692's F3, feed1248's N1). `None` for
+/// bytes that aren't a D310 token.
+pub(crate) fn token_seqno(t: &[u8]) -> Option<u64> {
+    /// The header's versions: a feed of some tables, of every table, of every table with
+    /// its catalog.
+    const VERSIONS: std::ops::RangeInclusive<u8> = 1..=3;
+    /// After the version (1), the database id (16) and the stream count (4).
+    const SEQNO: std::ops::Range<usize> = 21..29;
+    if t.len() < SEQNO.end || !VERSIONS.contains(&t[0]) {
+        return None;
+    }
+    Some(u64::from_le_bytes(t[SEQNO].try_into().ok()?))
 }
 
 /// One partition's part of a cluster subscription.
@@ -85,6 +121,7 @@ impl ClusterToken {
                 COMPACT => At::Token(Bytes::from(expand(take_bytes(buf)?)?)),
                 NOW => At::Now,
                 OLDEST => At::Oldest,
+                HAND_OVER => At::HandOver,
                 f => return Err(format!("a component of unknown form {f}")),
             };
             components.push(Component {
@@ -247,6 +284,11 @@ impl TokenCache {
             self.prefix.clear();
             put_prefix(cluster_id, map_version, subscription, n, &mut self.prefix);
             self.prefix_for = Some(map_version);
+            // A cached component is matched by place, not by partition: when the parts change
+            // (D331 PR 3b retires one), every place may hold another partition now.
+            if self.parts.len() != n {
+                self.parts.clear();
+            }
             self.parts.resize_with(n, Default::default);
         }
         out.extend_from_slice(&self.prefix);
@@ -286,6 +328,7 @@ fn put_component(partition: &str, epoch: u64, at: &At, out: &mut Vec<u8>, scratc
     match at {
         At::Now => out.push(NOW),
         At::Oldest => out.push(OLDEST),
+        At::HandOver => out.push(HAND_OVER),
         At::Token(token) => {
             // Compacted straight into `out` behind a one-byte length, patched after: a
             // compacted token is under 128 bytes at any likely stream count, so the copy
@@ -732,5 +775,45 @@ mod tests {
         assert_ne!(h(&["a", "b"], b"", false), h(&["ab"], b"", false));
         assert_ne!(h(&["a"], b"", false), h(&["a"], b"", true));
         assert_ne!(h(&["a"], b"x", false), h(&["a"], b"", false));
+    }
+
+    /// The accessor reads a real D310 token's seqno, of a feed of some tables and of every
+    /// table, and refuses bytes that aren't one.
+    #[test]
+    fn token_seqno_reads_a_d310_tokens_seqno() {
+        use pigeonhole::{Family, Options, Pigeonhole};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(
+            dir.join("t.phdb"),
+            Options::default()
+                .shards(1)
+                .change_feed(pigeonhole::FeedRetention::bytes(1 << 30)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let mut some = t.feed().open().unwrap();
+        let mut all = db.feed().open().unwrap();
+        let c = t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
+        let next = |f: &mut pigeonhole::Feed| {
+            f.next(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .seqno()
+        };
+        assert_eq!(next(&mut some), c.seqno);
+        assert_eq!(token_seqno(some.token().as_bytes()), Some(c.seqno));
+        while next(&mut all) < c.seqno {}
+        assert_eq!(token_seqno(all.token().as_bytes()), Some(c.seqno));
+        assert_eq!(token_seqno(b"short"), None);
+        let mut bad = some.token().as_bytes().to_vec();
+        bad[0] = 9;
+        assert_eq!(token_seqno(&bad), None);
+        assert_eq!(At::Now.seqno(), None);
+        let _ = db.close();
     }
 }
