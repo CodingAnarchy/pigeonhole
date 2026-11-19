@@ -1226,7 +1226,7 @@ fn a_range_drop_cut_by_a_crash_finishes_when_run_again() {
         vfs.set_faults(plan);
         finished = db.drop_range(&t, b"r3", Some(b"r7")).is_ok();
         vfs.set_faults(FaultPlan::none());
-        vfs.crash(if k % 2 == 0 {
+        vfs.crash(if k.is_multiple_of(2) {
             CrashKind::Power
         } else {
             CrashKind::Process

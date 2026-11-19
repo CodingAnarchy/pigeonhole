@@ -730,6 +730,10 @@ pub struct DroppedRange<'a> {
     body: &'a [u8],
 }
 
+/// A [`DroppedRange`]'s fields: the table, the range's first row, and the row after it
+/// (`None`: the table's end).
+pub type RangeFields<'a> = (TableId, &'a [u8], Option<&'a [u8]>);
+
 impl<'a> DroppedRange<'a> {
     /// Encodes a range into `out`. `InvalidArgument` for a row over [`MAX_KEY_PART`] or an
     /// end at or before the start.
@@ -765,7 +769,7 @@ impl<'a> DroppedRange<'a> {
         Ok(Self { body: bytes })
     }
 
-    fn parse(bytes: &'a [u8]) -> crate::Result<(TableId, &'a [u8], Option<&'a [u8]>)> {
+    fn parse(bytes: &'a [u8]) -> crate::Result<RangeFields<'a>> {
         let corrupt = |what| Error::Corrupt { what };
         let mut r = Reader::new(bytes, "wal range drop");
         let table = TableId(r.u32()?);
@@ -788,7 +792,7 @@ impl<'a> DroppedRange<'a> {
     }
 
     /// The fields: table, first row, and the row after the range (`None`: the table's end).
-    pub fn fields(&self) -> (TableId, &'a [u8], Option<&'a [u8]>) {
+    pub fn fields(&self) -> RangeFields<'a> {
         Self::parse(self.body).expect("checked when decoded")
     }
 
