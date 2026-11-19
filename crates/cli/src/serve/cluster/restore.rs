@@ -524,7 +524,12 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         record(&r.dir, &progress, &mut unwritable);
     }
     fault(&r.dir, "stamped")?;
-    // The map, forced: tables exactly as the backup's.
+    // The map, forced: tables exactly as the backup's. D331 PR 3: no range move goes on
+    // past a restore. A backup never spans a hand-over (`backup::moved`), so its map's
+    // placements already say who held each moved range then: a move before HANDED_OVER is
+    // rolled back (the source's), one at or after it forward (the target's). Each restored
+    // file is clipped to those placements when it opens (its stamp marked it).
+    m.moves.clear();
     for p in &mut m.partitions {
         p.epoch = jobs
             .iter()
@@ -785,6 +790,19 @@ async fn restore_partition(
             live.map_version
         )));
     };
+    // D331 PR 3: not while a range move names it: its ranges are changing, and the move
+    // would go on over a file from before it.
+    if let Some(m) = live
+        .moves
+        .iter()
+        .find(|m| m.from == partition || m.to == partition)
+    {
+        return Err(Failure::usage(&format!(
+            "range move {:?} names partition {partition:?} in the live map (version {}): \
+             finish or abort it, then restore",
+            m.id, live.map_version
+        )));
+    }
     let target = r.to.clone().unwrap_or_else(|| now.node.clone());
     let nodes: BTreeMap<String, String> = live
         .nodes
