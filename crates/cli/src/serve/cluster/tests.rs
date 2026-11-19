@@ -2180,6 +2180,27 @@ impl Three {
     }
 }
 
+#[test]
+fn a_cut_off_entry_cuts_only_its_own_clusters_dials() {
+    // #2095: a test that ends or panics with a node still cut leaves its entry; a later
+    // test's node that binds the same port mustn't be cut by it. The address matches only a
+    // dial from the cut node's own cluster; the node itself is cut whatever it dials.
+    let (mine, peer, other) = (test_dir(), test_dir(), test_dir());
+    let at = "127.0.0.1:1";
+    super::cut_node(&mine, at, &[mine.clone(), peer.clone()], true);
+    assert!(
+        super::cut_off(&mine, "127.0.0.1:2"),
+        "the cut node's own dials"
+    );
+    assert!(super::cut_off(&peer, at), "its peer's dial of it");
+    assert!(
+        !super::cut_off(&other, at),
+        "another cluster's dial of the same address"
+    );
+    super::cut_node(&mine, at, &[mine.clone(), peer.clone()], false);
+    assert!(!super::cut_off(&peer, at), "joined again");
+}
+
 impl Drop for Three {
     fn drop(&mut self) {
         self.stops.clear();
@@ -3638,16 +3659,14 @@ impl QualifierVectors {
         }
     }
 
-    /// Cuts node `i` off from its peers both ways, or joins it again (`CUT_OFF`).
+    /// Cuts node `i` off from its peers both ways, or joins it again (`cut_node`).
     fn cut(&self, i: usize, off: bool) {
-        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
-        let mut cut = super::CUT_OFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cut.retain(|e| *e != entry);
-        if off {
-            cut.push(entry);
-        }
+        super::cut_node(
+            &self.dirs[i],
+            &format!("127.0.0.1:{}", self.ports[i]),
+            &self.dirs,
+            off,
+        );
     }
 
     /// The oracle's ranking of [`Self::QUERY`]'s `k` nearest under `select`.
