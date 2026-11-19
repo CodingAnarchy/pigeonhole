@@ -223,8 +223,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS's ran 18.8-44.1 min on main, and a slow runner was cancelled at 45 with every
+          # test ok so far; 60 leaves 15 min of room.
           - os: macos-latest
-            timeout: 45
+            timeout: 60
           # Windows' workspace tests ran 41-59 min on main, and slow runners passed 60
           # (#1961: compiling took 20-33 min, the tests 22-28); 90 leaves 30 min of room.
           - os: windows-latest

@@ -104,6 +104,17 @@ impl RowEpochs {
     pub(crate) fn slots(&self) -> usize {
         self.table.slots()
     }
+
+    /// Raises every slot to `seqno` (D331): a range drop's rows are gone without a write to
+    /// any of them, so every cached row, in this process and in readers, misses from here
+    /// (an entry hits only while its slot holds its epoch), and a reader whose read point is
+    /// below `seqno` can't fill again. Call after the drop's view is published. A slot is
+    /// `hash & mask`, so the indexes themselves reach every one.
+    pub(crate) fn raise_all(&self, seqno: Seqno) {
+        for i in 0..self.table.slots() {
+            self.table.note_write_prev(i as u64, seqno);
+        }
+    }
 }
 
 /// The row cache, its write watermarks and its admission rules (writer process only).

@@ -32,8 +32,8 @@ use pigeonhole_format::sst::{Footer, Properties};
 use pigeonhole_format::superblock::{ExtentRef, Superblock};
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value, encode_value};
 use pigeonhole_format::wal::{
-    BatchBuilder, ExternalRead, ExternalShare, FRAME_SIZE, FrameEncoder, SegmentHeader, StreamList,
-    WalRecord,
+    BatchBuilder, DroppedRange, ExternalRead, ExternalShare, FRAME_SIZE, FrameEncoder,
+    SegmentHeader, StreamList, WalRecord,
 };
 use pigeonhole_format::{
     BlobFileId, FamilyId, FormatVersion, Lsn, SstId, StreamId, TableId, TabletId,
@@ -1007,6 +1007,45 @@ fn wal() {
             );
         }
     }
+
+    // D331 PR 4a (ICR 0141): a range drop, bounded and to the table's end. Behind
+    // `incompat` bit 3 as the silent mark is: `decode` refuses it (`Corrupt`).
+    let (mut bounded, mut open) = (Vec::new(), Vec::new());
+    DroppedRange::encode(&mut bounded, TableId(3), b"m", Some(b"t\x00")).unwrap();
+    DroppedRange::encode(&mut open, TableId(3), b"", None).unwrap();
+    let drops = [
+        (
+            "wal_record_range_drop.bin",
+            WalRecord::RangeDrop {
+                seqno: 109,
+                range: DroppedRange::decode(&bounded).unwrap(),
+            },
+        ),
+        (
+            "wal_record_range_drop_to_end.bin",
+            WalRecord::RangeDrop {
+                seqno: 110,
+                range: DroppedRange::decode(&open).unwrap(),
+            },
+        ),
+    ];
+    for (name, rec) in &drops {
+        let mut out = Vec::new();
+        rec.encode(&mut out);
+        check(name, &out);
+        assert_eq!(&WalRecord::decode_with(&out, true).unwrap(), rec, "{name}");
+        assert!(rec.batch().is_none());
+        for refused in [WalRecord::decode(&out), WalRecord::decode_with(&out, false)] {
+            assert!(
+                matches!(refused, Err(pigeonhole_format::Error::Corrupt { .. })),
+                "{name}: {refused:?}"
+            );
+        }
+    }
+    let WalRecord::RangeDrop { range, .. } = drops[0].1 else {
+        unreachable!()
+    };
+    assert_eq!(range.fields(), (TableId(3), &b"m"[..], Some(&b"t\x00"[..])));
 }
 
 #[test]

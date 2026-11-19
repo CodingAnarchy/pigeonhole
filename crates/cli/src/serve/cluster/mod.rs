@@ -1941,24 +1941,36 @@ impl ClusterGrpc {
 
 #[tonic::async_trait]
 impl proto::cluster_server::Cluster for ClusterGrpc {
-    /// `phdb cluster fence P --node N` (D317 ticket 6): admin scope.
+    /// `phdb cluster fence P --node N` (D317 ticket 6): admin scope, or a node's cluster token
+    /// (a move the map's writer runs, D332).
     async fn fence(
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "fence a partition")?;
+        // An operator's, or the map's writer's in a move it runs (D332, D331 PR 5).
+        self.caller(&req, &[Scope::Admin, Scope::Cluster], "fence a partition")?;
         let id = req.into_inner().partition;
         self.0.fence(&id).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
-    /// `phdb cluster unfence P --node N` (D317 ticket 6): admin scope.
+    /// `phdb cluster unfence P --node N` (D317 ticket 6): admin scope, or a node's cluster
+    /// token (a move the map's writer runs lifts its own fence on abort, D332).
     async fn unfence(
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "unfence a partition")?;
+        // A move the writer runs lifts its own fence on abort (the coordinator, #2094).
+        let caller = self.caller(&req, &[Scope::Admin, Scope::Cluster], "unfence a partition")?;
         let req = req.into_inner();
+        // `force` skips the check that the peers' newest map still names this node: never
+        // a move's abort, so an admin's only (simp724's should on #2094).
+        if req.force && caller.scope == Scope::Cluster {
+            return Err(ApiError::permission_denied(
+                "unfence with --force: a forced unfence is an admin's",
+            )
+            .into());
+        }
         let id = req.partition;
         self.0.unfence(&id, req.force).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
@@ -2026,23 +2038,29 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(self.local(&r.partition).await?))
     }
 
-    /// `phdb cluster close P --node N` (D317 amendment 2): admin scope.
+    /// `phdb cluster close P --node N` (D317 amendment 2): admin scope, or a node's cluster
+    /// token (a move the map's writer runs, D332).
     async fn close(
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "close a partition")?;
+        self.caller(&req, &[Scope::Admin, Scope::Cluster], "close a partition")?;
         let id = req.into_inner().partition;
         self.0.close(&id).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
-    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): admin scope.
+    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): admin scope, or a node's
+    /// cluster token (a move the map's writer runs, D332).
     async fn drop_partition(
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "drop a partition's files")?;
+        self.caller(
+            &req,
+            &[Scope::Admin, Scope::Cluster],
+            "drop a partition's files",
+        )?;
         let id = req.into_inner().partition;
         Ok(tonic::Response::new(self.0.drop_partition(&id).await?))
     }

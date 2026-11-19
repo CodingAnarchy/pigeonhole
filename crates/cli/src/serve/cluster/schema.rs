@@ -163,10 +163,11 @@ pub(crate) fn reconcile(db: &Pigeonhole, partition: &str, map: &ClusterMap) -> O
         .iter()
         .filter(|t| {
             t.partitions.iter().any(|p| p == partition)
-                || map
-                    .moves
-                    .iter()
-                    .any(|m| m.table == t.name && (m.from == partition || m.to == partition))
+                || map.moves.iter().any(|m| {
+                    !super::map::node_move(m)
+                        && m.table == t.name
+                        && (m.from == partition || m.to == partition)
+                })
                 || moved_away.iter().any(|m| m.table == t.name)
         })
         .map(|t| (t.name.as_str(), t))

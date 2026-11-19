@@ -472,6 +472,8 @@ pub enum AppendedKind {
     /// An external transaction's abort (D329, WAL type 6): its `seqno` is the commit's id,
     /// `apply_seqno` the abort's own seqno, which applies nothing.
     Abort,
+    /// A range drop (D331, WAL type 7): its `seqno` is the drop's, which applies nothing.
+    RangeDrop,
 }
 
 /// One raw entry of a table (a test hook).

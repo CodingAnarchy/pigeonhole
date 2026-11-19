@@ -161,8 +161,8 @@ impl ExternalRegistry {
         table.holds = table.holds.saturating_sub(1);
     }
 
-    /// Read holds live now (tests).
-    #[cfg(test)]
+    /// Read holds live now: a range drop waits while any is (D331, #2089 landing after
+    /// #2076).
     pub(crate) fn holds(&self) -> usize {
         self.table().holds
     }

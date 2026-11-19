@@ -7250,6 +7250,11 @@ pub struct RangeMove {
     pub handed_over_version: u64,
     #[prost(uint64, tag = "12")]
     pub handed_over_term: u64,
+    /// The source partition's epoch when the move entered COPYING (D332 PR 2, #1485). A NODE
+    /// move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
+    /// promoted it mid-move). 0 on a record from before this field.
+    #[prost(uint64, tag = "13")]
+    pub from_epoch: u64,
 }
 /// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -8401,7 +8406,7 @@ pub enum MoveKind {
     /// `phdb cluster split`: to a partition the split added.
     Partition = 2,
     /// D332: a whole partition relocated to another node (no table or range; `to` names the
-    /// node). Validated by D332's balancer PR; refused until then.
+    /// node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
     ///
     /// PR 6 (merge) adds MOVE_KIND_MERGE = 4.
     Node = 3,
@@ -9012,7 +9017,8 @@ pub mod cluster_client {
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
         /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+        /// PR 5).
         pub async fn fence(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -9036,7 +9042,8 @@ pub mod cluster_client {
         }
         /// Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
         /// unless this node's map names it as the partition's node at the epoch in its file.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer undoing its own move's fence:
+        /// D332, D331 PR 5).
         pub async fn unfence(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -9061,7 +9068,8 @@ pub mod cluster_client {
         /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
         /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
         /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-        /// unless it's fenced. Admin scope.
+        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+        /// move: D332, D331 PR 5).
         pub async fn close(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -9085,7 +9093,8 @@ pub mod cluster_client {
         }
         /// Moves a partition's files left on this node, after it moved away, into
         /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-        /// node's map names it as the partition's node, or while it's open. Admin scope.
+        /// node's map names it as the partition's node, or while it's open. Admin scope, or a
+        /// node's cluster token (the map's writer running a move: D332, D331 PR 5).
         pub async fn drop_partition(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -9112,7 +9121,7 @@ pub mod cluster_client {
         /// identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
         /// rerun resumes. The reply's `files` is the set this call installed (none: empty).
         /// `FailedPrecondition` while the partition is open here, or for a file of another
-        /// cluster, partition or epoch. Admin scope.
+        /// cluster, partition or epoch. Admin scope, or a node's cluster token.
         pub async fn stamp(
             &mut self,
             request: impl tonic::IntoRequest<super::StampRequest>,
@@ -9321,14 +9330,16 @@ pub mod cluster_server {
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
         /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+        /// PR 5).
         async fn fence(
             &self,
             request: tonic::Request<super::PartitionRequest>,
         ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
         /// unless this node's map names it as the partition's node at the epoch in its file.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer undoing its own move's fence:
+        /// D332, D331 PR 5).
         async fn unfence(
             &self,
             request: tonic::Request<super::PartitionRequest>,
@@ -9336,14 +9347,16 @@ pub mod cluster_server {
         /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
         /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
         /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-        /// unless it's fenced. Admin scope.
+        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+        /// move: D332, D331 PR 5).
         async fn close(
             &self,
             request: tonic::Request<super::PartitionRequest>,
         ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Moves a partition's files left on this node, after it moved away, into
         /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-        /// node's map names it as the partition's node, or while it's open. Admin scope.
+        /// node's map names it as the partition's node, or while it's open. Admin scope, or a
+        /// node's cluster token (the map's writer running a move: D332, D331 PR 5).
         async fn drop_partition(
             &self,
             request: tonic::Request<super::PartitionRequest>,
@@ -9353,7 +9366,7 @@ pub mod cluster_server {
         /// identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
         /// rerun resumes. The reply's `files` is the set this call installed (none: empty).
         /// `FailedPrecondition` while the partition is open here, or for a file of another
-        /// cluster, partition or epoch. Admin scope.
+        /// cluster, partition or epoch. Admin scope, or a node's cluster token.
         async fn stamp(
             &self,
             request: tonic::Request<super::StampRequest>,
@@ -10743,7 +10756,9 @@ pub mod admin_client {
         }
         /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
         /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
-        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4). On a
+        /// cluster node, a node's cluster token may also download a named partition's closed set
+        /// (`fenced_file`) or a replica's bootstrap (D328), as the map's writer's move does (D332).
         pub async fn backup_download(
             &mut self,
             request: impl tonic::IntoRequest<super::BackupDownloadRequest>,
@@ -10823,7 +10838,9 @@ pub mod admin_client {
         }
         /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
         /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
-        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only. A
+        /// node's cluster token may upload a relocation's set (a move the map's writer runs, D332),
+        /// never a restore's.
         pub async fn partition_upload(
             &mut self,
             request: impl tonic::IntoStreamingRequest<
@@ -10850,7 +10867,8 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUpload"));
             self.inner.client_streaming(req, path, codec).await
         }
-        /// How many bytes of an upload the node holds, to resume it.
+        /// How many bytes of an upload the node holds, to resume it. Admin scope, or a node's
+        /// cluster token.
         pub async fn partition_upload_status(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionUploadStatusRequest>,
@@ -10924,7 +10942,9 @@ pub mod admin_server {
             + 'static;
         /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
         /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
-        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4). On a
+        /// cluster node, a node's cluster token may also download a named partition's closed set
+        /// (`fenced_file`) or a replica's bootstrap (D328), as the map's writer's move does (D332).
         async fn backup_download(
             &self,
             request: tonic::Request<super::BackupDownloadRequest>,
@@ -10947,7 +10967,9 @@ pub mod admin_server {
         ) -> std::result::Result<tonic::Response<super::PromoteResponse>, tonic::Status>;
         /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
         /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
-        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only. A
+        /// node's cluster token may upload a relocation's set (a move the map's writer runs, D332),
+        /// never a restore's.
         async fn partition_upload(
             &self,
             request: tonic::Request<tonic::Streaming<super::PartitionUploadChunk>>,
@@ -10955,7 +10977,8 @@ pub mod admin_server {
             tonic::Response<super::PartitionUploadReply>,
             tonic::Status,
         >;
-        /// How many bytes of an upload the node holds, to resume it.
+        /// How many bytes of an upload the node holds, to resume it. Admin scope, or a node's
+        /// cluster token.
         async fn partition_upload_status(
             &self,
             request: tonic::Request<super::PartitionUploadStatusRequest>,

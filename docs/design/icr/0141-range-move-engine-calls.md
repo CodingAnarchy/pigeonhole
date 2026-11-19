@@ -46,6 +46,32 @@ A range move (D331) copies a key range from partition S to partition T, follows 
 - `InvalidArgument` without the change feed, and `Busy` before every stream has opened.
 - **Taken before the copy's first snapshot,** so the catch-up's token is always inside it.
 
+## Range drops (D331 PR 4a)
+`Engine::drop_range(table, start, end)` and `Pigeonhole::drop_range` (doc-hidden), with `apply_range_drop` on a replica. They remove rows `[start, end)` outright, with no delete markers, so a later write of the range at an older timestamp is visible. The `incompat` bit is D331's bit 3, the same feature and release.
+- **The steps:**
+  1. Split the table's tablets at the bounds, through the shards' tablet changes, which freeze and flush what they split, so nothing outside the range is lost.
+  2. Write a Range Drop (WAL type 7, FORMAT §10.3) synced on **every** stream at one seqno, held from readers until all have it and then released with nothing applied. Tablet owners aren't stored, so every stream carries it.
+  3. One manifest commit drops the tablets inside the range and puts one fresh tablet over it, with `SetFlushed` at the seqno in each family. Replay skips a write at or below a slot's flushed seqno, so no earlier write of the range comes back. Then the shards retire the dropped tablets' memtables.
+  4. Raise every row-cache slot to the seqno, so a cached row of the range misses in every process.
+- **Snapshots:** a live snapshot keeps its view, with the dropped tablets' SSTs and memtables.
+- **Gating:** the caller keeps the range unserved while it drops, and stops and joins every writer of the range first: at a source's cleanup its range fence, at a target's abort its copy and catch-up (simp724's M2). A write landing around the seqno would apply live into the fresh tablet but be skipped on replay. So no write of the range is in flight below the seqno. It runs the drop again after a crash until it returns, from its drop-pending row. Every step does nothing once done. Engine replay of a type 7 only counts its seqno, and the record is never needed past a checkpoint: every manifest commit stores a `seqno_ceiling` above it.
+- **The feed:** a client subscription passes it, as a seqno with no event. A reader that includes feed-silent records gets `Next::RangeDrop` in seqno order, once, which pigeonhole carries as `ReplicatedEvent` body tag 2. A replica's follower applies it between runs (`apply_range_drop`, then the token). The body is written in version 1 only, and a drop in any other version byte is refused (feed1248's M1).
+- **Upgrades:** body tag 2 is new inside version 1, so a replica built before it refuses the event and halts its follower at the first drop. Replicas are upgraded before their primary; a cluster's range moves need every node on 1.3.0 anyway (feed1248's S1).
+- **Refusals:**
+  - `ReadOnly` on a replica (`drop_range`), and `InvalidArgument` on a primary (`apply_range_drop`);
+  - `Busy` while an external share is in doubt (D329; pigeonhole names the xids) or while the balancer keeps changing the bounds' tablets. Read holds (D329 PR 2b's `hold_reads`) refuse it too, added by whichever of #2076 and #2089 lands second (simp724's S1);
+  - `Unsupported` with tablet changes off;
+  - `InvalidArgument` for an end at or before the start.
+- **Leftover tablets:** the balancer merges the small ones left at the bounds.
+
+## Logged batches by name (D331 PR 4a)
+`Pigeonhole::logged_batch() -> LoggedBatch` (doc-hidden) and `Engine::commit_logged`. A range move's target writes the source's changes exactly as the source logged them: their kinds, timestamps and stored values (`Change::stored`), named by table and family, since the target's ids aren't the source's.
+- It holds logged changes only, so it never mixes with ordinary writes.
+- It may be marked feed-silent.
+- The timestamp floor isn't raised; the target raises it once, before it serves the range.
+- A family the table lacks fails the whole batch, never dropping a change.
+- Refused on a replica (`ReadOnly`).
+
 ## Callers
 D331's range move (serve, later PRs) and D328/D315's replication. Nothing else.
 
@@ -66,6 +92,14 @@ D331's range move (serve, later PRs) and D328/D315's replication. Nothing else.
   - silent events are version 2 and the rest version 1;
   - neither the primary's client feed nor the replica's own feed sees a silent write;
   - version 3 is refused.
+- **PR 4a** (`crates/pigeonhole/tests/replication.rs`, `crates/format/tests/{golden,validation}.rs`):
+  - B1: a dropped range takes older writes again, before a crash, after it, after a re-run and after compaction, while a snapshot from before reads it whole;
+  - a crash after each of the drop's mutating operations leaves the range whole or gone, and the drop run again finishes it;
+  - a feed passes a drop, and tokens before and after it resume after a crash;
+  - a lagging replica applies the drop in feed order and matches its primary;
+  - a flagged drop event is refused;
+  - a logged batch copies another database's changes by name (a delete hiding an older `put_at`, counters), and a missing family fails it whole;
+  - type 7's golden files and bound checks.
 - **Mutation-checked:**
   - the reader not skipping silent batches;
   - the hold ignored by retention;

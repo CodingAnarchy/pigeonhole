@@ -362,8 +362,15 @@ impl ServiceOp {
                     | Self::RecallPool(_)
                     | Self::RecallBodies(_)
             ),
+            // A node's own token for what a node does to a peer: a replica's follow, and a
+            // download of a partition (a replica's bootstrap, and a move's copy of a closed
+            // set, which the map's writer runs: D332, D331 PR 5).
             peer: matches!(self, Self::Follow(_))
-                || matches!(self, Self::BackupDownload(r) if r.replica && !r.partition.is_empty()),
+                || matches!(
+                    self,
+                    Self::BackupDownload(r)
+                        if !r.partition.is_empty() && (r.replica || r.fenced_file.is_some())
+                ),
         }
     }
 
@@ -767,10 +774,11 @@ pub(crate) struct Admit {
     /// A memory call (`Memory`'s RPCs, `/mcp`'s memory tools): the only calls a token
     /// limited to namespaces may make (audit120's F5).
     pub memory: bool,
-    /// A call one cluster node makes of another for a replica copy (D328): `Follow`, and a
-    /// replica's bootstrap download of a partition. On a cluster node, the node's cluster
-    /// token may make it as well as an admin token; a single node's router refuses a cluster
-    /// token's (simp724's S1 on #1974).
+    /// A call one cluster node makes of another: a replica copy's `Follow` and bootstrap
+    /// download (D328), and a move's download of a partition's closed files, which the map's
+    /// writer runs (D332, D331 PR 5; the coordinator's scope ruling, #2094). On a cluster
+    /// node, the node's cluster token may make it as well as an admin token; a single node's
+    /// router refuses a cluster token's (simp724's S1 on #1974).
     pub peer: bool,
 }
 
