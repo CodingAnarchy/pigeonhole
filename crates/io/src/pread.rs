@@ -142,6 +142,7 @@ impl PreadVfs {
                 #[cfg(all(unix, not(target_os = "linux")))]
                 key,
             }),
+            counts: crate::count::FileCounts::default(),
         }))
     }
 }
@@ -234,6 +235,8 @@ impl Drop for Pool {
 #[derive(Debug)]
 pub(crate) struct PreadFile {
     inner: Arc<FileInner>,
+    /// Its device bytes' counters, once given (D332).
+    counts: crate::count::FileCounts,
 }
 
 #[cfg(target_os = "linux")]
@@ -593,14 +596,22 @@ impl File for PreadFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        self.counts.read(buf.len());
         self.inner.read_at(buf, offset)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        self.counts.written(buf.len());
         self.inner.write_at(buf, offset)
     }
 
+    fn count_into(&self, counters: Arc<crate::IoCounters>) {
+        self.counts.set(counters);
+    }
+
+    // `submit_reads_ahead` takes the default, which goes through `submit_read`: counted once.
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
+        self.counts.read(buf.len());
         if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
@@ -620,6 +631,7 @@ impl File for PreadFile {
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
+        self.counts.written(buf.len());
         if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }

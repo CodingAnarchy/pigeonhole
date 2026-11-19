@@ -138,6 +138,31 @@ pub(crate) struct ServeArgs {
     /// The longest a transaction lives, in milliseconds, however busy.
     #[arg(long, value_name = "MS", default_value_t = 300_000)]
     pub txn_lifetime_ms: u64,
+    /// The most partitions a transaction begun with `spans_partitions` may touch besides
+    /// its home (D329): a call that would open one more branch is refused
+    /// (`FailedPrecondition`), and the transaction stays usable.
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    pub txn_max_branches: usize,
+    /// The most shares of transactions across partitions a partition may hold in doubt
+    /// (prepared, their decision not yet known there; D329): past it, new prepares are
+    /// refused until some are decided. 0: no count limit (`--txn-max-in-doubt-wal-bytes`
+    /// still bounds them).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub txn_max_in_doubt: usize,
+    /// The most WAL bytes a partition's in-doubt shares may keep (D329): past it, new
+    /// prepares are refused. Each change-feed subscriber can hold up to this much more.
+    #[arg(long, value_name = "BYTES", default_value_t = 16 << 20)]
+    pub txn_max_in_doubt_wal_bytes: u64,
+    /// How long a share held in doubt waits before its node asks the transaction's home what
+    /// was decided (D329's resolver), e.g. `30s`. Default: the request timeout, so a healthy
+    /// commit never meets it.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub txn_resolve_delay: Option<Duration>,
+    /// How long a transaction's decision record is kept after every partition acknowledged
+    /// it (D329): `Transactions.Outcome` answers it for this long, e.g. `24h`. At least
+    /// `--txn-lifetime-ms` + the request timeout + 1 minute.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration, default_value = "24h")]
+    pub txn_outcome_retention: Duration,
     /// How long a pinned snapshot may sit idle, in milliseconds: each read at it renews it.
     #[arg(long, value_name = "MS", default_value_t = 60_000)]
     pub snapshot_idle_ms: u64,
@@ -331,6 +356,42 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_lease_ms: u64,
+    /// The failover margin, in milliseconds (D330): how long the map's writer goes without
+    /// its writer lease before another node is elected in its place, while the map has
+    /// failover on (`phdb cluster set-map`). 0: twice `--cluster-lease-ms`.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0,
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub cluster_failover_after_ms: u64,
+    /// The most a replica may lag the owner's last renewal and still be failed over to, in
+    /// milliseconds (D330): an automatic failover refuses a staler one. 0: no limit, only
+    /// the freshness rule (a heartbeat).
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0,
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub cluster_failover_max_lag_ms: u64,
+    /// The window a partition's load is averaged over (an exponential average, each 30 s
+    /// reading weighing `1 − e^(−30/window)`), and the node's device ceiling taken across,
+    /// in seconds, 30 to 86400 (D332): what the cluster balancer compares. Measured on every
+    /// cluster node; read only by a balancer.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64)
+            .range(30..=crate::serve::cluster::load::MAX_WINDOW_SECS),
+        requires = "cluster",
+        conflicts_with = "file"
+    )]
+    pub balance_window: u64,
     /// A remote MCP (`/mcp`) tool result's size, about, in bytes of JSON: a longer one is
     /// cut and returns a cursor, as with `phdb mcp --max-result-bytes`.
     #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
@@ -396,6 +457,12 @@ pub(crate) struct Limits {
     pub feed_client_events: usize,
     pub feed_client_bytes: usize,
     pub request_timeout: Duration,
+    /// `--txn-max-branches` (D329).
+    pub txn_max_branches: usize,
+    /// `--txn-resolve-delay` (D329): the request timeout when unset.
+    pub txn_resolve_delay: Duration,
+    /// `--txn-outcome-retention` (D329).
+    pub txn_outcome_retention: Duration,
     pub stream_idle: Duration,
     /// A test's hold seam (#1753): a fanned-out scan's entry waits after each partition's
     /// page until the partition's next page has taken its share.
@@ -437,6 +504,11 @@ impl ServeArgs {
             feed_client_events: super::feed::CLIENT_EVENTS,
             feed_client_bytes: super::feed::CLIENT_BYTES,
             request_timeout: Duration::from_millis(self.request_timeout_ms),
+            txn_max_branches: self.txn_max_branches.max(1),
+            txn_resolve_delay: self
+                .txn_resolve_delay
+                .unwrap_or(Duration::from_millis(self.request_timeout_ms)),
+            txn_outcome_retention: self.txn_outcome_retention,
             stream_idle: Duration::from_millis(self.stream_idle_ms.max(1)),
             #[cfg(test)]
             hold_after_part_page: false,
@@ -529,6 +601,28 @@ impl ShardSpin {
     }
 }
 
+/// A duration flag's value: a number and a unit, `ms`, `s`, `m`, `h` or `d` (`500ms`, `30s`,
+/// `24h`).
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("{s:?} needs a unit: ms, s, m, h or d (as in 30s)"))?;
+    let (n, unit) = s.split_at(split);
+    let n: u64 = n
+        .parse()
+        .map_err(|_| format!("{s:?} doesn't start with a whole number"))?;
+    let ms = match unit {
+        "ms" => n,
+        "s" => n.saturating_mul(1_000),
+        "m" => n.saturating_mul(60_000),
+        "h" => n.saturating_mul(3_600_000),
+        "d" => n.saturating_mul(86_400_000),
+        _ => return Err(format!("{s:?}: the unit is one of ms, s, m, h or d")),
+    };
+    Ok(Duration::from_millis(ms))
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
@@ -570,6 +664,9 @@ mod tests {
             ["--cluster-ca", "ca.pem"],
             ["--cluster-push-timeout-ms", "7"],
             ["--cluster-lease-ms", "21"],
+            ["--cluster-failover-after-ms", "40"],
+            ["--cluster-failover-max-lag-ms", "500"],
+            ["--balance-window", "60"],
         ] {
             if flag[0] != "--node-id" {
                 assert!(

@@ -209,6 +209,25 @@ impl Faults {
     }
 }
 
+/// One-shot callbacks for the next `Engine::open_reader` on a VFS, keyed by its address
+/// (`Engine::on_next_reader_open`). Process-wide, since a reader being opened has no `Shared`
+/// yet; keyed by VFS so tests running alongside never take another's.
+static READER_OPENS: Mutex<Vec<(usize, Callback)>> = Mutex::new(Vec::new());
+
+/// Runs the callback set for the next reader open on `vfs`, if any: between the open's
+/// root read (`Pager::open`) and its manifest load (#2085).
+pub(crate) fn run_reader_open(vfs: &Arc<dyn pigeonhole_io::Vfs>) {
+    let key = Arc::as_ptr(vfs).cast::<u8>() as usize;
+    let f = {
+        let mut v = READER_OPENS.lock().unwrap_or_else(PoisonError::into_inner);
+        let i = v.iter().position(|(k, _)| *k == key);
+        i.map(|i| v.swap_remove(i).1)
+    };
+    if let Some(f) = f {
+        f();
+    }
+}
+
 /// The engine-wide hook state (`Shared::hooks`).
 #[derive(Default)]
 pub(crate) struct Hooks {
@@ -358,6 +377,10 @@ pub(crate) struct ShardCounters {
     /// Entries read validation visited in the shard's memtables (`Engine::validate_entries`,
     /// D273's tests: a hot row validates in a few entries, not one per version).
     pub validate_entries: AtomicU64,
+    /// Cross-shard shares the shard admitted and holds until their decision
+    /// (`Engine::shares_tracked`): a test waits for a share to be admitted on a condition,
+    /// not a clock (perf2's S1 on #2058).
+    pub shares_tracked: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -449,6 +472,8 @@ pub enum AppendedKind {
     /// An external transaction's abort (D329, WAL type 6): its `seqno` is the commit's id,
     /// `apply_seqno` the abort's own seqno, which applies nothing.
     Abort,
+    /// A range drop (D331, WAL type 7): its `seqno` is the drop's, which applies nothing.
+    RangeDrop,
 }
 
 /// One raw entry of a table (a test hook).
@@ -496,6 +521,17 @@ impl Engine {
         self.inner.shared.hooks.sites.set(site, f);
     }
 
+    /// Sets a one-shot callback for the next `open_reader` on `vfs` (test hook): it runs on
+    /// the opening thread after the open has read the root and before it loads that root's
+    /// manifest (#2085), replacing one that has not run.
+    #[doc(hidden)]
+    pub fn on_next_reader_open<V: ?Sized>(vfs: &Arc<V>, f: Box<dyn FnOnce() + Send>) {
+        let key = Arc::as_ptr(vfs).cast::<u8>() as usize;
+        let mut v = READER_OPENS.lock().unwrap_or_else(PoisonError::into_inner);
+        v.retain(|(k, _)| *k != key);
+        v.push((key, f));
+    }
+
     /// Switches fault `fault` on or off (test hook): see [`Fault`] for each. A one-shot fault
     /// (`Next…`) switches itself off where it fires.
     #[doc(hidden)]
@@ -529,6 +565,41 @@ impl Engine {
             let _ = subs[usize::from(to.0)].submit(msg);
         }
         n
+    }
+
+    /// How many PREPAREs `Fault::HoldPrepares` holds now (test hook).
+    #[doc(hidden)]
+    pub fn held_prepares(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .held_prepares
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// How many cross-shard shares shard `shard` has admitted and tracked so far, each until
+    /// its decision (test hook): a share counted here holds its rows and reads there.
+    #[doc(hidden)]
+    pub fn shares_tracked(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .shares_tracked
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many commit `Decide`s `Fault::HoldDecides` holds now (test hook): one held means
+    /// its coordinator decided, so every participant had prepared its share.
+    #[doc(hidden)]
+    pub fn held_decides(&self) -> usize {
+        self.inner
+            .shared
+            .hooks
+            .held_decides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Sends the oldest `max` of the `Decide`s `Fault::HoldDecides` held, in the order they
@@ -981,7 +1052,7 @@ impl Engine {
     /// moves leave a claimed shard alone.
     #[doc(hidden)]
     pub fn claim_shard(&self, shard: usize, passes: u64) -> bool {
-        let now = self.inner.shared.vfs.monotonic_nanos();
+        let now = self.inner.shared.clock_vfs.monotonic_nanos();
         self.inner.shared.loads[shard].claim(passes, u64::MAX, now)
     }
 
@@ -989,7 +1060,7 @@ impl Engine {
     /// change that waits on a compaction claims nothing.
     #[doc(hidden)]
     pub fn shard_claimed(&self, shard: usize) -> bool {
-        let now = self.inner.shared.vfs.monotonic_nanos();
+        let now = self.inner.shared.clock_vfs.monotonic_nanos();
         !self.inner.shared.loads[shard].claimable(now)
     }
 

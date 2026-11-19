@@ -7,6 +7,7 @@
 //! or fails as it would have, and a lost reply is logged and counted.
 
 use std::collections::HashMap;
+use std::ops::{Bound, ControlFlow};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +100,8 @@ pub(crate) enum ServiceOp {
     /// ([`Service::fanout_part`]).
     TextStats(proto::TextStatsRequest),
     TextSearchPart(proto::TextSearchPartRequest),
+    /// `Transactions.Outcome` (D329 2b).
+    Outcome(proto::TxnOutcomeRequest),
 }
 
 /// One call's answer. Replies are moved once, from the service to the encoder, so the
@@ -140,6 +143,8 @@ pub(crate) enum ServiceReply {
     Forget(proto::ForgetResponse),
     MemoryWatch(super::memory::MemoryEvents),
     RecallPool(proto::RecallPoolResponse),
+    /// `Transactions.Outcome` (D329 2b).
+    Outcome(proto::TxnOutcomeResponse),
     RecallBodies(proto::RecallBodiesResponse),
     TextStats(proto::TextStatsResponse),
     /// A unary read's reply with its share of `--inflight-bytes` (#1567): held until the
@@ -333,6 +338,7 @@ impl ServiceOp {
             Self::RecallBodies(_) => 51,
             Self::TextStats(_) => 52,
             Self::TextSearchPart(_) => 53,
+            Self::Outcome(_) => 54,
         }
     }
 
@@ -356,8 +362,15 @@ impl ServiceOp {
                     | Self::RecallPool(_)
                     | Self::RecallBodies(_)
             ),
+            // A node's own token for what a node does to a peer: a replica's follow, and a
+            // download of a partition (a replica's bootstrap, and a move's copy of a closed
+            // set, which the map's writer runs: D332, D331 PR 5).
             peer: matches!(self, Self::Follow(_))
-                || matches!(self, Self::BackupDownload(r) if r.replica && !r.partition.is_empty()),
+                || matches!(
+                    self,
+                    Self::BackupDownload(r)
+                        if !r.partition.is_empty() && (r.replica || r.fenced_file.is_some())
+                ),
         }
     }
 
@@ -430,6 +443,9 @@ impl ServiceOp {
             | Self::Batch(_)
             | Self::MutateReturning(_)
             | Self::TxnWrite(_) => Scope::Write,
+            // It may end the transaction it asks about (D329: an abort marker), so it's a
+            // write on the home partition (audit120's S3 on the design).
+            Self::Outcome(_) => Scope::Write,
         }
     }
 
@@ -489,6 +505,7 @@ impl ServiceOp {
             Self::RecallBodies(r) => r.encoded_len(),
             Self::TextStats(r) => r.encoded_len(),
             Self::TextSearchPart(r) => r.encoded_len(),
+            Self::Outcome(r) => r.encoded_len(),
         }
     }
 
@@ -529,6 +546,214 @@ impl ServiceOp {
     pub(crate) fn writes(&self) -> bool {
         self.scope() == Scope::Write || matches!(self, Self::DropTable(_))
     }
+
+    /// Calls `f` with each (table or index, key) the call names, in request order, until `f`
+    /// returns `Break` (D331's range gates, D332's sampled read keys). A name is a table's or
+    /// an index's: they never clash (`validate_indexes`), and an index that follows a table
+    /// takes that table's ranges, so a gate maps it to the table.
+    ///
+    /// - **A table's rows:** the point reads report their rows; the writes (`Mutate`,
+    ///   `MutateReturning`, `CheckAndMutate`, `Batch`) and a transaction's reads, writes and
+    ///   commit theirs, a row named twice twice. A write naming no row reports nothing: it's
+    ///   refused on its way in.
+    /// - **A table's ranges:** a scan and a nearest search report their range (no range: the
+    ///   whole table), or a nearest search its keys. A resumed scan reports its whole range,
+    ///   not the rest after `after`: a superset, safe for a gate and harmless for a sample.
+    /// - **A traversal** reports its seeds. The rows its edges lead to aren't in the request:
+    ///   it reads them through the partitions' clipped fan-out, which D331 audits apart.
+    /// - **An index's ids:** `Text.Put` and `Text.Delete` (which write the source table's
+    ///   row beside its postings) and `Vectors.Insert` and `Vectors.Delete` report their id;
+    ///   a bulk load, a text rebuild, a search and a verify report the whole index.
+    /// - **Nothing:** every other call, each arm saying why. None writes a table's or an
+    ///   index's rows; the memory calls write the memory store's own placement, which no move
+    ///   names. So a gate passes a call that reports nothing, and a new call must be sorted
+    ///   into an arm before it compiles.
+    pub(crate) fn touches(
+        &self,
+        f: &mut dyn FnMut(&str, Touch<'_>) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        let mut rows = |rows: &[proto::RowWrites]| {
+            for k in rows.iter().filter_map(|r| r.row.as_ref()) {
+                f(&k.table, Touch::Row(&k.row))?;
+            }
+            ControlFlow::Continue(())
+        };
+        match self {
+            Self::Get(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::ReadRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::TxnGet(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::TxnGetRow(r) => f(&r.table, Touch::Row(&r.row)),
+            Self::MultiGet(r) => {
+                for k in &r.keys {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Scan(r) => f(&r.table, Touch::of_range(r.range.as_ref())),
+            Self::Nearest(r) => match &r.source {
+                Some(proto::nearest_request::Source::Keys(keys)) => {
+                    for k in &keys.keys {
+                        f(&r.table, Touch::Row(k))?;
+                    }
+                    ControlFlow::Continue(())
+                }
+                Some(proto::nearest_request::Source::Range(range)) => {
+                    f(&r.table, Touch::of_range(Some(range)))
+                }
+                None => f(&r.table, Touch::of_range(None)),
+            },
+            Self::Traverse(r) => {
+                for k in &r.seeds {
+                    f(&r.table, Touch::Row(k))?;
+                }
+                ControlFlow::Continue(())
+            }
+            Self::Mutate(r) | Self::MutateReturning(r) => rows(r.writes.as_slice()),
+            Self::CheckAndMutate(r) => rows(r.writes.as_slice()),
+            Self::Batch(r) => rows(&r.rows),
+            Self::TxnWrite(r) => rows(&r.rows),
+            Self::Commit(r) => rows(&r.rows),
+            // An index's ids: a text index always follows its source table, and `Text.Put`
+            // writes the source table's row keyed by exactly the id (`Index::put_in`; pinned
+            // by `a_text_put_writes_the_source_row_its_id_names`), so a gate fences that row.
+            // A vector index may follow a table, whose ranges route its ids.
+            Self::TextPut(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::TextDelete(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::VectorInsert(r) => f(&r.index, Touch::Row(&r.id)),
+            Self::VectorDelete(r) => f(&r.index, Touch::Row(&r.id)),
+            // A whole index: its ids are in the stream, or it reads or rebuilds every one.
+            Self::VectorBulkLoad(op) => f(&op.index, Touch::of_range(None)),
+            Self::VectorSearch(r) => f(&r.index, Touch::of_range(None)),
+            Self::VectorVerify(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextSearch(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextRebuild(r) | Self::TextVerify(r) => f(&r.index, Touch::of_range(None)),
+            Self::TextStats(proto::TextStatsRequest { search, .. })
+            | Self::TextSearchPart(proto::TextSearchPartRequest { search, .. }) => match search {
+                Some(r) => f(&r.index, Touch::of_range(None)),
+                None => ControlFlow::Continue(()),
+            },
+            // A transaction's or snapshot's start and end, a pinned snapshot's release: no rows
+            // (a transaction's routing key picks its home, it reads nothing).
+            // `Outcome` (D329) reads its own decision record, in the internal decision table,
+            // which no move names.
+            Self::Begin(_)
+            | Self::Abort(_)
+            | Self::Outcome(_)
+            | Self::OpenSnapshot(_)
+            | Self::ReleaseSnapshot(_)
+            // The schema, maintenance and the node's own calls: whole tables or none, never a
+            // row's write.
+            | Self::ListTables(_)
+            | Self::CreateTable(_)
+            | Self::DropTable(_)
+            | Self::DescribeTable(_)
+            | Self::CreateIndex(_)
+            | Self::TextCreateIndex(_)
+            | Self::Info(_)
+            | Self::Flush(_)
+            | Self::Compact(_)
+            | Self::Backup(_)
+            | Self::BackupDownload(_)
+            | Self::Metrics(_)
+            | Self::Promote(_)
+            // Feeds: a subscription and a replica's follow read history, not rows; a feed
+            // clips by map range where it's served (D331 PR 3).
+            | Self::Subscribe(_)
+            | Self::Follow(_)
+            | Self::MemoryWatch(_)
+            // Agent memory: memory ids in the memory store's placement (`ClusterMap.memory`),
+            // which a range move never names (D331 Amendment 3).
+            | Self::Remember(_)
+            | Self::Recall(_)
+            | Self::MarkUsed(_)
+            | Self::Supersede(_)
+            | Self::Link(_)
+            | Self::Forget(_)
+            | Self::RecallPool(_)
+            | Self::RecallBodies(_) => ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// A key a call names ([`ServiceOp::touches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Touch<'a> {
+    /// One row.
+    Row(&'a [u8]),
+    /// The rows within these bounds, as the scan's request gives them.
+    Range {
+        start: Bound<&'a [u8]>,
+        end: Bound<&'a [u8]>,
+    },
+    /// Every row starting with these bytes.
+    Prefix(&'a [u8]),
+}
+
+impl<'a> Touch<'a> {
+    /// A read's key range as its request gives it: no range is the whole table.
+    fn of_range(range: Option<&'a proto::KeyRange>) -> Self {
+        use proto::key_range::Range;
+        match range.and_then(|k| k.range.as_ref()) {
+            Some(Range::Prefix(p)) => Touch::Prefix(p),
+            Some(Range::Bounds(b)) => Touch::Range {
+                start: convert::bound(b.start.as_ref()),
+                end: convert::bound(b.end.as_ref()),
+            },
+            None => Touch::Range {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+        }
+    }
+}
+
+/// The barriers a cluster component starting at `start` carries for serving rows `rows`
+/// (D331 PR 3b): every row's, wherever it starts (feed1248's point 2: a start past `t_from`
+/// may come from a checkpoint taken while the merge held the part, with the source still
+/// below `final_seqno`). One past `t_from` (or from now) carries no token, so the merge's
+/// position for the component stays where it starts; the merge lifts it at once once the
+/// source's part is past `final_seqno`, gone or absent.
+fn barriers_for(
+    rows: Vec<super::ranges::Moved>,
+    start: Option<&proto::subscribe_request::Start>,
+) -> Vec<super::feed::Barrier> {
+    use proto::subscribe_request::Start as S;
+    let from = match start {
+        None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => u64::MAX,
+        Some(S::FromOldest(true)) => 0,
+        Some(S::Resume(t)) => super::cluster::token::token_seqno(t).unwrap_or(0),
+    };
+    rows.into_iter()
+        .map(|m| super::feed::Barrier {
+            t_from: m.seqno,
+            token: if from <= m.seqno {
+                m.token.into()
+            } else {
+                prost::bytes::Bytes::new()
+            },
+            move_id: m.id,
+            source: m.source,
+            final_seqno: m.final_seqno,
+        })
+        .collect()
+}
+
+/// How a subscription of this server's database starts ([`Service::subscribe_part`]): a
+/// client's own on a single node (the default), or one partition's part of a cluster
+/// subscription.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PartStart {
+    /// Commits through this seqno after the start are passed over (`skip_through`).
+    pub skip: u64,
+    /// A cluster component: it announces its start, and carries D331's barriers.
+    pub announce: bool,
+    /// A cluster feed hub's component (#1798).
+    pub internal: bool,
+    /// D331 PR 3b: start at the partition's hand-over for the tables.
+    pub from_hand_over: bool,
+    /// D331 PR 3b: end (cleanly, for the merge) past this seqno: a component of tables a
+    /// range move took from this partition whole.
+    pub ends_at: Option<u64>,
 }
 
 /// `Data.Scan`'s index in `RPCS`: its outcome is counted when its stream ends.
@@ -549,10 +774,11 @@ pub(crate) struct Admit {
     /// A memory call (`Memory`'s RPCs, `/mcp`'s memory tools): the only calls a token
     /// limited to namespaces may make (audit120's F5).
     pub memory: bool,
-    /// A call one cluster node makes of another for a replica copy (D328): `Follow`, and a
-    /// replica's bootstrap download of a partition. On a cluster node, the node's cluster
-    /// token may make it as well as an admin token; a single node's router refuses a cluster
-    /// token's (simp724's S1 on #1974).
+    /// A call one cluster node makes of another: a replica copy's `Follow` and bootstrap
+    /// download (D328), and a move's download of a partition's closed files, which the map's
+    /// writer runs (D332, D331 PR 5; the coordinator's scope ruling, #2094). On a cluster
+    /// node, the node's cluster token may make it as well as an admin token; a single node's
+    /// router refuses a cluster token's (simp724's S1 on #1974).
     pub peer: bool,
 }
 
@@ -702,7 +928,7 @@ fn step_recall(r: Option<proto::RecallRequest>) -> Result<crate::memcore::Recall
         .and_then(super::memory::recall)
 }
 
-pub(crate) const RPCS: [&str; 54] = [
+pub(crate) const RPCS: [&str; 55] = [
     "Data.Get",
     "Data.MultiGet",
     "Data.ReadRow",
@@ -761,6 +987,7 @@ pub(crate) const RPCS: [&str; 54] = [
     // another node's search, never a client's call.
     "Text.Stats",
     "Text.SearchPart",
+    "Transactions.Outcome",
 ];
 
 /// The outcomes a request is counted under: `ok`, every code ICR 0112's table names, and
@@ -1030,6 +1257,23 @@ pub(crate) fn render_sessions(out: &mut String, tables: &[&super::sessions::Sess
         "pigeonhole_serve_oldest_session_seconds {:.3}",
         s.oldest.as_secs_f64()
     );
+}
+
+/// `--embed-local`'s candle variables left unset at startup (#2061), one gauge per variable:
+/// 1 while the server runs without it, as its startup warning said. Only with `--embed-local`.
+pub(crate) fn render_candle(out: &mut String, bits: u8) {
+    use std::fmt::Write as _;
+    if bits & 0x80 == 0 {
+        return;
+    }
+    let _ = writeln!(out, "# TYPE pigeonhole_serve_embed_env_unset gauge");
+    for (i, var) in super::CANDLE_VARS.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "pigeonhole_serve_embed_env_unset{{variable=\"{var}\"}} {}",
+            (bits >> i) & 1
+        );
+    }
 }
 
 /// `Vectors.BulkLoad`'s gauges (perf287's B3 on 7b2): the running load's phase, and the
@@ -1346,6 +1590,8 @@ pub(crate) struct Partition {
     /// How its engine's threads were placed when it opened (D317 ticket 8a's pinning
     /// check): a cluster node's gauges.
     pub(crate) pinning: Pinning,
+    /// Its sampled load, for the cluster balancer (D332): request CPU and read keys.
+    pub(crate) load: Arc<super::cluster::load::PartitionLoad>,
     /// Its engine memory (D317 ticket 8a's `--engine-memory`): as resolved at open, then as a
     /// node's re-split at another partition's open or close changed its caches (#1761). A
     /// cluster node's gauges, and the next re-split's starting point.
@@ -1477,6 +1723,7 @@ impl Partition {
         Self {
             tables: ArcSwap::from_pointee(TableCache::default()),
             pinning: config.pinning,
+            load: Arc::default(),
             engine_memory: std::sync::Mutex::new(config.engine_memory),
             backups: config.backups,
             indexes: Arc::new(super::indexes::Indexes::new(
@@ -1528,6 +1775,16 @@ impl Service {
 
     pub(crate) fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The most branches a spanning transaction may open (`--txn-max-branches`, D329).
+    pub(crate) fn txn_max_branches(&self) -> usize {
+        self.limits.txn_max_branches
+    }
+
+    /// How long a transaction may go idle (`--txn-idle-ms`).
+    pub(crate) fn txn_idle(&self) -> std::time::Duration {
+        self.limits.leases.txn_idle
     }
 
     pub(crate) fn request_timeout(&self) -> std::time::Duration {
@@ -1901,7 +2158,54 @@ impl Service {
             }
             _ => (None, None),
         };
-        let mut reply = self.answer(op, caller, budget).await;
+        // D331: a range a move fences, moved away or doesn't serve here yet. One load while
+        // no move names the partition. A transaction's `Commit` is checked where it's
+        // answered, its rows as writes, with its snapshot (`commit`).
+        if let Some(gate) = &self.gate
+            && !matches!(op, ServiceOp::Commit(_))
+            && let Some(ranges) = &*gate.ranges().load()
+        {
+            ranges.check(&op, op.writes())?;
+        }
+        self.copy_ranges(&op)?;
+        // D332: a cluster partition's sampled loads. A read's first key, one read in 64 per
+        // thread; a call's CPU per poll, one in 16 per thread. An unsampled call touches
+        // nothing shared (perf287's must).
+        let load = match (&self.gate, &self.part) {
+            (Some(_), Some(part)) => Some(&part.load),
+            _ => None,
+        };
+        if let Some(load) = load
+            && op.reads_partition()
+            && super::cluster::load::sample_read()
+        {
+            let _ = op.touches(&mut |table, touch| {
+                // A range read's first key; one from the table's start has none to sample.
+                let key = match touch {
+                    Touch::Row(k) | Touch::Prefix(k) => k,
+                    Touch::Range {
+                        start: Bound::Included(k) | Bound::Excluded(k),
+                        ..
+                    } => k,
+                    Touch::Range {
+                        start: Bound::Unbounded,
+                        ..
+                    } => return ControlFlow::Continue(()),
+                };
+                load.add_read(table, key);
+                ControlFlow::Break(())
+            });
+        }
+        let mut reply = match load {
+            Some(load) if super::cluster::load::sample_cpu() => {
+                super::cluster::load::sampled_call(
+                    Arc::clone(load),
+                    self.answer(op, caller, budget),
+                )
+                .await
+            }
+            _ => self.answer(op, caller, budget).await,
+        };
         if reply.is_ok() {
             if let Some(h) = &held
                 && let Err(e) = h.committed()
@@ -2076,6 +2380,43 @@ impl Service {
             ServiceOp::Abort(r) => {
                 drop(budget);
                 self.abort(&r, caller).map(ServiceReply::Empty)
+            }
+            // A cluster's home answers it through `spanning::settle`, before here; this is a
+            // single node's: a session's recorded outcome, while it lasts (D329 2b).
+            ServiceOp::Outcome(r) => {
+                drop(budget);
+                use super::sessions::Peek;
+                use proto::TxnOutcomeState as S;
+                let answer = |state: S, reason: &str| proto::TxnOutcomeResponse {
+                    state: state as i32,
+                    reason: reason.to_owned(),
+                    ..Default::default()
+                };
+                match self.peek_txn(&r.txn_id, Some(caller.principal)) {
+                    Peek::Live => Ok(answer(
+                        S::InProgress,
+                        "the transaction is open or committing",
+                    )),
+                    Peek::Done(Ok(c)) => Ok(proto::TxnOutcomeResponse {
+                        state: S::Committed as i32,
+                        commit: c.commit,
+                        parts: c.parts,
+                        reason: String::new(),
+                    }),
+                    Peek::Done(Err(e)) => Ok(answer(
+                        if e.code == "OutcomeUnknown" {
+                            S::Unknown
+                        } else {
+                            S::Aborted
+                        },
+                        &e.message,
+                    )),
+                    Peek::Gone | Peek::Foreign => Err(ApiError::not_found(
+                        "no such transaction (its outcome is kept only while its session's \
+                         record is)",
+                    )),
+                }
+                .map(ServiceReply::Outcome)
             }
             ServiceOp::OpenSnapshot(r) => {
                 drop(budget);
@@ -2529,10 +2870,14 @@ impl Service {
         // The caller's scope, as admission checks it; the budget is the fanning-out node's.
         self.check(&op.admit(), caller)?;
         // Its partition's lease, before the read and again after it took its snapshot
-        // (D326, audit120's S3).
+        // (D326, audit120's S3); and its ranges a move gates (D331).
         if let Some(gate) = &self.gate {
             gate.serving()?;
+            if let Some(ranges) = &*gate.ranges().load() {
+                ranges.check(&op, false)?;
+            }
         }
+        self.copy_ranges(&op)?;
         let reply = self.fanout_read(op, caller).await?;
         if let Some(gate) = &self.gate {
             gate.serving()?;
@@ -2873,6 +3218,7 @@ impl Service {
             let _ = writeln!(text, "# TYPE pigeonhole_serve_feed_hub_threads gauge");
             let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
         }
+        render_candle(&mut text, super::CANDLE_UNSET.load(Ordering::Relaxed));
         render_bulk(&mut text, parts);
         if self.text_rebuilds.packs() {
             render_text_packs(&mut text, parts);
@@ -4064,6 +4410,7 @@ impl Service {
             .ok_or_else(|| ApiError::internal("a replica scan on a service that isn't one"))?;
         let op = ServiceOp::Scan(r);
         let budget = self.admit(&op.admit(), caller, None).await?;
+        self.copy_ranges(&op)?;
         let ServiceOp::Scan(r) = op else {
             unreachable!("made a scan just above")
         };
@@ -4075,6 +4422,20 @@ impl Service {
             .bounded(replica, max_lag_ms);
         drop(budget);
         opener.open(r, Some(slot), None, Some(Arc::clone(&self.metrics)))
+    }
+
+    /// D331 PR 3: on a cluster replica copy (it has no `WriteGate`), the copy's range gate,
+    /// which its follower keeps: a copy of a move's target serves the range once it has
+    /// applied the target's serving row, and a copy of its source refuses a moved range as
+    /// the source does. One load, `None` on every other service.
+    #[inline]
+    fn copy_ranges(&self, op: &ServiceOp) -> Result<(), ApiError> {
+        if let Some(replica) = &self.replica
+            && let Some(ranges) = &*replica.ranges().load()
+        {
+            ranges.check(op, false)?;
+        }
+        Ok(())
     }
 
     /// A `--max-scans` slot, or `Overloaded`.
@@ -4371,7 +4732,21 @@ impl Service {
             ));
         }
         drop(budget);
-        self.subscribe_part(r, caller, 0, false, false).await
+        self.subscribe_part(r, caller, PartStart::default()).await
+    }
+
+    /// D331 PR 3b: the last seqno of a range move that took table `table` from this
+    /// partition, while its moved-away row is here: a cluster component of it reads up to
+    /// there (the latest, for several).
+    pub(crate) fn moved_away(&self, table: &str) -> Option<u64> {
+        self.gate
+            .as_ref()?
+            .ranges()
+            .moved_rows()
+            .into_iter()
+            .filter(|m| m.table == table)
+            .map(|m| m.final_seqno)
+            .max()
     }
 
     /// A subscription of this server's database: a single node's `Feed.Subscribe`, or one
@@ -4379,14 +4754,25 @@ impl Service {
     /// commits the client already handled ([`super::feed::Spec::skip`]) and which
     /// `announce`s its start ([`super::feed::Spec::announce`]). Holds a `--max-streams`
     /// place either way.
+    ///
+    /// D331 PR 3b, on a cluster partition a range move gave a range of these tables: a
+    /// cluster component (`announce`) that starts at or before a move's hand-over carries
+    /// its barrier ([`super::feed::Barrier`]), and `from_hand_over` starts it at the earliest
+    /// hand-over of these tables here, not at `r`'s start (a resume that gained this
+    /// partition through a move; `FeedExpired` if no move did).
     pub(crate) async fn subscribe_part(
         &self,
-        r: proto::SubscribeRequest,
+        mut r: proto::SubscribeRequest,
         caller: &Caller,
-        skip: u64,
-        announce: bool,
-        internal: bool,
+        part: PartStart,
     ) -> Result<super::feed::FeedEvents, ApiError> {
+        let PartStart {
+            skip,
+            announce,
+            internal,
+            from_hand_over,
+            ends_at,
+        } = part;
         use super::feed::Start;
         use proto::subscribe_request::Start as S;
         let slot = self.stream_slot()?;
@@ -4400,6 +4786,11 @@ impl Service {
         for name in &names {
             tables.push(self.table(name).await?);
         }
+        let barriers = if announce {
+            self.hand_overs(&names, &mut r, from_hand_over)?
+        } else {
+            Vec::new()
+        };
         let start = match r.start {
             None | Some(S::FromOldest(false)) => Start::Now,
             Some(S::FromOldest(true)) => Start::Oldest,
@@ -4445,6 +4836,62 @@ impl Service {
                 Some(gate) => events.leased(Arc::clone(gate)),
                 None => Ok(events),
             })
+            .map(|events| {
+                // A cluster component of a cluster partition watches for a hand-over it
+                // takes while running (D331 PR 3b).
+                let watch = self
+                    .gate
+                    .as_ref()
+                    .filter(|_| announce)
+                    .map(|g| (Arc::clone(g), names.clone()));
+                events.with_barriers(barriers, ends_at, watch)
+            })
+    }
+
+    /// The range moves' hand-overs a cluster component of `tables` here carries (D331 PR
+    /// 3b): one barrier for each serving row of these tables, whatever the start.
+    /// `from_hand_over` first sets `r`'s start to the earliest of their tokens. None on a
+    /// partition no move gave a range.
+    fn hand_overs(
+        &self,
+        tables: &[String],
+        r: &mut proto::SubscribeRequest,
+        from_hand_over: bool,
+    ) -> Result<Vec<super::feed::Barrier>, ApiError> {
+        use proto::subscribe_request::Start as S;
+        let rows: Vec<super::ranges::Moved> = self
+            .gate
+            .as_ref()
+            .map(|g| g.ranges().serving_rows())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| !m.token.is_empty() && tables.contains(&m.table))
+            .collect();
+        if from_hand_over {
+            // A move into this partition that hasn't reached CLEANING (or whose serving row
+            // isn't here yet) is no gap: it serves none of the range yet, so the resume asks
+            // again shortly (cli692's M1 on PR 3b). No move at all is one.
+            let handing = self
+                .gate
+                .as_ref()
+                .and_then(|g| g.ranges().load().as_ref().cloned())
+                .is_some_and(|s| tables.iter().any(|t| s.awaits_hand_over(t)));
+            if rows.is_empty() && handing {
+                return Err(ApiError::partition_unavailable(
+                    "this partition is taking a range of these tables over from another, \
+                     and doesn't serve it yet: resume again shortly",
+                ));
+            }
+            let first = rows.iter().min_by_key(|m| m.seqno).ok_or_else(|| {
+                ApiError::from_code(
+                    pigeonhole::ErrorCode::FeedExpired,
+                    "no range move gave this partition a range of these tables, so a \
+                     resume has no hand-over to start it at: subscribe again",
+                )
+            })?;
+            r.start = Some(S::Resume(first.token.clone().into()));
+        }
+        Ok(barriers_for(rows, r.start.as_ref()))
     }
 
     /// The feed fan-out's limits: a cluster subscription's buffer and idle limit are a
@@ -4488,7 +4935,7 @@ impl Service {
     /// and decoded (`convert::txn_ops`), all before the transaction is taken out. So a missing
     /// table or a malformed write fails the call with nothing buffered (simp724's T1 on
     /// #1511), and buffering the rest can't fail on the server's side.
-    async fn txn_rows<'r>(
+    pub(crate) async fn txn_rows<'r>(
         &self,
         rows: &'r [proto::RowWrites],
     ) -> Result<Vec<(Table, &'r [u8], Vec<convert::TxnOp<'r>>)>, ApiError> {
@@ -4588,11 +5035,7 @@ impl Service {
         let rows = self.txn_rows(&r.rows).await?;
         let mut g = match self.sessions.take(&r.txn_id, caller.principal)? {
             Taken::Open(g) => g,
-            Taken::Done(outcome) => {
-                return outcome.map(|c| proto::TxnCommitResponse {
-                    commit: Some(convert::commit_info(c)),
-                });
-            }
+            Taken::Done(outcome) => return outcome,
         };
         // A commit that writes is a write to a fenced partition (D317 ticket 6); a
         // read-only one is a consistent read. Refused, the transaction stays open.
@@ -4600,6 +5043,17 @@ impl Service {
             Some(gate) if g.wrote() || !rows.is_empty() => Some(gate.enter()?),
             _ => None,
         };
+        // D331: the rows it carries, as writes, and M3, a transaction open across a range's
+        // fence or hand-over, as simp724 agreed it ([`super::ranges`]); one load.
+        if let Some(gate) = &self.gate
+            && let Some(ranges) = &*gate.ranges().load()
+        {
+            ranges.commit(
+                &r.rows,
+                g.txn().snapshot_seqno(),
+                g.wrote() || !rows.is_empty(),
+            )?;
+        }
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);
         }
@@ -4625,7 +5079,10 @@ impl Service {
                 (Ok(c), Some(h)) => h.committed().map(|()| c),
                 (o, _) => o,
             };
-            ticket.finish(outcome.clone());
+            ticket.finish(outcome.clone().map(|c| proto::TxnCommitResponse {
+                commit: Some(convert::commit_info(c)),
+                parts: Vec::new(),
+            }));
             drop(budget);
             drop(held);
             if tx.send(outcome).is_err() {
@@ -4639,12 +5096,735 @@ impl Service {
         })?;
         Ok(proto::TxnCommitResponse {
             commit: Some(convert::commit_info(outcome)),
+            parts: Vec::new(),
         })
     }
 
     fn abort(&self, r: &proto::TxnAbortRequest, caller: &Caller) -> Result<proto::Empty, ApiError> {
         self.open_txn(&r.txn_id, caller)?.abort();
         Ok(proto::Empty {})
+    }
+
+    /// The home partition's `Begin` of a spanning transaction (D329): its id carries the
+    /// home's history epoch (`epoch`), and is its xid. The decision table is made first, if
+    /// it's missing, so it's older than the transaction's snapshot: its commit point reads
+    /// and writes it, which a table created after the snapshot would refuse.
+    pub(crate) async fn begin_spanning(
+        &self,
+        r: proto::BeginRequest,
+        caller: &Caller,
+        epoch: u64,
+    ) -> Result<proto::BeginResponse, ApiError> {
+        if let Some(gate) = &self.gate {
+            gate.serving()?;
+        }
+        drop(self.decisions_table().await?);
+        let txn = self.part()?.db.transaction()?;
+        let snapshot_seqno = txn.snapshot_seqno();
+        let txn_id = self.sessions.begin_spanning(
+            caller.principal,
+            txn,
+            convert::durability(r.durability),
+            epoch,
+        )?;
+        Ok(proto::BeginResponse {
+            txn_id,
+            snapshot_seqno,
+        })
+    }
+
+    /// Buffers decoded `rows` ([`txn_rows`](Self::txn_rows)) in the transaction `g` holds:
+    /// it can't fail (D329's coordinator buffers a spanning call's home rows on the session
+    /// it already holds).
+    pub(crate) fn buffer_rows(
+        g: &mut super::sessions::TxnGuard,
+        rows: &[(Table, &[u8], Vec<convert::TxnOp<'_>>)],
+    ) {
+        for (table, row, ops) in rows {
+            convert::txn_apply(g.txn(), table, row, ops);
+        }
+        if !rows.is_empty() {
+            g.wrote_now();
+        }
+    }
+
+    /// Whether the partition takes writes now (its gate admits one): what a spanning call
+    /// checks before its first row goes to a branch.
+    pub(crate) fn writable(&self) -> Result<(), ApiError> {
+        match &self.gate {
+            Some(gate) => gate.enter().map(drop),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends spanning transaction `g` after a call that sent rows to a branch failed (D329,
+    /// audit120's M3b on #2062): its branches are aborted (in the background, on their own
+    /// budget), and `err` becomes the session's recorded outcome, so a retry finds the
+    /// transaction ended rather than applying those rows again. Returns `err`.
+    pub(crate) fn end_spanning(
+        mut g: super::sessions::TxnGuard,
+        err: ApiError,
+        driver: &super::cluster::spanning::Driver,
+    ) -> ApiError {
+        use super::cluster::spanning::SpanView;
+        if let Some(span) = g.span() {
+            let mut branches = span.branches(&driver.home);
+            branches.extend(span.idle(&driver.home));
+            let d = driver.for_round();
+            tokio::spawn(async move { d.abort(&branches).await });
+        }
+        let (txn, _, ticket) = g.commit();
+        drop(txn);
+        ticket.finish(Err(err.clone()));
+        err
+    }
+
+    /// How long after its begin an absent decision record of a spanning transaction is
+    /// presumed aborted (D329 2b): `--txn-outcome-retention`. A committed record can be
+    /// collected from its commit time plus retention, which may be just after the begin, so
+    /// from begin plus retention on an absent record may be a collected commit: not found,
+    /// never presumed aborted (audit120's M1 on #2076). The startup floor (retention at least
+    /// the lifetime, the request timeout and a minute) puts a transaction's whole life
+    /// inside this window, with the minute for clock skew.
+    pub(crate) fn outcome_horizon(&self) -> std::time::Duration {
+        self.limits.txn_outcome_retention
+    }
+
+    /// `--txn-outcome-retention`.
+    pub(crate) fn outcome_retention(&self) -> std::time::Duration {
+        self.limits.txn_outcome_retention
+    }
+
+    /// Records that branches `acked` applied spanning transaction `xid`'s commit (D329 2b), in
+    /// its decision row, for its GC. A row that's gone, or isn't a commit, is left as it is.
+    pub(crate) async fn ack_decision(&self, xid: &str, acked: &[String]) -> Result<(), ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, with_acks};
+        if acked.is_empty() {
+            return Ok(());
+        }
+        let table = self.decisions_table().await?;
+        let row = xid.as_bytes().to_vec();
+        for _ in 0..3 {
+            let mut txn = self.part()?.db.transaction()?;
+            let Some(c) = txn
+                .get_async(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER)
+                .await?
+            else {
+                return Ok(());
+            };
+            let Some(value) = with_acks(c.value(), acked) else {
+                return Ok(());
+            };
+            txn.put(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER, &value);
+            let held = match &self.gate {
+                Some(gate) => Some(gate.enter()?),
+                None => None,
+            };
+            let done = txn.commit_async().await.map_err(ApiError::from);
+            drop(held);
+            match done {
+                Ok(_) => return Ok(()),
+                Err(e) if e.code == "Conflict" => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes this home's decision rows past `--txn-outcome-retention` at `now_ms` (D329
+    /// 2b): commits every branch acknowledged, and abort markers. Returns how many went.
+    pub(crate) async fn sweep_decisions(&self, now_ms: u64) -> Result<usize, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
+        let table = self.decisions_table().await?;
+        let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
+        let gone: Vec<Vec<u8>> = {
+            let table = table.clone();
+            self.blocking(move || {
+                let mut gone = Vec::new();
+                for row in table.scan_prefix(b"").iter()? {
+                    let row = row?;
+                    let Some(cell) = row.get(DECISION_FAMILY, DECISION_QUALIFIER) else {
+                        continue;
+                    };
+                    if collectable(cell.value(), now_ms, retention) {
+                        gone.push(row.key().to_vec());
+                    }
+                }
+                Ok(gone)
+            })
+            .await?
+        };
+        let held = match &self.gate {
+            Some(gate) => Some(gate.enter()?),
+            None => None,
+        };
+        let mut n = 0;
+        for key in &gone {
+            table.mutate(key).delete_row().commit()?;
+            n += 1;
+        }
+        drop(held);
+        Ok(n)
+    }
+
+    /// What transaction `id` is now, for `caller` (D329's `Outcome` and resolver), without
+    /// taking it.
+    /// Transaction `id`'s session as `principal` sees it (`None`: the node's own call,
+    /// [`super::sessions::Sessions::peek`]).
+    pub(crate) fn peek_txn(
+        &self,
+        id: &str,
+        principal: Option<super::auth::Principal>,
+    ) -> super::sessions::Peek {
+        self.sessions.peek(id, principal)
+    }
+
+    /// `--txn-lifetime-ms`.
+    pub(crate) fn txn_lifetime(&self) -> std::time::Duration {
+        self.sessions.txn_lifetime()
+    }
+
+    /// Spanning transaction `xid`'s decision row on this home partition (D329), read now:
+    /// `None` when it has none.
+    pub(crate) async fn decision(&self, xid: &str) -> Result<Option<Vec<u8>>, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER};
+        let table = self.decisions_table().await?;
+        let row = xid.as_bytes().to_vec();
+        self.blocking(move || {
+            Ok(table
+                .get(&row, DECISION_FAMILY, DECISION_QUALIFIER)?
+                .map(|c| c.value().to_vec()))
+        })
+        .await
+    }
+
+    /// Makes spanning transaction `xid`'s outcome final as aborted, if nothing decided it
+    /// (D329: the resolver's and `Outcome`'s absent row, with the home's history unchanged):
+    /// an OCC transaction that reads the row and, absent, writes the abort marker through
+    /// the gate at `GroupSync`, so the commit point (which reads the row absent and writes
+    /// `COMMITTED`) and this can't both win. Returns the row as it is now: the marker, or
+    /// what a commit point that won the race wrote.
+    pub(crate) async fn decide_absent(&self, xid: &str, epoch: u64) -> Result<Vec<u8>, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, aborted_value};
+        let table = self.decisions_table().await?;
+        let row = xid.as_bytes().to_vec();
+        for _ in 0..3 {
+            let mut txn = self.part()?.db.transaction()?;
+            if let Some(c) = txn
+                .get_async(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER)
+                .await?
+            {
+                return Ok(c.value().to_vec());
+            }
+            let marker = aborted_value(epoch);
+            txn.put(&table, &row, DECISION_FAMILY, DECISION_QUALIFIER, &marker);
+            let held = match &self.gate {
+                Some(gate) => Some(gate.enter()?),
+                None => None,
+            };
+            let committed = txn
+                .commit_with_async(pigeonhole::Durability::GroupSync)
+                .await
+                .map_err(ApiError::from)
+                .and_then(|c| match &held {
+                    Some(h) => h.committed().map(|()| c),
+                    None => Ok(c),
+                });
+            drop(held);
+            match committed {
+                Ok(_) => return Ok(marker),
+                // The commit point (or another resolver) wrote it meanwhile: read again.
+                Err(e) if e.code == "Conflict" => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(ApiError::unavailable(
+            "the transaction's decision row kept changing: ask again",
+        ))
+    }
+
+    /// Takes transaction `id` for `caller`'s call (D329's coordinator: a spanning
+    /// transaction's home session, with its span).
+    pub(crate) fn take_txn(&self, id: &str, caller: &Caller) -> Result<Taken, ApiError> {
+        self.sessions.take(id, caller.principal)
+    }
+
+    /// Opens spanning transaction `xid`'s branch on this partition (D329), at its snapshot
+    /// now, for the client the home forwarded; with `renew`, renews the open one.
+    pub(crate) fn begin_branch(
+        &self,
+        xid: &str,
+        caller: &Caller,
+        renew: bool,
+    ) -> Result<(), ApiError> {
+        if let Some(gate) = &self.gate {
+            gate.serving()?;
+        }
+        self.sessions.begin_branch(
+            caller.principal,
+            || Ok(self.part()?.db.transaction()?),
+            xid,
+            renew,
+        )
+    }
+
+    /// Prepares branch `xid` (D329) for its home's commit. A writing transaction's branch
+    /// prepares durably, at `GroupSync`, through the gate (a write: its reads and writes
+    /// held until its decide). A read-only one holds its reads in memory, under the lease
+    /// term it was taken in, kept in `spanning` for the release (for twice the request
+    /// timeout at most: its release round is one call).
+    pub(crate) async fn prepare_branch(
+        &self,
+        xid: &str,
+        read_only: bool,
+        spanning: &Arc<super::cluster::spanning::Spanning>,
+        partition: &str,
+    ) -> Result<proto::BranchPrepared, ApiError> {
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("a branch off a cluster partition"))?;
+        let g = match self.sessions.take_branch(xid)? {
+            Taken::Open(g) => g,
+            Taken::Done(outcome) => return Err(ApiError::transaction_finished(&outcome)),
+        };
+        // A prepared branch's tombstone: its outcome is its home's to give.
+        let prepared_mark = || ApiError::invalid("the branch is prepared: its home decides it");
+        if read_only {
+            let term = gate.serving_term()?;
+            let (txn, _, ticket) = g.commit();
+            let held = self
+                .blocking(move || txn.hold_reads().map_err(ApiError::from))
+                .await;
+            // Taken, and the lease ran on unbroken: the hold counts from now.
+            let held = held.and_then(|h| match gate.serving_term() {
+                Ok(t) if t == term => Ok(h),
+                _ => Err(lost_hold(partition)),
+            });
+            let ttl = self.request_timeout() * 2;
+            let prepared = held.map(|h| proto::BranchPrepared {
+                hold: spanning.keep_hold(h, partition, term, ttl),
+                term,
+            });
+            ticket.finish(Err(prepared
+                .as_ref()
+                .err()
+                .cloned()
+                .unwrap_or_else(prepared_mark)));
+            return prepared;
+        }
+        let held = gate.enter()?;
+        let (txn, _, ticket) = g.commit();
+        let xid_bytes = xid.as_bytes().to_vec();
+        let prepared = self
+            .blocking(move || {
+                txn.prepare(&xid_bytes, pigeonhole::Durability::GroupSync)
+                    .map_err(ApiError::from)
+            })
+            .await
+            .and_then(|c| held.committed().map(|()| c));
+        drop(held);
+        ticket.finish(Err(prepared
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(prepared_mark)));
+        prepared.map(|_| proto::BranchPrepared { hold: 0, term: 0 })
+    }
+
+    /// Decides branch `xid` (D329). With `hold`, a read-only branch's release: whether its
+    /// hold lasted, under lease term `term` (`Conflict` if not). Otherwise its decide through
+    /// the gate, synced (the prepare's `GroupSync`) before it answers: the commit's info, or
+    /// `None` for an abort or a share no longer in doubt. An abort also ends a branch that
+    /// never prepared.
+    pub(crate) async fn decide_branch(
+        &self,
+        xid: &str,
+        commit: bool,
+        hold: u64,
+        term: u64,
+        spanning: &super::cluster::spanning::Spanning,
+        partition: &str,
+    ) -> Result<Option<pigeonhole::CommitInfo>, ApiError> {
+        let gate = self
+            .gate
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("a branch off a cluster partition"))?;
+        if hold != 0 {
+            let Some((h, taken)) = spanning.take_hold(hold, partition) else {
+                return Err(lost_hold(partition));
+            };
+            let lasted = self
+                .blocking(move || h.release().map_err(ApiError::from))
+                .await?;
+            return match gate.serving_term() {
+                Ok(t) if lasted && t == term && taken == term => Ok(None),
+                _ => Err(lost_hold(partition)),
+            };
+        }
+        if !commit && let Ok(Taken::Open(g)) = self.sessions.take_branch(xid) {
+            g.abort();
+        }
+        let held = gate.enter()?;
+        let db = self.part()?.db.clone();
+        let xid_bytes = xid.as_bytes().to_vec();
+        let decided = self
+            .blocking(move || db.decide(&xid_bytes, commit).map_err(ApiError::from))
+            .await;
+        let decided = decided.and_then(|c| held.committed().map(|()| c));
+        drop(held);
+        decided
+    }
+
+    /// The home's commit of spanning transaction `r.txn_id` (D329), its session `g` already
+    /// taken by the coordinator (its tombstone answered a repeated `Commit` there), with
+    /// `driver` reaching its branches: prepares, the commit point (the decision row in the
+    /// home's own commit) and the decides when anything was written anywhere; holds and
+    /// their release round when nothing was.
+    ///
+    /// Until the session turns to `Committing`, a refusal puts it back as it was, its span
+    /// and branches untouched, so a retried `Commit` commits the whole transaction (audit120's
+    /// M1 on #2062). From then the round runs detached, in its own task, as
+    /// [`commit`](Self::commit)'s does: a client that goes away never leaves branches
+    /// prepared past the commit point undecided by this node.
+    pub(crate) async fn commit_spanning(
+        self: &Arc<Self>,
+        mut g: super::sessions::TxnGuard,
+        r: proto::TxnCommitRequest,
+        caller: &Caller,
+        budget: OwnedSemaphorePermit,
+        driver: super::cluster::spanning::Driver,
+        forwarded: bool,
+    ) -> Result<proto::TxnCommitResponse, ApiError> {
+        use super::cluster::spanning::SpanView;
+        let gate = Arc::clone(
+            self.gate
+                .as_ref()
+                .ok_or_else(|| ApiError::internal("a spanning commit off a cluster"))?,
+        );
+        let home = driver.home.to_string();
+        let span = g
+            .span()
+            .cloned()
+            .ok_or_else(|| ApiError::internal("a spanning id on a plain session"))?;
+        let writes = span.wrote() || !r.rows.is_empty() || g.wrote();
+        // The coordinator checked these before the commit's rows went to branches; if one
+        // fails now anyway (a table dropped in between), a commit that sent rows ends the
+        // transaction rather than leave them applied for a retry (audit120's M3b).
+        let refuse = |g, e: ApiError| {
+            if forwarded {
+                Err(Self::end_spanning(g, e, &driver))
+            } else {
+                Err(e)
+            }
+        };
+        if writes && !caller.scope.allows(Scope::Write) {
+            return refuse(g, ApiError::permission_denied("commit writes"));
+        }
+        let rows = match self.txn_rows(&r.rows).await {
+            Ok(rows) => rows,
+            Err(e) => return refuse(g, e),
+        };
+        let decisions = if writes {
+            match self.decisions_table().await {
+                Ok(t) => Some(t),
+                Err(e) => return refuse(g, e),
+            }
+        } else {
+            None
+        };
+        for (table, row, ops) in &rows {
+            convert::txn_apply(g.txn(), table, row, ops);
+        }
+        drop(rows);
+        let branches = span.branches(&home);
+        let idle = span.idle(&home);
+        let home_read = span.read(&home);
+        let (txn, durability, ticket) = g.commit();
+        let me = Arc::clone(self);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let metrics = Arc::clone(&self.metrics);
+        tokio::spawn(async move {
+            // Branches opened that did nothing aren't prepared (they'd refuse): their
+            // sessions end (audit120's S3), beside the round, not before it (a silent node
+            // there mustn't spend the client's deadline).
+            if !idle.is_empty() {
+                let d = driver.for_round();
+                tokio::spawn(async move { d.abort(&idle).await });
+            }
+            let outcome = match decisions {
+                Some(decisions) => {
+                    me.spanning_write(txn, durability, &decisions, &gate, &driver, &branches)
+                        .await
+                }
+                None => {
+                    me.spanning_read(txn, home_read, &gate, &driver, &branches)
+                        .await
+                }
+            };
+            ticket.finish(outcome.clone());
+            drop(budget);
+            // The branches its decide round applied, recorded for the decision row's GC,
+            // after the reply (D329 2b).
+            let applied: Vec<String> = match &outcome {
+                Ok(r) => r
+                    .parts
+                    .iter()
+                    .skip(1)
+                    .filter(|p| p.applied)
+                    .map(|p| p.partition.clone())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            if tx.send(outcome).is_err() {
+                metrics.replies_lost.fetch_add(1, Ordering::Relaxed);
+            }
+            if !applied.is_empty()
+                && let Err(e) = me.ack_decision(&driver.xid, &applied).await
+            {
+                eprintln!(
+                    "phdb serve: recording a transaction's branch acks: {}",
+                    e.message
+                );
+            }
+        });
+        rx.await.unwrap_or_else(|_| {
+            Err(ApiError::outcome_unknown(
+                "the commit's task ended without an outcome",
+            ))
+        })
+    }
+
+    /// The home's decision table (D329). Created through the gate if it's missing (a write
+    /// to the file: never past a fence's drain), the first time a spanning transaction
+    /// begins on the partition.
+    pub(crate) async fn decisions_table(&self) -> Result<Table, ApiError> {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISIONS};
+        let db = self.part()?.db.clone();
+        if let Ok(t) = db.table(DECISIONS).and_then(|t| t.open()) {
+            return Ok(t);
+        }
+        let held = match &self.gate {
+            Some(gate) => Some(gate.enter()?),
+            None => None,
+        };
+        let table = self
+            .blocking(move || {
+                Ok(db
+                    .table(DECISIONS)?
+                    .family(DECISION_FAMILY, pigeonhole::Family::default())
+                    .create_if_missing()?)
+            })
+            .await;
+        drop(held);
+        table
+    }
+
+    /// A spanning commit that wrote: every branch prepares, then the commit point, then the
+    /// decides. Aborts and decides run on a budget of their own ([`Driver::for_round`]),
+    /// since the prepare round may have used the client's (audit120's S1); the answer waits
+    /// for the decides only until the client's deadline.
+    ///
+    /// [`Driver::for_round`]: super::cluster::spanning::Driver::for_round
+    async fn spanning_write(
+        &self,
+        mut txn: pigeonhole::Transaction,
+        durability: Option<pigeonhole::Durability>,
+        decisions: &Table,
+        gate: &Arc<super::gate::WriteGate>,
+        driver: &super::cluster::spanning::Driver,
+        branches: &[String],
+    ) -> super::sessions::Outcome {
+        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, committed_value};
+        let conflict = |why: String| ApiError::from_code(pigeonhole::ErrorCode::Conflict, &why);
+        let abort = || async { driver.for_round().abort(branches).await };
+        if let Err(e) = driver.check_feature().await {
+            abort().await;
+            return Err(e);
+        }
+        let (_, refused) = driver.prepare(branches, false).await;
+        if let Some(e) = refused {
+            abort().await;
+            // Never committed: the commit point wasn't reached, so any refusal, a timeout
+            // too, is safe to retry.
+            return Err(conflict(format!(
+                "a branch refused its prepare ({}): {}",
+                e.code, e.message
+            )));
+        }
+        #[cfg(test)]
+        {
+            use super::cluster::spanning::seams;
+            if seams::at(&driver.xid, seams::Step::CommitPoint).await {
+                return Err(ApiError::outcome_unknown(
+                    "abandoned before the commit point",
+                ));
+            }
+        }
+        // The commit point: the decision row read (absent: no abort marker) and written in
+        // the home's own commit, through its gate, at GroupSync or stronger.
+        let epoch = super::sessions::spanning_parts(&driver.xid).map_or(0, |(_, e, _)| e);
+        let row = driver.xid.as_bytes().to_vec();
+        let marker = match txn
+            .get_async(decisions, &row, DECISION_FAMILY, DECISION_QUALIFIER)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                abort().await;
+                return Err(e.into());
+            }
+        };
+        if marker.is_some() {
+            abort().await;
+            return Err(conflict(
+                "the transaction was decided without its home (an abort marker)".into(),
+            ));
+        }
+        txn.put(
+            decisions,
+            &row,
+            DECISION_FAMILY,
+            DECISION_QUALIFIER,
+            &committed_value(epoch, branches),
+        );
+        // Its records and feed events carry the xid, as every branch's share does (D329 2b):
+        // a subscriber groups the commit's shares by it. A home-only commit too (F3).
+        txn.tag_xid(driver.xid.as_bytes());
+        let held = match gate.enter() {
+            Ok(h) => h,
+            Err(e) => {
+                abort().await;
+                return Err(e);
+            }
+        };
+        let d = durability
+            .unwrap_or(pigeonhole::Durability::GroupSync)
+            .max(pigeonhole::Durability::GroupSync);
+        let committed = match tokio::spawn(txn.commit_with_async(d)).await {
+            Ok(r) => r.map_err(ApiError::from),
+            Err(e) => Err(ApiError::outcome_unknown(format!(
+                "the commit's task failed: {e}"
+            ))),
+        }
+        .and_then(|c| held.committed().map(|()| c));
+        drop(held);
+        let info = match committed {
+            Ok(c) => c,
+            // Unknown: the branches stay in doubt, and the resolver settles them from the
+            // decision row (D329 PR 2b).
+            Err(e) if e.code == "OutcomeUnknown" => return Err(e),
+            Err(e) => {
+                abort().await;
+                return Err(e);
+            }
+        };
+        #[cfg(test)]
+        {
+            use super::cluster::spanning::seams;
+            if seams::at(&driver.xid, seams::Step::Decide).await {
+                return Err(ApiError::outcome_unknown("abandoned before the decides"));
+            }
+        }
+        let home = proto::TxnPart {
+            partition: driver.home.to_string(),
+            seqno: info.seqno,
+            applied: true,
+        };
+        // The decides on their own budget, in a task of their own: they go on to every
+        // branch whatever the client's deadline; the answer waits for them until then.
+        let decides = {
+            let (d, b) = (driver.for_round(), branches.to_vec());
+            tokio::spawn(async move { d.decide(&b, true).await })
+        };
+        let decided = tokio::time::timeout_at(driver.deadline, decides).await;
+        let mut parts = vec![home];
+        match decided {
+            Ok(Ok(decided)) => parts.extend(decided),
+            // Not all answered in time (or the round's task failed): each is committed, and
+            // its resolver applies it if this round doesn't.
+            _ => parts.extend(branches.iter().map(|p| proto::TxnPart {
+                partition: p.clone(),
+                seqno: 0,
+                applied: false,
+            })),
+        }
+        Ok(proto::TxnCommitResponse {
+            commit: Some(convert::commit_info(info)),
+            parts,
+        })
+    }
+
+    /// A spanning commit that wrote nothing: every partition that read holds its reads, the
+    /// home too, then a release round confirms that every hold lasted (`Conflict` if not).
+    async fn spanning_read(
+        &self,
+        txn: pigeonhole::Transaction,
+        home_read: bool,
+        gate: &Arc<super::gate::WriteGate>,
+        driver: &super::cluster::spanning::Driver,
+        branches: &[String],
+    ) -> super::sessions::Outcome {
+        let seqno = txn.snapshot_seqno();
+        let lost = || {
+            ApiError::from_code(
+                pigeonhole::ErrorCode::Conflict,
+                "a read of the transaction changed or lost its hold before the commit (a \
+                 partition's lease lapsed, it moved or it reopened): retry it",
+            )
+        };
+        // The home's own hold first: a branch's taken after it overlaps it. A home whose
+        // read call failed holds nothing (`InvalidArgument`: no reads).
+        let home = if home_read {
+            let term = gate.serving_term()?;
+            match self
+                .blocking(move || txn.hold_reads().map_err(ApiError::from))
+                .await
+            {
+                Ok(hold) => Some((hold, term)),
+                Err(e) if e.code == "InvalidArgument" => None,
+                Err(e) => return Err(e),
+            }
+        } else {
+            drop(txn);
+            None
+        };
+        let (held, refused) = driver.prepare(branches, true).await;
+        #[cfg(test)]
+        {
+            use super::cluster::spanning::seams;
+            if seams::at(&driver.xid, seams::Step::Release).await {
+                // Abandoned: the branches' holds are never released (they expire).
+                return Err(lost());
+            }
+        }
+        let round = driver.for_round();
+        let lasted = refused.is_none() && round.release(&held).await;
+        let home_lasted = match home {
+            Some((hold, term)) => {
+                let lasted = self
+                    .blocking(move || hold.release().map_err(ApiError::from))
+                    .await
+                    .unwrap_or(false);
+                lasted && gate.serving_term().is_ok_and(|t| t == term)
+            }
+            None => true,
+        };
+        if refused.is_some() {
+            // Release whatever was held; the answer is the refusal's.
+            let _ = round.release(&held).await;
+        }
+        if lasted && home_lasted {
+            Ok(proto::TxnCommitResponse {
+                commit: Some(proto::CommitInfo {
+                    seqno,
+                    durability: 0,
+                }),
+                parts: Vec::new(),
+            })
+        } else {
+            Err(lost())
+        }
     }
 
     fn open_snapshot(
@@ -4837,10 +6017,12 @@ async fn held<T: Send + 'static>(
     _place: OwnedSemaphorePermit,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(|| {
+    // A sampled call's work is timed where it runs (D332, simp724's M1 on #2063).
+    let sampled = super::cluster::load::sampled();
+    tokio::task::spawn_blocking(move || {
         // A reused pool thread takes a mask published since it started (D317 ticket 6).
         super::placement::refresh();
-        f()
+        super::cluster::load::run_sampled(sampled.as_ref(), f)
     })
     .await
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
@@ -5370,6 +6552,18 @@ fn reserved(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A read-only spanning transaction's hold on `partition` lost (D329): released, the
+/// partition's lease lapsed or changed term, it moved, or this node restarted.
+fn lost_hold(partition: &str) -> ApiError {
+    ApiError::from_code(
+        pigeonhole::ErrorCode::Conflict,
+        &format!(
+            "the transaction's hold of its reads on partition {partition:?} didn't last to \
+             its commit: retry it"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod text_part_tests {
     use super::filled;
@@ -5417,5 +6611,313 @@ mod text_part_tests {
             .unwrap();
         assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
         filled(&index, "x").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod barriers_for_tests {
+    use super::{barriers_for, proto};
+    use proto::subscribe_request::Start as S;
+
+    /// D331 PR 3b (feed1248's point 2): a component of a move's target gets the move's
+    /// barrier wherever it starts. At or before `t_from` it carries the hand-over's token;
+    /// past it (a checkpoint taken while the merge held the part) or from now, none, so the
+    /// merge's position doesn't move. Mutant: give only starts at or before `t_from` a
+    /// barrier, and the start past it gets none.
+    #[test]
+    fn every_start_gets_the_barrier() {
+        let token = |seqno: u64| {
+            let mut t = vec![1u8];
+            t.extend_from_slice(&[7u8; 16]);
+            t.extend_from_slice(&1u32.to_le_bytes());
+            t.extend_from_slice(&seqno.to_le_bytes());
+            t
+        };
+        let row = super::super::ranges::Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            seqno: 10,
+            source: "p1".into(),
+            final_seqno: 99,
+            token: token(10),
+            ..Default::default()
+        };
+        let at = |start: Option<S>| barriers_for(vec![row.clone()], start.as_ref());
+        let before = at(Some(S::Resume(token(5).into())));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].token.as_ref(), token(10).as_slice());
+        let exactly = at(Some(S::Resume(token(10).into())));
+        assert_eq!(exactly[0].token.as_ref(), token(10).as_slice());
+        for start in [Some(S::Resume(token(20).into())), None] {
+            let past = at(start);
+            assert_eq!(past.len(), 1, "a start past t_from still gets it");
+            assert!(past[0].token.is_empty());
+            assert_eq!((past[0].t_from, past[0].final_seqno), (10, 99));
+        }
+    }
+}
+
+#[cfg(test)]
+mod touches_tests {
+    use std::ops::{Bound, ControlFlow};
+
+    use super::{ServiceOp, Touch, proto};
+
+    /// What `op.touches` reports, owned, stopping after `limit` keys.
+    fn touched(op: &ServiceOp, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let _ = op.touches(&mut |table: &str, touch: Touch<'_>| {
+            let show = |b: Bound<&[u8]>| match b {
+                Bound::Included(k) => format!("[{}", String::from_utf8_lossy(k)),
+                Bound::Excluded(k) => format!("({}", String::from_utf8_lossy(k)),
+                Bound::Unbounded => "*".to_owned(),
+            };
+            let key = match touch {
+                Touch::Row(k) => String::from_utf8_lossy(k).into_owned(),
+                Touch::Prefix(p) => format!("{}…", String::from_utf8_lossy(p)),
+                Touch::Range { start, end } => format!("{}..{}", show(start), show(end)),
+            };
+            out.push((table.to_owned(), key));
+            if out.len() == limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        out
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|&(t, k)| (t.to_owned(), k.to_owned()))
+            .collect()
+    }
+
+    fn row(table: &str, row: &'static str) -> proto::RowWrites {
+        proto::RowWrites {
+            row: Some(proto::RowKey {
+                table: table.into(),
+                row: row.into(),
+            }),
+            writes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn point_reads_report_their_rows_in_request_order() {
+        let get = ServiceOp::Get(proto::GetRequest {
+            table: "t".into(),
+            row: "a".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&get, usize::MAX), pairs(&[("t", "a")]));
+        let multi = ServiceOp::MultiGet(proto::MultiGetRequest {
+            table: "t".into(),
+            keys: vec!["c".into(), "a".into(), "c".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&multi, usize::MAX),
+            pairs(&[("t", "c"), ("t", "a"), ("t", "c")])
+        );
+        let txn = ServiceOp::TxnGetRow(proto::TxnGetRowRequest {
+            table: "u".into(),
+            row: "r".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&txn, usize::MAX), pairs(&[("u", "r")]));
+    }
+
+    #[test]
+    fn a_scan_reports_its_range_as_given() {
+        use proto::key_range::Range;
+        let scan = |range| {
+            ServiceOp::Scan(proto::ScanRequest {
+                table: "t".into(),
+                range,
+                ..Default::default()
+            })
+        };
+        let prefix = scan(Some(proto::KeyRange {
+            range: Some(Range::Prefix("ab".into())),
+        }));
+        assert_eq!(touched(&prefix, usize::MAX), pairs(&[("t", "ab…")]));
+        let bounds = scan(Some(proto::KeyRange {
+            range: Some(Range::Bounds(proto::Bounds {
+                start: Some(proto::Bound {
+                    key: "b".into(),
+                    inclusive: false,
+                }),
+                end: Some(proto::Bound {
+                    key: "m".into(),
+                    inclusive: true,
+                }),
+            })),
+        }));
+        assert_eq!(touched(&bounds, usize::MAX), pairs(&[("t", "(b..[m")]));
+        let open_end = scan(Some(proto::KeyRange {
+            range: Some(Range::Bounds(proto::Bounds {
+                start: Some(proto::Bound {
+                    key: "b".into(),
+                    inclusive: true,
+                }),
+                end: None,
+            })),
+        }));
+        assert_eq!(touched(&open_end, usize::MAX), pairs(&[("t", "[b..*")]));
+        assert_eq!(touched(&scan(None), usize::MAX), pairs(&[("t", "*..*")]));
+    }
+
+    #[test]
+    fn writes_report_each_row_with_its_own_table() {
+        let batch = ServiceOp::Batch(proto::BatchRequest {
+            rows: vec![
+                row("t", "a"),
+                proto::RowWrites::default(),
+                row("u", "b"),
+                row("t", "a"),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&batch, usize::MAX),
+            pairs(&[("t", "a"), ("u", "b"), ("t", "a")])
+        );
+        let mutate = ServiceOp::MutateReturning(proto::MutateRequest {
+            writes: Some(row("t", "x")),
+            ..Default::default()
+        });
+        assert_eq!(touched(&mutate, usize::MAX), pairs(&[("t", "x")]));
+        let no_row = ServiceOp::Mutate(proto::MutateRequest::default());
+        assert!(touched(&no_row, usize::MAX).is_empty());
+        let check = ServiceOp::CheckAndMutate(proto::CheckAndMutateRequest {
+            writes: Some(row("t", "y")),
+            ..Default::default()
+        });
+        assert_eq!(touched(&check, usize::MAX), pairs(&[("t", "y")]));
+        let write = ServiceOp::TxnWrite(proto::TxnWriteRequest {
+            rows: vec![row("t", "p")],
+            ..Default::default()
+        });
+        assert_eq!(touched(&write, usize::MAX), pairs(&[("t", "p")]));
+        let commit = ServiceOp::Commit(proto::TxnCommitRequest {
+            rows: vec![row("u", "q"), row("t", "p")],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&commit, usize::MAX),
+            pairs(&[("u", "q"), ("t", "p")])
+        );
+    }
+
+    #[test]
+    fn break_stops_the_walk() {
+        let batch = ServiceOp::Batch(proto::BatchRequest {
+            rows: vec![row("t", "a"), row("t", "b"), row("t", "c")],
+            ..Default::default()
+        });
+        assert_eq!(touched(&batch, 1), pairs(&[("t", "a")]));
+        assert_eq!(
+            batch.touches(&mut |_, _| ControlFlow::Break(())),
+            ControlFlow::Break(())
+        );
+        assert_eq!(
+            batch.touches(&mut |_, _| ControlFlow::Continue(())),
+            ControlFlow::Continue(())
+        );
+    }
+
+    #[test]
+    fn calls_without_rows_or_ids_report_nothing() {
+        for op in [
+            ServiceOp::Info(proto::Empty::default()),
+            ServiceOp::Begin(proto::BeginRequest::default()),
+            ServiceOp::Abort(proto::TxnAbortRequest::default()),
+            ServiceOp::TextCreateIndex(proto::CreateTextIndexRequest::default()),
+            ServiceOp::Forget(proto::ForgetRequest {
+                ids: vec!["a".into()],
+            }),
+        ] {
+            assert!(touched(&op, usize::MAX).is_empty(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn index_calls_report_their_ids_or_the_whole_index() {
+        let put = ServiceOp::TextPut(proto::TextPutRequest {
+            index: "x".into(),
+            id: "d1".into(),
+            ..Default::default()
+        });
+        assert_eq!(touched(&put, usize::MAX), pairs(&[("x", "d1")]));
+        let delete = ServiceOp::VectorDelete(proto::VectorDeleteRequest {
+            index: "v".into(),
+            id: "a".into(),
+        });
+        assert_eq!(touched(&delete, usize::MAX), pairs(&[("v", "a")]));
+        let rebuild = ServiceOp::TextRebuild(proto::TextIndexRequest { index: "x".into() });
+        assert_eq!(touched(&rebuild, usize::MAX), pairs(&[("x", "*..*")]));
+        let stats = ServiceOp::TextStats(proto::TextStatsRequest {
+            search: Some(proto::TextSearchRequest {
+                index: "x".into(),
+                ..Default::default()
+            }),
+        });
+        assert_eq!(touched(&stats, usize::MAX), pairs(&[("x", "*..*")]));
+    }
+
+    /// What a gate maps `Text.Put`'s id to: the source table's row of the same key.
+    #[test]
+    fn a_text_put_writes_the_source_row_its_id_names() {
+        use pigeonhole::{Family, Options, Pigeonhole};
+        use pigeonhole_text::{Index, IndexOptions, Source};
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let table = db
+            .table("docs")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let index = Index::create(
+            &db,
+            "x",
+            Source::new(&table, "f", b"body"),
+            IndexOptions::new(),
+        )
+        .unwrap();
+        index.put(b"d1", "hello there").unwrap();
+        let cell = table.get(b"d1", "f", b"body").unwrap().unwrap();
+        assert_eq!(cell.value(), b"hello there");
+    }
+
+    #[test]
+    fn a_nearest_search_reports_its_rows_and_a_traversal_its_seeds() {
+        use proto::nearest_request::Source;
+        let nearest = |source| {
+            ServiceOp::Nearest(proto::NearestRequest {
+                table: "t".into(),
+                source,
+                ..Default::default()
+            })
+        };
+        let keys = nearest(Some(Source::Keys(proto::KeyList {
+            keys: vec!["b".into(), "a".into()],
+        })));
+        assert_eq!(touched(&keys, usize::MAX), pairs(&[("t", "b"), ("t", "a")]));
+        let range = nearest(Some(Source::Range(proto::KeyRange {
+            range: Some(proto::key_range::Range::Prefix("ab".into())),
+        })));
+        assert_eq!(touched(&range, usize::MAX), pairs(&[("t", "ab…")]));
+        assert_eq!(touched(&nearest(None), usize::MAX), pairs(&[("t", "*..*")]));
+        let traverse = ServiceOp::Traverse(proto::TraverseRequest {
+            table: "g".into(),
+            seeds: vec!["s1".into(), "s2".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            touched(&traverse, usize::MAX),
+            pairs(&[("g", "s1"), ("g", "s2")])
+        );
     }
 }

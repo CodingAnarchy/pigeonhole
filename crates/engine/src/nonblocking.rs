@@ -206,12 +206,12 @@ impl Reading {
                 match self.take_point() {
                     Ok(at) => {
                         self.at = Some(at);
-                        self.now = self.inner.shared.vfs.now_micros();
+                        self.now = self.inner.shared.clock_vfs.now_micros();
                     }
                     Err(e) => return Poll::Ready(Err(e)),
                 }
             } else if self.now == 0 {
-                self.now = self.inner.shared.vfs.now_micros();
+                self.now = self.inner.shared.clock_vfs.now_micros();
             }
             let Some(at) = self.at.as_ref() else {
                 unreachable!("taken above");
@@ -317,7 +317,7 @@ pub(crate) fn try_latest_now<T>(
         Ok(None) => return Err(MissedRead::default()),
         Err(e) => return Ok(Err(e)),
     };
-    let now = inner.shared.vfs.now_micros();
+    let now = inner.shared.clock_vfs.now_micros();
     let (r, sync_reads) = as_async_read(true, || {
         attempt(&view, seqno, now, inner.shared.row_cache.as_ref())
     });

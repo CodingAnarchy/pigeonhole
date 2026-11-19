@@ -14,6 +14,7 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+mod device_bytes;
 #[path = "../gate/mod.rs"]
 mod gate;
 
@@ -50,6 +51,7 @@ mod feed_head;
 mod feed_reader;
 mod feed_reader_process;
 mod feed_retention;
+mod feed_silent;
 mod feed_written;
 mod fifo_expiry;
 mod file_growth;
@@ -82,6 +84,7 @@ mod poisoned_flush_barrier;
 mod punch;
 mod purge_bound;
 mod purge_race;
+mod read_holds;
 mod read_only_fallback;
 mod reader_backup;
 mod reader_crash_matrix;

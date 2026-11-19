@@ -415,11 +415,17 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             })
             .max()
             .unwrap_or(0);
+        // Above every epoch a promote of P recorded too (D330): a copy an unfinished one
+        // stamped is never taken for the restored history.
+        let promoted = live
+            .as_ref()
+            .map_or(0, |l| super::promote::promote_floor(l, &p.id));
         let epoch = 1 + copy
             .epoch
             .max(p.epoch)
             .max(old.map_or(0, |o| o.epoch))
-            .max(floor);
+            .max(floor)
+            .max(promoted);
         // Stamped by an earlier run under this live map, and its node's file says so.
         let earlier = progress.as_ref().is_some_and(|pr| {
             pr.stamped.get(&p.id)
@@ -518,7 +524,15 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         record(&r.dir, &progress, &mut unwritable);
     }
     fault(&r.dir, "stamped")?;
-    // The map, forced: tables exactly as the backup's.
+    // The map, forced: tables exactly as the backup's. D331 PR 3: no range move goes on
+    // past a restore. A backup never spans a hand-over (`backup::moved`), so its map's
+    // placements already say who held each moved range then: a move before HANDED_OVER is
+    // rolled back (the source's), one at or after it forward (the target's). Each restored
+    // file is clipped to those placements when it opens (its stamp marked it). A NODE move
+    // (D332 PR 2) needs neither: the backup's map already places the whole partition. A
+    // copy it staged or stamped on its target stays there, outside the map: the operator
+    // moves it aside with `drop-partition` on that node (ai1249's should on #2092).
+    m.moves.clear();
     for p in &mut m.partitions {
         p.epoch = jobs
             .iter()
@@ -779,6 +793,19 @@ async fn restore_partition(
             live.map_version
         )));
     };
+    // D331 PR 3: not while a range move names it: its ranges are changing, and the move
+    // would go on over a file from before it. Nor while a NODE move relocates it (D332 PR 2).
+    if let Some(m) = live
+        .moves
+        .iter()
+        .find(|m| m.from == partition || m.to == partition)
+    {
+        return Err(Failure::usage(&format!(
+            "range move {:?} names partition {partition:?} in the live map (version {}): \
+             finish or abort it, then restore",
+            m.id, live.map_version
+        )));
+    }
     let target = r.to.clone().unwrap_or_else(|| now.node.clone());
     let nodes: BTreeMap<String, String> = live
         .nodes
@@ -882,7 +909,12 @@ async fn restore_partition(
             now.node
         )));
     }
-    let e = copy.epoch.max(now.epoch).max(floor);
+    // Above every epoch a promote of P recorded too (D330).
+    let e = copy
+        .epoch
+        .max(now.epoch)
+        .max(floor)
+        .max(super::promote::promote_floor(&live, partition));
     // Stamped by an earlier run at this epoch still: no upload, no stamp.
     let stamped = mine == Some((target.clone(), e + 1)) && target_has == Some(e + 1);
     let mut pr = PartProgress {
@@ -906,6 +938,7 @@ async fn restore_partition(
             from_epoch: e,
             stamped,
         }),
+        None,
     )
     .await?;
     let version = set

@@ -849,7 +849,11 @@ fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it()
     if db.shard_of(u.id, b"w") == Some(here) {
         finish(db.move_tablet_pending(u.id, b"w", other as u16).unwrap()).unwrap();
     }
-    db.inject(Fault::HoldDecisionRecords, true);
+    // Its commit `Decide` to `r`'s shard is held (`Fault::HoldDecides`): that share stays
+    // undecided there. (Holding only the DECISION record isn't enough: D286 sends early
+    // `Decide`s that the participant applies meanwhile, so the share could be decided before
+    // the move, the second way #2056's CI run raced.)
+    db.inject(Fault::HoldDecides, true);
     let mut reader = db.begin().unwrap();
     let _ = reader.get(t.id, f, b"r", b"q").unwrap();
     reader
@@ -859,46 +863,27 @@ fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it()
     let mut commit = reader.submit(Some(Durability::GroupSync)).unwrap();
     let mut cx = Context::from_waker(Waker::noop());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    // Undecided once an external prepare reading `w` is refused for the overlap.
-    let mut n = 0;
-    loop {
-        n += 1;
-        let xid = format!("p{n}");
-        let mut p = txn(&db, &u, b"w", &[b"zz"], b"x")
-            .submit_prepare(xid.as_bytes(), Durability::GroupSync)
-            .unwrap();
-        let answer = loop {
-            if let Poll::Ready(r) = std::pin::Pin::new(&mut p).poll(&mut cx) {
-                break r;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the probe never answered"
-            );
-            std::thread::yield_now();
-        };
-        match answer {
-            Ok(_) => {
-                db.decide(xid.as_bytes(), false).unwrap().expect("in doubt");
-                assert!(std::time::Instant::now() < deadline, "never undecided");
-                std::thread::yield_now();
-            }
-            Err(Error::Busy) => break,
-            Err(e) => panic!("{e:?}"),
-        }
+    // Its coordinator decided once a `Decide` is held, which it sends only after every
+    // participant prepared: `r`'s shard holds the share, undecided. (A probe on `w` proved
+    // only the coordinator's own share, admitted first, while the PREPARE to `r`'s shard
+    // could still be on its way: the first way #2056's CI run raced.)
+    while db.held_decides() == 0 {
+        assert!(std::time::Instant::now() < deadline, "never decided");
+        std::thread::yield_now();
     }
     let mut moving = db.move_tablet_pending(t.id, b"r", other as u16).unwrap();
     let held_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
     while std::time::Instant::now() < held_until {
         if let Poll::Ready(r) = std::pin::Pin::new(&mut moving).poll(&mut cx) {
-            db.release_held_decisions();
+            db.inject(Fault::HoldDecides, false);
+            db.release_held_decides(usize::MAX);
             panic!("the move finished over an undecided share's read: {r:?}");
         }
         std::thread::yield_now();
     }
     assert_eq!(db.shard_of(t.id, b"r"), Some(here), "the tablet stays");
-    db.inject(Fault::HoldDecisionRecords, false);
-    db.release_held_decisions();
+    db.inject(Fault::HoldDecides, false);
+    db.release_held_decides(usize::MAX);
     loop {
         if let Poll::Ready(r) = std::pin::Pin::new(&mut commit).poll(&mut cx) {
             r.unwrap();
@@ -912,5 +897,648 @@ fn a_tablet_change_waits_for_an_undecided_internal_share_that_read_a_row_on_it()
     }
     finish(moving).unwrap();
     assert_eq!(db.shard_of(t.id, b"r"), Some(other));
+    db.close().unwrap();
+}
+
+/// A transaction that only reads `rows`.
+fn reader(db: &Engine, t: &pigeonhole_engine::TableInfo, rows: &[&[u8]]) -> pigeonhole_engine::Txn {
+    let f = t.family("f").unwrap().id;
+    let mut txn = db.begin().unwrap();
+    for row in rows {
+        let _ = txn.get(t.id, f, row, b"q").unwrap();
+    }
+    txn
+}
+
+#[test]
+fn a_branch_that_only_read_logs_its_reads_holds_them_and_is_decided_across_a_reopen() {
+    // D329 2a: a writing spanning transaction's read-only branch. Its prepare logs the reads
+    // with an empty batch and holds them: a write to one is refused at once while it's in
+    // doubt, across a reopen too, and either decision lets writes through again, writing
+    // nothing itself.
+    let vfs = SimVfs::new(41);
+    let rows: Vec<Vec<u8>> = (0..16).map(|i| format!("row{i:02}").into_bytes()).collect();
+    let rows: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+    {
+        let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let f = t.family("f").unwrap().id;
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, f, b"row03", b"q", None, ValueRef::Bytes(b"before"))
+            .unwrap();
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+
+        let p = reader(&db, &t, &rows)
+            .prepare(b"r1", Durability::GroupSync)
+            .unwrap();
+        assert!(p.seqno > 0);
+        let doubt: Vec<Vec<u8>> = db.in_doubt().into_iter().map(|(x, _)| x).collect();
+        assert_eq!(doubt, [b"r1".to_vec()]);
+        // A write to a row it read: refused at once.
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, f, b"row03", b"q", None, ValueRef::Bytes(b"no"))
+            .unwrap();
+        let w = db.commit(wb, Some(Durability::GroupSync));
+        assert!(matches!(w, Err(Error::Busy)), "{w:?}");
+        // A row it didn't read: written.
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, f, b"elsewhere", b"q", None, ValueRef::Bytes(b"yes"))
+            .unwrap();
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+        // Another read-only branch over a row it read can prepare too: reads don't conflict.
+        reader(&db, &t, &rows[..2])
+            .prepare(b"r2", Durability::GroupSync)
+            .unwrap();
+        db.close().unwrap();
+    }
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    let f = t.family("f").unwrap().id;
+    let mut doubt: Vec<Vec<u8>> = db.in_doubt().into_iter().map(|(x, _)| x).collect();
+    doubt.sort();
+    assert_eq!(doubt, [b"r1".to_vec(), b"r2".to_vec()]);
+    // The holds are back after the reopen.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"row03", b"q", None, ValueRef::Bytes(b"no"))
+        .unwrap();
+    assert!(matches!(
+        db.commit(wb, Some(Durability::GroupSync)),
+        Err(Error::Busy)
+    ));
+    let c = db.decide(b"r1", true).unwrap().expect("in doubt");
+    assert!(c.seqno > 0);
+    db.decide(b"r2", false).unwrap().expect("in doubt");
+    assert!(db.in_doubt().is_empty());
+    // Decided: writes go through, and the commit wrote nothing.
+    assert_eq!(
+        get_bytes(&db, &t, b"row03").as_deref(),
+        Some(&b"before"[..])
+    );
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"row03", b"q", None, ValueRef::Bytes(b"after"))
+        .unwrap();
+    db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    assert_eq!(get_bytes(&db, &t, b"row03").as_deref(), Some(&b"after"[..]));
+    db.close().unwrap();
+    // A reopen after both decisions finds nothing in doubt, and the later write stands.
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    assert!(db.in_doubt().is_empty());
+    assert_eq!(get_bytes(&db, &t, b"row03").as_deref(), Some(&b"after"[..]));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_sole_reads_only_share_keeps_its_prepare_until_its_commit_is_written() {
+    // The model check's find on 2a: a reads-only branch on one shard is its own coordinator
+    // and only participant, with nothing to flush. At Buffered its Decide goes out early
+    // (D286) and applies the share; with no slot and no other holder to wait on, its
+    // PREPARE left the log at the next checkpoint, before the COMMIT was written (the debug
+    // assertion where the COMMIT is logged). `Fault::HoldDecisionRecords` holds the COMMIT
+    // while writes drive checkpoints.
+    let vfs = SimVfs::new(46);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    put(&db, &t, b"a", b"v").unwrap();
+    // Flushed, so the PREPARE is the front of the shard's log (its checkpoint pops in order).
+    finish(db.flush_pending().unwrap()).unwrap();
+    reader(&db, &t, &[b"a"])
+        .prepare(b"sole", Durability::Buffered)
+        .unwrap();
+    db.inject(Fault::HoldDecisionRecords, true);
+    let (done, rx) = std::sync::mpsc::channel();
+    let decider = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || done.send(db.decide(b"sole", true)).unwrap())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !db.in_doubt().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the decide never reached its coordinator"
+        );
+        std::thread::yield_now();
+    }
+    // Writes to the shard drive its checkpoint while the COMMIT is held. They wait behind
+    // the held decision to become visible, so each is written from its own thread, and the
+    // test waits until the shard has logged all but one of them (the PREPARE gone or not).
+    let shard = db.shard_of(t.id, b"a").expect("routed");
+    let base = db.logged_records(shard);
+    const N: u64 = 16;
+    let writes: Vec<_> = (0..N)
+        .map(|i| {
+            let (db, t) = (Arc::clone(&db), Arc::clone(&t));
+            std::thread::spawn(move || put(&db, &t, format!("x{i}").as_bytes(), b"v").unwrap())
+        })
+        .collect();
+    while db.logged_records(shard) + 1 < base + N {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writes were never logged: {} records, {base} before",
+            db.logged_records(shard)
+        );
+        std::thread::yield_now();
+    }
+    db.release_held_decisions();
+    let c = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the decide never returned")
+        .unwrap()
+        .expect("in doubt");
+    assert!(c.seqno > 0);
+    decider.join().unwrap();
+    for w in writes {
+        w.join().unwrap();
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn a_branch_that_only_read_a_row_since_written_conflicts() {
+    let vfs = SimVfs::new(42);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    let r = reader(&db, &t, &[b"row07"]);
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"row07", b"q", None, ValueRef::Bytes(b"since"))
+        .unwrap();
+    db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    assert!(matches!(
+        r.prepare(b"r3", Durability::GroupSync),
+        Err(Error::Conflict)
+    ));
+    assert!(db.in_doubt().is_empty());
+    db.close().unwrap();
+}
+
+// ---- read holds (ICR 0140 amendment 1, D329 PR 2a) ----------------------------------------
+
+fn put(
+    db: &Engine,
+    t: &pigeonhole_engine::TableInfo,
+    row: &[u8],
+    value: &[u8],
+) -> pigeonhole_engine::Result<()> {
+    let f = t.family("f").unwrap().id;
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, row, b"q", None, ValueRef::Bytes(value))
+        .unwrap();
+    db.commit(wb, Some(Durability::GroupSync)).map(drop)
+}
+
+#[test]
+fn a_read_hold_refuses_writes_to_its_rows_at_once_until_released() {
+    let vfs = SimVfs::new(51);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let rows: Vec<Vec<u8>> = (0..8).map(|i| format!("row{i:02}").into_bytes()).collect();
+    let rows: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+    put(&db, &t, b"row03", b"before").unwrap();
+    let hold = reader(&db, &t, &rows).hold_reads().unwrap();
+    // Nothing logged, nothing in doubt.
+    assert!(db.in_doubt().is_empty());
+    // A write to a held row: refused at once, a single (a one-shard transaction's commit
+    // too) `Busy`, a prepare `Conflict`.
+    assert!(matches!(put(&db, &t, b"row03", b"no"), Err(Error::Busy)));
+    assert!(matches!(
+        txn(&db, &t, b"elsewhere", &[b"row05"], b"no").commit(Some(Durability::GroupSync)),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        txn(&db, &t, b"elsewhere", &[b"row05"], b"no").prepare(b"h1", Durability::GroupSync),
+        Err(Error::Conflict)
+    ));
+    assert!(db.in_doubt().is_empty());
+    // Reads go on, rows not held take writes, and another hold over the same rows is fine.
+    assert_eq!(
+        get_bytes(&db, &t, b"row03").as_deref(),
+        Some(&b"before"[..])
+    );
+    put(&db, &t, b"elsewhere", b"yes").unwrap();
+    let second = reader(&db, &t, &rows[..2]).hold_reads().unwrap();
+    assert!(hold.release().unwrap(), "held throughout");
+    assert!(second.release().unwrap());
+    put(&db, &t, b"row03", b"after").unwrap();
+    assert_eq!(get_bytes(&db, &t, b"row03").as_deref(), Some(&b"after"[..]));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_dropped_read_hold_lets_writes_through() {
+    let vfs = SimVfs::new(52);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let hold = reader(&db, &t, &[b"r"]).hold_reads().unwrap();
+    assert!(matches!(put(&db, &t, b"r", b"no"), Err(Error::Busy)));
+    drop(hold);
+    // The release is sent without waiting: the next write may still meet it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while put(&db, &t, b"r", b"yes").is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped hold stayed"
+        );
+        std::thread::yield_now();
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_hold_of_a_row_written_since_its_snapshot_conflicts() {
+    let vfs = SimVfs::new(53);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let r = reader(&db, &t, &[b"a", b"row07", b"z"]);
+    put(&db, &t, b"row07", b"since").unwrap();
+    assert!(matches!(r.hold_reads(), Err(Error::Conflict)));
+    // Nothing left held: every row takes writes.
+    for row in [&b"a"[..], b"z"] {
+        put(&db, &t, row, b"v").unwrap();
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_hold_over_a_row_a_share_in_doubt_writes_conflicts() {
+    let vfs = SimVfs::new(54);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    txn(&db, &t, b"x", &[b"w"], b"v")
+        .prepare(b"d1", Durability::GroupSync)
+        .unwrap();
+    assert!(matches!(
+        reader(&db, &t, &[b"w"]).hold_reads(),
+        Err(Error::Conflict)
+    ));
+    db.decide(b"d1", false).unwrap().expect("in doubt");
+    reader(&db, &t, &[b"w"])
+        .hold_reads()
+        .unwrap()
+        .release()
+        .unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_hold_lost_to_a_close_releases_false() {
+    let vfs = SimVfs::new(55);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let hold = reader(&db, &t, &[b"r"]).hold_reads().unwrap();
+    db.close().unwrap();
+    assert!(!hold.release().unwrap());
+    // A reopen holds nothing.
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db.table("t").expect("table t");
+    put(&db, &t, b"r", b"v").unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn read_holds_count_against_the_in_doubt_share_limit() {
+    let vfs = SimVfs::new(56);
+    let mut o = owned(Arc::clone(&vfs), 2);
+    o.in_doubt_limits = (1, 0);
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let hold = reader(&db, &t, &[b"r"]).hold_reads().unwrap();
+    assert!(matches!(
+        txn(&db, &t, b"a", &[b"b"], b"v").prepare(b"l1", Durability::GroupSync),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(
+        reader(&db, &t, &[b"s"]).hold_reads(),
+        Err(Error::Busy)
+    ));
+    assert!(hold.release().unwrap());
+    txn(&db, &t, b"a", &[b"b"], b"v")
+        .prepare(b"l1", Durability::GroupSync)
+        .unwrap();
+    assert!(matches!(
+        reader(&db, &t, &[b"s"]).hold_reads(),
+        Err(Error::Busy)
+    ));
+    db.decide(b"l1", true).unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn a_tablet_change_is_given_up_while_a_read_hold_holds_a_row_on_it() {
+    let vfs = SimVfs::new(57);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let from = db.shard_of(t.id, b"r").expect("routed");
+    let to = 1 - from;
+    let hold = reader(&db, &t, &[b"r"]).hold_reads().unwrap();
+    let moved = db
+        .move_tablet_pending(t.id, b"r", to as u16)
+        .and_then(finish);
+    assert!(matches!(moved, Err(Error::Busy)), "{moved:?}");
+    assert_eq!(db.shard_of(t.id, b"r"), Some(from));
+    assert!(hold.release().unwrap());
+    finish(db.move_tablet_pending(t.id, b"r", to as u16).unwrap()).unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn releasing_a_hold_wakes_a_commit_refused_over_a_row_it_held() {
+    // perf2's S1 on #2062: a PREPARE refused over an undecided share's read (`behind: None`)
+    // is woken at a share's decision only once no share and no hold covers its rows. With a
+    // hold on the row too, the share's decision leaves it waiting, so the hold's release
+    // must wake it, or it waits out D241's retry timeout (30 s) and fails `Busy`.
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let vfs = SimVfs::new(59);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"r").expect("routed");
+    if db.shard_of(u.id, b"x") == Some(here) {
+        finish(
+            db.move_tablet_pending(u.id, b"x", (1 - here) as u16)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // S reads `r` and writes `x` on the other shard; its Decide to `r`'s shard is held, so
+    // that share stays undecided with its read of `r`.
+    db.inject(Fault::HoldDecides, true);
+    let mut sharer = db.begin().unwrap();
+    let _ = sharer.get(t.id, f, b"r", b"q").unwrap();
+    sharer
+        .batch()
+        .put(u.id, uf, b"x", b"q", None, ValueRef::Bytes(b"s"))
+        .unwrap();
+    let mut share = sharer.submit(Some(Durability::GroupSync)).unwrap();
+    while db.held_decides() == 0 {
+        assert!(std::time::Instant::now() < deadline, "S never decided");
+        std::thread::yield_now();
+    }
+    // P writes `r` (and `y` on the other shard): refused over S's read, with no older
+    // commit to wait behind.
+    db.record_history(true);
+    let _ = db.take_refused_attempts();
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"p"))
+        .unwrap();
+    wb.put(u.id, uf, b"y", b"q", None, ValueRef::Bytes(b"p"))
+        .unwrap();
+    let mut p = db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    while db.take_refused_attempts().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "P was never refused");
+        assert!(std::pin::Pin::new(&mut p).poll(&mut cx).is_pending());
+        std::thread::yield_now();
+    }
+    // A hold on `r`: S only read it, so the hold is taken.
+    let hold = reader(&db, &t, &[b"r"]).hold_reads().unwrap();
+    // S decides: `r` is still held, so P stays refused.
+    db.inject(Fault::HoldDecides, false);
+    db.release_held_decides(usize::MAX);
+    loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut share).poll(&mut cx) {
+            r.unwrap();
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "S never answered");
+        std::thread::yield_now();
+    }
+    // The hold's release wakes P, which commits well inside the retry timeout.
+    assert!(hold.release().unwrap());
+    let woken = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut p).poll(&mut cx) {
+            r.unwrap();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < woken,
+            "P wasn't woken by the hold's release"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"p"[..]));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_of_a_table_dropped_since_cant_be_held() {
+    // perf2's nit on #2062: a read the engine's view can't route (its table dropped since)
+    // fails the hold, rather than leaving it out.
+    let vfs = SimVfs::new(60);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let mut txn = db.begin().unwrap();
+    for (table, row) in [(&t, b"a"), (&u, b"b")] {
+        let f = table.family("f").unwrap().id;
+        let _ = txn.get(table.id, f, row, b"q").unwrap();
+    }
+    db.drop_table(u.id).unwrap();
+    let refused = txn.hold_reads();
+    assert!(matches!(refused, Err(Error::Conflict)), "{refused:?}");
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_hold_is_refused_while_a_waiting_single_writes_its_row() {
+    // perf2's T1 on the 2a design: a single waiting behind an undecided share is admitted
+    // later without checking holds (D267's `waited`), so a hold over a row it writes would
+    // be passed by it. The hold is refused instead.
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let vfs = SimVfs::new(58);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"w").expect("routed");
+    assert_eq!(db.shard_of(t.id, b"r"), Some(here), "one tablet");
+    if db.shard_of(u.id, b"x") == Some(here) {
+        finish(
+            db.move_tablet_pending(u.id, b"x", (1 - here) as u16)
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    // A cross-shard commit that reads `w` (and writes `x` on the other shard, its
+    // coordinator), its commit `Decide` to `w`'s shard held: that share stays undecided,
+    // holding its read of `w`. (A share that *writes* `w` wouldn't do: a blind single over
+    // an undecided write is admitted and ordered (D271), not held back.)
+    db.inject(Fault::HoldDecides, true);
+    let mut sharer = db.begin().unwrap();
+    let _ = sharer.get(t.id, f, b"w", b"q").unwrap();
+    sharer
+        .batch()
+        .put(u.id, uf, b"x", b"q", None, ValueRef::Bytes(b"share"))
+        .unwrap();
+    let mut share = sharer.submit(Some(Durability::GroupSync)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Decided at its coordinator once a `Decide` is held: `w`'s shard prepared its share.
+    while db.held_decides() == 0 {
+        assert!(std::time::Instant::now() < deadline, "never decided");
+        std::thread::yield_now();
+    }
+    // A single writing `w` and `r` then waits behind it.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"w", b"q", None, ValueRef::Bytes(b"single"))
+        .unwrap();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"single"))
+        .unwrap();
+    let mut single = db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    let waited_until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    while std::time::Instant::now() < waited_until {
+        assert!(
+            std::pin::Pin::new(&mut single).poll(&mut cx).is_pending(),
+            "the single didn't wait behind the share"
+        );
+        std::thread::yield_now();
+    }
+    // A hold of `r`, which no share writes but the waiting single does: refused.
+    let refused = reader(&db, &t, &[b"r"]).hold_reads();
+    assert!(matches!(refused, Err(Error::Conflict)), "{refused:?}");
+    db.inject(Fault::HoldDecides, false);
+    db.release_held_decides(usize::MAX);
+    for pc in [&mut share, &mut single] {
+        loop {
+            if let Poll::Ready(r) = std::pin::Pin::new(&mut *pc).poll(&mut cx) {
+                r.unwrap();
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "never decided");
+            std::thread::yield_now();
+        }
+    }
+    assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"single"[..]));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_hold_needs_reads_and_no_writes() {
+    let vfs = SimVfs::new(59);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    assert!(matches!(
+        txn(&db, &t, b"a", &[b"b"], b"v").hold_reads(),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        db.begin().unwrap().hold_reads(),
+        Err(Error::InvalidArgument(_))
+    ));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_read_whose_tablet_moved_to_a_participant_after_it_validated_is_still_validated() {
+    // The CI failure of #2054's test, made deterministic. A cross-shard commit reads `r`
+    // (shard `here`) and writes `w` (shard `other`, its coordinator), after a write to `r`
+    // since its snapshot. The coordinator admits its own share first, while `r` isn't its
+    // row, so it doesn't validate it; the PREPARE to `here` is held (`Fault::HoldPrepares`)
+    // while `r`'s tablet moves to `other`. Released, `here` finds `r` now owned by a
+    // participant and leaves it to that one, which validated before it owned it: nobody
+    // would validate `r`. The commit must fail `Conflict` (or be retried through the new
+    // map and fail there), never commit over the changed read.
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let vfs = SimVfs::new(45);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"r").expect("routed");
+    let other = 1 - here;
+    if db.shard_of(u.id, b"w") == Some(here) {
+        finish(db.move_tablet_pending(u.id, b"w", other as u16).unwrap()).unwrap();
+    }
+    let mut txn = db.begin().unwrap();
+    let _ = txn.get(t.id, f, b"r", b"q").unwrap();
+    txn.batch()
+        .put(u.id, uf, b"w", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    // `r` changes after the snapshot.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"since"))
+        .unwrap();
+    db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    db.inject(Fault::HoldPrepares, true);
+    let mut commit = txn.submit(Some(Durability::GroupSync)).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    // The PREPARE to `here` is held, and the coordinator admitted its own share, before the
+    // move: on conditions, not a clock (perf2's S1 on #2058: a move first would route the
+    // coordinator's share with the new map, which then validates `r` itself, and the test
+    // would pass without reaching the hole).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.held_prepares() == 0 || db.shares_tracked(other) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the coordinator's share was never admitted"
+        );
+        assert!(std::pin::Pin::new(&mut commit).poll(&mut cx).is_pending());
+        std::thread::yield_now();
+    }
+    assert_eq!(db.shares_tracked(here), 0, "r's shard has seen nothing yet");
+    finish(db.move_tablet_pending(t.id, b"r", other as u16).unwrap()).unwrap();
+    assert_eq!(db.shard_of(t.id, b"r"), Some(other));
+    db.inject(Fault::HoldPrepares, false);
+    assert!(db.release_held_prepares() > 0, "no PREPARE was held");
+    let r = loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut commit).poll(&mut cx) {
+            break r;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the commit never answered"
+        );
+        std::thread::yield_now();
+    };
+    assert!(matches!(r, Err(Error::Conflict)), "{r:?}");
+    assert_eq!(
+        get_bytes(&db, &u, b"w"),
+        None,
+        "nothing written over the stale read"
+    );
     db.close().unwrap();
 }

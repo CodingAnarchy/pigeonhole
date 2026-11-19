@@ -7,14 +7,20 @@
 //! 2. **Copy** each file from OLD (`Admin.BackupDownload`'s `fenced_file`) into an upload
 //!    on NEW (`Admin.PartitionUpload`, `RELOCATE`, the epoch `e` the copy is of). Each
 //!    upload's id comes from the file's name and hash, so a rerun resumes what arrived.
-//! 3. **Stamp** NEW from `e` to `e + 1` and compare the set it installed with OLD's closed
-//!    set, file by file: name, size and SHA-256. A mismatch stops the move before the map
-//!    changes, so OLD keeps P.
+//! 3. **Stamp** NEW from `e` to its next epoch (`e + 1`, or past a promote's floor: #2070)
+//!    and compare the set it installed with OLD's closed set, file by file: name, size and
+//!    SHA-256. A mismatch stops the move before the map changes, so OLD keeps P.
 //! 4. **The map:** `relocate --copy`, which keeps P's `history_epoch`. Its stamp is then a
 //!    no-op.
-//! 5. **Serving:** wait for NEW to serve P at `e + 1`.
+//! 5. **Serving:** wait for NEW to serve P at that epoch.
 //! 6. **`--drop-source`:** only after a comparison that matched, OLD's files move aside
 //!    (`drop-partition`). Nothing is deleted.
+//!
+//! The map records the move while it runs (D332 PR 2): a `MOVE_KIND_NODE` record, written
+//! before step 1 and advanced at steps 3 (HANDING_OVER), 4 (HANDED_OVER, the map itself)
+//! and 5 (CLEANING), then removed. A rerun before the map writes a fresh record (simp724's
+//! M1); one after it finishes the record it finds. `--abort` ([`abort`]) removes one
+//! before HANDED_OVER.
 //!
 //! A rerun never trusts a copy an earlier run left on NEW: it copies OLD's closed set again
 //! (an upload still staged is resumed, one already installed is sent whole), and the stamp
@@ -28,14 +34,17 @@ use prost::bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::cli::{CopyCheck, NodeArgs, channel, connect, relocate_as, report, request, url_of};
+use super::cli::{
+    CopyCheck, NodeArgs, channel, connect, relocate_as, report, request, set_map, url_of,
+};
 use super::transfer::{Feed, Stopped, upload_file};
 use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::download::STALL;
 use crate::serve::proto::{
-    self, BackupDownloadRequest, GetMapRequest, LocalPartition, LocalPartitionState, PartitionFile,
-    PartitionRequest, PartitionUploadHeader, PartitionUploadPurpose, StatusRequest,
+    self, BackupDownloadRequest, ClusterMap, GetMapRequest, LocalPartition, LocalPartitionState,
+    MovePhase, PartitionFile, PartitionRequest, PartitionUploadHeader, PartitionUploadPurpose,
+    RangeMove, StatusRequest,
 };
 
 /// How often the move asks a node how a step is going.
@@ -206,6 +215,211 @@ impl Waiting {
 }
 
 /// A partition's `status` line in a wait's words: its state, then its error if any.
+/// D332 PR 2: the record of a whole-partition move of `partition` in `m` (a NODE move), if
+/// any.
+pub(super) fn record_of<'m>(m: &'m ClusterMap, partition: &str) -> Option<&'m RangeMove> {
+    m.moves
+        .iter()
+        .find(|r| super::map::node_move(r) && r.from == partition)
+}
+
+/// The refusal for a move whose record is gone from the map: a failover or an operator's
+/// change ended it, and the map still names `node` at `epoch` (D332 PR 2).
+pub(super) fn record_gone(id: &str, partition: &str, node: &str, epoch: u64) -> Failure {
+    Failure::usage(&format!(
+        "move {id}'s record is gone from the map (a failover or an operator's change ended \
+         it): the map gives {partition} to node {node:?} at epoch {epoch}. Check the map, \
+         then run the move again"
+    ))
+}
+
+/// The map as `args`' node has it.
+async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    Ok(c.get_map(request(GetMapRequest {}, token.as_deref())?)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner())
+}
+
+/// Sets `m` as the move's record change, waiting out a writer still taking its peers'
+/// maps after a restart (a retry-safe refusal, up to 30 s): a move started just after the
+/// writer did, which needed no map change before its last step until D332 PR 2, mustn't
+/// fail for it (#2092's Linux CI).
+async fn set_record(args: &NodeArgs, m: &ClusterMap) -> Result<(), Failure> {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        match set_map(args, m.clone(), false, Vec::new()).await {
+            Ok(_) => return Ok(()),
+            Err(f)
+                if f.message().contains("still taking its peers' maps")
+                    && Instant::now() < until =>
+            {
+                tokio::time::sleep(POLL).await;
+            }
+            Err(f) => return Err(f),
+        }
+    }
+}
+
+/// The move's record at its start, COPYING, before OLD fences (D332 PR 2, simp724's
+/// should): so a crash leaves a record `status` shows. Each attempt has a fresh id
+/// (simp724's M1), replacing an earlier attempt's record not yet at its commit point:
+/// that attempt's copy on NEW is never trusted (the module docs). `None` when a node can't
+/// keep a range move in its map (a 1.2 node): the move then runs unrecorded, as before.
+async fn start_record(
+    args: &NodeArgs,
+    m: &ClusterMap,
+    p: &proto::Partition,
+    to: &str,
+) -> Result<Option<String>, Failure> {
+    if let Some(r) = m.moves.iter().find(|r| r.from == p.id || r.to == p.id) {
+        let ours =
+            super::map::node_move(r) && r.to == to && super::map::phase(r) < MovePhase::HandedOver;
+        if !ours {
+            return Err(Failure::usage(&format!(
+                "move {:?} names partition {} ({:?}, at {:?}): finish it, or abort it before \
+                 its commit point (phdb cluster move {} --abort), then move",
+                r.id,
+                p.id,
+                crate::serve::proto::MoveKind::try_from(r.kind).unwrap_or_default(),
+                super::map::phase(r),
+                p.id
+            )));
+        }
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let id = format!("node-{ms}");
+    let mut next = m.clone();
+    next.map_version += 1;
+    next.moves
+        .retain(|r| !(super::map::node_move(r) && r.from == p.id));
+    let mut r = RangeMove {
+        id: id.clone(),
+        kind: crate::serve::proto::MoveKind::Node as i32,
+        from: p.id.clone(),
+        to: to.to_owned(),
+        from_epoch: p.epoch,
+        ..RangeMove::default()
+    };
+    r.set_phase(MovePhase::Copying);
+    next.moves.push(r);
+    match set_record(args, &next).await {
+        Ok(()) => Ok(Some(id)),
+        Err(f)
+            if f.message()
+                .contains("can't add a range move until every node") =>
+        {
+            Ok(None)
+        }
+        Err(f) => Err(f),
+    }
+}
+
+/// Sets the move's record `id` to `phase`, or removes it (`None`), in the next map.
+async fn advance(
+    args: &NodeArgs,
+    partition: &str,
+    id: &str,
+    phase: Option<MovePhase>,
+) -> Result<(), Failure> {
+    let mut m = map_now(args).await?;
+    let Some(i) = m.moves.iter().position(|r| r.id == id) else {
+        let (node, epoch) = m
+            .partitions
+            .iter()
+            .find(|q| q.id == partition)
+            .map_or((String::new(), 0), |q| (q.node.clone(), q.epoch));
+        return Err(record_gone(id, partition, &node, epoch));
+    };
+    m.map_version += 1;
+    match phase {
+        Some(phase) => m.moves[i].set_phase(phase),
+        None => {
+            m.moves.remove(i);
+        }
+    }
+    set_record(args, &m).await
+}
+
+/// `phdb cluster move P --abort` (D332 PR 2): removes P's move record before its commit
+/// point and sends the copy the move made on its target aside. OLD keeps P, closed and
+/// fenced as the move left it: unfence it there to serve it again. Refused from
+/// HANDED_OVER, which only goes forward.
+pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Failure> {
+    let m = map_now(args).await?;
+    let Some(r) = record_of(&m, partition).cloned() else {
+        return Err(Failure::usage(&format!(
+            "the map (version {}) records no move of {partition} to abort",
+            m.map_version
+        )));
+    };
+    let phase = super::map::phase(&r);
+    if phase >= MovePhase::HandedOver {
+        return Err(Failure::usage(&format!(
+            "move {} of {partition} is at {phase:?}, past its commit point: the map already \
+             gives {partition} to node {}. Let it finish: run phdb cluster move {partition} \
+             --to {} again",
+            r.id, r.to, r.to
+        )));
+    }
+    advance(args, partition, &r.id, None).await?;
+    // The target's copy, if the move got as far as staging or stamping one, goes aside:
+    // a later attempt never takes it (simp724's M1).
+    // If that fails, the record is already gone (safe: every later attempt copies and
+    // matches again), and the report says the copy is still there (simp724's N1 on #2092).
+    let drop_there = format!("phdb cluster drop-partition {partition} --node <{}>", r.to);
+    let aside = match m.nodes.iter().find(|n| n.id == r.to) {
+        None => Value::Null,
+        Some(n) => {
+            let tried = async {
+                let at = At::new(args, &n.id, &n.address).await?;
+                match at.local(partition).await? {
+                    Some(_) => at.call(partition, "drop").await.map(|lp| Some(lp.file)),
+                    None => Ok(None),
+                }
+            };
+            match tried.await {
+                Ok(Some(file)) => json!(file),
+                Ok(None) => Value::Null,
+                Err(f) => json!(format!(
+                    "not moved aside: the copy is still on node {} ({}): {drop_there}",
+                    r.to,
+                    f.message()
+                )),
+            }
+        }
+    };
+    let owner = m
+        .partitions
+        .iter()
+        .find(|q| q.id == partition)
+        .map(|q| q.node.clone())
+        .unwrap_or_default();
+    let mut rep = report(
+        "cluster move --abort",
+        vec![
+            ("partition", json!(partition)),
+            ("move", json!(r.id)),
+            ("phase", json!(format!("{phase:?}"))),
+            ("node", json!(owner)),
+            ("target_copy_aside", aside),
+            (
+                "next",
+                json!(format!(
+                    "{partition} stays on node {owner}, closed and fenced as the move left it: \
+                     phdb cluster unfence {partition} on node {owner} serves it there again"
+                )),
+            ),
+        ],
+        Value::Null,
+    );
+    rep.status = crate::ExitStatus::SUCCESS;
+    Ok(rep)
+}
+
 fn said(lp: &LocalPartition) -> String {
     let state = super::cli::state_text(lp);
     let state = if state.is_empty() { "not open" } else { &state };
@@ -258,6 +472,17 @@ pub(super) async fn run(
         // An earlier run set the map (or P was never elsewhere): it waits, as that run did,
         // for a majority of the nodes to hold the map (#1760).
         majority_holds(args, &m, m.map_version, timeout).await?;
+        // Its record past the commit point (D332 PR 2): finished here, once NEW serves.
+        if let Some(r) = record_of(&m, partition).cloned()
+            && r.to == to
+        {
+            let new = At::new(args, to, &new_address).await?;
+            serving(&new, partition, p.epoch, timeout).await?;
+            if super::map::phase(&r) == MovePhase::HandedOver {
+                advance(args, partition, &r.id, Some(MovePhase::Cleaning)).await?;
+            }
+            advance(args, partition, &r.id, None).await?;
+        }
         // An earlier run finished the move (or P was never elsewhere): nothing to copy, and
         // the copy can't be compared again, so nothing is dropped. Where the old copy lies
         // closed, the advice names it.
@@ -308,6 +533,11 @@ pub(super) async fn run(
     let old = At::new(args, &p.node, &old_address).await?;
     let new = At::new(args, to, &new_address).await?;
     let e = p.epoch;
+    // One above P's epoch and every epoch a promote of it recorded (#2070).
+    let next = super::promote::next_epoch(&m, &p);
+
+    // The move's record, before OLD fences (D332 PR 2).
+    let record = start_record(args, &m, &p, to).await?;
 
     // 1. Fenced and closed on OLD, its files hashed.
     let started = Instant::now();
@@ -366,7 +596,7 @@ pub(super) async fn run(
     stop_after(args, Step::Copied)?;
     #[cfg(test)]
     hold_before_stamp(args).await;
-    let installed = stamp(&new, &m.cluster_id, partition, e).await?;
+    let installed = stamp(&new, &m.cluster_id, partition, e, next).await?;
     if installed.is_empty() {
         // The set this run staged is gone: another run's stamp took it.
         return Err(Failure::usage(&format!(
@@ -385,8 +615,12 @@ pub(super) async fn run(
         ))
     })?;
 
+    // Stamped and matched this attempt: HANDING_OVER.
+    if let Some(id) = &record {
+        advance(args, partition, id, Some(MovePhase::HandingOver)).await?;
+    }
     stop_after(args, Step::Stamped)?;
-    // 4. The map, marked as copied.
+    // 4. The map, marked as copied: the record's HANDED_OVER, its commit point.
     let set = relocate_as(
         args,
         partition,
@@ -394,6 +628,7 @@ pub(super) async fn run(
         false,
         CopyCheck::Checked(files.clone()),
         None,
+        record.as_deref(),
     )
     .await?;
     let map_at = Instant::now();
@@ -408,9 +643,12 @@ pub(super) async fn run(
     majority_holds(args, &m, version, timeout).await?;
     stop_after(args, Step::Mapped)?;
 
-    // 5. Serving on NEW.
-    serving(&new, partition, e + 1, timeout).await?;
+    // 5. Serving on NEW: CLEANING.
+    serving(&new, partition, next, timeout).await?;
     let serving_at = Instant::now();
+    if let Some(id) = &record {
+        advance(args, partition, id, Some(MovePhase::Cleaning)).await?;
+    }
     stop_after(args, Step::Serving)?;
 
     // 6. OLD's files aside: the comparison matched.
@@ -423,6 +661,10 @@ pub(super) async fn run(
     } else {
         None
     };
+    // Done: the record goes (D332 PR 2).
+    if let Some(id) = &record {
+        advance(args, partition, id, None).await?;
+    }
 
     let bytes: u64 = files.iter().map(|f| f.bytes).sum();
     let ms = |d: Duration| json!(u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -430,7 +672,7 @@ pub(super) async fn run(
         ("partition", json!(partition)),
         ("from", json!(old.id)),
         ("node", json!(to)),
-        ("epoch", json!(e + 1)),
+        ("epoch", json!(next)),
         ("files", json!(files.len())),
         ("bytes", json!(bytes)),
         ("verified", json!(true)),
@@ -440,6 +682,14 @@ pub(super) async fn run(
             fenced_here.map_or(Value::Null, |at| ms(map_at - at)),
         ),
         ("reads_down_ms", ms(serving_at - closed_at)),
+        (
+            // Its record in the map while it ran (D332 PR 2), or why none.
+            "recorded",
+            record.as_ref().map_or_else(
+                || json!("no: a node of the map can't keep a move in its map (a 1.2 node)"),
+                |id| json!(id),
+            ),
+        ),
         ("took_ms", ms(started.elapsed())),
         (
             "map_version",
@@ -855,15 +1105,22 @@ pub(super) async fn copy_file(
     Ok(sent)
 }
 
-/// Stamps NEW from `e` to `e + 1`: the set it installed, none if it found no set staged.
-async fn stamp(new: &At, cluster: &str, p: &str, e: u64) -> Result<Vec<PartitionFile>, Failure> {
+/// Stamps NEW from `e` to `next` ([`super::promote::next_epoch`]): the set it installed,
+/// none if it found no set staged.
+async fn stamp(
+    new: &At,
+    cluster: &str,
+    p: &str,
+    e: u64,
+    next: u64,
+) -> Result<Vec<PartitionFile>, Failure> {
     let (mut c, _) = connect(&new.args, &new.args.node).await?;
     Ok(c.stamp(request(
         proto::StampRequest {
             cluster_id: cluster.to_owned(),
             partition: p.to_owned(),
             from_epoch: e,
-            to_epoch: e + 1,
+            to_epoch: next,
             restore: false,
             restore_from_cluster_id: String::new(),
             promote: false,

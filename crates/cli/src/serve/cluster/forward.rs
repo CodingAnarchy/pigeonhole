@@ -454,6 +454,7 @@ pub(crate) fn op_to_forward(op: ServiceOp) -> Result<forward_request::Op, ApiErr
         ServiceOp::TxnWrite(r) => Op::TxnWrite(r),
         ServiceOp::Commit(r) => Op::Commit(r),
         ServiceOp::Abort(r) => Op::Abort(r),
+        ServiceOp::Outcome(r) => Op::TxnOutcome(r),
         ServiceOp::OpenSnapshot(r) => Op::OpenSnapshot(r),
         ServiceOp::ReleaseSnapshot(r) => Op::ReleaseSnapshot(r),
         ServiceOp::Nearest(r) => Op::Nearest(r),
@@ -521,6 +522,7 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::TxnWrite(r) => ServiceOp::TxnWrite(r),
             Op::Commit(r) => ServiceOp::Commit(r),
             Op::Abort(r) => ServiceOp::Abort(r),
+            Op::TxnOutcome(r) => ServiceOp::Outcome(r),
             Op::OpenSnapshot(r) => ServiceOp::OpenSnapshot(r),
             Op::ReleaseSnapshot(r) => ServiceOp::ReleaseSnapshot(r),
             Op::Nearest(r) => ServiceOp::Nearest(r),
@@ -546,6 +548,11 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::Forget(r) => ServiceOp::Forget(r),
             Op::RecallPool(r) => ServiceOp::RecallPool(r),
             Op::RecallBodies(r) => ServiceOp::RecallBodies(r),
+            // A spanning transaction's branch calls (D329) are no client's call: the owner
+            // serves them before this (`spanning::serve_branch`).
+            Op::BranchBegin(_) | Op::BranchPrepare(_) | Op::BranchDecide(_) | Op::ResolveTxn(_) => {
+                return Err(ApiError::invalid("a branch's call isn't a client's"));
+            }
         },
     )
 }
@@ -567,6 +574,7 @@ pub(crate) fn reply_to_forward(
         ServiceReply::MultiGet(r) => Reply::MultiGet(r),
         ServiceReply::Begin(r) => Reply::Begin(r),
         ServiceReply::Commit(r) => Reply::Commit(r),
+        ServiceReply::Outcome(r) => Reply::TxnOutcome(r),
         ServiceReply::OpenSnapshot(r) => Reply::OpenSnapshot(r),
         ServiceReply::Table(r) => Reply::Table(r),
         ServiceReply::Empty(r) => Reply::Empty(r),
@@ -630,6 +638,10 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
             Reply::Forget(r) => ServiceReply::Forget(r),
             Reply::RecallPool(r) => ServiceReply::RecallPool(r),
             Reply::RecallBodies(r) => ServiceReply::RecallBodies(r),
+            Reply::BranchPrepare(_) | Reply::ResolveTxn(_) => {
+                return Err(ApiError::internal("a node's own reply isn't a client's"));
+            }
+            Reply::TxnOutcome(r) => ServiceReply::Outcome(r),
         },
     )
 }

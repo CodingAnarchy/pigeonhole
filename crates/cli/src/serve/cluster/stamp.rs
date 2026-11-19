@@ -179,9 +179,12 @@ impl Node {
         if !super::map::id_ok(&p) {
             return Err(ApiError::invalid(format!("{p:?} isn't a partition id")));
         }
-        if req.to_epoch != req.from_epoch + 1 {
+        // A stamp may skip epochs: every change that raises P's epoch goes above each epoch a
+        // promote of it recorded, so a copy an unfinished or abandoned one stamped is never
+        // taken for this history (D330 PR 2, simp724's S2; every change since #2070).
+        if req.to_epoch <= req.from_epoch {
             return Err(ApiError::invalid(format!(
-                "a stamp raises the epoch by one: from {} to {}, not {}",
+                "a stamp raises the epoch: from {} to {}, not {}",
                 req.from_epoch,
                 req.from_epoch + 1,
                 req.to_epoch
@@ -379,7 +382,14 @@ fn stamp_files(dir: &Path, req: &StampRequest) -> Result<Vec<PartitionFile>, Api
         } else {
             identity::restore(&db, &id, &req.restore_from_cluster_id)
         }
-        .map_err(ApiError::internal)
+        .map_err(ApiError::internal)?;
+        // D331 PR 3: a restored file is clipped to its map's ranges when it opens, before it
+        // serves (a cluster backup has no common point, so a moved range's rows may be in two
+        // partitions' copies).
+        if req.restore {
+            crate::serve::ranges::mark_clip(&db).map_err(ApiError::internal)?;
+        }
+        Ok(())
     })();
     let closed = db.close();
     stamped?;

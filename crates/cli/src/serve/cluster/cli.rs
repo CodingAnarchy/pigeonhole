@@ -55,10 +55,12 @@ pub(crate) enum ClusterCommand {
         file: PathBuf,
         #[command(flatten)]
         node: NodeArgs,
-        /// Recovery when the map's writer (the node with the smallest id) is down: set the
-        /// map at `--node` rather than the writer. Its version is put above every reachable
-        /// node's, and it must name a reachable writer (remove the down one, or let another
-        /// id be the smallest). No partition's epoch may go back, or stay with another node,
+        /// Recovery when the map's writer is down: set the map at `--node` rather than the
+        /// writer. Its version is put above every reachable node's, and it must name a
+        /// reachable writer: its "writer", or else the smallest id (remove the down one, or
+        /// let another id be the smallest). Once every reachable node keeps writer terms
+        /// (D330), its term is put above every one they know, so a writer it replaced can't
+        /// change the map when it comes back. No partition's epoch may go back, or stay with another node,
         /// against any reachable node's map; unreachable nodes are reported `unchecked`.
         /// Only for a writer that's down: a writer that's up and cut
         /// off can change the map meanwhile, and its change is lost (D317 amendment 1).
@@ -131,6 +133,11 @@ pub(crate) enum ClusterCommand {
         /// With `--partition`: the node it goes to (default: the node the live map gives it).
         #[arg(long, value_name = "ID", requires = "partition")]
         to: Option<String>,
+    },
+    /// Transactions across partitions (D329): `txn decide`.
+    Txn {
+        #[command(subcommand)]
+        command: TxnCommand,
     },
     /// Fence a partition on the node that serves it (`--node`): its writes answer `Fenced`
     /// through every node until it's unfenced, relocated or closed; reads go on. Answers
@@ -220,12 +227,19 @@ pub(crate) enum ClusterCommand {
     /// Writes answer `Fenced` from the fence until the map moves; reads are down from the
     /// close until `--to` serves. Both grow with the files' size, so with the feed's
     /// retention. Run it again to resume one that stopped. The old node's files stay
-    /// unless `--drop-source`.
+    /// unless `--drop-source`. The map records the move while it runs (`status` shows it),
+    /// so a stopped one is seen; `--abort` ends one before its commit point.
     Move {
         partition: String,
         /// The node id it moves to.
-        #[arg(long, value_name = "ID")]
-        to: String,
+        #[arg(long, value_name = "ID", required_unless_present = "abort")]
+        to: Option<String>,
+        /// End the partition's recorded move before its commit point (the map giving the
+        /// partition to `--to`): its record goes, and the copy it made on the target moves
+        /// aside. The partition stays on its node, closed and fenced as the move left it:
+        /// `unfence` serves it there again. Refused once the map gives it to the target.
+        #[arg(long, conflicts_with_all = ["to", "drop_source", "timeout"])]
+        abort: bool,
         #[command(flatten)]
         node: NodeArgs,
         /// Once the copy is checked and `--to` serves the partition, move the old node's
@@ -332,6 +346,17 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
                 to: to.clone(),
             },
         )),
+        ClusterCommand::Txn {
+            command:
+                TxnCommand::Decide {
+                    xid,
+                    partition,
+                    commit,
+                    abort: _,
+                    force,
+                    node,
+                },
+        } => runtime()?.block_on(txn_decide(node, partition, xid, *commit, *force)),
         ClusterCommand::Fence { partition, node } => {
             runtime()?.block_on(partition_call(node, partition, Call::Fence))
         }
@@ -345,14 +370,21 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
         }
         ClusterCommand::Move {
             partition,
+            abort: true,
+            node,
+            ..
+        } => runtime()?.block_on(super::moving::abort(node, partition)),
+        ClusterCommand::Move {
+            partition,
             to,
             node,
             drop_source,
             timeout,
+            ..
         } => runtime()?.block_on(super::moving::run(
             node,
             partition,
-            to,
+            to.as_deref().unwrap_or_default(),
             *drop_source,
             timeout.map(Duration::from_secs),
         )),
@@ -383,6 +415,59 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
 }
 
 /// One of the per-partition calls on a node (D317 ticket 6).
+/// `phdb cluster txn ...` (D329).
+#[derive(Debug, Clone, clap::Subcommand)]
+pub(crate) enum TxnCommand {
+    /// Decide a transaction's share held in doubt on partition `--partition`, on the node
+    /// that serves it (`--node`), for a transaction whose home will never settle it. Refused
+    /// while the home can (it answers committed, aborted or in progress) unless `--force`,
+    /// which can break the transaction's atomicity; a home that answers unknown can't.
+    /// Answers the partition's line.
+    Decide {
+        /// The transaction's id (as `phdb cluster status` lists it).
+        xid: String,
+        #[arg(long, value_name = "P")]
+        partition: String,
+        /// Commit the share.
+        #[arg(long, conflicts_with = "abort", required_unless_present = "abort")]
+        commit: bool,
+        /// Abort the share.
+        #[arg(long)]
+        abort: bool,
+        /// Decide even though the home answers.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        node: NodeArgs,
+    },
+}
+
+/// `phdb cluster txn decide`: the share's decide on `--node`, and the partition's line there.
+async fn txn_decide(
+    args: &NodeArgs,
+    partition: &str,
+    xid: &str,
+    commit: bool,
+    force: bool,
+) -> Result<Report, Failure> {
+    let (mut c, token) = connect(args, &args.node).await?;
+    let req = request(
+        proto::DecideTxnRequest {
+            partition: partition.to_owned(),
+            xid: xid.to_owned(),
+            commit,
+            force,
+        },
+        token.as_deref(),
+    )?;
+    let lp = c
+        .decide_txn(req)
+        .await
+        .map_err(|s| Failure::usage(&format!("{}: {}", args.node, s.message())))?
+        .into_inner();
+    Ok(local_report("cluster txn decide", &args.node, &lp))
+}
+
 #[derive(Clone, Copy)]
 enum Call {
     Fence,
@@ -485,7 +570,7 @@ pub(crate) async fn relocate(
     } else {
         CopyCheck::No
     };
-    relocate_as(args, partition, to, old_unreachable, copy, None).await
+    relocate_as(args, partition, to, old_unreachable, copy, None, None).await
 }
 
 /// A test's fault seam: the next one-partition restore through this `--node` URL stops
@@ -517,6 +602,7 @@ pub(super) async fn relocate_as(
     old_unreachable: bool,
     copy: CopyCheck,
     restoring: Option<Restoring>,
+    record: Option<&str>,
 ) -> Result<Report, Failure> {
     if restoring.is_some() && copy != CopyCheck::No {
         return Err(Failure::usage(
@@ -659,6 +745,13 @@ pub(super) async fn relocate_as(
         None
     };
     let from = restoring.map_or(p.epoch, |r| r.from_epoch.max(p.epoch));
+    // A restore's `from_epoch` already counts the promote floor; a relocation goes one above
+    // P's epoch and that floor (#2070).
+    let to_epoch = if restoring.is_some() {
+        from + 1
+    } else {
+        super::promote::next_epoch(&m, &p)
+    };
     // A restore reusing an earlier run's stamp at `from_epoch + 1` needs the map still
     // below it: a map moved on since gives P a later epoch than that file's.
     if let Some(r) = restoring
@@ -679,7 +772,7 @@ pub(super) async fn relocate_as(
                 cluster_id: m.cluster_id.clone(),
                 partition: partition.to_owned(),
                 from_epoch: from,
-                to_epoch: from + 1,
+                to_epoch,
                 restore: restoring.is_some(),
                 restore_from_cluster_id: String::new(),
                 promote: false,
@@ -718,9 +811,19 @@ pub(super) async fn relocate_as(
     }
     for q in m.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
-        q.epoch = from + 1;
+        q.epoch = to_epoch;
     }
     m.map_version += 1;
+    // `phdb cluster move`'s record (D332 PR 2): this map is its commit point, HANDED_OVER.
+    if let Some(id) = record {
+        let (term, version) = (m.writer_term, m.map_version);
+        let Some(r) = m.moves.iter_mut().find(|r| r.id == id) else {
+            return Err(super::moving::record_gone(id, partition, &p.node, p.epoch));
+        };
+        r.set_phase(proto::MovePhase::HandedOver);
+        r.handed_over_term = term;
+        r.handed_over_version = version;
+    }
     // Last, just before the map: OLD still holds P closed with exactly the files the copy
     // was checked against. A reopen rewrites them (FORMAT §10.1, §10.4), so an unfence and
     // a fence again on OLD since the check, with writes acknowledged between, is caught
@@ -776,7 +879,7 @@ pub(super) async fn relocate_as(
             ("partition", json!(partition)),
             ("from", json!(p.node)),
             ("node", json!(to)),
-            ("epoch", json!(from + 1)),
+            ("epoch", json!(to_epoch)),
             ("copied", json!(copy)),
             ("installed_files", json!(stamped.files.len())),
             (
@@ -984,6 +1087,10 @@ pub(crate) async fn set_map(
             }
         }
         let mut top = current.as_ref().map_or(0, |c| c.map_version);
+        // D330: the highest writer term a reachable node knows, and the nodes that don't
+        // keep terms (an older build).
+        let mut top_term = current.as_ref().map_or(0, |c| c.writer_term);
+        let mut no_terms = Vec::new();
         let mut live = Vec::new();
         let mut unchecked = Vec::new();
         for (id, address) in &ids {
@@ -1010,6 +1117,14 @@ pub(crate) async fn set_map(
                 continue;
             };
             top = top.max(s.map_version);
+            top_term = top_term.max(s.writer_term);
+            if !s
+                .map_features
+                .iter()
+                .any(|f| f == super::WRITER_TERMS_FEATURE)
+            {
+                no_terms.push(id.clone());
+            }
             live.push(id.clone());
             // No partition's epoch below, or kept with another node than, one a reachable
             // node has: a forced map's histories are then new everywhere it reaches
@@ -1025,13 +1140,41 @@ pub(crate) async fn set_map(
         }
         let w = super::schema::writer(&m).to_owned();
         if !live.contains(&w) {
+            let how = if m.writer.is_empty() {
+                "the smallest id"
+            } else {
+                "the map's \"writer\""
+            };
             return Err(Failure::usage(&format!(
-                "the map's writer would be node {w:?} (the smallest id), which can't be \
-                 reached: a forced map must name a writer that's up (remove the down node, \
-                 or give the writer's role to another id)"
+                "the map's writer would be node {w:?} ({how}), which can't be reached: a \
+                 forced map must name a writer that's up (remove the down node, give the \
+                 writer's role to another id, or set \"writer\" to a node that's up)"
             )));
         }
         m.map_version = m.map_version.max(top + 1);
+        // D330 (simp724's S2 on the PR 1 plan): once every reachable node keeps writer terms,
+        // a forced map takes a term above every one they know, naming its writer, so it
+        // fences an old writer that comes back. A node that knows a higher term refuses it.
+        if no_terms.is_empty() {
+            m.writer = w;
+            m.writer_term = top_term + 1;
+        } else if top_term > 0 {
+            return Err(Failure::usage(&format!(
+                "a node knows writer term {top_term}, but {} runs a build without writer \
+                 terms: upgrade it before forcing a map",
+                no_terms.join(", ")
+            )));
+        } else {
+            m.writer.clear();
+            m.writer_term = 0;
+            // Nor any failover field: a node without terms can't keep them.
+            m.failover = false;
+            m.failovers.clear();
+            for p in &mut m.partitions {
+                p.failover = 0;
+                p.failover_count = 0;
+            }
+        }
         forced_unchecked = Some(unchecked);
         c.set_map(request(
             SetMapRequest {
@@ -1122,6 +1265,10 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
     let mut rows = Vec::new();
     let mut nodes = Vec::new();
     let mut behind = 0usize;
+    // D330: the writer, and its lease as the writer last renewed it (null: unreachable).
+    let writer = super::schema::writer(&m).to_owned();
+    let mut writer_lease = Value::Null;
+    let mut failover_blocked = Value::Null;
     for n in &m.nodes {
         let url = format!("{scheme}://{}", n.address);
         let got = async {
@@ -1136,6 +1283,13 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
             Ok(s) => {
                 if s.map_version != m.map_version {
                     behind += 1;
+                }
+                if n.id == writer {
+                    writer_lease = json!(s.writer_lease_remaining_ms);
+                    // Down partitions the writer doesn't fail over, and why (D330).
+                    let blocked: std::collections::BTreeMap<_, _> =
+                        s.failover_blocked.iter().collect();
+                    failover_blocked = json!(blocked);
                 }
                 let ok = s.partitions.iter().filter(|p| p.ok).count();
                 let node_row = |partition: &str, state: String, error: &str| {
@@ -1156,7 +1310,17 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
                     rows.push(node_row("", String::new(), ""));
                 }
                 for lp in &s.partitions {
-                    rows.push(node_row(&lp.id, state_text(lp), &lp.error));
+                    // D329: shares held in doubt there, and how long the oldest has waited
+                    // (each one's xid and reason are in the JSON).
+                    let state = match lp.in_doubt {
+                        0 => state_text(lp),
+                        n => format!(
+                            "{}, {n} in doubt (oldest {}s)",
+                            state_text(lp),
+                            lp.in_doubt_oldest_age_ms / 1000
+                        ),
+                    };
+                    rows.push(node_row(&lp.id, state, &lp.error));
                 }
                 nodes.push(serde_json::to_value(&s).expect("NodeStatus serializes"));
             }
@@ -1181,6 +1345,15 @@ pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {
         ("map_version", json!(m.map_version)),
         ("nodes", json!(m.nodes.len())),
         ("not_current", json!(behind)),
+        ("writer", json!(writer)),
+        ("writer_term", json!(m.writer_term)),
+        ("writer_lease_remaining_ms", writer_lease),
+        ("failover", json!(m.failover)),
+        ("failover_blocked", failover_blocked),
+        (
+            "failovers",
+            serde_json::to_value(&m.failovers).expect("FailoverEvent serializes"),
+        ),
     ];
     let mut r = report("cluster status", summary, json!({ "nodes": nodes }));
     r.columns = [

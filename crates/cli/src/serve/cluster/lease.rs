@@ -15,6 +15,13 @@
 //! holder counts on one no slower than `1−ρ`, so its lease ends, in real time, before the
 //! earliest grant it relied on (audit120's Q5). ρ is each clock's drift against real time,
 //! fixed at 1%.
+//!
+//! **The writer lease (D330)** is a pseudo-partition, [`WRITER_LEASE`], in the same rounds
+//! and the same table, so its withheld votes and expiry are a partition's. A grantor renews
+//! it only to the node its map names as writer, at the map's term. An **election vote**
+//! ([`Grants::vote`]) is a request for it at a term above every one the grantor knows: the
+//! grantor records that term durably before it answers, and from then refuses any lower
+//! term's writer, lease or map (the term fence, D330 amendment 1's M1).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -25,6 +32,9 @@ use super::proto::{
 };
 use crate::serve::errors::ApiError;
 use crate::serve::gate::LeaseClock;
+
+/// The writer lease's name in a round (D330): a reserved partition id.
+pub(crate) const WRITER_LEASE: &str = "__writer";
 
 /// ρ, each clock's rate drift against real time, in parts per million: 1%.
 const RHO_PPM: u64 = 10_000;
@@ -82,6 +92,21 @@ struct Grant {
     until: u64,
 }
 
+/// What a node last granted of one partition (D330 PR 2), kept past the grant's end: the
+/// writer counts a partition's downtime from `until`, and names the in-doubt shares its
+/// owner last reported when it fails the partition over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LastGrant {
+    /// The node it was granted to, and at what epoch.
+    pub(crate) holder: String,
+    pub(crate) epoch: u64,
+    /// When the grant ends, on this node's lease clock.
+    pub(crate) until: u64,
+    /// The in-doubt xids and their count the holder sent with the request (F7).
+    pub(crate) in_doubt_xids: Vec<String>,
+    pub(crate) in_doubt_count: u64,
+}
+
 /// A node's grants: the leases it promised, by holder (itself included).
 #[derive(Debug)]
 pub(crate) struct Grants {
@@ -94,6 +119,15 @@ pub(crate) struct Grants {
     /// from a delayed request of its last start.
     start: u64,
     by_holder: Mutex<BTreeMap<String, Grant>>,
+    /// The highest writer term this node voted for (D330), as its `cluster-writer-term` file
+    /// holds it: a vote is written there before it's answered.
+    voted: Mutex<u64>,
+    /// When the last writer lease granted here ends, on this node's clock: the start
+    /// grace's end before any. How long the writer has gone without one is counted from it.
+    writer_until: Mutex<u64>,
+    /// Each partition's last grant here (D330 PR 2), by partition id: never dropped when it
+    /// ends, only replaced by the next. Locked after `by_holder`, never before.
+    last: Mutex<BTreeMap<String, LastGrant>>,
 }
 
 impl Grants {
@@ -106,7 +140,99 @@ impl Grants {
             started,
             start: start_id(),
             by_holder: Mutex::new(BTreeMap::new()),
+            voted: Mutex::new(0),
+            writer_until: Mutex::new(started.saturating_add(nanos(grace(lease)))),
+            last: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Grants that start with `term` voted for, from the node's `cluster-writer-term` file.
+    pub(crate) fn with_voted(self, term: u64) -> Self {
+        *self.voted.lock().unwrap_or_else(PoisonError::into_inner) = term;
+        self
+    }
+
+    /// Every partition lease granted here that still runs, to whom, and for how long
+    /// (`NodeStatus.grants`, D330 PR 2): the writer asks before it fails a partition over.
+    /// Not the writer lease.
+    pub(crate) fn granted(&self) -> Vec<LeaseWithheld> {
+        let now = self.clock.now();
+        let by = self
+            .by_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut out = Vec::new();
+        for (holder, g) in by.iter().filter(|(_, g)| g.until > now) {
+            for partition in g.parts.keys().filter(|p| *p != WRITER_LEASE) {
+                out.push(LeaseWithheld {
+                    partition: partition.clone(),
+                    holder: holder.clone(),
+                    remaining_ms: millis(g.until - now).max(1),
+                });
+            }
+        }
+        out
+    }
+
+    /// When partition `id`'s last grant here ends (or ended), if it was to `holder` at
+    /// `epoch`: the failover check's per-round question, without cloning the grant.
+    pub(crate) fn last_grant_until(&self, id: &str, holder: &str, epoch: u64) -> Option<u64> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .filter(|g| g.holder == holder && g.epoch == epoch)
+            .map(|g| g.until)
+    }
+
+    /// Partition `id`'s last grant here, ended or not (D330 PR 2).
+    pub(crate) fn last_grant(&self, id: &str) -> Option<LastGrant> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    /// The highest writer term this node voted for (0: none).
+    pub(crate) fn voted(&self) -> u64 {
+        *self.voted.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The highest writer term this node knows: its map's, or one it voted for. A map or a
+    /// writer lease below it is refused (the term fence).
+    pub(crate) fn term_floor(&self, mine: &ClusterMap) -> u64 {
+        self.voted().max(mine.writer_term)
+    }
+
+    /// How long ago the last writer lease granted here ended: zero while one runs.
+    pub(crate) fn writer_lapsed(&self) -> Duration {
+        let until = *self
+            .writer_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Duration::from_nanos(self.clock.now().saturating_sub(until))
+    }
+
+    /// The time left on this node's grant of the writer lease to `holder`: zero if none runs.
+    pub(crate) fn writer_remaining(&self, holder: &str) -> Duration {
+        let now = self.clock.now();
+        let by = self
+            .by_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        by.get(holder)
+            .filter(|g| g.until > now && g.parts.contains_key(WRITER_LEASE))
+            .map_or(Duration::ZERO, |g| Duration::from_nanos(g.until - now))
+    }
+
+    /// Notes a writer lease granted until `until`.
+    fn writer_granted(&self, until: u64) {
+        let mut w = self
+            .writer_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *w = (*w).max(until);
     }
 
     /// This start's id.
@@ -158,13 +284,19 @@ impl Grants {
             )));
         }
         let mut out = LeaseResponse::default();
-        if mine.map_version > req.map_version {
+        // Maps sort by `(writer_term, map_version)` (D330): an old writer's minority map is
+        // behind an elected one whatever its version.
+        let (theirs, ours) = (
+            (req.writer_term, req.map_version),
+            (mine.writer_term, mine.map_version),
+        );
+        if ours > theirs {
             out.newer_map_version = mine.map_version;
             return Ok(out);
         }
         // Behind the asking node: it pushes its map in its round before it asks, so this is
         // a race with that push. Nothing is granted; its next round asks again.
-        if mine.map_version < req.map_version {
+        if ours < theirs {
             return Ok(out);
         }
         let grace = self.grace_remaining();
@@ -193,14 +325,44 @@ impl Grants {
             return Ok(out);
         }
         let mut parts = BTreeMap::new();
-        for LeasePart { partition, epoch } in &req.parts {
-            let given = mine
-                .partitions
-                .iter()
-                .any(|p| p.id == *partition && p.node == req.node_id && p.epoch == *epoch);
+        let voted = self.voted();
+        let until = now.saturating_add(nanos(self.lease));
+        let mut last = Vec::new();
+        for LeasePart {
+            partition,
+            epoch,
+            term,
+            in_doubt_xids,
+            in_doubt_count,
+        } in &req.parts
+        {
+            let given = if partition == WRITER_LEASE {
+                // The writer lease (D330): to the map's writer at the map's term, unless this
+                // node voted for a higher one; or renewed to the node it voted for, at that
+                // term, while its vote's grant runs (a candidate before its map lands).
+                let writer = super::schema::writer(mine) == req.node_id
+                    && *term == mine.writer_term
+                    && *term >= voted;
+                let candidate = *term == voted
+                    && voted > mine.writer_term
+                    && by.get(&req.node_id).is_some_and(|g| {
+                        g.start == req.start && g.parts.get(WRITER_LEASE) == Some(term)
+                    });
+                writer || candidate
+            } else {
+                mine.partitions
+                    .iter()
+                    .any(|p| p.id == *partition && p.node == req.node_id && p.epoch == *epoch)
+            };
             if !given {
                 continue;
             }
+            // A partition's grant is keyed by its epoch, the writer lease's by its term.
+            let key = if partition == WRITER_LEASE {
+                *term
+            } else {
+                *epoch
+            };
             let other = by
                 .iter()
                 .filter(|(holder, _)| **holder != req.node_id)
@@ -213,11 +375,34 @@ impl Grants {
                 });
                 continue;
             }
-            parts.insert(partition.clone(), *epoch);
+            parts.insert(partition.clone(), key);
             out.granted.push(LeasePart {
                 partition: partition.clone(),
                 epoch: *epoch,
+                term: *term,
+                ..LeasePart::default()
             });
+            if partition != WRITER_LEASE {
+                last.push((
+                    partition.clone(),
+                    LastGrant {
+                        holder: req.node_id.clone(),
+                        epoch: *epoch,
+                        until,
+                        in_doubt_xids: in_doubt_xids.clone(),
+                        in_doubt_count: *in_doubt_count,
+                    },
+                ));
+            }
+        }
+        if !last.is_empty() {
+            self.last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(last);
+        }
+        if parts.contains_key(WRITER_LEASE) {
+            self.writer_granted(until);
         }
         // The new grant replaces the holder's last one: what it no longer asks for, or that
         // the map no longer gives it, is no longer granted.
@@ -227,9 +412,148 @@ impl Grants {
                 start: req.start,
                 round: req.round,
                 parts,
-                until: now.saturating_add(nanos(self.lease)),
+                until,
             },
         );
+        Ok(out)
+    }
+
+    /// An election vote (D330): `req` asks for the writer lease alone, at a term above the
+    /// map's `mine`. Granted, like a lease and whatever the request's map version (the
+    /// voters may hold different ones), when this node's start grace is over, no other
+    /// node's writer lease runs here (the withheld vote), and the term is above every one this
+    /// node knows; `persist` then records the term durably before the answer leaves (the
+    /// term fence must survive a restart). Otherwise the answer says why: the withheld
+    /// holder, the grace left, or this node's highest term in `writer_term`.
+    ///
+    /// The vote joins the candidate's grant here rather than replacing it: dropping its
+    /// partitions would free them to another node while the candidate still serves them.
+    pub(crate) fn vote(
+        &self,
+        mine: &ClusterMap,
+        req: &LeaseRequest,
+        persist: impl FnOnce(u64) -> std::io::Result<()>,
+    ) -> Result<LeaseResponse, ApiError> {
+        self.ballot(mine, req, None, persist)
+    }
+
+    /// An election's pre-vote (D330 PR 2, `LeaseRequest.pre_vote`): [`Grants::vote`]'s answer
+    /// without its effects. Nothing is recorded, granted or fenced. It's also refused while
+    /// the writer lease ran out here less than `margin` ago (simp724), so a node whose writer
+    /// is healthy doesn't help a candidate that merely can't reach it.
+    pub(crate) fn pre_vote(
+        &self,
+        mine: &ClusterMap,
+        req: &LeaseRequest,
+        margin: Duration,
+    ) -> Result<LeaseResponse, ApiError> {
+        self.ballot(mine, req, Some(margin), |_| Ok(()))
+    }
+
+    /// [`Grants::vote`], or with `pre_vote` (the failover margin) [`Grants::pre_vote`].
+    fn ballot(
+        &self,
+        mine: &ClusterMap,
+        req: &LeaseRequest,
+        pre_vote: Option<Duration>,
+        persist: impl FnOnce(u64) -> std::io::Result<()>,
+    ) -> Result<LeaseResponse, ApiError> {
+        let [part] = req.parts.as_slice() else {
+            return Err(ApiError::invalid(
+                "an election vote asks for the writer lease alone",
+            ));
+        };
+        if part.partition != WRITER_LEASE {
+            return Err(ApiError::invalid(
+                "an election vote asks for the writer lease alone",
+            ));
+        }
+        if req.lease_ms != self.lease_ms() {
+            return Err(ApiError::failed_precondition(format!(
+                "node {} runs with --cluster-lease-ms {} and this node with {}: every node of a \
+                 cluster must take the same lease, so this node grants it nothing",
+                req.node_id,
+                req.lease_ms,
+                self.lease_ms()
+            )));
+        }
+        let mut out = LeaseResponse::default();
+        let grace = self.grace_remaining();
+        if !grace.is_zero() {
+            out.grace_remaining_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX).max(1);
+            return Ok(out);
+        }
+        let now = self.clock.now();
+        let mut by = self
+            .by_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        by.retain(|_, g| g.until > now);
+        let mut voted = self.voted.lock().unwrap_or_else(PoisonError::into_inner);
+        let floor = (*voted).max(mine.writer_term);
+        if part.term <= floor {
+            out.writer_term = floor;
+            return Ok(out);
+        }
+        let other = by
+            .iter()
+            .filter(|(holder, _)| **holder != req.node_id)
+            .find(|(_, g)| g.parts.contains_key(WRITER_LEASE));
+        if let Some((holder, g)) = other {
+            out.withheld.push(LeaseWithheld {
+                partition: WRITER_LEASE.to_owned(),
+                holder: holder.clone(),
+                remaining_ms: millis(g.until - now).max(1),
+            });
+            out.writer_term = floor;
+            return Ok(out);
+        }
+        if let Some(margin) = pre_vote {
+            // The holder of this node's live writer lease, at the map's term, passes: it's
+            // the live writer adopting a term a lost election left above its own (#2073,
+            // simp724's point 1). Any other candidate waits out the margin.
+            let holder = by
+                .get(&req.node_id)
+                .is_some_and(|g| g.parts.get(WRITER_LEASE) == Some(&mine.writer_term));
+            let lapsed = self.writer_lapsed();
+            if !holder && lapsed < margin {
+                out.withheld.push(LeaseWithheld {
+                    partition: WRITER_LEASE.to_owned(),
+                    holder: super::schema::writer(mine).to_owned(),
+                    remaining_ms: millis(nanos(margin - lapsed)).max(1),
+                });
+                out.writer_term = floor;
+                return Ok(out);
+            }
+            out.granted.push(part.clone());
+            out.writer_term = part.term;
+            return Ok(out);
+        }
+        persist(part.term)
+            .map_err(|e| ApiError::internal(format!("record the writer term voted for: {e}")))?;
+        *voted = part.term;
+        let until = now.saturating_add(nanos(self.lease));
+        self.writer_granted(until);
+        match by.get_mut(&req.node_id) {
+            Some(g) if g.start == req.start => {
+                g.parts.insert(WRITER_LEASE.to_owned(), part.term);
+                g.round = g.round.max(req.round);
+                g.until = g.until.max(until);
+            }
+            _ => {
+                by.insert(
+                    req.node_id.clone(),
+                    Grant {
+                        start: req.start,
+                        round: req.round,
+                        parts: BTreeMap::from([(WRITER_LEASE.to_owned(), part.term)]),
+                        until,
+                    },
+                );
+            }
+        }
+        out.granted.push(part.clone());
+        out.writer_term = part.term;
         Ok(out)
     }
 
@@ -260,8 +584,20 @@ impl Grants {
         // what this release dropped.
         g.round = req.round;
         let before = g.parts.len();
-        for LeasePart { partition, epoch } in &req.parts {
-            if g.parts.get(partition) == Some(epoch) {
+        for LeasePart {
+            partition,
+            epoch,
+            term,
+            ..
+        } in &req.parts
+        {
+            // The writer lease is keyed by its term (D330).
+            let key = if partition == WRITER_LEASE {
+                term
+            } else {
+                epoch
+            };
+            if g.parts.get(partition) == Some(key) {
                 g.parts.remove(partition);
             }
         }
@@ -307,11 +643,15 @@ mod tests {
             round,
             lease_ms: 10_000,
             start: 1,
+            writer_term: 0,
+            pre_vote: false,
             parts: parts
                 .iter()
                 .map(|(p, e)| LeasePart {
                     partition: (*p).into(),
                     epoch: *e,
+                    term: 0,
+                    ..LeasePart::default()
                 })
                 .collect(),
         }
@@ -491,6 +831,8 @@ mod tests {
                 .map(|(p, e)| LeasePart {
                     partition: (*p).into(),
                     epoch: *e,
+                    term: 0,
+                    ..LeasePart::default()
                 })
                 .collect(),
             start,
@@ -551,5 +893,270 @@ mod tests {
             ["p1"]
         );
         assert!(!g.release(&release("a", 1, 8, &[("p1", 1)])));
+    }
+
+    /// A request for the writer lease alone, at `term`, from node `node` whose map is at
+    /// `(writer_term, version)`.
+    fn ask_writer(
+        node: &str,
+        writer_term: u64,
+        version: u64,
+        round: u64,
+        term: u64,
+    ) -> LeaseRequest {
+        LeaseRequest {
+            writer_term,
+            parts: vec![LeasePart {
+                partition: WRITER_LEASE.into(),
+                epoch: 0,
+                term,
+                ..LeasePart::default()
+            }],
+            ..ask(node, version, round, &[])
+        }
+    }
+
+    /// A map at writer term `term`, naming `writer` (term 0: none).
+    fn termed(version: u64, writer: &str, term: u64) -> ClusterMap {
+        ClusterMap {
+            writer: if term == 0 {
+                String::new()
+            } else {
+                writer.into()
+            },
+            writer_term: term,
+            ..map(version, &[("p1", "b", 1)])
+        }
+    }
+
+    #[test]
+    fn the_writer_lease_goes_only_to_the_maps_writer_at_its_term() {
+        let (g, _clock) = grants(Duration::from_secs(10));
+        // Term 0: the smallest id, a.
+        let v1 = termed(1, "", 0);
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 0, 1, 1, 0))),
+            [WRITER_LEASE]
+        );
+        assert!(granted(&grant(&g, &v1, &ask_writer("b", 0, 1, 1, 0))).is_empty());
+        // Term 3, naming c: c at 3 only.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v2 = termed(2, "c", 3);
+        assert!(granted(&grant(&g, &v2, &ask_writer("a", 3, 2, 1, 3))).is_empty());
+        assert!(granted(&grant(&g, &v2, &ask_writer("c", 3, 2, 1, 2))).is_empty());
+        assert_eq!(
+            granted(&grant(&g, &v2, &ask_writer("c", 3, 2, 2, 3))),
+            [WRITER_LEASE]
+        );
+        assert!(g.writer_remaining("c") > Duration::ZERO);
+        assert!(g.writer_lapsed().is_zero());
+    }
+
+    #[test]
+    fn maps_sort_by_term_then_version_in_a_grant() {
+        // simp724's S1 on the PR 1 plan: an old writer's map at a higher version but a lower
+        // term is behind, so the grantor answers with its newer map rather than a mismatch.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let elected = termed(5, "b", 2);
+        let r = grant(&g, &elected, &ask_writer("a", 1, 7, 1, 1));
+        assert_eq!(r.newer_map_version, 5, "{r:?}");
+        assert!(r.granted.is_empty());
+        // And a grantor behind the asker by term grants nothing, whatever the versions.
+        let r = grant(&g, &termed(9, "a", 1), &ask_writer("b", 2, 5, 1, 2));
+        assert!(r.granted.is_empty() && r.newer_map_version == 0, "{r:?}");
+    }
+
+    #[test]
+    fn a_pre_vote_records_nothing_and_waits_for_the_writer_lease_to_be_out_for_the_margin() {
+        // D330 PR 2: a pre-vote answers as the vote would, and changes nothing.
+        let (g, clock) = grants(Duration::from_secs(10));
+        let v1 = termed(4, "a", 1);
+        let margin = Duration::from_secs(5);
+        let pre = |req: LeaseRequest| LeaseRequest {
+            pre_vote: true,
+            ..req
+        };
+        // a's writer lease runs here: withheld.
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 1, 2)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty() && r.withheld[0].holder == "a", "{r:?}");
+        // Out, but for less than the margin: still withheld, the margin's rest as its time.
+        clock.advance(Duration::from_secs(12));
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 2, 2)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty(), "{r:?}");
+        assert!(r.withheld[0].remaining_ms > 0 && r.withheld[0].remaining_ms <= 5_000);
+        // Past the margin: it would vote, and nothing is recorded or granted.
+        clock.advance(margin);
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 3, 2)), margin)
+            .unwrap();
+        assert_eq!((granted(&r), r.writer_term), (vec![WRITER_LEASE], 2));
+        assert_eq!(g.voted(), 0);
+        assert!(g.writer_remaining("b").is_zero());
+        assert!(g.writer_lapsed() >= margin);
+        // c's pre-vote at the same term is answered alike: none was recorded for b.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("c", 1, 4, 1, 2)), margin)
+            .unwrap();
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        // A pre-vote at a term this node knows is refused with it.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("c", 1, 4, 2, 1)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty() && r.writer_term == 1, "{r:?}");
+    }
+
+    #[test]
+    fn the_live_writer_passes_its_own_pre_vote_and_vote_for_a_higher_term_and_no_one_else() {
+        // #2073 (simp724's point 1): the writer adopting a term a lost election left. Its
+        // own lease runs on every voter, so the margin can't have passed; the holder's
+        // ballot at the lease's term is let through, and only the holder's.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = termed(4, "a", 1);
+        let margin = Duration::from_secs(5);
+        let pre = |req: LeaseRequest| LeaseRequest {
+            pre_vote: true,
+            ..req
+        };
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        // Another candidate: withheld, a's lease runs.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 1, 3)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty() && r.withheld[0].holder == "a", "{r:?}");
+        // a itself, at a term above a lost election's 2: its pre-vote and vote pass.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("a", 1, 4, 2, 3)), margin)
+            .unwrap();
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        assert_eq!(g.voted(), 0, "a pre-vote records nothing");
+        let r = g
+            .vote(&v1, &ask_writer("a", 1, 4, 3, 3), |_| Ok(()))
+            .unwrap();
+        assert_eq!((granted(&r), g.voted()), (vec![WRITER_LEASE], 3));
+        // A grant of the writer lease at another term than the map's isn't the holder's.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        let v2 = termed(5, "a", 2);
+        let r = g
+            .pre_vote(&v2, &pre(ask_writer("a", 2, 5, 2, 3)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn a_vote_is_recorded_before_it_is_answered_and_fences_lower_terms() {
+        let (g, clock) = grants(Duration::from_secs(10));
+        let v1 = termed(4, "a", 1);
+        let recorded = std::cell::Cell::new(0);
+        let vote = |g: &Grants, req: &LeaseRequest| {
+            g.vote(&v1, req, |t| {
+                recorded.set(t);
+                Ok(())
+            })
+            .unwrap()
+        };
+        // Not a lone writer-lease request: refused.
+        assert!(
+            g.vote(&v1, &ask("b", 4, 1, &[("p1", 1)]), |_| Ok(()))
+                .is_err()
+        );
+        // a's writer lease runs here: b's vote is withheld, and nothing recorded.
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        let r = vote(&g, &ask_writer("b", 1, 3, 1, 2));
+        assert!(r.granted.is_empty() && r.withheld[0].holder == "a", "{r:?}");
+        assert_eq!((recorded.get(), g.voted()), (0, 0));
+        // Once it has run out, b is voted term 2, whatever its map version, and the term
+        // is recorded first.
+        clock.advance(Duration::from_secs(11));
+        assert!(g.writer_lapsed() >= Duration::from_secs(1));
+        let r = vote(&g, &ask_writer("b", 1, 3, 2, 2));
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        assert_eq!((recorded.get(), g.voted(), r.writer_term), (2, 2, 2));
+        // c's vote at the same term is refused with the term to beat; a's renewal at term 1
+        // too, as is any term at or below 2.
+        let r = vote(&g, &ask_writer("c", 1, 4, 1, 2));
+        assert!(r.granted.is_empty() && r.writer_term == 2, "{r:?}");
+        assert!(granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 2, 1))).is_empty());
+        assert_eq!(g.term_floor(&v1), 2);
+        // b renews its vote, as a candidate, before its map lands.
+        let r = grant(&g, &v1, &ask_writer("b", 1, 4, 3, 2));
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        // A vote whose record fails isn't granted.
+        clock.advance(Duration::from_secs(11));
+        assert!(
+            g.vote(&v1, &ask_writer("c", 1, 4, 2, 3), |_| Err(
+                std::io::Error::other("disk")
+            ))
+            .is_err()
+        );
+        assert_eq!(g.voted(), 2);
+    }
+
+    #[test]
+    fn a_vote_keeps_the_candidates_partition_grants() {
+        // Dropping them would free p1 to another node while the candidate still serves it.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = map(3, &[("p1", "b", 1)]);
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask("b", 3, 1, &[("p1", 1)]))),
+            ["p1"]
+        );
+        let r = g
+            .vote(&v1, &ask_writer("b", 0, 3, 2, 1), |_| Ok(()))
+            .unwrap();
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        let other = grant(
+            &g,
+            &map(3, &[("p1", "c", 1)]),
+            &ask("c", 3, 1, &[("p1", 1)]),
+        );
+        assert!(
+            other.granted.is_empty() && other.withheld[0].holder == "b",
+            "{other:?}"
+        );
+    }
+
+    #[test]
+    fn a_release_of_the_writer_lease_frees_it_at_once() {
+        // simp724's N2: a writer the map replaced releases its lease, so the new writer
+        // needn't wait out its grants.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = termed(1, "a", 1);
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 1, 1, 1))),
+            [WRITER_LEASE]
+        );
+        let rel = ReleaseRequest {
+            parts: vec![LeasePart {
+                partition: WRITER_LEASE.into(),
+                epoch: 0,
+                term: 1,
+                ..LeasePart::default()
+            }],
+            ..release("a", 1, 2, &[])
+        };
+        assert!(g.release(&rel));
+        assert!(g.writer_remaining("a").is_zero());
+        let r = g
+            .vote(&v1, &ask_writer("b", 1, 1, 1, 2), |_| Ok(()))
+            .unwrap();
+        assert_eq!(granted(&r), [WRITER_LEASE]);
     }
 }

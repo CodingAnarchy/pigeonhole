@@ -53,6 +53,30 @@ pub fn boot_clock_ns() -> u64 {
     crate::os::boot_clock_ns()
 }
 
+/// CPU time the calling thread has run, in nanoseconds since an arbitrary start (D332's
+/// sampled request CPU). Unix reads `CLOCK_THREAD_CPUTIME_ID` (on Linux a system call, not the
+/// vDSO: about 0.2–0.5 µs). Windows reads `QueryThreadCycleTime`, scaled by a cycle rate
+/// measured once against `Instant` (QPC), so it's precise per call where `GetThreadTimes`
+/// ticks every ~15.6 ms (perf287's S1), but approximate in absolute terms.
+///
+/// ```
+/// let a = pigeonhole_io::sys::thread_cpu_nanos();
+/// let mut x = 0u64;
+/// for i in 0..1_000_000u64 {
+///     x = std::hint::black_box(x.wrapping_add(i * i));
+/// }
+/// let b = pigeonhole_io::sys::thread_cpu_nanos();
+/// // Miri's emulated clock needn't move with interpreted work: it only never goes back.
+/// if cfg!(miri) {
+///     assert!(b >= a);
+/// } else {
+///     assert!(b > a, "{a} then {b}");
+/// }
+/// ```
+pub fn thread_cpu_nanos() -> u64 {
+    crate::os::thread_cpu_nanos()
+}
+
 /// Number of CPUs available to this process, honoring affinity masks and cgroup CPU quotas.
 pub fn available_cpus() -> usize {
     crate::os::available_cpus()

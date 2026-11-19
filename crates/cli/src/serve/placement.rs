@@ -873,7 +873,7 @@ impl Placement {
 
 /// The process's CPUs (Linux's affinity set), read once at the start before any thread is
 /// masked; `None` where there's no hard affinity or it can't be read.
-fn process_cpus() -> Option<Vec<usize>> {
+pub(crate) fn process_cpus() -> Option<Vec<usize>> {
     #[cfg(target_os = "linux")]
     {
         use nix::sched::{CpuSet, sched_getaffinity};

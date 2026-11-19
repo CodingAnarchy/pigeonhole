@@ -1414,6 +1414,17 @@ impl Pager {
         Ok(Some(st.root))
     }
 
+    /// The feature sets of the newest superblock on disk now, read again for a read-only
+    /// handle (a reader process's), without moving its root: a feature bit a writer set
+    /// since the last [`reload_root`](Self::reload_root) (D331's `incompat` bit 3 commits no
+    /// manifest, so a reader's reload never sees it). A writable pager answers its own.
+    pub fn features_on_disk(&self) -> Result<Features> {
+        if self.inner.writable {
+            return Ok(self.features());
+        }
+        Ok(read_superblocks(&self.inner.file)?.0.features)
+    }
+
     /// Marks `extent` unreachable from the root committed at `superseded_at` and every later
     /// one. It is freed by [`Pager::reclaim`] once no view older than `superseded_at` lives.
     pub fn retire(&self, extent: Extent, superseded_at: ManifestVersion) {

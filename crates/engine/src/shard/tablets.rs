@@ -361,24 +361,20 @@ impl ShardState {
     fn routing_of(&self, m: &Member) -> Routing {
         let prepare = matches!(m.kind, MemberKind::Prepare { .. });
         let mut out = Routing::Owned;
-        // A share routed with an older tablet map may name rows this shard no longer owns,
-        // and its reads may now belong to a shard outside the commit (nobody would validate
-        // them): it runs again through the new map only then (#102). A read another
-        // participant owns now is validated there, under that shard's current map.
-        let participants: Option<&[ShardId]> = (prepare && m.map_version < self.tablets.version())
-            .then(|| {
-                self.prepared
-                    .get(&m.seqno)
-                    .map_or(&[][..], |s| s.participants.as_slice())
-            });
+        // A share routed before this shard last handed a tablet away (`lost_version`, D145)
+        // may name rows it no longer owns, and its reads may now belong to another shard: it
+        // runs again through the new map. That holds for a read now owned by another
+        // participant too (D145 amended): that participant may have admitted its own share,
+        // and skipped the read as not its row, before the tablet moved to it, and then nobody
+        // would validate it (found by #2054's test in #2056's CI). It's refused only in that
+        // window, so a commit retries once per tablet this shard gives away during its flight,
+        // not under churn elsewhere, which D145 was about.
+        let stale = prepare && m.map_version < self.lost_version;
         let mut look = |table: TableId, row: &[u8], read_by_others: bool| {
             if let Some((tablet, owner)) = self.tablets.route(table, row) {
                 if self.moving.contains(&tablet) {
                     out = Routing::Moving;
-                } else if owner != self.id
-                    && out == Routing::Owned
-                    && (!read_by_others || participants.is_some_and(|p| !p.contains(&owner)))
-                {
+                } else if owner != self.id && out == Routing::Owned && (!read_by_others || stale) {
                     out = Routing::Elsewhere;
                 }
             }
@@ -826,6 +822,31 @@ impl ShardState {
         }
     }
 
+    /// After a read hold's release (D329, perf2's S1 on #2062): wakes the coordinators refused
+    /// with no older commit ahead (`behind: None`) whose rows no undecided share and no hold
+    /// here covers now, as [`release_overlaps`](Self::release_overlaps) does at a decision.
+    /// Without it, one refused over a row a hold also read would wait, once the share it met
+    /// was decided and the hold released, for D241's retry timeout.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_overlaps_cleared(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let mut i = 0;
+        while i < self.overlap_refused.len() {
+            let r = &self.overlap_refused[i];
+            let go = r.single == 0
+                && r.behind.is_none()
+                && !r.rows.iter().any(|h| {
+                    self.pending_rows.contains_key(h) || self.pending_reads.contains_key(h)
+                });
+            if go {
+                let r = self.overlap_refused.swap_remove(i);
+                self.wake_overlap(r, ctx);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// A share of the commit of `priority`, writing `written` (`hash_row`, sorted), committed
     /// here (D276): a refused commit that reads one of those rows and now fails validation
     /// on it would fail its retry the same way (its snapshot stays, and a version above it
@@ -1235,6 +1256,10 @@ impl ShardState {
     /// Runs a refused cross-shard commit again through the current tablet map.
     pub(super) fn retry(&mut self, r: CoordinateReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         let mut builder = BatchBuilder::new();
+        // The parts of a feed-silent batch are all silent (D331): so is the batch again.
+        if r.parts.iter().any(|(_, p)| p.is_silent()) {
+            builder.mark_silent();
+        }
         let mut failed = None;
         for (_, part) in &r.parts {
             for mu in part.batch().iter() {
@@ -1255,6 +1280,13 @@ impl ShardState {
                     failed = Some(e);
                 }
             }
+        }
+        // Its shares' xid, if a spanning commit's (D329 2b): every share carries the same.
+        if failed.is_none()
+            && let Some((_, part)) = r.parts.first()
+            && let Err(e) = crate::engine::carry_xid(part, &mut builder)
+        {
+            failed = Some(e);
         }
         if let Some(e) = failed {
             self.release_shards(r.submitted_at, r.first_seqno, &r.prev_shards, ctx);
@@ -1350,7 +1382,7 @@ impl ShardState {
         trace!("shard {} tablet timer armed for {deadline}", self.id.0);
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             deadline,
             Arc::clone(&state),
             ctx.submitter(self.id).clone(),
@@ -1648,6 +1680,15 @@ impl ShardState {
     /// Whether a prepared, undecided share writes or reads a tablet being changed: `None`
     /// if none does, `Some(true)` if one is an external share (D329), else `Some(false)`.
     fn shares_touch_moving(&self) -> Option<bool> {
+        // A read hold (ICR 0140 amendment 1) is given up for, as a share in doubt is: its
+        // caller may keep it for a while.
+        if self
+            .read_holds
+            .values()
+            .any(|h| h.tablets.iter().any(|t| self.moving.contains(t)))
+        {
+            return Some(true);
+        }
         let mut touch = None;
         for share in self.prepared.values() {
             // Its reads too (#2050): a write to a row it read, admitted on the tablet's new
@@ -1915,6 +1956,10 @@ impl ShardState {
             l.ewma = LOAD_ALPHA * l.writes as f64 + (1.0 - LOAD_ALPHA) * l.ewma;
             l.slow = SLOW_ALPHA * l.writes as f64 + (1.0 - SLOW_ALPHA) * l.slow;
         }
+        // Each tablet's load, for `Engine::tablets` (D332): stored whole, read by any thread.
+        self.shared.tablet_loads[usize::from(self.id.0)].store(Arc::new(
+            self.loads.iter().map(|(id, l)| (*id, l.ewma)).collect(),
+        ));
         self.note_arrivals(now);
         let (_, mem_per) = self.mem_bytes();
         self.measure_busy(now);
@@ -2740,7 +2785,7 @@ impl ShardState {
         }
         let state = TimerState::new();
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             self.next_balance,
             Arc::clone(&state),
             ctx.submitter(self.id).clone(),
@@ -3296,6 +3341,21 @@ fn row_of_key(key: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Bytes of SSTs `t` references, each shared one divided by the tablets referencing it
+/// (`Engine::tablets`, D332): summed over the tablets, every SST counts once.
+pub(crate) fn shared_bytes(view: &View, t: &TabletEntry, refs: &HashMap<SstId, usize>) -> u64 {
+    let mut bytes = 0;
+    for f in view.catalog.family_ids_of(t.table) {
+        if let Some(fam) = view.ssts.family(t.id, f) {
+            for sst in fam.iter() {
+                let n = refs.get(&sst.meta.id).copied().unwrap_or(1).max(1) as u64;
+                bytes += sst.meta.len / n;
+            }
+        }
+    }
+    bytes
+}
+
 /// Bytes of SSTs `t` references, and whether any of them is shared with another tablet.
 fn live_bytes(view: &View, t: &TabletEntry, refs: &HashMap<SstId, usize>) -> (u64, bool) {
     let mut bytes = 0;
@@ -3391,8 +3451,17 @@ pub(crate) fn split_by_shard(
     builder: &BatchBuilder,
     shards: &[ShardId],
 ) -> Result<Vec<(ShardId, Arc<BatchBuilder>)>> {
-    let mut parts: Vec<(ShardId, BatchBuilder)> =
-        shards.iter().map(|s| (*s, BatchBuilder::new())).collect();
+    let mut parts: Vec<(ShardId, BatchBuilder)> = shards
+        .iter()
+        .map(|s| {
+            let mut part = BatchBuilder::new();
+            // Every share of a feed-silent batch is silent (D331).
+            if builder.is_silent() {
+                part.mark_silent();
+            }
+            (*s, part)
+        })
+        .collect();
     for m in builder.batch().iter() {
         let m = m?;
         let Some((_, shard)) = view.tablets.route(m.table, m.row) else {
@@ -3405,6 +3474,10 @@ pub(crate) fn split_by_shard(
         };
         part.1
             .push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
+    }
+    // Every share of a spanning commit's batch carries its xid (D329 2b).
+    for (_, part) in &mut parts {
+        crate::engine::carry_xid(builder, part)?;
     }
     Ok(parts.into_iter().map(|(s, b)| (s, Arc::new(b))).collect())
 }

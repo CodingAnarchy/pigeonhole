@@ -422,14 +422,9 @@ fn positions(merge: &Merge, out: &mut Vec<u64>) {
 }
 
 /// A component position's seqno: the D310 token's last seqno delivered (or passed over),
-/// read from its fixed header ([`super::token`] reads the same layout).
+/// through the one accessor ([`At::seqno`]).
 fn position(at: &At) -> u64 {
-    match at {
-        At::Token(t) if t.len() >= 29 && matches!(t[0], 1..=3) => {
-            u64::from_le_bytes(t[21..29].try_into().expect("8 bytes"))
-        }
-        _ => UNKNOWN,
-    }
+    at.seqno().unwrap_or(UNKNOWN)
 }
 
 /// Opens `key`'s hub from `merge` (its components opened), its task spawned.
@@ -1072,6 +1067,7 @@ impl Member {
             token: self.token.clone(),
             event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
             partition: String::new(),
+            xid: Default::default(),
         };
         self.send(Out::event(event), true).await
     }

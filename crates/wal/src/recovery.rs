@@ -92,6 +92,10 @@ pub struct Recovery {
     chunk_start: u64,
     /// Opened by [`Recovery::open`] (else [`Recovery::open_read_only`]).
     writable: bool,
+    /// Whether a feed-silent batch's mark is taken ([`Recovery::accept_silent`]).
+    silent_ok: bool,
+    /// Whether a batch's xid trailer is taken (D329 2b, [`Recovery::accept_xid`]).
+    xid_ok: bool,
 }
 
 #[derive(Debug)]
@@ -132,6 +136,9 @@ fn seqno_of(rec: &WalRecord<'_>) -> Seqno {
         WalRecord::ExternalAbort {
             seqno, abort_seqno, ..
         } => (*seqno).max(*abort_seqno),
+        // A range drop's own seqno (D331): nothing applies there, and a reopen never hands it
+        // out again.
+        WalRecord::RangeDrop { seqno, .. } => *seqno,
         // `WalRecord::decode` returns no other type in this build (a newer one is corrupt).
         _ => 0,
     }
@@ -220,6 +227,8 @@ impl Recovery {
             chunk_slot: usize::MAX,
             chunk_start: 0,
             writable,
+            silent_ok: false,
+            xid_ok: true,
         };
         if missing {
             // The checkpoint's segment never reached the disk: everything before the
@@ -325,9 +334,24 @@ impl Recovery {
             }
         }
         let cur = self.cur.as_ref().expect("a record was just decoded");
-        let record = WalRecord::decode(cur.dec.record())?;
+        let record = WalRecord::decode_flags(cur.dec.record(), self.silent_ok, self.xid_ok)?;
         self.max_seqno = self.max_seqno.max(seqno_of(&record));
         Ok(Some((self.end, record)))
+    }
+
+    /// Takes feed-silent batches' mark (D331, ICR 0141): set when the superblock has
+    /// `incompat` bit 3 ([`INCOMPAT_FEED_SILENT`]). Without it a marked batch is corrupt.
+    ///
+    /// [`INCOMPAT_FEED_SILENT`]: pigeonhole_format::wal::INCOMPAT_FEED_SILENT
+    pub fn accept_silent(&mut self, ok: bool) {
+        self.silent_ok = ok;
+    }
+
+    /// Takes a batch's xid trailer (D329 2b, `XID_BATCH`): set when the superblock has
+    /// `incompat` bit 2. Without it a tagged batch is corrupt. On by default, for a reader
+    /// that doesn't know the database's bits.
+    pub fn accept_xid(&mut self, ok: bool) {
+        self.xid_ok = ok;
     }
 
     /// The stream file's slot size, `None` while it holds no segment. An existing file keeps

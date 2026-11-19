@@ -717,3 +717,306 @@ fn reserve_after_the_shares_alone() {
         &order[..3]
     );
 }
+
+#[test]
+fn a_spanning_transactions_branch_on_its_homes_node_is_a_local_call() {
+    // D329: home p3 on node a, with a branch on p1 (node a too: a local call) and one on p2
+    // (node b), committed together; then a node-limited --txn-max-branches is refused at
+    // the branch past it, the transaction still usable.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.txn_max_branches = 1;
+    let t = Several::start(limits);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        let begin = |port: u16| async move {
+            txns(port)
+                .await
+                .begin(crate::serve::proto::BeginRequest {
+                    durability: 0,
+                    route: route_row("zed"),
+                    spans_partitions: true,
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .txn_id
+        };
+        let id = begin(b).await;
+        assert!(id.starts_with("p3:h"), "{id}");
+        // p1's row (a local branch on a) is fine; p2's would be the second branch.
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let e = txn_write(c, &id, vec![put_row("hank", "1")], None)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "FailedPrecondition", "{e}");
+        let reply = txns(a)
+            .await
+            .commit(crate::serve::proto::TxnCommitRequest {
+                txn_id: id.clone(),
+                rows: Vec::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let parts: Vec<(&str, bool)> = reply
+            .parts
+            .iter()
+            .map(|p| (p.partition.as_str(), p.applied))
+            .collect();
+        assert_eq!(parts, [("p3", true), ("p1", true)], "{reply:?}");
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "hank").await.unwrap(), None);
+    });
+}
+
+/// A spanning transaction begun through `port` with its home at "zed" (p3, node a).
+async fn begin_spanning(port: u16) -> String {
+    txns(port)
+        .await
+        .begin(crate::serve::proto::BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .txn_id
+}
+
+#[test]
+fn a_spanning_transactions_branches_are_renewed_by_its_other_calls() {
+    // audit120's M2 and the design's S4: a branch idle past --txn-idle-ms while the
+    // transaction works elsewhere is renewed by those calls, so the commit has its write;
+    // without it the branch would expire and its write be lost.
+    let mut limits = crate::serve::server_tests::limits();
+    limits.leases.txn_idle = std::time::Duration::from_millis(800);
+    let t = Several::start(limits);
+    let [_, b, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(b).await;
+        txn_write(
+            c,
+            &id,
+            vec![put_row("hank", "1"), put_row("alice", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        // Two and a half idle leases of calls on the home alone.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            txn_get(c, &id, "zed").await.unwrap();
+        }
+        let reply = txns(c)
+            .await
+            .commit(crate::serve::proto::TxnCommitRequest {
+                txn_id: id.clone(),
+                rows: vec![put_row("zed", "1")],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.parts.iter().all(|p| p.applied), "{reply:?}");
+        assert_eq!(get_row(c, "hank").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+    });
+}
+
+#[test]
+fn a_read_only_branchs_hold_whose_release_never_comes_expires() {
+    // audit120's M4: a home lost in its release round leaves its branches' holds; each goes
+    // at twice the request timeout, and its row takes writes again.
+    use crate::serve::cluster::spanning::seams;
+    let mut limits = crate::serve::server_tests::limits();
+    limits.request_timeout = std::time::Duration::from_millis(800);
+    let t = Several::start(limits);
+    let [_, b, c] = t.ports;
+    t.rt.block_on(async {
+        put(c, "hank", "0").await;
+        let id = begin_spanning(b).await;
+        txn_get(c, &id, "hank").await.unwrap();
+        let pause = seams::pause(&id, seams::Step::Release);
+        let task = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                txns(c)
+                    .await
+                    .commit(crate::serve::proto::TxnCommitRequest {
+                        txn_id: id,
+                        rows: Vec::new(),
+                    })
+                    .await
+            })
+        };
+        pause.reached.notified().await;
+        // p2 holds hank now: a write is refused.
+        let e = data(c)
+            .await
+            .mutate(crate::serve::proto::MutateRequest {
+                writes: Some(put_row("hank", "1")),
+                durability: 0,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "Busy", "{e}");
+        // The home abandons its round: the hold is never released, so it expires.
+        pause.go.send(true).unwrap();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(code(&e), "Conflict", "{e}");
+        eventually("the hold to expire", async || {
+            data(c)
+                .await
+                .mutate(crate::serve::proto::MutateRequest {
+                    writes: Some(put_row("hank", "1")),
+                    durability: 0,
+                })
+                .await
+                .is_ok()
+        })
+        .await;
+    });
+}
+
+/// `row`'s writes with one that carries no operation: refused where it's decoded.
+fn bad_row(row: &str) -> crate::serve::proto::RowWrites {
+    let mut w = put_row(row, "x");
+    w.writes.push(crate::serve::proto::Write { op: None });
+    w
+}
+
+/// `row`'s increment of the counter `n:c` by `delta`.
+fn incr_row(row: &str, delta: i64) -> crate::serve::proto::RowWrites {
+    use crate::serve::proto::{Incr, RowKey, RowWrites, Write, write};
+    RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+        }),
+        writes: vec![Write {
+            op: Some(write::Op::Incr(Incr {
+                family: "n".into(),
+                qualifier: b"c".to_vec().into(),
+                timestamp: None,
+                delta,
+            })),
+        }],
+    }
+}
+
+/// `row`'s counter `n:c` through `port` (0 when absent).
+async fn counter(port: u16, row: &str) -> i64 {
+    let reply = data(port)
+        .await
+        .get(crate::serve::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "n".into(),
+            qualifier: b"c".to_vec().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    reply.cell.map_or(0, |c| {
+        i64::from_le_bytes(c.value[..8].try_into().expect("a counter's 8 bytes"))
+    })
+}
+
+/// Adds the counter family `n` to `users` through `port`, then waits until every node's
+/// partitions have taken that map.
+async fn add_counter(ports: &[u16], port: u16) {
+    use crate::serve::proto::schema_client::SchemaClient;
+    use crate::serve::proto::{
+        Aggregation, AggregationKind, CreateTableRequest, FamilySpec, family_spec,
+    };
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    SchemaClient::new(channel)
+        .create_table(CreateTableRequest {
+            name: "users".into(),
+            families: vec![FamilySpec {
+                name: "n".into(),
+                kind: Some(family_spec::Kind::Aggregate(Aggregation {
+                    kind: AggregationKind::Sum as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            if_missing: true,
+            placement: None,
+        })
+        .await
+        .unwrap();
+    let want = version(port).await;
+    for &p in ports {
+        eventually("every partition to take the map with n", async || {
+            client(p)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .all(|lp| lp.reconciled_version >= want)
+        })
+        .await;
+    }
+}
+
+#[test]
+fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
+    // audit120's M3b: rows a call already sent to a branch can't be applied twice by a
+    // retry. What the home could refuse is checked before any row goes out; a failure after
+    // that ends the transaction.
+    let t = Several::start(crate::serve::server_tests::limits());
+    let [_, b, c] = t.ports;
+    let commit = |id: String, rows| async move {
+        txns(c)
+            .await
+            .commit(crate::serve::proto::TxnCommitRequest { txn_id: id, rows })
+            .await
+    };
+    t.rt.block_on(async {
+        // An increment, so applying alice's row twice would show (audit120's note on #2062).
+        add_counter(&t.ports, c).await;
+        // A bad home row: refused before alice's row went to p1; the transaction goes on,
+        // and its corrected commit counts alice's increment once.
+        let id = begin_spanning(b).await;
+        let e = commit(id.clone(), vec![incr_row("alice", 1), bad_row("zed")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        commit(id.clone(), vec![incr_row("alice", 1), put_row("zed", "1")])
+            .await
+            .unwrap();
+        assert_eq!(counter(c, "alice").await, 1, "counted once");
+        // A bad row for the second branch (p2), after p1 took its rows: the transaction
+        // ends, its retry answers that outcome, and p1's row is never committed.
+        let id = begin_spanning(b).await;
+        let e = commit(id.clone(), vec![put_row("bob", "1"), bad_row("hank")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "{e}");
+        let e = commit(id.clone(), vec![put_row("bob", "1"), put_row("hank", "1")])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "InvalidArgument", "the recorded outcome: {e}");
+        assert_eq!(get_row(c, "bob").await.unwrap(), None);
+        assert_eq!(get_row(c, "hank").await.unwrap(), None);
+        // p1's branch was aborted: bob takes a plain write at once.
+        put(c, "bob", "2").await;
+    });
+}

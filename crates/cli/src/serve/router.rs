@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::auth::Caller;
 use super::cluster::forward::{self, Forwarder};
 use super::cluster::route::{Routes, prefix_end};
+use super::cluster::spanning;
 use super::errors::ApiError;
 use super::proto::{ForwardRequest, RoutingKey, RowWrites, ScanRequest, Selection, routing_key};
 use super::replica::ReadDeadline;
@@ -37,6 +38,47 @@ pub(crate) struct Cluster {
     /// when: skipped for [`REPLICA_BACKOFF`] after, so reads don't each pay for the miss.
     pub(crate) replica_backoff:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>>,
+    /// The spanning transactions this node coordinates, and the read-only holds its
+    /// partitions keep for others' (D329).
+    pub(crate) spanning: Arc<spanning::Spanning>,
+}
+
+impl Cluster {
+    /// A spanning transaction's coordinator for `op` at its home, `home` (D329): the call's
+    /// transaction, client and deadline, with handles to reach its branches.
+    pub(crate) fn driver(
+        &self,
+        home_service: &Service,
+        op: &ServiceOp,
+        caller: &Caller,
+        deadline: tokio::time::Instant,
+    ) -> Result<spanning::Driver, ApiError> {
+        let home = home_service
+            .gate()
+            .map(|g| g.partition().to_owned())
+            .ok_or_else(|| ApiError::internal("a spanning transaction off a cluster"))?;
+        let xid = match op {
+            ServiceOp::TxnGet(r) => r.txn_id.as_str(),
+            ServiceOp::TxnGetRow(r) => r.txn_id.as_str(),
+            ServiceOp::TxnWrite(r) => r.txn_id.as_str(),
+            ServiceOp::Commit(r) => r.txn_id.as_str(),
+            ServiceOp::Abort(r) => r.txn_id.as_str(),
+            _ => "",
+        };
+        Ok(spanning::Driver {
+            node: Arc::clone(&self.node),
+            parts: Arc::clone(&self.parts),
+            forwarder: Arc::clone(&self.forwarder),
+            spanning: Arc::clone(&self.spanning),
+            xid: xid.into(),
+            home: home.into(),
+            caller: caller.clone(),
+            deadline,
+            renew_after: home_service.txn_idle() / 2,
+            max_branches: home_service.txn_max_branches(),
+            round: home_service.request_timeout(),
+        })
+    }
 }
 
 /// The most of what's left of a read's time one replica's attempt takes (simp724's S2 on
@@ -96,6 +138,13 @@ impl Cluster {
         }
         self.here(partition).ok_or_else(|| not_open(partition))
     }
+}
+
+tokio::task_local! {
+    /// A `Replication.Follow` call's node id (the request's node-id header), for
+    /// [`Router::follow_owned`]'s check that the follower is one of the partition's map
+    /// replicas. Set by the gRPC handler; unset (or `None`) for any other caller.
+    pub(crate) static FOLLOWER: Option<String>;
 }
 
 /// Where `partition` is served, by `routes`, as an entry node sees it: here, or the node the
@@ -199,6 +248,7 @@ impl Router {
                 memory: None,
                 replicas: Arc::default(),
                 replica_backoff: Arc::default(),
+                spanning: spanning::Spanning::new(),
             }),
         }
     }
@@ -222,7 +272,8 @@ impl Router {
     }
 
     /// `Admin.PartitionUpload` (D317): `stream`'s file of a partition this node doesn't
-    /// have open, staged for the stamp that installs it. Admin scope; a cluster node only.
+    /// have open, staged for the stamp that installs it. Admin scope, or a node's cluster
+    /// token for a relocation's set (D332); a cluster node only.
     pub(crate) async fn partition_upload(
         &self,
         caller: &Caller,
@@ -248,6 +299,15 @@ impl Router {
                 "an upload's first message carries its header",
             ));
         };
+        // A node's own token uploads only what a move needs (simp724's S1 on #2094): a
+        // restore is an admin's upload.
+        if caller.scope == super::auth::Scope::Cluster
+            && header.purpose() != super::proto::PartitionUploadPurpose::Relocate
+        {
+            return Err(ApiError::permission_denied(
+                "upload a partition for anything but a move: a restore is an admin's upload",
+            ));
+        }
         let partitions = self.partitions();
         let open = |p: &str| partitions.iter().any(|(id, _)| id == p);
         let mut writing = uploads.begin(header, open)?;
@@ -284,7 +344,10 @@ impl Router {
         if caller.memory_only() {
             return Err(super::service::namespaced_denied("call PartitionUpload"));
         }
-        if !caller.scope.allows(super::auth::Scope::Admin) {
+        // Admin, or a node's own token: the map's writer runs a move's copy (D332, D331 PR 5).
+        if !caller.scope.allows(super::auth::Scope::Admin)
+            && caller.scope != super::auth::Scope::Cluster
+        {
             return Err(ApiError::permission_denied("call PartitionUpload"));
         }
         match &self.cluster {
@@ -396,6 +459,8 @@ impl Router {
             .map(|(id, c)| (id.as_str(), &*c.follower))
             .collect();
         super::replica::Replica::render_copies(&followers, &mut text);
+        // The map's failover counts and writer term (D330).
+        cluster.node.render_failover_metrics(&mut text);
         text
     }
 
@@ -597,7 +662,11 @@ impl Router {
     }
 
     /// `Replication.Follow` on a cluster node (D328): a replica copy's follower, at the node
-    /// its map says owns the partition. The token is opaque, so it's tried on each partition
+    /// its map says owns the partition. Only the partition's map replicas follow it (D329 2b,
+    /// the coordinator's ruling): a cluster-scope caller whose node id ([`FOLLOWER`], from the
+    /// request's node-id header) is one of the partition's replicas. Anyone else, an outside
+    /// `phdb serve --replica-of` included, is refused `FailedPrecondition`, since only the
+    /// map's nodes are known to read every replicated event this build writes. The token is opaque, so it's tried on each partition
     /// this node owns and has open, and the one whose database it names serves it (another
     /// database's token is refused by the engine, `InvalidArgument`). None: `WrongPartition`
     /// with this node's map version, so the follower re-reads the map (Q5: never forwarded,
@@ -618,9 +687,32 @@ impl Router {
             ));
         };
         let me = cluster.node.id();
+        let follower = FOLLOWER.try_with(Clone::clone).ok().flatten();
+        // A cluster-scope token, or a cluster without tokens (loopback only), where every
+        // caller is the anonymous admin: the node id must still be a map replica's.
+        let cluster_caller = caller.scope == super::auth::Scope::Cluster
+            || caller.token == super::auth::TokenId::ANONYMOUS;
+        // The map's replicas, not the routing view's: that one lists none while a range move
+        // gates the partition's copies (D331), and they must go on following then.
+        let map = cluster.node.get_map().ok();
+        let replicas_of = |id: &str| {
+            map.as_ref()
+                .and_then(|m| m.partitions.iter().find(|p| p.id == id))
+                .map(|p| p.replicas.clone())
+                .unwrap_or_default()
+        };
         let parts = cluster.parts.load_full();
+        let mut refused = false;
         for (id, service) in parts.iter() {
             if routes.owner(id).is_none_or(|o| o.node != me) {
+                continue;
+            }
+            let replica = cluster_caller
+                && follower
+                    .as_deref()
+                    .is_some_and(|f| replicas_of(id).iter().any(|n| n == f));
+            if !replica {
+                refused = true;
                 continue;
             }
             match service
@@ -631,6 +723,13 @@ impl Router {
                 }
                 answer => return answer,
             }
+        }
+        if refused {
+            return Err(ApiError::failed_precondition(
+                "a cluster partition is followed only by its map replicas: this follower isn't \
+                 one of the partition's replicas in the cluster map (an outside --replica-of \
+                 can't follow a cluster node)",
+            ));
         }
         Err(ApiError::wrong_partition(
             routes.map_version(),
@@ -804,6 +903,30 @@ impl Router {
                 _ => {}
             }
             return match cluster.target(&op)? {
+                // A transaction's outcome at its home's owner (D329 2b).
+                Place::Here(service) if matches!(op, ServiceOp::Outcome(_)) => {
+                    let ServiceOp::Outcome(r) = &op else {
+                        unreachable!("matched")
+                    };
+                    drop(service.admit(&op.admit(), caller, prepaid).await?);
+                    let settled = spanning::settle(
+                        &cluster.node,
+                        &service,
+                        &r.txn_id,
+                        spanning::Asker::Client(caller.principal),
+                    )
+                    .await?;
+                    Ok(ServiceReply::Outcome(settled))
+                }
+                // A spanning transaction's call at its home's owner (D329).
+                Place::Here(service) if spanning::spanning_call(&op) => {
+                    let deadline = deadline.map_or_else(
+                        || tokio::time::Instant::now() + self.service.request_timeout(),
+                        tokio::time::Instant::from_std,
+                    );
+                    let driver = cluster.driver(&service, &op, caller, deadline)?;
+                    Box::pin(spanning::serve_home(driver, service, op, caller, prepaid)).await
+                }
                 Place::Here(service) => service.call(op, caller, prepaid).await,
                 Place::There(owner) => {
                     let deadline = deadline.map_or_else(
@@ -1089,6 +1212,37 @@ impl Router {
                 if fanout_part =>
             {
                 service.fanout_part(op, caller).await?
+            }
+            // A transaction's outcome at its home's owner, forwarded (D329 2b).
+            ServiceOp::Outcome(r) => {
+                drop(
+                    service
+                        .admit(&ServiceOp::Outcome(r.clone()).admit(), caller, None)
+                        .await?,
+                );
+                ServiceReply::Outcome(
+                    spanning::settle(
+                        &cluster.node,
+                        &service,
+                        &r.txn_id,
+                        spanning::Asker::Client(caller.principal),
+                    )
+                    .await?,
+                )
+            }
+            // A spanning transaction's call at its home's owner (D329), forwarded by the
+            // node the client called.
+            op if spanning::spanning_call(&op) => {
+                let deadline = tokio::time::Instant::now() + self.service.request_timeout();
+                let driver = cluster.driver(&service, &op, caller, deadline)?;
+                Box::pin(spanning::serve_home(
+                    driver,
+                    Arc::clone(&service),
+                    op,
+                    caller,
+                    None,
+                ))
+                .await?
             }
             op => service.call(op, caller, None).await?,
         };
@@ -1543,6 +1697,7 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
     };
     // A session's partition, from its id; a row of `table` must be in it.
     let session = |id: &str, what: &str| session_partition(routes, id, what);
+    let spanning = |id: &str| super::sessions::spanning_parts(id).is_some();
     let within = |p: String, what: &str, table: &str, row: &[u8]| {
         let q = one(table, row)?;
         if q == p {
@@ -1607,6 +1762,12 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
         }
         ServiceOp::Begin(r) => begins(routes, r.route.as_ref(), "a transaction"),
         ServiceOp::OpenSnapshot(r) => begins(routes, r.route.as_ref(), "a snapshot"),
+        // A spanning transaction's call goes to its home, whatever rows it names: the home's
+        // owner sends each row of another partition on to that partition's branch (D329).
+        ServiceOp::TxnGet(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
+        ServiceOp::TxnGetRow(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
+        ServiceOp::TxnWrite(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
+        ServiceOp::Commit(r) if spanning(&r.txn_id) => session(&r.txn_id, "transaction"),
         ServiceOp::TxnGet(r) => {
             let p = session(&r.txn_id, "transaction")?;
             within(p, "the transaction", &r.table, &r.row)
@@ -1626,6 +1787,7 @@ pub(crate) fn route(routes: &Routes, op: &ServiceOp) -> Result<String, ApiError>
             &r.rows,
         ),
         ServiceOp::Abort(r) => session(&r.txn_id, "transaction"),
+        ServiceOp::Outcome(r) => session(&r.txn_id, "transaction"),
         ServiceOp::ReleaseSnapshot(r) => session(&r.snapshot_id, "snapshot"),
         // A read at a snapshot stays in the snapshot's partition (cli692's S3 on ticket 3).
         // Without one, a client's fans out before it gets here (ticket 4a), and this is one

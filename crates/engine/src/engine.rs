@@ -77,6 +77,23 @@ pub struct FamilyInfo {
     pub options: FamilyOptions,
 }
 
+/// One tablet as [`Engine::tablets`] reports it (D332, ICR 0142). Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TabletStats {
+    /// Its table's name.
+    pub table: String,
+    /// Inclusive start row; empty is unbounded.
+    pub start: Vec<u8>,
+    /// Exclusive end row; `None` is unbounded.
+    pub end: Option<Vec<u8>>,
+    /// Bytes of the SSTs it references, a shared SST's divided among its tablets.
+    pub bytes: u64,
+    /// Its shard's moving average of rows written to it per balancer interval.
+    pub write_load: f64,
+}
+
 /// A table as the catalog knows it. Immutable; adding a family publishes a new `TableInfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -232,6 +249,13 @@ pub struct Metrics {
     /// `GroupSync` member: a `Sync` commit's own sync isn't in it. Published at each group
     /// sync's start and finish (D316 A3, ICR 0116).
     pub group_sync_nanos: u64,
+    /// Bytes this database's files read since open, at their size on disk, readahead
+    /// included (D332, ICR 0142). The engine's own estimate of its device reads: reads the
+    /// OS page cache served count too, and metadata such as the manifest is included.
+    pub device_read_bytes: u64,
+    /// Bytes this database's files wrote since open: the WAL's, flushes' and compactions'
+    /// (D332, ICR 0142). Syncs, writeback hints and punches count nothing.
+    pub device_write_bytes: u64,
     /// Nanoseconds the compaction pool's threads spent in slices of the shards' flushes and
     /// compactions, summed over shards (D256). Its rise over an interval, divided by the
     /// interval, is how many threads' worth of pool work the store did; zero with the pool
@@ -744,6 +768,7 @@ fn external_pins(
     db_id: [u8; 16],
     catalog: &Catalog,
     shards: usize,
+    silent_ok: bool,
 ) -> Result<HashMap<TabletId, ShardId>> {
     // Each external PREPARE: (stream, id) -> (coordinator, participants, rows).
     #[allow(clippy::type_complexity)]
@@ -761,6 +786,9 @@ fn external_pins(
             .copied()
             .unwrap_or_default();
         let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
+        rec.accept_silent(silent_ok);
+        // Tagged batches only behind `incompat` bit 2 (D329 2b): this pass runs only with it.
+        rec.accept_xid(true);
         while let Some((_, record)) = rec.next_record()? {
             match record {
                 WalRecord::Prepare { seqno, .. } => {
@@ -1086,6 +1114,14 @@ impl Engine {
                 "memtable_budget must be at least 128 KiB".to_owned(),
             ));
         }
+        // Every file of the database counts its bytes (D332, ICR 0142).
+        let io = Arc::new(pigeonhole_io::IoCounters::new());
+        let mut options = options;
+        // The backend itself, for the clock reads on the commit path and the runtime's: only
+        // opens need the counting wrapper, and a clock read through it costs an extra call
+        // (#2063's callgrind: about 40 instructions a commit).
+        let clock_vfs = Arc::clone(&options.vfs);
+        options.vfs = crate::io_count::CountingVfs::wrap(Arc::clone(&options.vfs), Arc::clone(&io));
         let vfs = Arc::clone(&options.vfs);
         let registry = Arc::new(options.merge_operators.clone());
 
@@ -1353,10 +1389,14 @@ impl Engine {
         // perf2's M1 on #2000). Whether tablet changes are on is this open's choice, and an
         // earlier open's may have moved a tablet, so the pre-pass runs whenever the file may
         // hold external PREPAREs; a read-only open holds nothing, and skips it.
+        // Whether the WAL may hold feed-silent batches (D331, ICR 0141): their mark is taken
+        // only with `incompat` bit 3, set before the first was appended.
+        let silent_ok =
+            pager.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0;
         let pins = if !no_writes
             && pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0
         {
-            external_pins(&vfs, path, db_id, &catalog, shards)?
+            external_pins(&vfs, path, db_id, &catalog, shards, silent_ok)?
         } else {
             HashMap::new()
         };
@@ -1411,6 +1451,8 @@ impl Engine {
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
+            tablet_loads: (0..shards).map(|_| ArcSwap::default()).collect(),
+            io: Arc::clone(&io),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
                 interval_nanos: options.balance_interval_nanos,
@@ -1433,6 +1475,7 @@ impl Engine {
                 n => n,
             },
             feed: feed.clone(),
+            clock_vfs: Arc::clone(&clock_vfs),
             ..Shared::base(
                 &vfs,
                 &shm,
@@ -1561,6 +1604,10 @@ impl Engine {
             } else {
                 Recovery::open(&vfs, path, stream, db_id, checkpoint)?
             };
+            rec.accept_silent(silent_ok);
+            rec.accept_xid(
+                pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0,
+            );
             let mut records = Vec::new();
             while let Some((end, record)) = rec.next_record()? {
                 match record {
@@ -1676,6 +1723,22 @@ impl Engine {
                     WalRecord::ExternalAbort { seqno, .. } => {
                         external_aborts.insert((stream, seqno));
                         // An abort's record: its id is aborted (`log_replayed`, no apply).
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Commit,
+                        });
+                    }
+                    // A range drop (D331): nothing to apply. A drop whose manifest commit is
+                    // durable put a fresh tablet over the range, flushed through its seqno,
+                    // so the range's earlier writes replay into nothing: every write of the
+                    // range has a lower seqno, since its caller keeps the range unserved
+                    // while it drops, so none can be in flight below the seqno and land
+                    // after it (simp724). One whose commit isn't durable is run again by its
+                    // caller, which keeps the range unserved and its drop-pending row until
+                    // the drop completes. Never needed past a checkpoint: the re-run writes
+                    // its own record.
+                    WalRecord::RangeDrop { seqno, .. } => {
                         records.push(ReplayedRecord {
                             end,
                             seqno,
@@ -1801,7 +1864,7 @@ impl Engine {
             drop(recoveries);
             // D329: its shares in doubt are listed (`in_doubt`), for an operator to see; no
             // share is held, and `decide` is refused (`ReadOnly`), so nothing else is.
-            let now = shared.vfs.monotonic_nanos();
+            let now = shared.clock_vfs.monotonic_nanos();
             for (stream, seqno, coordinator) in &in_doubt {
                 if stream != coordinator {
                     continue;
@@ -1886,7 +1949,7 @@ impl Engine {
             }
             // D329: each in-doubt share is held again on its shard, and its coordinator
             // awaits `decide`, before any shard admits a write.
-            let now = shared.vfs.monotonic_nanos();
+            let now = shared.clock_vfs.monotonic_nanos();
             for (stream, seqno, coordinator) in &in_doubt {
                 let (Some(e), Some((.., bytes))) = (
                     external.get(&(*stream, *seqno)),
@@ -2074,7 +2137,8 @@ impl Engine {
             .saturating_sub(64 * 1024)
             .min(64 << 20)
             .min((options.memtable_budget / 2) as usize);
-        let mut config = RuntimeConfig::new(Arc::clone(&vfs));
+        // The runtime opens no file: it reads the clock, through the backend itself.
+        let mut config = RuntimeConfig::new(Arc::clone(&shared.clock_vfs));
         config.shards = shards;
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
@@ -2169,7 +2233,8 @@ impl Engine {
     }
 
     /// Opens a read-only handle in another process (Phase 4): attaches to the live region,
-    /// claims a reader slot, loads the manifest named in the region header.
+    /// claims a reader slot, loads the manifest named in the region header, under a pin of
+    /// that slot (#2085). [`Error::Busy`] if the writer restarted while it loaded: open again.
     ///
     /// The handle is read-only, but the process opens the database file **read-write**
     /// (decision D36): the shm-init and last-one-out presence locks are exclusive byte-range
@@ -2199,10 +2264,35 @@ impl Engine {
         let shards = shm.shard_count() as usize;
         let opened_in = pigeonhole_io::sys::process_id();
         let slot = claim_slot(&shm, vfs.current_process(), &file, opened_in)?;
-        let (catalog, _) = manifest::load(&opened, shards, Arc::clone(&registry))?;
-        let manifest_version = opened.root().manifest_version;
-        let manifest_file = opened.file().clone();
-        let pager = Arc::new(opened.finish([])?);
+        let pins = crate::snapshot::ReaderPins::new(slot);
+        // The manifest is read under a pin, as a snapshot reads one (#2085): the root
+        // `Pager::open` read named extents a writer committing since could already have
+        // retired, freed and written over. Pinned first, the root read again is at or above
+        // the pinned view's manifest version, so the writer keeps its extents until the
+        // release below.
+        let (_, key) = pins.take(&shm, false);
+        let loaded = (|| -> Result<_> {
+            let pager = Arc::new(opened.finish([])?);
+            pager.reload_root()?;
+            let root = pager.root();
+            #[cfg(feature = "test-hooks")]
+            hooks::run_reader_open(&vfs);
+            let (catalog, _) = manifest::load_root(
+                pager.file(),
+                &root,
+                pager.features().incompat,
+                shards,
+                Arc::clone(&registry),
+            )?;
+            Ok((pager, catalog, root.manifest_version))
+        })();
+        pins.release(key);
+        // A writer that restarted meanwhile (a new region generation) doesn't see this
+        // generation's pin and may have reused the extents anyway: retryable, as a reader
+        // snapshot that finds its writer gone re-attaches, never `Corruption` (#2085).
+        let (pager, catalog, manifest_version) =
+            loaded.map_err(|e| if shm.is_stale() { Error::Busy } else { e })?;
+        let manifest_file = pager.file().clone();
         open_data_file(&vfs, path, &pager, options.direct_io, false)?;
         let cache = block_cache(options.block_cache_bytes, shards);
         // The read-only pager is kept by the manifest writer (which never commits here).
@@ -2226,7 +2316,7 @@ impl Engine {
             shm: Mutex::new(Attachment {
                 row_cache: reader_row_cache(&options, &shm),
                 shm,
-                pins: crate::snapshot::ReaderPins::new(slot),
+                pins,
             }),
             catalog: Mutex::new((manifest_version, Arc::new(catalog), manifest_file)),
             view: Mutex::new(None),
@@ -2352,6 +2442,61 @@ impl Engine {
         self.inner.drop_table(table)
     }
 
+    /// Drops rows `[start, end)` of `table` (`end` `None`: to the table's end) outright, with
+    /// no delete markers (D331, ICR 0141): a range move's source at its cleanup, its target
+    /// at an abort. A later write of the range at an older timestamp is visible, as if the
+    /// rows had never been there; a live snapshot still reads them. The range must be
+    /// unserved while this runs, **with no write of it in flight**: the caller stops and
+    /// joins every writer of the range first (a source's range fence; a target's copy and
+    /// catch-up, at an abort), since a write landing around the drop's seqno would apply
+    /// live into the fresh tablet but be skipped on replay (simp724's M2 on #2089). The
+    /// caller runs it again after a crash until it returns: each step does nothing once
+    /// done. Feed-silent; a replica's follower runs it too.
+    ///
+    /// `ReadOnly` on a replica; `Busy` (retry) while an externally prepared transaction is
+    /// in doubt or the balancer keeps changing the range's tablets; `Unsupported` with
+    /// tablet changes off; `InvalidArgument` for an end at or before the start.
+    pub fn drop_range(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        if is_reserved_table(table) {
+            return Err(Error::InvalidArgument(
+                "a replica's state table can't be dropped".to_owned(),
+            ));
+        }
+        self.inner.refuse_on_replica()?;
+        self.inner.drop_range(table, start, end)
+    }
+
+    /// One chunk of rows `[after, end)` of `table` (`end` `None`: to the table's end) at
+    /// `snapshot`, for a range move's copy (D331 PR 4a, ICR 0141): exactly what a
+    /// compaction would write for them at the snapshot, every version and marker a reader
+    /// there could need, a counter or aggregate family's operands folded into their base.
+    /// The chunk ends at a row boundary once it holds `max_bytes`; its `next` is the row to
+    /// ask for next, `None` once the range is done. Reads without filling the block cache.
+    /// A target writes it back with [`WriteBatch::push_logged`] in one commit.
+    pub fn copy_range(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        after: &[u8],
+        end: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<crate::RangeChunk> {
+        self.inner.check_open()?;
+        let now = self.inner.shared.clock_vfs.now_micros();
+        crate::range_copy::copy_range(snapshot, now, table, after, end, max_bytes)
+    }
+
+    /// [`drop_range`](Self::drop_range) on a replica (D331): its primary's drop, which its
+    /// follower applies in feed order. `InvalidArgument` on a primary.
+    pub fn apply_range_drop(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        if !self.inner.replica.load(Ordering::Relaxed) {
+            return Err(Error::InvalidArgument(
+                "only a replica applies its primary's range drop".to_owned(),
+            ));
+        }
+        self.inner.drop_range(table, start, end)
+    }
+
     /// Applies one catalog change a primary's feed delivered (D315 PR 3), **with the
     /// primary's ids**, so a replica's tables and families keep them: a table created with
     /// its families, a family added, or a table dropped, as the change's `edits` hold them. A
@@ -2378,9 +2523,23 @@ impl Engine {
     /// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
     pub fn apply_replicated(
         &self,
+        batch: WriteBatch,
+        state: &[u8],
+        max_ts: Timestamp,
+    ) -> Result<CommitInfo> {
+        self.apply_replicated_with(batch, state, max_ts, None)
+    }
+
+    /// [`apply_replicated`](Self::apply_replicated) for a run of one spanning commit's share
+    /// (D329 2b): committed tagged with `xid`, so this replica's own feed delivers it as
+    /// the primary's does. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn apply_replicated_with(
+        &self,
         mut batch: WriteBatch,
         state: &[u8],
         max_ts: Timestamp,
+        xid: Option<&[u8]>,
     ) -> Result<CommitInfo> {
         if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
             return Err(Error::InvalidArgument(
@@ -2389,7 +2548,76 @@ impl Engine {
         }
         self.push_replication_state(&mut batch, state)?;
         self.inner.shared.clock.seed_ts(max_ts);
-        self.commit(batch, Some(Durability::GroupSync))
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
+        self.inner
+            .commit_blocking_with(batch, Some(Durability::GroupSync), xid)
+    }
+
+    /// Commits `batch`, every mutation [`push_logged`](WriteBatch::push_logged), on a
+    /// primary (D331 PR 4, ICR 0141): a range move's target writes the source's changes
+    /// exactly as the source logged them, with the source's kinds, timestamps and stored
+    /// values, in its own ids. The timestamp floor isn't raised: the target raises it once,
+    /// before it serves the range ([`raise_ts_floor`](Self::raise_ts_floor)). Refused on a
+    /// replica (`ReadOnly`), which takes logged mutations only through
+    /// [`apply_replicated`](Self::apply_replicated), and, `InvalidArgument`, for a batch that
+    /// is empty, isn't logged or deletes rows.
+    pub fn commit_logged(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+    ) -> Result<CommitInfo> {
+        if self.inner.replica.load(Ordering::Relaxed) {
+            return Err(replica_refusal());
+        }
+        if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a logged commit is a non-empty batch of logged mutations".to_owned(),
+            ));
+        }
+        self.commit(batch, durability)
+    }
+
+    /// Holds the change feed's retained history from now on (D331, ICR 0141): retention
+    /// trims nothing written from here until the hold is dropped, or until the database
+    /// retains more than `cap_bytes` of history, when the hold lapses
+    /// ([`FeedRetentionHold::lapsed`]) and retention trims as before. A range move takes one
+    /// before its copy's first snapshot, so its catch-up from that snapshot's token finds the
+    /// history there however long the copy takes, or the move learns it can't. The WAL
+    /// grows by the writes made while it holds. `InvalidArgument` without the change feed;
+    /// `Busy` before every stream has opened.
+    /// Not part of the stable API.
+    #[doc(hidden)]
+    pub fn hold_feed_retention(&self, cap_bytes: u64) -> Result<FeedRetentionHold> {
+        let shared = &self.inner.shared;
+        let Some(feed) = &shared.feed else {
+            return Err(Error::InvalidArgument(
+                "a retention hold needs the change feed".to_owned(),
+            ));
+        };
+        // Every stream opens with the database; one not open yet is a moment's wait
+        // (simp724's N1 on #2055).
+        let hold = feed.hold_retention(cap_bytes).ok_or(Error::Busy)?;
+        Ok(FeedRetentionHold {
+            shared: Arc::clone(shared),
+            hold,
+        })
+    }
+
+    /// Raises the timestamp floor (D271's `H`) to at least `ts`, durably (D331, ICR 0141): a
+    /// range move's target, before it serves the range, raises it past every timestamp it
+    /// copied from the source, so a default timestamp it hands out later sorts after them all,
+    /// whatever the two nodes' clocks. The floor is committed to the manifest before this
+    /// returns: replay recovers only commit timestamps, not a copy's explicit ones. Refused
+    /// on a replica, whose floor follows its primary's applies. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn raise_ts_floor(&self, ts: Timestamp) -> Result<()> {
+        self.inner.refuse_on_replica()?;
+        self.inner.shared.clock.seed_ts(ts);
+        self.inner.catalog_change(move |catalog| {
+            catalog.counters.ts_floor = catalog.counters.ts_floor.max(ts);
+            Ok(vec![catalog.counters_edit()])
+        })?;
+        Ok(())
     }
 
     /// The most bytes of logged changes one replicated commit should carry (D315 PR 3;
@@ -2618,6 +2846,19 @@ impl Engine {
         self.inner.in_doubt()
     }
 
+    /// [`in_doubt`](Self::in_doubt), with each share's batch bytes (what it keeps in the
+    /// WAL, as the in-doubt limit counts it): `(xid, nanoseconds since prepared, bytes)`.
+    pub fn in_doubt_shares(&self) -> Vec<(Vec<u8>, u64, u64)> {
+        let now = self.inner.shared.vfs.monotonic_nanos();
+        self.inner
+            .shared
+            .external
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, e)| (xid, now.saturating_sub(e.prepared_at), e.bytes))
+            .collect()
+    }
+
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
     /// after this commit (D314): its value as a read at the commit's seqno sees it, with a TTL judged at
     /// the commit's timestamp, in the order the batch first wrote each cell. `batch`
@@ -2638,6 +2879,7 @@ impl Engine {
             None,
             None,
             Some(Arc::clone(&out)),
+            None,
             NoAdmission,
         )? {
             Routed::Sent {
@@ -2670,6 +2912,7 @@ impl Engine {
             None,
             None,
             Some(Arc::clone(&out)),
+            None,
             NoAdmission,
         )? {
             Routed::Sent {
@@ -2943,14 +3186,22 @@ impl Engine {
         let inner = &self.inner;
         let Some(a) = &inner.admission else {
             return inner
-                .route_and_send_with(batch, durability, None, None, returning, NoAdmission)
+                .route_and_send_with(batch, durability, None, None, returning, None, NoAdmission)
                 .and_then(|routed| inner.submission(routed))
                 .map(PendingCommit::from);
         };
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        match inner.route_and_send_with(batch, durability, None, None, returning, (&**a, bytes))? {
+        match inner.route_and_send_with(
+            batch,
+            durability,
+            None,
+            None,
+            returning,
+            None,
+            (&**a, bytes),
+        )? {
             Routed::Held(prepared) => {
                 let shard = usize::from(prepared.target.0);
                 let admit = crate::Admit::new(Some(a), shard, bytes);
@@ -3031,6 +3282,7 @@ impl Engine {
             snapshot,
             reads: Vec::new(),
             batch: WriteBatch::new(),
+            xid: None,
         })
     }
 
@@ -3087,7 +3339,7 @@ impl Engine {
                         rc,
                         &snapshot.view,
                         snapshot.seqno,
-                        inner.shared.vfs.now_micros(),
+                        inner.shared.clock_vfs.now_micros(),
                         table,
                         family,
                         row,
@@ -3124,7 +3376,7 @@ impl Engine {
             if view.released {
                 return Err(Error::Closed);
             }
-            let clock = || inner.shared.vfs.now_micros();
+            let clock = || inner.shared.clock_vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && let Some(got) = crate::row_cache::get_through(
                     rc,
@@ -3157,7 +3409,7 @@ impl Engine {
     ) -> Result<Option<RowData>> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         snapshot.checked(read::read_row(snapshot, table, row, &families, spec, now))
     }
 
@@ -3176,7 +3428,7 @@ impl Engine {
     ) -> Result<bool> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         snapshot.checked(read::read_row_into(
             &snapshot.view,
             snapshot.seqno,
@@ -3206,7 +3458,7 @@ impl Engine {
     ) -> Result<bool> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         snapshot.checked(crate::row_cache::read_row_cached(
             rc,
             &snapshot.view,
@@ -3393,7 +3645,7 @@ impl Engine {
         }
         if let Some((view, seqno)) = inner.latest_view()? {
             let families = families_in_order(&view, table, families)?;
-            let now = inner.shared.vfs.now_micros();
+            let now = inner.shared.clock_vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && crate::row_cache::serves_spec(spec)
             {
@@ -3423,7 +3675,7 @@ impl Engine {
     pub fn scan(&self, snapshot: &Snapshot, table: TableId, spec: ScanSpec) -> Result<ScanCursor> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         Ok(ScanCursor::new(
             snapshot.clone(),
             table,
@@ -3453,7 +3705,7 @@ impl Engine {
     {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         let may_fan_out = self
             .inner
             .shared
@@ -3487,7 +3739,7 @@ impl Engine {
     {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         let may_fan_out = self
             .inner
             .shared
@@ -3518,7 +3770,7 @@ impl Engine {
     ) -> Result<crate::KeyCursor> {
         snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &read.families)?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         crate::KeyCursor::new(
             snapshot.clone(),
             table,
@@ -3543,7 +3795,7 @@ impl Engine {
         spec: &crate::TraverseSpec,
     ) -> Result<crate::Traversal> {
         snapshot.check_process()?;
-        let now = self.inner.shared.vfs.now_micros();
+        let now = self.inner.shared.clock_vfs.now_micros();
         let may_fan_out = self
             .inner
             .shared
@@ -3575,7 +3827,7 @@ impl Engine {
             table,
             seeds,
             spec,
-            self.inner.shared.vfs.now_micros(),
+            self.inner.shared.clock_vfs.now_micros(),
             Arc::clone(&self.inner.shared),
         ))
     }
@@ -3637,7 +3889,7 @@ impl Engine {
                     table,
                     families.into_vec(),
                     read,
-                    self.inner.shared.vfs.now_micros(),
+                    self.inner.shared.clock_vfs.now_micros(),
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
@@ -3713,7 +3965,7 @@ impl Engine {
                     table,
                     families.into_vec(),
                     read,
-                    self.inner.shared.vfs.now_micros(),
+                    self.inner.shared.clock_vfs.now_micros(),
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
@@ -4117,6 +4369,51 @@ impl Engine {
         rt.as_ref().map(|rt| rt.driver_trace()).unwrap_or_default()
     }
 
+    /// Every tablet's row range, SST bytes and write load (D332, ICR 0142): for a cluster
+    /// balancer choosing a split key. The bytes of an SST two tablets share (after a split,
+    /// until compaction rewrites it) count once, divided between them. The write load is
+    /// each tablet's moving average of rows written per balancer interval, as the shard that
+    /// holds it now last published it: 0 until it has, after a move between shards too (the
+    /// source shard's entry, stale, is never read), or with `tablet_changes` off. Not part
+    /// of the stable API.
+    #[doc(hidden)]
+    pub fn tablets(&self) -> Vec<TabletStats> {
+        let shared = &self.inner.shared;
+        let view = shared.view.load();
+        let loads: Vec<HashMap<TabletId, f64>> = shared
+            .tablet_loads
+            .iter()
+            .map(|l| l.load().iter().copied().collect())
+            .collect();
+        let refs = view.catalog.sst_refs();
+        view.tablets
+            .iter()
+            .map(|t| TabletStats {
+                table: view
+                    .catalog
+                    .table(t.table)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_default(),
+                start: t.start.clone(),
+                end: t.end.clone(),
+                bytes: crate::shard::shared_bytes(&view, t, &refs),
+                write_load: loads
+                    .get(usize::from(t.shard.0))
+                    .and_then(|l| l.get(&t.id))
+                    .copied()
+                    .unwrap_or(0.0),
+            })
+            .collect()
+    }
+
+    /// Bytes this database's files have read and written since open, as its `CountingVfs`
+    /// counts them (D332, ICR 0142): `Metrics::device_read_bytes` and `device_write_bytes`
+    /// without the rest of [`Engine::metrics`]. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn device_bytes(&self) -> (u64, u64) {
+        self.inner.shared.io.totals()
+    }
+
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,
     /// issue #51).
     #[doc(hidden)]
@@ -4251,6 +4548,7 @@ impl Engine {
                 }
             }
         }
+        (m.device_read_bytes, m.device_write_bytes) = shared.io.totals();
         for s in &shared.metrics {
             let limit = s.memtable_limit.load(Ordering::Relaxed);
             m.memtable_limit += limit;
@@ -4300,7 +4598,7 @@ impl Engine {
             );
         }
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
-        m.default_ts_lead_micros = shared.clock.lead(shared.vfs.now_micros());
+        m.default_ts_lead_micros = shared.clock.lead(shared.clock_vfs.now_micros());
         m.block_cache = shared.cache.hits_and_misses();
         m.block_cache_pinned = shared.cache.pinned() as u64;
         m.block_cache_capacity = shared.cache.capacity() as u64;
@@ -4519,6 +4817,31 @@ impl Engine {
     }
 }
 
+/// A change-feed retention hold ([`Engine::hold_feed_retention`], D331): released when
+/// dropped. Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FeedRetentionHold {
+    shared: Arc<Shared>,
+    hold: Arc<crate::feed::RetentionHold>,
+}
+
+impl FeedRetentionHold {
+    /// Whether it lapsed at its cap: retention trims again, and a reader that relied on it
+    /// may find its position gone (its feed then expires).
+    pub fn lapsed(&self) -> bool {
+        self.hold.lapsed()
+    }
+}
+
+impl Drop for FeedRetentionHold {
+    fn drop(&mut self) {
+        if let Some(feed) = &self.shared.feed {
+            feed.release_retention(&self.hold);
+        }
+    }
+}
+
 /// What [`Engine::close_for_reopen`] keeps for [`Engine::open_with`]: the writer lock, the
 /// presence and the handle they live on, and the path they belong to (D265). Dropping it
 /// releases the locks but runs no last-one-out cleanup: the WAL files and the shm region
@@ -4669,7 +4992,7 @@ fn spill_recovered(
     states: &mut [ShardState],
     spill: &mut Spilled,
 ) -> Result<()> {
-    let created = shared.vfs.now_micros();
+    let created = shared.clock_vfs.now_micros();
     for state in states.iter_mut() {
         for ((tablet, family), reader, bytes, max_seqno) in state.take_memtables() {
             let Some(meta) = catalog.family(family) else {
@@ -5620,6 +5943,192 @@ impl Inner {
             .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))
     }
 
+    /// Drops `[start, end)` of `table` (D331, ICR 0141; FORMAT §10.3's Range Drop): every
+    /// entry of the range goes, with no delete markers, so a later write of the range at an
+    /// older timestamp is visible. The caller keeps the range unserved until this returns
+    /// and runs it again after a crash until it does: each step does nothing once done.
+    ///
+    /// 1. Splits the table's tablets at `start` and `end`, through the shards' tablet
+    ///    changes (which freeze and flush the tablets they split, so nothing outside the
+    ///    range is lost).
+    /// 2. Writes a Range Drop on every stream at one seqno, held from readers until every
+    ///    stream has it, then released with nothing applied.
+    /// 3. One manifest commit drops the tablets inside the range and puts one fresh tablet
+    ///    over it, flushed through that seqno in every family: replay never brings an
+    ///    earlier write of the range back, and a later one routes to the fresh tablet. The
+    ///    shards then retire the dropped tablets' memtables. A live snapshot keeps its view,
+    ///    and with it the dropped tablets' SSTs and memtables.
+    /// 4. Raises every row-cache slot to the seqno, so no cached row of the range is served.
+    ///
+    /// `Busy` (retry) while an externally prepared transaction is in doubt (D329: one may
+    /// hold rows of the range), or when the balancer changed the range's tablets between
+    /// the split and the drop three times running; `Unsupported` with tablet changes off.
+    fn drop_range(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.check_open()?;
+        let mut range = Vec::new();
+        pigeonhole_format::wal::DroppedRange::encode(&mut range, table, start, end)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if !self.shared.balance.enabled {
+            return Err(Error::Unsupported("a range drop needs tablet changes"));
+        }
+        if self.shared.view.load().catalog.table(table).is_none() {
+            return Err(Error::TableNotFound(format!("table {}", table.0)));
+        }
+        // D329 (simp724): a share in doubt may hold rows of the range, and its commit would
+        // write them back. Tablet-granular checks exist only on the shards; the coarse
+        // refusal is retryable and rare.
+        // A read hold (D329 2b) on rows of the range would lose its continuity: wait for it
+        // as for a share in doubt (simp724's S1 on #2089).
+        if !self.in_doubt().is_empty() || self.shared.external.holds() > 0 {
+            return Err(Error::Busy);
+        }
+        self.flag_silent()?;
+        for _ in 0..3 {
+            self.split_at(table, start)?;
+            if let Some(end) = end {
+                self.split_at(table, end)?;
+            }
+            let seqno = self.log_range_drop(&range)?;
+            match self.drop_inside(table, start, end, seqno) {
+                Err(Error::Busy) => continue,
+                r => r?,
+            }
+            if let Some(epochs) = &self.shared.row_epochs {
+                epochs.raise_all(seqno);
+            }
+            return Ok(());
+        }
+        // The range's tablets kept changing under the drop: the caller drops it again.
+        Err(Error::Busy)
+    }
+
+    /// Splits `table`'s tablet holding `key` at `key`, unless `key` already starts one.
+    fn split_at(&self, table: TableId, key: &[u8]) -> Result<()> {
+        if key.is_empty() {
+            return Ok(());
+        }
+        let view = self.shared.view.load_full();
+        let Some(t) = view
+            .tablets()
+            .tablets_of(table)
+            .iter()
+            .find(|t| t.start.as_slice() <= key && t.end.as_deref().is_none_or(|e| key < e))
+        else {
+            return Err(Error::TableNotFound(format!("table {}", table.0)));
+        };
+        if t.start == key {
+            return Ok(());
+        }
+        let op = crate::shard::TabletOpKind::Split {
+            tablet: t.id,
+            keys: vec![key.to_vec()],
+            owners: vec![t.shard, t.shard],
+        };
+        self.tablet_op(t.shard, op)?.wait()
+    }
+
+    /// Writes a Range Drop of `range` (encoded) on every stream at one seqno, held from
+    /// readers until every stream has it written, then released.
+    fn log_range_drop(&self, range: &[u8]) -> Result<Seqno> {
+        let now = self.shared.clock_vfs.now_micros();
+        let (seqno, _) = self.shared.clock.reserve_decision(now, &self.shared.shm);
+        let mut waits = Vec::new();
+        let mut sent = Ok(());
+        for i in 0..self.shared.shards {
+            let (tx, rx) = completion();
+            match self
+                .shared
+                .submitter(ShardId(i as u16))
+                .submit(ShardMsg::RangeDrop {
+                    seqno,
+                    range: range.to_vec(),
+                    reply: tx,
+                }) {
+                Ok(()) => waits.push(rx),
+                Err(e) => {
+                    sent = Err(Error::from(e));
+                    break;
+                }
+            }
+        }
+        let written = sent.and_then(|()| {
+            waits
+                .into_iter()
+                .try_for_each(|rx| rx.wait().unwrap_or(Err(Error::Closed)))
+        });
+        self.shared.clock.release(seqno, &self.shared.shm);
+        self.shared.wake_visible();
+        written.map(|()| seqno)
+    }
+
+    /// Drops the tablets inside `[start, end)` and puts one fresh tablet over the range,
+    /// flushed through `seqno` in every family. `Busy` if a tablet of the table straddles
+    /// a bound (the balancer merged or split since `split_at`).
+    fn drop_inside(
+        &self,
+        table: TableId,
+        start: &[u8],
+        end: Option<&[u8]>,
+        seqno: Seqno,
+    ) -> Result<()> {
+        let (lo, hi) = (start.to_vec(), end.map(<[u8]>::to_vec));
+        let inside = Arc::new(Mutex::new(Vec::new()));
+        let out = Arc::clone(&inside);
+        self.catalog_change(move |catalog| {
+            let overlaps = |s: &[u8], e: Option<&[u8]>| {
+                hi.as_deref().is_none_or(|h| s < h) && e.is_none_or(|e| lo.as_slice() < e)
+            };
+            let mut dropped = Vec::new();
+            for t in catalog.tablets().into_iter().filter(|t| t.table == table) {
+                if !overlaps(&t.start, t.end.as_deref()) {
+                    continue;
+                }
+                let within = t.start.as_slice() >= lo.as_slice()
+                    && match (&hi, &t.end) {
+                        (None, _) => true,
+                        (Some(h), Some(e)) => e <= h,
+                        (Some(_), None) => false,
+                    };
+                if !within {
+                    // A tablet straddles a bound: the balancer changed them since the split.
+                    return Err(Error::Busy);
+                }
+                dropped.push(t.id);
+            }
+            let fresh = catalog.alloc_tablet();
+            let mut edits: Vec<Edit> = dropped
+                .iter()
+                .map(|&tablet| Edit::DropTablet { tablet })
+                .collect();
+            edits.push(Edit::PutTablet {
+                tablet: fresh,
+                table,
+                start: lo.clone(),
+                end: hi.clone(),
+            });
+            edits.extend(
+                catalog
+                    .family_ids_of(table)
+                    .into_iter()
+                    .map(|family| Edit::SetFlushed {
+                        tablet: fresh,
+                        family,
+                        seqno,
+                    }),
+            );
+            *out.lock().unwrap_or_else(PoisonError::into_inner) = dropped;
+            Ok(edits)
+        })?;
+        let tablets = std::mem::take(&mut *inside.lock().unwrap_or_else(PoisonError::into_inner));
+        self.shared.broadcast(|| ShardMsg::DropTablets {
+            tablets: tablets.clone(),
+        });
+        Ok(())
+    }
+
     fn drop_table(&self, table: TableId) -> Result<()> {
         let dropped = self.catalog().tablet_ids_of(table);
         self.catalog_change(move |catalog| {
@@ -5652,6 +6161,19 @@ impl Inner {
     /// Separates the puts of `builder` above the inline limit into blob files (#230). Waits
     /// for a manifest commit when there is one; the waiting thread drives that commit
     /// itself (`manifest::commit_from_thread`, as `shrink` does), so it may drive a shard.
+    /// Tags routed batch `builder` with `xid`, a spanning commit's (D329 2b), as its last
+    /// step, behind `incompat` bit 2. Rebuilds after it (large values, the split into
+    /// shares, a retry) carry it; the counter pass in `route` runs before it, on a batch with
+    /// no trailer yet. Nothing for an untagged batch.
+    #[inline]
+    fn tag_routed(&self, xid: Option<&[u8]>, builder: &mut BatchBuilder) -> Result<()> {
+        if let Some(xid) = xid {
+            self.flag_external()?;
+            builder.tag_xid(xid)?;
+        }
+        Ok(())
+    }
+
     fn separate_large(
         &self,
         builder: BatchBuilder,
@@ -5662,10 +6184,17 @@ impl Inner {
     /// Validates and routes a batch: per-shard parts in first-appearance order.
     fn route(&self, mut batch: WriteBatch, view: &View) -> Result<(BatchBuilder, Shards)> {
         if batch.logged() {
+            if batch.builder.is_silent() {
+                self.flag_silent()?;
+            }
             return route_logged(batch, view);
         }
+        // A replica refuses its own writes before a silent one's bit is set.
         if self.replica.load(Ordering::Relaxed) {
             return Err(replica_refusal());
+        }
+        if batch.builder.is_silent() {
+            self.flag_silent()?;
         }
         let catalog = &view.catalog;
         for rd in std::mem::take(&mut batch.row_deletes) {
@@ -5765,7 +6294,22 @@ impl Inner {
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
-        let routed = self.route_and_send(batch, durability, validate, predicate, NoAdmission)?;
+        self.submit_with(batch, durability, validate, predicate, None)
+    }
+
+    /// [`submit`](Self::submit) for a transaction that may be a spanning commit's share
+    /// (D329 2b, `xid`). Inlined, so `submit`'s constant `None` folds away (perf2 on #2076).
+    #[inline(always)]
+    pub(crate) fn submit_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        validate: Option<Arc<Validate>>,
+        predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        xid: Option<&[u8]>,
+    ) -> Result<Submission> {
+        let routed =
+            self.route_and_send(batch, durability, validate, predicate, xid, NoAdmission)?;
         self.submission(routed)
     }
 
@@ -5818,10 +6362,11 @@ impl Inner {
                 }
             }
         }
-        if shards.is_empty() || builder.is_empty() {
+        // A branch that only read (D329 2a) logs its read set with an empty batch, and holds
+        // those rows until decided, as any share does: its shards are the reads' shards.
+        if shards.is_empty() {
             return Err(Error::InvalidArgument(
-                "an external prepare needs writes (a read-only prepare is ICR 0140's later part)"
-                    .to_owned(),
+                "an external prepare needs reads or writes".to_owned(),
             ));
         }
         // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
@@ -5845,7 +6390,7 @@ impl Inner {
             parts,
             durability,
             reply: tx,
-            submitted_at: self.shared.vfs.monotonic_nanos(),
+            submitted_at: self.shared.clock_vfs.monotonic_nanos(),
             validate,
             map_version: view.tablets.version(),
             epoch: 0,
@@ -5863,6 +6408,114 @@ impl Inner {
             },
             token,
         ))
+    }
+
+    /// Validates and holds a read-only transaction's `validate.reads` in memory (ICR 0140
+    /// amendment 1, D329 PR 2a): each shard owning some checks them against the snapshot
+    /// and holds them; nothing is logged. The answer's token and shards are for
+    /// [`release_reads`](Self::release_reads). `Conflict` if a read changed since the
+    /// snapshot or overlaps an undecided write; `Busy` past the in-doubt share limit (live
+    /// holds count), or for a read whose tablet is moving. Refused on a replica, and on a
+    /// read-only open (`ReadOnly`).
+    pub(crate) fn hold_reads(&self, validate: Arc<Validate>) -> Result<(u64, Vec<ShardId>)> {
+        if self.read_only || self.replica.load(Ordering::Relaxed) {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        if validate.reads.is_empty() {
+            return Err(Error::InvalidArgument("a read hold needs reads".to_owned()));
+        }
+        let view = self.shared.view.load();
+        type Routed = (Vec<crate::write::ReadKey>, Vec<TabletId>);
+        let mut by_shard: BTreeMap<ShardId, Routed> = BTreeMap::new();
+        for r in &validate.reads {
+            // A read the view can't route is of a table dropped since it was read: changed,
+            // so nothing can hold it (perf2's nit on #2062).
+            let Some((tablet, shard)) = view.tablets().route(r.table, &r.row) else {
+                return Err(Error::Conflict);
+            };
+            let (reads, tablets) = by_shard.entry(shard).or_default();
+            reads.push(r.clone());
+            tablets.push(tablet);
+        }
+        drop(view);
+        let token = self.shared.external.reserve_hold()?;
+        let mut waiting = Vec::with_capacity(by_shard.len());
+        let mut shards = Vec::with_capacity(by_shard.len());
+        let mut failed = None;
+        for (shard, (reads, tablets)) in by_shard {
+            let (tx, rx) = completion();
+            let msg = ShardMsg::HoldReads(Box::new(crate::shard::HoldReadsReq {
+                token,
+                validate: Arc::clone(&validate),
+                reads,
+                tablets,
+                reply: tx,
+            }));
+            match self.shared.submitter(shard).submit(msg) {
+                Ok(()) => waiting.push((shard, rx)),
+                Err(e) => {
+                    failed = Some(Error::from(e));
+                    break;
+                }
+            }
+        }
+        for (shard, rx) in waiting {
+            match rx.wait() {
+                Some(Ok(())) => shards.push(shard),
+                // A conflict wins over another shard's transient refusal: retrying can't help.
+                Some(Err(e)) => {
+                    if !matches!(failed, Some(Error::Conflict)) {
+                        failed = Some(e);
+                    }
+                }
+                None => {
+                    failed.get_or_insert(Error::Closed);
+                }
+            }
+        }
+        match failed {
+            None => Ok((token, shards)),
+            Some(e) => {
+                self.release_reads(token, &shards, false);
+                Err(e)
+            }
+        }
+    }
+
+    /// Ends read hold `token` on `shards` (ICR 0140 amendment 1); with `wait`, answers
+    /// whether every shard still held it (`false` once the hold was lost to a close or a
+    /// recovery). With `wait`, never called on a thread that drives a shard
+    /// ([`ReadHold::release`](crate::ReadHold::release) refuses that first). Without it (a
+    /// dropped hold), it doesn't wait, and its answer means nothing. The hold stops counting
+    /// against the limit either way.
+    pub(crate) fn release_reads(&self, token: u64, shards: &[ShardId], wait: bool) -> bool {
+        self.shared.external.release_hold();
+        debug_assert!(!wait || !self.shared.drivers.current_drives());
+        let mut held = true;
+        let mut waiting = Vec::new();
+        for &shard in shards {
+            let (reply, rx) = if wait {
+                let (tx, rx) = completion();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if self
+                .shared
+                .submitter(shard)
+                .submit(ShardMsg::ReleaseReads(Box::new((token, reply))))
+                .is_err()
+            {
+                held = false;
+            } else if let Some(rx) = rx {
+                waiting.push(rx);
+            }
+        }
+        for rx in waiting {
+            held &= rx.wait() == Some(true);
+        }
+        held && wait
     }
 
     /// [`submit_prepare_external`](Self::submit_prepare_external), waited for. The answer in,
@@ -5928,7 +6581,7 @@ impl Inner {
     /// The externally prepared transactions in doubt here (D329): each one's xid, and how
     /// long ago (the engine's monotonic clock) it was prepared, in nanoseconds.
     pub(crate) fn in_doubt(&self) -> Vec<(Vec<u8>, u64)> {
-        let now = self.shared.vfs.monotonic_nanos();
+        let now = self.shared.clock_vfs.monotonic_nanos();
         self.shared
             .external
             .in_doubt()
@@ -5943,13 +6596,31 @@ impl Inner {
         if self.shared.external_flagged.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut writer = self
-            .shared
-            .manifest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        writer.flag_incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE)?;
+        // Through the writer, under its exclusion: never beside a root commit in flight
+        // (the race #2089's crash sweep found for bit 3).
+        manifest::commit_from_thread(
+            &self.shared,
+            manifest::ReqKind::Incompat(pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE),
+        )?;
         self.shared.external_flagged.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Sets `incompat` bit 3 in both superblock pages before the first feed-silent batch is
+    /// routed (D331, ICR 0141), so every record carrying the mark is behind it: once per
+    /// database, under the manifest writer's lock. Sticky (FORMAT §8.2).
+    #[cold]
+    #[inline(never)]
+    fn flag_silent(&self) -> Result<()> {
+        if self.shared.silent_flagged.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Through the writer, under its exclusion: never beside a root commit in flight.
+        manifest::commit_from_thread(
+            &self.shared,
+            manifest::ReqKind::Incompat(pigeonhole_format::wal::INCOMPAT_FEED_SILENT),
+        )?;
+        self.shared.silent_flagged.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -5968,15 +6639,20 @@ impl Inner {
         durability: Option<Durability>,
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        xid: Option<&[u8]>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
-        self.route_and_send_with(batch, durability, validate, predicate, None, admit)
+        self.route_and_send_with(batch, durability, validate, predicate, None, xid, admit)
     }
 
     /// [`route_and_send`](Self::route_and_send), for a commit that may return its
     /// incremented counters (D314): `returning` is `None` on every other path, a constant the
     /// inlined body folds away.
     #[inline(always)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a constant at its inlined call sites, which fold away (returning, xid)"
+    )]
     pub(crate) fn route_and_send_with<A: Admitter>(
         &self,
         batch: WriteBatch,
@@ -5984,6 +6660,7 @@ impl Inner {
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
         returning: Option<crate::shard::ReturnSlot>,
+        xid: Option<&[u8]>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
         if self.read_only {
@@ -5994,7 +6671,11 @@ impl Inner {
         // One tablet map for the whole routing: its version goes with a cross-shard commit,
         // which a participant moving a tablet refuses and the coordinator retries.
         let view = self.shared.view.load();
-        let (builder, mut shards) = self.route(batch, &view)?;
+        let (mut builder, mut shards) = self.route(batch, &view)?;
+        // A spanning commit's share (D329 2b): `xid` comes with the commit, not on the
+        // batch, so a `WriteBatch` moved through every commit carries nothing for it; `None`
+        // on every other path, a constant the inlined body folds away (perf2's N1 on #2076).
+        self.tag_routed(xid, &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
@@ -6007,7 +6688,7 @@ impl Inner {
                 }
             }
         }
-        let submitted_at = self.shared.vfs.monotonic_nanos();
+        let submitted_at = self.shared.clock_vfs.monotonic_nanos();
         let (tx, waiter) = crate::write::commit_completion();
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::commit_succeeded);
@@ -6104,7 +6785,19 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        match self.route_and_send(batch, durability, None, None, NoAdmission)? {
+        self.commit_blocking_with(batch, durability, None)
+    }
+
+    /// [`commit_blocking`](Self::commit_blocking) for a replica's run of a spanning commit's
+    /// share (D329 2b, `xid`). Inlined, so `commit_blocking`'s constant `None` folds away.
+    #[inline(always)]
+    fn commit_blocking_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        xid: Option<&[u8]>,
+    ) -> Result<CommitInfo> {
+        match self.route_and_send(batch, durability, None, None, xid, NoAdmission)? {
             // Caller-runs (D321): the commit's shard, which this thread may run itself while
             // its spinning wait goes on. A cross-shard commit's coordinator refuses it (only
             // single-shard commits are a caller's to run).
@@ -6208,7 +6901,7 @@ impl Inner {
             [s] => *s,
             _ => unreachable!("one row routes to one shard"),
         };
-        let submitted_at = self.shared.vfs.monotonic_nanos();
+        let submitted_at = self.shared.clock_vfs.monotonic_nanos();
         let (tx, rx) = completion();
         if let Some(large) = large {
             large.settle_on(&tx, crate::large::check_succeeded);
@@ -6319,7 +7012,7 @@ impl Inner {
                 rc,
                 &snapshot.view,
                 snapshot.seqno,
-                self.shared.vfs.now_micros(),
+                self.shared.clock_vfs.now_micros(),
                 table,
                 family,
                 row,
@@ -6331,7 +7024,7 @@ impl Inner {
         snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
-            || self.shared.vfs.now_micros(),
+            || self.shared.clock_vfs.now_micros(),
             table,
             family,
             row,
@@ -7044,6 +7737,27 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
 /// the last write.
 ///
+/// Tags `to`, a batch rebuilt from `from`, with `from`'s xid if it has one (D329 2b): the
+/// rebuild's last step, so its pushes never meet the trailer. One bit test for an untagged
+/// batch.
+#[inline]
+pub(crate) fn carry_xid(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    // One byte's test for an untagged batch (perf2's N1 on #2076); the copy out of line.
+    if from.is_tagged() {
+        return carry_xid_cold(from, to);
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn carry_xid_cold(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    match from.batch().xid() {
+        Some(xid) => Ok(to.tag_xid(xid)?),
+        None => Ok(()),
+    }
+}
+
 /// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
 /// one, the only change is the fixed timestamp, and the batch is copied straight through: no
 /// map, no list of writes, and the copy sized once (#1795: a lone `incr`'s rebuilt batch grew
@@ -7054,8 +7768,13 @@ fn prepare_counter_writes(
     catalog: &Catalog,
     combines: bool,
 ) -> Result<BatchBuilder> {
+    // Runs inside `route`, before `tag_routed`: the batch has no xid trailer to carry yet.
+    debug_assert!(!batch.is_tagged(), "a tagged batch before routing");
     // Each write may gain an 8-byte timestamp.
     let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
+    if batch.is_silent() {
+        out.mark_silent();
+    }
     if !combines {
         for m in batch.batch().iter() {
             let mut m = m?;
@@ -7720,6 +8439,7 @@ impl Shared {
     ) -> Self {
         Shared {
             vfs: Arc::clone(vfs),
+            clock_vfs: Arc::clone(vfs),
             shm: shm.clone(),
             reader_reclaim_at: AtomicU64::new(0),
             reader_slots_reclaimed: AtomicU64::new(0),
@@ -7764,6 +8484,9 @@ impl Shared {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             external_flagged: AtomicBool::new(false),
+            silent_flagged: AtomicBool::new(
+                pager.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0,
+            ),
             external: Arc::new(crate::external_registry::ExternalRegistry::new(
                 options.in_doubt_limits,
             )),
@@ -7783,6 +8506,8 @@ impl Shared {
             clock: Default::default(),
             flushed_through: Vec::new(),
             loads: Vec::new(),
+            tablet_loads: Vec::new(),
+            io: Arc::default(),
             balance: BalanceConfig::default(),
             view_capacity,
             tablet_epoch: AtomicU64::new(0),

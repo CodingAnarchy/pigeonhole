@@ -268,6 +268,9 @@ pub(crate) fn separate(
     // One sink per family, plus one per displaceable value (`None` here: never shared).
     let mut sinks: Vec<(FamilyId, bool, BlobSink)> = Vec::new();
     let mut out = BatchBuilder::new();
+    if builder.is_silent() {
+        out.mark_silent();
+    }
     let written = (|| -> Result<()> {
         for (i, m) in mutations.iter().enumerate() {
             let key = (
@@ -324,7 +327,7 @@ pub(crate) fn separate(
                 &encode_blob_stored(&ptr),
             )?;
         }
-        Ok(())
+        crate::engine::carry_xid(&builder, &mut out)
     })();
     if let Err(e) = written {
         for (_, _, mut sink) in sinks {

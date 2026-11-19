@@ -1719,7 +1719,12 @@ pub struct FeedEvent {
     /// On a cluster subscription, the partition the event came from; empty on a single node.
     #[prost(string, tag = "5")]
     pub partition: ::prost::alloc::string::String,
-    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6")]
+    /// A commit of a transaction across partitions (D329, `BeginRequest.spans_partitions`): its
+    /// id, the same on every partition's share of it, so a subscriber can group them. Empty
+    /// for any other commit.
+    #[prost(bytes = "bytes", tag = "7")]
+    pub xid: ::prost::bytes::Bytes,
+    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
 /// Nested message and enum types in `FeedEvent`.
@@ -1735,7 +1740,26 @@ pub mod feed_event {
         /// A cluster subscription's partition became unavailable or available again.
         #[prost(message, tag = "6")]
         PartitionState(super::PartitionState),
+        /// D331: internal to a cluster subscription, never sent to a client. A move's target
+        /// emits it in its component just before the first event past the move's hand-over:
+        /// the entry node's merge holds the component there until the source's has passed the
+        /// move's last seqno (per-key order across the hand-over). 7 is D329's.
+        #[prost(message, tag = "8")]
+        MoveBarrier(super::MoveBarrier),
     }
+}
+/// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveBarrier {
+    #[prost(string, tag = "1")]
+    pub move_id: ::prost::alloc::string::String,
+    /// The move's source partition.
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+    /// The source's last seqno of the range: the target's component waits until the source's
+    /// has passed it.
+    #[prost(uint64, tag = "3")]
+    pub final_seqno: u64,
 }
 /// On a cluster subscription: a partition of it is unavailable (only with `allow_partial`,
 /// which keeps the stream open; sent at the start for each partition unavailable then, and
@@ -4862,6 +4886,14 @@ pub struct BeginRequest {
     /// start. A single-node server ignores it.
     #[prost(message, optional, tag = "2")]
     pub route: ::core::option::Option<RoutingKey>,
+    /// Lets the transaction read and write rows of other partitions (D329, ICR 0140): its
+    /// partition (`route`) is its home, and every other partition it touches is a branch,
+    /// committed with it atomically by two-phase commit. Without it, a row outside the home is
+    /// `CrossPartition`. Every node must keep the `spanning_txns` map feature. A commit that
+    /// writes runs at `GroupSync` or stronger. A single-node server accepts it and changes
+    /// nothing.
+    #[prost(bool, tag = "3")]
+    pub spans_partitions: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BeginResponse {
@@ -4912,10 +4944,51 @@ pub struct TxnCommitRequest {
     #[prost(message, repeated, tag = "2")]
     pub rows: ::prost::alloc::vec::Vec<RowWrites>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnCommitResponse {
+    /// A spanning transaction's (`BeginRequest.spans_partitions`): its home partition's commit.
     #[prost(message, optional, tag = "1")]
     pub commit: ::core::option::Option<CommitInfo>,
+    /// A spanning transaction that wrote: each partition it touched, the home first. A part not
+    /// yet `applied` is committed and is applied by its partition's resolver.
+    #[prost(message, repeated, tag = "2")]
+    pub parts: ::prost::alloc::vec::Vec<TxnPart>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnOutcomeRequest {
+    #[prost(string, tag = "1")]
+    pub txn_id: ::prost::alloc::string::String,
+}
+/// A commit that wrote is answered from its decision row, kept for --txn-outcome-retention
+/// from the decision (and, for a commit, until every branch acknowledged it). A read-only
+/// spanning commit has no decision row: it's answered COMMITTED only while its session's
+/// record lasts (one --txn-idle-ms after its Commit, not across a restart of its home's
+/// node), then ABORTED (the first ask records it, for a retention), then NotFound. It wrote
+/// nothing either way, so Commit's own answer is the one to rely on for whether its reads
+/// held. From a full retention after a transaction began, a missing row is NotFound, never
+/// a presumed abort.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TxnOutcomeResponse {
+    #[prost(enumeration = "TxnOutcomeState", tag = "1")]
+    pub state: i32,
+    /// When committed: the home's commit, and each partition's share as recorded.
+    #[prost(message, optional, tag = "2")]
+    pub commit: ::core::option::Option<CommitInfo>,
+    #[prost(message, repeated, tag = "3")]
+    pub parts: ::prost::alloc::vec::Vec<TxnPart>,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// One partition's share of a spanning transaction's commit (D329).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnPart {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The share's commit seqno on that partition, once applied (0 before).
+    #[prost(uint64, tag = "2")]
+    pub seqno: u64,
+    #[prost(bool, tag = "3")]
+    pub applied: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TxnAbortRequest {
@@ -4944,6 +5017,46 @@ pub struct OpenSnapshotResponse {
 pub struct ReleaseSnapshotRequest {
     #[prost(string, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
+}
+/// What became of a transaction (D329).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TxnOutcomeState {
+    Unspecified = 0,
+    /// Its session is open or committing: ask again.
+    InProgress = 1,
+    Committed = 2,
+    /// Aborted, or never committed (now final).
+    Aborted = 3,
+    /// Its home partition's history changed since it began (a promotion, a restore): the
+    /// decision may be lost, so nothing is presumed (`reason` says why).
+    Unknown = 4,
+}
+impl TxnOutcomeState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TXN_OUTCOME_STATE_UNSPECIFIED",
+            Self::InProgress => "TXN_OUTCOME_STATE_IN_PROGRESS",
+            Self::Committed => "TXN_OUTCOME_STATE_COMMITTED",
+            Self::Aborted => "TXN_OUTCOME_STATE_ABORTED",
+            Self::Unknown => "TXN_OUTCOME_STATE_UNKNOWN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TXN_OUTCOME_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "TXN_OUTCOME_STATE_IN_PROGRESS" => Some(Self::InProgress),
+            "TXN_OUTCOME_STATE_COMMITTED" => Some(Self::Committed),
+            "TXN_OUTCOME_STATE_ABORTED" => Some(Self::Aborted),
+            "TXN_OUTCOME_STATE_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod transactions_client {
@@ -5166,6 +5279,37 @@ pub mod transactions_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Transactions", "Abort"));
             self.inner.unary(req, path, codec).await
         }
+        /// A transaction's outcome, by its id, after the `Commit` reply was lost (D329): for a
+        /// transaction begun with `spans_partitions`, from its home partition's decision record,
+        /// kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
+        /// and changes nothing. Once the session is gone, a transaction never committed is made
+        /// final as `ABORTED`, which is why it needs write scope; so is a read-only one that
+        /// committed, once its session's record is gone (TxnOutcomeResponse says why). `NotFound`
+        /// past retention, and for other transactions once their session's record is gone.
+        pub async fn outcome(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TxnOutcomeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TxnOutcomeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Transactions/Outcome",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Transactions", "Outcome"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -5212,6 +5356,20 @@ pub mod transactions_server {
             &self,
             request: tonic::Request<super::TxnAbortRequest>,
         ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        /// A transaction's outcome, by its id, after the `Commit` reply was lost (D329): for a
+        /// transaction begun with `spans_partitions`, from its home partition's decision record,
+        /// kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
+        /// and changes nothing. Once the session is gone, a transaction never committed is made
+        /// final as `ABORTED`, which is why it needs write scope; so is a read-only one that
+        /// committed, once its session's record is gone (TxnOutcomeResponse says why). `NotFound`
+        /// past retention, and for other transactions once their session's record is gone.
+        async fn outcome(
+            &self,
+            request: tonic::Request<super::TxnOutcomeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TxnOutcomeResponse>,
+            tonic::Status,
+        >;
     }
     /// A transaction reads at one snapshot, buffers writes, and commits them atomically; a
     /// conflicting commit fails with `Conflict` and writes nothing. The retry loop is the
@@ -5547,6 +5705,51 @@ pub mod transactions_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AbortSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Transactions/Outcome" => {
+                    #[allow(non_camel_case_types)]
+                    struct OutcomeSvc<T: Transactions>(pub Arc<T>);
+                    impl<
+                        T: Transactions,
+                    > tonic::server::UnaryService<super::TxnOutcomeRequest>
+                    for OutcomeSvc<T> {
+                        type Response = super::TxnOutcomeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TxnOutcomeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Transactions>::outcome(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OutcomeSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -6985,6 +7188,149 @@ pub struct ClusterMap {
     /// partition named holds a whole store for the namespaces in its range.
     #[prost(message, optional, tag = "8")]
     pub memory: ::core::option::Option<MemoryPlacement>,
+    /// D330: the map's writer, the one node that changes it, and the term it was elected at.
+    /// Maps are ordered by `(writer_term, map_version)`: a node takes a map with a higher term
+    /// whatever its version, and refuses one with a lower term. Term 0 (no node named): the
+    /// writer is the node with the smallest id, as before D330, until the first election
+    /// writes term 1. Set only once every node keeps them (`map_features`: `writer_terms`).
+    #[prost(string, tag = "9")]
+    pub writer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "10")]
+    pub writer_term: u64,
+    /// D330: automatic failover, off by default (the owner's Q1), turned on with `set-map`.
+    /// Off: no node elects a new writer on its own; the writer changes only as before D330
+    /// (an operator's `set-map --force`, which raises the term). Set only once every node
+    /// keeps it (`map_features`: `writer_terms`). On: a writer whose lease lapses is replaced
+    /// by election, and the writer fails a down partition over to its freshest replica (PR 2),
+    /// unless the partition opts out (`Partition.failover`).
+    #[prost(bool, tag = "11")]
+    pub failover: bool,
+    /// D330: reserved for an old owner rejoining as a replica on its own (the owner's Q4); a
+    /// map setting it is refused in 1.3.0, where the operator rejoins it.
+    #[prost(bool, tag = "12")]
+    pub failover_rejoin: bool,
+    /// D330: the failovers and writer elections this map records, oldest first: the last 16
+    /// done or abandoned, and every promote still pending (one whose `to_epoch` is above its
+    /// partition's epoch), which is never dropped. A writer's change keeps them; a `set-map`
+    /// that drops or alters a pending one is refused.
+    #[prost(message, repeated, tag = "13")]
+    pub failovers: ::prost::alloc::vec::Vec<FailoverEvent>,
+    /// D331: the range moves in flight, each a table's key range going from one partition to
+    /// another through `MovePhase`s. The map's writer advances them; every node derives its
+    /// partitions' range gates from them. A partition is in at most one at a time, as source
+    /// or target. Set only once every node keeps them (`map_features`: `range_moves`).
+    #[prost(message, repeated, tag = "14")]
+    pub moves: ::prost::alloc::vec::Vec<RangeMove>,
+}
+/// D331: one range move, `[start, end)` of `table` from partition `from` to partition `to`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RangeMove {
+    /// The move's id: 1-64 of `\[a-z0-9_-\]`, unique among `moves`.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MoveKind", tag = "2")]
+    pub kind: i32,
+    #[prost(string, tag = "3")]
+    pub table: ::prost::alloc::string::String,
+    /// The range's first key; absent: the table's first key.
+    #[prost(message, optional, tag = "4")]
+    pub start: ::core::option::Option<SplitKey>,
+    /// The key after the range; absent: to the table's end.
+    #[prost(message, optional, tag = "5")]
+    pub end: ::core::option::Option<SplitKey>,
+    /// The source partition, S.
+    #[prost(string, tag = "6")]
+    pub from: ::prost::alloc::string::String,
+    /// The target partition, T (for a split, the partition the split added).
+    #[prost(string, tag = "7")]
+    pub to: ::prost::alloc::string::String,
+    #[prost(enumeration = "MovePhase", tag = "8")]
+    pub phase: i32,
+    /// S's seqno the copy was taken at, once T reported the copy done; 0 before.
+    #[prost(uint64, tag = "9")]
+    pub snapshot_seqno: u64,
+    /// S's visible seqno once its range fence drained (from HANDING_OVER): every write to the
+    /// range S took is at or below it. 0 until S reports it.
+    #[prost(uint64, tag = "10")]
+    pub final_seqno: u64,
+    /// The `(writer_term, map_version)` of the map that gave the range to T, set in that map
+    /// itself (from HANDED_OVER): a node holding it, or any map ordered after it, is past the
+    /// move's commit point.
+    #[prost(uint64, tag = "11")]
+    pub handed_over_version: u64,
+    #[prost(uint64, tag = "12")]
+    pub handed_over_term: u64,
+    /// The source partition's epoch when the move entered COPYING (D332 PR 2, #1485). A NODE
+    /// move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
+    /// promoted it mid-move). 0 on a record from before this field.
+    #[prost(uint64, tag = "13")]
+    pub from_epoch: u64,
+}
+/// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveStatus {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub table: ::prost::alloc::string::String,
+    #[prost(enumeration = "MovePhase", tag = "3")]
+    pub phase: i32,
+    /// This partition is the move's source (else its target).
+    #[prost(bool, tag = "4")]
+    pub source: bool,
+    /// The source fences the range's writes.
+    #[prost(bool, tag = "5")]
+    pub fenced: bool,
+    /// The partition serves the range here.
+    #[prost(bool, tag = "6")]
+    pub serving: bool,
+}
+/// D330: one failover of a partition to a replica, or one writer election, as the writer
+/// that made it recorded it in the map.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FailoverEvent {
+    #[prost(enumeration = "FailoverKind", tag = "1")]
+    pub kind: i32,
+    /// PARTITION: the partition failed over; empty for WRITER.
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// PARTITION: its owner before, and the replica's node it's promoted on. WRITER: the
+    /// writer before, and the node elected.
+    #[prost(string, tag = "3")]
+    pub from: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub to: ::prost::alloc::string::String,
+    /// The writer's wall clock when it recorded the event, in ms since the Unix epoch: for
+    /// operators, never compared.
+    #[prost(uint64, tag = "5")]
+    pub at_ms: u64,
+    /// The writer that recorded it, and its term then.
+    #[prost(string, tag = "6")]
+    pub writer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub writer_term: u64,
+    /// PARTITION: the primary seqno the promoted copy had applied through, and the owner's
+    /// durable seqno as the copy last heard it. Their difference is the known part of what
+    /// the failover lost; commits the owner acknowledged after the copy last heard from it
+    /// may be lost too (D330 §4). `primary_seqno` 0: unknown (the copy's follower hadn't heard
+    /// the owner's frontier since it last reconnected).
+    #[prost(uint64, tag = "8")]
+    pub applied_seqno: u64,
+    #[prost(uint64, tag = "9")]
+    pub primary_seqno: u64,
+    /// PARTITION: the external transaction shares the old owner reported in doubt, as of its
+    /// last lease renewal before it went down (at most 4 KiB of ids), and how many there were.
+    #[prost(string, repeated, tag = "10")]
+    pub in_doubt_xids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "11")]
+    pub in_doubt_count: u64,
+    /// PARTITION: the epoch the promote stamps the copy at, above every earlier pending
+    /// promote's of the partition, so a copy stamped by a promote that never finished is never
+    /// taken for this history (simp724's S2 on the D330 PR 2 plan).
+    #[prost(uint64, tag = "12")]
+    pub to_epoch: u64,
+    #[prost(enumeration = "FailoverState", tag = "13")]
+    pub state: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Node {
@@ -7023,6 +7369,14 @@ pub struct Partition {
     /// write or P's lease. A change to this alone is no move: P's epoch stays. (6 is unused.)
     #[prost(string, repeated, tag = "7")]
     pub replicas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// D330: whether the writer fails P over on its own while the map's `failover` is on.
+    /// The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
+    #[prost(enumeration = "FailoverMode", tag = "8")]
+    pub failover: i32,
+    /// D330: how many times P has failed over, ever: monotonic, unlike the map's last-16
+    /// events (`pigeonhole_cluster_failovers_total`).
+    #[prost(uint64, tag = "11")]
+    pub failover_count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -7202,6 +7556,30 @@ pub struct NodeStatus {
     ///   Empty from older nodes.
     #[prost(string, repeated, tag = "7")]
     pub map_features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// D330: the map's writer as this node's map names it (the smallest id at term 0), and
+    /// the highest writer term this node knows: its map's, or one it voted for. A map below it
+    /// is refused here, so `phdb cluster set-map --force` sets a term above every node's.
+    #[prost(string, tag = "8")]
+    pub writer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub writer_term: u64,
+    /// On the writer: the time left on its writer lease, as its last lease round gave it. On
+    /// another node: the time left on this node's grant of the writer lease to the writer. 0
+    /// once it has run out (or this node never granted it).
+    #[prost(uint64, tag = "10")]
+    pub writer_lease_remaining_ms: u64,
+    /// D330, on the writer: each partition it finds down but doesn't fail over, and why
+    /// ("failover off", "no fresh replica", "waiting: node X still grants its lease", ...).
+    #[prost(map = "string, string", tag = "12")]
+    pub failover_blocked: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    /// D330: every partition lease this node grants that still runs: the partition, its
+    /// holder, and the time left on this node's clock (not the writer lease). The writer asks
+    /// before it fails a partition over: an owner some node still grants is alive.
+    #[prost(message, repeated, tag = "13")]
+    pub grants: ::prost::alloc::vec::Vec<LeaseWithheld>,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7271,6 +7649,54 @@ pub struct LocalPartition {
     /// For a replica copy: where its follower is.
     #[prost(enumeration = "ReplicaState", tag = "20")]
     pub replica_state: i32,
+    /// D329: shares of transactions across partitions held here in doubt (prepared, their
+    /// decision not yet known here), the oldest's xid and age, and the WAL bytes they keep.
+    #[prost(uint32, tag = "21")]
+    pub in_doubt: u32,
+    #[prost(string, tag = "22")]
+    pub in_doubt_oldest_xid: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "23")]
+    pub in_doubt_oldest_age_ms: u64,
+    #[prost(uint64, tag = "24")]
+    pub in_doubt_wal_bytes: u64,
+    /// Each, with why it's still in doubt (its home unreachable, or its home's history changed).
+    #[prost(message, repeated, tag = "25")]
+    pub in_doubt_shares: ::prost::alloc::vec::Vec<InDoubtShare>,
+    /// D331: the range moves naming this partition, as source or target.
+    #[prost(message, repeated, tag = "27")]
+    pub moves: ::prost::alloc::vec::Vec<MoveStatus>,
+    /// D331: for a move's target, its range follower's lag behind the source, in milliseconds
+    /// (0 when it has none).
+    #[prost(uint64, tag = "28")]
+    pub move_follower_lag_ms: u64,
+    /// D332: the partition's load on this node, for the cluster balancer, each an exponential
+    /// average over `--balance-window` (each 30 s reading weighing `1 − e^(−30/window)`). 0 for a
+    /// replica copy, and until the first interval ends.
+    ///
+    /// * `load_cpu`: its share of the node's cores, `(max(B, sync_busy) + sampled request CPU) ÷ cores`, B and sync_busy being its database's shard busy and group-sync fractions. The
+    ///   sampled CPU includes its reads' work on the server's read pools. CPU outside the
+    ///   partition's service calls (request decoding and encoding, framing, sockets) isn't
+    ///   counted: compare partitions, not absolutes.
+    /// * `load_device`: its device bytes per second (the engine's estimate at its files: reads
+    ///   the OS page cache served count too) over this node's ceiling, the highest one-second
+    ///   rate of the same counters summed over the node's partitions within the window.
+    /// * `load`: the larger of the two.
+    #[prost(double, tag = "29")]
+    pub load_cpu: f64,
+    #[prost(double, tag = "30")]
+    pub load_device: f64,
+    #[prost(double, tag = "31")]
+    pub load: f64,
+}
+/// A share held in doubt (D329).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InDoubtShare {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub age_ms: u64,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7311,7 +7737,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 52"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7421,6 +7847,23 @@ pub mod forward_request {
         RecallPool(super::RecallPoolRequest),
         #[prost(message, tag = "41")]
         RecallBodies(super::RecallBodiesRequest),
+        /// D329 (ICR 0140): a spanning transaction's home node, the coordinator, to a branch's
+        /// partition owner (`partition` names it). `branch_begin` carries the client as `caller`;
+        /// `branch_prepare` and `branch_decide` are the node's own, cluster scope only.
+        #[prost(message, tag = "45")]
+        BranchBegin(super::BranchBegin),
+        #[prost(message, tag = "46")]
+        BranchPrepare(super::BranchPrepare),
+        #[prost(message, tag = "47")]
+        BranchDecide(super::BranchDecide),
+        /// A branch's node asks its transaction's home what was decided, for a share it holds in
+        /// doubt (D329's resolver): the node's own call, cluster scope only.
+        #[prost(message, tag = "48")]
+        ResolveTxn(super::ResolveTxn),
+        /// A client's `Transactions.Outcome` for a transaction whose home this node isn't
+        /// (D329): the client's caller rides `caller`, write scope.
+        #[prost(message, tag = "52")]
+        TxnOutcome(super::TxnOutcomeRequest),
     }
 }
 /// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
@@ -7570,6 +8013,81 @@ pub struct ForwardedCaller {
 }
 /// A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 /// call's own status.
+/// Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
+/// transaction's id (its xid), at that partition's snapshot now; with `renew`, renews the open
+/// one instead, or answers `TransactionExpired` if it's gone (never reopening it).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchBegin {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub renew: bool,
+}
+/// Prepares a branch (D329): a writing transaction's durably (its reads and writes held until
+/// `BranchDecide`), or with `read_only` a hold of its reads in memory, released by a
+/// `BranchDecide` that names the hold.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchPrepare {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub read_only: bool,
+}
+/// Decides a prepared branch (D329): commit or abort, synced before the answer. With `hold`
+/// (non-zero), the release of a read-only branch's hold instead, which answers only if the
+/// hold lasted and the partition's lease term is still `term`; otherwise `Conflict`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchDecide {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub commit: bool,
+    #[prost(uint64, tag = "3")]
+    pub hold: u64,
+    #[prost(uint64, tag = "4")]
+    pub term: u64,
+}
+/// `phdb cluster txn decide` (D329): an operator decides a share held in doubt on this node's
+/// `partition`, for a home that will never answer. Without `force`, refused while the home
+/// answers `ResolveTxn`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecideTxnRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub commit: bool,
+    #[prost(bool, tag = "4")]
+    pub force: bool,
+}
+/// What a share in doubt asks its home (D329): the transaction's xid. With `acked` (the
+/// branch's partition), the branch reports it has applied the commit its home answered, for
+/// the decision record's GC; the answer is then the decision again.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveTxn {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub acked: ::prost::alloc::string::String,
+}
+/// The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
+/// `UNKNOWN` leave it in doubt (`reason` says why).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnResolution {
+    #[prost(enumeration = "TxnOutcomeState", tag = "1")]
+    pub state: i32,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// A prepared branch (D329): for a read-only one, its hold and the lease term it was taken in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchPrepared {
+    #[prost(uint64, tag = "1")]
+    pub hold: u64,
+    #[prost(uint64, tag = "2")]
+    pub term: u64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForwardResponse {
     /// The seqno the serving node read at, in the owner's numbering (D328's
@@ -7579,7 +8097,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 30"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -7644,6 +8162,12 @@ pub mod forward_response {
         RecallPool(super::RecallPoolResponse),
         #[prost(message, tag = "24")]
         RecallBodies(super::RecallBodiesResponse),
+        #[prost(message, tag = "25")]
+        BranchPrepare(super::BranchPrepared),
+        #[prost(message, tag = "26")]
+        ResolveTxn(super::TxnResolution),
+        #[prost(message, tag = "30")]
+        TxnOutcome(super::TxnOutcomeResponse),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7665,6 +8189,12 @@ pub struct ForwardSubscribeRequest {
     /// most 64 of them; 0: none.
     #[prost(uint64, tag = "5")]
     pub skip_through: u64,
+    /// D331: start the component at this partition's hand-over position for the request's
+    /// tables (the earliest of its serving rows' tokens), not `request`'s start: a cluster
+    /// resume whose token lacks this partition because a range move gave it the tables since.
+    /// `FeedExpired` if no move did, or its feed has trimmed past that position.
+    #[prost(bool, tag = "6")]
+    pub from_hand_over: bool,
 }
 /// D326: a node's lease round asks each node of its map, itself included, for a grant.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7698,6 +8228,18 @@ pub struct LeaseRequest {
     /// that starts holds no lease).
     #[prost(uint64, tag = "7")]
     pub start: u64,
+    /// D330: the asking node's map's writer term. This node grants only at the same
+    /// `(writer_term, map_version)`, and answers `newer_map_version` when its own sorts after
+    /// the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
+    #[prost(uint64, tag = "8")]
+    pub writer_term: u64,
+    /// D330 PR 2: an election's pre-vote. The request asks for the writer lease alone, as a
+    /// vote does; the answer grants it only if this node would vote, and records nothing.
+    /// A candidate asks for real votes only once a majority would, so a node that can't win
+    /// never records a vote, whose term would fence the live writer's maps from it once it
+    /// rejoins.
+    #[prost(bool, tag = "9")]
+    pub pre_vote: bool,
 }
 /// A partition at an epoch.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7706,6 +8248,17 @@ pub struct LeasePart {
     pub partition: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub epoch: u64,
+    /// D330: for the writer lease (`partition` "\_\_writer"), the writer term asked for or
+    /// granted; `epoch` is then 0. 0 for a partition.
+    #[prost(uint64, tag = "3")]
+    pub term: u64,
+    /// D330, from an owner: the external transaction shares it holds in doubt for this
+    /// partition (at most 4 KiB of ids), and how many there are, so a writer that fails the
+    /// partition over can name them. Empty in a grantor's answer.
+    #[prost(string, repeated, tag = "4")]
+    pub in_doubt_xids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "5")]
+    pub in_doubt_count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LeaseResponse {
@@ -7724,6 +8277,11 @@ pub struct LeaseResponse {
     /// otherwise.
     #[prost(uint64, tag = "4")]
     pub grace_remaining_ms: u64,
+    /// D330: the grantor's highest writer term, its map's or one it voted for, on an answer
+    /// to an election vote (a `__writer` part above its map's term). A candidate refused for a
+    /// term at or below it asks again above it. 0 otherwise.
+    #[prost(uint64, tag = "5")]
+    pub writer_term: u64,
 }
 /// A partition this node won't grant yet, and why.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7816,6 +8374,11 @@ pub enum FenceReason {
     /// The partition's lease ran out on this node (D326): its renewals stopped reaching a
     /// majority of the map's nodes, so it stopped serving until a renewal does.
     LeaseLapsed = 3,
+    /// A range of the partition is being handed over to another partition (D331): writes
+    /// touching it answer `Fenced` until the move's map gives it to the target, then
+    /// `WrongPartition`. The partition's other keys take writes; this is reported only in
+    /// `MoveStatus.fenced`, never as the partition's `fence_reason`. Retry-safe.
+    RangeMoving = 4,
 }
 impl FenceReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -7828,6 +8391,7 @@ impl FenceReason {
             Self::Operator => "FENCE_REASON_OPERATOR",
             Self::AwaitingPeerMap => "FENCE_REASON_AWAITING_PEER_MAP",
             Self::LeaseLapsed => "FENCE_REASON_LEASE_LAPSED",
+            Self::RangeMoving => "FENCE_REASON_RANGE_MOVING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -7837,6 +8401,194 @@ impl FenceReason {
             "FENCE_REASON_OPERATOR" => Some(Self::Operator),
             "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
             "FENCE_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
+            "FENCE_REASON_RANGE_MOVING" => Some(Self::RangeMoving),
+            _ => None,
+        }
+    }
+}
+/// D331: what a range move is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MoveKind {
+    Unspecified = 0,
+    /// `phdb cluster move-range`: to an existing partition.
+    Range = 1,
+    /// `phdb cluster split`: to a partition the split added.
+    Partition = 2,
+    /// D332: a whole partition relocated to another node (no table or range; `to` names the
+    /// node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
+    ///
+    /// PR 6 (merge) adds MOVE_KIND_MERGE = 4.
+    Node = 3,
+}
+impl MoveKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MOVE_KIND_UNSPECIFIED",
+            Self::Range => "MOVE_KIND_RANGE",
+            Self::Partition => "MOVE_KIND_PARTITION",
+            Self::Node => "MOVE_KIND_NODE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MOVE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MOVE_KIND_RANGE" => Some(Self::Range),
+            "MOVE_KIND_PARTITION" => Some(Self::Partition),
+            "MOVE_KIND_NODE" => Some(Self::Node),
+            _ => None,
+        }
+    }
+}
+/// D331: where a range move is. A move goes forward one phase per map; before HANDED_OVER it
+/// may be removed (an abort), and from CLEANING it is removed once S's copy is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MovePhase {
+    Unspecified = 0,
+    /// T copies the range from S's snapshots. S serves it; T answers it `PartitionUnavailable`.
+    Copying = 1,
+    /// T follows S's feed for the range.
+    CatchingUp = 2,
+    /// S fences the range's writes (`Fenced`, RANGE_MOVING) and drains them; reads go on.
+    HandingOver = 3,
+    /// The commit point: the map gives the range to T and raises S's epoch. S answers the
+    /// range `WrongPartition`; T still answers it `PartitionUnavailable` until CLEANING.
+    HandedOver = 4,
+    /// T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
+    /// ended); S deletes its copy.
+    ///
+    /// PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
+    /// the merged-away source waits for its transaction outcomes before it's dropped. The
+    /// phases stay in order, so "from HANDED_OVER on" includes it.
+    Cleaning = 5,
+}
+impl MovePhase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MOVE_PHASE_UNSPECIFIED",
+            Self::Copying => "MOVE_PHASE_COPYING",
+            Self::CatchingUp => "MOVE_PHASE_CATCHING_UP",
+            Self::HandingOver => "MOVE_PHASE_HANDING_OVER",
+            Self::HandedOver => "MOVE_PHASE_HANDED_OVER",
+            Self::Cleaning => "MOVE_PHASE_CLEANING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MOVE_PHASE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MOVE_PHASE_COPYING" => Some(Self::Copying),
+            "MOVE_PHASE_CATCHING_UP" => Some(Self::CatchingUp),
+            "MOVE_PHASE_HANDING_OVER" => Some(Self::HandingOver),
+            "MOVE_PHASE_HANDED_OVER" => Some(Self::HandedOver),
+            "MOVE_PHASE_CLEANING" => Some(Self::Cleaning),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FailoverKind {
+    Unspecified = 0,
+    Partition = 1,
+    Writer = 2,
+}
+impl FailoverKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAILOVER_KIND_UNSPECIFIED",
+            Self::Partition => "FAILOVER_KIND_PARTITION",
+            Self::Writer => "FAILOVER_KIND_WRITER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAILOVER_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAILOVER_KIND_PARTITION" => Some(Self::Partition),
+            "FAILOVER_KIND_WRITER" => Some(Self::Writer),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FailoverState {
+    Unspecified = 0,
+    /// Recorded before the stamp: the map doesn't give the partition its new node yet.
+    Pending = 1,
+    /// The map gives it its new node at `to_epoch` (every WRITER event is done).
+    Done = 2,
+    /// A later promote of the partition took over: a copy stamped at this event's
+    /// `to_epoch` is orphaned, never served.
+    Abandoned = 3,
+}
+impl FailoverState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAILOVER_STATE_UNSPECIFIED",
+            Self::Pending => "FAILOVER_STATE_PENDING",
+            Self::Done => "FAILOVER_STATE_DONE",
+            Self::Abandoned => "FAILOVER_STATE_ABANDONED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAILOVER_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAILOVER_STATE_PENDING" => Some(Self::Pending),
+            "FAILOVER_STATE_DONE" => Some(Self::Done),
+            "FAILOVER_STATE_ABANDONED" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FailoverMode {
+    Unspecified = 0,
+    Inherit = 1,
+    Off = 2,
+    On = 3,
+}
+impl FailoverMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FAILOVER_MODE_UNSPECIFIED",
+            Self::Inherit => "FAILOVER_MODE_INHERIT",
+            Self::Off => "FAILOVER_MODE_OFF",
+            Self::On => "FAILOVER_MODE_ON",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FAILOVER_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FAILOVER_MODE_INHERIT" => Some(Self::Inherit),
+            "FAILOVER_MODE_OFF" => Some(Self::Off),
+            "FAILOVER_MODE_ON" => Some(Self::On),
             _ => None,
         }
     }
@@ -8100,6 +8852,31 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Status"));
             self.inner.unary(req, path, codec).await
         }
+        /// `phdb cluster txn decide` (D329): decides a share held in doubt on this node's partition,
+        /// for a transaction whose home will never answer. Admin or cluster scope. It can break the
+        /// transaction's atomicity, so without `force` it's refused while the home answers. Answers
+        /// the partition's status line.
+        pub async fn decide_txn(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DecideTxnRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/DecideTxn",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "DecideTxn"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
         /// the caller it names, whose scope and namespaces this node checks again. This node
         /// serves it only if its own map gives it the key; otherwise `WrongPartition` with its
@@ -8250,7 +9027,8 @@ pub mod cluster_client {
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
         /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+        /// PR 5).
         pub async fn fence(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -8274,7 +9052,8 @@ pub mod cluster_client {
         }
         /// Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
         /// unless this node's map names it as the partition's node at the epoch in its file.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer undoing its own move's fence:
+        /// D332, D331 PR 5).
         pub async fn unfence(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -8299,7 +9078,8 @@ pub mod cluster_client {
         /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
         /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
         /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-        /// unless it's fenced. Admin scope.
+        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+        /// move: D332, D331 PR 5).
         pub async fn close(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -8323,7 +9103,8 @@ pub mod cluster_client {
         }
         /// Moves a partition's files left on this node, after it moved away, into
         /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-        /// node's map names it as the partition's node, or while it's open. Admin scope.
+        /// node's map names it as the partition's node, or while it's open. Admin scope, or a
+        /// node's cluster token (the map's writer running a move: D332, D331 PR 5).
         pub async fn drop_partition(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRequest>,
@@ -8350,7 +9131,7 @@ pub mod cluster_client {
         /// identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
         /// rerun resumes. The reply's `files` is the set this call installed (none: empty).
         /// `FailedPrecondition` while the partition is open here, or for a file of another
-        /// cluster, partition or epoch. Admin scope.
+        /// cluster, partition or epoch. Admin scope, or a node's cluster token.
         pub async fn stamp(
             &mut self,
             request: impl tonic::IntoRequest<super::StampRequest>,
@@ -8473,6 +9254,14 @@ pub mod cluster_server {
             &self,
             request: tonic::Request<super::StatusRequest>,
         ) -> std::result::Result<tonic::Response<super::NodeStatus>, tonic::Status>;
+        /// `phdb cluster txn decide` (D329): decides a share held in doubt on this node's partition,
+        /// for a transaction whose home will never answer. Admin or cluster scope. It can break the
+        /// transaction's atomicity, so without `force` it's refused while the home answers. Answers
+        /// the partition's status line.
+        async fn decide_txn(
+            &self,
+            request: tonic::Request<super::DecideTxnRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
         /// the caller it names, whose scope and namespaces this node checks again. This node
         /// serves it only if its own map gives it the key; otherwise `WrongPartition` with its
@@ -8551,14 +9340,16 @@ pub mod cluster_server {
         /// (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
         /// unfenced, or at its new node); its reads go on. Answers once every write admitted before
         /// the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+        /// PR 5).
         async fn fence(
             &self,
             request: tonic::Request<super::PartitionRequest>,
         ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
         /// unless this node's map names it as the partition's node at the epoch in its file.
-        /// Admin scope.
+        /// Admin scope, or a node's cluster token (the map's writer undoing its own move's fence:
+        /// D332, D331 PR 5).
         async fn unfence(
             &self,
             request: tonic::Request<super::PartitionRequest>,
@@ -8566,14 +9357,16 @@ pub mod cluster_server {
         /// D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
         /// and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
         /// `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-        /// unless it's fenced. Admin scope.
+        /// unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+        /// move: D332, D331 PR 5).
         async fn close(
             &self,
             request: tonic::Request<super::PartitionRequest>,
         ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Moves a partition's files left on this node, after it moved away, into
         /// `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-        /// node's map names it as the partition's node, or while it's open. Admin scope.
+        /// node's map names it as the partition's node, or while it's open. Admin scope, or a
+        /// node's cluster token (the map's writer running a move: D332, D331 PR 5).
         async fn drop_partition(
             &self,
             request: tonic::Request<super::PartitionRequest>,
@@ -8583,7 +9376,7 @@ pub mod cluster_server {
         /// identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
         /// rerun resumes. The reply's `files` is the set this call installed (none: empty).
         /// `FailedPrecondition` while the partition is open here, or for a file of another
-        /// cluster, partition or epoch. Admin scope.
+        /// cluster, partition or epoch. Admin scope, or a node's cluster token.
         async fn stamp(
             &self,
             request: tonic::Request<super::StampRequest>,
@@ -8841,6 +9634,49 @@ pub mod cluster_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = StatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/DecideTxn" => {
+                    #[allow(non_camel_case_types)]
+                    struct DecideTxnSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::DecideTxnRequest>
+                    for DecideTxnSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DecideTxnRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::decide_txn(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DecideTxnSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -9930,7 +10766,9 @@ pub mod admin_client {
         }
         /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
         /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
-        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4). On a
+        /// cluster node, a node's cluster token may also download a named partition's closed set
+        /// (`fenced_file`) or a replica's bootstrap (D328), as the map's writer's move does (D332).
         pub async fn backup_download(
             &mut self,
             request: impl tonic::IntoRequest<super::BackupDownloadRequest>,
@@ -10010,7 +10848,9 @@ pub mod admin_client {
         }
         /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
         /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
-        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only. A
+        /// node's cluster token may upload a relocation's set (a move the map's writer runs, D332),
+        /// never a restore's.
         pub async fn partition_upload(
             &mut self,
             request: impl tonic::IntoStreamingRequest<
@@ -10037,7 +10877,8 @@ pub mod admin_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Admin", "PartitionUpload"));
             self.inner.client_streaming(req, path, codec).await
         }
-        /// How many bytes of an upload the node holds, to resume it.
+        /// How many bytes of an upload the node holds, to resume it. Admin scope, or a node's
+        /// cluster token.
         pub async fn partition_upload_status(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionUploadStatusRequest>,
@@ -10111,7 +10952,9 @@ pub mod admin_server {
             + 'static;
         /// A consistent backup, streamed as the file's bytes in chunks of up to 1 MiB. The server
         /// keeps the backup for a few minutes after the stream ends or breaks, so a download can
-        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4).
+        /// resume from an offset; the last chunk carries the file's SHA-256 (perf287's S4). On a
+        /// cluster node, a node's cluster token may also download a named partition's closed set
+        /// (`fenced_file`) or a replica's bootstrap (D328), as the map's writer's move does (D332).
         async fn backup_download(
             &self,
             request: tonic::Request<super::BackupDownloadRequest>,
@@ -10134,7 +10977,9 @@ pub mod admin_server {
         ) -> std::result::Result<tonic::Response<super::PromoteResponse>, tonic::Status>;
         /// On a cluster node (D317): one file of a partition's set, streamed in, for a restore or a
         /// relocation by file copy. It's staged aside, never served; the stamp that relocates or
-        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only.
+        /// restores the partition here installs the complete set (D317 ticket 6). gRPC only. A
+        /// node's cluster token may upload a relocation's set (a move the map's writer runs, D332),
+        /// never a restore's.
         async fn partition_upload(
             &self,
             request: tonic::Request<tonic::Streaming<super::PartitionUploadChunk>>,
@@ -10142,7 +10987,8 @@ pub mod admin_server {
             tonic::Response<super::PartitionUploadReply>,
             tonic::Status,
         >;
-        /// How many bytes of an upload the node holds, to resume it.
+        /// How many bytes of an upload the node holds, to resume it. Admin scope, or a node's
+        /// cluster token.
         async fn partition_upload_status(
             &self,
             request: tonic::Request<super::PartitionUploadStatusRequest>,

@@ -147,6 +147,21 @@ pub enum Next<'a> {
     Catalog(&'a CatalogEvent),
 }
 
+/// A range drop as a feed that includes feed-silent records delivers it (D331): as an empty
+/// [`Next::Commit`] at the drop's seqno, which [`FeedReader::range_drop`] names: rows
+/// `[start, end)` of `table` (`end` `None`: to the table's end) dropped at `seqno`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangeDropEvent {
+    /// The drop's seqno, which applies nothing.
+    pub seqno: Seqno,
+    /// The table.
+    pub table: TableId,
+    /// The range's first row.
+    pub start: Vec<u8>,
+    /// The row after the range; `None`: to the table's end.
+    pub end: Option<Vec<u8>>,
+}
+
 /// How far a feed has covered its history ([`FeedReader::position`], ICR 0114 amendment):
 /// a seqno for its commits, and in a feed of every table a sequence for its catalog changes.
 /// Each part only grows, and they are independent: one position covers another iff both
@@ -325,12 +340,15 @@ enum Item {
         seqno: Seqno,
         ts: Timestamp,
         changes: Raws,
+        /// Feed-silent, for a reader that includes them (D331): noted once it's kept.
+        silent: bool,
     },
     Prepare {
         id: Seqno,
         changes: Raws,
         /// An external share (D329): see [`Held::external`].
         external: bool,
+        silent: bool,
     },
     Decision {
         id: Seqno,
@@ -348,6 +366,13 @@ enum Item {
     /// delivered at its own seqno.
     Abort {
         id: Seqno,
+    },
+    /// A range drop (D331, type 7), at a seqno of its own, which applies nothing: the
+    /// frontier passes it. A reader that includes feed-silent records (a replica's
+    /// follower) is delivered it, in seqno order; its range is read only then.
+    RangeDrop {
+        seqno: Seqno,
+        event: Option<Box<RangeDropEvent>>,
     },
     Other,
 }
@@ -727,6 +752,27 @@ pub struct FeedReader {
     /// An entry goes once the floor passes its segment.
     dropped: HashMap<Seqno, (usize, u32)>,
     out: Commit,
+    /// Feed-silent commits are delivered (D331: a replica's follower only), and whether the
+    /// last commit delivered was one.
+    include_silent: bool,
+    out_silent: bool,
+    /// The xids of the spanning commits read and not yet delivered: a single commit's by its
+    /// seqno, a round's by its id. Beside the records, not in them, as `silent_seen`: a
+    /// commit without one pays a bit test when read and an emptiness test when delivered.
+    xids: HashMap<Seqno, Arc<[u8]>>,
+    /// The xid of the record just read, if it's a spanning commit's share: set as the record
+    /// is read and taken by the item that keeps it, not carried in the item, which every
+    /// record read moves (perf2's N2 on #2076).
+    read_xid: Option<Arc<[u8]>>,
+    /// The xid of the commit last delivered ([`xid`](Self::xid)): beside the commit, not in
+    /// it, as `out_silent` is, so `Commit` keeps its fields (semver: an exhaustively
+    /// constructible public struct can't gain one).
+    out_xid: Option<Arc<[u8]>>,
+    /// With `include_silent`, the silent commits read, kept and not yet delivered: a single
+    /// commit's seqno, a round's id. Kept beside the records, not in them, so a reader that
+    /// doesn't include them carries nothing for it (#2055's feed shapes). Noted only where a
+    /// commit is kept (ready or held) and removed with it, so it's bounded by what's kept.
+    silent_seen: HashSet<Seqno>,
     /// A feed of every table (D315): the catalog changes read from the sidecar and not yet
     /// delivered, in order; the last one delivered (its root sequence, in the token); how far
     /// the sidecar is read; and the tables dropped by delivered changes, whose later changes
@@ -774,6 +820,12 @@ pub struct FeedReader {
     /// The table the last commit's changes ended with, present in `present_of`.
     present_last: Option<TableId>,
     out_catalog: CatalogEvent,
+    /// The range drop the commit last delivered stands for (D331), at `drop_seqno`.
+    out_drop: Option<RangeDropEvent>,
+    drop_seqno: Seqno,
+    /// Range drops queued in `ready` as empty commits, by seqno (D331; only with
+    /// `include_silent`).
+    drops: BTreeMap<Seqno, RangeDropEvent>,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
     /// couldn't be read): every later call fails, since going on would skip that commit.
@@ -1282,6 +1334,12 @@ impl FeedReader {
             ahead: ReadAhead::new(shared.shards, READ_AHEAD_BYTES),
             dropped: HashMap::new(),
             out: Commit::default(),
+            include_silent: false,
+            out_silent: false,
+            xids: HashMap::new(),
+            read_xid: None,
+            out_xid: None,
+            silent_seen: HashSet::new(),
             expired: None,
             failed: None,
             key,
@@ -1309,6 +1367,9 @@ impl FeedReader {
             present_of: None,
             present_last: None,
             out_catalog: CatalogEvent::default(),
+            out_drop: None,
+            drop_seqno: 0,
+            drops: BTreeMap::new(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
         // A feed of every table: the catalog its start reflects, for `Now` and a snapshot
@@ -1461,6 +1522,8 @@ impl FeedReader {
         if let Some(marks) = self.writer.as_ref().and_then(|f| f.marks(s)) {
             cursor.follow_head(Arc::clone(marks));
         }
+        // The mark is decoded here and checked against `incompat` bit 3 by `read_one`'s filter.
+        cursor.accept_silent(true);
         Ok(cursor)
     }
 
@@ -1697,6 +1760,89 @@ impl FeedReader {
         self.frontier
     }
 
+    /// Delivers feed-silent commits too (D331, ICR 0141), each with [`silent`](Self::silent)
+    /// set: for a replica's follower only, which applies them silent, so the replica stays a
+    /// copy of its primary and its own feed matches the primary's. Never reachable from a
+    /// client's subscription: the public API's feed options have no such field. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn include_silent(&mut self) {
+        self.include_silent = true;
+    }
+
+    /// Whether the commit last delivered is feed-silent (only ever, with
+    /// [`include_silent`](Self::include_silent)). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn silent(&self) -> bool {
+        self.out_silent
+    }
+
+    /// The range drop the commit last delivered stands for (D331; only ever with
+    /// [`include_silent`](Self::include_silent)): an empty commit at the drop's seqno. Not
+    /// part of the stable API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn range_drop(&self) -> Option<&RangeDropEvent> {
+        // One compare for a commit (#2089's callgrind): `drop_seqno` is set only when a
+        // drop's empty commit is delivered, and a seqno is never delivered twice.
+        if self.drop_seqno != self.out.seqno {
+            return None;
+        }
+        self.out_drop.as_ref()
+    }
+
+    /// Delivers the range drop at `key` (D331), if one is there: an empty commit at its
+    /// seqno, which [`range_drop`](Self::range_drop) names (simp724's M1 on #2089: `Next`
+    /// stays as it is). Every stream logs the drop, and their copies share one key in
+    /// `ready`: the one kept advances its stream, and the others pass as records behind
+    /// `delivered` (feed1248's note).
+    #[cold]
+    #[inline(never)]
+    fn emit_drop(&mut self, key: Seqno) -> bool {
+        // Ones behind `delivered` were passed over (read again past a cutoff).
+        self.drops.retain(|&k, _| k >= key);
+        let Some(event) = self.drops.remove(&key) else {
+            return false;
+        };
+        self.out.seqno = key;
+        self.out.ts = 0;
+        self.out.changes.clear();
+        self.out_silent = false;
+        // Nor a transaction's share (D329 2b's xid): the drop isn't one, whatever the
+        // commit before it was (#2089 landing after #2076).
+        self.out_xid = None;
+        self.out_drop = Some(event);
+        self.drop_seqno = key;
+        true
+    }
+
+    /// The transaction the commit last delivered is a share of, when it's a spanning
+    /// commit's (D329 2b): every share of one commit has the same. Not part of the stable
+    /// API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn xid(&self) -> Option<&Arc<[u8]>> {
+        self.out_xid.as_ref()
+    }
+
+    /// The silent and xid notes held now (test hook), each checked against what the reader
+    /// keeps: a single commit's in `ready`, a round's among the held shares. So empty once a
+    /// feed has drained.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn notes(&self) -> usize {
+        for &k in self.silent_seen.iter().chain(self.xids.keys()) {
+            let kept = self.ready.contains_key(&k)
+                || self
+                    .held
+                    .range((k, 0)..(k.saturating_add(1), 0))
+                    .next()
+                    .is_some();
+            assert!(kept, "a note for {k}, a commit the reader doesn't keep");
+        }
+        self.silent_seen.len() + self.xids.len()
+    }
+
     /// The last delivered seqno: every commit at or below it was delivered (or precedes the
     /// feed's start).
     pub fn delivered(&self) -> Seqno {
@@ -1817,11 +1963,7 @@ impl FeedReader {
             at = at.min(r);
         }
         for p in self.ready.values() {
-            let (stream, start) = match p {
-                Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
-                    (*stream, *start)
-                }
-            };
+            let (stream, start) = p.at();
             if stream == s {
                 at = at.min(start);
             }
@@ -2081,6 +2223,8 @@ impl FeedReader {
         }
         self.ready.clear();
         self.held.clear();
+        self.silent_seen.clear();
+        self.xids.clear();
         self.starts = Starts::default();
         let a = &mut self.ahead;
         a.bytes = 0;
@@ -2172,8 +2316,15 @@ impl FeedReader {
         self.forget_ready(&p);
         let (stream, start) = p.at();
         self.ahead.skip(stream, start);
-        if let Pending::Decided { id, .. } = p {
-            self.evict_round(id);
+        match p {
+            // A round's note goes with its shares (`remove_held`).
+            Pending::Decided { id, .. } => self.evict_round(id),
+            // A single's goes here: it's read again, and noted again, past the cutoff
+            // (ai1249's nit on #2068).
+            Pending::Single { .. } => {
+                self.silent_seen.remove(&key);
+                self.xids.remove(&key);
+            }
         }
         self.ahead.lower_cutoff(key - 1);
     }
@@ -2340,8 +2491,17 @@ impl FeedReader {
                 self.raise_session(session);
             }
             match item {
-                Item::Single { seqno, ts, changes } => {
+                Item::Single {
+                    seqno,
+                    ts,
+                    changes,
+                    silent,
+                } => {
                     if seqno <= self.delivered {
+                        // A re-read: its xid, if any, isn't kept, nor left for the next record.
+                        if self.read_xid.is_some() {
+                            self.read_xid = None;
+                        }
                         let st = &mut self.streams[s];
                         st.delivered_end = st.delivered_end.max(end);
                         continue;
@@ -2353,6 +2513,16 @@ impl FeedReader {
                         }
                         self.expired = Some(gap(seqno));
                         return Ok(false);
+                    }
+                    // Noted only once it's kept: a commit re-read at or below what was
+                    // delivered, or skipped, leaves no note behind (feed1248's condition on 2b).
+                    if silent {
+                        self.silent_seen.insert(seqno);
+                    }
+                    // One test for an untagged commit; the note out of line (#2076's feed
+                    // shapes).
+                    if self.read_xid.is_some() {
+                        take_read_xid(&mut self.read_xid, &mut self.xids, seqno);
                     }
                     self.insert_ready(
                         seqno,
@@ -2378,7 +2548,32 @@ impl FeedReader {
                     id,
                     changes,
                     external,
+                    silent,
                 } => {
+                    if silent {
+                        self.silent_seen.insert(id);
+                    }
+                    match self.read_xid.take() {
+                        Some(xid) => {
+                            // A round's shares are all tagged or all not: a tagged share with
+                            // an untagged one held first (feed1248's check, both orders).
+                            debug_assert!(
+                                self.xids.contains_key(&id)
+                                    || self
+                                        .held
+                                        .range((id, 0)..(id.saturating_add(1), 0))
+                                        .next()
+                                        .is_none(),
+                                "a tagged share of a round with an untagged one"
+                            );
+                            note_xid(&mut self.xids, id, xid);
+                        }
+                        // A round's shares are all tagged or all not (feed1248's check).
+                        None => debug_assert!(
+                            !self.xids.contains_key(&id),
+                            "an untagged share of a tagged round"
+                        ),
+                    }
                     let h = Held {
                         stream: s,
                         start,
@@ -2432,7 +2627,37 @@ impl FeedReader {
                 Item::Abort { id } => {
                     // Its shares are never delivered; the abort's own seqno holds nothing, so
                     // the frontier passes it as any seqno with no event (ICR 0140's E1).
+                    // Nor is it a silent commit to report (simp724's N2 on #2055): its note
+                    // goes with its shares.
                     self.remove_held(id);
+                }
+                // Feed-silent (D331): a client's feed passes its seqno as one with no event.
+                // A replica's follower takes it in seqno order; every stream holds it, and
+                // the copies share one key in `ready`.
+                Item::RangeDrop { seqno, event } => {
+                    let Some(event) = event else { continue };
+                    if seqno <= self.delivered {
+                        let st = &mut self.streams[s];
+                        st.delivered_end = st.delivered_end.max(end);
+                        continue;
+                    }
+                    // An empty commit at its seqno in `ready` (no variant of its own: the
+                    // commits' matches stay as they were, #2089's callgrind), its range
+                    // aside until it's delivered.
+                    self.drops.insert(seqno, *event);
+                    self.insert_ready(
+                        seqno,
+                        Pending::Single {
+                            ts: 0,
+                            changes: Raws {
+                                heads: Box::new([]),
+                                bytes: Box::new([]),
+                            },
+                            stream: s,
+                            start,
+                            end,
+                        },
+                    );
                 }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
@@ -2454,12 +2679,24 @@ impl FeedReader {
     /// tables and prefix; `None` at the readable end, or once its segment is gone (which
     /// expires the feed).
     fn read_one<const INDEXING: bool>(&mut self, s: usize) -> Result<Option<ReadRecord>> {
-        let (tables, prefix) = (&self.tables, &self.prefix);
+        let (tables, prefix, include_silent) = (&self.tables, &self.prefix, self.include_silent);
+        let shared = &self.shared;
         // D320: a record past the read-ahead's cutoff is passed over before its mutations
         // are filtered or copied. One at or below `delivered` takes its usual path.
         let (cutoff, delivered) = (self.ahead.cutoff, self.delivered);
         let skipped_rounds = &self.ahead.skipped_rounds;
-        let filter = |batch: BatchRef<'_>| pack(batch, tables, prefix);
+        // A feed-silent batch (D331, ICR 0141): checked against `incompat` bit 3 and passed
+        // over for a subscription, out of line. The cursors take the mark, so this one test
+        // per batch is the feed path's whole cost (#2055's feed shapes); `pack` is as it was.
+        // `silent` from the batch's count flags, which the caller read once for this and the
+        // xid's bit (#2076's feed shapes).
+        let filter = |batch: BatchRef<'_>, silent: bool| {
+            if silent {
+                silent_batch(shared, batch, tables, prefix, include_silent)
+            } else {
+                pack(batch, tables, prefix)
+            }
+        };
         let (start, end, session, record) = match self.streams[s].cursor.step()? {
             Step::Record {
                 start,
@@ -2495,7 +2732,8 @@ impl FeedReader {
             WalRecord::Prepare { seqno, .. }
             | WalRecord::Decision { seqno, .. }
             | WalRecord::ExternalPrepare { seqno, .. }
-            | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
+            | WalRecord::ExternalAbort { seqno, .. }
+            | WalRecord::RangeDrop { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
         let item = match record {
@@ -2515,27 +2753,59 @@ impl FeedReader {
                 seqno,
                 commit_ts,
                 batch,
-            } => Item::Single {
-                seqno,
-                ts: commit_ts,
-                changes: filter(batch)?,
-            },
-            WalRecord::Prepare { seqno, batch, .. } => Item::Prepare {
-                id: seqno,
-                changes: filter(batch)?,
-                external: false,
-            },
+            } => {
+                let flags = batch.count_flags();
+                if flags & XID_FLAG != 0 {
+                    set_read_xid_of(&mut self.read_xid, batch);
+                }
+                let silent = flags & SILENT_FLAG != 0;
+                Item::Single {
+                    seqno,
+                    ts: commit_ts,
+                    changes: filter(batch, silent)?,
+                    silent: include_silent && silent,
+                }
+            }
+            WalRecord::Prepare { seqno, batch, .. } => {
+                let flags = batch.count_flags();
+                if flags & XID_FLAG != 0 {
+                    set_read_xid_of(&mut self.read_xid, batch);
+                }
+                let silent = flags & SILENT_FLAG != 0;
+                Item::Prepare {
+                    id: seqno,
+                    changes: filter(batch, silent)?,
+                    external: false,
+                    silent: include_silent && silent,
+                }
+            }
             // D329: an external share is held as a D263 one is, delivered at its Decision's
             // apply seqno, or dropped by its abort.
             WalRecord::ExternalPrepare { seqno, share, .. } => match share.batch() {
                 Some(batch) => Item::Prepare {
-                    id: seqno,
-                    changes: filter(batch)?,
+                    id: {
+                        set_read_xid(&mut self.read_xid, share.xid());
+                        seqno
+                    },
+                    changes: filter(batch, batch.is_silent())?,
                     external: true,
+                    silent: include_silent && batch.is_silent(),
                 },
                 None => Item::Other,
             },
             WalRecord::ExternalAbort { seqno, .. } => Item::Abort { id: seqno },
+            WalRecord::RangeDrop { seqno, range } => Item::RangeDrop {
+                seqno,
+                event: include_silent.then(|| {
+                    let (table, start, end) = range.fields();
+                    Box::new(RangeDropEvent {
+                        seqno,
+                        table,
+                        start: start.to_vec(),
+                        end: end.map(<[u8]>::to_vec),
+                    })
+                }),
+            },
             WalRecord::Decision {
                 seqno,
                 apply_seqno,
@@ -2587,6 +2857,10 @@ impl FeedReader {
             self.ahead.bytes -= held_bytes(&h);
             shares.push(h);
         }
+        // Its notes go with its shares: a round dropped, evicted or decided below what was
+        // delivered leaves nothing behind.
+        self.silent_seen.remove(&id);
+        self.xids.remove(&id);
         shares
     }
 
@@ -2671,6 +2945,8 @@ impl FeedReader {
                 self.catalog_seq = ev.sequence;
                 self.raise_session(session);
                 self.out_catalog = ev;
+                // No commit is delivered with it, so no drop either (feed1248 on #2089).
+                self.drop_seqno = 0;
                 return Ok(Emitted::Catalog);
             }
             let Some((&key, _)) = self.ready.first_key_value() else {
@@ -2715,6 +2991,14 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
+                    if self.include_silent {
+                        self.out_silent = self.silent_seen.remove(&key);
+                    }
+                    // One test for a commit that isn't a spanning one's share, as `out_silent`
+                    // is (#2076's feed shapes).
+                    if !self.xids.is_empty() || self.out_xid.is_some() {
+                        set_out_xid(&mut self.out_xid, &mut self.xids, key);
+                    }
                     (ts, Packs::One(changes))
                 }
                 Pending::Decided {
@@ -2728,6 +3012,12 @@ impl FeedReader {
                 } => {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
+                    if self.include_silent {
+                        self.out_silent = self.silent_seen.remove(&id);
+                    }
+                    if !self.xids.is_empty() || self.out_xid.is_some() {
+                        set_out_xid(&mut self.out_xid, &mut self.xids, id);
+                    }
                     match self.take_round(id, &participants, session) {
                         Round::Whole(raws) => (ts, Packs::Many(raws)),
                         Round::Dropped => {
@@ -2765,6 +3055,10 @@ impl FeedReader {
             let dropped = &self.dropped_tables;
             let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
             if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
+                // A range drop's empty commit (D331), only ever with `include_silent`.
+                if !self.drops.is_empty() && self.emit_drop(key) {
+                    return Ok(Emitted::Commit);
+                }
                 continue;
             }
             self.out.seqno = key;
@@ -2991,14 +3285,16 @@ impl FeedReader {
     fn earlier_start(&self, db_id: [u8; 16]) -> Option<(Seqno, Vec<Lsn>, u64)> {
         let shards = self.shared.shards;
         let open = |s: usize, at: Lsn| {
-            FeedCursor::open(
+            let mut cursor = FeedCursor::open(
                 &self.shared.vfs,
                 &self.shared.path,
                 StreamId(s as u32),
                 db_id,
                 at,
             )
-            .ok()
+            .ok()?;
+            cursor.accept_silent(true);
+            Some(cursor)
         };
         // Each stream's first retained segment of every earlier session in the history.
         let mut firsts: Vec<HashMap<u64, u32>> = Vec::with_capacity(shards);
@@ -3048,6 +3344,7 @@ impl FeedReader {
                         WalRecord::ExternalAbort {
                             seqno, abort_seqno, ..
                         } => seqno.min(abort_seqno),
+                        WalRecord::RangeDrop { seqno, .. } => seqno,
                         // A kind this build can't key: the session can't be started in.
                         _ => continue 'sessions,
                     },
@@ -3507,6 +3804,93 @@ pub fn all_tables_token_position(token: &[u8]) -> Result<([u8; 16], u64, u64)> {
         ));
     }
     Ok((h.db_id, h.delivered, h.catalog_seq))
+}
+
+/// A feed-silent batch a feed read (D331, ICR 0141): `Corruption` unless the database has
+/// `incompat` bit 3, which a writer sets before appending the first (a stray bit is never
+/// read as the mark); then nothing for a subscription, whose commit is passed over as one
+/// to other tables is, and the batch's mutations for a reader that includes them. A reader
+/// process's pager doesn't see the bit until it reloads, and setting it commits no
+/// manifest, so the superblocks on disk are read again (simp724's S1 on #2055); a `true`
+/// is kept in `silent_flagged`.
+#[cold]
+#[inline(never)]
+fn silent_batch(
+    shared: &Shared,
+    batch: BatchRef<'_>,
+    tables: &[TableId],
+    prefix: &[u8],
+    include_silent: bool,
+) -> Result<Raws> {
+    if !shared.silent_flagged.load(Ordering::Acquire) {
+        let on_disk = shared
+            .pager
+            .features_on_disk()
+            .is_ok_and(|f| f.incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0);
+        if !on_disk {
+            return Err(Error::Corruption(
+                pigeonhole_format::wal::SILENT_WITHOUT_BIT.to_owned(),
+            ));
+        }
+        shared.silent_flagged.store(true, Ordering::Release);
+    }
+    if include_silent {
+        pack(batch, tables, prefix)
+    } else {
+        Ok(Raws::default())
+    }
+}
+
+/// The record just read's xid into its note under `key` (D329 2b), out of line: only for a
+/// spanning commit's share.
+#[cold]
+#[inline(never)]
+fn take_read_xid(slot: &mut Option<Arc<[u8]>>, xids: &mut HashMap<Seqno, Arc<[u8]>>, key: Seqno) {
+    if let Some(xid) = slot.take() {
+        note_xid(xids, key, xid);
+    }
+}
+
+/// The delivered commit's xid: its note under `key`, or none. Out of line: only once a
+/// spanning commit's share has been read.
+#[cold]
+#[inline(never)]
+fn set_out_xid(out: &mut Option<Arc<[u8]>>, xids: &mut HashMap<Seqno, Arc<[u8]>>, key: Seqno) {
+    *out = xids.remove(&key);
+}
+
+/// The count's flags (`BatchRef::count_flags`): the silent mark and the xid trailer's bit.
+const SILENT_FLAG: u8 = (pigeonhole_format::wal::SILENT_BATCH >> 24) as u8;
+const XID_FLAG: u8 = (pigeonhole_format::wal::XID_BATCH >> 24) as u8;
+
+/// Sets the reader's slot for the record just read to `batch`'s xid (D329 2b), out of
+/// line: only a spanning commit's share has one.
+#[cold]
+#[inline(never)]
+fn set_read_xid_of(slot: &mut Option<Arc<[u8]>>, batch: BatchRef<'_>) {
+    if let Some(x) = batch.xid() {
+        *slot = Some(Arc::from(x));
+    }
+}
+
+/// Sets the reader's slot to an external share's xid (D329 2b), out of line.
+#[cold]
+#[inline(never)]
+fn set_read_xid(slot: &mut Option<Arc<[u8]>>, xid: &[u8]) {
+    *slot = Some(Arc::from(xid));
+}
+
+/// Notes `xid` under `key` for delivery. Every share of a round has the same xid, and a
+/// round is never part tagged (feed1248's assert on 2b): a split that lost the tag on one
+/// shard's share would show here.
+#[cold]
+#[inline(never)]
+fn note_xid(xids: &mut HashMap<Seqno, Arc<[u8]>>, key: Seqno, xid: Arc<[u8]>) {
+    let old = xids.insert(key, Arc::clone(&xid));
+    debug_assert!(
+        old.as_deref().is_none_or(|o| *o == *xid),
+        "two shares of one round carry different xids"
+    );
 }
 
 #[cfg(test)]

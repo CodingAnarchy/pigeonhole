@@ -644,3 +644,346 @@ Additive; the numbers are the coordinator's (`.coord/numbers.md`). In 1.2.0 a cl
 - **Not in 1.3.0:** making the old owner a replica automatically (the owner's #1484 call: the operator rejoins it).
 - **`Admin.Promote` on a cluster node** answers `FailedPrecondition`, naming `phdb cluster promote`.
 - **S4, now done for you:** `move`, `relocate` and `restore --partition` with `--to` a node in `P.replicas` first set a map without it there, and wait for it to close its copy. The set installed replaces the copy's file, which goes aside. The node still refuses `Stamp` while a copy of P is open, as the safety net.
+
+## D330 PR 1: the map's writer under a lease, with terms (1.3.0, #1484)
+**The map's writer holds a lease as a partition's owner does, and maps are ordered by a writer term.** With failover on, a node is elected in a down writer's place. Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ClusterMap.writer = 9`, `.writer_term = 10`: the writer the map names, and the term it was elected or forced at. A map names a writer from term 1 on, and only then. At term 0 the writer is the smallest id, as before.
+- `ClusterMap.failover = 11`: off by default (the owner's Q1). Turned on with `set-map`. Off, no node elects a writer.
+- `LeasePart.term = 3`: the writer lease's term (`partition` `__writer`, `epoch` 0).
+- `LeaseRequest.writer_term = 8`: the asking node's map term.
+- `LeaseResponse.writer_term = 5`: the grantor's highest term, on an answer to a vote.
+- `NodeStatus.writer = 8`, `.writer_term = 9`, `.writer_lease_remaining_ms = 10`.
+  - `writer_term` is the node's highest term: its map's, or one it voted for.
+  - `writer_lease_remaining_ms` is, on the writer, its own lease; elsewhere, the node's grant of it to the writer.
+- **Map feature `writer_terms`:** `writer`, `writer_term` and `failover` go into a map only once every node reports it.
+
+**Flag:** `phdb serve --cluster-failover-after-ms` (default 0, which means 2 × `--cluster-lease-ms`): the failover margin.
+
+**Ordering:** maps are ordered by `(writer_term, map_version)`.
+- A node takes a map with a higher term, whatever its version, and refuses one with a lower term.
+- An equal pair with other contents is divergent. An equal pair with the same contents is a no-op install.
+- A lease round orders peers' maps the same way. So does a grantor, for its version check and `newer_map_version`.
+
+**The writer lease:**
+- `__writer` is a reserved partition id. The writer asks for it in its lease rounds at the map's term.
+- A grantor grants it to the node its map names as writer, at the map's term, unless it voted for a higher one. It withholds it from any other node as it withholds a partition.
+- From term 1, `SetMap` needs it before the install, waiting up to `L·(1+ρ)` plus a push timeout for it, and again before the push. If it's gone by the push, the map stays installed on the writer and the answer is `OutcomeUnknown`: the map may still reach the cluster at the writer's next round, or be replaced by an elected map (simp724's S1 on #2056). At term 0 the lease isn't needed, so a cluster whose older nodes don't grant it can still change its map.
+- A plain `SetMap` keeps the current map's `writer` and `writer_term`, whatever the request says.
+- A node that installs a map naming another writer releases its writer lease to every node (`Cluster.Release`, keyed by the term).
+
+**The term fence:**
+- A node refuses any map below the highest term it voted for: on a push, a set, a forced set or a round's catch-up.
+- The vote is synced to `cluster-writer-term` in the node's cluster directory before it's answered, so the fence survives a restart.
+
+**An election** runs only while the map has `failover` on. It starts on a node once:
+- its grant of the writer lease has been out for the failover margin;
+- every node it reaches reports no writer lease;
+- each smaller live id (one that answered) has had a margin to go first.
+
+Its steps:
+1. **A vote:** `Cluster.Lease` with the writer lease alone, at one above every term it has seen. A grantor grants it, whatever the request's map version, when:
+   - its start grace is over;
+   - no other node's writer lease runs there;
+   - the term is above its map's and above any term it has voted for.
+
+   The grantor records the term, then answers. The vote joins the candidate's grant there rather than replacing it.
+2. **The newest map** by `(term, version)` that the voting majority holds.
+3. **That map** at the new term, naming the candidate, at the next version. It's pushed until a majority holds it, while the vote's lease runs.
+
+**`set-map --force`:** once every reachable node keeps `writer_terms`, the forced map takes a term above every one they know (simp724's S2), naming its writer: the map's `writer` if set, else the smallest id. It must be reachable. A node that knows a higher term refuses it. If a node knows a term but runs a build without terms, the force is refused.
+
+**`phdb cluster status`** adds `writer`, `writer_term`, `writer_lease_remaining_ms` (the writer's own) and `failover`.
+
+**Not yet:** the guide's failure model and timeline (PR 3). Partition failover, its events and metrics are D330 PR 2, below.
+
+## D330 PR 2: partition failover by the map's writer (1.3.0, #1484)
+**With the map's `failover` on, the writer promotes a down partition's freshest replica, through D328's promote path, and records it in the map.** Off by default. Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ClusterMap.failover_rejoin = 12`: reserved (the owner's Q4); a map setting it is refused.
+- `ClusterMap.failovers = 13`: repeated `FailoverEvent`, a new message with its fields numbered from 1:
+  - `kind` (`FailoverKind`: PARTITION or WRITER), `partition`, `from`, `to`;
+  - `at_ms` (the writer's wall clock, never compared), `writer`, `writer_term`;
+  - `applied_seqno` and `primary_seqno` (the promoted copy's applied seqno and the owner's durable seqno as it last heard it);
+  - `in_doubt_xids` (at most 4 KiB, as of the owner's last renewal) and `in_doubt_count`;
+  - `to_epoch` and `state` (`FailoverState`: PENDING, DONE, ABANDONED).
+
+  The map keeps the last 16 finished events, and every pending one.
+- `Partition.failover = 8` (`FailoverMode`: INHERIT, OFF, ON). The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
+- `Partition.failover_count = 11`: P's failovers, ever; it never goes down.
+- `LeaseRequest.pre_vote = 9` (bool): an election's pre-vote (Raft's). A candidate asks for real votes, and records its own, only once a majority would vote. A node answers it as the vote, recording, granting and fencing nothing, and says yes only once the writer lease has been out there for the failover margin (simp724). Without it, a node cut off from every other ran an election it couldn't win; its recorded vote then fenced the live writer's lower-term maps from it for good once it rejoined (found by §8 test 2). A build without leases answers `Unimplemented`, as to a vote: no pre-vote. A vote that's really held and lost can still strand its candidate; the live writer then adopts its term (#2073, below).
+- `LeasePart.in_doubt_xids = 4` and `.in_doubt_count = 5`: an owner's in-doubt external shares of P, sent with its renewals while the map has failover on, as the operator pastes them into `phdb cluster txn decide` (UTF-8; hex only for an xid that isn't). They're empty in an answer.
+- `NodeStatus.failover_blocked = 12`: on the writer, each down partition it doesn't fail over, and why.
+- `NodeStatus.grants = 13`: every partition lease the node grants that still runs (`LeaseWithheld`: partition, holder, time left). The writer's survey reads it.
+- `LocalPartition.failover_blocked_reason = 26` was assigned and isn't used: the owner of a down partition can't report it, so the writer's `failover_blocked` replaces it (simp724's F6).
+- **Map feature `writer_terms`** gates every field above, as it gates `failover`.
+
+**Flag:** `phdb serve --cluster-failover-max-lag-ms` (default 0, no limit). An automatic failover refuses a replica staler than that beyond the owner's last renewal.
+
+**Down:** the writer's own grant of P to P's owner has run out, unrenewed, the failover margin ago.
+- A writer that took office since counts from the owner's first renewal it saw, or from a lease after taking office (simp724's S3).
+- Down partitions are reported, not failed over, when:
+  - the map's `failover` is off;
+  - P is OFF;
+  - P has no replicas;
+  - the owner answers and serves P, or the operator fenced (`FENCE_REASON_OPERATOR`) or closed it there. An owner that answers but has lost its lease reports Fenced awaiting its peers, and counts as down;
+  - any other node still grants P's lease to its owner (`NodeStatus.grants`: the owner is alive, cut off from the writer alone).
+- A node that doesn't answer the survey is unknown, not granting. The grant round still keeps two owners from serving at once.
+- A partition blocked after a survey is surveyed again only once it's due, or when the map changes (perf287 on #2069). It's due when the grant it waits on ends ("node X still grants its lease"), else after the failover margin. A newly down partition is surveyed at once, and a survey any down partition is due takes every down partition, so none keeps a stale reason through another's survey (perf2's S2 on #2069, #2073).
+
+**The replica:** of P's replicas, the one with the highest applied seqno (then map order) whose copy:
+- is FOLLOWING or BEHIND;
+- is at the writer's own map version and term;
+- is inside P's history;
+- is no staler than the owner's last renewal plus a heartbeat (1 s), and within `--cluster-failover-max-lag-ms`.
+
+The owner's last renewal is the writer's own last grant of P to it, less a lease. The writer is one of P's grantors, so it has this whatever its office time; a writer elected after the owner died still measures from the owner's real renewal (simp724's B1 on #2069). A writer that has seen no renewal of P's owner since it started has no baseline. It blocks P with a reason that says to promote by hand (`phdb cluster promote P --to <replica> --old-unreachable`).
+
+**The promote** is `phdb cluster promote`'s, shared code, run by the writer over its peers. One runs at a time.
+1. **A map** takes the copy's node out of P's replicas and, with writer terms or failover in the map, records the promote PENDING at its `to_epoch`.
+   - `to_epoch` is above P's epoch and above every epoch a promote of P has recorded (simp724's S2): a copy stamped by a promote that never finished never matches a new history.
+   - An older pending promote of P becomes ABANDONED.
+2. **The stamp** at `to_epoch`. A promote's stamp may raise the epoch by more than one; every other stamp still raises it by exactly one.
+3. **The map** gives P to the copy's node at `to_epoch`, with a new history, marks the event DONE and raises `failover_count`.
+4. **It waits** for P to serve there.
+
+A writer that stops between the stamp and the map leaves the promote PENDING. The next check finds the copy stamped at `to_epoch` and finishes it (finish only; simp724's F4). `phdb cluster promote` by hand does the same, and resumes by the pending epoch, not "the map's + 1".
+
+**Pending promotes are kept.** A map that drops or alters a pending promote whose `to_epoch` is above P's epoch is refused, on a set, a forced set, a push or a catch-up. It may only:
+- finish it, with the map giving P that node at that epoch;
+- abandon it, for a later promote of P recorded above it.
+
+No other move takes P to an epoch at or below a pending one's.
+
+**An election** records a WRITER event in the elected map.
+
+**The writer's duties** (an election, then failovers) run on a task of their own after each lease round, one at a time, never inline. Every survey asks all nodes at once, under one deadline: the push timeout, at most a sixth of the lease. This fixes #2056's stall, where an election's survey asked nodes in turn inside the lease round, so a black-holed peer could delay the node's own renewals.
+
+**A map change wakes a replica copy** whose partition's owner, epoch or history it changes (D330 amendment 2). The copy looks the owner up at once, rather than after its retry pause (up to 10 s).
+
+**Metrics:** `pigeonhole_cluster_failovers_total{partition}` (from `failover_count`) and `pigeonhole_cluster_writer_term`, from the node's map: every node shows the same.
+
+**`phdb cluster status`** adds `failover_blocked` (the writer's) and `failovers` (the map's events). Each node's JSON has its `grants`.
+
+#### A node stranded by a lost vote (#2073, simp724's design)
+**The problem.** A candidate that passes its pre-vote but loses its real vote has recorded its own vote for term N. Say it was cut off between the rounds. The install term fence then refuses every map below N. If the live writer stays at a lower term, the node never takes its maps: its partitions stay fenced, and it routes on an old map. The node mustn't simply take a lower-term map, which would break the vote's promise.
+
+**Worse: it stopped every other node's leases too.** Each node's lease round pushes its map to a peer that answers with an older one. A peer that didn't take it blocked the round (audit120's F2 on #1899), so with the stranded node refusing every push, no node confirmed a lease, the writer's included.
+- **Now:** a peer whose push the term fence refuses counts as one that never answered, not as behind.
+- **Why that's safe** (D326, not F2; audit120's S1 on #2083):
+  - the node can't renew a lease once a majority holds a newer map;
+  - its grantors withhold from any other node a lease it still holds, until that lease runs out;
+  - a round that leaves it out still needs a majority of holders and of grants.
+
+  F2 predates D326, and the grant rule now covers the old-owner case it was written for. The fence's marker also matches a voter in an election that won or is still running. Then the pusher is a replaced writer, and its majority includes a voter that refuses the push or refuses its writer lease.
+- **Also:** the writer's own rounds note the refusal for the adopt duty below.
+
+**The fix: the live writer adopts the term.**
+- **How the writer notices**, with no new wire field:
+  - it notes each node it answers with `newer_map_version` (the Lease handler), and each node whose map push the term fence refuses (matched by the refusal's marker, as a divergent push's is);
+  - once one has been behind for a lease, the writer's duties ask its `Status`. `NodeStatus.writer_term` is the highest term it knows, a vote's included, so one above the map's is a refused term N.
+- **The election:** the writer holds an election at N + 1 (pre-vote, vote, a WRITER event from it to itself), and the stranded node takes the term-N + 1 map. Every voter has this writer's lease running, so a ballot from the holder of a voter's live writer lease, at the map's term, passes the pre-vote's margin check. That's the holder only: any other candidate still waits the margin out.
+- **The guards:**
+  - **Only a live writer:** it goes ahead only while it holds a writer lease from a renewal round that began after it saw the node behind. Had term N won, this writer's lease would have lapsed, and it does nothing.
+  - **No storm:** at most one attempt per refused term per lease, retried while the node stays behind.
+
+The seeded model loses a real vote now and then. In a settle phase at the end, every node holds the writer's map and has no vote above it. It also checks that no vote is recorded while another node holds a live writer lease.
+
+#### A promote left pending whose owner came back (#2070, simp724's ruling)
+**The problem** (found by the seeded model's partition half):
+1. A failover records its promote PENDING and stamps the copy, then its writer dies before the map.
+2. P's owner comes back and serves P again.
+3. Nothing then finishes or clears the promote:
+   - the writer waits on the serving owner;
+   - validation refused ABANDONED unless a later promote's event was above it.
+
+It stayed pending for good, and with D331's N1 it refused every range move of P.
+
+**The fix:**
+- **The writer abandons it.** Its failover check (`failover::check` returns `Abandon`) applies when P's owner renewed P with the writer since it took office and that grant still runs. Once the survey finds the owner serving P at its epoch, the writer sets the promote ABANDONED. It can't safely finish while the old owner holds a lease.
+  - Validation accepts PENDING → ABANDONED when P stays on the event's `from` at its epoch.
+  - A promote run that finds its own event abandoned since its first step stops, naming the orphan copy (for a manual promote racing the writer).
+- **The floor binds every epoch change of P.** A promote's `to_epoch`, in any state, may have a copy stamped at it.
+  - No map takes P to that epoch or below it, unless it's that promote finishing.
+  - A relocation, a move and D331's hand-over take P to `promote::next_epoch`, `max(epoch, floor) + 1`. Stamps may skip epochs.
+  - An abandoned event stays pinned, like a pending one, while P's epoch is at or below its `to_epoch`. It doesn't count toward the 16 finished events kept, so pruning never drops the floor.
+- **Status:** while an abandoned promote pins the floor, P's `failover_blocked` names the copy it stamped: "an unfinished promote stamped node X at epoch E: drop that copy".
+- **The orphan:** the copy an abandoned promote stamped stays an owner's file at that epoch. Re-added to P's replicas, its node refuses to open it until the operator drops it (`phdb cluster drop-partition`). On the next map that lists it, the node bootstraps a fresh copy from P's owner.
+
+#### The seeded model's partition half (#2070, design §8 test 5)
+**What it extends:** the writer half's model (5 nodes, drifting clocks, the real `Grants`).
+- **What it adds:**
+  - 2 partitions with replicas, each node's lease round asking for all its leases at once;
+  - owner writes under the partition lease, and replicas following;
+  - failover by the writer through the real `failover::check`, `failover::qualify` and `promote::run`, over the model's `Promoter`;
+  - restarts that keep the vote and lose the grants;
+  - writers that die after their stamp.
+- **Every map** its writer sets passes the real catch-up validation.
+- **It asserts:**
+  - at most one holder of the writer lease and of each partition's lease (at any epoch), on true time;
+  - §4's loss bound at each stamp: the copy holds every acknowledged write at or below the seqno the writer saw;
+  - no write acknowledged by an old owner after its successor's lease began;
+  - no epoch stamped twice;
+  - no orphan copy ever holding a lease;
+  - no map giving P an epoch a promote stamped, except that promote finishing;
+  - each map that moves P raising its `failover_count` by one;
+  - no failover by a writer that saw no renewal, except to finish a pending one.
+- **A settle phase** ends with:
+  - one serving owner per partition;
+  - following replicas;
+  - no promote left pending.
+
+## D331 PR 2: range moves in the map, and the range gates (1.3.0, #1499)
+**The map records each range move in flight, and every partition a move names gates the range's calls.** No data moves yet: the copy is PR 4, and the driver and CLI are PR 5. Additive on the wire.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ClusterMap.moves = 14`, repeated `RangeMove`: `{ id, kind, table, start, end, from, to, phase, snapshot_seqno, final_seqno, handed_over_version, handed_over_term }`. `start` and `end` are `SplitKey`s; an absent start is the table's first key, and an absent end is the table's end.
+- `MoveKind`: `RANGE = 1`, `PARTITION = 2` (a split), `NODE = 3` (D332's whole-partition relocation, refused until D332 validates it). `MERGE = 4` comes with PR 6.
+- `MovePhase`: `COPYING = 1`, `CATCHING_UP = 2`, `HANDING_OVER = 3`, `HANDED_OVER = 4`, `CLEANING = 5`.
+- `FenceReason.FENCE_REASON_RANGE_MOVING = 4`: a write to a range being handed over. It's reported per move (`MoveStatus.fenced`), never as the partition's `fence_reason`.
+- `LocalPartition.moves = 27` (repeated `MoveStatus { id, table, phase, source, fenced, serving }`) and `.move_follower_lag_ms = 28` (0 until PR 4's follower).
+- **Map feature `range_moves`:** a map gets its first move only once every node reports it.
+
+**Validation** (`map::validate`, every map, forced ones included):
+- a move names a placed table, not in a co-location group;
+- **no index follows the table**: a text index's postings and a vector index's lists hold ids from both sides of any range (coordinator, 2026-11-18; #2066 lifts it);
+- two listed, different partitions, and a non-empty range;
+- before HANDED_OVER the range lies inside one range of its source, and from HANDED_OVER inside one of its target;
+- **a partition is in at most one move**, as source or target;
+- `final_seqno` is set only from HANDING_OVER on, and the hand-over pair only from HANDED_OVER on, never after the map itself.
+
+**Changes** (`map::validate_change`, at the writer):
+- A move appears at COPYING, keeps its table, range, partitions and kind, and goes forward one phase per map. It may be removed before HANDED_OVER (an abort) and from CLEANING (done), never at HANDED_OVER.
+- **The HANDING_OVER → HANDED_OVER step is the one reshape a table placement takes:** the range's ends become split keys where they aren't, and the range goes to the target. The same map:
+  - names itself as the hand-over (`handed_over_term`, `handed_over_version` = its own `(writer_term, map_version)`);
+  - raises the source's epoch on the same node, keeping its `history_epoch`, so its replica copies and feed tokens go on. The new epoch is `max(epoch, promote floor) + 1` (#2070), never one a promote stamped a copy at.
+
+**The range gate** (a partition's state beside its `WriteGate`, derived at every map install and at open):
+- One load per call while no move names the partition. Otherwise a cold walk of the keys the call names (`ServiceOp::touches`).
+- **The source, at HANDING_OVER:** a write touching the range answers `Fenced`, retry-safe (unlike the operator's fence). Reads go on.
+- **The source, from HANDED_OVER:** any call touching the range answers `WrongPartition` at the node's map version, whoever sent it, and the sender pulls the newer map.
+- **The target, until it serves the range:** any call touching the range answers `PartitionUnavailable`, retry-safe.
+  - The writer sets CLEANING only once the never-both rule holds (PR 5).
+  - Taking that map, the target first records a **serving row** (`serving/<move id>`: the range, the hand-over pair, and `t_from`, its visible seqno just before), then serves the range.
+  - So nothing of the range lands on it at or below `t_from` except the move's feed-silent copy, and a replica copy of it serves the range once it has applied that row.
+- **Transactions on the source:** a commit that writes, of a transaction whose snapshot is below the fence's seqno or the latest hand-over's, answers `Fenced` or `Conflict`, retry-safe, whatever it read. Serve doesn't see a transaction's read set. A read-only commit passes, since its snapshot is consistent on its own.
+
+**The source's hand-over** (on the node holding it, at the HANDED_OVER map's install):
+1. It ends its lease: a lapse, so D329 read holds under the old term are lost.
+2. It records the range in its file: `__phdb_cluster`, family `moved`, row `moved/<move id>`, with the table, range, hand-over pair and its visible seqno. The row is a plain logged write, so its replica copies carry it.
+3. It writes the new epoch into its identity row (until D331 only `Stamp` raised an epoch).
+4. It asks for its lease at the new epoch at once.
+
+A partition that opens gates its moved ranges from those rows before it serves.
+- A moved-away range is served again only where a serving row with a newer hand-over pair covers it: a later move gave it back, partly or whole.
+- Any other part a map places on the partition, such as a forced map with no move back, answers `PartitionUnavailable`, naming the move, because its rows there may have been cleaned.
+
+A moved-away row outlives the move record and is pruned by PR 5's writer, at the later of two bounds: every node holds a map at or after the hand-over, and the transaction lifetime plus the request timeout has passed. A serving row lives while it gates its target or clears an older moved-away row.
+
+**Not yet:** the copy and the range follower (PR 4); the driver, the drain and `final_seqno`, the never-both decision, cleanup and the CLI (PR 5); refusing D329 prepares and read holds on a fenced range (with D329 PR 2a); the cluster feed's hold, clipping and backups (PR 3).
+
+## D331 PR 3a: replica copies' range gates, and restoring across a move (1.3.0, #1499)
+**Replica copies gate a moving range as their owners do, and a restore leaves each row in one partition.** No wire change.
+
+**Replica copies (D328):**
+- A copy has no `WriteGate`, so it gets its own range gate, held by its follower.
+  - It's armed when the copy opens and at each map install, under the install lock.
+  - It's checked on the copy's calls, fan-out parts and scans.
+- A copy of a target serves the range once it has applied the target's serving row. A copy of a source refuses a moved range from the source's moved-away row.
+- A copy whose file lacks a row it needs waits, keeping its previous span for a source, and its follower reads the rows again after each run it applies.
+- While a move names a partition as its target, or as its source from HANDED_OVER on, the routing view lists no copies for it, so bounded reads go to the owner. A gated copy never counts as behind or unreachable.
+  - The cost (cli692's note on the 3a review): for the move's length, CLEANING included, the partition's bounded reads of every table, not only the moved one, are its owner's. Moves are short, and narrowing it would need per-table copy lists in the routing view. PR 5's guide states it.
+
+**Restore:**
+- A cluster backup never spans a hand-over: `backup::moved` refuses a backup during which a placement or epoch changed.
+- So a restore drops its map's moves. Each is rolled back or forward by its phase, since the map's placements already say who held the range. Its stamp marks each restored file.
+- The file's open clips it to the map before it serves:
+  - rows outside the partition's ranges are deleted, feed-silently;
+  - a row a D329 share in doubt holds is left, counted and logged, and the marker stays, so the next open after the share is decided deletes it;
+  - moved-away rows covering a range the map gives back are cut to the rest, and every one left drops its hand-over pair to (0, 0), so a later move back in the restored cluster counts as newer;
+  - the timestamp floor rises to the newest timestamp kept (`raise_ts_floor`).
+- A clip that stops runs again at the next open.
+- A single-partition restore is refused while a move names the partition.
+
+## D331 PR 3b: the cluster feed across a range move (1.3.0, #1499)
+**A key's events stay in order across a hand-over, a subscription that misses the new partition is rerouted, and no token expires because of a move.** The design is cli692's (d), reviewed by simp724, cli692 and feed1248.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `FeedEvent.move_barrier = 8`, `MoveBarrier { move_id = 1; source = 2; final_seqno = 3; }`: internal to a cluster subscription, never sent to a client. 7 is D329's `FeedEvent.xid`.
+- `ForwardSubscribeRequest.from_hand_over = 6` (bool): start the component at the partition's hand-over for the request's tables.
+- A serve-level error, `FeedRerouted`: UNAVAILABLE/503, retry-safe, not a public `ErrorCode`. The stream ends right after a checkpoint, so its last token resumes it.
+
+**The target's serving row** (PR 2's, extended) carries the move's source, its `final_seqno` from the map's record, and a D310 feed token at `t_from`. The token comes from a feed of the table opened before the gate opens the range.
+
+**The barrier:**
+- A cluster component of a move's target carries a barrier for each of its serving rows of the component's tables, whatever its start.
+- A start at or before `t_from` carries the hand-over's token; one past it carries none, so the merge's position doesn't move.
+- The barrier goes out just before the first event past `t_from`, quiet progress included.
+- A running component also watches its gate's serving-row version (one load per event, after the event's read and before its send), so a hand-over taken while it runs adds its barrier.
+
+**The merge's hold:**
+- A part that passed a barrier isn't polled while the source's part is below `final_seqno`. Holds lift in barrier order.
+- The merge has no part of the source: no hold. A source part still at its own now holds nothing either (feed1248's S1): a barrier exists only from the target's serving row, written after `final_seqno` was fixed, so the source's now is past it. The source's part can't get there: the subscription expires (`FeedExpired`), never reorders.
+
+**Rerouting:**
+- A merge whose node's map gives one of its tables a partition it has no live part for (a retired part doesn't count, feed1248's M2) ends with a checkpoint, then `FeedRerouted`. It's checked when the map's version changes, and only from the move's CLEANING: before it the target serves none of the range and has no hand-over position (cli692's M1 on the code). A resume that gains the target before then gets a retry-safe `PartitionUnavailable` from it.
+- A resume whose token lacks a partition the map now places the tables on starts it at that partition's hand-over (`from_hand_over`). The partition resolves the position from its serving rows, or answers `FeedExpired`.
+- A token partition the map still lists is asked for every subscription table, whatever the map places there, and its node decides (feed1248's M1): it reads the tables it serves and those it holds a moved-away row of, and leaves out the rest. With none left, `WrongPartition`.
+
+**A source of a whole-table move:**
+- It serves a component of the table while its file has the moved-away row: up to the move's `final_seqno`, then it ends with an internal `MovedAway`. A component already running when the move takes its last table there finds the same end through the gate's version, which moved-away rows and state changes bump too (feed1248's M3).
+- The merge retires the part and leaves it out of later checkpoints.
+- Without the row, it answers `WrongPartition`, and a resume of it expires.
+
+**Pruning, for PR 5:**
+- A target's serving row goes only once its own feed floor has passed `t_from`.
+- A source's moved-away row goes only once its feed retention has passed `final_seqno`, plus PR 2's bounds.
+
+## D332 PR 2: whole-partition moves recorded in the map (1.3.0, #1485)
+**`phdb cluster move P --to N` keeps a record of itself in `ClusterMap.moves`,** so a move stopped by a crash, of the CLI or of the writer, is seen. `status` shows it, failover takes it into account, and a rerun finishes it.
+
+**Proto:** `RangeMove.from_epoch = 13`, P's epoch when the move entered COPYING (coordinator-assigned; D331 may use it with the same meaning). `MOVE_KIND_NODE = 3` was declared by D331 PR 2.
+
+**The record:** `{ id: node-<ms>, kind: NODE, from: P, to: <node>, from_epoch, phase }`, with no table or range.
+
+| phase | NODE meaning | written |
+|---|---|---|
+| COPYING | the move started: P is fenced and closed on its node and copied to `to` | before the fence |
+| HANDING_OVER | `to` stamped P and its set matched the closed one | after the match |
+| HANDED_OVER | the commit point: the relocation map itself, P on `to` at `promote::next_epoch`, with `copies` and the hand-over pair | the map step |
+| CLEANING | `to` serves P | after it serves |
+| (gone) | done, after `--drop-source` if given | at the end |
+
+**Validation:**
+- **A NODE record (`validate_node_move`):**
+  - no table or range;
+  - a listed partition, and `to` a listed node;
+  - never at CATCHING_UP (simp724's Q1);
+  - `from_epoch` set, and no seqnos.
+- **Where P must be:** before HANDED_OVER, still on its node at `from_epoch`; from it, on `to` past it. So a map that moves P any other way, a failover's promote among them, has to drop the record (simp724's M2). `promote::run` drops it in its map.
+- **The steps:** COPYING goes straight to HANDING_OVER. HANDED_OVER's map must put P on `to` at `max(epoch, floor) + 1`, from its node at `from_epoch`, and name itself; it checks P's node and epoch, the relocation's own `copies` keep its history, and the rest of the map is held to the usual change rules (simp724's N2 on #2092).
+- **One move per partition, whatever the kind.**
+
+**Attempts (simp724's M1):** each run writes a fresh record, replacing an earlier attempt's not yet at its commit point, and copies, stamps and matches the old node's closed set again. A rerun past the commit point finishes the record it finds.
+
+**`phdb cluster move P --abort`:**
+- before HANDED_OVER, it removes the record and moves the target's copy aside (`drop-partition`). P stays on its node, closed and fenced: `unfence` serves it there.
+- at or past HANDED_OVER, it's refused, naming the phase: run the move again to finish it.
+
+**Failover:** at COPYING and HANDING_OVER, P is closed on its node, so the failover check reports it closed by the operator while that node answers. If the node is down, a promote goes ahead and drops the record. From HANDED_OVER the check blocks with "move <id> (relocating it to node X) is past its commit point: let it finish, or use a forced map".
+
+**Every reader of `moves` that acts on a range skips NODE** (`map::node_move`):
+- the range gates and the open's gates;
+- the hand-over and its crash-finish;
+- the feed's barriers and reroutes;
+- reconcile's keep;
+- routing's replica check: copies keep serving reads during a relocation;
+- the restore's clip, which needs nothing for NODE because the backup map's placement decides it. A copy a cleared NODE move staged or stamped on its target is left there, outside the map; `drop-partition` on that node moves it aside (ai1249's should on #2092);
+- `#2087`'s pinning.
+
+`LocalPartition.moves` shows a NODE record with no table. `restore_partition` stays refused while one names P.
+
+**Mixed versions:** a record needs the `range_moves` feature on every node, which is what keeps `moves` in a node's map. Without it, the move runs unrecorded and its report says so (`recorded`). Every node reporting `range_moves` runs 1.3.0, which validates NODE.
+

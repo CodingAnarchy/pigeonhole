@@ -41,6 +41,7 @@ use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
 mod tablets;
+pub(crate) use tablets::shared_bytes;
 
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
@@ -462,7 +463,12 @@ fn new_memtable(
 /// (`open_writer_inner`) overrides its own fields. A new field whose writer value differs
 /// from a reader's must be added to that override list too.
 pub(crate) struct Shared {
+    /// The database's VFS: for opens and file-system calls. On a writer it's the device-byte
+    /// counting wrapper (D332), so read the clock through [`Shared::clock_vfs`].
     pub vfs: VfsRef,
+    /// The same backend unwrapped, for clock reads (`monotonic_nanos`, `now_micros`): they
+    /// run on every commit, and through the wrapper each cost an extra call (#2063).
+    pub clock_vfs: VfsRef,
     pub shm: ShmRegion,
     /// When the writer next frees the slots of reader processes that are gone (monotonic
     /// nanoseconds; [`Shared::reclaim_dead_readers`], #833).
@@ -536,6 +542,12 @@ pub(crate) struct Shared {
     /// logged. Set once, under the manifest writer's lock, after `flag_incompat` returned;
     /// read (Acquire) by `Engine::prepare_external` to skip the lock.
     pub external_flagged: AtomicBool,
+    /// `incompat` bit 3 is set in both superblock pages (D331, ICR 0141): a feed-silent
+    /// batch may be logged, and a WAL reader takes its mark. Seeded at open from the
+    /// superblock; set once by `Engine::flag_silent`, under the manifest writer's lock, after
+    /// `flag_incompat` returned and before the first silent batch is routed; read (Acquire)
+    /// by the commit path to skip the lock and by feed cursors that meet a silent batch.
+    pub silent_flagged: AtomicBool,
     /// Externally prepared transactions in doubt (D329, ICR 0140), by xid: each one's id and
     /// coordinator shard. A leaf lock: inserted by the coordinator once every share is
     /// prepared (before it answers the caller, so a `decide` after `prepare` returned
@@ -568,6 +580,12 @@ pub(crate) struct Shared {
     pub flushed_through: Vec<Padded>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
+    /// Per shard, each tablet's write load as of its last balancer pass (D332, ICR 0142): the
+    /// tablet and its moving average of rows written per interval. Stored whole by the
+    /// owning shard (`ArcSwap`), loaded by [`Engine::tablets`](crate::Engine::tablets).
+    pub tablet_loads: Vec<ArcSwap<Vec<(TabletId, f64)>>>,
+    /// The database's device bytes (D332): every file it opens counts into it.
+    pub io: Arc<pigeonhole_io::IoCounters>,
     pub balance: BalanceConfig,
     /// Bytes of a shared-memory view buffer (a split that would outgrow it is refused, D28).
     pub view_capacity: usize,
@@ -689,7 +707,7 @@ impl Shared {
         let Some(file) = &self.lock_file else {
             return;
         };
-        let now = self.vfs.monotonic_nanos();
+        let now = self.clock_vfs.monotonic_nanos();
         let at = self.reader_reclaim_at.load(Ordering::Relaxed);
         if now >= at
             && self
@@ -712,6 +730,9 @@ impl Shared {
         }
     }
 
+    /// Always inlined: every commit asks, and a call here showed in the commit shapes once
+    /// routing grew (#2076; `#[inline]` alone left it out of line in commit-one).
+    #[inline(always)]
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
     }
@@ -1710,6 +1731,11 @@ pub(crate) enum ShardMsg {
         commit: bool,
         reply: Notifier<Result<Settled>>,
     },
+    /// A read-only transaction's reads this shard owns, to validate and hold in memory
+    /// (`Engine::hold_reads`, ICR 0140 amendment 1, D329 PR 2a). Boxed for the message size.
+    HoldReads(Box<HoldReadsReq>),
+    /// Ends read hold `.0` here; `.1` answers whether it was still held.
+    ReleaseReads(Box<(u64, Option<Notifier<bool>>)>),
     Prepared {
         seqno: Seqno,
         from: ShardId,
@@ -1836,6 +1862,14 @@ pub(crate) enum ShardMsg {
     DropTablets {
         tablets: Vec<TabletId>,
     },
+    /// D331: write a Range Drop (type 7) at `seqno`, synced, on this shard's stream, and
+    /// answer once it's written. The engine holds `seqno` and releases it once every stream
+    /// has.
+    RangeDrop {
+        seqno: Seqno,
+        range: Vec<u8>,
+        reply: Notifier<Result<()>>,
+    },
     /// Start-up work (spare WAL segments).
     Start,
     /// Nothing: forces a drain so deferred members form a group.
@@ -1909,6 +1943,11 @@ enum MemberKind {
         /// variant's padding, not a `Bytes` variant of its own: a fourth variant there made
         /// every match on a member's bytes dearer (#2000's callgrind on x86).
         external_abort: bool,
+        /// D331: a Range Drop (type 7), its `bytes` the encoded range (in `Bytes::Streams`),
+        /// its `seqno` and `apply_seqno` the drop's one seqno, which the engine holds and
+        /// releases once every stream has written it. A flag beside `external_abort`, for
+        /// the same reason.
+        range_drop: bool,
     },
 }
 
@@ -2061,6 +2100,12 @@ impl Member {
                 seqno: self.seqno,
                 coordinator: StreamId(u32::from(coordinator.0)),
                 share: pigeonhole_format::wal::ExternalShare::decode(share, true)?,
+            },
+            MemberKind::CommitRecord {
+                range_drop: true, ..
+            } => WalRecord::RangeDrop {
+                seqno: self.seqno,
+                range: pigeonhole_format::wal::DroppedRange::decode(self.bytes.as_slice())?,
             },
             MemberKind::CommitRecord {
                 apply_seqno,
@@ -2312,6 +2357,30 @@ struct PreparedShare {
     /// whether it is `None` (written by no write of its own). A commit decision holds the
     /// feed's watermarks at its apply seqno until a write and a sync pass it.
     feed_end: Option<(Lsn, bool)>,
+}
+
+/// [`ShardMsg::HoldReads`]: hold `token`'s `reads` (the ones this shard owned when the
+/// engine routed them), validated against `validate`'s snapshot.
+#[derive(Debug)]
+pub(crate) struct HoldReadsReq {
+    pub token: u64,
+    /// The snapshot's seqno, and its pin, which keeps the writes above it from being purged
+    /// before they are looked for.
+    pub validate: Arc<crate::write::Validate>,
+    pub reads: Vec<crate::write::ReadKey>,
+    /// Each read's tablet in the engine's view when it routed them, for a read of a table
+    /// this shard's map doesn't have yet.
+    pub tablets: Vec<TabletId>,
+    pub reply: Notifier<Result<()>>,
+}
+
+/// A read hold this shard keeps (ICR 0140 amendment 1): its rows, counted in
+/// `pending_reads`, and their tablets, which a tablet change gives up for.
+#[derive(Debug)]
+struct ReadHoldHere {
+    /// `hash_row`, sorted.
+    rows: Vec<u64>,
+    tablets: Vec<TabletId>,
 }
 
 /// A `Decide` waiting for its share's PREPARE to settle (D279).
@@ -3556,6 +3625,9 @@ pub(crate) struct ShardState {
     waiting_singles: FastMap<u32, WaitingSingle>,
     /// A row's waiting singles (any row they write or read).
     single_rows: FastMap<u64, Vec<u32>>,
+    /// Read holds by token (ICR 0140 amendment 1, D329 PR 2a): a write to a held row is
+    /// refused at once, as over an external share in doubt.
+    read_holds: FastMap<u64, ReadHoldHere>,
     next_share_wait: u32,
     /// Refused commits that read, each older than every undecided share on its rows: while
     /// one is listed, a younger blind PREPARE on its rows is refused, not chained, so the
@@ -3595,6 +3667,8 @@ pub(crate) struct ShardState {
     creation_wake: bool,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
     aborted: HashSet<Seqno>,
+    /// D331: the Range Drops this shard is writing, each answered once its record is.
+    range_drops: HashMap<Seqno, Notifier<Result<()>>>,
     /// The highest seqno this shard asked each peer to answer for (`AwaitFlushed`, D266),
     /// until the peer's `FlushedThrough` covers it.
     awaiting: BTreeMap<ShardId, Seqno>,
@@ -3942,6 +4016,7 @@ impl ShardState {
             overlap_refused: Vec::new(),
             waiting_singles: FastMap::default(),
             single_rows: FastMap::default(),
+            read_holds: FastMap::default(),
             next_share_wait: 0,
             reader_fences: Vec::new(),
             overlap_released: Vec::new(),
@@ -3959,6 +4034,7 @@ impl ShardState {
             continuations: Continuations::default(),
             creation_wake: false,
             aborted: HashSet::new(),
+            range_drops: HashMap::new(),
             awaiting: BTreeMap::new(),
             f_waiters: BTreeMap::new(),
             ckpt_vis_wait: None,
@@ -5574,7 +5650,7 @@ impl ShardState {
                     let state = TimerState::new();
                     self.flush_retry = Some(Arc::clone(&state));
                     ctx.spawn(Box::new(ClockTimer::new(
-                        &self.shared.vfs,
+                        &self.shared.clock_vfs,
                         ctx.now_nanos().saturating_add(backoff_nanos(
                             self.shared.flush_backoff_nanos,
                             FLUSH_BACKOFF_CAP,
@@ -5824,7 +5900,7 @@ impl ShardState {
         let state = TimerState::new();
         self.feed_sync_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             ctx.now_nanos().saturating_add(feed.sync_interval_nanos),
             state,
             ctx.submitter(self.id).clone(),
@@ -5905,7 +5981,7 @@ impl ShardState {
         let state = TimerState::new();
         self.feed_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             ctx.now_nanos().saturating_add(feed.flush_interval_nanos),
             state,
             ctx.submitter(self.id).clone(),
@@ -6043,7 +6119,7 @@ impl ShardState {
     fn reserve_stamps(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let (first, t0) = self.shared.clock.reserve_group(
             n,
             k,
@@ -6139,7 +6215,7 @@ impl ShardState {
         if sources.is_empty() {
             return Ok(None);
         }
-        let mut opts = ResolveOptions::new(u64::MAX, self.shared.vfs.now_micros());
+        let mut opts = ResolveOptions::new(u64::MAX, self.shared.clock_vfs.now_micros());
         opts.ttl_micros = meta.options.ttl_micros;
         opts.versions = 1;
         opts.merge = meta.merge_op.clone();
@@ -6235,7 +6311,7 @@ impl ShardState {
         out: &CheckSlot,
     ) -> Result<bool> {
         let (family, qualifier) = predicate_column(predicate);
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let cell = self.read_before::<true>(table, family, row, qualifier, u64::MAX, now)?;
         let holds = match predicate {
             Predicate::Exists { .. } => cell.is_some(),
@@ -7363,7 +7439,7 @@ impl ShardState {
             self.stall.timer = Some(Arc::clone(&state));
             let due = self.stall.arm(now, rate);
             ctx.spawn(Box::new(ClockTimer::new(
-                &self.shared.vfs,
+                &self.shared.clock_vfs,
                 due,
                 state,
                 ctx.submitter(self.id).clone(),
@@ -7947,6 +8023,11 @@ impl ShardState {
                     && !share.tracked
                 {
                     share.tracked = true;
+                    #[cfg(feature = "test-hooks")]
+                    self.shared.metrics[usize::from(self.id.0)]
+                        .hooks
+                        .shares_tracked
+                        .fetch_add(1, Ordering::Relaxed);
                     share.commit_ts = floor;
                     share.reads = reads;
                     share.read_tablets = read_tablets;
@@ -8120,6 +8201,9 @@ impl ShardState {
                         kind: match &m.kind {
                             MemberKind::Single => AppendedKind::Batch,
                             MemberKind::Prepare { .. } => AppendedKind::Prepare,
+                            MemberKind::CommitRecord {
+                                range_drop: true, ..
+                            } => AppendedKind::RangeDrop,
                             MemberKind::CommitRecord {
                                 external_abort: true,
                                 ..
@@ -8335,6 +8419,28 @@ impl ShardState {
                         let kind = LoggedKind::Prepare { slots };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                         self.log_cross_record(m.seqno);
+                    }
+                }
+                // D331: a Range Drop is never needed past a checkpoint (perf2's condition 3).
+                // Once its drop's manifest commit is durable, the fresh tablet is flushed
+                // through its seqno, so replay needs nothing from it. Before that commit, a
+                // checkpoint past it loses nothing: the range's writes are all below it and
+                // still in place (the drop removed none of them yet), and the drop's caller
+                // runs it again, with a record of its own. Nor is its seqno handed out
+                // again: every manifest commit, the checkpoint's own, stores a
+                // `seqno_ceiling` from the allocator, which reserved it before.
+                MemberKind::CommitRecord {
+                    participants,
+                    range_drop: true,
+                    ..
+                } => {
+                    if let Some(t) = m.ticket {
+                        let kind = LoggedKind::Commit {
+                            holders: Arc::clone(participants),
+                            apply: None,
+                            replayed: false,
+                        };
+                        self.log_record(t.end, m.seqno, 0, kind);
                     }
                 }
                 MemberKind::CommitRecord {
@@ -9387,6 +9493,78 @@ impl ShardState {
         self.share_seqnos.get(&id).map_or(id, |s| s.0)
     }
 
+    /// [`ShardMsg::HoldReads`] (ICR 0140 amendment 1): validates the reads this shard owns
+    /// against the snapshot, then holds them. Handled between groups: every member admitted
+    /// so far is in its memtable, so `conflicts` sees it (perf2's Q3 on the design).
+    /// `Conflict` for a write above the snapshot, a row an undecided share writes (its seqno
+    /// lands above the snapshot at its decision), or a row a waiting single writes (it is
+    /// admitted later without checking holds, D267). `Busy` for a read whose tablet moved
+    /// here or is being changed: the caller tries again.
+    #[cold]
+    #[inline(never)]
+    fn on_hold_reads(&mut self, req: HoldReadsReq) {
+        let HoldReadsReq {
+            token,
+            validate,
+            reads,
+            tablets: routed,
+            reply,
+        } = req;
+        if self.closing || self.poisoned {
+            reply.notify(Err(Error::Closed));
+            return;
+        }
+        let mut rows = Vec::with_capacity(reads.len());
+        let mut tablets = Vec::with_capacity(reads.len());
+        for (r, routed) in reads.iter().zip(routed) {
+            // `None`: a table created since this shard's map (the engine routed it here with
+            // its newer view), on which no tablet change can be running yet: the engine's
+            // tablet is kept, so a later change of it gives up for the hold.
+            match self.tablets.route(r.table, &r.row) {
+                None => tablets.push(routed),
+                Some((tablet, shard)) if shard == self.id && !self.moving.contains(&tablet) => {
+                    tablets.push(tablet);
+                }
+                Some(_) => {
+                    reply.notify(Err(Error::Busy));
+                    return;
+                }
+            }
+            let h = hash_row(r.table, &r.row);
+            let single_writes = self.single_rows.get(&h).is_some_and(|ids| {
+                ids.iter().any(|id| {
+                    self.waiting_singles
+                        .get(id)
+                        .is_some_and(|w| w.writes.binary_search(&h).is_ok())
+                })
+            });
+            if self.pending_rows.contains_key(&h) || single_writes {
+                reply.notify(Err(Error::Conflict));
+                return;
+            }
+            match self.conflicts(validate.seqno, r) {
+                Ok(false) => {}
+                Ok(true) => {
+                    reply.notify(Err(Error::Conflict));
+                    return;
+                }
+                Err(e) => {
+                    reply.notify(Err(e));
+                    return;
+                }
+            }
+            rows.push(h);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        tablets.sort_unstable();
+        tablets.dedup();
+        self.track_share_reads(&rows, true);
+        self.read_holds
+            .insert(token, ReadHoldHere { rows, tablets });
+        reply.notify(Ok(()));
+    }
+
     /// The tablets of this shard `reads` route to, sorted and deduplicated (#2050).
     fn read_tablets<'r>(&self, reads: impl Iterator<Item = (TableId, &'r [u8])>) -> Vec<TabletId> {
         let mut tablets: Vec<TabletId> = reads
@@ -9454,17 +9632,24 @@ impl ShardState {
         if let Some((table, row, _)) = m.predicate.as_deref() {
             reads.push(hash_row(*table, row));
         }
-        self.prepared
+        // A read hold (ICR 0140 amendment 1) is refused over as a share in doubt is, for a
+        // write to a row it holds (perf2's T1 on the 2a design: waiting instead would admit
+        // the write later with `waited`, past the hold).
+        self.read_holds
             .values()
-            .filter(|p| p.external.is_some() && p.tracked)
-            .any(|p| {
-                writes.iter().any(|w| p.reads.contains(w))
-                    || p.bytes
-                        .batch()
-                        .iter()
-                        .flatten()
-                        .any(|mu| reads.contains(&hash_row(mu.table, mu.row)))
-            })
+            .any(|h| writes.iter().any(|w| h.rows.binary_search(w).is_ok()))
+            || self
+                .prepared
+                .values()
+                .filter(|p| p.external.is_some() && p.tracked)
+                .any(|p| {
+                    writes.iter().any(|w| p.reads.contains(w))
+                        || p.bytes
+                            .batch()
+                            .iter()
+                            .flatten()
+                            .any(|mu| reads.contains(&hash_row(mu.table, mu.row)))
+                })
     }
 
     fn overlaps_undecided(&self, m: &Member) -> bool {
@@ -9607,9 +9792,18 @@ impl ShardState {
                 }
             }
             MemberKind::CommitRecord {
+                range_drop: true, ..
+            } => {
+                // The engine releases the seqno once every stream has written it.
+                if let Some(reply) = self.range_drops.remove(&m.seqno) {
+                    reply.notify(result.map(|_| ()));
+                }
+            }
+            MemberKind::CommitRecord {
                 participants,
                 apply_seqno,
                 external_abort: true,
+                ..
             } => self.settle_external_abort(
                 m.seqno,
                 apply_seqno,
@@ -9621,6 +9815,7 @@ impl ShardState {
                 participants,
                 apply_seqno,
                 external_abort: false,
+                ..
             } => {
                 // D286: a Buffered commit's `Decide`s went out at its decision.
                 if self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent) {
@@ -9977,7 +10172,7 @@ impl ShardState {
     /// seqno from readers until the last participant applied (D278), or the coordinator
     /// releases it after an abort (`on_applied`).
     fn decide_commit(&mut self) -> (Seqno, Timestamp) {
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, &self.shared.shm);
         self.note_stamped(commit_ts);
         (apply_seqno, commit_ts)
@@ -10195,11 +10390,56 @@ impl ShardState {
                 participants: shards.into(),
                 apply_seqno: abort_seqno,
                 external_abort: true,
+                range_drop: false,
             },
             durability,
             seqno: id,
             commit_ts,
             bytes: Bytes::Streams(body),
+            reply: Reply::None,
+            submitted_at: 0,
+            validate: None,
+            predicate: None,
+            ticket: None,
+            failed: None,
+            reserved: 0,
+            map_version: 0,
+            retry: None,
+            room_since: 0,
+            decoded: 0,
+            share_wait: 0,
+            rank: 0,
+            voted: false,
+        });
+        let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+    }
+
+    /// Queues a Range Drop's record (D331) at `seqno`, synced; `reply` hears once it's
+    /// written. Nothing applies at the seqno: the engine holds it from readers and releases
+    /// it once every stream has the record.
+    fn log_range_drop(
+        &mut self,
+        seqno: Seqno,
+        range: Vec<u8>,
+        reply: Notifier<Result<()>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        if self.closing {
+            reply.notify(Err(Error::Closed));
+            return;
+        }
+        self.range_drops.insert(seqno, reply);
+        self.pending.push(Member {
+            kind: MemberKind::CommitRecord {
+                participants: vec![self.id].into(),
+                apply_seqno: seqno,
+                external_abort: false,
+                range_drop: true,
+            },
+            durability: Durability::Sync,
+            seqno,
+            commit_ts: 0,
+            bytes: Bytes::Streams(range),
             reply: Reply::None,
             submitted_at: 0,
             validate: None,
@@ -10330,6 +10570,7 @@ impl ShardState {
                 participants: holders,
                 apply_seqno,
                 external_abort: false,
+                range_drop: false,
             },
             durability,
             seqno,
@@ -10962,9 +11203,14 @@ impl ShardState {
                 let Some((at, holders, replayed)) = self.share_seqnos.get(&l.seqno) else {
                     return true;
                 };
+                // A share with nothing to flush (a reads-only external one, ICR 0140
+                // amendment 1) has no slot to keep it: this shard's own flushed-through stands
+                // in, as for a replayed one. Its apply seqno is held until the COMMIT is
+                // written (D266), so a sole participant's own PREPARE stays until then
+                // (asserted where the COMMIT is logged).
                 unflushed(slots, *at)
                     || self.peers_behind(holders, *at).next().is_some()
-                    || (*replayed && self.own_behind(*at))
+                    || ((*replayed || slots.is_empty()) && self.own_behind(*at))
             }
             // Never the record that decides a live commit: its own PREPARE precedes it and
             // waits on the same holders (asserted where the COMMIT is logged). A replayed one
@@ -11264,7 +11510,7 @@ impl ShardState {
         let state = TimerState::new();
         self.checkpoint_timer = Some(Arc::clone(&state));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             ctx.now_nanos().saturating_add(backoff_nanos(
                 self.shared.compaction_backoff_nanos,
                 COMPACTION_BACKOFF_CAP,
@@ -11326,10 +11572,12 @@ impl ShardState {
         let Some(feed) = &self.shared.feed else {
             return;
         };
+        // A retention hold past its cap lapses first (D331), so this pass trims again.
+        feed.enforce_retention_caps();
         if let Some(wal) = self.wal.as_mut()
             && !self.poisoned
         {
-            wal.trim_retained(self.shared.vfs.now_micros(), feed.age_micros);
+            wal.trim_retained(self.shared.clock_vfs.now_micros(), feed.age_micros);
         }
         let stream = usize::from(self.id.0);
         if let Some(marks) = feed.marks(stream) {
@@ -11347,7 +11595,7 @@ impl ShardState {
         }
         self.feed_maintain();
         let view = self.shared.view.load_full();
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         // The write stall's score: the highest L0 depth over its trigger among the slots.
         let mut score = 0.0f64;
         // Slots that need a compaction, most urgent first.
@@ -11652,7 +11900,7 @@ impl ShardState {
         let state = TimerState::new();
         self.backoff_timer = Some((Arc::clone(&state), deadline));
         ctx.spawn(Box::new(ClockTimer::new(
-            &self.shared.vfs,
+            &self.shared.clock_vfs,
             deadline,
             state,
             ctx.submitter(self.id).clone(),
@@ -11760,7 +12008,7 @@ impl ShardState {
             })
         });
         let mem_min_ts = mem_min_ts.min(self.prepared_min_ts(key.1));
-        let now = self.shared.vfs.now_micros();
+        let now = self.shared.clock_vfs.now_micros();
         let mut gc = compact::gc_policy(
             &self.shared,
             fam,
@@ -12517,6 +12765,21 @@ impl ShardState {
                     self.on_external_decide(id, commit, reply, ctx);
                 }
             }
+            ShardMsg::HoldReads(req) => self.on_hold_reads(*req),
+            ShardMsg::ReleaseReads(b) => {
+                let (token, reply) = *b;
+                let held = self.read_holds.remove(&token);
+                if let Some(h) = &held {
+                    self.track_share_reads(&h.rows, false);
+                    // A commit refused over a row the hold also read may now go.
+                    if !self.overlap_refused.is_empty() {
+                        self.release_overlaps_cleared(ctx);
+                    }
+                }
+                if let Some(reply) = reply {
+                    reply.notify(held.is_some());
+                }
+            }
             ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
             ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),
@@ -12656,6 +12919,11 @@ impl ShardState {
                     self.poison(crate::health::FailureCause::Internal);
                 }
             }
+            ShardMsg::RangeDrop {
+                seqno,
+                range,
+                reply,
+            } => self.log_range_drop(seqno, range, reply, ctx),
             ShardMsg::Start => {
                 self.replaying = false;
                 // After replay: a shard with nothing to flush never publishes otherwise.

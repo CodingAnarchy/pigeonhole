@@ -1,0 +1,2 @@
+### Added
+- **`phdb cluster move` records itself in the cluster map while it runs** (D332, #1485). `phdb cluster status` shows a move in progress and its step, so one stopped by a crash is seen, and a rerun finishes it. `phdb cluster move P --abort` ends one before the map gives the partition to its new node, moving the copy there aside. A failover of the partition mid-move ends the move in the same map. New field: `RangeMove.from_epoch`.

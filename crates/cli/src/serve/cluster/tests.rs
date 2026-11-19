@@ -51,8 +51,13 @@ fn node_with(dir: &Path, id: &str, tokens: &str) -> Arc<Node> {
             ca: None,
             push_timeout: Duration::from_millis(500),
             lease: TEST_LEASE,
+            failover_after: TEST_LEASE * 2,
+            failover_max_lag: None,
+            balance_window: Duration::from_secs(300),
+            load_interval: Duration::from_millis(500),
         },
         state,
+        super::read_voted(dir).unwrap(),
     )
 }
 
@@ -118,6 +123,8 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
                 epoch: 1,
                 memory_bytes: 0,
                 replicas: Vec::new(),
+                failover: 0,
+                failover_count: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -128,6 +135,12 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             partitions: vec!["p1".into(), "p2".into()],
             created: 0,
         }],
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
+        moves: Vec::new(),
     }
 }
 
@@ -594,6 +607,33 @@ fn a_node_that_missed_a_drop_and_a_recreate_still_catches_up() {
     let mut other = the_map(4, &ports);
     other.cluster_id = "c2".into();
     assert!(n.push_map(other, Some("b")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// D330 amendment 1's M1, the term fence: a node that voted for a term refuses any map below
+/// it, though its own map is still older (the elected map hasn't reached it yet) and the
+/// pushed map is newer by version. The vote is in `cluster-writer-term`, so a restart keeps
+/// the fence.
+#[test]
+fn a_node_that_voted_for_a_term_refuses_a_lower_terms_map_across_a_restart() {
+    let dir = test_dir();
+    let ports = [7001, 7002, 7003];
+    let n = node(&dir, "b");
+    n.push_map(the_map(1, &ports), None).unwrap();
+    super::write_synced(&dir, super::WRITER_TERM_FILE, b"1\n").unwrap();
+    drop(n);
+    let n = node(&dir, "b");
+    let e = n.push_map(the_map(5, &ports), Some("a")).unwrap_err();
+    assert!(
+        e.message.contains("voted for term 1"),
+        "the old writer's late push: {}",
+        e.message
+    );
+    assert_eq!(n.get_map().unwrap().map_version, 1);
+    let mut elected = the_map(2, &ports);
+    elected.writer = "c".into();
+    elected.writer_term = 1;
+    assert_eq!(n.push_map(elected, Some("c")).unwrap().map_version, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1236,12 +1276,21 @@ fn data_node_served(
             replica_run: 256,
         },
     );
-    // A restart with a map: the node takes its peers' newer maps, as `run` has it.
-    let start = if restart {
+    // A restart with a map: the node takes its peers' newer maps, as `run` has it. D329's
+    // resolver starts once it serves, as `run` starts it.
+    let sync = if restart {
         super::start_sync(&node, node.get_map().map_or(0, |m| m.map_version))
     } else {
         None
     };
+    let resolver =
+        super::spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        if let Some(sync) = sync {
+            sync();
+        }
+        resolver();
+    }));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let app = crate::serve::http::router(shared);
     rt.spawn(async move {
@@ -1678,6 +1727,7 @@ fn a_seeded_workload_through_random_entry_nodes_answers_as_one_database_does() {
                     .begin(super::proto::BeginRequest {
                         durability: 0,
                         route: route_row(&home),
+                        spans_partitions: false,
                     })
                     .await
                     .unwrap_or_else(|e| panic!("{at}: begin at {home}: {e}"))
@@ -1943,6 +1993,9 @@ fn a_partition_takes_every_option_a_single_node_does() {
         "cluster-ca",
         "cluster-push-timeout-ms",
         "cluster-lease-ms",
+        "cluster-failover-after-ms",
+        "cluster-failover-max-lag-ms",
+        "balance-window",
         "tls-key",
         "tls-cert",
     ];
@@ -2007,6 +2060,8 @@ fn a_partition_takes_every_option_a_single_node_does() {
                 "/tmp/phdb-1775",
                 "http://127.0.0.1:1",
                 "127.0.0.1:1",
+                // A duration flag's (D329's `--txn-*`): a number and a unit.
+                "30s",
             ]
             .map(str::to_owned)
             .to_vec()
@@ -2087,6 +2142,11 @@ struct Three {
 
 impl Three {
     fn start(tokens: [&str; 3]) -> Self {
+        Self::start_limits(tokens, crate::serve::server_tests::limits())
+    }
+
+    /// [`Three::start`] under `limits` (each node's).
+    fn start_limits(tokens: [&str; 3], limits: crate::serve::config::Limits) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -2107,7 +2167,7 @@ impl Three {
         {
             let dir = test_dir();
             super::write_map(&dir, &super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_tokens(&rt, &dir, id, local, l, tokens);
+            let (stop, db) = data_node_limits(&rt, &dir, id, local, l, tokens, limits);
             stops.push(stop);
             dbs.extend(db);
         }
@@ -2118,6 +2178,27 @@ impl Three {
             dbs,
         }
     }
+}
+
+#[test]
+fn a_cut_off_entry_cuts_only_its_own_clusters_dials() {
+    // #2095: a test that ends or panics with a node still cut leaves its entry; a later
+    // test's node that binds the same port mustn't be cut by it. The address matches only a
+    // dial from the cut node's own cluster; the node itself is cut whatever it dials.
+    let (mine, peer, other) = (test_dir(), test_dir(), test_dir());
+    let at = "127.0.0.1:1";
+    super::cut_node(&mine, at, &[mine.clone(), peer.clone()], true);
+    assert!(
+        super::cut_off(&mine, "127.0.0.1:2"),
+        "the cut node's own dials"
+    );
+    assert!(super::cut_off(&peer, at), "its peer's dial of it");
+    assert!(
+        !super::cut_off(&other, at),
+        "another cluster's dial of the same address"
+    );
+    super::cut_node(&mine, at, &[mine.clone(), peer.clone()], false);
+    assert!(!super::cut_off(&peer, at), "joined again");
 }
 
 impl Drop for Three {
@@ -2174,6 +2255,7 @@ async fn begin(port: u16, row: &str, token: Option<&str>) -> Result<String, toni
     let r = super::proto::BeginRequest {
         durability: 0,
         route: route_row(row),
+        spans_partitions: false,
     };
     Ok(txns(port)
         .await
@@ -2230,6 +2312,55 @@ async fn get_at(port: u16, row: &str, snapshot: &str) -> Result<Option<Vec<u8>>,
         })
         .await?;
     Ok(reply.into_inner().cell.map(|c| c.value.to_vec()))
+}
+
+#[test]
+fn status_reports_each_partitions_load_and_a_read_only_partitions_sampled_cpu() {
+    // D332 (simp724's S5 and M1 on #2063): Status fills `load_*`. Writes to p1 count as its
+    // shards' busy time; ReadRows of p2, which never run on a shard, count from their
+    // sampled CPU on the read pools, where their work runs.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (_stops, ports, _dbs) = three_nodes(&rt);
+    let (a, b) = (ports[0], ports[1]);
+    let row_of = async |port: u16, p: &str| {
+        client(port)
+            .await
+            .status(StatusRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|lp| lp.id == p)
+            .unwrap()
+    };
+    rt.block_on(async {
+        put(a, "hank", "v").await;
+        // The first reading of each partition's interval.
+        assert_eq!(row_of(a, "p1").await.load, 0.0);
+        assert_eq!(row_of(b, "p2").await.load, 0.0);
+        for i in 0..300 {
+            put(a, &format!("a{i:03}"), "v").await;
+        }
+        let mut c = data(b).await;
+        for _ in 0..(16 * 100) {
+            c.read_row(super::proto::ReadRowRequest {
+                table: "users".into(),
+                row: b"hank".to_vec().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        eventually("p1's and p2's loads", async || {
+            let (p1, p2) = (row_of(a, "p1").await, row_of(b, "p2").await);
+            p1.load_cpu > 0.0
+                && p2.load_cpu > 0.0
+                && p1.load == p1.load_cpu.max(p1.load_device)
+                && p2.load == p2.load_cpu.max(p2.load_device)
+        })
+        .await;
+    });
 }
 
 async fn put(port: u16, row: &str, value: &str) {
@@ -3528,16 +3659,14 @@ impl QualifierVectors {
         }
     }
 
-    /// Cuts node `i` off from its peers both ways, or joins it again (`CUT_OFF`).
+    /// Cuts node `i` off from its peers both ways, or joins it again (`cut_node`).
     fn cut(&self, i: usize, off: bool) {
-        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
-        let mut cut = super::CUT_OFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cut.retain(|e| *e != entry);
-        if off {
-            cut.push(entry);
-        }
+        super::cut_node(
+            &self.dirs[i],
+            &format!("127.0.0.1:{}", self.ports[i]),
+            &self.dirs,
+            off,
+        );
     }
 
     /// The oracle's ranking of [`Self::QUERY`]'s `k` nearest under `select`.
@@ -4123,6 +4252,8 @@ fn split_nodes(
                 epoch: 1,
                 memory_bytes: 0,
                 replicas: Vec::new(),
+                failover: 0,
+                failover_count: 0,
             })
             .collect(),
         tables: vec![TablePlacement {
@@ -4133,6 +4264,12 @@ fn split_nodes(
             partitions: (0..n).map(|i| format!("q{i}")).collect(),
             created: 0,
         }],
+        writer: String::new(),
+        writer_term: 0,
+        failover: false,
+        failover_rejoin: false,
+        failovers: Vec::new(),
+        moves: Vec::new(),
     };
     let mut stops = Vec::new();
     let mut dbs = Vec::new();
@@ -4903,8 +5040,10 @@ mod memory;
 mod metrics;
 mod moving;
 mod open;
+mod range_moves;
 mod replicas;
 mod restore;
 mod several;
+mod spanning;
 mod stamp;
 mod upload;

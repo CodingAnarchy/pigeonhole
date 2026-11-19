@@ -563,7 +563,7 @@ pub(crate) struct CompactionWork {
 /// holds. A base it can't read is not folded: the run stays apart and the read that needs it
 /// reports the error.
 #[derive(Debug)]
-struct BaseBlobs(Arc<SstSet>);
+pub(crate) struct BaseBlobs(pub(crate) Arc<SstSet>);
 
 impl pigeonhole_compaction::BlobFetch for BaseBlobs {
     fn fetch(&self, ptr: &pigeonhole_format::value::BlobPointer) -> Option<pigeonhole_cache::Cell> {
@@ -585,7 +585,7 @@ impl CompactionWork {
         gc: GcPolicy,
         record: Option<CompactionRecord>,
     ) -> Result<Self> {
-        let started = shared.vfs.monotonic_nanos();
+        let started = shared.clock_vfs.monotonic_nanos();
         let job = if matches!(task.kind, TaskKind::Rewrite | TaskKind::BlobGc { .. }) {
             let priority = SstSet::priority(meta.options.cache_priority);
             let mut inputs: Vec<Arc<SstReader>> = Vec::new();

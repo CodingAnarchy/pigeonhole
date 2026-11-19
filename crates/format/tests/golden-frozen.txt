@@ -42,3 +42,8 @@ feed_sidecar_catalog_names.bin 177 af37dfee06a53778
 feed_sidecar_root_intent.bin 90 9d73f00dfdccabea
 wal_record_external_abort.bin 46 a389aad3e481b627
 wal_record_external_prepare.bin 210 31b8d294d753b5c7
+wal_record_batch_silent.bin 145 cfb66488584da834
+wal_record_external_prepare_silent.bin 210 10cba2f871f5092a
+wal_record_prepare_silent.bin 149 4d2fbf7e12d7f023
+wal_record_range_drop.bin 19 72a1444df8102779
+wal_record_range_drop_to_end.bin 15 5282810a17c9f58d

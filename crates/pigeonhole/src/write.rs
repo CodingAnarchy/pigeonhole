@@ -1461,6 +1461,20 @@ impl WriteBatch {
         }
     }
 
+    /// Marks the batch feed-silent (D331, ICR 0141): committed, durable and replicated as
+    /// any batch, but never delivered to a change-feed subscription. A range move's copy and
+    /// its source's cleanup write so: the range's history isn't new on either partition. The
+    /// first silent commit sets the file's `incompat` bit 3, which builds before D331 refuse
+    /// to open. Refused on a replica, which takes its primary's silent commits only through
+    /// [`Pigeonhole::apply_replicated`](crate::Pigeonhole::apply_replicated), silent there too
+    /// (cli692's N2 on #2055). Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn mark_feed_silent(&mut self) -> &mut Self {
+        self.builder.batch.mark_feed_silent();
+        self
+    }
+
     /// Adds one mutation of `row` in `table`'s `family` (`qualifier` and `value` only size
     /// errors).
     fn op(
@@ -2220,6 +2234,25 @@ pub struct Transaction {
     failed_read: Option<Error>,
 }
 
+/// A read-only transaction's reads, held in memory ([`Transaction::hold_reads`], D329,
+/// ICR 0140 amendment 1). Dropping it releases the hold. Hidden, as `hold_reads`.
+#[cfg(feature = "__unstable-txn-prepare")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ReadHold(pigeonhole_engine::ReadHold);
+
+#[cfg(feature = "__unstable-txn-prepare")]
+impl ReadHold {
+    /// Ends the hold: `true` if it was in place until now, `false` if it was lost to a close
+    /// or a recovery (the transaction's reads are then no longer known to be current).
+    /// `false` only ever means lost. It waits for the answer, so on a thread that drives a
+    /// shard (application-owned mode) it's refused (`InvalidArgument`), and the hold is
+    /// released as it's dropped, with no answer.
+    pub fn release(self) -> Result<bool> {
+        self.0.release().map_err(Error::from)
+    }
+}
+
 impl Transaction {
     pub(crate) fn new(db: Arc<Db>, txn: Txn, generation: u64) -> Self {
         Self {
@@ -2337,6 +2370,35 @@ impl Transaction {
             .prepare(xid, durability.engine())
             .map(CommitInfo::from_engine)
             .map_err(|e| commit_error(e, largest, max))
+    }
+
+    /// Tags the transaction's commit with `xid` (D329 2b, ICR 0140 amendment 2): its records
+    /// carry it, and its change-feed events deliver it ([`feed::Commit::xid`]), so a
+    /// subscriber can group a spanning commit's shares. 1–255 bytes, checked at commit.
+    /// Hidden: not part of the API, outside the semver promise.
+    ///
+    /// [`feed::Commit::xid`]: crate::feed::Commit::xid
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) {
+        self.txn.tag_xid(xid);
+    }
+
+    /// Validates the transaction's reads and holds them in memory (D329, ICR 0140
+    /// amendment 1): a read-only transaction's part of a commit across partitions. Nothing
+    /// is logged, and nothing is ever in doubt. While the [`ReadHold`] lives, a write to a
+    /// held row is refused at once (`Conflict` for a transaction, `Busy` otherwise).
+    /// `InvalidArgument` for a transaction with writes or without reads, `Conflict` if a
+    /// read changed since the snapshot, `Busy` past the in-doubt limit. Hidden: not part of
+    /// the API, outside the semver promise.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn hold_reads(self) -> Result<ReadHold> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        self.db.check_generation(self.generation)?;
+        self.txn.hold_reads().map(ReadHold).map_err(Error::from)
     }
 
     /// The sequence number of the snapshot the transaction reads at (ICR 0118): every read

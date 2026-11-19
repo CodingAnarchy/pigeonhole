@@ -32,6 +32,11 @@ service Cluster {
   // This node: its id, its map version and the partitions in its directory. Read, admin or
   // cluster scope.
   rpc Status(StatusRequest) returns (NodeStatus);
+  // `phdb cluster txn decide` (D329): decides a share held in doubt on this node's partition,
+  // for a transaction whose home will never answer. Admin or cluster scope. It can break the
+  // transaction's atomicity, so without `force` it's refused while the home answers. Answers
+  // the partition's status line.
+  rpc DecideTxn(DecideTxnRequest) returns (LocalPartition);
   // Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
   // the caller it names, whose scope and namespaces this node checks again. This node
   // serves it only if its own map gives it the key; otherwise `WrongPartition` with its
@@ -68,27 +73,31 @@ service Cluster {
   // (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
   // unfenced, or at its new node); its reads go on. Answers once every write admitted before
   // the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-  // Admin scope.
+  // Admin scope, or a node's cluster token (the map's writer running a move: D332, D331
+  // PR 5).
   rpc Fence(PartitionRequest) returns (LocalPartition);
   // Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
   // unless this node's map names it as the partition's node at the epoch in its file.
-  // Admin scope.
+  // Admin scope, or a node's cluster token (the map's writer undoing its own move's fence:
+  // D332, D331 PR 5).
   rpc Unfence(PartitionRequest) returns (LocalPartition);
   // D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
   // and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
   // `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-  // unless it's fenced. Admin scope.
+  // unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a
+  // move: D332, D331 PR 5).
   rpc Close(PartitionRequest) returns (LocalPartition);
   // Moves a partition's files left on this node, after it moved away, into
   // `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-  // node's map names it as the partition's node, or while it's open. Admin scope.
+  // node's map names it as the partition's node, or while it's open. Admin scope, or a
+  // node's cluster token (the map's writer running a move: D332, D331 PR 5).
   rpc DropPartition(PartitionRequest) returns (LocalPartition);
   // `phdb cluster relocate`'s first step, on the partition's new node: installs a complete
   // staged file set (`Admin.PartitionUpload`), if one is staged, then rewrites the file's
   // identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
   // rerun resumes. The reply's `files` is the set this call installed (none: empty).
   // `FailedPrecondition` while the partition is open here, or for a file of another
-  // cluster, partition or epoch. Admin scope.
+  // cluster, partition or epoch. Admin scope, or a node's cluster token.
   rpc Stamp(StampRequest) returns (LocalPartition);
   // Node to node (D326): a lease round's request for this node's grant of the partitions it
   // names, for `--cluster-lease-ms` on this node's clock from its receipt. This node grants
@@ -168,6 +177,11 @@ enum FenceReason {
   // The partition's lease ran out on this node (D326): its renewals stopped reaching a
   // majority of the map's nodes, so it stopped serving until a renewal does.
   FENCE_REASON_LEASE_LAPSED = 3;
+  // A range of the partition is being handed over to another partition (D331): writes
+  // touching it answer `Fenced` until the move's map gives it to the target, then
+  // `WrongPartition`. The partition's other keys take writes; this is reported only in
+  // `MoveStatus.fenced`, never as the partition's `fence_reason`. Retry-safe.
+  FENCE_REASON_RANGE_MOVING = 4;
 }
 
 // The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
@@ -194,6 +208,162 @@ message ClusterMap {
   // The agent memory store's placement (#1915, ICR 0139), if the cluster serves one: each
   // partition named holds a whole store for the namespaces in its range.
   MemoryPlacement memory = 8;
+  // D330: the map's writer, the one node that changes it, and the term it was elected at.
+  // Maps are ordered by `(writer_term, map_version)`: a node takes a map with a higher term
+  // whatever its version, and refuses one with a lower term. Term 0 (no node named): the
+  // writer is the node with the smallest id, as before D330, until the first election
+  // writes term 1. Set only once every node keeps them (`map_features`: `writer_terms`).
+  string writer = 9;
+  uint64 writer_term = 10;
+  // D330: automatic failover, off by default (the owner's Q1), turned on with `set-map`.
+  // Off: no node elects a new writer on its own; the writer changes only as before D330
+  // (an operator's `set-map --force`, which raises the term). Set only once every node
+  // keeps it (`map_features`: `writer_terms`). On: a writer whose lease lapses is replaced
+  // by election, and the writer fails a down partition over to its freshest replica (PR 2),
+  // unless the partition opts out (`Partition.failover`).
+  bool failover = 11;
+  // D330: reserved for an old owner rejoining as a replica on its own (the owner's Q4); a
+  // map setting it is refused in 1.3.0, where the operator rejoins it.
+  bool failover_rejoin = 12;
+  // D330: the failovers and writer elections this map records, oldest first: the last 16
+  // done or abandoned, and every promote still pending (one whose `to_epoch` is above its
+  // partition's epoch), which is never dropped. A writer's change keeps them; a `set-map`
+  // that drops or alters a pending one is refused.
+  repeated FailoverEvent failovers = 13;
+  // D331: the range moves in flight, each a table's key range going from one partition to
+  // another through `MovePhase`s. The map's writer advances them; every node derives its
+  // partitions' range gates from them. A partition is in at most one at a time, as source
+  // or target. Set only once every node keeps them (`map_features`: `range_moves`).
+  repeated RangeMove moves = 14;
+}
+
+// D331: one range move, `[start, end)` of `table` from partition `from` to partition `to`.
+message RangeMove {
+  // The move's id: 1-64 of `[a-z0-9_-]`, unique among `moves`.
+  string id = 1;
+  MoveKind kind = 2;
+  string table = 3;
+  // The range's first key; absent: the table's first key.
+  SplitKey start = 4;
+  // The key after the range; absent: to the table's end.
+  SplitKey end = 5;
+  // The source partition, S.
+  string from = 6;
+  // The target partition, T (for a split, the partition the split added).
+  string to = 7;
+  MovePhase phase = 8;
+  // S's seqno the copy was taken at, once T reported the copy done; 0 before.
+  uint64 snapshot_seqno = 9;
+  // S's visible seqno once its range fence drained (from HANDING_OVER): every write to the
+  // range S took is at or below it. 0 until S reports it.
+  uint64 final_seqno = 10;
+  // The `(writer_term, map_version)` of the map that gave the range to T, set in that map
+  // itself (from HANDED_OVER): a node holding it, or any map ordered after it, is past the
+  // move's commit point.
+  uint64 handed_over_version = 11;
+  uint64 handed_over_term = 12;
+  // The source partition's epoch when the move entered COPYING (D332 PR 2, #1485). A NODE
+  // move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
+  // promoted it mid-move). 0 on a record from before this field.
+  uint64 from_epoch = 13;
+}
+
+// D331: what a range move is for.
+enum MoveKind {
+  MOVE_KIND_UNSPECIFIED = 0;
+  // `phdb cluster move-range`: to an existing partition.
+  MOVE_KIND_RANGE = 1;
+  // `phdb cluster split`: to a partition the split added.
+  MOVE_KIND_PARTITION = 2;
+  // D332: a whole partition relocated to another node (no table or range; `to` names the
+  // node; `from_epoch` its epoch at COPYING). D332 PR 2: `phdb cluster move` records one.
+  MOVE_KIND_NODE = 3;
+  // PR 6 (merge) adds MOVE_KIND_MERGE = 4.
+}
+
+// D331: where a range move is. A move goes forward one phase per map; before HANDED_OVER it
+// may be removed (an abort), and from CLEANING it is removed once S's copy is gone.
+enum MovePhase {
+  MOVE_PHASE_UNSPECIFIED = 0;
+  // T copies the range from S's snapshots. S serves it; T answers it `PartitionUnavailable`.
+  MOVE_PHASE_COPYING = 1;
+  // T follows S's feed for the range.
+  MOVE_PHASE_CATCHING_UP = 2;
+  // S fences the range's writes (`Fenced`, RANGE_MOVING) and drains them; reads go on.
+  MOVE_PHASE_HANDING_OVER = 3;
+  // The commit point: the map gives the range to T and raises S's epoch. S answers the
+  // range `WrongPartition`; T still answers it `PartitionUnavailable` until CLEANING.
+  MOVE_PHASE_HANDED_OVER = 4;
+  // T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
+  // ended); S deletes its copy.
+  MOVE_PHASE_CLEANING = 5;
+  // PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
+  // the merged-away source waits for its transaction outcomes before it's dropped. The
+  // phases stay in order, so "from HANDED_OVER on" includes it.
+}
+
+// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
+message MoveStatus {
+  string id = 1;
+  string table = 2;
+  MovePhase phase = 3;
+  // This partition is the move's source (else its target).
+  bool source = 4;
+  // The source fences the range's writes.
+  bool fenced = 5;
+  // The partition serves the range here.
+  bool serving = 6;
+}
+
+// D330: one failover of a partition to a replica, or one writer election, as the writer
+// that made it recorded it in the map.
+message FailoverEvent {
+  FailoverKind kind = 1;
+  // PARTITION: the partition failed over; empty for WRITER.
+  string partition = 2;
+  // PARTITION: its owner before, and the replica's node it's promoted on. WRITER: the
+  // writer before, and the node elected.
+  string from = 3;
+  string to = 4;
+  // The writer's wall clock when it recorded the event, in ms since the Unix epoch: for
+  // operators, never compared.
+  uint64 at_ms = 5;
+  // The writer that recorded it, and its term then.
+  string writer = 6;
+  uint64 writer_term = 7;
+  // PARTITION: the primary seqno the promoted copy had applied through, and the owner's
+  // durable seqno as the copy last heard it. Their difference is the known part of what
+  // the failover lost; commits the owner acknowledged after the copy last heard from it
+  // may be lost too (D330 §4). `primary_seqno` 0: unknown (the copy's follower hadn't heard
+  // the owner's frontier since it last reconnected).
+  uint64 applied_seqno = 8;
+  uint64 primary_seqno = 9;
+  // PARTITION: the external transaction shares the old owner reported in doubt, as of its
+  // last lease renewal before it went down (at most 4 KiB of ids), and how many there were.
+  repeated string in_doubt_xids = 10;
+  uint64 in_doubt_count = 11;
+  // PARTITION: the epoch the promote stamps the copy at, above every earlier pending
+  // promote's of the partition, so a copy stamped by a promote that never finished is never
+  // taken for this history (simp724's S2 on the D330 PR 2 plan).
+  uint64 to_epoch = 12;
+  FailoverState state = 13;
+}
+
+enum FailoverKind {
+  FAILOVER_KIND_UNSPECIFIED = 0;
+  FAILOVER_KIND_PARTITION = 1;
+  FAILOVER_KIND_WRITER = 2;
+}
+
+enum FailoverState {
+  FAILOVER_STATE_UNSPECIFIED = 0;
+  // Recorded before the stamp: the map doesn't give the partition its new node yet.
+  FAILOVER_STATE_PENDING = 1;
+  // The map gives it its new node at `to_epoch` (every WRITER event is done).
+  FAILOVER_STATE_DONE = 2;
+  // A later promote of the partition took over: a copy stamped at this event's
+  // `to_epoch` is orphaned, never served.
+  FAILOVER_STATE_ABANDONED = 3;
 }
 
 message Node {
@@ -224,6 +394,19 @@ message Partition {
   // (which must be on) and serves reads that allow a bounded staleness; it never takes a
   // write or P's lease. A change to this alone is no move: P's epoch stays. (6 is unused.)
   repeated string replicas = 7;
+  // D330: whether the writer fails P over on its own while the map's `failover` is on.
+  // The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
+  FailoverMode failover = 8;
+  // D330: how many times P has failed over, ever: monotonic, unlike the map's last-16
+  // events (`pigeonhole_cluster_failovers_total`).
+  uint64 failover_count = 11;
+}
+
+enum FailoverMode {
+  FAILOVER_MODE_UNSPECIFIED = 0;
+  FAILOVER_MODE_INHERIT = 1;
+  FAILOVER_MODE_OFF = 2;
+  FAILOVER_MODE_ON = 3;
 }
 
 message TablePlacement {
@@ -354,6 +537,22 @@ message NodeStatus {
   //   refuses a request that needs one while a node holding a part of it doesn't report it.
   // Empty from older nodes.
   repeated string map_features = 7;
+  // D330: the map's writer as this node's map names it (the smallest id at term 0), and
+  // the highest writer term this node knows: its map's, or one it voted for. A map below it
+  // is refused here, so `phdb cluster set-map --force` sets a term above every node's.
+  string writer = 8;
+  uint64 writer_term = 9;
+  // On the writer: the time left on its writer lease, as its last lease round gave it. On
+  // another node: the time left on this node's grant of the writer lease to the writer. 0
+  // once it has run out (or this node never granted it).
+  uint64 writer_lease_remaining_ms = 10;
+  // D330, on the writer: each partition it finds down but doesn't fail over, and why
+  // ("failover off", "no fresh replica", "waiting: node X still grants its lease", ...).
+  map<string, string> failover_blocked = 12;
+  // D330: every partition lease this node grants that still runs: the partition, its
+  // holder, and the time left on this node's clock (not the writer lease). The writer asks
+  // before it fails a partition over: an owner some node still grants is alive.
+  repeated LeaseWithheld grants = 13;
 }
 
 // A partition file in the node's directory, as its identity row says.
@@ -403,6 +602,41 @@ message LocalPartition {
   uint64 replica_lag_ms = 19;
   // For a replica copy: where its follower is.
   ReplicaState replica_state = 20;
+  // D329: shares of transactions across partitions held here in doubt (prepared, their
+  // decision not yet known here), the oldest's xid and age, and the WAL bytes they keep.
+  uint32 in_doubt = 21;
+  string in_doubt_oldest_xid = 22;
+  uint64 in_doubt_oldest_age_ms = 23;
+  uint64 in_doubt_wal_bytes = 24;
+  // Each, with why it's still in doubt (its home unreachable, or its home's history changed).
+  repeated InDoubtShare in_doubt_shares = 25;
+  // D331: the range moves naming this partition, as source or target.
+  repeated MoveStatus moves = 27;
+  // D331: for a move's target, its range follower's lag behind the source, in milliseconds
+  // (0 when it has none).
+  uint64 move_follower_lag_ms = 28;
+  // D332: the partition's load on this node, for the cluster balancer, each an exponential
+  // average over `--balance-window` (each 30 s reading weighing `1 − e^(−30/window)`). 0 for a
+  // replica copy, and until the first interval ends.
+  // - `load_cpu`: its share of the node's cores, `(max(B, sync_busy) + sampled request CPU) ÷
+  //   cores`, B and sync_busy being its database's shard busy and group-sync fractions. The
+  //   sampled CPU includes its reads' work on the server's read pools. CPU outside the
+  //   partition's service calls (request decoding and encoding, framing, sockets) isn't
+  //   counted: compare partitions, not absolutes.
+  // - `load_device`: its device bytes per second (the engine's estimate at its files: reads
+  //   the OS page cache served count too) over this node's ceiling, the highest one-second
+  //   rate of the same counters summed over the node's partitions within the window.
+  // - `load`: the larger of the two.
+  double load_cpu = 29;
+  double load_device = 30;
+  double load = 31;
+}
+
+// A share held in doubt (D329).
+message InDoubtShare {
+  string xid = 1;
+  uint64 age_ms = 2;
+  string reason = 3;
 }
 
 // D328: how a node holds a partition.
@@ -525,6 +759,18 @@ message ForwardRequest {
     // 0139): the pool, or a hop of its graph expansion, and the hits' bodies.
     RecallPoolRequest recall_pool = 40;
     RecallBodiesRequest recall_bodies = 41;
+    // D329 (ICR 0140): a spanning transaction's home node, the coordinator, to a branch's
+    // partition owner (`partition` names it). `branch_begin` carries the client as `caller`;
+    // `branch_prepare` and `branch_decide` are the node's own, cluster scope only.
+    BranchBegin branch_begin = 45;
+    BranchPrepare branch_prepare = 46;
+    BranchDecide branch_decide = 47;
+    // A branch's node asks its transaction's home what was decided, for a share it holds in
+    // doubt (D329's resolver): the node's own call, cluster scope only.
+    ResolveTxn resolve_txn = 48;
+    // A client's `Transactions.Outcome` for a transaction whose home this node isn't
+    // (D329): the client's caller rides `caller`, write scope.
+    TxnOutcomeRequest txn_outcome = 52;
   }
 }
 
@@ -645,6 +891,63 @@ message ForwardedCaller {
 
 // A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 // call's own status.
+// Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
+// transaction's id (its xid), at that partition's snapshot now; with `renew`, renews the open
+// one instead, or answers `TransactionExpired` if it's gone (never reopening it).
+message BranchBegin {
+  string xid = 1;
+  bool renew = 2;
+}
+
+// Prepares a branch (D329): a writing transaction's durably (its reads and writes held until
+// `BranchDecide`), or with `read_only` a hold of its reads in memory, released by a
+// `BranchDecide` that names the hold.
+message BranchPrepare {
+  string xid = 1;
+  bool read_only = 2;
+}
+
+// Decides a prepared branch (D329): commit or abort, synced before the answer. With `hold`
+// (non-zero), the release of a read-only branch's hold instead, which answers only if the
+// hold lasted and the partition's lease term is still `term`; otherwise `Conflict`.
+message BranchDecide {
+  string xid = 1;
+  bool commit = 2;
+  uint64 hold = 3;
+  uint64 term = 4;
+}
+
+// `phdb cluster txn decide` (D329): an operator decides a share held in doubt on this node's
+// `partition`, for a home that will never answer. Without `force`, refused while the home
+// answers `ResolveTxn`.
+message DecideTxnRequest {
+  string partition = 1;
+  string xid = 2;
+  bool commit = 3;
+  bool force = 4;
+}
+
+// What a share in doubt asks its home (D329): the transaction's xid. With `acked` (the
+// branch's partition), the branch reports it has applied the commit its home answered, for
+// the decision record's GC; the answer is then the decision again.
+message ResolveTxn {
+  string xid = 1;
+  string acked = 2;
+}
+
+// The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
+// `UNKNOWN` leave it in doubt (`reason` says why).
+message TxnResolution {
+  TxnOutcomeState state = 1;
+  string reason = 2;
+}
+
+// A prepared branch (D329): for a read-only one, its hold and the lease term it was taken in.
+message BranchPrepared {
+  uint64 hold = 1;
+  uint64 term = 2;
+}
+
 message ForwardResponse {
   oneof reply {
     GetResponse get = 1;
@@ -680,6 +983,9 @@ message ForwardResponse {
     ForgetResponse forget = 22;
     RecallPoolResponse recall_pool = 23;
     RecallBodiesResponse recall_bodies = 24;
+    BranchPrepared branch_prepare = 25;
+    TxnResolution resolve_txn = 26;
+    TxnOutcomeResponse txn_outcome = 30;
   }
   // The seqno the serving node read at, in the owner's numbering (D328's
   // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the
@@ -700,6 +1006,11 @@ message ForwardSubscribeRequest {
   // Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
   // most 64 of them; 0: none.
   uint64 skip_through = 5;
+  // D331: start the component at this partition's hand-over position for the request's
+  // tables (the earliest of its serving rows' tokens), not `request`'s start: a cluster
+  // resume whose token lacks this partition because a range move gave it the tables since.
+  // `FeedExpired` if no move did, or its feed has trimmed past that position.
+  bool from_hand_over = 6;
 }
 
 // D326: a node's lease round asks each node of its map, itself included, for a grant.
@@ -726,12 +1037,30 @@ message LeaseRequest {
   // again, so the round order doesn't apply, and the request replaces the grant (a node
   // that starts holds no lease).
   uint64 start = 7;
+  // D330: the asking node's map's writer term. This node grants only at the same
+  // `(writer_term, map_version)`, and answers `newer_map_version` when its own sorts after
+  // the request's (simp724's S1 on the PR 1 plan). 0 from older nodes, as for a map at term 0.
+  uint64 writer_term = 8;
+  // D330 PR 2: an election's pre-vote. The request asks for the writer lease alone, as a
+  // vote does; the answer grants it only if this node would vote, and records nothing.
+  // A candidate asks for real votes only once a majority would, so a node that can't win
+  // never records a vote, whose term would fence the live writer's maps from it once it
+  // rejoins.
+  bool pre_vote = 9;
 }
 
 // A partition at an epoch.
 message LeasePart {
   string partition = 1;
   uint64 epoch = 2;
+  // D330: for the writer lease (`partition` "__writer"), the writer term asked for or
+  // granted; `epoch` is then 0. 0 for a partition.
+  uint64 term = 3;
+  // D330, from an owner: the external transaction shares it holds in doubt for this
+  // partition (at most 4 KiB of ids), and how many there are, so a writer that fails the
+  // partition over can name them. Empty in a grantor's answer.
+  repeated string in_doubt_xids = 4;
+  uint64 in_doubt_count = 5;
 }
 
 message LeaseResponse {
@@ -746,6 +1075,10 @@ message LeaseResponse {
   // This node is in its start grace and grants nothing until it ends: the time left. 0
   // otherwise.
   uint64 grace_remaining_ms = 4;
+  // D330: the grantor's highest writer term, its map's or one it voted for, on an answer
+  // to an election vote (a `__writer` part above its map's term). A candidate refused for a
+  // term at or below it asks again above it. 0 otherwise.
+  uint64 writer_term = 5;
 }
 
 // A partition this node won't grant yet, and why.

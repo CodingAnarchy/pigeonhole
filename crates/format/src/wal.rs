@@ -83,6 +83,92 @@ pub const INCOMPAT_WAL_PAD: u64 = 1 << 1;
 /// such records long after a checkpoint, for a feed resumed from before them.
 pub const INCOMPAT_EXTERNAL_PREPARE: u64 = 1 << 2;
 
+/// `incompat` bit 3 (D331, ICR 0141): the WAL may hold feed-silent batches, whose `count`
+/// has [`SILENT_BATCH`] set. A build without D331 would read the count as two billion
+/// mutations and report the record corrupt. Set in both superblock pages before the first
+/// silent batch is appended, and never cleared (retained feed segments can keep such
+/// records long after a checkpoint). A record decoder refuses the mark unless the bit is
+/// set ([`WalRecord::decode_with`]), so a stray bit is never read as a mark.
+pub const INCOMPAT_FEED_SILENT: u64 = 1 << 3;
+
+/// The bit of a batch's `count u32` that marks it feed-silent (D331, ICR 0141, FORMAT
+/// §10.3): logged and applied as usual, skipped by change-feed subscriptions, carried by
+/// replication. The mutation count is the low 31 bits.
+pub const SILENT_BATCH: u32 = 1 << 31;
+
+/// The bit of a batch's `count u32` that says the batch ends in an xid trailer (D329 2b,
+/// FORMAT §10.3): after the mutations, the xid's bytes and then its length (one byte,
+/// 1–255), so a reader finds it from the end. The transaction a spanning commit's share
+/// belongs to, which the change feed delivers with it. Written only by a database with
+/// `incompat` bit 2 ([`INCOMPAT_EXTERNAL_PREPARE`]); a build without it reads the count as
+/// over a billion mutations and reports the record corrupt.
+pub const XID_BATCH: u32 = 1 << 30;
+
+/// A batch count's flag bits ([`SILENT_BATCH`], [`XID_BATCH`]); the mutation count is the
+/// rest ([`COUNT_MASK`]). Every reader of a count masks through it.
+pub const COUNT_FLAGS: u32 = SILENT_BATCH | XID_BATCH;
+
+/// A batch count's mutation count bits: everything below the flags.
+pub const COUNT_MASK: u32 = !COUNT_FLAGS;
+
+/// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch, or a Range
+/// Drop, read without `incompat` bit 3 (D331): a reader that may have opened before the bit
+/// was set asks again on this one only.
+pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
+
+/// Whether a record's batch carries the [`SILENT_BATCH`] mark, read at its place in the
+/// record's bytes (FORMAT §10.3): a Batch's `count` ends at byte 21 (type, seqno and
+/// timestamp before it), a Prepare's at byte 25 (and the coordinator). An External Prepare's
+/// batch follows its variable-length share, so it's decoded (a rare record). A record too
+/// short to hold its count isn't marked here: decoding then reports it.
+#[inline(always)]
+fn marked(bytes: &[u8]) -> bool {
+    let top = |at: usize| bytes.get(at).is_some_and(|b| b & 0x80 != 0);
+    match bytes.first() {
+        Some(1) => top(20),
+        Some(2) => top(24),
+        Some(5) => external_marked(bytes),
+        // A Range Drop needs the bit too (D331), and is refused without it alike.
+        Some(7) => true,
+        _ => false,
+    }
+}
+
+/// The `Corrupt` reason [`WalRecord::decode_flags`] gives a batch with an xid trailer read
+/// without `incompat` bit 2 (D329 2b): a stray bit is never read as a trailer.
+pub const XID_WITHOUT_BIT: &str = "wal record: an xid-tagged batch without incompat bit 2";
+
+/// Whether a record's batch has [`XID_BATCH`] set, at the same fixed places as [`marked`]
+/// (the count's top byte, bit 6). An External Prepare's batch never may (its share names
+/// its xid), which decoding refuses. Out of line: only a reader that may meet a stray bit
+/// asks.
+#[cold]
+#[inline(never)]
+fn xid_marked(bytes: &[u8]) -> bool {
+    let bit = |at: usize| bytes.get(at).is_some_and(|b| b & 0x40 != 0);
+    match bytes.first() {
+        Some(1) => bit(20),
+        Some(2) => bit(24),
+        _ => false,
+    }
+}
+
+/// [`marked`] for an External Prepare: its share decoded, then its batch's mark.
+#[cold]
+#[inline(never)]
+fn external_marked(bytes: &[u8]) -> bool {
+    WalRecord::decode_any(bytes).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
+}
+
+/// [`SILENT_WITHOUT_BIT`]'s error, out of the decoder's way.
+#[cold]
+#[inline(never)]
+fn silent_without_bit() -> Error {
+    Error::Corrupt {
+        what: SILENT_WITHOUT_BIT,
+    }
+}
+
 /// The header in frame 0 of every segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
@@ -583,6 +669,8 @@ pub enum RecordType {
     ExternalPrepare = 5,
     /// An externally prepared transaction aborted, at a seqno of its own (D329).
     ExternalAbort = 6,
+    /// A table's key range dropped, at a seqno of its own (D331, `incompat` bit 3).
+    RangeDrop = 7,
 }
 
 /// A decoded WAL record, borrowing its batch bytes. Non-exhaustive: a later format may add
@@ -654,6 +742,102 @@ pub enum WalRecord<'a> {
         /// The xid and the participants (no read set, no mutations).
         share: ExternalShare<'a>,
     },
+    /// A table's key range dropped (D331, ICR 0141; `incompat` bit 3): every entry of the
+    /// range at or below `seqno` is gone, from the memtables and the SSTs alike, with no
+    /// delete markers, so a later write of the range at an older timestamp is visible. A
+    /// range move's source writes it at its cleanup, and its target at an abort. Written on
+    /// every stream at one seqno, which nothing else applies at; a replica runs the same drop
+    /// on its own tablets. Feed-silent.
+    RangeDrop {
+        /// The drop's seqno.
+        seqno: Seqno,
+        /// The table and the range.
+        range: DroppedRange<'a>,
+    },
+}
+
+/// A [`WalRecord::RangeDrop`]'s range (FORMAT §10.3): table `u32 LE`, the range's first
+/// row (varint-length bytes), then the end: `0` for the table's end, or `1` followed by
+/// the row after the range (varint-length bytes). Rows are at most [`MAX_KEY_PART`], and a
+/// bounded end is after the start. Kept as its body, read on access, so the record stays
+/// [`WalRecord`]'s size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedRange<'a> {
+    body: &'a [u8],
+}
+
+/// A [`DroppedRange`]'s fields: the table, the range's first row, and the row after it
+/// (`None`: the table's end).
+pub type RangeFields<'a> = (TableId, &'a [u8], Option<&'a [u8]>);
+
+impl<'a> DroppedRange<'a> {
+    /// Encodes a range into `out`. `InvalidArgument` for a row over [`MAX_KEY_PART`] or an
+    /// end at or before the start.
+    pub fn encode(
+        out: &mut Vec<u8>,
+        table: TableId,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> crate::Result<()> {
+        if start.len() > MAX_KEY_PART || end.is_some_and(|e| e.len() > MAX_KEY_PART) {
+            return Err(Error::KeyTooLarge);
+        }
+        if end.is_some_and(|e| e <= start) {
+            return Err(Error::InvalidArgument {
+                what: "a dropped range's end is after its start",
+            });
+        }
+        out.extend_from_slice(&table.0.to_le_bytes());
+        crate::varint::put_bytes(out, start);
+        match end {
+            None => out.push(0),
+            Some(e) => {
+                out.push(1);
+                crate::varint::put_bytes(out, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes and checks a body. Never panics. Out of line, so the record decoder around it
+    /// keeps its inlining (#2089's callgrind).
+    #[inline(never)]
+    pub fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
+        Self::parse(bytes)?;
+        Ok(Self { body: bytes })
+    }
+
+    fn parse(bytes: &'a [u8]) -> crate::Result<RangeFields<'a>> {
+        let corrupt = |what| Error::Corrupt { what };
+        let mut r = Reader::new(bytes, "wal range drop");
+        let table = TableId(r.u32()?);
+        let start = r.bytes()?;
+        let end = match r.u8()? {
+            0 => None,
+            1 => Some(r.bytes()?),
+            _ => return Err(corrupt("wal range drop end flag")),
+        };
+        if r.remaining() != 0 {
+            return Err(corrupt("wal range drop length"));
+        }
+        if start.len() > MAX_KEY_PART || end.is_some_and(|e| e.len() > MAX_KEY_PART) {
+            return Err(corrupt("wal range drop row length"));
+        }
+        if end.is_some_and(|e| e <= start) {
+            return Err(corrupt("wal range drop bounds"));
+        }
+        Ok((table, start, end))
+    }
+
+    /// The fields: table, first row, and the row after the range (`None`: the table's end).
+    pub fn fields(&self) -> RangeFields<'a> {
+        Self::parse(self.body).expect("checked when decoded")
+    }
+
+    /// The encoded body, re-encoded unchanged by [`WalRecord::split`].
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.body
+    }
 }
 
 /// An external share's encoded fields (D329, FORMAT §10.3): `xid` (varint-length bytes),
@@ -827,7 +1011,16 @@ impl<'a> ExternalShare<'a> {
         }
         let reads = &bytes[start..r.pos()];
         let batch = if with_batch {
-            Some(BatchRef::new(r.rest())?)
+            let b = BatchRef::new(r.rest())?;
+            // An External Prepare's batch never carries an xid trailer: its share names the
+            // xid (D329 2b; FORMAT §10.3). Refused here, on every read (feed1248's must on
+            // #2076: `xid_marked` doesn't look inside a share).
+            if b.xid().is_some() {
+                return Err(Error::Corrupt {
+                    what: "wal external prepare: an xid trailer on its batch",
+                });
+            }
+            Some(b)
         } else if r.remaining() != 0 {
             return Err(Error::Corrupt {
                 what: "wal external abort length",
@@ -931,6 +1124,11 @@ impl WalRecord<'_> {
                 head[9..17].copy_from_slice(&abort_seqno.to_le_bytes());
                 (17, share.as_bytes())
             }
+            WalRecord::RangeDrop { seqno, range } => {
+                head[0] = RecordType::RangeDrop as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                (9, range.as_bytes())
+            }
         };
         (&head[..len], body)
     }
@@ -948,7 +1146,99 @@ impl WalRecord<'_> {
     /// rec.encode(&mut bytes);
     /// assert_eq!(WalRecord::decode(&bytes).unwrap(), rec);
     /// ```
+    ///
+    /// A batch marked [`SILENT_BATCH`] is refused (`Corrupt`), as a build without D331 reads
+    /// it: use [`decode_with`](Self::decode_with) where the superblock has
+    /// [`INCOMPAT_FEED_SILENT`].
+    #[inline]
     pub fn decode(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
+        Self::decode_with(bytes, false)
+    }
+
+    /// As [`decode`](Self::decode), taking a batch's [`SILENT_BATCH`] mark when `silent_ok`
+    /// (the database's superblock has [`INCOMPAT_FEED_SILENT`], D331). Without it a marked
+    /// batch is `Corrupt`, so a stray bit is never read as the mark.
+    ///
+    /// The mark is found at its fixed place in the record's bytes before the record is
+    /// decoded, and the decoding itself is what it was before D331, so a record costs a byte
+    /// test more (#2055's feed shapes).
+    #[inline]
+    pub fn decode_with(bytes: &[u8], silent_ok: bool) -> crate::Result<WalRecord<'_>> {
+        if !silent_ok && marked(bytes) {
+            return Err(silent_without_bit());
+        }
+        let record = Self::decode_any(bytes);
+        // The mark's places in the bytes agree with the decoded batch (perf2's nit on #2055).
+        debug_assert!(
+            record
+                .as_ref()
+                .map_or(true, |r| matches!(r, WalRecord::RangeDrop { .. })
+                    || r.batch().is_some_and(|b| b.is_silent()) == marked(bytes)),
+            "a feed-silent mark at a place the decoder doesn't read"
+        );
+        record
+    }
+
+    /// [`decode_with`](Self::decode_with), refusing a batch's [`XID_BATCH`] trailer unless
+    /// `xid_ok` (the superblock has [`INCOMPAT_EXTERNAL_PREPARE`], D329 2b): a reader that
+    /// knows the database's bits passes both (recovery, the check tool), so a stray bit is
+    /// never read as a trailer. An External Prepare's batch refuses the bit whatever
+    /// `xid_ok` says.
+    #[inline]
+    pub fn decode_flags(
+        bytes: &[u8],
+        silent_ok: bool,
+        xid_ok: bool,
+    ) -> crate::Result<WalRecord<'_>> {
+        // Only a reader that knows the database lacks bit 2 asks: the feed's cursor, the
+        // hottest reader, goes straight to `decode_with` (#2076's feed shapes).
+        if !xid_ok && xid_marked(bytes) {
+            return Err(Error::Corrupt {
+                what: XID_WITHOUT_BIT,
+            });
+        }
+        Self::decode_with(bytes, silent_ok)
+    }
+
+    /// Whether the encoded record `bytes` carries a batch marked [`SILENT_BATCH`] (D331),
+    /// read at the mark's place without decoding the record: a reader that doesn't take
+    /// the mark yet tests it first, then decodes with [`decode_with`](Self::decode_with).
+    #[inline(always)]
+    pub fn is_marked(bytes: &[u8]) -> bool {
+        marked(bytes)
+    }
+
+    /// The batch a record carries, if any: a Batch's, a Prepare's, or an external PREPARE's.
+    pub fn batch(&self) -> Option<BatchRef<'_>> {
+        match self {
+            WalRecord::Batch { batch, .. } | WalRecord::Prepare { batch, .. } => Some(*batch),
+            WalRecord::ExternalPrepare { share, .. } => share.batch(),
+            WalRecord::Commit { .. }
+            | WalRecord::Decision { .. }
+            | WalRecord::ExternalAbort { .. }
+            | WalRecord::RangeDrop { .. } => None,
+        }
+    }
+
+    /// [`decode_any`](Self::decode_any)'s record of type `t`, `rest` the bytes after its
+    /// type byte: a Range Drop (D331), or an error.
+    #[cold]
+    #[inline(never)]
+    fn decode_other(t: u8, rest: &[u8]) -> crate::Result<WalRecord<'_>> {
+        if t != RecordType::RangeDrop as u8 {
+            return Err(Error::UnsupportedFeature {
+                what: "wal record type",
+                value: u64::from(t),
+            });
+        }
+        let mut r = Reader::new(rest, "wal record");
+        Ok(WalRecord::RangeDrop {
+            seqno: r.u64()?,
+            range: DroppedRange::decode(r.rest())?,
+        })
+    }
+
+    fn decode_any(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
         let mut r = Reader::new(bytes, "wal record");
         match r.u8()? {
             1 => Ok(WalRecord::Batch {
@@ -982,10 +1272,10 @@ impl WalRecord<'_> {
                 abort_seqno: r.u64()?,
                 share: ExternalShare::decode(r.rest(), false)?,
             }),
-            t => Err(Error::UnsupportedFeature {
-                what: "wal record type",
-                value: u64::from(t),
-            }),
+            // A Range Drop (D331, gated by its bit in `decode_with`), or a type this build
+            // doesn't know: out of line, so the arms above inline as they did (#2089's
+            // callgrind).
+            t => Self::decode_other(t, r.rest()),
         }
     }
 }
@@ -1001,6 +1291,8 @@ pub struct BatchBuilder {
     /// replica's apply, D315 PR 3). Here rather than beside the builder, so it sits in the
     /// padding after `count` and a batch moved by value on every commit doesn't grow.
     logged: bool,
+    /// Feed-silent (D331): encoded, as [`SILENT_BATCH`] in the count.
+    silent: bool,
 }
 
 impl Default for BatchBuilder {
@@ -1009,6 +1301,7 @@ impl Default for BatchBuilder {
             buf: vec![0; 4],
             count: 0,
             logged: false,
+            silent: false,
         }
     }
 }
@@ -1053,6 +1346,7 @@ impl BatchBuilder {
             buf: batch.as_bytes().to_vec(),
             count: batch.len() as u32,
             logged: false,
+            silent: batch.is_silent(),
         }
     }
 
@@ -1066,6 +1360,7 @@ impl BatchBuilder {
             buf,
             count: 0,
             logged: false,
+            silent: false,
         }
     }
 
@@ -1078,6 +1373,65 @@ impl BatchBuilder {
     /// Whether [`mark_logged`](Self::mark_logged) marked it (since the last `clear`).
     pub fn is_logged(&self) -> bool {
         self.logged
+    }
+
+    /// Marks the batch feed-silent (D331, ICR 0141): encoded as [`SILENT_BATCH`] in its
+    /// count, so its record carries the mark. Its writer sets [`INCOMPAT_FEED_SILENT`]
+    /// before appending it.
+    pub fn mark_silent(&mut self) {
+        self.silent = true;
+        self.write_count();
+        if self.tagged() {
+            // `write_count` wrote the count without the trailer's bit: put it back.
+            self.buf[3] |= (XID_BATCH >> 24) as u8;
+        }
+    }
+
+    /// Ends the batch with an xid trailer (D329 2b, [`XID_BATCH`]): the transaction a
+    /// spanning commit's share belongs to. The batch's last step: a push after it is a bug
+    /// (the trailer would sit inside the mutations), and the engine tags a share only once
+    /// it's whole, so `push` needn't look. `InvalidArgument` for an empty xid or one over
+    /// 255 bytes, or for a batch already tagged. Its writer sets `incompat` bit 2 first.
+    pub fn tag_xid(&mut self, xid: &[u8]) -> crate::Result<()> {
+        let len = u8::try_from(xid.len()).map_err(|_| Error::InvalidArgument {
+            what: "an xid over 255 bytes",
+        })?;
+        if len == 0 || self.tagged() {
+            return Err(Error::InvalidArgument {
+                what: "an empty xid, or a batch already tagged",
+            });
+        }
+        self.buf.extend_from_slice(xid);
+        self.buf.push(len);
+        self.buf[3] |= (XID_BATCH >> 24) as u8;
+        Ok(())
+    }
+
+    /// Whether [`tag_xid`](Self::tag_xid) tagged it (since the last `clear`).
+    /// Whether [`tag_xid`](Self::tag_xid) tagged it: one byte's test, for callers that copy
+    /// the tag through a rebuild (D329 2b).
+    #[inline]
+    pub fn is_tagged(&self) -> bool {
+        self.tagged()
+    }
+
+    #[inline]
+    fn tagged(&self) -> bool {
+        self.buf
+            .get(3)
+            .is_some_and(|b| b & (XID_BATCH >> 24) as u8 != 0)
+    }
+
+    /// Whether [`mark_silent`](Self::mark_silent) marked it (since the last `clear`).
+    pub fn is_silent(&self) -> bool {
+        self.silent
+    }
+
+    /// Writes the encoded count: the mutations, with the silent mark.
+    #[inline]
+    fn write_count(&mut self) {
+        let mark = u32::from(self.silent) << 31;
+        self.buf[..4].copy_from_slice(&(self.count | mark).to_le_bytes());
     }
 
     /// Appends one mutation. `ts == None` means "use the commit timestamp". `value` is an
@@ -1127,11 +1481,19 @@ impl BatchBuilder {
         head: &[u8],
         tail: &[u8],
     ) -> crate::Result<()> {
+        // The xid trailer is the batch's last step (D329 2b): a push after it would land past
+        // the trailer and clear bit 30 (`write_count`), silently corrupting the record
+        // (perf2's S1 on #2076). Every engine path tags last; this catches any that doesn't.
+        debug_assert!(!self.tagged(), "a push after the batch's xid trailer");
         let value_len = head.len() + tail.len();
         check_mutation(kind, row, qualifier, value_len, |what| {
             Error::InvalidArgument { what }
         })?;
-        let count = self.count.checked_add(1).ok_or(Error::ValueTooLarge)?;
+        let count = self
+            .count
+            .checked_add(1)
+            .filter(|&c| c & COUNT_FLAGS == 0)
+            .ok_or(Error::ValueTooLarge)?;
         let b = &mut self.buf;
         // One growth for the whole mutation, not one per field.
         b.reserve(4 + 4 + 1 + 8 + 3 * 10 + row.len() + qualifier.len() + value_len);
@@ -1150,7 +1512,7 @@ impl BatchBuilder {
         b.extend_from_slice(head);
         b.extend_from_slice(tail);
         self.count = count;
-        b[..4].copy_from_slice(&count.to_le_bytes());
+        self.write_count();
         Ok(())
     }
 
@@ -1179,6 +1541,7 @@ impl BatchBuilder {
         self.buf.fill(0);
         self.count = 0;
         self.logged = false;
+        self.silent = false;
     }
 }
 
@@ -1193,12 +1556,31 @@ impl<'a> BatchRef<'a> {
     /// Wraps encoded batch bytes, validating the count. Never panics.
     ///
     /// Every mutation is parsed once here, and trailing bytes are rejected, so iterating a
-    /// `BatchRef` built by this function never yields an error.
+    /// `BatchRef` built by this function never yields an error. A [`SILENT_BATCH`] mark is
+    /// taken as the mark, so this is for batches built in memory: bytes read from a WAL file
+    /// go through [`WalRecord::decode_with`] (or the WAL crate's readers), which refuse the
+    /// mark without `incompat` bit 3, never straight through here (perf2's N2 on #2055).
     pub fn new(bytes: &'a [u8]) -> crate::Result<Self> {
         let mut r = Reader::new(bytes, "wal batch");
-        let count = r.u32()?;
+        let raw = r.u32()?;
+        let count = raw & COUNT_MASK;
+        let mut rest = r.rest();
+        if raw & XID_BATCH != 0 {
+            // The xid trailer (D329 2b): its length last, then the xid before it. The
+            // mutations end where it begins, and anything else past them is still refused.
+            let (&len, before) = rest.split_last().ok_or(Error::Corrupt {
+                what: "wal batch: an xid trailer without its length",
+            })?;
+            let len = usize::from(len);
+            if len == 0 || before.len() < len {
+                return Err(Error::Corrupt {
+                    what: "wal batch: a malformed xid trailer",
+                });
+            }
+            rest = &before[..before.len() - len];
+        }
         let mut it = BatchIter {
-            rest: r.rest(),
+            rest,
             remaining: count,
             validate: true,
         };
@@ -1226,6 +1608,34 @@ impl<'a> BatchRef<'a> {
     /// Whether the batch has no mutations.
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// The count's top byte, where its flags live ([`SILENT_BATCH`] as 0x80, [`XID_BATCH`]
+    /// as 0x40): a reader that tests both reads it once (#2076's feed shapes).
+    #[inline]
+    pub fn count_flags(&self) -> u8 {
+        self.bytes.get(3).copied().unwrap_or(0)
+    }
+
+    /// Whether the batch is feed-silent ([`SILENT_BATCH`], D331): read from its count's
+    /// top byte, so a `BatchRef` stays two words and a count (#2055's feed shapes).
+    #[inline]
+    pub fn is_silent(&self) -> bool {
+        self.bytes.get(3).is_some_and(|b| b & 0x80 != 0)
+    }
+
+    /// The transaction this batch is a share of ([`XID_BATCH`], D329 2b): its trailer, read
+    /// from the end. `None` for an untagged batch: one bit test.
+    #[inline]
+    pub fn xid(&self) -> Option<&'a [u8]> {
+        if self
+            .bytes
+            .get(3)
+            .is_none_or(|b| b & (XID_BATCH >> 24) as u8 == 0)
+        {
+            return None;
+        }
+        xid_trailer(self.bytes)
     }
 
     /// Iterates the mutations in insertion order.
@@ -1398,4 +1808,14 @@ impl<'a> StreamList<'a> {
         let (ids, _) = self.bytes[2..].as_chunks::<4>();
         ids.iter().map(|c| StreamId(u32::from_le_bytes(*c)))
     }
+}
+
+/// The xid trailer of encoded batch `bytes` whose count has [`XID_BATCH`]: out of line, as
+/// only spanning commits' shares have one.
+#[cold]
+#[inline(never)]
+fn xid_trailer(bytes: &[u8]) -> Option<&[u8]> {
+    let (&len, before) = bytes.get(4..)?.split_last()?;
+    let len = usize::from(len);
+    before.get(before.len().checked_sub(len)?..)
 }

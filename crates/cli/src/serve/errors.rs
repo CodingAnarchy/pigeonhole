@@ -350,9 +350,14 @@ impl ApiError {
     /// A call other than `Commit` on a transaction that has received `Commit`: the session
     /// is its tombstone (D313 B1), and `Commit` answers the recorded outcome, which this
     /// error's message names too. Not retry-safe: whatever the call wanted is past.
-    pub(crate) fn transaction_finished(outcome: &Result<pigeonhole::CommitInfo, Self>) -> Self {
+    pub(crate) fn transaction_finished(
+        outcome: &Result<super::proto::TxnCommitResponse, Self>,
+    ) -> Self {
         let what = match outcome {
-            Ok(c) => format!("committed at seqno {}", c.seqno),
+            Ok(c) => format!(
+                "committed at seqno {}",
+                c.commit.as_ref().map_or(0, |c| c.seqno)
+            ),
             Err(e) => format!("its Commit failed with {}", e.code),
         };
         Self::new(
@@ -428,6 +433,45 @@ impl ApiError {
             tonic::Code::FailedPrecondition,
             StatusCode::CONFLICT,
         )
+    }
+
+    /// D331 PR 3b: a cluster subscription's merge ended because the map gave a range of its
+    /// tables to a partition it doesn't read (a range move). Its last event was a checkpoint:
+    /// resuming from that token reads the new partition from its hand-over on. Not a public
+    /// `ErrorCode` (the coordinator's call): carried as `ReplicaBehind` is. Retry-safe.
+    pub(crate) fn feed_rerouted(message: impl Into<String>) -> Self {
+        Self::new(
+            "FeedRerouted",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .retry(RetryFrom::Request)
+        .after(RETRY_AFTER_MS)
+    }
+
+    /// D331 PR 3b, internal to a cluster subscription: a source's component of tables a
+    /// range move took from it whole has read up to the move's last seqno, and ends here.
+    /// The merge retires the part; a client never sees it.
+    pub(crate) fn moved_away(message: impl Into<String>) -> Self {
+        Self::new(
+            "MovedAway",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    }
+
+    /// D331: a write touching a range its partition is handing over to another (reason
+    /// `RANGE_MOVING`), refused before anything is written. Unlike the operator's fence it's
+    /// retry-safe and short: the range takes writes again at its target once the hand-over's
+    /// map lands, and the client's retry is routed there.
+    pub(crate) fn range_moving(message: impl Into<String>) -> Self {
+        Self::fenced(message)
+            .retry(RetryFrom::Request)
+            .after(RETRY_AFTER_MS)
     }
 
     /// D317 (ICR 0117): the partition's node couldn't be reached, and nothing was sent to

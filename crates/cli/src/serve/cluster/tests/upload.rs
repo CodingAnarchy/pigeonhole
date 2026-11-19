@@ -14,7 +14,7 @@ use crate::serve::proto::{
 };
 
 /// A client stream fed by a channel, so a test controls when it ends.
-pub(super) struct Chunks(tokio::sync::mpsc::Receiver<PartitionUploadChunk>);
+pub(super) struct Chunks(pub(super) tokio::sync::mpsc::Receiver<PartitionUploadChunk>);
 
 impl futures_core::Stream for Chunks {
     type Item = PartitionUploadChunk;

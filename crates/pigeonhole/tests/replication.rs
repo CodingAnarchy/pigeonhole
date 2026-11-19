@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pigeonhole::replication::ReplicatedEvent;
-use pigeonhole::{ErrorCode, Family, Feed, FeedEvent, FeedRetention, Options, Pigeonhole, Value};
+use pigeonhole::{
+    ErrorCode, Family, Feed, FeedEvent, FeedRetention, FeedToken, Options, Pigeonhole, Value,
+};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 
 fn options(vfs: &Arc<SimVfs>) -> Options {
@@ -79,9 +81,16 @@ fn apply(replica: &Pigeonhole, events: &[ReplicatedEvent], run: usize) {
             i += 1;
             continue;
         }
+        if events[i].is_range_drop() {
+            replica
+                .apply_range_drop(&events[i], events[i].token())
+                .unwrap();
+            i += 1;
+            continue;
+        }
         let end = (i..events.len())
             .take(run)
-            .take_while(|&j| !events[j].is_catalog())
+            .take_while(|&j| !events[j].is_catalog() && !events[j].is_range_drop())
             .last()
             .unwrap()
             + 1;
@@ -99,9 +108,14 @@ fn try_apply(
     events: &[ReplicatedEvent],
     run: usize,
 ) -> pigeonhole::Result<()> {
-    for chunk in events.chunk_by(|a, b| !a.is_catalog() && !b.is_catalog()) {
+    let alone = |e: &ReplicatedEvent| e.is_catalog() || e.is_range_drop();
+    for chunk in events.chunk_by(|a, b| !alone(a) && !alone(b)) {
         if chunk[0].is_catalog() {
             replica.apply_catalog(&chunk[0], chunk[0].token())?;
+            continue;
+        }
+        if chunk[0].is_range_drop() {
+            replica.apply_range_drop(&chunk[0], chunk[0].token())?;
             continue;
         }
         for part in chunk.chunks(run) {
@@ -719,6 +733,1163 @@ fn a_reader_of_the_replaced_file_never_removes_the_new_file_s_wal() {
             "r{i:02}, committed after the swap, survives the crash"
         );
     }
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 (ICR 0141): a primary's feed-silent commits reach a replica that includes them, as
+/// version 2 events (the rest stay version 1), and the replica applies them silent: it
+/// matches the primary, and neither's own subscription ever sees a silent write. A feed
+/// that doesn't include them (any client's) passes them over. A newer event version is
+/// refused.
+#[test]
+fn a_replica_applies_silent_commits_silent() {
+    let (pv, rv) = (SimVfs::new(31), SimVfs::new(32));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let mut client = primary.feed().open().unwrap();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let mut own = replica.feed().open().unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for step in 0..12u32 {
+        let silent = step % 3 != 0;
+        let mut wb = primary.write_batch();
+        if silent {
+            wb.mark_feed_silent();
+        }
+        let row = format!("{}{step}", if silent { "quiet" } else { "loud" });
+        wb.put(&t, row.as_bytes(), "a", b"q", b"v");
+        wb.commit().unwrap();
+        let events = ready(&mut feed);
+        for e in &events {
+            let version = e.encode()[0];
+            assert_eq!(version, if e.is_silent() { 2 } else { 1 });
+        }
+        assert!(events.iter().any(|e| e.is_silent()) == silent);
+        apply(&replica, &events, 3);
+    }
+    assert_eq!(contents(&replica), contents(&primary));
+
+    for (who, f) in [
+        ("the primary's client", &mut client),
+        ("the replica's own", &mut own),
+    ] {
+        while let Some(ev) = f.next_event(Duration::from_millis(200)).unwrap() {
+            if let FeedEvent::Commit(c) = ev {
+                assert!(
+                    c.changes().iter().all(|ch| !ch.row().starts_with(b"quiet")),
+                    "{who} feed delivered a silent write"
+                );
+            }
+        }
+    }
+
+    let mut wb = primary.write_batch();
+    wb.put(&t, b"last", "a", b"q", b"v");
+    wb.commit().unwrap();
+    let mut bytes = ready(&mut feed)[0].encode();
+    // A version this build doesn't know is refused, as a build before D329 2b refuses
+    // version 3 (the guide's upgrade note on spanning_txns).
+    bytes[0] = 4;
+    assert!(
+        ReplicatedEvent::decode(&bytes).is_err(),
+        "a newer version is refused"
+    );
+    drop((feed, client, own));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4 (ICR 0141): a range move's target writes the source's changes as the source
+/// logged them, by name into its own ids, feed-silently: puts at explicit timestamps, a
+/// column delete that hides an older `put_at` written after it, counter increments and a
+/// counter delete, in commit order. The target then reads as the source does, its own feed
+/// carries none of it, and a family the target lacks fails the whole batch.
+#[test]
+fn a_logged_batch_writes_another_databases_changes_by_name() {
+    let (sv, tv) = (SimVfs::new(41), SimVfs::new(42));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let mut feed = source.feed().open().unwrap();
+    // The target's ids differ from the source's: another table and family come first.
+    target
+        .table("other")
+        .unwrap()
+        .family("x", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("z", Family::default())
+            .family("a", Family::default())
+            .family("n", Family::counter())
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    let mut own = target.feed().open().unwrap();
+
+    s.mutate(b"r1")
+        .put_at("a", b"q", 10, b"v10")
+        .commit()
+        .unwrap();
+    s.mutate(b"r1")
+        .put_at("a", b"q", 20, b"v20")
+        .commit()
+        .unwrap();
+    s.mutate(b"r2").put("a", b"q", b"now").commit().unwrap();
+    s.mutate(b"r2").delete_column("a", b"q").commit().unwrap();
+    // Older than the delete: hidden on the source, and must be on the target too.
+    s.mutate(b"r2")
+        .put_at("a", b"q", 5, b"old")
+        .commit()
+        .unwrap();
+    s.mutate(b"c").incr("n", b"q", 3).commit().unwrap();
+    s.mutate(b"c").delete_column("n", b"q").commit().unwrap();
+    s.mutate(b"c").incr("n", b"q", 4).commit().unwrap();
+
+    while let Some(ev) = feed.next_event(Duration::from_millis(200)).unwrap() {
+        let FeedEvent::Commit(c) = ev else { continue };
+        let mut wb = target.logged_batch();
+        wb.mark_feed_silent();
+        for ch in c.changes() {
+            wb.push(
+                &t,
+                ch.row(),
+                ch.family(),
+                ch.kind(),
+                ch.qualifier(),
+                ch.timestamp(),
+                ch.stored(),
+            );
+        }
+        wb.commit().unwrap();
+    }
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t"))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    assert_eq!(
+        t.get(b"c", "n", b"q").unwrap().map(|c| c.as_i64()),
+        Some(Some(4))
+    );
+    assert!(t.get(b"r2", "a", b"q").unwrap().is_none());
+    assert!(
+        own.next_event(Duration::from_millis(200))
+            .unwrap()
+            .is_none(),
+        "the target's own feed carries none of the source's changes"
+    );
+
+    // A family the target lacks fails the batch whole: nothing of it commits.
+    let mut wb = target.logged_batch();
+    wb.push(
+        &t,
+        b"r3",
+        "a",
+        pigeonhole::ChangeKind::Put,
+        b"q",
+        7,
+        b"\x00x",
+    );
+    wb.push(
+        &t,
+        b"r3",
+        "missing",
+        pigeonhole::ChangeKind::Put,
+        b"q",
+        7,
+        b"\x00x",
+    );
+    assert_eq!(wb.commit().unwrap_err().code(), ErrorCode::FamilyNotFound);
+    assert!(t.get(b"r3", "a", b"q").unwrap().is_none());
+    drop((feed, own));
+    target.close().unwrap();
+    source.close().unwrap();
+}
+
+/// Every row of `t` with a cell in family "a" qualifier "q", as `row=value`, at `snap` if
+/// given.
+fn rows_of(t: &pigeonhole::Table, snap: Option<&pigeonhole::Snapshot>) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 0..10u8 {
+        let row = [b'r', b'0' + i];
+        let text = |v: Value<'_>| match v {
+            Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            other => format!("{other:?}"),
+        };
+        let cell = match snap {
+            Some(s) => t
+                .get_at(s, &row, "a", b"q")
+                .unwrap()
+                .map(|c| text(c.typed())),
+            None => t.get(&row, "a", b"q").unwrap().map(|c| text(c.typed())),
+        };
+        if let Some(v) = cell {
+            out.push(format!("{}={v}", String::from_utf8_lossy(&row)));
+        }
+    }
+    out
+}
+
+/// D331 PR 4a (B1, the coordinator's test): a dropped range takes writes at older
+/// timestamps again, which delete markers never would. Rows `r3..r7` are dropped from the
+/// memtable and the SSTs alike, a column delete inside the range goes with them, a snapshot
+/// taken before still reads the range whole, the rows outside are untouched, and writes of
+/// the range at timestamps below the dropped versions and below the dropped marker are then
+/// visible: before a crash, after it, and after the drop is run again.
+#[test]
+fn a_dropped_range_takes_older_writes_again() {
+    let vfs = SimVfs::new(43);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..10u8 {
+        t.mutate(&[b'r', b'0' + i])
+            .put_at("a", b"q", 100, format!("v{i}").as_bytes())
+            .commit()
+            .unwrap();
+        // Half the rows in the SSTs, half in the memtable.
+        if i == 4 {
+            db.flush().unwrap();
+        }
+    }
+    t.mutate(b"r5").delete_column("a", b"q").commit().unwrap();
+    let before = db.snapshot().unwrap();
+    let whole = rows_of(&t, Some(&before));
+    assert_eq!(whole.len(), 9, "{whole:?}");
+
+    db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    let outside = ["r0=v0", "r1=v1", "r2=v2", "r7=v7", "r8=v8", "r9=v9"];
+    assert_eq!(rows_of(&t, None), outside);
+    assert_eq!(
+        rows_of(&t, Some(&before)),
+        whole,
+        "a snapshot keeps its view"
+    );
+    drop(before);
+
+    // Below the dropped versions (ts 100) and below the dropped marker: visible now.
+    for row in [&b"r3"[..], b"r5"] {
+        t.mutate(row)
+            .put_at("a", b"q", 50, b"old")
+            .commit()
+            .unwrap();
+    }
+    let expect = [
+        "r0=v0", "r1=v1", "r2=v2", "r3=old", "r5=old", "r7=v7", "r8=v8", "r9=v9",
+    ];
+    assert_eq!(rows_of(&t, None), expect);
+
+    vfs.crash(CrashKind::Process);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    assert_eq!(rows_of(&t, None), expect, "after a crash");
+    // Run again (the caller's rule after a crash): the range's own writes since go too.
+    db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    assert_eq!(rows_of(&t, None), outside);
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(rows_of(&t, None), outside, "after compaction");
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a: a range drop refuses a range that ends at or before it starts.
+#[test]
+fn a_range_drop_refuses_a_bad_range() {
+    let vfs = SimVfs::new(44);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for (start, end) in [(&b"m"[..], &b"m"[..]), (b"m", b"a")] {
+        assert_eq!(
+            db.drop_range(&t, start, Some(end)).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a (perf2's condition 5): a range drop is feed-silent, and a subscription open
+/// across it goes on: its seqno passes with no event, the commits on both sides of it
+/// arrive once each, and tokens taken just before and just after it resume, also after a
+/// crash.
+#[test]
+fn a_feed_passes_a_range_drop_and_its_tokens_resume() {
+    let vfs = SimVfs::new(45);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let commit = |t: &pigeonhole::Table, row: &[u8]| {
+        t.mutate(row).put("a", b"q", b"v").commit().unwrap().seqno
+    };
+    let next_seqno = |feed: &mut Feed| match feed.next_event(Duration::from_secs(5)).unwrap() {
+        Some(FeedEvent::Commit(c)) => c.seqno(),
+        other => panic!("expected a commit, got {other:?}"),
+    };
+    let mut feed = t.feed().open().unwrap();
+    let one = commit(&t, b"r1");
+    commit(&t, b"r6");
+    assert_eq!(next_seqno(&mut feed), one);
+    next_seqno(&mut feed);
+    let before = FeedToken::from_bytes(feed.token().as_bytes().to_vec());
+    db.drop_range(&t, b"r5", Some(b"r9")).unwrap();
+    assert!(
+        feed.next_event(Duration::from_millis(200))
+            .unwrap()
+            .is_none(),
+        "a range drop delivers nothing"
+    );
+    let after = FeedToken::from_bytes(feed.token().as_bytes().to_vec());
+    let two = commit(&t, b"r2");
+    assert_eq!(next_seqno(&mut feed), two);
+    drop(feed);
+
+    vfs.crash(CrashKind::Process);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    for token in [&before, &after] {
+        let mut feed = t.feed().resume(token).open().unwrap();
+        assert_eq!(next_seqno(&mut feed), two);
+        assert!(
+            feed.next_event(Duration::from_millis(200))
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a (perf2's condition 1): a primary's range drop reaches a replica in feed
+/// order, between the commits before it and after it. The replica lags: it applies the
+/// writes of the range, the drop, and a write of the range at an older timestamp only
+/// after all of them happened, and then reads as the primary: the dropped rows gone, the
+/// older write visible. A client's feed of the primary never sees the drop.
+#[test]
+fn a_replica_applies_a_range_drop_in_feed_order() {
+    let (pv, rv) = (SimVfs::new(46), SimVfs::new(47));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut client = t.feed().open().unwrap();
+    for i in 0..10u8 {
+        t.mutate(&[b'r', b'0' + i])
+            .put_at("a", b"q", 100, format!("v{i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    primary.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    t.mutate(b"r4")
+        .put_at("a", b"q", 50, b"old")
+        .commit()
+        .unwrap();
+
+    let events = ready(&mut feed);
+    let drops: Vec<usize> = (0..events.len())
+        .filter(|&i| events[i].is_range_drop())
+        .collect();
+    assert_eq!(
+        drops.len(),
+        1,
+        "one drop event, though every stream logged it"
+    );
+    assert!(
+        drops[0] + 1 < events.len() && !events[drops[0] + 1].is_catalog(),
+        "the drop comes before the write after it"
+    );
+    apply(&replica, &events, 3);
+    assert_eq!(contents(&replica), contents(&primary));
+    let rt = replica.table("t").unwrap().open().unwrap();
+    assert_eq!(
+        rows_of(&rt, None),
+        [
+            "r0=v0", "r1=v1", "r2=v2", "r4=old", "r7=v7", "r8=v8", "r9=v9"
+        ]
+    );
+
+    let mut seen = 0;
+    while let Some(ev) = client.next_event(Duration::from_millis(200)).unwrap() {
+        assert!(matches!(ev, FeedEvent::Commit(_)), "{ev:?}");
+        seen += 1;
+    }
+    assert_eq!(
+        seen, 11,
+        "the client sees every commit and nothing for the drop"
+    );
+    drop((feed, client, rt, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4a: a range drop's event round-trips, bounded and to the table's end, and its
+/// bytes re-encode identically (feed1248's S2); a truncated one is refused, and so is one in
+/// any version but the plain one (the coordinator's condition; feed1248's M1: version 2
+/// here, and version 3, D329 PR 2b's flags form, whichever lands first).
+#[test]
+fn a_range_drop_event_round_trips_and_a_flagged_one_is_refused() {
+    let vfs = SimVfs::new(48);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let mut feed = db.feed().open().unwrap();
+    feed.include_silent();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    db.drop_range(&t, b"b", Some(b"m\x00")).unwrap();
+    db.drop_range(&t, b"x", None).unwrap();
+    let drops: Vec<ReplicatedEvent> = ready(&mut feed)
+        .into_iter()
+        .filter(ReplicatedEvent::is_range_drop)
+        .collect();
+    assert_eq!(drops.len(), 2, "both drops are delivered");
+    for event in &drops {
+        let bytes = event.encode();
+        assert_eq!(bytes[0], 1, "the plain version");
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert_eq!(&back, event);
+        assert_eq!(back.encode(), bytes, "re-encoded byte for byte");
+        for cut in 1..bytes.len() {
+            assert!(
+                ReplicatedEvent::decode(&bytes[..cut]).is_err(),
+                "truncated at {cut}"
+            );
+        }
+        for version in [2u8, 3] {
+            let mut flagged = bytes.clone();
+            flagged[0] = version;
+            assert_eq!(
+                ReplicatedEvent::decode(&flagged).unwrap_err().code(),
+                ErrorCode::InvalidArgument,
+                "version {version}"
+            );
+        }
+    }
+    drop((feed, t));
+    db.close().unwrap();
+}
+
+/// D331 PR 4a (perf2's conditions 2 and 3): a crash at any step of a range drop leaves the
+/// range whole or gone, never partly, with the rows outside it untouched, and the drop run
+/// again (the caller's rule) finishes it. The crash comes after the drop's `k`th mutating
+/// operation, for every `k` until the drop completes first: after its splits, after the
+/// record reached some streams or all, before and after its manifest commit, with power and
+/// process crashes in turn. Each reopen then takes a write at a lower seqno than nothing
+/// (a commit), the drop again, and a write of the range at an older timestamp, visible.
+#[test]
+fn a_range_drop_cut_by_a_crash_finishes_when_run_again() {
+    let outside = ["r0=v0", "r1=v1", "r2=v2", "r7=v7", "r8=v8", "r9=v9"];
+    let whole = [
+        "r0=v0", "r1=v1", "r2=v2", "r3=v3", "r4=v4", "r5=v5", "r6=v6", "r7=v7", "r8=v8", "r9=v9",
+    ];
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("a", Family::default())
+            .create_if_missing()
+            .unwrap()
+    };
+    let mut finished = false;
+    let mut k = 1u64;
+    while !finished {
+        assert!(k < 500, "the drop never finished before its crash point");
+        let vfs = SimVfs::new(1000 + k);
+        let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+        let t = make(&db);
+        for i in 0..10u8 {
+            t.mutate(&[b'r', b'0' + i])
+                .put_at("a", b"q", 100, format!("v{i}").as_bytes())
+                .commit()
+                .unwrap();
+            if i == 4 {
+                db.flush().unwrap();
+            }
+        }
+        let mut plan = FaultPlan::none();
+        plan.crash_after_ops = Some(vfs.mutating_ops() + k);
+        vfs.set_faults(plan);
+        finished = db.drop_range(&t, b"r3", Some(b"r7")).is_ok();
+        vfs.set_faults(FaultPlan::none());
+        vfs.crash(if k.is_multiple_of(2) {
+            CrashKind::Power
+        } else {
+            CrashKind::Process
+        });
+        drop(t);
+        drop(db);
+
+        let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let rows = rows_of(&t, None);
+        assert!(
+            rows == whole || rows == outside,
+            "k {k}: a crashed drop left the range partly: {rows:?}"
+        );
+        assert!(
+            !finished || rows == outside,
+            "k {k}: a drop that returned came back after a crash: {rows:?}"
+        );
+        t.mutate(b"r0")
+            .put_at("a", b"q", 100, b"v0")
+            .commit()
+            .unwrap();
+        db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+        assert_eq!(rows_of(&t, None), outside, "k {k}: run again");
+        t.mutate(b"r4")
+            .put_at("a", b"q", 50, b"old")
+            .commit()
+            .unwrap();
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let mut expect = outside.to_vec();
+        expect.insert(3, "r4=old");
+        assert_eq!(rows_of(&t, None), expect, "k {k}: after the re-run");
+        drop(t);
+        db.close().unwrap();
+        k += 1;
+    }
+    // The sweep crossed the drop's steps: its splits, a record per stream (2 here) and
+    // its manifest commit each took at least one mutating operation.
+    assert!(k > 4, "the drop finished at its {}th operation", k - 1);
+    eprintln!("the drop finished at operation {}", k - 1);
+}
+
+/// D331 PR 4a (feed1248 on #2089): a range drop followed at once by a catalog change reaches
+/// a replica's follower as one drop, then the change, and the replica matches its primary:
+/// the change isn't taken for a second drop.
+#[test]
+fn a_catalog_change_right_after_a_range_drop_is_delivered_as_itself() {
+    let (pv, rv) = (SimVfs::new(50), SimVfs::new(51));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"r1").put("a", b"q", b"v").commit().unwrap();
+    primary.drop_range(&t, b"r0", Some(b"r5")).unwrap();
+    primary
+        .table("u")
+        .unwrap()
+        .family("b", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let events = ready(&mut feed);
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| {
+            if e.is_range_drop() {
+                "drop"
+            } else if e.is_catalog() {
+                "catalog"
+            } else {
+                "commit"
+            }
+        })
+        .collect();
+    assert_eq!(kinds, ["catalog", "commit", "drop", "catalog"], "{kinds:?}");
+    apply(&replica, &events, 3);
+    assert_eq!(contents(&replica), contents(&primary));
+    assert!(replica.table("u").unwrap().open().is_ok());
+    drop((feed, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4a (B2): a range copied chunk by chunk from one snapshot, and written back by
+/// name into another database, reads there as the source did at the snapshot, in every
+/// family kind: versions (a capped family too), a column delete hiding an older `put_at`
+/// written after it, a TTL family, a counter with a delete and increments after it, and
+/// sum, max and HLL aggregates, some of each in SSTs and some in the memtable. A write after
+/// the snapshot isn't copied, and every chunk holds whole rows.
+#[test]
+fn a_range_copied_at_a_snapshot_reads_as_its_source() {
+    use pigeonhole::Aggregation;
+    let (sv, tv) = (SimVfs::new(52), SimVfs::new(53));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("a", Family::default())
+            .family("v", Family::default().max_versions(2))
+            .family("l", Family::default().ttl(Duration::from_secs(3600)))
+            .family("n", Family::counter())
+            .family("s", Family::aggregate(Aggregation::Sum))
+            .family("m", Family::aggregate(Aggregation::Max))
+            .family("h", Family::aggregate(Aggregation::Hll))
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    for i in 0..40u32 {
+        let row = format!("r{i:02}");
+        let r = row.as_bytes();
+        s.mutate(r)
+            .put_at("a", b"q", 100 + u64::from(i), b"first")
+            .put_at("a", b"q", 200 + u64::from(i), b"second")
+            .put_at("v", b"q", 10, b"v10")
+            .put_at("v", b"q", 20, b"v20")
+            .put_at("v", b"q", 30, b"v30")
+            .put("l", b"q", b"lives")
+            .incr("n", b"c", 3)
+            .aggregate("s", b"q", i64::from(i))
+            .aggregate("m", b"q", i64::from(i % 7))
+            .aggregate_bytes("h", b"q", r)
+            .commit()
+            .unwrap();
+        if i % 3 == 0 {
+            s.mutate(r).delete_column("a", b"q").commit().unwrap();
+            s.mutate(r)
+                .put_at("a", b"q", 50, b"hidden")
+                .commit()
+                .unwrap();
+            s.mutate(r).delete_column("n", b"c").commit().unwrap();
+        }
+        s.mutate(r)
+            .incr("n", b"c", 4)
+            .aggregate("s", b"q", 1)
+            .aggregate("m", b"q", 9)
+            .aggregate_bytes("h", b"q", b"shared")
+            .commit()
+            .unwrap();
+        if i == 20 {
+            source.flush().unwrap();
+        }
+    }
+    let snap = source.snapshot().unwrap();
+    s.mutate(b"zz").put("a", b"q", b"after").commit().unwrap();
+
+    let mut after = Vec::new();
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
+    loop {
+        let chunk = source.copy_range(&snap, &s, &after, None, 300).unwrap();
+        let mut rows: Vec<Vec<u8>> = chunk.cells.iter().map(|c| c.row.clone()).collect();
+        rows.dedup();
+        for batch in chunk.batches() {
+            let mut wb = target.logged_batch();
+            wb.mark_feed_silent();
+            for c in batch {
+                wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+            }
+            wb.commit().unwrap();
+        }
+        chunks.push(rows);
+        match chunk.next {
+            Some(n) => after = n,
+            None => break,
+        }
+    }
+    assert!(chunks.len() > 3, "{} chunks", chunks.len());
+    let mut seen = std::collections::HashSet::new();
+    for rows in &chunks {
+        for r in rows {
+            assert!(seen.insert(r.clone()), "row {r:?} in two chunks");
+        }
+    }
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t") && !l.contains(&format!("\t{}\t", hex(b"zz"))))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    assert!(
+        t.get(b"zz", "a", b"q").unwrap().is_none(),
+        "a write after the snapshot"
+    );
+    drop((snap, s, t));
+    target.close().unwrap();
+    source.close().unwrap();
+}
+
+/// D331 PR 4a (simp724 on B2): a set family's copy is its settled state, never the fold's
+/// 0xFF working form (D298), and the target reads as the source: adds and removes, some
+/// flushed and some in the memtable, across several chunks.
+#[test]
+fn a_copied_set_family_is_settled() {
+    use pigeonhole::Aggregation;
+    let (sv, tv) = (SimVfs::new(54), SimVfs::new(55));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("set", Family::aggregate(Aggregation::Set))
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    for i in 0..30u32 {
+        let row = format!("r{i:02}");
+        for x in 0..20u32 {
+            s.mutate(row.as_bytes())
+                .set_add("set", b"q", x * 1000 + i)
+                .commit()
+                .unwrap();
+        }
+        s.mutate(row.as_bytes())
+            .set_remove("set", b"q", 3000 + i)
+            .commit()
+            .unwrap();
+        if i == 15 {
+            source.flush().unwrap();
+        }
+    }
+    let snap = source.snapshot().unwrap();
+    let mut after = Vec::new();
+    let mut chunks = 0;
+    loop {
+        let chunk = source.copy_range(&snap, &s, &after, None, 400).unwrap();
+        for c in &chunk.cells {
+            assert_ne!(
+                c.stored.first(),
+                Some(&0xFF),
+                "row {:?}: a set copied in its working form",
+                c.row
+            );
+        }
+        for batch in chunk.batches() {
+            let mut wb = target.logged_batch();
+            for c in batch {
+                wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+            }
+            wb.commit().unwrap();
+        }
+        chunks += 1;
+        match chunk.next {
+            Some(n) => after = n,
+            None => break,
+        }
+    }
+    assert!(chunks > 2, "{chunks} chunks");
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t"))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    drop((snap, s, t));
+    target.close().unwrap();
+    source.close().unwrap();
+}
+
+/// D331 PR 4a (D34, found checking simp724's (d)): a counter's value newer than a cell
+/// delete at the same timestamp (`incr` is at timestamp 0, and a counter delete hides only
+/// what came before it) is copied beside the delete, and the target commits them apart,
+/// the delete first, so it reads the value, not nothing. A chunk whose aggregate cells are
+/// each one folded value (puts of their finished state, simp724's (d)) reads the same
+/// copied twice; a cell kept beside its delete is copied once.
+#[test]
+fn a_counter_value_beside_its_delete_survives_the_copy() {
+    use pigeonhole::Aggregation;
+    let (sv, tv) = (SimVfs::new(56), SimVfs::new(57));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("n", Family::counter())
+            .family("s", Family::aggregate(Aggregation::Sum))
+            .family("set", Family::aggregate(Aggregation::Set))
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    s.mutate(b"a").incr("n", b"q", 3).commit().unwrap();
+    s.mutate(b"a").delete_cell("n", b"q", 0).commit().unwrap();
+    s.mutate(b"a").incr("n", b"q", 4).commit().unwrap();
+    for x in 0..5 {
+        s.mutate(b"b")
+            .incr("n", b"q", 1)
+            .aggregate("s", b"q", x)
+            .commit()
+            .unwrap();
+        s.mutate(b"b")
+            .set_add("set", b"q", 7 + x as u32)
+            .commit()
+            .unwrap();
+    }
+    assert_eq!(
+        s.get(b"a", "n", b"q").unwrap().map(|c| c.as_i64()),
+        Some(Some(4))
+    );
+    let snap = source.snapshot().unwrap();
+    let chunk = source.copy_range(&snap, &s, b"", None, 1 << 20).unwrap();
+    assert!(chunk.next.is_none());
+    for batch in chunk.batches() {
+        let mut wb = target.logged_batch();
+        for c in batch {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        wb.commit().unwrap();
+    }
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t"))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    assert_eq!(
+        t.get(b"a", "n", b"q").unwrap().map(|c| c.as_i64()),
+        Some(Some(4))
+    );
+    // A crash between the chunk's commits and the chunk copied again (simp724): first only
+    // its first commit, then the whole chunk once more; the delete masks the first
+    // attempt's increment before it's written again.
+    let again = source.copy_range(&snap, &s, b"", None, 1 << 20).unwrap();
+    let batches = again.batches();
+    assert!(
+        batches.len() > 1,
+        "the delete and its value are committed apart"
+    );
+    for batch in [batches[0]].into_iter().chain(batches.iter().copied()) {
+        let mut wb = target.logged_batch();
+        for c in batch {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        wb.commit().unwrap();
+    }
+    assert_eq!(of_t(&target), of_t(&source), "the chunk applied again");
+    // Row b's cells are each one folded value, copied as puts: twice reads the same.
+    let b_chunk = source.copy_range(&snap, &s, b"b", None, 1 << 20).unwrap();
+    assert!(
+        b_chunk
+            .cells
+            .iter()
+            .all(|c| c.kind == pigeonhole::ChangeKind::Put),
+        "{:?}",
+        b_chunk.cells
+    );
+    for batch in b_chunk.batches() {
+        let mut wb = target.logged_batch();
+        for c in batch {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        wb.commit().unwrap();
+    }
+    assert_eq!(of_t(&target), of_t(&source), "a folded chunk copied twice");
+    drop((snap, s, t));
+    target.close().unwrap();
+    source.close().unwrap();
+}
+
+/// D331 PR 4a (simp724's M1 on #2089): a chunk's bounds prune SSTs by escaped rows. A row
+/// with a zero byte, alone in an SST, inside a chunk ending just past it (`a\0` against
+/// `a\0\x05`, which a raw comparison puts below the escaped `a\0`), is copied.
+#[test]
+fn a_row_with_a_zero_byte_at_a_chunks_edge_is_copied() {
+    let vfs = SimVfs::new(58);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"a\0").put("a", b"q", b"v").commit().unwrap();
+    db.flush().unwrap();
+    let snap = db.snapshot().unwrap();
+    for (after, end) in [
+        (&b""[..], &b"a\0\x05"[..]),
+        (b"a\0", b"a\0\x05"),
+        (b"a", b"a\0\x01"),
+    ] {
+        let chunk = db.copy_range(&snap, &t, after, Some(end), 1 << 20).unwrap();
+        assert_eq!(
+            chunk
+                .cells
+                .iter()
+                .map(|c| c.row.clone())
+                .collect::<Vec<_>>(),
+            [b"a\0".to_vec()],
+            "[{after:?}, {end:?})"
+        );
+    }
+    let none = db.copy_range(&snap, &t, b"a\0\x01", None, 1 << 20).unwrap();
+    assert!(none.cells.is_empty(), "past the row");
+    drop((snap, t));
+    db.close().unwrap();
+}
+
+/// `row`'s put on `t`: feed-silent, or a spanning commit's share tagged with `xid` (a
+/// transaction, as `phdb serve` tags one), or plain.
+fn commit(db: &Pigeonhole, t: &pigeonhole::Table, row: &[u8], silent: bool, xid: Option<&[u8]>) {
+    match xid {
+        Some(x) => {
+            let mut txn = db.transaction().unwrap();
+            txn.put(t, row, "a", b"q", b"v");
+            txn.tag_xid(x);
+            txn.commit().unwrap();
+        }
+        None => {
+            let mut wb = db.write_batch();
+            if silent {
+                wb.mark_feed_silent();
+            }
+            wb.put(t, row, "a", b"q", b"v");
+            wb.commit().unwrap();
+        }
+    }
+}
+
+/// D329 2b (ICR 0140 amendment 2): a spanning commit's share replicates as a version 3
+/// event, a flags byte and the xid before version 1's fields. The replica
+/// applies it tagged, so its own feed carries the xid; an untagged commit stays version 1
+/// or 2, byte for byte. Unknown flag bits, and an empty xid, are refused.
+#[test]
+fn a_replica_applies_a_spanning_share_with_its_xid() {
+    let (pv, rv) = (SimVfs::new(41), SimVfs::new(42));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let mut own = replica.feed().open().unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let xid = b"p0:h3-0123456789abcdef0123456789abcdef";
+    // (row, silent, tagged): a spanning commit's share is a tagged transaction (no producer
+    // makes one silent too; the flags' combination is replication.rs's unit test).
+    let steps: [(&[u8], bool, bool); 3] = [
+        (b"plain", false, false),
+        (b"tagged", false, true),
+        (b"quiet", true, false),
+    ];
+    for (row, silent, tagged) in steps {
+        commit(&primary, &t, row, silent, tagged.then_some(&xid[..]));
+        let events = ready(&mut feed);
+        let commits: Vec<_> = events.iter().filter(|e| !e.is_catalog()).collect();
+        assert_eq!(commits.len(), 1);
+        let e = commits[0];
+        let bytes = e.encode();
+        let want = match (tagged, silent) {
+            (true, _) => 3,
+            (false, true) => 2,
+            (false, false) => 1,
+        };
+        assert_eq!(bytes[0], want, "{}", hex(row));
+        assert_eq!(e.xid(), tagged.then_some(&xid[..]));
+        assert_eq!(e.is_silent(), silent);
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert_eq!(back.encode(), bytes, "it round-trips");
+        assert_eq!(back.xid(), e.xid());
+        assert_eq!(back.is_silent(), silent);
+        if tagged {
+            // Unknown flag bits, or a tagged flag with an empty xid, are refused.
+            let mut b = bytes.clone();
+            b[1] |= 0x80;
+            assert!(ReplicatedEvent::decode(&b).is_err(), "an unknown flag");
+            let mut b = bytes.clone();
+            b.splice(2..6 + xid.len(), 0u32.to_le_bytes());
+            assert!(ReplicatedEvent::decode(&b).is_err(), "an empty xid");
+            // Version 3 without the xid flag is never written: refused.
+            let mut b = bytes.clone();
+            b[1] &= !2;
+            b.splice(2..6 + xid.len(), []);
+            assert!(ReplicatedEvent::decode(&b).is_err(), "v3 without an xid");
+        }
+        apply(&replica, &events, 1);
+    }
+    assert_eq!(contents(&replica), contents(&primary));
+    // The replica's own feed: the loud commits, the tagged one with its xid.
+    let mut seen = Vec::new();
+    while let Some(ev) = own.next_event(Duration::from_millis(200)).unwrap() {
+        if let FeedEvent::Commit(c) = ev {
+            for ch in c.changes() {
+                seen.push((ch.row().to_vec(), c.xid().map(<[u8]>::to_vec)));
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            (b"plain".to_vec(), None),
+            (b"tagged".to_vec(), Some(xid.to_vec())),
+        ]
+    );
+    // A run mixing two xids and an untagged commit, applied as one call: each tagged share
+    // is its own part, so no tag spreads to a neighbour.
+    let other = b"p0:h3-fedcba9876543210fedcba9876543210";
+    for (row, x) in [
+        (&b"m1"[..], Some(&xid[..])),
+        (b"m2", Some(&other[..])),
+        (b"m3", None),
+        (b"m4", Some(&xid[..])),
+    ] {
+        commit(&primary, &t, row, false, x);
+    }
+    let events = ready(&mut feed);
+    apply(&replica, &events, events.len());
+    let mut seen = Vec::new();
+    while let Some(ev) = own.next_event(Duration::from_millis(200)).unwrap() {
+        if let FeedEvent::Commit(c) = ev {
+            for ch in c.changes() {
+                seen.push((ch.row().to_vec(), c.xid().map(<[u8]>::to_vec)));
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            (b"m1".to_vec(), Some(xid.to_vec())),
+            (b"m2".to_vec(), Some(other.to_vec())),
+            (b"m3".to_vec(), None),
+            (b"m4".to_vec(), Some(xid.to_vec())),
+        ]
+    );
+    assert_eq!(contents(&replica), contents(&primary));
+    drop((feed, own));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4a, landing after D329 2b (simp724's S1 on #2089): a range drop waits for a
+/// live read hold, as for a share in doubt (`Busy`, to retry), and runs once the hold goes.
+#[cfg(feature = "__unstable-txn-prepare")]
+#[test]
+fn a_range_drop_waits_for_a_read_hold() {
+    let vfs = SimVfs::new(59);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"r5").put("a", b"q", b"v").commit().unwrap();
+    let mut txn = db.transaction().unwrap();
+    txn.get(&t, b"r5", "a", b"q").unwrap();
+    let hold = txn.hold_reads().unwrap();
+    assert_eq!(
+        db.drop_range(&t, b"r3", Some(b"r7")).unwrap_err().code(),
+        ErrorCode::Busy
+    );
+    drop(hold);
+    db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    assert!(t.get(b"r5", "a", b"q").unwrap().is_none());
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a, landing after D329 2b (perf2 and simp724 on #2089): a range drop right
+/// after a spanning commit's share carries no xid. The tagged commit replicates with its
+/// xid, the drop after it with none (so in the plain version, which a drop must be: one
+/// in the flags form is refused), and the replica matches its primary.
+#[test]
+fn a_range_drop_after_a_tagged_commit_carries_no_xid() {
+    let (pv, rv) = (SimVfs::new(60), SimVfs::new(61));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let xid = b"p0:h3-0123456789abcdef0123456789abcdef";
+    commit(&primary, &t, b"r1", false, Some(xid));
+    primary.drop_range(&t, b"r5", Some(b"r9")).unwrap();
+    commit(&primary, &t, b"r2", false, None);
+    let events = ready(&mut feed);
+    let tagged: Vec<(bool, Option<Vec<u8>>)> = events
+        .iter()
+        .filter(|e| !e.is_catalog())
+        .map(|e| (e.is_range_drop(), e.xid().map(<[u8]>::to_vec)))
+        .collect();
+    assert_eq!(
+        tagged,
+        [(false, Some(xid.to_vec())), (true, None), (false, None)],
+        "the tagged commit, the drop, the plain commit"
+    );
+    let drop_event = events.iter().find(|e| e.is_range_drop()).unwrap();
+    assert_eq!(drop_event.encode()[0], 1, "a drop in the plain version");
+    apply(&replica, &events, 3);
+    assert_eq!(contents(&replica), contents(&primary));
+    drop((feed, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4a (#2089's crash sweep on macOS, "root commits overlap"): a database's first
+/// feed-silent commit sets `incompat` bit 3 under the manifest writer's exclusion, as a
+/// manifest commit does, never beside a root commit in flight. While a hold has the
+/// exclusion, the commit waits for it; it goes through once the hold is dropped.
+#[test]
+fn the_first_silent_commit_flags_its_bit_under_the_writers_exclusion() {
+    let vfs = SimVfs::new(62);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let hold = db.hold_root_commits(Duration::from_secs(5)).unwrap();
+    std::thread::scope(|sc| {
+        let silent = sc.spawn(|| {
+            let mut wb = db.write_batch();
+            wb.mark_feed_silent();
+            wb.put(&t, b"r", "a", b"q", b"v");
+            wb.commit()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !silent.is_finished(),
+            "the bit is set only under the writer's exclusion"
+        );
+        drop(hold);
+        silent.join().unwrap().unwrap();
+    });
+    assert!(t.get(b"r", "a", b"q").unwrap().is_some());
     drop(t);
     db.close().unwrap();
 }

@@ -31,8 +31,8 @@ const DRAIN_WAIT: Duration = Duration::from_secs(30);
 
 /// How often a node whose partition has no lease asks its peers again (cli692's S3): the
 /// first wait, doubled up to the last, and never more than a third of a lease.
-const RETRY_FIRST: Duration = Duration::from_millis(250);
-const RETRY_MAX: Duration = Duration::from_secs(5);
+pub(super) const RETRY_FIRST: Duration = Duration::from_millis(250);
+pub(super) const RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Reads `dir`'s fenced partitions; none when there's no file.
 pub(crate) fn read_fenced(dir: &Path) -> Result<BTreeSet<String>, String> {
@@ -298,6 +298,17 @@ impl Fences {
         self.local().entry(id.to_owned()).or_default().is = Is::Served(Served { gate, epoch });
     }
 
+    /// Partition `id`, served here, is at `epoch` now (D331's hand-over raised it on its
+    /// own node): its lease rounds ask at it.
+    pub(super) fn raise_epoch(&self, id: &str, epoch: u64) {
+        if let Some(Local {
+            is: Is::Served(s), ..
+        }) = self.local().get_mut(id)
+        {
+            s.epoch = s.epoch.max(epoch);
+        }
+    }
+
     pub(super) fn gate(&self, id: &str) -> Option<(Arc<WriteGate>, u64)> {
         match &self.local().get(id)?.is {
             Is::Served(s) => Some((Arc::clone(&s.gate), s.epoch)),
@@ -384,6 +395,8 @@ impl Fences {
                 out.push(LeasePart {
                     partition: id.to_owned(),
                     epoch: s.epoch,
+                    term: 0,
+                    ..LeasePart::default()
                 });
             }
         });
@@ -658,8 +671,15 @@ impl Node {
         }
         let answers: Vec<(String, String, ClusterMap)> =
             asks.join_all().await.into_iter().flatten().collect();
-        if let Some((peer, _, newest)) = answers.iter().max_by_key(|(_, _, m)| m.map_version)
-            && newest.map_version > self.state().version()
+        // Ordered by `(writer_term, map_version)` (D330, simp724's S1 on the PR 1 plan): an
+        // old writer's minority map, at a higher version but a lower term, is behind.
+        let mine_key = self
+            .get_map()
+            .map_or((0, 0), |m| (m.writer_term, m.map_version));
+        if let Some((peer, _, newest)) = answers
+            .iter()
+            .max_by_key(|(_, _, m)| (m.writer_term, m.map_version))
+            && (newest.writer_term, newest.map_version) > mine_key
             && let Err(e) = self
                 .push_map_async(newest.clone(), Some(peer.clone()))
                 .await
@@ -675,7 +695,8 @@ impl Node {
         let mut divergent = Vec::new();
         let mut pushes = tokio::task::JoinSet::new();
         for (peer, address, theirs) in &answers {
-            match theirs.map_version.cmp(&map.map_version) {
+            match (theirs.writer_term, theirs.map_version).cmp(&(map.writer_term, map.map_version))
+            {
                 std::cmp::Ordering::Equal if super::map::canonical_json(theirs) == json => {
                     holders += usize::from(members.contains(peer.as_str()));
                 }
@@ -684,13 +705,13 @@ impl Node {
                     let (node, peer, address, map) =
                         (Arc::clone(self), peer.clone(), address.clone(), map.clone());
                     pushes.spawn(async move {
-                        let took = tokio::time::timeout(
+                        let pushed = tokio::time::timeout(
                             node.peers.push_timeout,
                             node.push_to(&address, map),
                         )
                         .await
-                        .is_ok_and(|r| r.is_ok());
-                        (peer, took)
+                        .unwrap_or_else(|_| Err("timed out".to_owned()));
+                        (peer, pushed)
                     });
                 }
                 // Newer than the map this node now holds: its install was refused (a forced
@@ -701,19 +722,42 @@ impl Node {
         }
         // An answerer that was behind counts once it took the map. One that didn't blocks
         // the round: it answered with an older map, and may be an old owner that hasn't taken
-        // the move yet (audit120's F2). A peer that never answered doesn't block.
+        // the move yet (audit120's F2). A peer that never answered doesn't block, and nor
+        // does one whose term fence refused the map (#2073): it voted above the map's term,
+        // and takes no map below it. It counts as one that never answered. That's safe by
+        // D326, not by F2 (audit120's S1 on #2083): it can't renew a lease once a majority
+        // holds a newer map, a lease it still holds is withheld from any other node by its
+        // grantors until it runs out, and a round that leaves it out still needs a majority of
+        // holders and of grants. Were it to block, a node stranded by a lost vote would stop
+        // every node's leases, the writer's included, and the writer could never adopt the
+        // term that lets it take the map.
         let mut behind = Vec::new();
         let mut holding: Vec<(String, String)> = answers
             .iter()
             .filter(|(peer, _, theirs)| {
                 members.contains(peer.as_str())
-                    && theirs.map_version == map.map_version
+                    && (theirs.writer_term, theirs.map_version)
+                        == (map.writer_term, map.map_version)
                     && !divergent.contains(peer)
             })
             .map(|(peer, address, _)| (peer.clone(), address.clone()))
             .collect();
-        for (peer, took) in pushes.join_all().await {
-            if took {
+        let writer = super::schema::writer(&map) == self.id;
+        for (peer, pushed) in pushes.join_all().await {
+            if let Err(e) = &pushed
+                && e.contains(super::VOTED_ABOVE)
+            {
+                // The writer's duties look at it (#2073).
+                if writer {
+                    let now = self.grants.clock().now();
+                    self.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .refused(&peer, now, self.grants.lease());
+                }
+                continue;
+            }
+            if pushed.is_ok() {
                 holders += usize::from(members.contains(peer.as_str()));
                 if members.contains(peer.as_str())
                     && let Some((_, address, _)) = answers.iter().find(|(p, _, _)| *p == peer)
@@ -739,11 +783,66 @@ impl Node {
         Ok(round)
     }
 
+    /// Partition `id`'s in-doubt external shares here (D329), for its lease part (D330 PR
+    /// 2's F7): their xids as UTF-8 (hex if not), as many as fit in
+    /// [`super::map::IN_DOUBT_BYTES`], and how many there are. None while it isn't served
+    /// here.
+    fn in_doubt_of(&self, id: &str) -> (Vec<String>, u64) {
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
+            return (Vec::new(), 0);
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let parts = cluster.parts.load();
+        let Some(Ok(part)) = parts.get(id).map(|s| s.part()) else {
+            return (Vec::new(), 0);
+        };
+        let all = part.db.in_doubt();
+        let mut xids = Vec::new();
+        let mut bytes = 0;
+        for (xid, _) in &all {
+            // As the operator pastes it into `phdb cluster txn decide` (simp724's M1 on
+            // #2069): serve's xids are UTF-8; another's bytes go as hex.
+            let text = String::from_utf8(xid.clone()).unwrap_or_else(|_| {
+                use std::fmt::Write as _;
+                xid.iter()
+                    .fold(String::with_capacity(xid.len() * 2), |mut s, b| {
+                        let _ = write!(s, "{b:02x}");
+                        s
+                    })
+            });
+            bytes += text.len();
+            if bytes > super::map::IN_DOUBT_BYTES {
+                break;
+            }
+            xids.push(text);
+        }
+        (xids, all.len() as u64)
+    }
+
     /// A round's lease requests (D326): to each node in `holding` (id, address), which hold
     /// the round's map, and to this node's own grants if the map names it; each bounded by
     /// the push timeout. Counts each partition's grants into `round`.
     async fn ask_leases(self: &Arc<Self>, round: &mut Round, holding: &[(String, String)]) {
-        let parts = self.fences.askable(&round.map, &self.id);
+        let mut parts = self.fences.askable(&round.map, &self.id);
+        // With failover on, each part carries the partition's in-doubt shares, so a writer
+        // that fails it over can name them (D330 PR 2's F7).
+        if round.map.failover {
+            for p in &mut parts {
+                (p.in_doubt_xids, p.in_doubt_count) = self.in_doubt_of(&p.partition);
+            }
+        }
+        // The writer lease (D330): the map's writer asks for it at the map's term; a
+        // candidate, at the term it was voted, until its map lands.
+        if let Some(term) = self.writer_term_to_ask(&round.map) {
+            parts.push(LeasePart {
+                partition: super::lease::WRITER_LEASE.to_owned(),
+                epoch: 0,
+                term,
+                ..LeasePart::default()
+            });
+        }
         // Nothing to ask, and nothing asked last time: no grant here to end.
         if !self
             .fences
@@ -765,6 +864,8 @@ impl Node {
             parts,
             lease_ms: self.grants.lease_ms(),
             start: self.grants.start(),
+            writer_term: round.map.writer_term,
+            pre_vote: false,
         };
         let mut asks = tokio::task::JoinSet::new();
         for (peer, address) in holding {
@@ -809,7 +910,15 @@ impl Node {
                                          each lease this node asks, until it's upgraded"
                                     );
                                 }
-                                let granted = req.parts.clone();
+                                // Never the writer lease (D330, simp724's N1 on the PR 1
+                                // plan): a 1.2 node grants no such thing, so a phantom
+                                // grant mustn't count toward it.
+                                let granted = req
+                                    .parts
+                                    .iter()
+                                    .filter(|p| p.partition != super::lease::WRITER_LEASE)
+                                    .cloned()
+                                    .collect();
                                 Some((
                                     peer,
                                     super::proto::LeaseResponse {
@@ -868,6 +977,25 @@ impl Node {
     /// costs the new owner a wait until the grant runs out, never safety. Numbered as a
     /// lease round, so an older round's request that arrives after it is ignored.
     pub(crate) fn release_soon(&self, id: &str, epoch: u64) {
+        self.release_part_soon(LeasePart {
+            partition: id.to_owned(),
+            epoch,
+            term: 0,
+            ..LeasePart::default()
+        });
+    }
+
+    /// The next lease round's number, for a request or a release.
+    pub(super) fn next_round(&self) -> u64 {
+        self.fences
+            .round
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// [`Node::release_soon`] of any part: a partition at its epoch, or the writer lease at
+    /// its term (D330, simp724's N2 on the PR 1 plan).
+    pub(crate) fn release_part_soon(&self, part: LeasePart) {
         let (Some(node), Ok(rt), Ok(map)) = (
             self.me.upgrade(),
             tokio::runtime::Handle::try_current(),
@@ -878,15 +1006,8 @@ impl Node {
         let req = super::proto::ReleaseRequest {
             cluster_id: map.cluster_id.clone(),
             node_id: self.id.clone(),
-            round: self
-                .fences
-                .round
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1,
-            parts: vec![LeasePart {
-                partition: id.to_owned(),
-                epoch,
-            }],
+            round: self.next_round(),
+            parts: vec![part],
             start: self.grants.start(),
         };
         self.grants.release(&req);
@@ -934,7 +1055,7 @@ impl Node {
     /// before D326 answers `Unimplemented`). A failed connect is `Unavailable` and a request
     /// that can't be built `Internal`, never `Unimplemented`, so neither can count as a 1.2
     /// peer's grant.
-    async fn ask_lease(
+    pub(super) async fn ask_lease(
         &self,
         address: &str,
         req: LeaseRequest,
@@ -1018,6 +1139,7 @@ impl Node {
             }
         };
         self.apply_leases(&round);
+        self.note_writer_lease(&round);
         // A lease-less partition's feeds wait while the node reaches a majority, and end
         // once it doesn't (feed1248's F2).
         self.grants.clock().set_majority(round.majority());
@@ -1073,6 +1195,8 @@ impl Node {
     /// One loop per node, started once its partitions are open; it holds the node only
     /// while a round runs, and ends once the node is gone.
     pub(crate) fn renew_leases(self: &Arc<Self>) {
+        // The node's device ceiling's readings start with its lease renewals (D332).
+        self.watch_device();
         if self
             .fences
             .retrying
@@ -1084,6 +1208,12 @@ impl Node {
             self.fences
                 .retrying
                 .store(false, std::sync::atomic::Ordering::Release);
+            // Said, not silent (simp724's nit on D331 PR 2): a partition that asked for a
+            // lease here would otherwise hold it only until its first grant runs out.
+            eprintln!(
+                "phdb serve: the lease renewals can't start here (no runtime); the next \
+                 call from the node's runtime starts them"
+            );
             return;
         };
         let me = Arc::downgrade(self);
@@ -1095,7 +1225,11 @@ impl Node {
                 let started = tokio::time::Instant::now();
                 let asked = node.fences.asked.load(std::sync::atomic::Ordering::Acquire);
                 let missing = match node.get_map() {
-                    Ok(map) if asked || !node.fences.askable(&map, &node.id).is_empty() => {
+                    Ok(map)
+                        if asked
+                            || !node.fences.askable(&map, &node.id).is_empty()
+                            || node.writer_term_to_ask(&map).is_some() =>
+                    {
                         match node.confirm_round().await {
                             Some(r) => !node.fences.confirmable(&r.map, &node.id).is_empty(),
                             None => true,
@@ -1103,6 +1237,9 @@ impl Node {
                     }
                     _ => false,
                 };
+                // An election of the map's writer, then failovers, if due (D330), off this
+                // task.
+                node.spawn_duties();
                 drop(node);
                 let next = if missing {
                     let w = wait.min(period);

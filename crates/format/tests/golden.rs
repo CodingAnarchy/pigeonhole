@@ -32,8 +32,8 @@ use pigeonhole_format::sst::{Footer, Properties};
 use pigeonhole_format::superblock::{ExtentRef, Superblock};
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value, encode_value};
 use pigeonhole_format::wal::{
-    BatchBuilder, ExternalRead, ExternalShare, FRAME_SIZE, FrameEncoder, SegmentHeader, StreamList,
-    WalRecord,
+    BatchBuilder, DroppedRange, ExternalRead, ExternalShare, FRAME_SIZE, FrameEncoder,
+    SegmentHeader, StreamList, WalRecord,
 };
 use pigeonhole_format::{
     BlobFileId, FamilyId, FormatVersion, Lsn, SstId, StreamId, TableId, TabletId,
@@ -951,6 +951,101 @@ fn wal() {
     }
     // Starting 100 bytes before a frame end, so the first record is split First/Last.
     check("wal_fragments.bin", &frames);
+
+    // D331 (ICR 0141): the same batch marked feed-silent (`count` bit 31), in each record
+    // that carries a batch. `decode` refuses each (a file without `incompat` bit 3, or a
+    // build before D331); `decode_with(.., true)` takes it, mark and all (perf2's S1, S2).
+    let mut quiet = BatchBuilder::from_batch(b.batch());
+    quiet.mark_silent();
+    let mut quiet_share = Vec::new();
+    ExternalShare::encode(
+        b"p1:h3-00ff",
+        &[StreamId(0), StreamId(5)],
+        reads.iter().copied(),
+        Some(quiet.batch()),
+        &mut quiet_share,
+    )
+    .unwrap();
+    let silent = [
+        (
+            "wal_record_batch_silent.bin",
+            WalRecord::Batch {
+                seqno: 106,
+                commit_ts: 1_700_000_000_000_003,
+                batch: quiet.batch(),
+            },
+        ),
+        (
+            "wal_record_prepare_silent.bin",
+            WalRecord::Prepare {
+                seqno: 107,
+                commit_ts: 1_700_000_000_000_004,
+                coordinator: StreamId(0),
+                batch: quiet.batch(),
+            },
+        ),
+        (
+            "wal_record_external_prepare_silent.bin",
+            WalRecord::ExternalPrepare {
+                seqno: 108,
+                coordinator: StreamId(0),
+                share: ExternalShare::decode(&quiet_share, true).unwrap(),
+            },
+        ),
+    ];
+    for (name, rec) in &silent {
+        let mut out = Vec::new();
+        rec.encode(&mut out);
+        check(name, &out);
+        let taken = WalRecord::decode_with(&out, true).unwrap();
+        assert_eq!(&taken, rec, "{name}");
+        assert!(taken.batch().unwrap().is_silent(), "{name}");
+        for refused in [WalRecord::decode(&out), WalRecord::decode_with(&out, false)] {
+            assert!(
+                matches!(refused, Err(pigeonhole_format::Error::Corrupt { .. })),
+                "{name}: {refused:?}"
+            );
+        }
+    }
+
+    // D331 PR 4a (ICR 0141): a range drop, bounded and to the table's end. Behind
+    // `incompat` bit 3 as the silent mark is: `decode` refuses it (`Corrupt`).
+    let (mut bounded, mut open) = (Vec::new(), Vec::new());
+    DroppedRange::encode(&mut bounded, TableId(3), b"m", Some(b"t\x00")).unwrap();
+    DroppedRange::encode(&mut open, TableId(3), b"", None).unwrap();
+    let drops = [
+        (
+            "wal_record_range_drop.bin",
+            WalRecord::RangeDrop {
+                seqno: 109,
+                range: DroppedRange::decode(&bounded).unwrap(),
+            },
+        ),
+        (
+            "wal_record_range_drop_to_end.bin",
+            WalRecord::RangeDrop {
+                seqno: 110,
+                range: DroppedRange::decode(&open).unwrap(),
+            },
+        ),
+    ];
+    for (name, rec) in &drops {
+        let mut out = Vec::new();
+        rec.encode(&mut out);
+        check(name, &out);
+        assert_eq!(&WalRecord::decode_with(&out, true).unwrap(), rec, "{name}");
+        assert!(rec.batch().is_none());
+        for refused in [WalRecord::decode(&out), WalRecord::decode_with(&out, false)] {
+            assert!(
+                matches!(refused, Err(pigeonhole_format::Error::Corrupt { .. })),
+                "{name}: {refused:?}"
+            );
+        }
+    }
+    let WalRecord::RangeDrop { range, .. } = drops[0].1 else {
+        unreachable!()
+    };
+    assert_eq!(range.fields(), (TableId(3), &b"m"[..], Some(&b"t\x00"[..])));
 }
 
 #[test]

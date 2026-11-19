@@ -67,8 +67,8 @@ fn for_each_piece(
 }
 
 /// How many written bytes a blob file gathers before it starts their writeback (#2023): the
-/// SST writer's chunk (D334).
-const HINT_BYTES: u64 = 1 << 20;
+/// SST writer's chunk (D334), 256 KiB, for the same reason.
+const HINT_BYTES: u64 = 256 << 10;
 
 pub(crate) struct Writer {
     file: FileRef,
@@ -202,7 +202,7 @@ impl Writer {
         let mut at = offset;
         for mut bytes in [&header[..], value] {
             while !bytes.is_empty() {
-                // Up to the next megabyte since the last hint, so a long value's writeback
+                // Up to the next chunk since the last hint, so a long value's writeback
                 // starts as it is written, a chunk at a time, and not all at its end.
                 let n = match self.buffered {
                     true => (HINT_BYTES - (at - self.hinted)).min(bytes.len() as u64) as usize,
@@ -228,7 +228,7 @@ impl Writer {
     }
 
     pub(crate) fn finish(mut self) -> (Vec<ExtentRef>, u64) {
-        // The last, partial megabyte.
+        // The last, partial chunk.
         self.hint_to(self.pos);
         (self.extents, self.pos)
     }

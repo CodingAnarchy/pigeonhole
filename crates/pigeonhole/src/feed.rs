@@ -82,12 +82,6 @@ impl Change {
         self.ids
     }
 
-    /// The stored value, its tag byte first; empty for deletes.
-    #[cfg(feature = "__unstable-replication")]
-    pub(crate) fn stored(&self) -> &[u8] {
-        &self.stored
-    }
-
     /// The table's name. Empty only for a family created after the feed opened whose table
     /// was dropped before the feed reached this change: its name went with the table.
     pub fn table(&self) -> &str {
@@ -119,6 +113,16 @@ impl Change {
         self.ts
     }
 
+    /// The value as the engine stored it, tag byte first (empty for the deletes): what a
+    /// range move's target writes again with
+    /// [`LoggedBatch::push`](crate::replication::LoggedBatch::push) (D331 PR 4). Not part of
+    /// the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn stored(&self) -> &[u8] {
+        &self.stored
+    }
+
     /// The value written or merged, as the read API types it; `None` for the deletes.
     pub fn value(&self) -> Option<Value<'_>> {
         if self.kind.is_delete() {
@@ -139,6 +143,8 @@ pub struct Commit {
     seqno: u64,
     ts: u64,
     changes: Vec<Change>,
+    /// A spanning commit's xid (D329 2b): [`xid`](Self::xid), and a replicated event's.
+    pub(crate) xid: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Commit {
@@ -151,6 +157,16 @@ impl Commit {
     /// Its commit timestamp.
     pub fn timestamp(&self) -> u64 {
         self.ts
+    }
+
+    /// The transaction it is a share of, when it's a spanning commit's (D329 2b, ICR 0140
+    /// amendment 2): every share of one commit, on every partition, carries the same, so a
+    /// subscriber can group them. `None` for any other commit. Hidden, as
+    /// [`Transaction::tag_xid`](crate::Transaction::tag_xid).
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn xid(&self) -> Option<&[u8]> {
+        self.xid.as_deref()
     }
 
     /// Its changes the feed follows, in the order the commit wrote them.
@@ -166,6 +182,7 @@ impl Commit {
             seqno: 0,
             ts: 0,
             changes: Vec::new(),
+            xid: None,
         }
     }
 }
@@ -181,6 +198,13 @@ pub enum FeedEvent {
     /// Tables created or dropped, or families added: every commit before it saw the old
     /// tables, every commit after it the new ones.
     Catalog(CatalogChange),
+    /// A range drop (D331), to a replica's follower only
+    /// ([`include_silent`](Feed::include_silent)): apply it with
+    /// [`Pigeonhole::apply_range_drop`](crate::Pigeonhole::apply_range_drop). Not part of
+    /// the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    RangeDrop(crate::replication::RangeDrop),
 }
 
 /// One change to the database's tables, as a feed of every table delivers it
@@ -463,7 +487,9 @@ impl FeedBuilder {
             },
             covered: pigeonhole_engine::FeedPosition::default(),
             span: (start, start),
+            xid_out: false,
             progress: FeedProgress::attach(reader_progress),
+            include_silent: false,
         })
     }
 }
@@ -560,8 +586,14 @@ pub struct Feed {
     /// The stream's position before and after the last delivery (D315 PR 3): a replica checks
     /// that the runs it applies chain, each starting where the last ended.
     span: (StreamPosition, StreamPosition),
+    /// The commit last delivered carried an xid (D329 2b): the next delivery clears it. With
+    /// none now and none before, a delivery's xid costs one test (#2076's feed shapes).
+    xid_out: bool,
     /// Its position, published by the reader as it moves ([`Feed::progress`]).
     progress: FeedProgress,
+    /// Feed-silent commits are delivered (D331: a replica's follower only), kept across a
+    /// resubscribe.
+    include_silent: bool,
 }
 
 /// Where a [`Feed`] is, readable from any thread ([`Feed::progress`], D316 A4, ICR 0116): a
@@ -710,6 +742,9 @@ impl Feed {
             match step(&mut self.out, &self.db, self.generation, next, events)? {
                 Step::Ready => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     return Ok(true);
                 }
                 // A catalog change a commits-only call passes over, or a superseded
@@ -742,6 +777,9 @@ impl Feed {
             return match step(&mut self.out, &self.db, self.generation, next, events)? {
                 Step::Ready => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     Ok(true)
                 }
                 Step::Again => continue,
@@ -780,6 +818,9 @@ impl Feed {
             return match step(&mut self.out, &self.db, self.generation, next, events) {
                 Ok(Step::Ready) => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     Poll::Ready(Ok(()))
                 }
                 Ok(Step::Again) => continue,
@@ -815,7 +856,19 @@ impl Feed {
             event,
             self.span,
             self.token(),
+            self.reader.silent(),
         ))
+    }
+
+    /// Delivers the primary's feed-silent commits too (D331, ICR 0141), each marked in
+    /// [`replicated`](Self::replicated): for a replica's follower only, which applies them
+    /// silent. [`FeedBuilder`](crate::FeedBuilder) has no such option, so a client's
+    /// subscription never sees them. Not part of the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn include_silent(&mut self) {
+        self.include_silent = true;
+        self.reader.include_silent();
     }
 
     /// The digest of the catalog at the feed's position, for a feed of every table (#1853
@@ -829,9 +882,77 @@ impl Feed {
     }
 
     /// A delivery happened: the span from the last one's end to the stream's position now.
+    /// D331: a range drop comes from the engine as an empty commit at its seqno, which the
+    /// reader names ([`FeedReader::range_drop`](pigeonhole_engine::FeedReader::range_drop);
+    /// only with `include_silent`). An event call gets it as [`FeedEvent::RangeDrop`]; a
+    /// commits-only call passes it over (true).
+    #[inline(always)]
+    fn drop_passed(&mut self, events: bool) -> bool {
+        // One flag for a commit (#2089's callgrind): only a feed that includes feed-silent
+        // records gets a drop.
+        if !self.include_silent || self.reader.range_drop().is_none() {
+            return false;
+        }
+        self.drop_taken(events)
+    }
+
+    /// [`drop_passed`](Self::drop_passed) for a delivery that is a drop's.
+    #[cold]
+    #[inline(never)]
+    fn drop_taken(&mut self, events: bool) -> bool {
+        let Some(_drop) = self.reader.range_drop() else {
+            return false;
+        };
+        // Only a commit can stand for a drop: a catalog change delivered after one leaves
+        // the reader's drop behind it (feed1248 on #2089).
+        if events && !matches!(self.out.event, Some(FeedEvent::Commit(_))) {
+            return false;
+        }
+        if !events {
+            return true;
+        }
+        #[cfg(feature = "__unstable-replication")]
+        {
+            self.out.event = Some(FeedEvent::RangeDrop(
+                crate::replication::RangeDrop::from_engine(_drop),
+            ));
+            false
+        }
+        // Without the feature no feed includes feed-silent records, so none gets a drop.
+        #[cfg(not(feature = "__unstable-replication"))]
+        true
+    }
+
     fn note_delivery(&mut self) {
         let after = stream_position(&self.reader);
         self.span = (self.span.1, after);
+        // A spanning commit's xid (D329 2b), which the engine's reader keeps beside the
+        // commit: into the commit just delivered, as an event or on its own.
+        if self.xid_out || self.reader.xid().is_some() {
+            self.deliver_xid();
+        }
+    }
+
+    /// [`note_delivery`](Self::note_delivery)'s xid, out of line: only once a spanning
+    /// commit's share has been delivered.
+    #[cold]
+    #[inline(never)]
+    fn deliver_xid(&mut self) {
+        let xid = self.reader.xid().cloned();
+        self.xid_out = xid.is_some();
+        match &mut self.out.event {
+            Some(FeedEvent::Commit(c)) => c.xid = xid,
+            // Not a commit: nothing carries an xid, and the commit buffer's (the last
+            // commit's, which `fill` leaves) is cleared, so `xid_out` is set exactly when the
+            // buffer holds one. Otherwise a reader replaced since that commit (a resubscribe,
+            // its `xid()` none) would let the next plain commit skip this and go out with the
+            // old xid (audit120's X1 on #2076).
+            Some(_) => {
+                self.out.commit.xid = None;
+                self.xid_out = false;
+            }
+            None => self.out.commit.xid = xid,
+        }
     }
 
     /// The error that ended the feed, again.
@@ -902,6 +1023,9 @@ impl Feed {
         // position, so it stays covered.
         self.covered = self.covered.join(self.reader.position());
         reader.set_progress(Arc::clone(&self.progress.covered));
+        if self.include_silent {
+            reader.include_silent();
+        }
         self.reader = reader;
         self.generation = generation;
         Ok(())
@@ -1175,6 +1299,76 @@ mod tests {
             assert_eq!(feed.next(Duration::from_secs(5)).unwrap_err(), e);
             assert_eq!(feed.try_next().unwrap_err(), e);
         }
+        drop(feed);
+        db.close().unwrap();
+    }
+
+    /// audit120's X1 on #2076: a feed of every table delivers a spanning commit's share with
+    /// its xid, then resubscribes (as after a recovery or its writer's restart: the new
+    /// reader's `xid()` is none), then delivers a catalog change and a plain commit. The plain
+    /// commit carries no xid, as an event and as a replica would apply it, so no replica
+    /// logs it as a share of the earlier transaction.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[test]
+    fn a_plain_commit_after_a_resubscribe_and_a_catalog_change_carries_no_xid() {
+        let dir = crate::doc_support::temp_dir();
+        let db = Pigeonhole::open(
+            dir.join("db.phdb"),
+            Options::default().change_feed(FeedRetention::bytes(16 << 20)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let mut feed = db.feed().open().unwrap();
+        let wait = Duration::from_secs(5);
+        let next_commit = |feed: &mut Feed| loop {
+            match feed.next_event(wait).unwrap().expect("an event") {
+                FeedEvent::Commit(c) => return c.xid().map(<[u8]>::to_vec),
+                _ => continue,
+            }
+        };
+        let xid = b"p0:h1-0123456789abcdef0123456789abcdef";
+        let mut txn = db.transaction().unwrap();
+        txn.put(&t, b"share", "f", b"q", b"v");
+        txn.tag_xid(xid);
+        txn.commit().unwrap();
+        assert_eq!(next_commit(&mut feed).as_deref(), Some(&xid[..]));
+        feed.resubscribe().unwrap();
+        assert!(
+            feed.reader.xid().is_none(),
+            "a fresh reader has delivered nothing"
+        );
+        db.table("u")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        assert!(
+            matches!(feed.next_event(wait).unwrap(), Some(FeedEvent::Catalog(_))),
+            "the table's creation"
+        );
+        t.mutate(b"plain").put("f", b"q", b"v").commit().unwrap();
+        assert_eq!(
+            next_commit(&mut feed),
+            None,
+            "the plain commit carries no xid"
+        );
+        #[cfg(feature = "__unstable-replication")]
+        assert_eq!(
+            feed.replicated().expect("the commit").xid(),
+            None,
+            "nor as a replica applies it"
+        );
+        // A later share still carries its own.
+        let mut txn = db.transaction().unwrap();
+        txn.put(&t, b"again", "f", b"q", b"v");
+        txn.tag_xid(xid);
+        txn.commit().unwrap();
+        assert_eq!(next_commit(&mut feed).as_deref(), Some(&xid[..]));
         drop(feed);
         db.close().unwrap();
     }

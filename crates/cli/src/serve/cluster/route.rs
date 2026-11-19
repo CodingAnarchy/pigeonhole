@@ -91,6 +91,7 @@ pub(crate) struct Owner {
     /// before it can't resume.
     pub history_epoch: u64,
     /// P's replicas (D328), in the map's order of preference: each node's id and address.
+    /// None while a range move gates P's copies (D331 PR 3; see [`Routes::new`]).
     pub replicas: Vec<(String, String)>,
 }
 
@@ -118,6 +119,21 @@ impl Routes {
             .iter()
             .map(|n| (n.id.as_str(), n.address.as_str()))
             .collect();
+        // D331 PR 3: a partition a move names as its target, or as its source from the
+        // hand-over on, has its bounded reads served by its owner while the move is in the
+        // map: its copies' range gates may refuse the range (a copy of the target serves it
+        // only once it has applied the target's serving row), and a read refused there
+        // mustn't count against a copy's health (cli692's F6). The copies' own gates still
+        // refuse a read sent by a node with an older map.
+        let moving = |id: &str| {
+            // A NODE move (a whole relocation, D332 PR 2) leaves the copies serving reads.
+            map.moves.iter().any(|m| {
+                !super::map::node_move(m)
+                    && (m.to == id
+                        || (m.from == id
+                            && super::map::phase(m) >= crate::serve::proto::MovePhase::HandedOver))
+            })
+        };
         let owners = map
             .partitions
             .iter()
@@ -131,6 +147,7 @@ impl Routes {
                     replicas: p
                         .replicas
                         .iter()
+                        .filter(|_| !moving(&p.id))
                         .map(|r| {
                             let address = addresses.get(r.as_str()).copied().unwrap_or_default();
                             (r.clone(), address.to_owned())
@@ -306,6 +323,20 @@ impl Routes {
         self.owners.get(partition)
     }
 
+    /// Every node the map places a partition or a replica copy on, once each: `(id,
+    /// address)`.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        let mut seen = std::collections::BTreeMap::new();
+        for o in self.owners.values() {
+            seen.entry(o.node.clone())
+                .or_insert_with(|| o.address.clone());
+            for (n, a) in &o.replicas {
+                seen.entry(n.clone()).or_insert_with(|| a.clone());
+            }
+        }
+        seen.into_iter()
+    }
+
     /// Whether a node of the map is at `address`.
     pub(crate) fn has_address(&self, address: &str) -> bool {
         self.owners.values().any(|o| o.address == address)
@@ -379,6 +410,8 @@ mod tests {
             epoch,
             memory_bytes: 0,
             replicas: Vec::new(),
+            failover: 0,
+            failover_count: 0,
         };
         ClusterMap {
             cluster_id: "c1".into(),
@@ -415,6 +448,12 @@ mod tests {
                     created: 0,
                 },
             ],
+            writer: String::new(),
+            writer_term: 0,
+            failover: false,
+            failover_rejoin: false,
+            failovers: Vec::new(),
+            moves: Vec::new(),
         }
     }
 

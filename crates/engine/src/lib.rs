@@ -41,6 +41,7 @@ mod flushed_roots;
 #[cfg(all(test, engine_loom))]
 mod flushed_through_loom;
 mod health;
+mod io_count;
 mod large;
 mod large_settle;
 mod load_slot;
@@ -51,6 +52,7 @@ mod options;
 mod position;
 mod punch;
 mod purge_guard;
+mod range_copy;
 mod read;
 mod row_cache;
 mod shard;
@@ -67,24 +69,28 @@ pub use check::{
     WalFile,
 };
 #[doc(hidden)]
+pub use engine::FeedRetentionHold;
+#[doc(hidden)]
 pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
     AppOwned, BackgroundWorker, CheckReturned, CommitInfo, CrossShardMetrics, DbInfo, Engine,
     EngineShard, FamilyInfo, FamilyStorage, FeedStorage, LatencyBuckets, LevelStorage, Metrics,
     PendingCheckReturning, PendingReturning, Previous, Returned, Role, ShardStats, TableInfo,
-    TableStorage,
+    TableStorage, TabletStats,
 };
 pub use error::{Error, Result};
 pub use feed_reader::all_tables_token_position;
 pub use feed_reader::{
     CatalogEvent, Change, Commit, Expiry, FeedPosition, FeedReader, FeedSpec, FeedStart, Next,
+    RangeDropEvent,
 };
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};
 pub use position::ColumnPosition;
 pub use punch::PunchTuning;
+pub use range_copy::{CopiedCell, RangeChunk};
 pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, NEAREST_POLL_CELLS, PendingNearest, Score};
 pub use read::reduce::{
@@ -103,7 +109,7 @@ pub use shard::remove_side_files;
 #[doc(hidden)]
 pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};
-pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, Txn, WriteBatch};
+pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, ReadHold, Txn, WriteBatch};
 
 /// What the engine's own tests reach in with (the `test-hooks` feature, `engine::hooks`).
 #[cfg(feature = "test-hooks")]

@@ -30,8 +30,47 @@ pub(crate) enum Body {
         seqno: u64,
         ts: u64,
         changes: Vec<ReplicatedChange>,
+        /// Feed-silent (D331, ICR 0141): a replica applies it silent too. Here, in the
+        /// commit's room under the catalog variant, so an event is no larger than before
+        /// (#2055's replicate-apply).
+        silent: bool,
+        /// A spanning commit's xid (D329 2b): a replica applies it tagged, so its own feed, and
+        /// a promoted replica's, carries it as the primary's does.
+        xid: Option<std::sync::Arc<[u8]>>,
     },
     Catalog(CatalogEvent),
+    /// A range drop (D331): rows `[start, end)` of `table` dropped, with the primary's
+    /// table id. Body tag 2; never silent. Boxed, so every event keeps its size (#2089's
+    /// callgrind).
+    RangeDrop(Box<RangeDrop>),
+}
+
+/// A range drop a primary's feed delivers to a replica's follower (D331,
+/// [`FeedEvent::RangeDrop`](crate::FeedEvent::RangeDrop)): rows `[start, end)` of a table,
+/// gone outright at `seqno`. Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeDrop {
+    pub(crate) seqno: u64,
+    pub(crate) table: TableId,
+    pub(crate) start: Vec<u8>,
+    pub(crate) end: Option<Vec<u8>>,
+}
+
+impl RangeDrop {
+    pub(crate) fn from_engine(ev: &pigeonhole_engine::RangeDropEvent) -> Self {
+        Self {
+            seqno: ev.seqno,
+            table: ev.table,
+            start: ev.start.clone(),
+            end: ev.end.clone(),
+        }
+    }
+
+    /// The drop's seqno, which applies nothing.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
 }
 
 /// One change of a replicated commit, as the primary logged it.
@@ -52,6 +91,7 @@ impl ReplicatedEvent {
         event: &FeedEvent,
         (before, after): (StreamPosition, StreamPosition),
         token: FeedToken,
+        silent: bool,
     ) -> Self {
         let body = match event {
             FeedEvent::Commit(c) => Body::Commit {
@@ -73,8 +113,11 @@ impl ReplicatedEvent {
                         }
                     })
                     .collect(),
+                silent,
+                xid: c.xid.clone(),
             },
             FeedEvent::Catalog(change) => Body::Catalog(change.raw().clone()),
+            FeedEvent::RangeDrop(d) => Body::RangeDrop(Box::new(d.clone())),
         };
         Self {
             before,
@@ -84,9 +127,29 @@ impl ReplicatedEvent {
         }
     }
 
+    /// Whether it is a feed-silent commit (D331, ICR 0141): a range move's copy or cleanup,
+    /// which a replica applies silent so its own feed matches its primary's.
+    pub fn is_silent(&self) -> bool {
+        matches!(self.body, Body::Commit { silent: true, .. })
+    }
+
+    /// The spanning commit's xid, if it is one's share (D329 2b).
+    pub fn xid(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Commit { xid, .. } => xid.as_deref(),
+            Body::Catalog(_) | Body::RangeDrop(_) => None,
+        }
+    }
+
     /// Whether it is a catalog change (applied with `apply_catalog`, between runs of commits).
     pub fn is_catalog(&self) -> bool {
         matches!(self.body, Body::Catalog(_))
+    }
+
+    /// A range drop (D331): apply it with
+    /// [`Pigeonhole::apply_range_drop`](crate::Pigeonhole::apply_range_drop).
+    pub fn is_range_drop(&self) -> bool {
+        matches!(self.body, Body::RangeDrop(_))
     }
 
     /// The primary feed's token right after this event: what a replica stores with it.
@@ -102,10 +165,27 @@ impl ReplicatedEvent {
 
     /// The event's bytes, for a replica in another process (#1436: `phdb serve`'s
     /// `Replication.Follow`): versioned, opaque to the transport. [`decode`](Self::decode)
-    /// reads them back.
+    /// reads them back. A feed-silent commit is version 2 (D331), every other event version
+    /// 1; an older replica refuses a version 2 event rather than apply it as an ordinary
+    /// write. A range drop (D331 PR 4a) is body tag 2 inside version 1, which builds before
+    /// it refuse as an unknown body, halting their follower at the first drop: upgrade a
+    /// primary's replicas before the primary (feed1248's S1 on #2089).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(EVENT_VERSION);
+        match self.xid() {
+            // A spanning commit's share (D329 2b): version 3, its flags, then the xid. Only
+            // then: versions 1 and 2 are what they were, byte for byte.
+            Some(xid) => {
+                out.push(FLAGS_EVENT_VERSION);
+                out.push(u8::from(self.is_silent()) | FLAG_XID);
+                put_bytes(&mut out, xid);
+            }
+            None => out.push(if self.is_silent() {
+                SILENT_EVENT_VERSION
+            } else {
+                EVENT_VERSION
+            }),
+        }
         for v in [
             self.before.seqno,
             self.before.catalog,
@@ -116,7 +196,9 @@ impl ReplicatedEvent {
         }
         put_bytes(&mut out, self.token.as_bytes());
         match &self.body {
-            Body::Commit { seqno, ts, changes } => {
+            Body::Commit {
+                seqno, ts, changes, ..
+            } => {
                 out.push(0);
                 out.extend_from_slice(&seqno.to_le_bytes());
                 out.extend_from_slice(&ts.to_le_bytes());
@@ -148,6 +230,18 @@ impl ReplicatedEvent {
                     put_bytes(&mut out, name.as_bytes());
                 }
             }
+            Body::RangeDrop(d) => {
+                out.push(2);
+                out.extend_from_slice(&d.seqno.to_le_bytes());
+                // WAL type 7's range encoding (FORMAT §10.3), checked when it was written.
+                pigeonhole_format::wal::DroppedRange::encode(
+                    &mut out,
+                    d.table,
+                    &d.start,
+                    d.end.as_deref(),
+                )
+                .expect("a range the engine logged");
+            }
         }
         out
     }
@@ -156,9 +250,36 @@ impl ReplicatedEvent {
     /// newer encoding.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
-        if r.u8()? != EVENT_VERSION {
-            return Err(invalid("not a replicated event of this version".to_owned()));
-        }
+        let (silent, xid) = match r.u8()? {
+            EVENT_VERSION => (false, None),
+            SILENT_EVENT_VERSION => (true, None),
+            FLAGS_EVENT_VERSION => {
+                let flags = r.u8()?;
+                if flags & !(FLAG_SILENT | FLAG_XID) != 0 {
+                    return Err(invalid(
+                        "a replicated event with flags this build doesn't know".to_owned(),
+                    ));
+                }
+                // Version 3 is written only with an xid (versions 1 and 2 cover the rest):
+                // one without isn't this build's (feed1248's N3 on #2076).
+                if flags & FLAG_XID == 0 {
+                    return Err(invalid(
+                        "a version 3 replicated event without an xid".to_owned(),
+                    ));
+                }
+                let xid = if flags & FLAG_XID != 0 {
+                    let x = r.bytes()?;
+                    if x.is_empty() || x.len() > 255 {
+                        return Err(invalid("a replicated event's xid".to_owned()));
+                    }
+                    Some(std::sync::Arc::<[u8]>::from(x))
+                } else {
+                    None
+                };
+                (flags & FLAG_SILENT != 0, xid)
+            }
+            _ => return Err(invalid("not a replicated event of this version".to_owned())),
+        };
         let before = StreamPosition {
             seqno: r.u64()?,
             catalog: r.u64()?,
@@ -189,9 +310,19 @@ impl ReplicatedEvent {
                         stored: r.bytes()?.to_vec(),
                     });
                 }
-                Body::Commit { seqno, ts, changes }
+                Body::Commit {
+                    seqno,
+                    ts,
+                    changes,
+                    silent,
+                    xid,
+                }
             }
             1 => {
+                // A catalog change is never a spanning commit's share: never version 3.
+                if xid.is_some() {
+                    return Err(invalid("a catalog change in a flagged event".to_owned()));
+                }
                 let mut ev = CatalogEvent::default();
                 ev.seqno_ceiling = r.u64()?;
                 ev.timestamp = r.u64()?;
@@ -212,8 +343,12 @@ impl ReplicatedEvent {
                 }
                 Body::Catalog(ev)
             }
+            2 => Body::RangeDrop(Box::new(decode_drop(bytes, &mut r)?)),
             _ => return Err(invalid("a replicated event's body".to_owned())),
         };
+        if silent && matches!(body, Body::Catalog(_)) {
+            return Err(invalid("a feed-silent catalog change".to_owned()));
+        }
         if !r.0.is_empty() {
             return Err(invalid(
                 "trailing bytes after a replicated event".to_owned(),
@@ -228,8 +363,46 @@ impl ReplicatedEvent {
     }
 }
 
+/// A range drop's body (tag 2), the rest of `r`, out of the commits' way (#2089's
+/// callgrind). Written in the plain version only: keyed on the event's version byte itself,
+/// not the flags one version reads, so a later flags form (D329 PR 2b's version 3) is refused
+/// too (feed1248's M1 on #2089).
+#[cold]
+#[inline(never)]
+fn decode_drop(event: &[u8], r: &mut Reader<'_>) -> Result<RangeDrop> {
+    if event.first() != Some(&EVENT_VERSION) {
+        return Err(invalid(
+            "a range drop in a version other than the plain one".to_owned(),
+        ));
+    }
+    let seqno = r.u64()?;
+    let range = pigeonhole_format::wal::DroppedRange::decode(r.0)
+        .map_err(|_| invalid("a replicated range drop".to_owned()))?;
+    r.0 = &[];
+    let (table, start, end) = range.fields();
+    Ok(RangeDrop {
+        seqno,
+        table,
+        start: start.to_vec(),
+        end: end.map(<[u8]>::to_vec),
+    })
+}
+
 /// [`ReplicatedEvent::encode`]'s version.
 const EVENT_VERSION: u8 = 1;
+
+/// [`ReplicatedEvent::encode`]'s version for a feed-silent commit (D331, ICR 0141): version 1's
+/// fields, read only by builds that apply the mark.
+const SILENT_EVENT_VERSION: u8 = 2;
+
+/// [`ReplicatedEvent::encode`]'s version for a spanning commit's share (D329 2b, numbers.md):
+/// a flags byte after the version ([`FLAG_SILENT`], [`FLAG_XID`]; any other bit refused),
+/// then the xid, then version 1's fields. Written only for an event with an xid.
+const FLAGS_EVENT_VERSION: u8 = 3;
+/// Version 3's flag for a feed-silent commit.
+const FLAG_SILENT: u8 = 1;
+/// Version 3's flag for an xid that follows.
+const FLAG_XID: u8 = 2;
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -358,6 +531,35 @@ fn invalid(message: String) -> Error {
 }
 
 impl Pigeonhole {
+    /// Bytes this database's files have read and written since open, as the engine counts
+    /// them at its files (D332, ICR 0142): on-disk sizes, readahead included, syncs not. An
+    /// estimate for comparing databases on one node, since reads the OS page cache served
+    /// count too. A reader instance (`open_reader`) counts nothing. Not part of the stable
+    /// API.
+    #[doc(hidden)]
+    pub fn device_bytes(&self) -> (u64, u64) {
+        self.engine().device_bytes()
+    }
+
+    /// Every tablet's row range, SST bytes and write load (D332, ICR 0142): what a cluster
+    /// balancer splits a partition by. A shared SST's bytes are divided among its tablets;
+    /// the write load is the engine's moving average of rows written per balancer interval
+    /// (0 with `tablet_changes` off). Not part of the stable API.
+    #[doc(hidden)]
+    pub fn tablets(&self) -> Vec<TabletLoad> {
+        self.engine()
+            .tablets()
+            .into_iter()
+            .map(|t| TabletLoad {
+                table: t.table,
+                start: t.start,
+                end: t.end,
+                bytes: t.bytes,
+                write_load: t.write_load,
+            })
+            .collect()
+    }
+
     /// Makes this database, a bootstrap copy of a primary (its [`backup_at`](Self::backup_at)
     /// of a snapshot), a replica that follows the primary from `token`: the token of a feed of
     /// every table opened `from_snapshot` on that same snapshot (#1436, ICR 0125). The first
@@ -568,18 +770,27 @@ impl Pigeonhole {
         let cap = self.engine().max_replicated_part_bytes();
         let mut part_bytes = 0;
         for event in run {
+            // A range drop in the run is refused here, at no cost to a run of commits (#2089's
+            // callgrind). A part committed before it stays, with its own token: the replica
+            // has applied the run up to there, and resumes from it.
             let Body::Commit { changes, .. } = &event.body else {
-                unreachable!("checked above");
+                return Err(invalid(
+                    "a range drop in a replicated run: apply it with apply_range_drop".to_owned(),
+                ));
             };
             let bytes: usize = changes
                 .iter()
                 .map(|c| c.row.len() + c.qualifier.len() + c.stored.len() + 32)
                 .sum();
             // A cell and timestamp this part already writes, or a part this event would take
-            // past the byte cap (simp724's S1): commit the part first. One event is never
-            // split: a primary commit applies whole.
+            // past the byte cap (simp724's S1), or a feed-silent event after an ordinary one
+            // or the other way round (D331: one commit is silent or not): commit the part
+            // first. One event is never split: a primary commit applies whole.
             if let Some(end) = part_end
                 && (part_bytes + bytes > cap
+                    || end.is_silent() != event.is_silent()
+                    // One spanning commit's share per part, as its xid tags the whole batch.
+                    || end.xid() != event.xid()
                     || changes.iter().any(|c| {
                         cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
                     }))
@@ -590,6 +801,11 @@ impl Pigeonhole {
                 part_bytes = 0;
             }
             part_bytes += bytes;
+            // A primary's silent commit stays silent here: the replica's own feed skips it as
+            // the primary's does, and a promoted replica's feed is the primary's.
+            if event.is_silent() {
+                batch.mark_feed_silent();
+            }
             for c in changes {
                 batch.push_logged(
                     c.table,
@@ -620,14 +836,156 @@ impl Pigeonhole {
         self.commit_part(batch, end, max_ts)
     }
 
+    /// Raises the timestamp floor to at least `ts`, durably (D331, ICR 0141): a range move's
+    /// target, before it serves the range, so a write it timestamps later sorts after every
+    /// version it copied, whatever the clocks. Refused on a replica. Not part of the stable
+    /// API.
+    #[doc(hidden)]
+    pub fn raise_ts_floor(&self, ts: u64) -> Result<()> {
+        self.engine().raise_ts_floor(ts)?;
+        Ok(())
+    }
+
+    /// Holds the change feed's history from now on (D331, ICR 0141), until the hold is
+    /// dropped or the database retains more than `cap_bytes` of history, when it lapses:
+    /// a range move's catch-up then finds the source's history from its copy's first
+    /// snapshot, or learns it can't. `InvalidArgument` without the change feed. Not part of
+    /// the stable API.
+    #[doc(hidden)]
+    pub fn hold_feed_retention(
+        &self,
+        cap_bytes: u64,
+    ) -> Result<pigeonhole_engine::FeedRetentionHold> {
+        Ok(self.engine().hold_feed_retention(cap_bytes)?)
+    }
+
+    /// A batch of changes written exactly as another database logged them (D331 PR 4, ICR
+    /// 0141): a range move's target writes the source's copy and catch-up so, with the
+    /// source's kinds, timestamps and stored values, named by table and family (the target's
+    /// ids aren't the source's). It holds logged changes only, so it never mixes with
+    /// ordinary writes. Refused at commit on a replica. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn logged_batch(&self) -> LoggedBatch<'_> {
+        LoggedBatch {
+            db: self,
+            batch: WriteBatch::new(),
+            error: None,
+        }
+    }
+
+    /// Drops rows `[start, end)` of `table` (`end` `None`: to the table's end) outright,
+    /// with no delete markers (D331 PR 4, ICR 0141): a range move's source at its cleanup,
+    /// its target at an abort. A later write of the range at an older timestamp is visible,
+    /// as if the rows had never been there, and a live snapshot still reads them. The caller
+    /// keeps the range unserved while it runs, and runs it again after a crash until it
+    /// returns. Feed-silent. `ReadOnly` on a replica; `Busy` to retry; `InvalidArgument`
+    /// for an end at or before the start. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn drop_range(&self, table: &crate::Table, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        crate::write::check_table(&self.db, table)?;
+        match self.engine().drop_range(table.core.info.id, start, end) {
+            // The engine refuses while an externally prepared transaction is in doubt: name
+            // them, so an operator can decide one stuck there (simp724).
+            Err(pigeonhole_engine::Error::Busy) if !self.engine().in_doubt().is_empty() => {
+                let xids: Vec<String> = self
+                    .engine()
+                    .in_doubt()
+                    .iter()
+                    .map(|(xid, _)| String::from_utf8_lossy(xid).into_owned())
+                    .collect();
+                Err(Error::new(
+                    ErrorCode::Busy,
+                    format!(
+                        "a range drop waits for the transactions in doubt here to be decided: {}",
+                        xids.join(", ")
+                    ),
+                ))
+            }
+            r => Ok(r?),
+        }
+    }
+
+    /// Applies a range drop a primary's feed delivered (D331): the same rows go from this
+    /// replica's own tablets, then `token` (the event's) is stored. It must start where the
+    /// last apply ended. The drop and the token are two steps: after a crash between them
+    /// the drop runs again, which changes nothing. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn apply_range_drop(&self, event: &ReplicatedEvent, token: &FeedToken) -> Result<()> {
+        let Body::RangeDrop(d) = &event.body else {
+            return Err(invalid(
+                "apply_range_drop takes a range drop: apply commits with apply_replicated"
+                    .to_owned(),
+            ));
+        };
+        if event.token != *token {
+            return Err(invalid("the token to store must be the event's".to_owned()));
+        }
+        self.chain(event.before, primary_of(&event.token))?;
+        self.engine()
+            .apply_range_drop(d.table, &d.start, d.end.as_deref())?;
+        let state = State {
+            primary: primary_of(&event.token),
+            after: event.after,
+            token: Some(event.token.clone()),
+        };
+        self.engine().store_replication_state(&state.encode())?;
+        Ok(())
+    }
+
+    /// One chunk of rows `[after, end)` of `table` at `snapshot`, for a range move's copy
+    /// (D331 PR 4a, ICR 0141): exactly what a compaction would write for them there (every
+    /// version and marker a reader at the snapshot could need; a counter or aggregate
+    /// family's operands folded into their base), named by family, for
+    /// [`LoggedBatch::push`]. It ends at a row boundary once it holds `max_bytes`; its
+    /// `next` is the row to ask for next, `None` once the range is done. Reads without
+    /// filling the block cache. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn copy_range(
+        &self,
+        snapshot: &crate::Snapshot,
+        table: &crate::Table,
+        after: &[u8],
+        end: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<CopiedChunk> {
+        crate::write::check_table(&self.db, table)?;
+        let chunk =
+            self.engine()
+                .copy_range(&snapshot.inner, table.core.info.id, after, end, max_bytes)?;
+        let info = table.core.current_info();
+        let mut cells = Vec::with_capacity(chunk.cells.len());
+        for c in chunk.cells {
+            let Some(family) = info.families.iter().find(|f| f.id == c.family) else {
+                return Err(Error::new(
+                    ErrorCode::FamilyNotFound,
+                    format!("family {} of table {:?}", c.family.0, info.name),
+                ));
+            };
+            cells.push(CopiedCell {
+                family: family.name.clone(),
+                kind: ChangeKind::of(c.kind),
+                row: c.row,
+                qualifier: c.qualifier,
+                ts: c.ts,
+                stored: c.stored,
+            });
+        }
+        Ok(CopiedChunk {
+            cells,
+            next: chunk.next,
+        })
+    }
+
     fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {
         let state = State {
             primary: primary_of(&end.token),
             after: end.after,
             token: Some(end.token.clone()),
         };
+        // A part holds one spanning commit's share or none (the split above), so its last
+        // event's xid is the whole part's (D329 2b).
         self.engine()
-            .apply_replicated(batch, &state.encode(), max_ts)?;
+            .apply_replicated_with(batch, &state.encode(), max_ts, end.xid())?;
         Ok(())
     }
 
@@ -656,5 +1014,211 @@ impl Pigeonhole {
         };
         self.engine().store_replication_state(&state.encode())?;
         Ok(())
+    }
+}
+
+/// One chunk of a range copy ([`Pigeonhole::copy_range`]). Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopiedChunk {
+    /// Its cells, in row order, each row whole.
+    pub cells: Vec<CopiedCell>,
+    /// The row to ask for next; `None`: the range is done.
+    pub next: Option<Vec<u8>>,
+}
+
+impl CopiedChunk {
+    /// The chunk as the commits a target writes it in, in order: one commit keeps only the
+    /// last mutation of a cell and timestamp (D34), so a cell the copy holds twice at one
+    /// timestamp (a value beside a delete kept with it) starts a new commit, and the
+    /// entries apply in the source's seqno order, oldest first, as they're listed.
+    ///
+    /// **Applying a chunk again is safe** (simp724), so a target writes its progress row in
+    /// the chunk's last commit only, and after a crash between two of its commits copies the
+    /// whole chunk again, at a fresh snapshot:
+    /// - an aggregate cell held whole is a put of its folded state, which writes the same
+    ///   again;
+    /// - a value kept beside its delete comes after the delete, which masks what the first
+    ///   attempt wrote before the value is written again;
+    /// - a fold that failed comes as its base (a put) before its operands, which then apply
+    ///   to that fresh base, not on top of the first attempt's.
+    ///
+    /// A standard family's operands under a named operator (D41: they run across
+    /// timestamps) are the exception: they apply twice, so their chunk must commit once.
+    pub fn batches(&self) -> Vec<&[CopiedCell]> {
+        type Key<'a> = (&'a str, &'a [u8], &'a [u8], u64, bool);
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut seen: std::collections::HashSet<Key<'_>> = std::collections::HashSet::new();
+        for (i, c) in self.cells.iter().enumerate() {
+            // A family marker is keyed apart from the family's cells (D34).
+            let key = (
+                c.family.as_str(),
+                &c.row[..],
+                &c.qualifier[..],
+                c.ts,
+                c.kind == ChangeKind::DeleteFamily,
+            );
+            if !seen.insert(key) {
+                out.push(&self.cells[start..i]);
+                start = i;
+                seen.clear();
+                seen.insert(key);
+            }
+        }
+        if start < self.cells.len() {
+            out.push(&self.cells[start..]);
+        }
+        out
+    }
+}
+
+/// One cell of a range copy, as its source logged it, for [`LoggedBatch::push`]. Not part
+/// of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopiedCell {
+    /// The family's name.
+    pub family: String,
+    /// A put (a counter or aggregate family's folded base too), a merge, or a delete.
+    pub kind: ChangeKind,
+    /// The row.
+    pub row: Vec<u8>,
+    /// The qualifier; empty for a family delete.
+    pub qualifier: Vec<u8>,
+    /// The timestamp.
+    pub ts: u64,
+    /// The stored value, tag byte first; empty for a delete.
+    pub stored: Vec<u8>,
+}
+
+/// [`Pigeonhole::logged_batch`]'s batch. Errors (a table of another database, a family
+/// the table lacks, a key too large) surface at [`commit`](Self::commit), and the first
+/// one wins. Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct LoggedBatch<'a> {
+    db: &'a Pigeonhole,
+    batch: WriteBatch,
+    error: Option<Error>,
+}
+
+impl LoggedBatch<'_> {
+    /// Adds one change as its source logged it: its kind, timestamp and stored value (the
+    /// tag byte first, as [`ReplicatedEvent`]s and raw reads carry it; empty for a delete).
+    /// A family `table` lacks is an error (`FamilyNotFound`), never a dropped change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(
+        &mut self,
+        table: &crate::Table,
+        row: &[u8],
+        family: &str,
+        kind: ChangeKind,
+        qualifier: &[u8],
+        ts: u64,
+        stored: &[u8],
+    ) -> &mut Self {
+        if self.error.is_some() {
+            return self;
+        }
+        let r = crate::write::check_table(&self.db.db, table)
+            .and_then(|()| table.core.family_id(family))
+            .and_then(|family| {
+                Ok(self.batch.push_logged(
+                    table.core.info.id,
+                    family,
+                    logged_kind(kind),
+                    row,
+                    qualifier,
+                    ts,
+                    stored,
+                )?)
+            });
+        if let Err(e) = r {
+            self.error = Some(e);
+        }
+        self
+    }
+
+    /// Marks the batch feed-silent: committed, durable and replicated, but never delivered
+    /// to a change-feed subscription.
+    pub fn mark_feed_silent(&mut self) -> &mut Self {
+        self.batch.mark_feed_silent();
+        self
+    }
+
+    /// The changes added so far.
+    pub fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    /// No change added yet.
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    /// Commits the batch atomically. `ReadOnly` on a replica; `InvalidArgument` when empty.
+    pub fn commit(self) -> Result<crate::CommitInfo> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let info = self.db.engine().commit_logged(self.batch, None)?;
+        Ok(crate::CommitInfo::from_engine(info))
+    }
+}
+
+/// One tablet as [`Pigeonhole::tablets`] reports it (D332, ICR 0142).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct TabletLoad {
+    /// Its table's name.
+    pub table: String,
+    /// Inclusive start row; empty is unbounded.
+    pub start: Vec<u8>,
+    /// Exclusive end row; `None` is unbounded.
+    pub end: Option<Vec<u8>>,
+    /// Bytes of the SSTs it references, a shared SST's divided among its tablets.
+    pub bytes: u64,
+    /// Rows written to it per balancer interval, a moving average.
+    pub write_load: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_spanning_share_round_trips_as_version_3() {
+        // D329 2b: version 3's flags carry both marks; no producer makes such a commit today
+        // (a range move's copy is silent, a spanning commit's share is tagged), but the
+        // encoding keeps them apart and a replica would apply it silent and tagged.
+        let xid: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"p1:h2-aa"[..]);
+        let e = ReplicatedEvent {
+            before: StreamPosition {
+                seqno: 1,
+                catalog: 0,
+            },
+            after: StreamPosition {
+                seqno: 2,
+                catalog: 0,
+            },
+            token: FeedToken::from_bytes(b"t"),
+            body: Body::Commit {
+                seqno: 2,
+                ts: 5,
+                changes: Vec::new(),
+                silent: true,
+                xid: Some(xid),
+            },
+        };
+        let bytes = e.encode();
+        assert_eq!(
+            (bytes[0], bytes[1]),
+            (FLAGS_EVENT_VERSION, FLAG_SILENT | FLAG_XID)
+        );
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert!(back.is_silent());
+        assert_eq!(back.xid(), Some(&b"p1:h2-aa"[..]));
+        assert_eq!(back.encode(), bytes, "it round-trips");
     }
 }

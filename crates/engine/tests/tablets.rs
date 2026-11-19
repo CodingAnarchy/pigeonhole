@@ -408,6 +408,82 @@ fn a_tables_writes_spread_across_shards_after_splits() {
     }
 }
 
+#[test]
+fn tablets_reports_each_tablets_range_and_write_load() {
+    // D332 (ICR 0142): `Engine::tablets` gives every tablet of `t` once, its ranges tiling the
+    // key space, and the write loads the shards published at their last balancer pass.
+    let mut db = open(4, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    assert!(
+        db.engine.tablets().iter().all(|t| t.write_load == 0.0),
+        "no pass has published yet"
+    );
+    let mut written = 0u64;
+    for _ in 0..14 {
+        for _ in 0..100 {
+            db.put(&key(written), b"v");
+            written += 1;
+        }
+        let m = db.engine.balance_pending().unwrap();
+        db.drive(m).unwrap();
+    }
+    let tablets: Vec<_> = db
+        .engine
+        .tablets()
+        .into_iter()
+        .filter(|t| t.table == "t")
+        .collect();
+    assert_eq!(tablets.len(), db.ranges().len(), "{tablets:?}");
+    assert!(tablets.len() > 1, "the hot tablet split: {tablets:?}");
+    assert!(tablets[0].start.is_empty() && tablets.last().unwrap().end.is_none());
+    for w in tablets.windows(2) {
+        assert_eq!(w[0].end.as_deref(), Some(&w[1].start[..]), "{tablets:?}");
+    }
+    let load: f64 = tablets.iter().map(|t| t.write_load).sum();
+    assert!(load > 0.0, "{tablets:?}");
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+#[test]
+fn tablets_counts_a_shared_ssts_bytes_once_divided_between_its_tablets() {
+    // D332 (ICR 0142; simp724's S5 on #2063): one flushed SST's bytes are the tablet's; a
+    // split leaves the SST shared by both halves until compaction rewrites it, and each
+    // reports half, so the sum stays the SST's.
+    let mut db = open(1, |o| o.balance_interval_nanos = u64::MAX);
+    for t in 0..2 {
+        for i in 0..200 {
+            db.put(&tablet_row(t, i), &[7u8; 64]);
+        }
+    }
+    db.flush();
+    let bytes = |db: &Db| -> Vec<u64> {
+        db.engine
+            .tablets()
+            .into_iter()
+            .filter(|t| t.table == "t")
+            .map(|t| t.bytes)
+            .collect()
+    };
+    let whole = bytes(&db);
+    assert_eq!(whole.len(), 1);
+    assert!(whole[0] > 0, "the flushed SST's bytes: {whole:?}");
+    let m = db.engine.split_tablet_pending(db.table.id, b"t01").unwrap();
+    db.drive(m).unwrap();
+    let halves = bytes(&db);
+    assert_eq!(halves.len(), 2, "{halves:?}");
+    assert!(halves.iter().all(|b| *b > 0), "{halves:?}");
+    assert!(
+        whole[0] - halves.iter().sum::<u64>() <= 1,
+        "the shared SST counts once: {whole:?} then {halves:?}"
+    );
+    db.close();
+}
+
 /// Row `i` of tablet `t` in [`tablets_on`]'s layout (split at `t01`, `t02`, ...).
 fn tablet_row(t: usize, i: u64) -> Vec<u8> {
     format!("t{t:02}-{i:08}").into_bytes()
@@ -4424,7 +4500,8 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
                 pigeonhole_engine::AppendedKind::Batch => Some((r.seqno, r.commit_ts)),
                 pigeonhole_engine::AppendedKind::Prepare => committed.get(&r.seqno).copied(),
                 pigeonhole_engine::AppendedKind::Commit
-                | pigeonhole_engine::AppendedKind::Abort => None,
+                | pigeonhole_engine::AppendedKind::Abort
+                | pigeonhole_engine::AppendedKind::RangeDrop => None,
             })
             .collect();
         shares += records
@@ -4452,9 +4529,9 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
         .filter_map(|r| match r.kind {
             pigeonhole_engine::AppendedKind::Batch => Some((r.seqno, r.commit_ts)),
             pigeonhole_engine::AppendedKind::Prepare => committed.get(&r.seqno).copied(),
-            pigeonhole_engine::AppendedKind::Commit | pigeonhole_engine::AppendedKind::Abort => {
-                None
-            }
+            pigeonhole_engine::AppendedKind::Commit
+            | pigeonhole_engine::AppendedKind::Abort
+            | pigeonhole_engine::AppendedKind::RangeDrop => None,
         })
         .collect();
     all.sort_unstable();

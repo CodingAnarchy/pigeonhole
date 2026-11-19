@@ -913,8 +913,12 @@ impl Checker {
 
     /// Every WAL sidecar: its segment headers, then the log from the stream's checkpoint.
     fn wal(&mut self, vfs: &VfsRef, path: &Path, catalog: Option<&Catalog>) -> Result<()> {
-        let db_id = match Pager::open(vfs, path, false) {
-            Ok(o) => o.db_id(),
+        let (db_id, silent_ok, xid_ok) = match Pager::open(vfs, path, false) {
+            Ok(o) => (
+                o.db_id(),
+                o.features().incompat & pigeonhole_format::wal::INCOMPAT_FEED_SILENT != 0,
+                o.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0,
+            ),
             Err(_) => return Ok(()),
         };
         let mut streams = pigeonhole_wal::discover_streams(vfs, path)?;
@@ -942,6 +946,8 @@ impl Checker {
                 file,
                 stream,
                 db_id,
+                silent_ok,
+                xid_ok,
                 findings: Vec::new(),
             };
             scan.run(checkpoint, &mut w)?;
@@ -958,6 +964,10 @@ struct WalScan {
     file: FileRef,
     stream: StreamId,
     db_id: [u8; 16],
+    /// The superblock has `incompat` bit 3 (D331): a feed-silent batch's mark is taken.
+    silent_ok: bool,
+    /// The superblock has `incompat` bit 2 (D329 2b): a batch's xid trailer is taken.
+    xid_ok: bool,
     findings: Vec<Finding>,
 }
 
@@ -1068,7 +1078,9 @@ impl WalScan {
                         let len = dec.record().len();
                         last_end =
                             offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;
-                        if let Err(e) = WalRecord::decode(dec.record()) {
+                        if let Err(e) =
+                            WalRecord::decode_flags(dec.record(), self.silent_ok, self.xid_ok)
+                        {
                             self.find(
                                 Severity::Corruption,
                                 Some(base + offset),
