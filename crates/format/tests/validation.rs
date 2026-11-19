@@ -475,3 +475,58 @@ fn a_push_after_the_xid_trailer_is_refused_in_debug_builds() {
         b"\x00v",
     );
 }
+
+/// feed1248's condition 5 on #2076: an External Prepare's batch never carries an xid
+/// trailer (its share names the xid): its share, and the record holding it, are `Corrupt`
+/// on every read, whatever bits the database has.
+#[test]
+fn an_external_prepares_batch_with_an_xid_trailer_is_corrupt() {
+    use pigeonhole_format::wal::{BatchBuilder, ExternalShare, WalRecord};
+    use pigeonhole_format::{FamilyId, Kind, StreamId, TableId};
+    let share = |tagged: bool| {
+        let mut b = BatchBuilder::new();
+        b.push(
+            TableId(1),
+            FamilyId(2),
+            Kind::Put,
+            b"a",
+            b"q",
+            None,
+            b"\x00v",
+        )
+        .unwrap();
+        if tagged {
+            b.tag_xid(b"p1:h3-00ff").unwrap();
+        }
+        let mut body = Vec::new();
+        ExternalShare::encode(
+            b"p1:h3-00ff",
+            &[StreamId(0), StreamId(5)],
+            std::iter::empty(),
+            Some(b.batch()),
+            &mut body,
+        )
+        .unwrap();
+        body
+    };
+    let (plain, tagged) = (share(false), share(true));
+    assert!(ExternalShare::decode(&plain, true).is_ok());
+    assert!(ExternalShare::decode(&tagged, true).is_err(), "the share");
+    // The whole record: an untagged one's head, the tagged share's body.
+    let mut rec = Vec::new();
+    WalRecord::ExternalPrepare {
+        seqno: 104,
+        coordinator: StreamId(0),
+        share: ExternalShare::decode(&plain, true).unwrap(),
+    }
+    .encode(&mut rec);
+    assert!(WalRecord::decode_flags(&rec, true, true).is_ok());
+    rec.truncate(rec.len() - plain.len());
+    rec.extend_from_slice(&tagged);
+    for (silent_ok, xid_ok) in [(true, true), (true, false), (false, false)] {
+        assert!(
+            WalRecord::decode_flags(&rec, silent_ok, xid_ok).is_err(),
+            "decode_flags({silent_ok}, {xid_ok}) took a tagged External Prepare"
+        );
+    }
+}

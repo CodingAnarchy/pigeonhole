@@ -853,6 +853,11 @@ fn a_replica_applies_a_spanning_share_with_its_xid() {
             let mut b = bytes.clone();
             b.splice(2..6 + xid.len(), 0u32.to_le_bytes());
             assert!(ReplicatedEvent::decode(&b).is_err(), "an empty xid");
+            // Version 3 without the xid flag is never written: refused.
+            let mut b = bytes.clone();
+            b[1] &= !2;
+            b.splice(2..6 + xid.len(), []);
+            assert!(ReplicatedEvent::decode(&b).is_err(), "v3 without an xid");
         }
         apply(&replica, &events, 1);
     }

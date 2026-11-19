@@ -405,9 +405,10 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum TxnCommand {
     /// Decide a transaction's share held in doubt on partition `--partition`, on the node
-    /// that serves it (`--node`), for a transaction whose home will never answer. Refused
-    /// while the home answers (its resolver settles the share then) unless `--force`, which
-    /// can break the transaction's atomicity. Answers the partition's line.
+    /// that serves it (`--node`), for a transaction whose home will never settle it. Refused
+    /// while the home can (it answers committed, aborted or in progress) unless `--force`,
+    /// which can break the transaction's atomicity; a home that answers unknown can't.
+    /// Answers the partition's line.
     Decide {
         /// The transaction's id (as `phdb cluster status` lists it).
         xid: String,

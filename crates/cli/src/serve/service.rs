@@ -4996,13 +4996,15 @@ impl Service {
         err
     }
 
-    /// How long after its begin a spanning transaction's decision record can still be asked
-    /// for (D329 2b): its lifetime, the request timeout and `--txn-outcome-retention`. Past
-    /// it, an absent record may have been GC'd, and isn't presumed aborted.
+    /// How long after its begin an absent decision record of a spanning transaction is
+    /// presumed aborted (D329 2b): `--txn-outcome-retention`. A committed record can be
+    /// collected from its commit time plus retention, which may be just after the begin, so
+    /// from begin plus retention on an absent record may be a collected commit: not found,
+    /// never presumed aborted (audit120's M1 on #2076). The startup floor (retention at least
+    /// the lifetime, the request timeout and a minute) puts a transaction's whole life
+    /// inside this window, with the minute for clock skew.
     pub(crate) fn outcome_horizon(&self) -> std::time::Duration {
-        self.limits.leases.txn_lifetime
-            + self.limits.request_timeout
-            + self.limits.txn_outcome_retention
+        self.limits.txn_outcome_retention
     }
 
     /// `--txn-outcome-retention`.

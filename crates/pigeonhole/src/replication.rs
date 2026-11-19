@@ -207,6 +207,13 @@ impl ReplicatedEvent {
                         "a replicated event with flags this build doesn't know".to_owned(),
                     ));
                 }
+                // Version 3 is written only with an xid (versions 1 and 2 cover the rest):
+                // one without isn't this build's (feed1248's N3 on #2076).
+                if flags & FLAG_XID == 0 {
+                    return Err(invalid(
+                        "a version 3 replicated event without an xid".to_owned(),
+                    ));
+                }
                 let xid = if flags & FLAG_XID != 0 {
                     let x = r.bytes()?;
                     if x.is_empty() || x.len() > 255 {

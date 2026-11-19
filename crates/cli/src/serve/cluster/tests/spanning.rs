@@ -555,6 +555,39 @@ fn outcome_answers_in_progress_unknown_and_not_found() {
     });
 }
 
+#[test]
+fn an_absent_record_is_presumed_aborted_only_within_retention_of_the_begin() {
+    // audit120's M1 on #2076: a committed, acked record can be collected from its commit
+    // time plus retention, just after the begin plus retention. From then on an absent
+    // record answers NotFound and writes nothing, so a collected commit is never
+    // re-recorded as aborted; just inside, an absent one is presumed aborted, with a marker.
+    use crate::serve::proto::TxnOutcomeState as St;
+    let t = Three::start(["", "", ""]);
+    let [_, _, c] = t.ports;
+    t.rt.block_on(async {
+        let id = begin_spanning(c, "zed").await.unwrap();
+        commit_parts(c, &id, vec![put_row("zed", "1")])
+            .await
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let retention = 86_400_000;
+        let past = forged(&id, now - retention - 1_000, None);
+        let e = outcome(c, &past).await.unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
+        assert_eq!(decision_row(&t.dbs[1], &past), None, "nothing written");
+        let inside = forged(&id, now - retention + 60_000, None);
+        let o = outcome(c, &inside).await.unwrap();
+        assert_eq!(o.state(), St::Aborted, "{o:?}");
+        assert!(
+            decision_row(&t.dbs[1], &inside).is_some_and(|v| v.starts_with(b"aborted ")),
+            "the abort marker"
+        );
+    });
+}
+
 /// `phdb cluster txn decide`'s call: decides `id`'s share on partition `p` through `port`.
 async fn decide(
     port: u16,

@@ -12,7 +12,7 @@
     - with no decision recorded and the home's history unchanged, the home records an abort, so a late commit can't follow;
     - across a history change the share stays in doubt, with the reason in `Status` (`LocalPartition.in_doubt`, `in_doubt_shares`).
   - **`Transactions.Outcome`** answers what became of a transaction: in progress, committed (with its parts), aborted, unknown, or not found once its record has gone. Records are kept for `--txn-outcome-retention` (default 24 h) after every branch has applied the outcome.
-  - **`phdb cluster txn decide <xid> --partition P --commit|--abort`** decides a share by hand. It's refused while the home answers, unless `--force`, which can break the transaction's atomicity.
+  - **`phdb cluster txn decide <xid> --partition P --commit|--abort`** decides a share by hand. It's refused while the home can settle the share (it answers committed, aborted or in progress), unless `--force`, which can break the transaction's atomicity. A home that answers unknown can't, so the decide goes ahead.
   - **Limits:** `--txn-max-in-doubt` and `--txn-max-in-doubt-wal-bytes` (default 16 MiB) bound what a partition holds in doubt.
   - **The change feed:** each partition's commit of a spanning transaction carries the transaction's id (`FeedEvent.xid`), the same on every share, so a subscriber can group them.
 - **The engine and `pigeonhole` (behind `__unstable-txn-prepare`):**

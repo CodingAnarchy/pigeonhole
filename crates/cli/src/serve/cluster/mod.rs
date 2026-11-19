@@ -1938,7 +1938,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
                 shared.limits.request_timeout,
             )
             .await;
-            if let Ok(home) = asked {
+            // A home that answers UNKNOWN (its history changed) can't settle the share: the
+            // operator's decide is what's left (audit120's S1 on #2076).
+            if let Ok(home) = asked
+                && home.state != proto::TxnOutcomeState::Unknown as i32
+            {
                 return Err(ApiError::failed_precondition(format!(
                     "the transaction's home answers ({:?}: {}), so its resolver settles this \
                      share; --force only for a home that will never answer, and it can break \

@@ -911,7 +911,16 @@ impl<'a> ExternalShare<'a> {
         }
         let reads = &bytes[start..r.pos()];
         let batch = if with_batch {
-            Some(BatchRef::new(r.rest())?)
+            let b = BatchRef::new(r.rest())?;
+            // An External Prepare's batch never carries an xid trailer: its share names the
+            // xid (D329 2b; FORMAT §10.3). Refused here, on every read (feed1248's must on
+            // #2076: `xid_marked` doesn't look inside a share).
+            if b.xid().is_some() {
+                return Err(Error::Corrupt {
+                    what: "wal external prepare: an xid trailer on its batch",
+                });
+            }
+            Some(b)
         } else if r.remaining() != 0 {
             return Err(Error::Corrupt {
                 what: "wal external abort length",

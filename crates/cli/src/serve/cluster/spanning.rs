@@ -186,6 +186,11 @@ pub(crate) async fn settle(
         Peek::Done(Err(e)) if e.code != "OutcomeUnknown" => {
             return Ok(answer(S::Aborted, &e.message));
         }
+        // A plain transaction's lost answer: unknown, as one node answers it (audit120's S2
+        // on #2076). A spanning one's is settled from its decision row below.
+        Peek::Done(Err(e)) if super::super::sessions::spanning_parts(id).is_none() => {
+            return Ok(answer(S::Unknown, &e.message));
+        }
         Peek::Done(Err(_)) | Peek::Gone => {}
     }
     let Some((home_id, epoch, _)) = super::super::sessions::spanning_parts(id) else {
@@ -196,11 +201,11 @@ pub(crate) async fn settle(
     let value = match home.decision(id).await? {
         Some(v) => v,
         None => {
-            // Past what its record is kept for, an absent record may have been GC'd: not
-            // presumed aborted (D329 2b).
+            // From begin plus retention on, an absent record may be a collected commit: not
+            // found, never presumed aborted (D329 2b; audit120's M1 on #2076).
             let begun = super::super::sessions::spanning_begun_ms(id).unwrap_or(0);
             let horizon = u64::try_from(home.outcome_horizon().as_millis()).unwrap_or(u64::MAX);
-            if begun.saturating_add(horizon) < now_ms() {
+            if begun.saturating_add(horizon) <= now_ms() {
                 return Err(ApiError::not_found(
                     "no record of the transaction: its outcome is kept for \
                      --txn-outcome-retention after it ends",
