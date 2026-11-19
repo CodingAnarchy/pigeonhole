@@ -94,6 +94,8 @@ pub struct Recovery {
     writable: bool,
     /// Whether a feed-silent batch's mark is taken ([`Recovery::accept_silent`]).
     silent_ok: bool,
+    /// Whether a batch's xid trailer is taken (D329 2b, [`Recovery::accept_xid`]).
+    xid_ok: bool,
 }
 
 #[derive(Debug)]
@@ -226,6 +228,7 @@ impl Recovery {
             chunk_start: 0,
             writable,
             silent_ok: false,
+            xid_ok: true,
         };
         if missing {
             // The checkpoint's segment never reached the disk: everything before the
@@ -331,7 +334,7 @@ impl Recovery {
             }
         }
         let cur = self.cur.as_ref().expect("a record was just decoded");
-        let record = WalRecord::decode_with(cur.dec.record(), self.silent_ok)?;
+        let record = WalRecord::decode_flags(cur.dec.record(), self.silent_ok, self.xid_ok)?;
         self.max_seqno = self.max_seqno.max(seqno_of(&record));
         Ok(Some((self.end, record)))
     }
@@ -342,6 +345,13 @@ impl Recovery {
     /// [`INCOMPAT_FEED_SILENT`]: pigeonhole_format::wal::INCOMPAT_FEED_SILENT
     pub fn accept_silent(&mut self, ok: bool) {
         self.silent_ok = ok;
+    }
+
+    /// Takes a batch's xid trailer (D329 2b, `XID_BATCH`): set when the superblock has
+    /// `incompat` bit 2. Without it a tagged batch is corrupt. On by default, for a reader
+    /// that doesn't know the database's bits.
+    pub fn accept_xid(&mut self, ok: bool) {
+        self.xid_ok = ok;
     }
 
     /// The stream file's slot size, `None` while it holds no segment. An existing file keeps

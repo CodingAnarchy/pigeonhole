@@ -1719,6 +1719,11 @@ pub struct FeedEvent {
     /// On a cluster subscription, the partition the event came from; empty on a single node.
     #[prost(string, tag = "5")]
     pub partition: ::prost::alloc::string::String,
+    /// A commit of a transaction across partitions (D329, `BeginRequest.spans_partitions`): its
+    /// id, the same on every partition's share of it, so a subscriber can group them. Empty
+    /// for any other commit.
+    #[prost(bytes = "bytes", tag = "7")]
+    pub xid: ::prost::bytes::Bytes,
     #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
@@ -4881,6 +4886,14 @@ pub struct BeginRequest {
     /// start. A single-node server ignores it.
     #[prost(message, optional, tag = "2")]
     pub route: ::core::option::Option<RoutingKey>,
+    /// Lets the transaction read and write rows of other partitions (D329, ICR 0140): its
+    /// partition (`route`) is its home, and every other partition it touches is a branch,
+    /// committed with it atomically by two-phase commit. Without it, a row outside the home is
+    /// `CrossPartition`. Every node must keep the `spanning_txns` map feature. A commit that
+    /// writes runs at `GroupSync` or stronger. A single-node server accepts it and changes
+    /// nothing.
+    #[prost(bool, tag = "3")]
+    pub spans_partitions: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BeginResponse {
@@ -4931,10 +4944,43 @@ pub struct TxnCommitRequest {
     #[prost(message, repeated, tag = "2")]
     pub rows: ::prost::alloc::vec::Vec<RowWrites>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnCommitResponse {
+    /// A spanning transaction's (`BeginRequest.spans_partitions`): its home partition's commit.
     #[prost(message, optional, tag = "1")]
     pub commit: ::core::option::Option<CommitInfo>,
+    /// A spanning transaction that wrote: each partition it touched, the home first. A part not
+    /// yet `applied` is committed and is applied by its partition's resolver.
+    #[prost(message, repeated, tag = "2")]
+    pub parts: ::prost::alloc::vec::Vec<TxnPart>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnOutcomeRequest {
+    #[prost(string, tag = "1")]
+    pub txn_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TxnOutcomeResponse {
+    #[prost(enumeration = "TxnOutcomeState", tag = "1")]
+    pub state: i32,
+    /// When committed: the home's commit, and each partition's share as recorded.
+    #[prost(message, optional, tag = "2")]
+    pub commit: ::core::option::Option<CommitInfo>,
+    #[prost(message, repeated, tag = "3")]
+    pub parts: ::prost::alloc::vec::Vec<TxnPart>,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// One partition's share of a spanning transaction's commit (D329).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnPart {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    /// The share's commit seqno on that partition, once applied (0 before).
+    #[prost(uint64, tag = "2")]
+    pub seqno: u64,
+    #[prost(bool, tag = "3")]
+    pub applied: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TxnAbortRequest {
@@ -4963,6 +5009,46 @@ pub struct OpenSnapshotResponse {
 pub struct ReleaseSnapshotRequest {
     #[prost(string, tag = "1")]
     pub snapshot_id: ::prost::alloc::string::String,
+}
+/// What became of a transaction (D329).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TxnOutcomeState {
+    Unspecified = 0,
+    /// Its session is open or committing: ask again.
+    InProgress = 1,
+    Committed = 2,
+    /// Aborted, or never committed (now final).
+    Aborted = 3,
+    /// Its home partition's history changed since it began (a promotion, a restore): the
+    /// decision may be lost, so nothing is presumed (`reason` says why).
+    Unknown = 4,
+}
+impl TxnOutcomeState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TXN_OUTCOME_STATE_UNSPECIFIED",
+            Self::InProgress => "TXN_OUTCOME_STATE_IN_PROGRESS",
+            Self::Committed => "TXN_OUTCOME_STATE_COMMITTED",
+            Self::Aborted => "TXN_OUTCOME_STATE_ABORTED",
+            Self::Unknown => "TXN_OUTCOME_STATE_UNKNOWN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TXN_OUTCOME_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "TXN_OUTCOME_STATE_IN_PROGRESS" => Some(Self::InProgress),
+            "TXN_OUTCOME_STATE_COMMITTED" => Some(Self::Committed),
+            "TXN_OUTCOME_STATE_ABORTED" => Some(Self::Aborted),
+            "TXN_OUTCOME_STATE_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 /// Generated client implementations.
 pub mod transactions_client {
@@ -5185,6 +5271,36 @@ pub mod transactions_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Transactions", "Abort"));
             self.inner.unary(req, path, codec).await
         }
+        /// A transaction's outcome, by its id, after the `Commit` reply was lost (D329): for a
+        /// transaction begun with `spans_partitions`, from its home partition's decision record,
+        /// kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
+        /// and changes nothing. Once the session is gone, a transaction never committed is made
+        /// final as `ABORTED`, which is why it needs write scope. `NotFound` past retention, and
+        /// for other transactions once their session's record is gone.
+        pub async fn outcome(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TxnOutcomeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TxnOutcomeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Transactions/Outcome",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Transactions", "Outcome"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -5231,6 +5347,19 @@ pub mod transactions_server {
             &self,
             request: tonic::Request<super::TxnAbortRequest>,
         ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
+        /// A transaction's outcome, by its id, after the `Commit` reply was lost (D329): for a
+        /// transaction begun with `spans_partitions`, from its home partition's decision record,
+        /// kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
+        /// and changes nothing. Once the session is gone, a transaction never committed is made
+        /// final as `ABORTED`, which is why it needs write scope. `NotFound` past retention, and
+        /// for other transactions once their session's record is gone.
+        async fn outcome(
+            &self,
+            request: tonic::Request<super::TxnOutcomeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::TxnOutcomeResponse>,
+            tonic::Status,
+        >;
     }
     /// A transaction reads at one snapshot, buffers writes, and commits them atomically; a
     /// conflicting commit fails with `Conflict` and writes nothing. The retry loop is the
@@ -5566,6 +5695,51 @@ pub mod transactions_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AbortSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Transactions/Outcome" => {
+                    #[allow(non_camel_case_types)]
+                    struct OutcomeSvc<T: Transactions>(pub Arc<T>);
+                    impl<
+                        T: Transactions,
+                    > tonic::server::UnaryService<super::TxnOutcomeRequest>
+                    for OutcomeSvc<T> {
+                        type Response = super::TxnOutcomeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TxnOutcomeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Transactions>::outcome(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OutcomeSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -7460,6 +7634,19 @@ pub struct LocalPartition {
     /// For a replica copy: where its follower is.
     #[prost(enumeration = "ReplicaState", tag = "20")]
     pub replica_state: i32,
+    /// D329: shares of transactions across partitions held here in doubt (prepared, their
+    /// decision not yet known here), the oldest's xid and age, and the WAL bytes they keep.
+    #[prost(uint32, tag = "21")]
+    pub in_doubt: u32,
+    #[prost(string, tag = "22")]
+    pub in_doubt_oldest_xid: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "23")]
+    pub in_doubt_oldest_age_ms: u64,
+    #[prost(uint64, tag = "24")]
+    pub in_doubt_wal_bytes: u64,
+    /// Each, with why it's still in doubt (its home unreachable, or its home's history changed).
+    #[prost(message, repeated, tag = "25")]
+    pub in_doubt_shares: ::prost::alloc::vec::Vec<InDoubtShare>,
     /// D331: the range moves naming this partition, as source or target.
     #[prost(message, repeated, tag = "27")]
     pub moves: ::prost::alloc::vec::Vec<MoveStatus>,
@@ -7485,6 +7672,16 @@ pub struct LocalPartition {
     pub load_device: f64,
     #[prost(double, tag = "31")]
     pub load: f64,
+}
+/// A share held in doubt (D329).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InDoubtShare {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub age_ms: u64,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
 }
 /// A forwarded single-key call (D317 ticket 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7525,7 +7722,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 52"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7635,6 +7832,23 @@ pub mod forward_request {
         RecallPool(super::RecallPoolRequest),
         #[prost(message, tag = "41")]
         RecallBodies(super::RecallBodiesRequest),
+        /// D329 (ICR 0140): a spanning transaction's home node, the coordinator, to a branch's
+        /// partition owner (`partition` names it). `branch_begin` carries the client as `caller`;
+        /// `branch_prepare` and `branch_decide` are the node's own, cluster scope only.
+        #[prost(message, tag = "45")]
+        BranchBegin(super::BranchBegin),
+        #[prost(message, tag = "46")]
+        BranchPrepare(super::BranchPrepare),
+        #[prost(message, tag = "47")]
+        BranchDecide(super::BranchDecide),
+        /// A branch's node asks its transaction's home what was decided, for a share it holds in
+        /// doubt (D329's resolver): the node's own call, cluster scope only.
+        #[prost(message, tag = "48")]
+        ResolveTxn(super::ResolveTxn),
+        /// A client's `Transactions.Outcome` for a transaction whose home this node isn't
+        /// (D329): the client's caller rides `caller`, write scope.
+        #[prost(message, tag = "52")]
+        TxnOutcome(super::TxnOutcomeRequest),
     }
 }
 /// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
@@ -7784,6 +7998,81 @@ pub struct ForwardedCaller {
 }
 /// A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 /// call's own status.
+/// Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
+/// transaction's id (its xid), at that partition's snapshot now; with `renew`, renews the open
+/// one instead, or answers `TransactionExpired` if it's gone (never reopening it).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchBegin {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub renew: bool,
+}
+/// Prepares a branch (D329): a writing transaction's durably (its reads and writes held until
+/// `BranchDecide`), or with `read_only` a hold of its reads in memory, released by a
+/// `BranchDecide` that names the hold.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchPrepare {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub read_only: bool,
+}
+/// Decides a prepared branch (D329): commit or abort, synced before the answer. With `hold`
+/// (non-zero), the release of a read-only branch's hold instead, which answers only if the
+/// hold lasted and the partition's lease term is still `term`; otherwise `Conflict`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchDecide {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub commit: bool,
+    #[prost(uint64, tag = "3")]
+    pub hold: u64,
+    #[prost(uint64, tag = "4")]
+    pub term: u64,
+}
+/// `phdb cluster txn decide` (D329): an operator decides a share held in doubt on this node's
+/// `partition`, for a home that will never answer. Without `force`, refused while the home
+/// answers `ResolveTxn`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DecideTxnRequest {
+    #[prost(string, tag = "1")]
+    pub partition: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub commit: bool,
+    #[prost(bool, tag = "4")]
+    pub force: bool,
+}
+/// What a share in doubt asks its home (D329): the transaction's xid. With `acked` (the
+/// branch's partition), the branch reports it has applied the commit its home answered, for
+/// the decision record's GC; the answer is then the decision again.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveTxn {
+    #[prost(string, tag = "1")]
+    pub xid: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub acked: ::prost::alloc::string::String,
+}
+/// The home's answer (D329): `COMMITTED` or `ABORTED` decides the share; `IN_PROGRESS` and
+/// `UNKNOWN` leave it in doubt (`reason` says why).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TxnResolution {
+    #[prost(enumeration = "TxnOutcomeState", tag = "1")]
+    pub state: i32,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
+/// A prepared branch (D329): for a read-only one, its hold and the lease term it was taken in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchPrepared {
+    #[prost(uint64, tag = "1")]
+    pub hold: u64,
+    #[prost(uint64, tag = "2")]
+    pub term: u64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ForwardResponse {
     /// The seqno the serving node read at, in the owner's numbering (D328's
@@ -7793,7 +8082,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 30"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -7858,6 +8147,12 @@ pub mod forward_response {
         RecallPool(super::RecallPoolResponse),
         #[prost(message, tag = "24")]
         RecallBodies(super::RecallBodiesResponse),
+        #[prost(message, tag = "25")]
+        BranchPrepare(super::BranchPrepared),
+        #[prost(message, tag = "26")]
+        ResolveTxn(super::TxnResolution),
+        #[prost(message, tag = "30")]
+        TxnOutcome(super::TxnOutcomeResponse),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8542,6 +8837,31 @@ pub mod cluster_client {
                 .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "Status"));
             self.inner.unary(req, path, codec).await
         }
+        /// `phdb cluster txn decide` (D329): decides a share held in doubt on this node's partition,
+        /// for a transaction whose home will never answer. Admin or cluster scope. It can break the
+        /// transaction's atomicity, so without `force` it's refused while the home answers. Answers
+        /// the partition's status line.
+        pub async fn decide_txn(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DecideTxnRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/pigeonhole.v1.Cluster/DecideTxn",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("pigeonhole.v1.Cluster", "DecideTxn"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
         /// the caller it names, whose scope and namespaces this node checks again. This node
         /// serves it only if its own map gives it the key; otherwise `WrongPartition` with its
@@ -8915,6 +9235,14 @@ pub mod cluster_server {
             &self,
             request: tonic::Request<super::StatusRequest>,
         ) -> std::result::Result<tonic::Response<super::NodeStatus>, tonic::Status>;
+        /// `phdb cluster txn decide` (D329): decides a share held in doubt on this node's partition,
+        /// for a transaction whose home will never answer. Admin or cluster scope. It can break the
+        /// transaction's atomicity, so without `force` it's refused while the home answers. Answers
+        /// the partition's status line.
+        async fn decide_txn(
+            &self,
+            request: tonic::Request<super::DecideTxnRequest>,
+        ) -> std::result::Result<tonic::Response<super::LocalPartition>, tonic::Status>;
         /// Node to node (D317 ticket 2): a single-key call the sending node routed to this one, for
         /// the caller it names, whose scope and namespaces this node checks again. This node
         /// serves it only if its own map gives it the key; otherwise `WrongPartition` with its
@@ -9283,6 +9611,49 @@ pub mod cluster_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = StatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/pigeonhole.v1.Cluster/DecideTxn" => {
+                    #[allow(non_camel_case_types)]
+                    struct DecideTxnSvc<T: Cluster>(pub Arc<T>);
+                    impl<T: Cluster> tonic::server::UnaryService<super::DecideTxnRequest>
+                    for DecideTxnSvc<T> {
+                        type Response = super::LocalPartition;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DecideTxnRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Cluster>::decide_txn(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DecideTxnSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

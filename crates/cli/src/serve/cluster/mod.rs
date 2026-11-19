@@ -33,6 +33,7 @@ pub(crate) mod promote;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
+pub(crate) mod spanning;
 pub(crate) mod stamp;
 #[cfg(test)]
 mod tests;
@@ -78,6 +79,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     LEASES_FEATURE,
     WRITER_TERMS_FEATURE,
     RANGE_MOVES_FEATURE,
+    spanning::SPANNING_TXNS_FEATURE,
 ];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
@@ -171,7 +173,7 @@ pub(crate) const LOCK_FILE: &str = ".lock";
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
 
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
-const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
+pub(crate) const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
 /// Takes `dir`'s lock, or says another server or command has it.
 pub(crate) fn lock_dir(dir: &Path) -> Result<std::fs::File, Failure> {
@@ -251,6 +253,30 @@ pub(crate) static OLD_INDEXES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// is listed, as a stalled peer's wouldn't.
 #[cfg(test)]
 pub(crate) static HOLD_STATUS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): nodes that hold no election while their cluster directory is
+/// listed.
+#[cfg(test)]
+pub(crate) static NO_ELECTION: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): candidates whose real vote requests reach no peer, past a
+/// pre-vote that did: an election lost between the two rounds. Its own vote is recorded.
+#[cfg(test)]
+pub(crate) static DROP_VOTES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): writers that don't adopt a stranded node's term, so a test
+/// can watch the cluster with the node still stranded.
+#[cfg(test)]
+pub(crate) static NO_ADOPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Whether the seam `list` names this node's directory `dir`.
+#[cfg(test)]
+pub(crate) fn seam(list: &Mutex<Vec<PathBuf>>, dir: &Path) -> bool {
+    list.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}
 
 /// How [`OLD_NEAREST`] has a node act.
 #[cfg(test)]
@@ -427,6 +453,8 @@ pub(crate) struct Node {
     /// The writer's failover state (D330 PR 2): when it took office, the last survey, the
     /// promote in progress.
     failovers: failover::Failovers,
+    /// The writer's watch for nodes a lost election stranded (#2073).
+    stranded: Mutex<writer::Stranded>,
     /// The node's device ceiling (D332): the highest one-second rate of its partitions'
     /// device bytes within `--balance-window`, fed by [`Node::watch_device`].
     device_ceiling: load::DeviceCeiling,
@@ -514,6 +542,7 @@ impl Node {
             elect_since: Mutex::new(None),
             duties: std::sync::atomic::AtomicBool::new(false),
             failovers: failover::Failovers::default(),
+            stranded: Mutex::new(writer::Stranded::default()),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -614,8 +643,8 @@ impl Node {
             let voted = self.grants.voted();
             if map.writer_term < voted {
                 return Err(ApiError::failed_precondition(format!(
-                    "the map is at writer term {}, but this node voted for term {voted}: it's \
-                     from a writer that has been replaced (D330)",
+                    "the map is at writer term {}, but {VOTED_ABOVE} {voted}: it's from a writer \
+                     that has been replaced (D330)",
                     map.writer_term
                 )));
             }
@@ -1061,6 +1090,17 @@ impl Node {
                 {
                     node.state().divergent.insert(id.clone());
                 }
+                // A node the term fence keeps from this map: it voted in an election that
+                // lost (#2073). The writer's duties look at it.
+                if let Err(e) = &result
+                    && e.contains(VOTED_ABOVE)
+                {
+                    let now = node.grants.clock().now();
+                    node.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .refused(&id, now, node.grants.lease());
+                }
                 NodePush {
                     node: id,
                     ok: result.is_ok(),
@@ -1370,6 +1410,17 @@ impl Node {
                     .map(|c| c.replicas.load_full())
             })
             .unwrap_or_default();
+        let spanning = self
+            .server
+            .get()
+            .and_then(|o| o.shared.upgrade())
+            .and_then(|shared| {
+                shared
+                    .router
+                    .cluster
+                    .as_ref()
+                    .map(|c| Arc::clone(&c.spanning))
+            });
         for path in files {
             let file = path
                 .file_name()
@@ -1450,6 +1501,10 @@ impl Node {
                     };
                     lp.ok = lp.error.is_empty();
                 }
+            }
+            // D329: its shares held in doubt, the oldest first named, and why each waits.
+            if let Some(part) = open.get(&named) {
+                in_doubt(&mut lp, &part.db, &named, spanning.as_deref());
             }
             partitions.push(lp);
         }
@@ -1850,6 +1905,10 @@ impl Node {
 /// would be sturdier across versions, once a client other than a node needs it.
 const DIVERGENT: &str = "divergent map";
 
+/// The marker the term fence's refusal carries (D330), so a writer whose push it refuses
+/// looks at the node (#2073). Matched in the message, as [`DIVERGENT`] is.
+const VOTED_ABOVE: &str = "this node voted for term";
+
 /// The `Cluster` service over gRPC.
 #[derive(Debug, Clone)]
 /// The `Cluster` service: the node, and on a node that serves data (not a bare node in a
@@ -1903,6 +1962,68 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         let id = req.partition;
         self.0.unfence(&id, req.force).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
+    }
+
+    /// `phdb cluster txn decide` (D329 2b): decides a share held in doubt on this node's
+    /// partition, for a transaction whose home will never answer. Admin or cluster scope.
+    /// It can break the transaction's atomicity, so without `force` it's refused while the
+    /// home answers `ResolveTxn` (its resolver settles the share then).
+    async fn decide_txn(
+        &self,
+        req: Request<proto::DecideTxnRequest>,
+    ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
+        self.caller(
+            &req,
+            &[Scope::Admin, Scope::Cluster],
+            "decide a transaction",
+        )?;
+        let r = req.into_inner();
+        let Some(shared) = &self.1 else {
+            return Err(ApiError::unsupported("this node doesn't serve data").into());
+        };
+        let Some(cluster) = shared.router.cluster.as_ref() else {
+            return Err(ApiError::unsupported("this node isn't a cluster node").into());
+        };
+        let service = {
+            let routes = cluster.node.routes();
+            let Some(routes) = routes.as_ref() else {
+                return Err(
+                    ApiError::wrong_partition(0, "this node has no cluster map yet").into(),
+                );
+            };
+            cluster.owned_here(routes, &r.partition)?
+        };
+        if !r.force {
+            let asked = spanning::ask_home(
+                &cluster.node,
+                &cluster.parts,
+                &cluster.forwarder,
+                &cluster.spanning,
+                &r.xid,
+                None,
+                shared.limits.request_timeout,
+            )
+            .await;
+            // A home that answers UNKNOWN (its history changed) can't settle the share: the
+            // operator's decide is what's left (audit120's S1 on #2076).
+            if let Ok(home) = asked
+                && home.state != proto::TxnOutcomeState::Unknown as i32
+            {
+                return Err(ApiError::failed_precondition(format!(
+                    "the transaction's home answers ({:?}: {}), so its resolver settles this \
+                     share; --force only for a home that will never answer, and it can break \
+                     the transaction's atomicity",
+                    proto::TxnOutcomeState::try_from(home.state)
+                        .unwrap_or(proto::TxnOutcomeState::Unspecified),
+                    home.reason
+                ))
+                .into());
+            }
+        }
+        service
+            .decide_branch(&r.xid, r.commit, 0, 0, &cluster.spanning, &r.partition)
+            .await?;
+        Ok(tonic::Response::new(self.local(&r.partition).await?))
     }
 
     /// `phdb cluster close P --node N` (D317 amendment 2): admin scope.
@@ -1973,7 +2094,23 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         if self.0.is_vote(&mine, &req) {
             return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
         }
-        Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
+        let r = self.0.grants.grant(&mine, &req)?;
+        // The writer notes an asker it answers with its newer map (#2073): one that stays
+        // behind may be stranded by the term fence.
+        if schema::writer(&mine) == self.0.id {
+            let now = self.0.grants.clock().now();
+            let mut s = self
+                .0
+                .stranded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if r.newer_map_version != 0 {
+                s.behind(&req.node_id, now);
+            } else {
+                s.caught_up(&req.node_id);
+            }
+        }
+        Ok(tonic::Response::new(r))
     }
 
     /// Node to node (D326 PR 2): a node gave up partitions it closed. Cluster scope.
@@ -2078,6 +2215,35 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             crate::serve::grpc::grpc_timeout(req.metadata().as_ref()),
         );
         let msg = req.into_inner();
+        // A spanning transaction's branch call (D329): served on the partition it names.
+        if spanning::is_branch(&msg) {
+            let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
+            let Some(cluster) = shared.router.cluster.as_ref() else {
+                return Err(ApiError::unsupported("this node isn't a cluster node").into());
+            };
+            let service = {
+                let routes = cluster.node.routes();
+                let Some(routes) = routes.as_ref() else {
+                    return Err(
+                        ApiError::wrong_partition(0, "this node has no cluster map yet").into(),
+                    );
+                };
+                cluster.owned_here(routes, &msg.partition)?
+            };
+            let op = msg
+                .op
+                .ok_or_else(|| ApiError::invalid("a forward carries no call"))?;
+            let reply = spanning::serve_branch(
+                &cluster.node,
+                &cluster.spanning,
+                service,
+                &msg.partition,
+                op,
+                &caller,
+            )
+            .await?;
+            return Ok(tonic::Response::new(reply));
+        }
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
         // node's own token entry (D317 amendment 1).
@@ -2554,6 +2720,17 @@ pub(crate) fn run(
     }
     let placement = Arc::new(placement);
     let limits = args.limits();
+    // D329: a decision record must outlive any transaction that could still ask for it
+    // (audit120's S2 on the design).
+    let floor =
+        limits.leases.txn_lifetime + limits.request_timeout + std::time::Duration::from_secs(60);
+    if limits.txn_outcome_retention < floor {
+        return Err(Failure::usage(&format!(
+            "--txn-outcome-retention {:?} is below --txn-lifetime-ms + the request timeout + 1 \
+             minute ({floor:?}): a transaction's outcome must outlive its session",
+            limits.txn_outcome_retention
+        )));
+    }
     let metrics = Arc::new(super::service::Metrics::default());
     // The node's service, which serves no partition itself: its budgets, pools, session
     // caps and metrics are every partition's (D317 ticket 8a), as is its one `Backups`
@@ -2663,8 +2840,17 @@ pub(crate) fn run(
             replica_run: args.replica_run.max(1),
         },
     );
-    // A node that restarts with a map takes a newer one from its peers, then pushes.
-    let start = start_sync(&node, version);
+    // A node that restarts with a map takes a newer one from its peers, then pushes; and
+    // D329's resolver starts once it serves.
+    let resolver =
+        spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let sync = start_sync(&node, version);
+    let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        if let Some(sync) = sync {
+            sync();
+        }
+        resolver();
+    }));
     super::serve_shared(
         super::Serving {
             args,
@@ -3085,14 +3271,17 @@ fn open_partition(
             let _ = db.close();
             Ok(None)
         }
-        // D331 (simp724's B3): one epoch below a map that hands a range of it over, at that
-        // epoch: a crash after the map's persist and before the source's stamp. The open
-        // finishes the hand-over (the moved-away row, then the stamp) before it serves.
+        // D331 (simp724's B3): just below a map that hands a range of it over, at that epoch:
+        // a crash after the map's persist and before the source's stamp. The open finishes
+        // the hand-over (the moved-away row, then the stamp) before it serves. The map's
+        // epoch is exactly the hand-over's from the file's: one above, or past a promote's
+        // floor (#2070, ai1249's review), so a file staler than that isn't served.
         Ok(Some(id))
             if id.cluster_id == want.cluster_id
                 && id.partition_id == want.partition_id
-                && id.epoch + 1 == epoch
+                && id.epoch < epoch
                 && let Ok(Some(map)) = read_map(dir)
+                && epoch == id.epoch.max(promote::promote_floor(&map, partition)) + 1
                 && let Some(m) = moves::handing_over(&map, partition) =>
         {
             match moves::finish_hand_over(&db, m, epoch, dir) {
@@ -3123,6 +3312,37 @@ fn open_partition(
             )))
         }
     }
+}
+
+/// Fills `lp`'s in-doubt fields (D329, `LocalPartition` 21–25) from `db`'s shares held in
+/// doubt, with each one's reason as the resolver last found it.
+fn in_doubt(
+    lp: &mut LocalPartition,
+    db: &pigeonhole::Pigeonhole,
+    partition: &str,
+    spanning: Option<&spanning::Spanning>,
+) {
+    let mut shares = db.in_doubt_shares();
+    if shares.is_empty() {
+        return;
+    }
+    // The oldest first.
+    shares.sort_by_key(|s| std::cmp::Reverse(s.1));
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    lp.in_doubt = u32::try_from(shares.len()).unwrap_or(u32::MAX);
+    lp.in_doubt_oldest_xid = String::from_utf8_lossy(&shares[0].0).into_owned();
+    lp.in_doubt_oldest_age_ms = ms(shares[0].1);
+    lp.in_doubt_wal_bytes = shares.iter().map(|s| s.2).sum();
+    lp.in_doubt_shares = shares
+        .iter()
+        .map(|(xid, age, _)| proto::InDoubtShare {
+            xid: String::from_utf8_lossy(xid).into_owned(),
+            age_ms: ms(*age),
+            reason: spanning
+                .and_then(|s| s.reason(partition, xid))
+                .unwrap_or_else(|| "its decision hasn't arrived yet".to_owned()),
+        })
+        .collect();
 }
 
 /// The partitions whose owner, epoch or history `new` changes from `old` (all of them for a

@@ -143,6 +143,8 @@ pub struct Commit {
     seqno: u64,
     ts: u64,
     changes: Vec<Change>,
+    /// A spanning commit's xid (D329 2b): [`xid`](Self::xid), and a replicated event's.
+    pub(crate) xid: Option<std::sync::Arc<[u8]>>,
 }
 
 impl Commit {
@@ -155,6 +157,16 @@ impl Commit {
     /// Its commit timestamp.
     pub fn timestamp(&self) -> u64 {
         self.ts
+    }
+
+    /// The transaction it is a share of, when it's a spanning commit's (D329 2b, ICR 0140
+    /// amendment 2): every share of one commit, on every partition, carries the same, so a
+    /// subscriber can group them. `None` for any other commit. Hidden, as
+    /// [`Transaction::tag_xid`](crate::Transaction::tag_xid).
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[doc(hidden)]
+    pub fn xid(&self) -> Option<&[u8]> {
+        self.xid.as_deref()
     }
 
     /// Its changes the feed follows, in the order the commit wrote them.
@@ -170,6 +182,7 @@ impl Commit {
             seqno: 0,
             ts: 0,
             changes: Vec::new(),
+            xid: None,
         }
     }
 }
@@ -474,6 +487,7 @@ impl FeedBuilder {
             },
             covered: pigeonhole_engine::FeedPosition::default(),
             span: (start, start),
+            xid_out: false,
             progress: FeedProgress::attach(reader_progress),
             include_silent: false,
         })
@@ -572,6 +586,9 @@ pub struct Feed {
     /// The stream's position before and after the last delivery (D315 PR 3): a replica checks
     /// that the runs it applies chain, each starting where the last ended.
     span: (StreamPosition, StreamPosition),
+    /// The commit last delivered carried an xid (D329 2b): the next delivery clears it. With
+    /// none now and none before, a delivery's xid costs one test (#2076's feed shapes).
+    xid_out: bool,
     /// Its position, published by the reader as it moves ([`Feed::progress`]).
     progress: FeedProgress,
     /// Feed-silent commits are delivered (D331: a replica's follower only), kept across a
@@ -909,6 +926,33 @@ impl Feed {
     fn note_delivery(&mut self) {
         let after = stream_position(&self.reader);
         self.span = (self.span.1, after);
+        // A spanning commit's xid (D329 2b), which the engine's reader keeps beside the
+        // commit: into the commit just delivered, as an event or on its own.
+        if self.xid_out || self.reader.xid().is_some() {
+            self.deliver_xid();
+        }
+    }
+
+    /// [`note_delivery`](Self::note_delivery)'s xid, out of line: only once a spanning
+    /// commit's share has been delivered.
+    #[cold]
+    #[inline(never)]
+    fn deliver_xid(&mut self) {
+        let xid = self.reader.xid().cloned();
+        self.xid_out = xid.is_some();
+        match &mut self.out.event {
+            Some(FeedEvent::Commit(c)) => c.xid = xid,
+            // Not a commit: nothing carries an xid, and the commit buffer's (the last
+            // commit's, which `fill` leaves) is cleared, so `xid_out` is set exactly when the
+            // buffer holds one. Otherwise a reader replaced since that commit (a resubscribe,
+            // its `xid()` none) would let the next plain commit skip this and go out with the
+            // old xid (audit120's X1 on #2076).
+            Some(_) => {
+                self.out.commit.xid = None;
+                self.xid_out = false;
+            }
+            None => self.out.commit.xid = xid,
+        }
     }
 
     /// The error that ended the feed, again.
@@ -1255,6 +1299,76 @@ mod tests {
             assert_eq!(feed.next(Duration::from_secs(5)).unwrap_err(), e);
             assert_eq!(feed.try_next().unwrap_err(), e);
         }
+        drop(feed);
+        db.close().unwrap();
+    }
+
+    /// audit120's X1 on #2076: a feed of every table delivers a spanning commit's share with
+    /// its xid, then resubscribes (as after a recovery or its writer's restart: the new
+    /// reader's `xid()` is none), then delivers a catalog change and a plain commit. The plain
+    /// commit carries no xid, as an event and as a replica would apply it, so no replica
+    /// logs it as a share of the earlier transaction.
+    #[cfg(feature = "__unstable-txn-prepare")]
+    #[test]
+    fn a_plain_commit_after_a_resubscribe_and_a_catalog_change_carries_no_xid() {
+        let dir = crate::doc_support::temp_dir();
+        let db = Pigeonhole::open(
+            dir.join("db.phdb"),
+            Options::default().change_feed(FeedRetention::bytes(16 << 20)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let mut feed = db.feed().open().unwrap();
+        let wait = Duration::from_secs(5);
+        let next_commit = |feed: &mut Feed| loop {
+            match feed.next_event(wait).unwrap().expect("an event") {
+                FeedEvent::Commit(c) => return c.xid().map(<[u8]>::to_vec),
+                _ => continue,
+            }
+        };
+        let xid = b"p0:h1-0123456789abcdef0123456789abcdef";
+        let mut txn = db.transaction().unwrap();
+        txn.put(&t, b"share", "f", b"q", b"v");
+        txn.tag_xid(xid);
+        txn.commit().unwrap();
+        assert_eq!(next_commit(&mut feed).as_deref(), Some(&xid[..]));
+        feed.resubscribe().unwrap();
+        assert!(
+            feed.reader.xid().is_none(),
+            "a fresh reader has delivered nothing"
+        );
+        db.table("u")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        assert!(
+            matches!(feed.next_event(wait).unwrap(), Some(FeedEvent::Catalog(_))),
+            "the table's creation"
+        );
+        t.mutate(b"plain").put("f", b"q", b"v").commit().unwrap();
+        assert_eq!(
+            next_commit(&mut feed),
+            None,
+            "the plain commit carries no xid"
+        );
+        #[cfg(feature = "__unstable-replication")]
+        assert_eq!(
+            feed.replicated().expect("the commit").xid(),
+            None,
+            "nor as a replica applies it"
+        );
+        // A later share still carries its own.
+        let mut txn = db.transaction().unwrap();
+        txn.put(&t, b"again", "f", b"q", b"v");
+        txn.tag_xid(xid);
+        txn.commit().unwrap();
+        assert_eq!(next_commit(&mut feed).as_deref(), Some(&xid[..]));
         drop(feed);
         db.close().unwrap();
     }

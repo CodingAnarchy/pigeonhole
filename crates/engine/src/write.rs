@@ -1175,6 +1175,48 @@ pub struct Txn {
     pub(crate) snapshot: Snapshot,
     pub(crate) reads: Vec<ReadKey>,
     pub(crate) batch: WriteBatch,
+    /// A spanning commit's xid (D329 2b, [`tag_xid`](Txn::tag_xid)): passed with the commit,
+    /// not carried on the batch (perf2's N1 on #2076).
+    pub(crate) xid: Option<Box<[u8]>>,
+}
+
+/// A read-only transaction's reads, validated and held in memory ([`Txn::hold_reads`],
+/// ICR 0140 amendment 1). Dropping it releases the hold without asking whether it lasted.
+#[derive(Debug)]
+pub struct ReadHold {
+    engine: std::sync::Weak<Inner>,
+    token: u64,
+    shards: Vec<pigeonhole_runtime::ShardId>,
+    done: bool,
+}
+
+impl ReadHold {
+    /// Ends the hold, answering whether it was still in place on every shard (`true`), or
+    /// was lost to a close or a recovery (`false`): `false` only ever means lost. It waits
+    /// for the shards' answers, so on a thread that drives a shard (application-owned mode)
+    /// it's refused (`InvalidArgument`) rather than guess: the hold is then released as it's
+    /// dropped, without an answer (perf2's S2 on #2062).
+    pub fn release(mut self) -> crate::Result<bool> {
+        let Some(engine) = self.engine.upgrade() else {
+            self.done = true;
+            return Ok(false);
+        };
+        engine
+            .shared
+            .refuse_blocking_on_driver("releasing a read hold")?;
+        self.done = true;
+        Ok(engine.release_reads(self.token, &self.shards, true))
+    }
+}
+
+impl Drop for ReadHold {
+    fn drop(&mut self) {
+        if !self.done
+            && let Some(e) = self.engine.upgrade()
+        {
+            e.release_reads(self.token, &self.shards, false);
+        }
+    }
 }
 
 impl Txn {
@@ -1281,6 +1323,14 @@ impl Txn {
         &mut self.batch
     }
 
+    /// Tags the transaction's commit with `xid` (D329 2b): a spanning commit's home share.
+    /// Its records carry it (`XID_BATCH`), and its change-feed events deliver it. 1–255
+    /// bytes; checked when the commit is routed. Hidden.
+    #[doc(hidden)]
+    pub fn tag_xid(&mut self, xid: &[u8]) {
+        self.xid = Some(xid.into());
+    }
+
     /// The commit of a transaction that writes nothing (#694, ICR 0060): it needs no
     /// validation and no shard round. Its reads all come from one consistent snapshot, so it
     /// is serializable at that snapshot whatever committed since, and it never conflicts. It
@@ -1324,6 +1374,7 @@ impl Txn {
                     snapshot,
                     reads,
                     batch,
+                    xid,
                 } = self;
                 let validate = Validate::new(snapshot, reads);
                 return Ok(PendingCommit::waiting(
@@ -1331,7 +1382,7 @@ impl Txn {
                     admit,
                     Box::new(move || {
                         engine
-                            .submit(batch, durability, Some(validate), None)
+                            .submit_with(batch, durability, Some(validate), None, xid.as_deref())
                             .map(PendingCommit::from)
                     }),
                 ));
@@ -1360,12 +1411,14 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid,
         } = self;
-        engine.submit(
+        engine.submit_with(
             batch,
             durability,
             Some(Validate::new(snapshot, reads)),
             None,
+            xid.as_deref(),
         )
     }
 
@@ -1381,14 +1434,16 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid,
         } = self;
         engine.shared.refuse_blocking_on_driver("Txn::commit")?;
         engine
-            .submit(
+            .submit_with(
                 batch,
                 durability,
                 Some(Validate::new(snapshot, reads)),
                 None,
+                xid.as_deref(),
             )?
             .wait()
     }
@@ -1397,18 +1452,55 @@ impl Txn {
     /// ICR 0140): its shares are logged (`durability`, GroupSync at least for the caller's
     /// atomicity) and hold their rows, and its decision waits for
     /// [`Engine::decide`](crate::Engine::decide), across a close and a reopen. The answer's
-    /// seqno is the commit's id. `Conflict` as a commit would be; `InvalidArgument` for a
-    /// transaction with no writes (a read-only prepare is a later part of ICR 0140), a value
-    /// over the inline limit, or an `xid` already in doubt here.
+    /// seqno is the commit's id. A transaction that only read logs its reads with an empty
+    /// batch and holds them the same way (a spanning commit's read-only branch, ICR 0140
+    /// amendment 1); a wholly read-only spanning commit holds its reads in memory instead
+    /// ([`hold_reads`](Self::hold_reads)). `Conflict` as a commit would be;
+    /// `InvalidArgument` for a transaction with no reads and no writes, a value over the
+    /// inline limit, or an `xid` already in doubt here.
     pub fn prepare(self, xid: &[u8], durability: Durability) -> crate::Result<CommitInfo> {
         let Txn {
             engine,
             snapshot,
             reads,
             batch,
+            xid: tag,
         } = self;
+        refuse_tagged(tag.as_deref())?;
         engine.shared.refuse_blocking_on_driver("Txn::prepare")?;
         engine.prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
+    }
+
+    /// Validates the transaction's reads and holds them in memory (ICR 0140 amendment 1,
+    /// D329 PR 2a): a wholly read-only transaction's part of a spanning commit. Nothing is
+    /// logged and nothing is ever in doubt. While the [`ReadHold`] lives, a write to a held
+    /// row is refused at once (a transaction's prepare with `Conflict`, any other write
+    /// `Busy`), and a tablet change touching one is given up (`Busy`).
+    /// `InvalidArgument` for a transaction with writes or without reads; `Conflict` if a read
+    /// changed since the snapshot or overlaps an undecided write; `Busy` past the in-doubt
+    /// share limit (live holds count) or while a read's tablet moves; `ReadOnly` on a replica
+    /// or a read-only open.
+    pub fn hold_reads(self) -> crate::Result<ReadHold> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+            xid: _,
+        } = self;
+        if !batch.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "a read hold is for a transaction without writes: prepare it instead".to_owned(),
+            ));
+        }
+        engine.shared.refuse_blocking_on_driver("Txn::hold_reads")?;
+        let (token, shards) = engine.hold_reads(Validate::new(snapshot, reads))?;
+        Ok(ReadHold {
+            engine: Arc::downgrade(&engine),
+            token,
+            shards,
+            done: false,
+        })
     }
 
     /// [`prepare`](Self::prepare) without waiting (D329): the [`PendingCommit`] resolves as
@@ -1426,10 +1518,23 @@ impl Txn {
             snapshot,
             reads,
             batch,
+            xid: tag,
         } = self;
+        refuse_tagged(tag.as_deref())?;
         engine
             .submit_prepare_external(batch, durability, Some(Validate::new(snapshot, reads)), xid)
             .map(|(sub, _)| PendingCommit::from(sub))
+    }
+}
+
+/// An External Prepare names its xid in its record: a transaction tagged for a spanning
+/// commit's home share ([`Txn::tag_xid`]) has no place there (feed1248's point 6 on 2b).
+fn refuse_tagged(tag: Option<&[u8]>) -> crate::Result<()> {
+    match tag {
+        Some(_) => Err(crate::Error::InvalidArgument(
+            "an external prepare can't carry an xid tag: its share names its xid".to_owned(),
+        )),
+        None => Ok(()),
     }
 }
 

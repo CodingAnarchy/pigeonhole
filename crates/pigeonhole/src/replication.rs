@@ -34,6 +34,9 @@ pub(crate) enum Body {
         /// commit's room under the catalog variant, so an event is no larger than before
         /// (#2055's replicate-apply).
         silent: bool,
+        /// A spanning commit's xid (D329 2b): a replica applies it tagged, so its own feed, and
+        /// a promoted replica's, carries it as the primary's does.
+        xid: Option<std::sync::Arc<[u8]>>,
     },
     Catalog(CatalogEvent),
     /// A range drop (D331): rows `[start, end)` of `table` dropped, with the primary's
@@ -111,6 +114,7 @@ impl ReplicatedEvent {
                     })
                     .collect(),
                 silent,
+                xid: c.xid.clone(),
             },
             FeedEvent::Catalog(change) => Body::Catalog(change.raw().clone()),
             FeedEvent::RangeDrop(d) => Body::RangeDrop(Box::new(d.clone())),
@@ -127,6 +131,14 @@ impl ReplicatedEvent {
     /// which a replica applies silent so its own feed matches its primary's.
     pub fn is_silent(&self) -> bool {
         matches!(self.body, Body::Commit { silent: true, .. })
+    }
+
+    /// The spanning commit's xid, if it is one's share (D329 2b).
+    pub fn xid(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Commit { xid, .. } => xid.as_deref(),
+            Body::Catalog(_) | Body::RangeDrop(_) => None,
+        }
     }
 
     /// Whether it is a catalog change (applied with `apply_catalog`, between runs of commits).
@@ -160,11 +172,20 @@ impl ReplicatedEvent {
     /// primary's replicas before the primary (feed1248's S1 on #2089).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(if self.is_silent() {
-            SILENT_EVENT_VERSION
-        } else {
-            EVENT_VERSION
-        });
+        match self.xid() {
+            // A spanning commit's share (D329 2b): version 3, its flags, then the xid. Only
+            // then: versions 1 and 2 are what they were, byte for byte.
+            Some(xid) => {
+                out.push(FLAGS_EVENT_VERSION);
+                out.push(u8::from(self.is_silent()) | FLAG_XID);
+                put_bytes(&mut out, xid);
+            }
+            None => out.push(if self.is_silent() {
+                SILENT_EVENT_VERSION
+            } else {
+                EVENT_VERSION
+            }),
+        }
         for v in [
             self.before.seqno,
             self.before.catalog,
@@ -229,9 +250,34 @@ impl ReplicatedEvent {
     /// newer encoding.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
-        let silent = match r.u8()? {
-            EVENT_VERSION => false,
-            SILENT_EVENT_VERSION => true,
+        let (silent, xid) = match r.u8()? {
+            EVENT_VERSION => (false, None),
+            SILENT_EVENT_VERSION => (true, None),
+            FLAGS_EVENT_VERSION => {
+                let flags = r.u8()?;
+                if flags & !(FLAG_SILENT | FLAG_XID) != 0 {
+                    return Err(invalid(
+                        "a replicated event with flags this build doesn't know".to_owned(),
+                    ));
+                }
+                // Version 3 is written only with an xid (versions 1 and 2 cover the rest):
+                // one without isn't this build's (feed1248's N3 on #2076).
+                if flags & FLAG_XID == 0 {
+                    return Err(invalid(
+                        "a version 3 replicated event without an xid".to_owned(),
+                    ));
+                }
+                let xid = if flags & FLAG_XID != 0 {
+                    let x = r.bytes()?;
+                    if x.is_empty() || x.len() > 255 {
+                        return Err(invalid("a replicated event's xid".to_owned()));
+                    }
+                    Some(std::sync::Arc::<[u8]>::from(x))
+                } else {
+                    None
+                };
+                (flags & FLAG_SILENT != 0, xid)
+            }
             _ => return Err(invalid("not a replicated event of this version".to_owned())),
         };
         let before = StreamPosition {
@@ -269,9 +315,14 @@ impl ReplicatedEvent {
                     ts,
                     changes,
                     silent,
+                    xid,
                 }
             }
             1 => {
+                // A catalog change is never a spanning commit's share: never version 3.
+                if xid.is_some() {
+                    return Err(invalid("a catalog change in a flagged event".to_owned()));
+                }
                 let mut ev = CatalogEvent::default();
                 ev.seqno_ceiling = r.u64()?;
                 ev.timestamp = r.u64()?;
@@ -343,6 +394,15 @@ const EVENT_VERSION: u8 = 1;
 /// [`ReplicatedEvent::encode`]'s version for a feed-silent commit (D331, ICR 0141): version 1's
 /// fields, read only by builds that apply the mark.
 const SILENT_EVENT_VERSION: u8 = 2;
+
+/// [`ReplicatedEvent::encode`]'s version for a spanning commit's share (D329 2b, numbers.md):
+/// a flags byte after the version ([`FLAG_SILENT`], [`FLAG_XID`]; any other bit refused),
+/// then the xid, then version 1's fields. Written only for an event with an xid.
+const FLAGS_EVENT_VERSION: u8 = 3;
+/// Version 3's flag for a feed-silent commit.
+const FLAG_SILENT: u8 = 1;
+/// Version 3's flag for an xid that follows.
+const FLAG_XID: u8 = 2;
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -729,6 +789,8 @@ impl Pigeonhole {
             if let Some(end) = part_end
                 && (part_bytes + bytes > cap
                     || end.is_silent() != event.is_silent()
+                    // One spanning commit's share per part, as its xid tags the whole batch.
+                    || end.xid() != event.xid()
                     || changes.iter().any(|c| {
                         cells.contains(&(c.table, c.family, &c.row[..], &c.qualifier[..], c.ts))
                     }))
@@ -920,8 +982,10 @@ impl Pigeonhole {
             after: end.after,
             token: Some(end.token.clone()),
         };
+        // A part holds one spanning commit's share or none (the split above), so its last
+        // event's xid is the whole part's (D329 2b).
         self.engine()
-            .apply_replicated(batch, &state.encode(), max_ts)?;
+            .apply_replicated_with(batch, &state.encode(), max_ts, end.xid())?;
         Ok(())
     }
 
@@ -1117,4 +1181,44 @@ pub struct TabletLoad {
     pub bytes: u64,
     /// Rows written to it per balancer interval, a moving average.
     pub write_load: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_spanning_share_round_trips_as_version_3() {
+        // D329 2b: version 3's flags carry both marks; no producer makes such a commit today
+        // (a range move's copy is silent, a spanning commit's share is tagged), but the
+        // encoding keeps them apart and a replica would apply it silent and tagged.
+        let xid: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"p1:h2-aa"[..]);
+        let e = ReplicatedEvent {
+            before: StreamPosition {
+                seqno: 1,
+                catalog: 0,
+            },
+            after: StreamPosition {
+                seqno: 2,
+                catalog: 0,
+            },
+            token: FeedToken::from_bytes(b"t"),
+            body: Body::Commit {
+                seqno: 2,
+                ts: 5,
+                changes: Vec::new(),
+                silent: true,
+                xid: Some(xid),
+            },
+        };
+        let bytes = e.encode();
+        assert_eq!(
+            (bytes[0], bytes[1]),
+            (FLAGS_EVENT_VERSION, FLAG_SILENT | FLAG_XID)
+        );
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert!(back.is_silent());
+        assert_eq!(back.xid(), Some(&b"p1:h2-aa"[..]));
+        assert_eq!(back.encode(), bytes, "it round-trips");
+    }
 }

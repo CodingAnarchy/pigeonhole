@@ -135,6 +135,13 @@ pub(crate) struct WriteGate {
     leased_once: std::sync::atomic::AtomicBool,
     /// The node's lease clock.
     clock: Arc<LeaseClock>,
+    /// The lease term (D329, audit120's condition 2 on the read-only release round): raised
+    /// whenever the partition's lease stops being continuous, so two reads of it under a live
+    /// lease that agree mean the lease held throughout. Raised by a renewal that starts a
+    /// lease after a gap (before the new end is stored), by `lapse` and by the operator's
+    /// `fence`. SeqCst, like the other fields: [`serving_term`](Self::serving_term) reads it
+    /// on both sides of the lease check.
+    term: AtomicU64,
     /// Woken when the last write finishes while fenced.
     drained: Notify,
     /// The ranges a move gates (D331): read beside the gate on every call.
@@ -153,6 +160,7 @@ impl WriteGate {
             lease_end: AtomicU64::new(0),
             leased_once: std::sync::atomic::AtomicBool::new(false),
             clock,
+            term: AtomicU64::new(0),
             drained: Notify::new(),
             ranges: super::ranges::RangeGate::default(),
         })
@@ -192,6 +200,28 @@ impl WriteGate {
     pub(crate) fn serving(&self) -> Result<(), ApiError> {
         if self.leased() {
             Ok(())
+        } else {
+            Err(unleased(&self.partition, self.leased_once()))
+        }
+    }
+
+    /// The lease term while the partition serves, unfenced, under a live lease (D329): a
+    /// read-only branch's hold records it at prepare, and its release answers only under the
+    /// same term, so a lapse, fence or move in between always reads as a lost hold.
+    /// `PartitionUnavailable` or `Fenced` otherwise. Reads the term on both sides of the
+    /// checks: a renewal after a gap raises it before it stores the new end, so a gap that
+    /// ends between the reads changes the second.
+    pub(crate) fn serving_term(&self) -> Result<u64, ApiError> {
+        let before = self.term.load(Ordering::SeqCst);
+        if let Some(why) = self.fenced() {
+            return Err(match why {
+                Fence::Operator => fenced(&self.partition, why),
+                _ => unleased(&self.partition, self.leased_once()),
+            });
+        }
+        let after = self.term.load(Ordering::SeqCst);
+        if before == after {
+            Ok(after)
         } else {
             Err(unleased(&self.partition, self.leased_once()))
         }
@@ -254,6 +284,7 @@ impl WriteGate {
     /// lease is untouched: its reads go on while it holds one.
     pub(crate) fn fence(&self) {
         self.fence.fetch_or(OPERATOR, Ordering::SeqCst);
+        self.term.fetch_add(1, Ordering::SeqCst);
     }
 
     /// A lease round's grant reached a majority: the lease runs until `end` on the node's
@@ -261,6 +292,10 @@ impl WriteGate {
     /// before (it starts serving now).
     pub(crate) fn renew(&self, end: u64) -> bool {
         let was = self.leased();
+        if !was {
+            // A new lease after a gap: a new term, raised before the end that starts it.
+            self.term.fetch_add(1, Ordering::SeqCst);
+        }
         self.lease_end.fetch_max(end, Ordering::SeqCst);
         self.leased_once.store(true, Ordering::SeqCst);
         !was
@@ -273,6 +308,7 @@ impl WriteGate {
     /// in between must see `Wait` (and take that end next), not `End`'s
     /// `PartitionUnavailable`, which would skip S-C5's reopen at the new owner.
     pub(crate) fn lapse(&self) {
+        self.term.fetch_add(1, Ordering::SeqCst);
         self.lease_end.store(0, Ordering::SeqCst);
         self.leased_once.store(false, Ordering::SeqCst);
     }
@@ -409,6 +445,41 @@ mod tests {
         let g = WriteGate::opened(partition, false, Arc::clone(&clock));
         assert!(g.renew(clock.now() + 3_600_000_000_000));
         g
+    }
+
+    #[test]
+    fn the_term_holds_only_while_the_lease_runs_unbroken() {
+        // D329 (audit120's condition 2): two `serving_term` reads that agree mean the lease
+        // ran unbroken between them. Renewals within the lease keep the term; a lapse, an
+        // expiry renewed later, and the operator's fence each change it.
+        let clock = Arc::new(LeaseClock::default());
+        let g = WriteGate::opened("p1", false, Arc::clone(&clock));
+        assert_eq!(g.serving_term().unwrap_err().code, "PartitionUnavailable");
+        assert!(g.renew(clock.now() + 1_000_000_000));
+        let t = g.serving_term().unwrap();
+        assert!(!g.renew(clock.now() + 2_000_000_000), "a renewal in time");
+        assert_eq!(
+            g.serving_term().unwrap(),
+            t,
+            "renewed in time: the same term"
+        );
+        // Expired, then renewed: serving again, at a new term.
+        clock.advance(Duration::from_secs(3));
+        assert!(g.serving_term().is_err());
+        assert!(g.renew(clock.now() + 1_000_000_000));
+        let t2 = g.serving_term().unwrap();
+        assert_ne!(t2, t, "a gap in the lease");
+        // The operator's fence, lifted: the same lease, but a new term.
+        g.fence();
+        assert_eq!(g.serving_term().unwrap_err().code, "Fenced");
+        g.unfence();
+        let t3 = g.serving_term().unwrap();
+        assert_ne!(t3, t2, "a fence in between");
+        // A lapse (the map moved it away), then a lease again.
+        g.lapse();
+        assert!(g.serving_term().is_err());
+        assert!(g.renew(clock.now() + 1_000_000_000));
+        assert_ne!(g.serving_term().unwrap(), t3, "a lapse in between");
     }
 
     #[test]

@@ -200,6 +200,9 @@ pub use retry::RetryPolicy;
 pub use set::{SetIntersection, SetIter, SetRef};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use vector::{Element, Metric, Vector, VectorRef, VectorSpec};
+#[cfg(feature = "__unstable-txn-prepare")]
+#[doc(hidden)]
+pub use write::ReadHold;
 pub use write::{
     Checked, CommitInfo, CommitTicket, Durability, Incremented, Returned, RowMutation, Seen,
     Transaction, WriteBatch,

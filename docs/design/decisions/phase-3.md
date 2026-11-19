@@ -5129,6 +5129,19 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 
 - **Before merge:** a box A/B at main's defaults (group sync depth 2) and across the gate's write rows.
 
+**Amended (coordinator, 2026-11-18; the 1.3.0 pre-gate): the chunk is 256 KiB, not 1 MiB.** The SST writer's write-and-hint unit and the blob writer's hint unit are both 256 KiB.
+- **What it fixed:** the 1.3.0 pre-gate found GroupSync p99.9 1.4–1.9× v1.2.3 on the contended default-durability rows, with throughput and p99 level. ABBA attribution (perf287, the hint a no-op, then punching off) pinned it on the hint: a 1 MiB hint queues its range at the device at once, and a WAL group sync's small write that lands behind it waits about 100 µs more. g145b ran the gate's write rows uncontended and missed this.
+- **The A/B** (AX102, 2026-11-18, ABBA; pigeonhole p99.9 µs, two runs each):
+
+  | row | v1.2.3 | 1 MiB | 256 KiB | 256 KiB + a wait for no sync in flight |
+  |---|---|---|---|---|
+  | time-series-ttl | 152 / 152 | 262 / 256 | 154 / 150 | 161 / 162 |
+  | ycsb-a | 137 / 126 | 201 / 212 | 135 / 140 | 139 / 144 |
+
+  - RocksDB beside: within ±1% on every arm. Throughput and p99 level with v1.2.3 at 256 KiB.
+  - #1991's serve session (g155, perf287): rows 10–16 put p99 0.27–0.29 ms at 256 KiB (1 MiB: 0.28–0.31). Device writes ≥ 5 ms 0, write stalls 0, every hint returned 0.
+- **Not taken: the wait.** Holding each hint (up to 500 µs) until no data sync was in flight removed the serve session's slow fsyncs (0 against 11). It also cost time-series-ttl p99 (114–120 against 107 µs) and about 2% throughput, and had the window's only write stalls.
+
 <a id="d333"></a>
 ## D333 — Punch the data file's free space, on by default (coordinator, 2026-11-17; engine/pager/io, #2013; ICR 0144)
 

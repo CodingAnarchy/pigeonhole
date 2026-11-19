@@ -102,7 +102,9 @@ impl Admission {
     /// It doesn't look at `closed`: its caller checked the engine is open just before, and
     /// a commit charged as a close begins is answered `Closed` by its shard, which returns
     /// the charge like any other resolution.
-    #[inline]
+    // Always inlined: an async commit's fast path, which the compiler stopped inlining once
+    // routing grew (#2076's commit-async).
+    #[inline(always)]
     pub(crate) fn try_fast(&self, shard: usize, bytes: u64) -> Option<Charge> {
         let s = &self.shards[shard];
         if s.waiting.load(Ordering::Acquire) != 0 {

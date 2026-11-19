@@ -109,7 +109,7 @@ pub use shard::remove_side_files;
 #[doc(hidden)]
 pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};
-pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, Txn, WriteBatch};
+pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, ReadHold, Txn, WriteBatch};
 
 /// What the engine's own tests reach in with (the `test-hooks` feature, `engine::hooks`).
 #[cfg(feature = "test-hooks")]

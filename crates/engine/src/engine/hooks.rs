@@ -209,6 +209,25 @@ impl Faults {
     }
 }
 
+/// One-shot callbacks for the next `Engine::open_reader` on a VFS, keyed by its address
+/// (`Engine::on_next_reader_open`). Process-wide, since a reader being opened has no `Shared`
+/// yet; keyed by VFS so tests running alongside never take another's.
+static READER_OPENS: Mutex<Vec<(usize, Callback)>> = Mutex::new(Vec::new());
+
+/// Runs the callback set for the next reader open on `vfs`, if any: between the open's
+/// root read (`Pager::open`) and its manifest load (#2085).
+pub(crate) fn run_reader_open(vfs: &Arc<dyn pigeonhole_io::Vfs>) {
+    let key = Arc::as_ptr(vfs).cast::<u8>() as usize;
+    let f = {
+        let mut v = READER_OPENS.lock().unwrap_or_else(PoisonError::into_inner);
+        let i = v.iter().position(|(k, _)| *k == key);
+        i.map(|i| v.swap_remove(i).1)
+    };
+    if let Some(f) = f {
+        f();
+    }
+}
+
 /// The engine-wide hook state (`Shared::hooks`).
 #[derive(Default)]
 pub(crate) struct Hooks {
@@ -500,6 +519,17 @@ impl Engine {
     #[doc(hidden)]
     pub fn on_next(&self, site: HookSite, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.sites.set(site, f);
+    }
+
+    /// Sets a one-shot callback for the next `open_reader` on `vfs` (test hook): it runs on
+    /// the opening thread after the open has read the root and before it loads that root's
+    /// manifest (#2085), replacing one that has not run.
+    #[doc(hidden)]
+    pub fn on_next_reader_open<V: ?Sized>(vfs: &Arc<V>, f: Box<dyn FnOnce() + Send>) {
+        let key = Arc::as_ptr(vfs).cast::<u8>() as usize;
+        let mut v = READER_OPENS.lock().unwrap_or_else(PoisonError::into_inner);
+        v.retain(|(k, _)| *k != key);
+        v.push((key, f));
     }
 
     /// Switches fault `fault` on or off (test hook): see [`Fault`] for each. A one-shot fault

@@ -476,3 +476,62 @@ fn a_share_in_doubt_keeps_the_clip_until_it_is_decided() {
     assert!(t.get(b"zed", "f", b"q").unwrap().is_none());
     let _ = db.close();
 }
+
+/// #2070 (ai1249's review): the open that finishes a hand-over cut before the stamp takes the
+/// file only at the hand-over's exact jump. A file at epoch 1 under a hand-over map at 3
+/// finishes when an abandoned promote recorded epoch 2 (the floor the hand-over went past),
+/// and is refused when nothing explains the gap (a stale file).
+#[test]
+fn an_open_finishes_a_hand_over_past_a_promotes_floor_and_no_further() {
+    use crate::serve::proto::{FailoverEvent, FailoverKind, FailoverState};
+    for floor in [true, false] {
+        let ports = [7001, 7002, 7003];
+        let dir = test_dir();
+        let mut handed = moving(&the_map(1, &ports), 5, Some(MovePhase::HandedOver));
+        handed.partitions[0].epoch = 3;
+        if floor {
+            let mut e = FailoverEvent {
+                partition: "p1".into(),
+                from: "a".into(),
+                to: "b".into(),
+                to_epoch: 2,
+                ..Default::default()
+            };
+            e.set_kind(FailoverKind::Partition);
+            e.set_state(FailoverState::Abandoned);
+            handed.failovers.push(e);
+        }
+        super::super::write_map(&dir, &super::super::map::canonical_json(&handed)).unwrap();
+        let path = dir.join("p1.phdb");
+        let db =
+            pigeonhole::Pigeonhole::open(&path, pigeonhole::Options::default().shards(1)).unwrap();
+        super::super::identity::write(
+            &db,
+            &super::super::identity::Identity {
+                cluster_id: "c1".into(),
+                partition_id: "p1".into(),
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        db.close().unwrap();
+        let opened = super::super::open_partition(
+            &dir,
+            "c1",
+            "p1",
+            3,
+            pigeonhole::Options::default().shards(1),
+        );
+        if floor {
+            let db = opened.unwrap().expect("opened at the map's epoch");
+            assert_eq!(super::super::identity::read(&db).unwrap().unwrap().epoch, 3);
+            assert_eq!(crate::serve::ranges::read_moved(&db).unwrap().len(), 1);
+            let _ = db.close();
+        } else {
+            assert!(
+                !matches!(opened, Ok(Some(_))),
+                "a file two epochs below with no floor was opened"
+            );
+        }
+    }
+}

@@ -295,8 +295,10 @@ impl Entry {
     /// An entry for `commit`, encoded for clients with no prefix and sized with that
     /// encoding (simp724's R1, perf287's P1 on #1541); `prev` is set when it's pushed.
     fn new(commit: &Commit, token: Bytes) -> Self {
-        let encoded: Option<Bytes> = filtered(commit, b"")
-            .map(|c| prost::Message::encode_to_vec(&commit_event(token.clone(), c)).into());
+        let encoded: Option<Bytes> = filtered(commit, b"").map(|c| {
+            let xid = commit.xid().unwrap_or_default();
+            prost::Message::encode_to_vec(&commit_event(token.clone(), c, xid)).into()
+        });
         // The token is the event's field 1, which prost writes first: its tag, its length,
         // then its bytes. Kept as that slice, it isn't held twice.
         let token = match &encoded {
@@ -462,12 +464,14 @@ fn prefix_out(e: &Arc<Entry>, prefix: &[u8]) -> Option<Out> {
     }
 }
 
-/// A commit event: `c` with the token right after it.
-fn commit_event(token: Bytes, c: proto::FeedCommit) -> proto::FeedEvent {
+/// A commit event: `c` with the token right after it, and its spanning transaction's id
+/// (`xid`, D329 2b; empty for any other commit).
+fn commit_event(token: Bytes, c: proto::FeedCommit, xid: &[u8]) -> proto::FeedEvent {
     proto::FeedEvent {
         token,
         event: Some(proto::feed_event::Event::Commit(c)),
         partition: String::new(),
+        xid: Bytes::copy_from_slice(xid),
     }
 }
 
@@ -1685,6 +1689,7 @@ impl Client {
                 token: pos.token.clone(),
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
                 partition: String::new(),
+                xid: Default::default(),
             };
             self.send(Out::event(event), &mut pos).await?;
         }
@@ -1917,7 +1922,8 @@ impl Client {
             if self.skipping(commit.seqno())? {
                 return Ok(());
             }
-            self.send(Out::event(commit_event(token.clone(), c)), pos)
+            let xid = commit.xid().unwrap_or_default();
+            self.send(Out::event(commit_event(token.clone(), c, xid)), pos)
                 .await?;
         }
         Ok(())
@@ -1977,6 +1983,7 @@ impl Client {
                 token: pos.token.clone(),
                 event: Some(proto::feed_event::Event::Progress(proto::Progress {})),
                 partition: String::new(),
+                xid: Default::default(),
             }),
             pos,
         )
@@ -2448,6 +2455,8 @@ impl Barrier {
                 final_seqno: self.final_seqno,
             })),
             partition: String::new(),
+            // A barrier isn't a commit: no transaction's id (D329 2b).
+            xid: Default::default(),
         })
     }
 }
@@ -2553,7 +2562,9 @@ impl Out {
             Out::Shared(e) => e
                 .encoded()
                 .and_then(|b| <proto::FeedEvent as prost::Message>::decode(b.clone()).ok())
-                .unwrap_or_else(|| commit_event(e.token.clone(), proto::FeedCommit::default())),
+                .unwrap_or_else(|| {
+                    commit_event(e.token.clone(), proto::FeedCommit::default(), b"")
+                }),
             Out::Spliced { .. } | Out::Merged(_) => {
                 <proto::FeedEvent as prost::Message>::decode(self.to_bytes()).unwrap_or_default()
             }
@@ -4478,6 +4489,7 @@ mod tests {
                         .collect(),
                 })),
                 partition: String::new(),
+                xid: Default::default(),
             });
             assert_eq!(e.encoded().map(|b| &b[..]), Some(&want[..]));
             let mut wire = Vec::new();
@@ -4499,7 +4511,7 @@ mod tests {
             // would give them.
             for prefix in [&b""[..], b"r", b"zz"] {
                 let got = e.for_prefix(prefix);
-                let want = filtered(c, prefix).map(|f| commit_event(token.clone(), f));
+                let want = filtered(c, prefix).map(|f| commit_event(token.clone(), f, b""));
                 assert_eq!(got, want, "prefix {prefix:?}");
             }
             let decoded = <proto::FeedEvent as prost::Message>::decode(&want[..]).unwrap();

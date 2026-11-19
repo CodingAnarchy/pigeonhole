@@ -787,6 +787,8 @@ fn external_pins(
             .unwrap_or_default();
         let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
         rec.accept_silent(silent_ok);
+        // Tagged batches only behind `incompat` bit 2 (D329 2b): this pass runs only with it.
+        rec.accept_xid(true);
         while let Some((_, record)) = rec.next_record()? {
             match record {
                 WalRecord::Prepare { seqno, .. } => {
@@ -1603,6 +1605,9 @@ impl Engine {
                 Recovery::open(&vfs, path, stream, db_id, checkpoint)?
             };
             rec.accept_silent(silent_ok);
+            rec.accept_xid(
+                pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0,
+            );
             let mut records = Vec::new();
             while let Some((end, record)) = rec.next_record()? {
                 match record {
@@ -2228,7 +2233,8 @@ impl Engine {
     }
 
     /// Opens a read-only handle in another process (Phase 4): attaches to the live region,
-    /// claims a reader slot, loads the manifest named in the region header.
+    /// claims a reader slot, loads the manifest named in the region header, under a pin of
+    /// that slot (#2085). [`Error::Busy`] if the writer restarted while it loaded: open again.
     ///
     /// The handle is read-only, but the process opens the database file **read-write**
     /// (decision D36): the shm-init and last-one-out presence locks are exclusive byte-range
@@ -2258,10 +2264,35 @@ impl Engine {
         let shards = shm.shard_count() as usize;
         let opened_in = pigeonhole_io::sys::process_id();
         let slot = claim_slot(&shm, vfs.current_process(), &file, opened_in)?;
-        let (catalog, _) = manifest::load(&opened, shards, Arc::clone(&registry))?;
-        let manifest_version = opened.root().manifest_version;
-        let manifest_file = opened.file().clone();
-        let pager = Arc::new(opened.finish([])?);
+        let pins = crate::snapshot::ReaderPins::new(slot);
+        // The manifest is read under a pin, as a snapshot reads one (#2085): the root
+        // `Pager::open` read named extents a writer committing since could already have
+        // retired, freed and written over. Pinned first, the root read again is at or above
+        // the pinned view's manifest version, so the writer keeps its extents until the
+        // release below.
+        let (_, key) = pins.take(&shm, false);
+        let loaded = (|| -> Result<_> {
+            let pager = Arc::new(opened.finish([])?);
+            pager.reload_root()?;
+            let root = pager.root();
+            #[cfg(feature = "test-hooks")]
+            hooks::run_reader_open(&vfs);
+            let (catalog, _) = manifest::load_root(
+                pager.file(),
+                &root,
+                pager.features().incompat,
+                shards,
+                Arc::clone(&registry),
+            )?;
+            Ok((pager, catalog, root.manifest_version))
+        })();
+        pins.release(key);
+        // A writer that restarted meanwhile (a new region generation) doesn't see this
+        // generation's pin and may have reused the extents anyway: retryable, as a reader
+        // snapshot that finds its writer gone re-attaches, never `Corruption` (#2085).
+        let (pager, catalog, manifest_version) =
+            loaded.map_err(|e| if shm.is_stale() { Error::Busy } else { e })?;
+        let manifest_file = pager.file().clone();
         open_data_file(&vfs, path, &pager, options.direct_io, false)?;
         let cache = block_cache(options.block_cache_bytes, shards);
         // The read-only pager is kept by the manifest writer (which never commits here).
@@ -2285,7 +2316,7 @@ impl Engine {
             shm: Mutex::new(Attachment {
                 row_cache: reader_row_cache(&options, &shm),
                 shm,
-                pins: crate::snapshot::ReaderPins::new(slot),
+                pins,
             }),
             catalog: Mutex::new((manifest_version, Arc::new(catalog), manifest_file)),
             view: Mutex::new(None),
@@ -2492,9 +2523,23 @@ impl Engine {
     /// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
     pub fn apply_replicated(
         &self,
+        batch: WriteBatch,
+        state: &[u8],
+        max_ts: Timestamp,
+    ) -> Result<CommitInfo> {
+        self.apply_replicated_with(batch, state, max_ts, None)
+    }
+
+    /// [`apply_replicated`](Self::apply_replicated) for a run of one spanning commit's share
+    /// (D329 2b): committed tagged with `xid`, so this replica's own feed delivers it as
+    /// the primary's does. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn apply_replicated_with(
+        &self,
         mut batch: WriteBatch,
         state: &[u8],
         max_ts: Timestamp,
+        xid: Option<&[u8]>,
     ) -> Result<CommitInfo> {
         if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
             return Err(Error::InvalidArgument(
@@ -2503,7 +2548,9 @@ impl Engine {
         }
         self.push_replication_state(&mut batch, state)?;
         self.inner.shared.clock.seed_ts(max_ts);
-        self.commit(batch, Some(Durability::GroupSync))
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
+        self.inner
+            .commit_blocking_with(batch, Some(Durability::GroupSync), xid)
     }
 
     /// Commits `batch`, every mutation [`push_logged`](WriteBatch::push_logged), on a
@@ -2799,6 +2846,19 @@ impl Engine {
         self.inner.in_doubt()
     }
 
+    /// [`in_doubt`](Self::in_doubt), with each share's batch bytes (what it keeps in the
+    /// WAL, as the in-doubt limit counts it): `(xid, nanoseconds since prepared, bytes)`.
+    pub fn in_doubt_shares(&self) -> Vec<(Vec<u8>, u64, u64)> {
+        let now = self.inner.shared.vfs.monotonic_nanos();
+        self.inner
+            .shared
+            .external
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, e)| (xid, now.saturating_sub(e.prepared_at), e.bytes))
+            .collect()
+    }
+
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
     /// after this commit (D314): its value as a read at the commit's seqno sees it, with a TTL judged at
     /// the commit's timestamp, in the order the batch first wrote each cell. `batch`
@@ -2819,6 +2879,7 @@ impl Engine {
             None,
             None,
             Some(Arc::clone(&out)),
+            None,
             NoAdmission,
         )? {
             Routed::Sent {
@@ -2851,6 +2912,7 @@ impl Engine {
             None,
             None,
             Some(Arc::clone(&out)),
+            None,
             NoAdmission,
         )? {
             Routed::Sent {
@@ -3124,14 +3186,22 @@ impl Engine {
         let inner = &self.inner;
         let Some(a) = &inner.admission else {
             return inner
-                .route_and_send_with(batch, durability, None, None, returning, NoAdmission)
+                .route_and_send_with(batch, durability, None, None, returning, None, NoAdmission)
                 .and_then(|routed| inner.submission(routed))
                 .map(PendingCommit::from);
         };
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        match inner.route_and_send_with(batch, durability, None, None, returning, (&**a, bytes))? {
+        match inner.route_and_send_with(
+            batch,
+            durability,
+            None,
+            None,
+            returning,
+            None,
+            (&**a, bytes),
+        )? {
             Routed::Held(prepared) => {
                 let shard = usize::from(prepared.target.0);
                 let admit = crate::Admit::new(Some(a), shard, bytes);
@@ -3212,6 +3282,7 @@ impl Engine {
             snapshot,
             reads: Vec::new(),
             batch: WriteBatch::new(),
+            xid: None,
         })
     }
 
@@ -5909,7 +5980,9 @@ impl Inner {
         // D329 (simp724): a share in doubt may hold rows of the range, and its commit would
         // write them back. Tablet-granular checks exist only on the shards; the coarse
         // refusal is retryable and rare.
-        if !self.in_doubt().is_empty() {
+        // A read hold (D329 2b) on rows of the range would lose its continuity: wait for it
+        // as for a share in doubt (simp724's S1 on #2089).
+        if !self.in_doubt().is_empty() || self.shared.external.holds() > 0 {
             return Err(Error::Busy);
         }
         self.flag_silent()?;
@@ -6088,6 +6161,19 @@ impl Inner {
     /// Separates the puts of `builder` above the inline limit into blob files (#230). Waits
     /// for a manifest commit when there is one; the waiting thread drives that commit
     /// itself (`manifest::commit_from_thread`, as `shrink` does), so it may drive a shard.
+    /// Tags routed batch `builder` with `xid`, a spanning commit's (D329 2b), as its last
+    /// step, behind `incompat` bit 2. Rebuilds after it (large values, the split into
+    /// shares, a retry) carry it; the counter pass in `route` runs before it, on a batch with
+    /// no trailer yet. Nothing for an untagged batch.
+    #[inline]
+    fn tag_routed(&self, xid: Option<&[u8]>, builder: &mut BatchBuilder) -> Result<()> {
+        if let Some(xid) = xid {
+            self.flag_external()?;
+            builder.tag_xid(xid)?;
+        }
+        Ok(())
+    }
+
     fn separate_large(
         &self,
         builder: BatchBuilder,
@@ -6208,7 +6294,22 @@ impl Inner {
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
-        let routed = self.route_and_send(batch, durability, validate, predicate, NoAdmission)?;
+        self.submit_with(batch, durability, validate, predicate, None)
+    }
+
+    /// [`submit`](Self::submit) for a transaction that may be a spanning commit's share
+    /// (D329 2b, `xid`). Inlined, so `submit`'s constant `None` folds away (perf2 on #2076).
+    #[inline(always)]
+    pub(crate) fn submit_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        validate: Option<Arc<Validate>>,
+        predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        xid: Option<&[u8]>,
+    ) -> Result<Submission> {
+        let routed =
+            self.route_and_send(batch, durability, validate, predicate, xid, NoAdmission)?;
         self.submission(routed)
     }
 
@@ -6261,10 +6362,11 @@ impl Inner {
                 }
             }
         }
-        if shards.is_empty() || builder.is_empty() {
+        // A branch that only read (D329 2a) logs its read set with an empty batch, and holds
+        // those rows until decided, as any share does: its shards are the reads' shards.
+        if shards.is_empty() {
             return Err(Error::InvalidArgument(
-                "an external prepare needs writes (a read-only prepare is ICR 0140's later part)"
-                    .to_owned(),
+                "an external prepare needs reads or writes".to_owned(),
             ));
         }
         // Reserved under the lock that checks the xid and the limits (ICR 0140): two prepares of
@@ -6306,6 +6408,114 @@ impl Inner {
             },
             token,
         ))
+    }
+
+    /// Validates and holds a read-only transaction's `validate.reads` in memory (ICR 0140
+    /// amendment 1, D329 PR 2a): each shard owning some checks them against the snapshot
+    /// and holds them; nothing is logged. The answer's token and shards are for
+    /// [`release_reads`](Self::release_reads). `Conflict` if a read changed since the
+    /// snapshot or overlaps an undecided write; `Busy` past the in-doubt share limit (live
+    /// holds count), or for a read whose tablet is moving. Refused on a replica, and on a
+    /// read-only open (`ReadOnly`).
+    pub(crate) fn hold_reads(&self, validate: Arc<Validate>) -> Result<(u64, Vec<ShardId>)> {
+        if self.read_only || self.replica.load(Ordering::Relaxed) {
+            return Err(Error::ReadOnly);
+        }
+        self.check_writable()?;
+        if validate.reads.is_empty() {
+            return Err(Error::InvalidArgument("a read hold needs reads".to_owned()));
+        }
+        let view = self.shared.view.load();
+        type Routed = (Vec<crate::write::ReadKey>, Vec<TabletId>);
+        let mut by_shard: BTreeMap<ShardId, Routed> = BTreeMap::new();
+        for r in &validate.reads {
+            // A read the view can't route is of a table dropped since it was read: changed,
+            // so nothing can hold it (perf2's nit on #2062).
+            let Some((tablet, shard)) = view.tablets().route(r.table, &r.row) else {
+                return Err(Error::Conflict);
+            };
+            let (reads, tablets) = by_shard.entry(shard).or_default();
+            reads.push(r.clone());
+            tablets.push(tablet);
+        }
+        drop(view);
+        let token = self.shared.external.reserve_hold()?;
+        let mut waiting = Vec::with_capacity(by_shard.len());
+        let mut shards = Vec::with_capacity(by_shard.len());
+        let mut failed = None;
+        for (shard, (reads, tablets)) in by_shard {
+            let (tx, rx) = completion();
+            let msg = ShardMsg::HoldReads(Box::new(crate::shard::HoldReadsReq {
+                token,
+                validate: Arc::clone(&validate),
+                reads,
+                tablets,
+                reply: tx,
+            }));
+            match self.shared.submitter(shard).submit(msg) {
+                Ok(()) => waiting.push((shard, rx)),
+                Err(e) => {
+                    failed = Some(Error::from(e));
+                    break;
+                }
+            }
+        }
+        for (shard, rx) in waiting {
+            match rx.wait() {
+                Some(Ok(())) => shards.push(shard),
+                // A conflict wins over another shard's transient refusal: retrying can't help.
+                Some(Err(e)) => {
+                    if !matches!(failed, Some(Error::Conflict)) {
+                        failed = Some(e);
+                    }
+                }
+                None => {
+                    failed.get_or_insert(Error::Closed);
+                }
+            }
+        }
+        match failed {
+            None => Ok((token, shards)),
+            Some(e) => {
+                self.release_reads(token, &shards, false);
+                Err(e)
+            }
+        }
+    }
+
+    /// Ends read hold `token` on `shards` (ICR 0140 amendment 1); with `wait`, answers
+    /// whether every shard still held it (`false` once the hold was lost to a close or a
+    /// recovery). With `wait`, never called on a thread that drives a shard
+    /// ([`ReadHold::release`](crate::ReadHold::release) refuses that first). Without it (a
+    /// dropped hold), it doesn't wait, and its answer means nothing. The hold stops counting
+    /// against the limit either way.
+    pub(crate) fn release_reads(&self, token: u64, shards: &[ShardId], wait: bool) -> bool {
+        self.shared.external.release_hold();
+        debug_assert!(!wait || !self.shared.drivers.current_drives());
+        let mut held = true;
+        let mut waiting = Vec::new();
+        for &shard in shards {
+            let (reply, rx) = if wait {
+                let (tx, rx) = completion();
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
+            if self
+                .shared
+                .submitter(shard)
+                .submit(ShardMsg::ReleaseReads(Box::new((token, reply))))
+                .is_err()
+            {
+                held = false;
+            } else if let Some(rx) = rx {
+                waiting.push(rx);
+            }
+        }
+        for rx in waiting {
+            held &= rx.wait() == Some(true);
+        }
+        held && wait
     }
 
     /// [`submit_prepare_external`](Self::submit_prepare_external), waited for. The answer in,
@@ -6430,15 +6640,20 @@ impl Inner {
         durability: Option<Durability>,
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        xid: Option<&[u8]>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
-        self.route_and_send_with(batch, durability, validate, predicate, None, admit)
+        self.route_and_send_with(batch, durability, validate, predicate, None, xid, admit)
     }
 
     /// [`route_and_send`](Self::route_and_send), for a commit that may return its
     /// incremented counters (D314): `returning` is `None` on every other path, a constant the
     /// inlined body folds away.
     #[inline(always)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a constant at its inlined call sites, which fold away (returning, xid)"
+    )]
     pub(crate) fn route_and_send_with<A: Admitter>(
         &self,
         batch: WriteBatch,
@@ -6446,6 +6661,7 @@ impl Inner {
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
         returning: Option<crate::shard::ReturnSlot>,
+        xid: Option<&[u8]>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
         if self.read_only {
@@ -6456,7 +6672,11 @@ impl Inner {
         // One tablet map for the whole routing: its version goes with a cross-shard commit,
         // which a participant moving a tablet refuses and the coordinator retries.
         let view = self.shared.view.load();
-        let (builder, mut shards) = self.route(batch, &view)?;
+        let (mut builder, mut shards) = self.route(batch, &view)?;
+        // A spanning commit's share (D329 2b): `xid` comes with the commit, not on the
+        // batch, so a `WriteBatch` moved through every commit carries nothing for it; `None`
+        // on every other path, a constant the inlined body folds away (perf2's N1 on #2076).
+        self.tag_routed(xid, &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
@@ -6566,7 +6786,19 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        match self.route_and_send(batch, durability, None, None, NoAdmission)? {
+        self.commit_blocking_with(batch, durability, None)
+    }
+
+    /// [`commit_blocking`](Self::commit_blocking) for a replica's run of a spanning commit's
+    /// share (D329 2b, `xid`). Inlined, so `commit_blocking`'s constant `None` folds away.
+    #[inline(always)]
+    fn commit_blocking_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        xid: Option<&[u8]>,
+    ) -> Result<CommitInfo> {
+        match self.route_and_send(batch, durability, None, None, xid, NoAdmission)? {
             // Caller-runs (D321): the commit's shard, which this thread may run itself while
             // its spinning wait goes on. A cross-shard commit's coordinator refuses it (only
             // single-shard commits are a caller's to run).
@@ -7506,6 +7738,27 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
 /// the last write.
 ///
+/// Tags `to`, a batch rebuilt from `from`, with `from`'s xid if it has one (D329 2b): the
+/// rebuild's last step, so its pushes never meet the trailer. One bit test for an untagged
+/// batch.
+#[inline]
+pub(crate) fn carry_xid(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    // One byte's test for an untagged batch (perf2's N1 on #2076); the copy out of line.
+    if from.is_tagged() {
+        return carry_xid_cold(from, to);
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn carry_xid_cold(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    match from.batch().xid() {
+        Some(xid) => Ok(to.tag_xid(xid)?),
+        None => Ok(()),
+    }
+}
+
 /// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
 /// one, the only change is the fixed timestamp, and the batch is copied straight through: no
 /// map, no list of writes, and the copy sized once (#1795: a lone `incr`'s rebuilt batch grew
@@ -7516,6 +7769,8 @@ fn prepare_counter_writes(
     catalog: &Catalog,
     combines: bool,
 ) -> Result<BatchBuilder> {
+    // Runs inside `route`, before `tag_routed`: the batch has no xid trailer to carry yet.
+    debug_assert!(!batch.is_tagged(), "a tagged batch before routing");
     // Each write may gain an 8-byte timestamp.
     let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
     if batch.is_silent() {

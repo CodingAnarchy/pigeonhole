@@ -1912,6 +1912,17 @@ fn failover_rig_with(on: bool, replicas: &[&str]) -> Rig {
             map_of(c).await.failover == on
         })
         .await;
+        // The writer has seen c renew p3 since it started (after its start grace): without
+        // that, it fails nothing over by design (simp724's B1 on #2069), and a test that cuts
+        // c sooner raced it (a macOS CI failure on #2087).
+        eventually_within(Duration::from_secs(10), "a to grant c's p3", async || {
+            status_of(a)
+                .await
+                .grants
+                .iter()
+                .any(|g| g.partition == "p3" && g.holder == "c")
+        })
+        .await;
     });
     t
 }
@@ -2427,9 +2438,10 @@ fn an_owner_cut_off_from_every_node_takes_no_write_once_failed_over_and_serves_n
 }
 
 #[test]
-fn a_blocked_partition_is_surveyed_again_only_after_the_margin() {
+fn a_blocked_partition_is_surveyed_again_only_when_its_block_can_have_ended() {
     // perf287's S1 on #2069: while test 7's cut holds, p3 stays blocked ("still grants");
-    // the writer surveys again only after the failover margin, not on every lease round.
+    // the writer surveys again when that grant can have run out (simp724's nit on #2069,
+    // #2073), not on every lease round.
     let t = failover_rig(true);
     let [a, _, c] = t.ports;
     let pair = |from: usize, to: u16| (t.dirs[from].clone(), format!("127.0.0.1:{to}"));
@@ -2454,10 +2466,12 @@ fn a_blocked_partition_is_surveyed_again_only_after_the_margin() {
         let held = TEST_LEASE * 4;
         tokio::time::sleep(held).await;
         let more = surveys() - before;
-        // The margin is 2·L: at most one survey per margin, plus one at an edge. A lease round
-        // every L/3 would have made twelve.
+        // b renews its grant to c every third of a lease, so at each survey it has between
+        // 2L/3 and L left: one survey per 2L/3 at most, six in 4L, plus one at an edge (a
+        // Linux CI run on #2087 saw six against the bound of five #2073 set). A survey on
+        // every lease round would have made twelve.
         assert!(
-            more <= 3,
+            more <= 7,
             "{more} surveys in {held:?} of a blocked partition"
         );
         assert!(blocked_for(a, "waiting: node b").await, "still reported");
@@ -2467,4 +2481,368 @@ fn a_blocked_partition_is_surveyed_again_only_after_the_margin() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|e| *e != ac && *e != ca);
+}
+
+#[test]
+fn a_node_stranded_by_a_lost_vote_takes_the_live_map_once_the_writer_adopts_its_term() {
+    // #2073: with a, the writer, cut off, c passes its pre-vote but its vote requests are
+    // dropped, so it records its own vote and loses (b holds no election). Healed, a is the
+    // writer again, at the lower term, and c's term fence refuses its next map. a adopts the
+    // term above c's vote, and c takes the map and serves p3 again. Before a adopts it
+    // (held off by a seam), c, refusing every push, mustn't stop a's and b's leases: a
+    // fence-refused push counts as no answer, not as behind (relaxing audit120's F2 on
+    // #1899).
+    let t = failover_rig(true);
+    let [a, b, c] = t.ports;
+    // p3 opts out of failover, so it's still c's when c takes the map: while c is stranded
+    // its lease lapses, and the writer would otherwise fail it over to b.
+    t.rt.block_on(async {
+        let mut m = map_of(a).await;
+        m.map_version += 1;
+        for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+            p.set_failover(crate::serve::proto::FailoverMode::Off);
+        }
+        set_at(a, m).await.unwrap();
+    });
+    let seams = || {
+        [
+            (&super::super::NO_ELECTION, t.dirs[1].clone()),
+            (&super::super::DROP_VOTES, t.dirs[2].clone()),
+        ]
+    };
+    for (seam, dir) in seams() {
+        seam.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(dir);
+    }
+    super::super::NO_ADOPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(t.dirs[0].clone());
+    cut(&t, 0, true);
+    let voted = t.rt.block_on(async {
+        eventually_within(FAILOVER_WINDOW, "c to lose an election", async || {
+            status_of(c).await.writer_term > 0
+        })
+        .await;
+        status_of(c).await.writer_term
+    });
+    for (seam, dir) in seams() {
+        seam.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|d| *d != dir);
+    }
+    cut(&t, 0, false);
+    t.rt.block_on(async {
+        // a's next map, once it holds its writer lease again: c's term fence refuses it.
+        let mut last = None;
+        let mut changed = false;
+        for _ in 0..200 {
+            let mut m = map_of(a).await;
+            m.map_version += 1;
+            match set_at(a, m).await {
+                Ok(_) => {
+                    changed = true;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(changed, "a changed no map: {last:?}");
+        // Still stranded, held there by the seam: a and b keep their partition leases, and a
+        // its writer lease, past any lease from before the change.
+        eventually_within(Duration::from_secs(10), "p1 to serve on a", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        tokio::time::sleep(TEST_LEASE * 3).await;
+        let (ours, theirs) = (map_of(a).await, map_of(c).await);
+        assert!(
+            theirs.map_version < ours.map_version,
+            "c took a's map: {theirs:?}"
+        );
+        assert_eq!(
+            state(a, "p1").await,
+            LocalPartitionState::Serving,
+            "p1 on a"
+        );
+        assert_eq!(
+            state(b, "p2").await,
+            LocalPartitionState::Serving,
+            "p2 on b"
+        );
+        let st = status_of(a).await;
+        assert!(st.writer_lease_remaining_ms > 0, "a's writer lease: {st:?}");
+        super::super::NO_ADOPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|d| *d != t.dirs[0]);
+        eventually_within(Duration::from_secs(20), "c to take a's map", async || {
+            let (ours, theirs) = (map_of(a).await, map_of(c).await);
+            ours.writer == "a"
+                && ours.writer_term > voted
+                && (theirs.writer_term, theirs.map_version) == (ours.writer_term, ours.map_version)
+        })
+        .await;
+        let st = status_of(c).await;
+        assert!(st.writer_term <= map_of(c).await.writer_term, "{st:?}");
+        eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+            state(c, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        eventually("a write through c", async || {
+            try_put(c, "zed", "after").await.is_ok()
+        })
+        .await;
+        // The election is recorded: a WRITER event from a to a, above c's vote.
+        let m = map_of(a).await;
+        assert!(
+            m.failovers.iter().any(|e| {
+                e.kind() == crate::serve::proto::FailoverKind::Writer
+                    && e.from == "a"
+                    && e.to == "a"
+                    && e.writer_term > voted
+            }),
+            "{:?}",
+            m.failovers
+        );
+    });
+}
+
+/// `m` one version on with a range move of `users` `[x, y)` from p3 to p1 at COPYING.
+fn with_p3_move(mut m: crate::serve::proto::ClusterMap) -> crate::serve::proto::ClusterMap {
+    use crate::serve::proto::{MoveKind, MovePhase, RangeMove};
+    m.map_version += 1;
+    m.moves.push(RangeMove {
+        id: "mv3".into(),
+        kind: MoveKind::Range as i32,
+        table: "users".into(),
+        start: Some(text("x")),
+        end: Some(text("y")),
+        from: "p3".into(),
+        to: "p1".into(),
+        phase: MovePhase::Copying as i32,
+        ..Default::default()
+    });
+    m
+}
+
+/// Whether node `port` holds `p` as a copy a promote stamped at `epoch`: its own file, no
+/// longer a replica.
+async fn stamped_at(port: u16, p: &str, epoch: u64) -> bool {
+    status_of(port).await.partitions.iter().any(|lp| {
+        lp.id == p && lp.role() != crate::serve::proto::PartitionRole::Replica && lp.epoch == epoch
+    })
+}
+
+#[test]
+fn a_pending_promote_whose_owner_came_back_is_abandoned_and_the_partition_moves_again() {
+    // #2070 (simp724's ruling, the coordinator's test): a stamps b's copy for p3 and stops
+    // before its map, as the writer dying there leaves it, and every finish stops there too
+    // while this test runs. c, p3's owner, comes back and serves. a abandons the promote: p3
+    // stays on c at epoch 1, status names b's orphan copy, and a range move of p3 (which N1
+    // on #2075 refuses while a promote of it is pending: map.rs's unit test) is allowed.
+    use crate::serve::proto::FailoverState as S;
+    let t = failover_rig(true);
+    let [a, _, c] = t.ports;
+    let b = t.ports[1];
+    super::super::failover::STOP_AFTER_STAMP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(std::iter::repeat_n(t.dirs[0].clone(), 1_000));
+    cut(&t, 2, true);
+    t.rt.block_on(async {
+        let mut epoch = 0;
+        eventually_within(
+            FAILOVER_WINDOW,
+            "b's copy stamped, its promote pending",
+            async || {
+                let m = map_of(a).await;
+                let Some(e) = m
+                    .failovers
+                    .iter()
+                    .find(|e| e.partition == "p3" && e.state() == S::Pending && e.to == "b")
+                else {
+                    return false;
+                };
+                epoch = e.to_epoch;
+                stamped_at(b, "p3", epoch).await
+            },
+        )
+        .await;
+    });
+    cut(&t, 2, false);
+    t.rt.block_on(async {
+        eventually_within(FAILOVER_WINDOW, "the promote abandoned", async || {
+            map_of(a)
+                .await
+                .failovers
+                .iter()
+                .any(|e| e.partition == "p3" && e.state() == S::Abandoned && e.to == "b")
+        })
+        .await;
+        let m = map_of(a).await;
+        let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+        assert_eq!(
+            (p3.node.as_str(), p3.epoch, p3.failover_count),
+            ("c", 1, 0),
+            "{p3:?}"
+        );
+        eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+            state(c, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        eventually("status to name b's orphan copy", async || {
+            status_of(a)
+                .await
+                .failover_blocked
+                .get("p3")
+                .is_some_and(|why| why.starts_with("an unfinished promote stamped node b"))
+        })
+        .await;
+        let mut last = None;
+        for _ in 0..100 {
+            match set_at(a, with_p3_move(map_of(a).await)).await {
+                Ok(_) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(last.is_none(), "a move of p3 once abandoned: {last:?}");
+    });
+    super::super::failover::STOP_AFTER_STAMP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|d| *d != t.dirs[0]);
+}
+
+#[test]
+fn an_orphaned_stamped_copy_bootstraps_again_once_added_back() {
+    // Amendment 1's S2 end to end (#2070), on three nodes. c, p3's owner, can't send (a
+    // one-way cut): its renewals stop, but it still answers and grants, so a keeps its
+    // majority. a stamps b's copy and stops before its map (a writer dying there), and b is
+    // then cut off. a fails p3 over to its own copy at an epoch above b's pending one,
+    // abandoning b's. b comes back and is added back to p3's replicas: its stamped copy isn't
+    // taken for a replica until the operator drops it; then b's copy bootstraps again from
+    // a, and a's write reads back on every node.
+    use crate::serve::proto::FailoverState as S;
+    let t = failover_rig_with(true, &["b", "a"]);
+    let [a, b, c] = t.ports;
+    super::super::failover::STOP_AFTER_STAMP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(t.dirs[0].clone());
+    let pair = |from: usize, to: u16| (t.dirs[from].clone(), format!("127.0.0.1:{to}"));
+    let one_way = [pair(2, a), pair(2, b)];
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .extend(one_way.clone());
+    let pending = t.rt.block_on(async {
+        let mut epoch = 0;
+        eventually_within(
+            FAILOVER_WINDOW,
+            "b's copy stamped, its promote pending",
+            async || {
+                let m = map_of(a).await;
+                let Some(e) = m
+                    .failovers
+                    .iter()
+                    .find(|e| e.partition == "p3" && e.state() == S::Pending && e.to == "b")
+                else {
+                    return false;
+                };
+                epoch = e.to_epoch;
+                stamped_at(b, "p3", epoch).await
+            },
+        )
+        .await;
+        epoch
+    });
+    cut(&t, 1, true);
+    t.rt.block_on(async {
+        eventually_within(FAILOVER_WINDOW, "p3 to fail over to a", async || {
+            let m = map_of(a).await;
+            m.partitions
+                .iter()
+                .any(|p| p.id == "p3" && p.node == "a" && p.epoch > pending)
+        })
+        .await;
+        let m = map_of(a).await;
+        assert!(
+            m.failovers
+                .iter()
+                .any(|e| e.partition == "p3" && e.to == "b" && e.state() == S::Abandoned),
+            "b's promote abandoned: {:?}",
+            m.failovers
+        );
+        eventually_within(Duration::from_secs(10), "p3 to serve on a", async || {
+            state(a, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        try_put(a, "zed", "v2").await.unwrap();
+    });
+    cut(&t, 1, false);
+    super::super::CUT_BETWEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|e| !one_way.contains(e));
+    t.rt.block_on(async {
+        p3_replicas(a, &["b"]).await;
+        // b's stamped copy isn't taken for a replica: it's an owner's file at another
+        // epoch, which only the operator drops (simp724's N1 on #2069).
+        tokio::time::sleep(TEST_LEASE).await;
+        assert!(
+            replica_row(b, "p3")
+                .await
+                .is_none_or(|lp| lp.replica_of != "a"),
+            "b's orphan copy opened as a replica"
+        );
+        client(b)
+            .await
+            .drop_partition(crate::serve::proto::PartitionRequest {
+                partition: "p3".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // The replica opens on the next map that lists it.
+        p3_replicas(a, &["b"]).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            // A fresh replica copy of a's history, bootstrapping from a. (The rig's nodes run
+            // no --change-feed, so a's promoted copy has no feed for it to follow: following
+            // is D328's tests'.)
+            let row = replica_row(b, "p3").await;
+            if row.as_ref().is_some_and(|lp| {
+                lp.replica_of == "a"
+                    && matches!(
+                        lp.replica_state(),
+                        crate::serve::proto::ReplicaState::Bootstrapping
+                            | crate::serve::proto::ReplicaState::OwnerFeedOff
+                            | crate::serve::proto::ReplicaState::Following
+                    )
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "b's copy to bootstrap again from a: {row:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Nothing diverged: a's write is the one every node reads.
+        for port in [a, b, c] {
+            eventually("zed to read v2", async || {
+                get_row(port, "zed")
+                    .await
+                    .is_ok_and(|v| v.as_deref() == Some(b"v2".as_slice()))
+            })
+            .await;
+        }
+    });
 }

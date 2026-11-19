@@ -23,6 +23,13 @@ service Transactions {
   rpc Commit(TxnCommitRequest) returns (TxnCommitResponse);
   // Ends the transaction without writing.
   rpc Abort(TxnAbortRequest) returns (Empty);
+  // A transaction's outcome, by its id, after the `Commit` reply was lost (D329): for a
+  // transaction begun with `spans_partitions`, from its home partition's decision record,
+  // kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
+  // and changes nothing. Once the session is gone, a transaction never committed is made
+  // final as `ABORTED`, which is why it needs write scope. `NotFound` past retention, and
+  // for other transactions once their session's record is gone.
+  rpc Outcome(TxnOutcomeRequest) returns (TxnOutcomeResponse);
 }
 
 message BeginRequest {
@@ -31,6 +38,13 @@ message BeginRequest {
   // Where the transaction runs once the database is partitioned (D317): send it from the
   // start. A single-node server ignores it.
   RoutingKey route = 2;
+  // Lets the transaction read and write rows of other partitions (D329, ICR 0140): its
+  // partition (`route`) is its home, and every other partition it touches is a branch,
+  // committed with it atomically by two-phase commit. Without it, a row outside the home is
+  // `CrossPartition`. Every node must keep the `spanning_txns` map feature. A commit that
+  // writes runs at `GroupSync` or stronger. A single-node server accepts it and changes
+  // nothing.
+  bool spans_partitions = 3;
 }
 
 message BeginResponse {
@@ -68,7 +82,44 @@ message TxnCommitRequest {
 }
 
 message TxnCommitResponse {
+  // A spanning transaction's (`BeginRequest.spans_partitions`): its home partition's commit.
   CommitInfo commit = 1;
+  // A spanning transaction that wrote: each partition it touched, the home first. A part not
+  // yet `applied` is committed and is applied by its partition's resolver.
+  repeated TxnPart parts = 2;
+}
+
+message TxnOutcomeRequest {
+  string txn_id = 1;
+}
+
+// What became of a transaction (D329).
+enum TxnOutcomeState {
+  TXN_OUTCOME_STATE_UNSPECIFIED = 0;
+  // Its session is open or committing: ask again.
+  TXN_OUTCOME_STATE_IN_PROGRESS = 1;
+  TXN_OUTCOME_STATE_COMMITTED = 2;
+  // Aborted, or never committed (now final).
+  TXN_OUTCOME_STATE_ABORTED = 3;
+  // Its home partition's history changed since it began (a promotion, a restore): the
+  // decision may be lost, so nothing is presumed (`reason` says why).
+  TXN_OUTCOME_STATE_UNKNOWN = 4;
+}
+
+message TxnOutcomeResponse {
+  TxnOutcomeState state = 1;
+  // When committed: the home's commit, and each partition's share as recorded.
+  CommitInfo commit = 2;
+  repeated TxnPart parts = 3;
+  string reason = 4;
+}
+
+// One partition's share of a spanning transaction's commit (D329).
+message TxnPart {
+  string partition = 1;
+  // The share's commit seqno on that partition, once applied (0 before).
+  uint64 seqno = 2;
+  bool applied = 3;
 }
 
 message TxnAbortRequest {

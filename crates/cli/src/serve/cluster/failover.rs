@@ -55,9 +55,10 @@ pub(crate) struct Failovers {
     office: Mutex<(u64, u64)>,
     /// Each down partition not failed over, and why, as the last check found them.
     blocked: Mutex<BTreeMap<String, String>>,
-    /// When each blocked partition was last surveyed, on the lease clock, and at which map
-    /// version (perf287's S1 on #2069): it's surveyed again only after the failover margin
-    /// or a map change, not every lease round.
+    /// When each blocked partition that went through the last survey is due another, on the
+    /// lease clock, and the map version it was surveyed at (perf287's S1 on #2069): after
+    /// the failover margin, or when the grant it waits on ends (simp724's nit), or on a map
+    /// change, not every lease round.
     surveyed: Mutex<HashMap<String, (u64, u64)>>,
 }
 
@@ -68,7 +69,7 @@ pub(crate) static SURVEYS: Mutex<Vec<(std::path::PathBuf, u64)>> = Mutex::new(Ve
 
 impl Failovers {
     /// When this node took office at `term`, recording `now` if it's a new term.
-    fn office(&self, term: u64, now: u64) -> u64 {
+    pub(super) fn office(&self, term: u64, now: u64) -> u64 {
         let mut o = self.office.lock().unwrap_or_else(PoisonError::into_inner);
         if o.0 != term || o.1 == 0 {
             *o = (term, now);
@@ -100,21 +101,21 @@ impl Failovers {
     }
 
     /// Whether blocked partition `id` is due a survey at `now` under map `version`: never
-    /// surveyed, or `margin` since, or the map changed since.
-    fn survey_due(&self, id: &str, now: u64, version: u64, margin: u64) -> bool {
+    /// surveyed, or its due time passed, or the map changed since.
+    fn survey_due(&self, id: &str, now: u64, version: u64) -> bool {
         self.surveyed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
-            .is_none_or(|(at, v)| *v != version || now.saturating_sub(*at) >= margin)
+            .is_none_or(|(due, v)| *v != version || now >= *due)
     }
 
-    fn note_surveyed(&self, ids: &[String], now: u64, version: u64) {
+    /// The partitions a survey left blocked, each with when it's due again. Only those that
+    /// went through it (perf2's S2 on #2069): one that wasn't keeps no stale stamp.
+    fn note_surveyed(&self, due: Vec<(String, u64)>, version: u64) {
         let mut s = self.surveyed.lock().unwrap_or_else(PoisonError::into_inner);
         s.clear();
-        for id in ids {
-            s.insert(id.clone(), (now, version));
-        }
+        s.extend(due.into_iter().map(|(id, at)| (id, (at, version))));
     }
 }
 
@@ -124,6 +125,321 @@ fn nanos(d: Duration) -> u64 {
 
 fn millis(ns: u64) -> u64 {
     ns / 1_000_000
+}
+
+/// Another node that still grants down partition `p`'s lease to its owner, and that grant,
+/// from the survey's `statuses`. The owner's own grant to itself isn't a majority's: it
+/// renews that one even cut off from every grantor, so only the others' count.
+fn still_granted<'a>(
+    p: &proto::Partition,
+    statuses: &'a HashMap<String, NodeStatus>,
+) -> Option<(&'a String, &'a proto::LeaseWithheld)> {
+    statuses
+        .iter()
+        .filter(|(id, _)| **id != p.node)
+        .find_map(|(id, st)| {
+            st.grants
+                .iter()
+                .find(|g| g.partition == p.id && g.holder == p.node && g.remaining_ms > 0)
+                .map(|g| (id, g))
+        })
+}
+
+/// Partition `p` as the writer sees it before any survey (the module doc's Down): the pure
+/// part of [`Node::maybe_fail_over`], which the seeded model calls too (simp724 on #2070).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Not down: its owner's grant here ran out less than the margin ago, or still runs.
+    Up,
+    /// Down, and not failed over, for this reason.
+    Blocked(String),
+    /// Down, for the survey and [`qualify`]: when its owner last renewed it here, on the
+    /// writer's lease clock (`None`: not since this node started).
+    Survey(Option<u64>),
+    /// Not down, with a promote of it left pending: its owner renewed it here since this
+    /// node took office, so it came back. Once the survey finds it serving P at its epoch,
+    /// the promote is abandoned ([`abandoned`]): it can't safely finish while the old owner
+    /// holds a lease, and left pending it would never clear (#2070, simp724).
+    Abandon,
+}
+
+/// What an abandoned promote of `p` left, while it pins the floor: the copy it stamped,
+/// for the operator to drop.
+fn orphaned(map: &ClusterMap, p: &proto::Partition) -> Option<String> {
+    map.failovers
+        .iter()
+        .filter(|e| {
+            e.kind() == FailoverKind::Partition
+                && e.partition == p.id
+                && e.state() == FailoverState::Abandoned
+                && e.to_epoch > p.epoch
+        })
+        .max_by_key(|e| e.to_epoch)
+        .map(|e| {
+            format!(
+                "an unfinished promote stamped node {} at epoch {}: drop that copy (phdb cluster \
+                 drop-partition {} on node {})",
+                e.to, e.to_epoch, p.id, e.to
+            )
+        })
+}
+
+/// Whether `st`, partition `p`'s owner's status, has it serving `p` at its epoch.
+pub(crate) fn serves(p: &proto::Partition, st: Option<&NodeStatus>) -> bool {
+    st.is_some_and(|st| {
+        st.partitions.iter().any(|lp| {
+            lp.id == p.id
+                && lp.role() != PartitionRole::Replica
+                && lp.epoch == p.epoch
+                && lp.state() == LocalPartitionState::Serving
+        })
+    })
+}
+
+/// `map` with the live pending promotes of `ids` abandoned, its version raised: the
+/// writer's change once each one's owner serves it again (#2070).
+pub(crate) fn abandoned(map: &ClusterMap, ids: &[String]) -> ClusterMap {
+    let mut m = map.clone();
+    m.map_version += 1;
+    let epochs: HashMap<&str, u64> = map
+        .partitions
+        .iter()
+        .map(|p| (p.id.as_str(), p.epoch))
+        .collect();
+    for e in m.failovers.iter_mut().filter(|e| {
+        e.kind() == FailoverKind::Partition
+            && e.state() == FailoverState::Pending
+            && ids.contains(&e.partition)
+            && epochs
+                .get(e.partition.as_str())
+                .is_some_and(|ep| *ep < e.to_epoch)
+    }) {
+        e.set_state(FailoverState::Abandoned);
+    }
+    m
+}
+
+/// [`Check`] for `p` in `map` at `now`: `until` is the end of the owner's last grant of `p`
+/// here at its epoch, `office` when this node took office at the map's term, `lease` and
+/// `margin` (A) in ns.
+pub(crate) fn check(
+    map: &ClusterMap,
+    p: &proto::Partition,
+    until: Option<u64>,
+    office: u64,
+    now: u64,
+    lease: u64,
+    margin: u64,
+) -> Check {
+    let pending = map.failovers.iter().any(|e| {
+        e.kind() == FailoverKind::Partition
+            && e.partition == p.id
+            && e.state() == FailoverState::Pending
+            && e.to_epoch > p.epoch
+    });
+    // Its owner renewed it here in office, and that grant runs: it came back (#2070).
+    if pending && until.is_some_and(|u| u > office && now < u) {
+        return Check::Abandon;
+    }
+    // From the owner's last grant here if this node saw it renewed in office, else from a
+    // lease after taking office (S3: when P counts as down, only).
+    let lapsed_at = match until {
+        Some(u) if u > office => u,
+        _ => office.saturating_add(lease),
+    };
+    if now < lapsed_at.saturating_add(margin) {
+        return Check::Up;
+    }
+    // With the map's failover off, a down partition is only reported (§6).
+    if !map.failover {
+        return Check::Blocked("failover off".to_owned());
+    }
+    if p.failover() == FailoverMode::Off {
+        return Check::Blocked("failover off for this partition".to_owned());
+    }
+    // A promote left pending has already taken its copy out of the replicas: it's finished
+    // from its event (F4), so an empty list doesn't stop it.
+    if p.replicas.is_empty() && !pending {
+        return Check::Blocked("no replicas".to_owned());
+    }
+    Check::Survey(until.map(|u| u.saturating_sub(lease)))
+}
+
+/// The down partitions a pass surveys (perf2's S2 on #2069): every one once any is due, since
+/// the survey is the cost, so none keeps a stale reason through another's survey; or, if
+/// none is due, none, each keeping its last reason (`Err`).
+fn survey_or_keep(down: Vec<Down>) -> Result<Vec<Down>, Vec<(String, String)>> {
+    if !down.is_empty() && down.iter().all(|d| d.kept.is_some()) {
+        return Err(down
+            .into_iter()
+            .map(|d| (d.p.id, d.kept.unwrap_or_default()))
+            .collect());
+    }
+    Ok(down)
+}
+
+/// The replica down partition `p` fails over to, or why none: the module doc's rules, the
+/// pure part of [`Node::maybe_fail_over`], which the seeded model calls too (simp724 on
+/// #2070). `renewed` is [`Check::Survey`]'s, `statuses` the survey's (the writer's own
+/// included), `now` the writer's lease clock, and `max_lag` `--cluster-failover-max-lag-ms`.
+pub(crate) fn qualify(
+    map: &ClusterMap,
+    p: &proto::Partition,
+    renewed: Option<u64>,
+    statuses: &HashMap<String, NodeStatus>,
+    now: u64,
+    max_lag: Option<Duration>,
+) -> Result<String, String> {
+    if let Some(st) = statuses.get(&p.node)
+        && let Some(lp) = st.partitions.iter().find(|lp| lp.id == p.id)
+        && lp.role() != PartitionRole::Replica
+    {
+        match lp.state() {
+            LocalPartitionState::Serving => {
+                return Err(format!("waiting: node {} answers and serves it", p.node));
+            }
+            // An operator's fence or close only: an owner that answers but has lost its
+            // lease reports Fenced too (awaiting its peers), and is down for this.
+            LocalPartitionState::Closed => {
+                return Err(format!("closed by the operator on node {}", p.node));
+            }
+            LocalPartitionState::Fenced if lp.fence_reason() == proto::FenceReason::Operator => {
+                return Err(format!("fenced by the operator on node {}", p.node));
+            }
+            _ => {}
+        }
+    }
+    // A promote of P left pending (its writer stopped after the stamp): finished on the
+    // copy it stamped, if that node answers with it (finish only, F4).
+    if let Some(e) = map
+        .failovers
+        .iter()
+        .filter(|e| {
+            e.kind() == FailoverKind::Partition
+                && e.partition == p.id
+                && e.state() == FailoverState::Pending
+                && e.to_epoch > p.epoch
+        })
+        .max_by_key(|e| e.to_epoch)
+    {
+        let stamped = statuses.get(&e.to).is_some_and(|st| {
+            st.partitions.iter().any(|lp| {
+                lp.id == p.id && lp.role() != PartitionRole::Replica && lp.epoch == e.to_epoch
+            })
+        });
+        if stamped {
+            return Ok(e.to.clone());
+        }
+    }
+    // Freshness as of the owner's last renewal: its grant here began a lease before it
+    // ended. `replica_lag_ms` is the replica's own monotonic clock since its last fresh
+    // message, and `now - renewed` the writer's lease clock since that renewal: two clocks,
+    // compared only to within the heartbeat and drift (simp724's N1).
+    // From the owner's real last renewal here (simp724's B1): this node is one of P's
+    // grantors, so it has it whenever it ran while the owner renewed. Without one there's
+    // no baseline to bound what a failover loses, so the writer doesn't guess.
+    let Some(renewed) = renewed else {
+        return Err(format!(
+            "no renewal of {}'s owner (node {}) seen here since this node started: promote \
+             by hand (phdb cluster promote {} --to <replica> --old-unreachable)",
+            p.id, p.node, p.id
+        ));
+    };
+    let since_renewal = millis(now.saturating_sub(renewed));
+    // Any other node still granting P's lease to its owner (design §4, simp724's B2 on
+    // the plan): the owner is alive and leased there, cut off from this node alone (§8
+    // test 7). The grant round would keep a promoted copy from serving until those grants
+    // end anyway; this saves moving P off an owner that serves. A node that didn't
+    // answer the survey is unknown, not granting (simp724): the writer goes on, since
+    // waiting on silence would never fail over a partition whose grantors are down too,
+    // and the grant round still keeps two owners from serving at once.
+    if let Some((id, g)) = still_granted(p, statuses) {
+        return Err(format!(
+            "waiting: node {id} still grants its lease to node {} ({} ms left)",
+            p.node, g.remaining_ms
+        ));
+    }
+    let mut best: Option<(u64, String)> = None;
+    let mut why = Vec::new();
+    for r in &p.replicas {
+        let Some(st) = statuses.get(r) else {
+            why.push(format!("{r}: didn't answer"));
+            continue;
+        };
+        let Some(lp) = st
+            .partitions
+            .iter()
+            .find(|lp| lp.id == p.id && lp.role() == PartitionRole::Replica)
+        else {
+            // A copy an unfinished promote stamped (Amendment 1's S2): it serves no
+            // history now, and only the operator should drop it (simp724's N1 on #2069).
+            let orphan = st.partitions.iter().find(|lp| {
+                lp.id == p.id
+                    && lp.role() != PartitionRole::Replica
+                    && lp.epoch != p.epoch
+                    && map.failovers.iter().any(|e| {
+                        e.kind() == FailoverKind::Partition
+                            && e.partition == p.id
+                            && e.to == *r
+                            && e.to_epoch == lp.epoch
+                    })
+            });
+            why.push(match orphan {
+                Some(lp) => format!(
+                    "{r}: its copy was stamped at epoch {} by an unfinished promote: drop it \
+                     there (phdb cluster drop-partition {} on node {r})",
+                    lp.epoch, p.id
+                ),
+                None => format!("{r}: no replica copy open"),
+            });
+            continue;
+        };
+        if !matches!(
+            lp.replica_state(),
+            ReplicaState::Following | ReplicaState::Behind
+        ) {
+            why.push(format!("{r}: {:?}", lp.replica_state()));
+            continue;
+        }
+        if (st.writer_term, st.map_version) != (map.writer_term, map.map_version) {
+            why.push(format!(
+                "{r}: holds map version {} at term {}, not the writer's",
+                st.map_version, st.writer_term
+            ));
+            continue;
+        }
+        if !(p.history_epoch <= lp.epoch && lp.epoch <= p.epoch) {
+            why.push(format!(
+                "{r}: its copy is at epoch {}, outside P's history",
+                lp.epoch
+            ));
+            continue;
+        }
+        let stale_by = lp.replica_lag_ms.saturating_sub(since_renewal);
+        if stale_by > millis(nanos(HEARTBEAT)) {
+            why.push(format!(
+                "{r}: {stale_by} ms staler than the owner's last renewal"
+            ));
+            continue;
+        }
+        if let Some(max) = max_lag
+            && Duration::from_millis(stale_by) > max
+        {
+            why.push(format!(
+                "{r}: {stale_by} ms behind, over --cluster-failover-max-lag-ms"
+            ));
+            continue;
+        }
+        // Highest applied, then map order (the first such).
+        if best
+            .as_ref()
+            .is_none_or(|(applied, _)| lp.replica_applied_seqno > *applied)
+        {
+            best = Some((lp.replica_applied_seqno, r.clone()));
+        }
+    }
+    best.map(|(_, r)| r)
+        .ok_or_else(|| format!("no fresh replica ({})", why.join("; ")))
 }
 
 /// A partition the writer finds down: its map entry, and when its owner's grant here ran
@@ -136,9 +452,53 @@ struct Down {
     renewed: Option<u64>,
     in_doubt_xids: Vec<String>,
     in_doubt_count: u64,
+    /// Its last blocked reason while it isn't due a survey: kept unless another down
+    /// partition's survey runs anyway.
+    kept: Option<String>,
 }
 
 impl Node {
+    /// Abandons the pending promotes of `back`, partitions whose owner came back
+    /// ([`Check::Abandon`]), once the survey finds each serving at its epoch (#2070).
+    async fn abandon_pending(self: &Arc<Self>, map: &ClusterMap, back: &[proto::Partition]) {
+        let statuses: HashMap<String, NodeStatus> = self
+            .survey(map)
+            .await
+            .into_iter()
+            .filter_map(|(id, st)| st.map(|st| (id, st)))
+            .collect();
+        let ids: Vec<String> = back
+            .iter()
+            .filter(|p| serves(p, statuses.get(&p.node)))
+            .map(|p| p.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        // Still the writer, with its lease, at the same map, or a later round decides.
+        let Ok(current) = self.get_map() else { return };
+        if (current.writer_term, current.map_version) != (map.writer_term, map.map_version)
+            || self.writer_may_change(&current).is_err()
+        {
+            return;
+        }
+        let ops = NodeOps {
+            node: Arc::downgrade(self),
+        };
+        match ops.set_map(abandoned(map, &ids)).await {
+            Ok(v) => eprintln!(
+                "phdb serve: abandoned the pending promote of {} at map version {v}: the owner \
+                 came back and serves it (#2070). A copy that promote stamped must be dropped",
+                ids.join(", ")
+            ),
+            Err(f) => eprintln!(
+                "phdb serve: abandoning the pending promote of {}: {}",
+                ids.join(", "),
+                f.message()
+            ),
+        }
+    }
+
     /// The failover check (the module doc). Runs on the writer's duty task.
     pub(crate) async fn maybe_fail_over(self: &Arc<Self>) {
         let Ok(map) = self.get_map() else { return };
@@ -152,47 +512,35 @@ impl Node {
         let office = self.failovers.office(map.writer_term, now);
         let mut blocked = BTreeMap::new();
         let mut down = Vec::new();
+        let mut back = Vec::new();
         for p in map.partitions.iter().filter(|p| p.node != self.id) {
             let until = self.grants.last_grant_until(&p.id, &p.node, p.epoch);
-            // From the owner's last grant here if this node saw it renewed in office, else
-            // from a lease after taking office (S3: when P counts as down, only).
-            let lapsed_at = match until {
-                Some(u) if u > office => u,
-                _ => office.saturating_add(lease),
+            let renewed = match check(&map, p, until, office, now, lease, margin) {
+                Check::Up => {
+                    // An abandoned promote's copy is an orphan until the operator drops it
+                    // (#2070, simp724's point 4).
+                    if let Some(why) = orphaned(&map, p) {
+                        blocked.insert(p.id.clone(), why);
+                    }
+                    continue;
+                }
+                Check::Abandon => {
+                    back.push(p.clone());
+                    continue;
+                }
+                Check::Blocked(why) => {
+                    blocked.insert(p.id.clone(), why);
+                    continue;
+                }
+                Check::Survey(renewed) => renewed,
             };
-            if now < lapsed_at.saturating_add(margin) {
-                continue;
-            }
-            // With the map's failover off, a down partition is only reported (§6).
-            if !map.failover {
-                blocked.insert(p.id.clone(), "failover off".to_owned());
-                continue;
-            }
-            if p.failover() == FailoverMode::Off {
-                blocked.insert(p.id.clone(), "failover off for this partition".to_owned());
-                continue;
-            }
-            // A promote left pending has already taken its copy out of the replicas: it's
-            // finished from its event (F4), so an empty list doesn't stop it.
-            let pending = map.failovers.iter().any(|e| {
-                e.kind() == FailoverKind::Partition
-                    && e.partition == p.id
-                    && e.state() == FailoverState::Pending
-                    && e.to_epoch > p.epoch
-            });
-            if p.replicas.is_empty() && !pending {
-                blocked.insert(p.id.clone(), "no replicas".to_owned());
-                continue;
-            }
-            // Not due a survey (perf287's S1): its last reason stands.
-            if !self
-                .failovers
-                .survey_due(&p.id, now, map.map_version, margin)
-                && let Some(why) = self.failovers.blocked_reason(&p.id)
-            {
-                blocked.insert(p.id.clone(), why);
-                continue;
-            }
+            // Not due a survey (perf287's S1): its last reason stands, unless another down
+            // partition's survey runs anyway (perf2's S2 on #2069).
+            let kept = if self.failovers.survey_due(&p.id, now, map.map_version) {
+                None
+            } else {
+                self.failovers.blocked_reason(&p.id)
+            };
             let (in_doubt_xids, in_doubt_count) = self
                 .grants
                 .last_grant(&p.id)
@@ -201,11 +549,22 @@ impl Node {
                 .unwrap_or_default();
             down.push(Down {
                 p: p.clone(),
-                renewed: until.map(|u| u.saturating_sub(lease)),
+                renewed,
                 in_doubt_xids,
                 in_doubt_count,
+                kept,
             });
         }
+        if !back.is_empty() {
+            self.abandon_pending(&map, &back).await;
+        }
+        let down = match survey_or_keep(down) {
+            Ok(down) => down,
+            Err(kept) => {
+                blocked.extend(kept);
+                Vec::new()
+            }
+        };
         if down.is_empty() {
             self.failovers.set_blocked(blocked);
             return;
@@ -238,8 +597,22 @@ impl Node {
         }
         let now = self.grants.clock().now();
         let mut chosen = None;
+        let mut due = Vec::new();
         for d in down {
-            match self.qualify(&map, &d, &statuses, now) {
+            // Due again once the grant it may wait on ends (simp724's nit on #2069), else
+            // after the margin.
+            let again = still_granted(&d.p, &statuses).map_or(margin, |(_, g)| {
+                nanos(Duration::from_millis(g.remaining_ms))
+            });
+            due.push((d.p.id.clone(), now.saturating_add(again)));
+            match qualify(
+                &map,
+                &d.p,
+                d.renewed,
+                &statuses,
+                now,
+                self.peers.failover_max_lag,
+            ) {
                 Ok(to) if chosen.is_none() => chosen = Some((d, to)),
                 // One promote at a time: the others wait for a later round.
                 Ok(to) => {
@@ -253,9 +626,9 @@ impl Node {
                 }
             }
         }
-        // The ones still blocked are surveyed again after the margin or a map change.
-        let still: Vec<String> = blocked.keys().cloned().collect();
-        self.failovers.note_surveyed(&still, now, map.map_version);
+        // The ones the survey left blocked are due again as above, or on a map change.
+        due.retain(|(id, _)| blocked.contains_key(id));
+        self.failovers.note_surveyed(due, map.map_version);
         let Some((d, to)) = chosen else {
             self.failovers.set_blocked(blocked);
             return;
@@ -296,181 +669,6 @@ impl Node {
                 self.failovers.set_blocked(blocked);
             }
         }
-    }
-
-    /// The replica `d` fails over to, or why none: the module doc's rules.
-    fn qualify(
-        &self,
-        map: &ClusterMap,
-        d: &Down,
-        statuses: &HashMap<String, NodeStatus>,
-        now: u64,
-    ) -> Result<String, String> {
-        let p = &d.p;
-        if let Some(st) = statuses.get(&p.node)
-            && let Some(lp) = st.partitions.iter().find(|lp| lp.id == p.id)
-            && lp.role() != PartitionRole::Replica
-        {
-            match lp.state() {
-                LocalPartitionState::Serving => {
-                    return Err(format!("waiting: node {} answers and serves it", p.node));
-                }
-                // An operator's fence or close only: an owner that answers but has lost its
-                // lease reports Fenced too (awaiting its peers), and is down for this.
-                LocalPartitionState::Closed => {
-                    return Err(format!("closed by the operator on node {}", p.node));
-                }
-                LocalPartitionState::Fenced
-                    if lp.fence_reason() == proto::FenceReason::Operator =>
-                {
-                    return Err(format!("fenced by the operator on node {}", p.node));
-                }
-                _ => {}
-            }
-        }
-        // A promote of P left pending (its writer stopped after the stamp): finished on the
-        // copy it stamped, if that node answers with it (finish only, F4).
-        if let Some(e) = map
-            .failovers
-            .iter()
-            .filter(|e| {
-                e.kind() == FailoverKind::Partition
-                    && e.partition == p.id
-                    && e.state() == FailoverState::Pending
-                    && e.to_epoch > p.epoch
-            })
-            .max_by_key(|e| e.to_epoch)
-        {
-            let stamped = statuses.get(&e.to).is_some_and(|st| {
-                st.partitions.iter().any(|lp| {
-                    lp.id == p.id && lp.role() != PartitionRole::Replica && lp.epoch == e.to_epoch
-                })
-            });
-            if stamped {
-                return Ok(e.to.clone());
-            }
-        }
-        // Freshness as of the owner's last renewal: its grant here began a lease before it
-        // ended. `replica_lag_ms` is the replica's own monotonic clock since its last fresh
-        // message, and `now - renewed` the writer's lease clock since that renewal: two clocks,
-        // compared only to within the heartbeat and drift (simp724's N1).
-        // From the owner's real last renewal here (simp724's B1): this node is one of P's
-        // grantors, so it has it whenever it ran while the owner renewed. Without one there's
-        // no baseline to bound what a failover loses, so the writer doesn't guess.
-        let Some(renewed) = d.renewed else {
-            return Err(format!(
-                "no renewal of {}'s owner (node {}) seen here since this node started: promote \
-                 by hand (phdb cluster promote {} --to <replica> --old-unreachable)",
-                p.id, p.node, p.id
-            ));
-        };
-        let since_renewal = millis(now.saturating_sub(renewed));
-        // Any other node still granting P's lease to its owner (design §4, simp724's B2 on
-        // the plan): the owner is alive and leased there, cut off from this node alone (§8
-        // test 7). The grant round would keep a promoted copy from serving until those grants
-        // end anyway; this saves moving P off an owner that serves. A node that didn't
-        // answer the survey is unknown, not granting (simp724): the writer goes on, since
-        // waiting on silence would never fail over a partition whose grantors are down too,
-        // and the grant round still keeps two owners from serving at once.
-        // The owner's own grant to itself isn't a majority's: it renews that one even cut
-        // off from every grantor, so only the others' grants count.
-        if let Some((id, g)) =
-            statuses
-                .iter()
-                .filter(|(id, _)| **id != p.node)
-                .find_map(|(id, st)| {
-                    st.grants
-                        .iter()
-                        .find(|g| g.partition == p.id && g.holder == p.node && g.remaining_ms > 0)
-                        .map(|g| (id, g))
-                })
-        {
-            return Err(format!(
-                "waiting: node {id} still grants its lease to node {} ({} ms left)",
-                p.node, g.remaining_ms
-            ));
-        }
-        let mut best: Option<(u64, String)> = None;
-        let mut why = Vec::new();
-        for r in &p.replicas {
-            let Some(st) = statuses.get(r) else {
-                why.push(format!("{r}: didn't answer"));
-                continue;
-            };
-            let Some(lp) = st
-                .partitions
-                .iter()
-                .find(|lp| lp.id == p.id && lp.role() == PartitionRole::Replica)
-            else {
-                // A copy an unfinished promote stamped (Amendment 1's S2): it serves no
-                // history now, and only the operator should drop it (simp724's N1 on #2069).
-                let orphan = st.partitions.iter().find(|lp| {
-                    lp.id == p.id
-                        && lp.role() != PartitionRole::Replica
-                        && lp.epoch != p.epoch
-                        && map.failovers.iter().any(|e| {
-                            e.kind() == FailoverKind::Partition
-                                && e.partition == p.id
-                                && e.to == *r
-                                && e.to_epoch == lp.epoch
-                        })
-                });
-                why.push(match orphan {
-                    Some(lp) => format!(
-                        "{r}: its copy was stamped at epoch {} by an unfinished promote: drop it \
-                         there (phdb cluster drop-partition {} on node {r})",
-                        lp.epoch, p.id
-                    ),
-                    None => format!("{r}: no replica copy open"),
-                });
-                continue;
-            };
-            if !matches!(
-                lp.replica_state(),
-                ReplicaState::Following | ReplicaState::Behind
-            ) {
-                why.push(format!("{r}: {:?}", lp.replica_state()));
-                continue;
-            }
-            if (st.writer_term, st.map_version) != (map.writer_term, map.map_version) {
-                why.push(format!(
-                    "{r}: holds map version {} at term {}, not the writer's",
-                    st.map_version, st.writer_term
-                ));
-                continue;
-            }
-            if !(p.history_epoch <= lp.epoch && lp.epoch <= p.epoch) {
-                why.push(format!(
-                    "{r}: its copy is at epoch {}, outside P's history",
-                    lp.epoch
-                ));
-                continue;
-            }
-            let stale_by = lp.replica_lag_ms.saturating_sub(since_renewal);
-            if stale_by > millis(nanos(HEARTBEAT)) {
-                why.push(format!(
-                    "{r}: {stale_by} ms staler than the owner's last renewal"
-                ));
-                continue;
-            }
-            if let Some(max) = self.peers.failover_max_lag
-                && Duration::from_millis(stale_by) > max
-            {
-                why.push(format!(
-                    "{r}: {stale_by} ms behind, over --cluster-failover-max-lag-ms"
-                ));
-                continue;
-            }
-            // Highest applied, then map order (the first such).
-            if best
-                .as_ref()
-                .is_none_or(|(applied, _)| lp.replica_applied_seqno > *applied)
-            {
-                best = Some((lp.replica_applied_seqno, r.clone()));
-            }
-        }
-        best.map(|(_, r)| r)
-            .ok_or_else(|| format!("no fresh replica ({})", why.join("; ")))
     }
 
     /// `pigeonhole_cluster_failovers_total` and `pigeonhole_cluster_writer_term`, from the
@@ -662,5 +860,84 @@ impl Promoter for NodeOps {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn down(id: &str, kept: Option<&str>) -> Down {
+        Down {
+            p: proto::Partition {
+                id: id.into(),
+                node: "c".into(),
+                ..Default::default()
+            },
+            renewed: None,
+            in_doubt_xids: Vec::new(),
+            in_doubt_count: 0,
+            kept: kept.map(str::to_owned),
+        }
+    }
+
+    /// perf2's S2 on #2069: P1, blocked and not due, goes through the survey that P2, newly
+    /// down, brings, so its reason is refreshed; with neither due, both keep theirs.
+    #[test]
+    fn a_survey_any_partition_is_due_takes_every_down_partition() {
+        let both = survey_or_keep(vec![down("p1", Some("waiting")), down("p2", None)])
+            .map(|d| d.into_iter().map(|d| d.p.id).collect::<Vec<_>>());
+        assert_eq!(both, Ok(vec!["p1".to_owned(), "p2".to_owned()]));
+        let kept =
+            survey_or_keep(vec![down("p1", Some("a")), down("p2", Some("b"))]).map(|d| d.len());
+        assert_eq!(
+            kept,
+            Err(vec![
+                ("p1".to_owned(), "a".to_owned()),
+                ("p2".to_owned(), "b".to_owned())
+            ])
+        );
+        assert_eq!(survey_or_keep(Vec::new()).map(|d| d.len()), Ok(0));
+    }
+
+    /// A partition is due again at its own time (simp724's nit: a grant's end, else the
+    /// margin), or on a map change; one the last survey didn't take is due at once.
+    #[test]
+    fn a_blocked_partition_is_due_at_its_own_time_or_on_a_map_change() {
+        let f = Failovers::default();
+        f.note_surveyed(vec![("p1".into(), 500), ("p2".into(), 2_000)], 7);
+        assert!(!f.survey_due("p1", 499, 7));
+        assert!(f.survey_due("p1", 500, 7));
+        assert!(!f.survey_due("p2", 500, 7));
+        assert!(f.survey_due("p2", 500, 8), "a map change");
+        assert!(f.survey_due("p3", 0, 7), "not in the last survey");
+        // The next survey's stamps replace them: one it didn't take keeps none.
+        f.note_surveyed(vec![("p2".into(), 3_000)], 7);
+        assert!(f.survey_due("p1", 0, 7));
+    }
+
+    /// The still-granting grant comes from another node only: the owner's own grant to
+    /// itself isn't a majority's.
+    #[test]
+    fn only_another_nodes_grant_to_the_owner_holds_a_partition() {
+        let grant = |ms| proto::LeaseWithheld {
+            partition: "p1".into(),
+            holder: "c".into(),
+            remaining_ms: ms,
+        };
+        let st = |grants| NodeStatus {
+            grants,
+            ..Default::default()
+        };
+        let d = down("p1", None);
+        let own: HashMap<String, NodeStatus> = [("c".to_owned(), st(vec![grant(900)]))].into();
+        assert!(still_granted(&d.p, &own).is_none());
+        let other: HashMap<String, NodeStatus> = [
+            ("b".to_owned(), st(vec![grant(400)])),
+            ("c".to_owned(), st(vec![grant(900)])),
+        ]
+        .into();
+        let (id, g) = still_granted(&d.p, &other).unwrap();
+        assert_eq!((id.as_str(), g.remaining_ms), ("b", 400));
     }
 }

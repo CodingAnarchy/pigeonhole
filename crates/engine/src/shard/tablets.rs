@@ -822,6 +822,31 @@ impl ShardState {
         }
     }
 
+    /// After a read hold's release (D329, perf2's S1 on #2062): wakes the coordinators refused
+    /// with no older commit ahead (`behind: None`) whose rows no undecided share and no hold
+    /// here covers now, as [`release_overlaps`](Self::release_overlaps) does at a decision.
+    /// Without it, one refused over a row a hold also read would wait, once the share it met
+    /// was decided and the hold released, for D241's retry timeout.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_overlaps_cleared(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let mut i = 0;
+        while i < self.overlap_refused.len() {
+            let r = &self.overlap_refused[i];
+            let go = r.single == 0
+                && r.behind.is_none()
+                && !r.rows.iter().any(|h| {
+                    self.pending_rows.contains_key(h) || self.pending_reads.contains_key(h)
+                });
+            if go {
+                let r = self.overlap_refused.swap_remove(i);
+                self.wake_overlap(r, ctx);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// A share of the commit of `priority`, writing `written` (`hash_row`, sorted), committed
     /// here (D276): a refused commit that reads one of those rows and now fails validation
     /// on it would fail its retry the same way (its snapshot stays, and a version above it
@@ -1256,6 +1281,13 @@ impl ShardState {
                 }
             }
         }
+        // Its shares' xid, if a spanning commit's (D329 2b): every share carries the same.
+        if failed.is_none()
+            && let Some((_, part)) = r.parts.first()
+            && let Err(e) = crate::engine::carry_xid(part, &mut builder)
+        {
+            failed = Some(e);
+        }
         if let Some(e) = failed {
             self.release_shards(r.submitted_at, r.first_seqno, &r.prev_shards, ctx);
             r.reply.notify(Err(e));
@@ -1648,6 +1680,15 @@ impl ShardState {
     /// Whether a prepared, undecided share writes or reads a tablet being changed: `None`
     /// if none does, `Some(true)` if one is an external share (D329), else `Some(false)`.
     fn shares_touch_moving(&self) -> Option<bool> {
+        // A read hold (ICR 0140 amendment 1) is given up for, as a share in doubt is: its
+        // caller may keep it for a while.
+        if self
+            .read_holds
+            .values()
+            .any(|h| h.tablets.iter().any(|t| self.moving.contains(t)))
+        {
+            return Some(true);
+        }
         let mut touch = None;
         for share in self.prepared.values() {
             // Its reads too (#2050): a write to a row it read, admitted on the tablet's new
@@ -3433,6 +3474,10 @@ pub(crate) fn split_by_shard(
         };
         part.1
             .push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
+    }
+    // Every share of a spanning commit's batch carries its xid (D329 2b).
+    for (_, part) in &mut parts {
+        crate::engine::carry_xid(builder, part)?;
     }
     Ok(parts.into_iter().map(|(s, b)| (s, Arc::new(b))).collect())
 }

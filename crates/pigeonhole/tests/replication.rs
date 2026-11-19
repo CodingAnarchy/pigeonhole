@@ -794,7 +794,9 @@ fn a_replica_applies_silent_commits_silent() {
     wb.put(&t, b"last", "a", b"q", b"v");
     wb.commit().unwrap();
     let mut bytes = ready(&mut feed)[0].encode();
-    bytes[0] = 3;
+    // A version this build doesn't know is refused, as a build before D329 2b refuses
+    // version 3 (the guide's upgrade note on spanning_txns).
+    bytes[0] = 4;
     assert!(
         ReplicatedEvent::decode(&bytes).is_err(),
         "a newer version is refused"
@@ -1651,4 +1653,208 @@ fn a_row_with_a_zero_byte_at_a_chunks_edge_is_copied() {
     assert!(none.cells.is_empty(), "past the row");
     drop((snap, t));
     db.close().unwrap();
+}
+
+/// `row`'s put on `t`: feed-silent, or a spanning commit's share tagged with `xid` (a
+/// transaction, as `phdb serve` tags one), or plain.
+fn commit(db: &Pigeonhole, t: &pigeonhole::Table, row: &[u8], silent: bool, xid: Option<&[u8]>) {
+    match xid {
+        Some(x) => {
+            let mut txn = db.transaction().unwrap();
+            txn.put(t, row, "a", b"q", b"v");
+            txn.tag_xid(x);
+            txn.commit().unwrap();
+        }
+        None => {
+            let mut wb = db.write_batch();
+            if silent {
+                wb.mark_feed_silent();
+            }
+            wb.put(t, row, "a", b"q", b"v");
+            wb.commit().unwrap();
+        }
+    }
+}
+
+/// D329 2b (ICR 0140 amendment 2): a spanning commit's share replicates as a version 3
+/// event, a flags byte and the xid before version 1's fields. The replica
+/// applies it tagged, so its own feed carries the xid; an untagged commit stays version 1
+/// or 2, byte for byte. Unknown flag bits, and an empty xid, are refused.
+#[test]
+fn a_replica_applies_a_spanning_share_with_its_xid() {
+    let (pv, rv) = (SimVfs::new(41), SimVfs::new(42));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let mut own = replica.feed().open().unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let xid = b"p0:h3-0123456789abcdef0123456789abcdef";
+    // (row, silent, tagged): a spanning commit's share is a tagged transaction (no producer
+    // makes one silent too; the flags' combination is replication.rs's unit test).
+    let steps: [(&[u8], bool, bool); 3] = [
+        (b"plain", false, false),
+        (b"tagged", false, true),
+        (b"quiet", true, false),
+    ];
+    for (row, silent, tagged) in steps {
+        commit(&primary, &t, row, silent, tagged.then_some(&xid[..]));
+        let events = ready(&mut feed);
+        let commits: Vec<_> = events.iter().filter(|e| !e.is_catalog()).collect();
+        assert_eq!(commits.len(), 1);
+        let e = commits[0];
+        let bytes = e.encode();
+        let want = match (tagged, silent) {
+            (true, _) => 3,
+            (false, true) => 2,
+            (false, false) => 1,
+        };
+        assert_eq!(bytes[0], want, "{}", hex(row));
+        assert_eq!(e.xid(), tagged.then_some(&xid[..]));
+        assert_eq!(e.is_silent(), silent);
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert_eq!(back.encode(), bytes, "it round-trips");
+        assert_eq!(back.xid(), e.xid());
+        assert_eq!(back.is_silent(), silent);
+        if tagged {
+            // Unknown flag bits, or a tagged flag with an empty xid, are refused.
+            let mut b = bytes.clone();
+            b[1] |= 0x80;
+            assert!(ReplicatedEvent::decode(&b).is_err(), "an unknown flag");
+            let mut b = bytes.clone();
+            b.splice(2..6 + xid.len(), 0u32.to_le_bytes());
+            assert!(ReplicatedEvent::decode(&b).is_err(), "an empty xid");
+            // Version 3 without the xid flag is never written: refused.
+            let mut b = bytes.clone();
+            b[1] &= !2;
+            b.splice(2..6 + xid.len(), []);
+            assert!(ReplicatedEvent::decode(&b).is_err(), "v3 without an xid");
+        }
+        apply(&replica, &events, 1);
+    }
+    assert_eq!(contents(&replica), contents(&primary));
+    // The replica's own feed: the loud commits, the tagged one with its xid.
+    let mut seen = Vec::new();
+    while let Some(ev) = own.next_event(Duration::from_millis(200)).unwrap() {
+        if let FeedEvent::Commit(c) = ev {
+            for ch in c.changes() {
+                seen.push((ch.row().to_vec(), c.xid().map(<[u8]>::to_vec)));
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            (b"plain".to_vec(), None),
+            (b"tagged".to_vec(), Some(xid.to_vec())),
+        ]
+    );
+    // A run mixing two xids and an untagged commit, applied as one call: each tagged share
+    // is its own part, so no tag spreads to a neighbour.
+    let other = b"p0:h3-fedcba9876543210fedcba9876543210";
+    for (row, x) in [
+        (&b"m1"[..], Some(&xid[..])),
+        (b"m2", Some(&other[..])),
+        (b"m3", None),
+        (b"m4", Some(&xid[..])),
+    ] {
+        commit(&primary, &t, row, false, x);
+    }
+    let events = ready(&mut feed);
+    apply(&replica, &events, events.len());
+    let mut seen = Vec::new();
+    while let Some(ev) = own.next_event(Duration::from_millis(200)).unwrap() {
+        if let FeedEvent::Commit(c) = ev {
+            for ch in c.changes() {
+                seen.push((ch.row().to_vec(), c.xid().map(<[u8]>::to_vec)));
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            (b"m1".to_vec(), Some(xid.to_vec())),
+            (b"m2".to_vec(), Some(other.to_vec())),
+            (b"m3".to_vec(), None),
+            (b"m4".to_vec(), Some(xid.to_vec())),
+        ]
+    );
+    assert_eq!(contents(&replica), contents(&primary));
+    drop((feed, own));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4a, landing after D329 2b (simp724's S1 on #2089): a range drop waits for a
+/// live read hold, as for a share in doubt (`Busy`, to retry), and runs once the hold goes.
+#[cfg(feature = "__unstable-txn-prepare")]
+#[test]
+fn a_range_drop_waits_for_a_read_hold() {
+    let vfs = SimVfs::new(59);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"r5").put("a", b"q", b"v").commit().unwrap();
+    let mut txn = db.transaction().unwrap();
+    txn.get(&t, b"r5", "a", b"q").unwrap();
+    let hold = txn.hold_reads().unwrap();
+    assert_eq!(
+        db.drop_range(&t, b"r3", Some(b"r7")).unwrap_err().code(),
+        ErrorCode::Busy
+    );
+    drop(hold);
+    db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    assert!(t.get(b"r5", "a", b"q").unwrap().is_none());
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a, landing after D329 2b (perf2 and simp724 on #2089): a range drop right
+/// after a spanning commit's share carries no xid. The tagged commit replicates with its
+/// xid, the drop after it with none (so in the plain version, which a drop must be: one
+/// in the flags form is refused), and the replica matches its primary.
+#[test]
+fn a_range_drop_after_a_tagged_commit_carries_no_xid() {
+    let (pv, rv) = (SimVfs::new(60), SimVfs::new(61));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let xid = b"p0:h3-0123456789abcdef0123456789abcdef";
+    commit(&primary, &t, b"r1", false, Some(xid));
+    primary.drop_range(&t, b"r5", Some(b"r9")).unwrap();
+    commit(&primary, &t, b"r2", false, None);
+    let events = ready(&mut feed);
+    let tagged: Vec<(bool, Option<Vec<u8>>)> = events
+        .iter()
+        .filter(|e| !e.is_catalog())
+        .map(|e| (e.is_range_drop(), e.xid().map(<[u8]>::to_vec)))
+        .collect();
+    assert_eq!(
+        tagged,
+        [(false, Some(xid.to_vec())), (true, None), (false, None)],
+        "the tagged commit, the drop, the plain commit"
+    );
+    let drop_event = events.iter().find(|e| e.is_range_drop()).unwrap();
+    assert_eq!(drop_event.encode()[0], 1, "a drop in the plain version");
+    apply(&replica, &events, 3);
+    assert_eq!(contents(&replica), contents(&primary));
+    drop((feed, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
 }
