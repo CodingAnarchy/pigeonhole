@@ -126,6 +126,13 @@ impl FamilyStream {
     ///   idempotent, so a chunk copied twice reads the same. A standard family's operands
     ///   run across timestamps (D41), so they stay operands.
     fn settle(&self, group: &mut [CopiedCell]) {
+        // One GC step is one unit: a family marker, or one `(column, ts)` group.
+        debug_assert!(
+            group.windows(2).all(|w| {
+                (&w[0].row, &w[0].qualifier, w[0].ts) == (&w[1].row, &w[1].qualifier, w[1].ts)
+            }),
+            "a GC step's output spans more than one cell and timestamp"
+        );
         if group.len() > 1 {
             group.reverse();
             return;
@@ -242,6 +249,20 @@ fn open(
         crate::source::mem_sources(set, &all, false, &mut sources);
     }
     if let Some(fam) = l.ssts {
+        // The bounds as encoded row prefixes, as a scan's are: an SST's first and last rows
+        // are escaped (simp724's M1 on #2089: a raw `a\0\x05` is below the escaped `a\0`).
+        let lo = (!from.is_empty())
+            .then(|| {
+                let mut k = Vec::new();
+                encode_row_prefix(&mut k, from).map(|()| k)
+            })
+            .transpose()?;
+        let hi = to
+            .map(|e| {
+                let mut k = Vec::new();
+                encode_row_prefix(&mut k, e).map(|()| k)
+            })
+            .transpose()?;
         let mut read = ReadOptions::default();
         read.fill_cache = false;
         read.readahead_blocks = 4;
@@ -251,8 +272,8 @@ fn open(
             &all,
             // Only the SSTs the chunk's rows can be in (perf287's should-fix on B2): every
             // other one's index would be read again for each chunk, uncached.
-            (!from.is_empty()).then_some(from),
-            to,
+            lo.as_deref(),
+            hi.as_deref(),
             l.priority,
             read,
             &mut sources,

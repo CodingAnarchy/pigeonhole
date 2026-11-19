@@ -1614,3 +1614,41 @@ fn a_counter_value_beside_its_delete_survives_the_copy() {
     target.close().unwrap();
     source.close().unwrap();
 }
+
+/// D331 PR 4a (simp724's M1 on #2089): a chunk's bounds prune SSTs by escaped rows. A row
+/// with a zero byte, alone in an SST, inside a chunk ending just past it (`a\0` against
+/// `a\0\x05`, which a raw comparison puts below the escaped `a\0`), is copied.
+#[test]
+fn a_row_with_a_zero_byte_at_a_chunks_edge_is_copied() {
+    let vfs = SimVfs::new(58);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"a\0").put("a", b"q", b"v").commit().unwrap();
+    db.flush().unwrap();
+    let snap = db.snapshot().unwrap();
+    for (after, end) in [
+        (&b""[..], &b"a\0\x05"[..]),
+        (b"a\0", b"a\0\x05"),
+        (b"a", b"a\0\x01"),
+    ] {
+        let chunk = db.copy_range(&snap, &t, after, Some(end), 1 << 20).unwrap();
+        assert_eq!(
+            chunk
+                .cells
+                .iter()
+                .map(|c| c.row.clone())
+                .collect::<Vec<_>>(),
+            [b"a\0".to_vec()],
+            "[{after:?}, {end:?})"
+        );
+    }
+    let none = db.copy_range(&snap, &t, b"a\0\x01", None, 1 << 20).unwrap();
+    assert!(none.cells.is_empty(), "past the row");
+    drop((snap, t));
+    db.close().unwrap();
+}
