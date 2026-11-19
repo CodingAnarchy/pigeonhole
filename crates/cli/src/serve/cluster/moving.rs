@@ -242,6 +242,26 @@ async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
         .into_inner())
 }
 
+/// Sets `m` as the move's record change, waiting out a writer still taking its peers'
+/// maps after a restart (a retry-safe refusal, up to 30 s): a move started just after the
+/// writer did, which needed no map change before its last step until D332 PR 2, mustn't
+/// fail for it (#2092's Linux CI).
+async fn set_record(args: &NodeArgs, m: &ClusterMap) -> Result<(), Failure> {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        match set_map(args, m.clone(), false, Vec::new()).await {
+            Ok(_) => return Ok(()),
+            Err(f)
+                if f.message().contains("still taking its peers' maps")
+                    && Instant::now() < until =>
+            {
+                tokio::time::sleep(POLL).await;
+            }
+            Err(f) => return Err(f),
+        }
+    }
+}
+
 /// The move's record at its start, COPYING, before OLD fences (D332 PR 2, simp724's
 /// should): so a crash leaves a record `status` shows. Each attempt has a fresh id
 /// (simp724's M1), replacing an earlier attempt's record not yet at its commit point:
@@ -286,8 +306,8 @@ async fn start_record(
     };
     r.set_phase(MovePhase::Copying);
     next.moves.push(r);
-    match set_map(args, next, false, Vec::new()).await {
-        Ok(_) => Ok(Some(id)),
+    match set_record(args, &next).await {
+        Ok(()) => Ok(Some(id)),
         Err(f)
             if f.message()
                 .contains("can't add a range move until every node") =>
@@ -321,7 +341,7 @@ async fn advance(
             m.moves.remove(i);
         }
     }
-    set_map(args, m, false, Vec::new()).await.map(drop)
+    set_record(args, &m).await
 }
 
 /// `phdb cluster move P --abort` (D332 PR 2): removes P's move record before its commit
