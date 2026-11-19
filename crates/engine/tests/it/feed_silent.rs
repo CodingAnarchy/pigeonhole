@@ -95,7 +95,6 @@ fn drain(r: &mut FeedReader) -> Vec<(Seqno, bool)> {
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
             Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
-            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
         };
         got.push((seqno, r.silent()));
     }
@@ -275,7 +274,7 @@ fn resumes(db: &Engine, t: &TableInfo, token: Vec<u8>) -> Option<usize> {
     loop {
         match r.wait(Duration::from_millis(300)).unwrap() {
             Next::Commit(_) => n += 1,
-            Next::Catalog(_) | Next::RangeDrop(_) => {}
+            Next::Catalog(_) => {}
             Next::Pending => return Some(n),
             Next::Expired(_) => return None,
         }

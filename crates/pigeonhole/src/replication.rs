@@ -153,8 +153,10 @@ impl ReplicatedEvent {
     /// The event's bytes, for a replica in another process (#1436: `phdb serve`'s
     /// `Replication.Follow`): versioned, opaque to the transport. [`decode`](Self::decode)
     /// reads them back. A feed-silent commit is version 2 (D331), every other event version
-    /// 1, so a stream without one is what builds before D331 read; an older replica refuses
-    /// a version 2 event rather than apply it as an ordinary write.
+    /// 1; an older replica refuses a version 2 event rather than apply it as an ordinary
+    /// write. A range drop (D331 PR 4a) is body tag 2 inside version 1, which builds before
+    /// it refuse as an unknown body, halting their follower at the first drop: upgrade a
+    /// primary's replicas before the primary (feed1248's S1 on #2089).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(if self.is_silent() {
@@ -226,6 +228,7 @@ impl ReplicatedEvent {
     /// newer encoding.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
+        let version = bytes.first().copied();
         let silent = match r.u8()? {
             EVENT_VERSION => false,
             SILENT_EVENT_VERSION => true,
@@ -307,9 +310,13 @@ impl ReplicatedEvent {
         if silent && matches!(body, Body::Catalog(_)) {
             return Err(invalid("a feed-silent catalog change".to_owned()));
         }
-        // A drop is written in the plain version only: a flag on one is never written.
-        if silent && matches!(body, Body::RangeDrop(_)) {
-            return Err(invalid("a flagged range drop".to_owned()));
+        // A drop is written in the plain version only. Keyed on the version byte itself,
+        // not on the flags one version reads, so a later flags form (D329 PR 2b's version 3)
+        // is refused too, whichever lands first (feed1248's M1 on #2089).
+        if matches!(body, Body::RangeDrop(_)) && version != Some(EVENT_VERSION) {
+            return Err(invalid(
+                "a range drop in a version other than the plain one".to_owned(),
+            ));
         }
         if !r.0.is_empty() {
             return Err(invalid(

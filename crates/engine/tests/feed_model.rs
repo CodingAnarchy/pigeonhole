@@ -450,9 +450,6 @@ impl Run {
                     Next::Catalog(e) => {
                         panic!("seed {seed}: a catalog event in a per-table feed: {e:?}")
                     }
-                    Next::RangeDrop(e) => {
-                        panic!("seed {seed}: a range drop in a client's feed: {e:?}")
-                    }
                 };
                 let tag = tag_of(&c, seed);
                 let m = self

@@ -1155,10 +1155,12 @@ fn a_replica_applies_a_range_drop_in_feed_order() {
     primary.close().unwrap();
 }
 
-/// D331 PR 4a (the coordinator's condition): a range drop's event is written in the plain
-/// version only, so one in the silent version is refused.
+/// D331 PR 4a: a range drop's event round-trips, bounded and to the table's end, and its
+/// bytes re-encode identically (feed1248's S2); a truncated one is refused, and so is one in
+/// any version but the plain one (the coordinator's condition; feed1248's M1: version 2
+/// here, and version 3, D329 PR 2b's flags form, whichever lands first).
 #[test]
-fn a_flagged_range_drop_event_is_refused() {
+fn a_range_drop_event_round_trips_and_a_flagged_one_is_refused() {
     let vfs = SimVfs::new(48);
     let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
     let mut feed = db.feed().open().unwrap();
@@ -1169,18 +1171,35 @@ fn a_flagged_range_drop_event_is_refused() {
         .family("a", Family::default())
         .create_if_missing()
         .unwrap();
-    db.drop_range(&t, b"a", None).unwrap();
-    let drop_event = ready(&mut feed)
+    db.drop_range(&t, b"b", Some(b"m\x00")).unwrap();
+    db.drop_range(&t, b"x", None).unwrap();
+    let drops: Vec<ReplicatedEvent> = ready(&mut feed)
         .into_iter()
-        .find(ReplicatedEvent::is_range_drop)
-        .expect("the drop is delivered");
-    let mut bytes = drop_event.encode();
-    assert_eq!(bytes[0], 1, "the plain version");
-    bytes[0] = 2;
-    assert_eq!(
-        ReplicatedEvent::decode(&bytes).unwrap_err().code(),
-        ErrorCode::InvalidArgument
-    );
+        .filter(ReplicatedEvent::is_range_drop)
+        .collect();
+    assert_eq!(drops.len(), 2, "both drops are delivered");
+    for event in &drops {
+        let bytes = event.encode();
+        assert_eq!(bytes[0], 1, "the plain version");
+        let back = ReplicatedEvent::decode(&bytes).unwrap();
+        assert_eq!(&back, event);
+        assert_eq!(back.encode(), bytes, "re-encoded byte for byte");
+        for cut in 1..bytes.len() {
+            assert!(
+                ReplicatedEvent::decode(&bytes[..cut]).is_err(),
+                "truncated at {cut}"
+            );
+        }
+        for version in [2u8, 3] {
+            let mut flagged = bytes.clone();
+            flagged[0] = version;
+            assert_eq!(
+                ReplicatedEvent::decode(&flagged).unwrap_err().code(),
+                ErrorCode::InvalidArgument,
+                "version {version}"
+            );
+        }
+    }
     drop((feed, t));
     db.close().unwrap();
 }

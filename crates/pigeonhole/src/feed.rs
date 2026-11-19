@@ -725,6 +725,9 @@ impl Feed {
             match step(&mut self.out, &self.db, self.generation, next, events)? {
                 Step::Ready => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     return Ok(true);
                 }
                 // A catalog change a commits-only call passes over, or a superseded
@@ -757,6 +760,9 @@ impl Feed {
             return match step(&mut self.out, &self.db, self.generation, next, events)? {
                 Step::Ready => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     Ok(true)
                 }
                 Step::Again => continue,
@@ -795,6 +801,9 @@ impl Feed {
             return match step(&mut self.out, &self.db, self.generation, next, events) {
                 Ok(Step::Ready) => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     Poll::Ready(Ok(()))
                 }
                 Ok(Step::Again) => continue,
@@ -856,6 +865,29 @@ impl Feed {
     }
 
     /// A delivery happened: the span from the last one's end to the stream's position now.
+    /// D331: a range drop comes from the engine as an empty commit at its seqno, which the
+    /// reader names ([`FeedReader::range_drop`](pigeonhole_engine::FeedReader::range_drop);
+    /// only with `include_silent`). An event call gets it as [`FeedEvent::RangeDrop`]; a
+    /// commits-only call passes it over (true).
+    fn drop_passed(&mut self, events: bool) -> bool {
+        let Some(_drop) = self.reader.range_drop() else {
+            return false;
+        };
+        if !events {
+            return true;
+        }
+        #[cfg(feature = "__unstable-replication")]
+        {
+            self.out.event = Some(FeedEvent::RangeDrop(
+                crate::replication::RangeDrop::from_engine(_drop),
+            ));
+            false
+        }
+        // Without the feature no feed includes feed-silent records, so none gets a drop.
+        #[cfg(not(feature = "__unstable-replication"))]
+        true
+    }
+
     fn note_delivery(&mut self) {
         let after = stream_position(&self.reader);
         self.span = (self.span.1, after);
@@ -997,19 +1029,6 @@ fn step(
             out.event = Some(FeedEvent::Catalog(change));
             Ok(Step::Ready)
         }
-        // Only a reader that includes feed-silent records gets one (a replica's follower).
-        #[cfg(feature = "__unstable-replication")]
-        Next::RangeDrop(ev) => {
-            if !events {
-                return Ok(Step::Again);
-            }
-            out.event = Some(FeedEvent::RangeDrop(
-                crate::replication::RangeDrop::from_engine(ev),
-            ));
-            Ok(Step::Ready)
-        }
-        #[cfg(not(feature = "__unstable-replication"))]
-        Next::RangeDrop(_) => Ok(Step::Again),
         // The old engine's reader, still waiting as a recovery swapped in a new engine,
         // reads the new session's records as outside its history: the new engine's reader
         // decides from the token instead (cli692's S2 on #1321).

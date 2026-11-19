@@ -2415,9 +2415,12 @@ impl Engine {
     /// no delete markers (D331, ICR 0141): a range move's source at its cleanup, its target
     /// at an abort. A later write of the range at an older timestamp is visible, as if the
     /// rows had never been there; a live snapshot still reads them. The range must be
-    /// unserved while this runs, and the caller runs it again after a crash until it
-    /// returns: each step does nothing once done. Feed-silent; a replica's follower runs
-    /// it too.
+    /// unserved while this runs, **with no write of it in flight**: the caller stops and
+    /// joins every writer of the range first (a source's range fence; a target's copy and
+    /// catch-up, at an abort), since a write landing around the drop's seqno would apply
+    /// live into the fresh tablet but be skipped on replay (simp724's M2 on #2089). The
+    /// caller runs it again after a crash until it returns: each step does nothing once
+    /// done. Feed-silent; a replica's follower runs it too.
     ///
     /// `ReadOnly` on a replica; `Busy` (retry) while an externally prepared transaction is
     /// in doubt or the balancer keeps changing the range's tablets; `Unsupported` with

@@ -82,7 +82,6 @@ fn next(r: &mut FeedReader) -> Commit {
         Next::Pending => panic!("no commit within {WAIT:?} (frontier {})", r.frontier()),
         Next::Expired(e) => panic!("expired: {e:?}"),
         Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
-        Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
     }
 }
 
@@ -362,7 +361,7 @@ fn retention_passing_a_token_expires_it() {
     let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
     let expired = loop {
         match r.wait(WAIT).unwrap() {
-            Next::Commit(_) | Next::Catalog(_) | Next::RangeDrop(_) => continue,
+            Next::Commit(_) | Next::Catalog(_) => continue,
             Next::Pending => break false,
             Next::Expired(_) => break true,
         }
@@ -409,7 +408,6 @@ fn drain(r: &mut FeedReader, shards: &mut [EngineShard]) -> Vec<Commit> {
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
             Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
-            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
         }
     }
     panic!("never drained");
@@ -631,7 +629,6 @@ fn drain_seqnos(r: &mut FeedReader) -> Vec<Seqno> {
             Next::Pending => return got,
             Next::Expired(e) => panic!("expired: {e:?}"),
             Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
-            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
         }
     }
 }
@@ -1326,7 +1323,6 @@ fn a_process_crash_around_a_root_commit_never_expires_a_durable_feed() {
                     }
                 }
                 Next::Catalog(ev) => got.push(format!("catalog{}", ev.edits.len())),
-                Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
                 Next::Expired(e) => panic!("{what}: the durable feed expired: {e:?}"),
                 Next::Pending => panic!("{what}: nothing within {WAIT:?}: {got:?}"),
             }
@@ -2046,7 +2042,6 @@ fn a_capped_feed_of_every_table_delivers_a_catalog_change_after_the_commits_befo
                 assert!(ev.seqno_ceiling > before[5], "{ev:?}");
                 order.push(None);
             }
-            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
             Next::Pending => panic!("nothing within {WAIT:?} after {order:?}"),
             Next::Expired(e) => panic!("expired: {e:?}"),
         }
@@ -2616,7 +2611,6 @@ fn a_capped_readers_skip_index_keeps_tokens_and_retention_as_they_were() {
                 break;
             }
             Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
-            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
         }
     }
     let n = seen.len().min(want.len());

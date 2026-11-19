@@ -145,12 +145,10 @@ pub enum Next<'a> {
     /// A catalog change (D315), in a feed of every table only: between every commit below
     /// its ceiling and every commit at or above it.
     Catalog(&'a CatalogEvent),
-    /// A range drop (D331, WAL type 7), only to a reader that includes feed-silent records
-    /// (a replica's follower): between every commit below its seqno and every commit above.
-    RangeDrop(&'a RangeDropEvent),
 }
 
-/// A range drop as a feed that includes feed-silent records delivers it (D331): rows
+/// A range drop as a feed that includes feed-silent records delivers it (D331): as an empty
+/// [`Next::Commit`] at the drop's seqno, which [`FeedReader::range_drop`] names: rows
 /// `[start, end)` of `table` (`end` `None`: to the table's end) dropped at `seqno`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RangeDropEvent {
@@ -817,8 +815,8 @@ pub struct FeedReader {
     /// The table the last commit's changes ended with, present in `present_of`.
     present_last: Option<TableId>,
     out_catalog: CatalogEvent,
-    /// The range drop [`Next::RangeDrop`] lends (D331).
-    out_drop: RangeDropEvent,
+    /// The range drop the commit last delivered stands for (D331), if it does.
+    out_drop: Option<RangeDropEvent>,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
     /// couldn't be read): every later call fails, since going on would skip that commit.
@@ -1245,7 +1243,6 @@ enum Emitted {
     Nothing,
     Commit,
     Catalog,
-    RangeDrop,
 }
 
 impl Emitted {
@@ -1254,7 +1251,6 @@ impl Emitted {
             Emitted::Nothing => None,
             Emitted::Commit => Some(Polled::Commit),
             Emitted::Catalog => Some(Polled::Catalog),
-            Emitted::RangeDrop => Some(Polled::RangeDrop),
         }
     }
 }
@@ -1263,7 +1259,6 @@ impl Emitted {
 enum Polled {
     Commit,
     Catalog,
-    RangeDrop,
     Pending { held: bool },
     Expired,
 }
@@ -1365,7 +1360,7 @@ impl FeedReader {
             present_of: None,
             present_last: None,
             out_catalog: CatalogEvent::default(),
-            out_drop: RangeDropEvent::default(),
+            out_drop: None,
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
         // A feed of every table: the catalog its start reflects, for `Now` and a snapshot
@@ -1707,7 +1702,6 @@ impl FeedReader {
         match polled {
             Polled::Commit => Next::Commit(&self.out),
             Polled::Catalog => Next::Catalog(&self.out_catalog),
-            Polled::RangeDrop => Next::RangeDrop(&self.out_drop),
             Polled::Pending { .. } => Next::Pending,
             Polled::Expired => Next::Expired(self.expired.as_ref().expect("set")),
         }
@@ -1772,6 +1766,14 @@ impl FeedReader {
     #[doc(hidden)]
     pub fn silent(&self) -> bool {
         self.out_silent
+    }
+
+    /// The range drop the commit last delivered stands for (D331; only ever with
+    /// [`include_silent`](Self::include_silent)): an empty commit at the drop's seqno. Not
+    /// part of the stable API.
+    #[doc(hidden)]
+    pub fn range_drop(&self) -> Option<&RangeDropEvent> {
+        self.out_drop.as_ref()
     }
 
     /// The silent notes held now (test hook), each checked against what the reader keeps: a
@@ -2876,14 +2878,24 @@ impl FeedReader {
                 Pending::Dropped {
                     event, stream, end, ..
                 } => {
+                    // Every stream logs the drop, and their copies share one key in `ready`:
+                    // the one kept (the last read) advances its stream, and the others pass
+                    // as records behind `delivered` (feed1248's note).
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
                     self.delivered = key;
-                    self.out_drop = *event;
-                    return Ok(Emitted::RangeDrop);
+                    // An empty commit at its seqno (simp724's M1 on #2089: `Next` stays as
+                    // it is), which `range_drop` names.
+                    self.out.seqno = event.seqno;
+                    self.out.ts = 0;
+                    self.out.changes.clear();
+                    self.out_silent = false;
+                    self.out_drop = Some(*event);
+                    return Ok(Emitted::Commit);
                 }
                 p => p,
             };
+            self.out_drop = None;
             let (ts, raws) = match p {
                 Pending::Dropped { .. } => unreachable!("taken above"),
                 Pending::Single {
