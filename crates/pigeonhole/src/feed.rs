@@ -870,6 +870,11 @@ impl Feed {
     /// only with `include_silent`). An event call gets it as [`FeedEvent::RangeDrop`]; a
     /// commits-only call passes it over (true).
     fn drop_passed(&mut self, events: bool) -> bool {
+        // Only a commit can stand for a drop: a catalog change delivered after one leaves
+        // the reader's drop behind it (feed1248 on #2089).
+        if events && !matches!(self.out.event, Some(FeedEvent::Commit(_))) {
+            return false;
+        }
         let Some(_drop) = self.reader.range_drop() else {
             return false;
         };

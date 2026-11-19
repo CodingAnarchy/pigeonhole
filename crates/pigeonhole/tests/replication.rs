@@ -1288,3 +1288,49 @@ fn a_range_drop_cut_by_a_crash_finishes_when_run_again() {
     assert!(k > 4, "the drop finished at its {}th operation", k - 1);
     eprintln!("the drop finished at operation {}", k - 1);
 }
+
+/// D331 PR 4a (feed1248 on #2089): a range drop followed at once by a catalog change reaches
+/// a replica's follower as one drop, then the change, and the replica matches its primary:
+/// the change isn't taken for a second drop.
+#[test]
+fn a_catalog_change_right_after_a_range_drop_is_delivered_as_itself() {
+    let (pv, rv) = (SimVfs::new(50), SimVfs::new(51));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"r1").put("a", b"q", b"v").commit().unwrap();
+    primary.drop_range(&t, b"r0", Some(b"r5")).unwrap();
+    primary
+        .table("u")
+        .unwrap()
+        .family("b", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let events = ready(&mut feed);
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| {
+            if e.is_range_drop() {
+                "drop"
+            } else if e.is_catalog() {
+                "catalog"
+            } else {
+                "commit"
+            }
+        })
+        .collect();
+    assert_eq!(kinds, ["catalog", "commit", "drop", "catalog"], "{kinds:?}");
+    apply(&replica, &events, 3);
+    assert_eq!(contents(&replica), contents(&primary));
+    assert!(replica.table("u").unwrap().open().is_ok());
+    drop((feed, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}

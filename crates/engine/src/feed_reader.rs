@@ -2840,6 +2840,8 @@ impl FeedReader {
                 self.catalog_seq = ev.sequence;
                 self.raise_session(session);
                 self.out_catalog = ev;
+                // No commit is delivered with it, so no drop either (feed1248 on #2089).
+                self.out_drop = None;
                 return Ok(Emitted::Catalog);
             }
             let Some((&key, _)) = self.ready.first_key_value() else {
