@@ -1726,10 +1726,13 @@ impl Engine {
                     }
                     // A range drop (D331): nothing to apply. A drop whose manifest commit is
                     // durable put a fresh tablet over the range, flushed through its seqno,
-                    // so the range's earlier writes replay into nothing; one whose commit
-                    // isn't is run again by its caller, which keeps the range unserved and
-                    // its drop-pending row until the drop completes. Never needed past a
-                    // checkpoint: the re-run writes its own record.
+                    // so the range's earlier writes replay into nothing: every write of the
+                    // range has a lower seqno, since its caller keeps the range unserved
+                    // while it drops, so none can be in flight below the seqno and land
+                    // after it (simp724). One whose commit isn't durable is run again by its
+                    // caller, which keeps the range unserved and its drop-pending row until
+                    // the drop completes. Never needed past a checkpoint: the re-run writes
+                    // its own record.
                     WalRecord::RangeDrop { seqno, .. } => {
                         records.push(ReplayedRecord {
                             end,
@@ -2426,6 +2429,17 @@ impl Engine {
             ));
         }
         self.inner.refuse_on_replica()?;
+        self.inner.drop_range(table, start, end)
+    }
+
+    /// [`drop_range`](Self::drop_range) on a replica (D331): its primary's drop, which its
+    /// follower applies in feed order. `InvalidArgument` on a primary.
+    pub fn apply_range_drop(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        if !self.inner.replica.load(Ordering::Relaxed) {
+            return Err(Error::InvalidArgument(
+                "only a replica applies its primary's range drop".to_owned(),
+            ));
+        }
         self.inner.drop_range(table, start, end)
     }
 

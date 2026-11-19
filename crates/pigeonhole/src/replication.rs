@@ -36,6 +36,37 @@ pub(crate) enum Body {
         silent: bool,
     },
     Catalog(CatalogEvent),
+    /// A range drop (D331): rows `[start, end)` of `table` dropped, with the primary's
+    /// table id. Body tag 2; never silent.
+    RangeDrop(RangeDrop),
+}
+
+/// A range drop a primary's feed delivers to a replica's follower (D331,
+/// [`FeedEvent::RangeDrop`](crate::FeedEvent::RangeDrop)): rows `[start, end)` of a table,
+/// gone outright at `seqno`. Not part of the stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeDrop {
+    pub(crate) seqno: u64,
+    pub(crate) table: TableId,
+    pub(crate) start: Vec<u8>,
+    pub(crate) end: Option<Vec<u8>>,
+}
+
+impl RangeDrop {
+    pub(crate) fn from_engine(ev: &pigeonhole_engine::RangeDropEvent) -> Self {
+        Self {
+            seqno: ev.seqno,
+            table: ev.table,
+            start: ev.start.clone(),
+            end: ev.end.clone(),
+        }
+    }
+
+    /// The drop's seqno, which applies nothing.
+    pub fn seqno(&self) -> u64 {
+        self.seqno
+    }
 }
 
 /// One change of a replicated commit, as the primary logged it.
@@ -81,6 +112,7 @@ impl ReplicatedEvent {
                 silent,
             },
             FeedEvent::Catalog(change) => Body::Catalog(change.raw().clone()),
+            FeedEvent::RangeDrop(d) => Body::RangeDrop(d.clone()),
         };
         Self {
             before,
@@ -99,6 +131,12 @@ impl ReplicatedEvent {
     /// Whether it is a catalog change (applied with `apply_catalog`, between runs of commits).
     pub fn is_catalog(&self) -> bool {
         matches!(self.body, Body::Catalog(_))
+    }
+
+    /// A range drop (D331): apply it with
+    /// [`Pigeonhole::apply_range_drop`](crate::Pigeonhole::apply_range_drop).
+    pub fn is_range_drop(&self) -> bool {
+        matches!(self.body, Body::RangeDrop(_))
     }
 
     /// The primary feed's token right after this event: what a replica stores with it.
@@ -167,6 +205,18 @@ impl ReplicatedEvent {
                     out.extend_from_slice(&table.0.to_le_bytes());
                     put_bytes(&mut out, name.as_bytes());
                 }
+            }
+            Body::RangeDrop(d) => {
+                out.push(2);
+                out.extend_from_slice(&d.seqno.to_le_bytes());
+                // WAL type 7's range encoding (FORMAT §10.3), checked when it was written.
+                pigeonhole_format::wal::DroppedRange::encode(
+                    &mut out,
+                    d.table,
+                    &d.start,
+                    d.end.as_deref(),
+                )
+                .expect("a range the engine logged");
             }
         }
         out
@@ -239,10 +289,27 @@ impl ReplicatedEvent {
                 }
                 Body::Catalog(ev)
             }
+            2 => {
+                let seqno = r.u64()?;
+                let range = pigeonhole_format::wal::DroppedRange::decode(r.0)
+                    .map_err(|_| invalid("a replicated range drop".to_owned()))?;
+                r.0 = &[];
+                let (table, start, end) = range.fields();
+                Body::RangeDrop(RangeDrop {
+                    seqno,
+                    table,
+                    start: start.to_vec(),
+                    end: end.map(<[u8]>::to_vec),
+                })
+            }
             _ => return Err(invalid("a replicated event's body".to_owned())),
         };
         if silent && matches!(body, Body::Catalog(_)) {
             return Err(invalid("a feed-silent catalog change".to_owned()));
+        }
+        // A drop is written in the plain version only: a flag on one is never written.
+        if silent && matches!(body, Body::RangeDrop(_)) {
+            return Err(invalid("a flagged range drop".to_owned()));
         }
         if !r.0.is_empty() {
             return Err(invalid(
@@ -612,6 +679,11 @@ impl Pigeonhole {
                 "a catalog change in a replicated run: apply it with apply_catalog".to_owned(),
             ));
         }
+        if run.iter().any(ReplicatedEvent::is_range_drop) {
+            return Err(invalid(
+                "a range drop in a replicated run: apply it with apply_range_drop".to_owned(),
+            ));
+        }
         if let Some(w) = run.windows(2).find(|w| w[1].before != w[0].after) {
             return Err(invalid(format!(
                 "a replicated run's events must chain: one ends at {:?}, the next starts at {:?}",
@@ -737,7 +809,52 @@ impl Pigeonhole {
     #[doc(hidden)]
     pub fn drop_range(&self, table: &crate::Table, start: &[u8], end: Option<&[u8]>) -> Result<()> {
         crate::write::check_table(&self.db, table)?;
-        self.engine().drop_range(table.core.info.id, start, end)?;
+        match self.engine().drop_range(table.core.info.id, start, end) {
+            // The engine refuses while an externally prepared transaction is in doubt: name
+            // them, so an operator can decide one stuck there (simp724).
+            Err(pigeonhole_engine::Error::Busy) if !self.engine().in_doubt().is_empty() => {
+                let xids: Vec<String> = self
+                    .engine()
+                    .in_doubt()
+                    .iter()
+                    .map(|(xid, _)| String::from_utf8_lossy(xid).into_owned())
+                    .collect();
+                Err(Error::new(
+                    ErrorCode::Busy,
+                    format!(
+                        "a range drop waits for the transactions in doubt here to be decided: {}",
+                        xids.join(", ")
+                    ),
+                ))
+            }
+            r => Ok(r?),
+        }
+    }
+
+    /// Applies a range drop a primary's feed delivered (D331): the same rows go from this
+    /// replica's own tablets, then `token` (the event's) is stored. It must start where the
+    /// last apply ended. The drop and the token are two steps: after a crash between them
+    /// the drop runs again, which changes nothing. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn apply_range_drop(&self, event: &ReplicatedEvent, token: &FeedToken) -> Result<()> {
+        let Body::RangeDrop(d) = &event.body else {
+            return Err(invalid(
+                "apply_range_drop takes a range drop: apply commits with apply_replicated"
+                    .to_owned(),
+            ));
+        };
+        if event.token != *token {
+            return Err(invalid("the token to store must be the event's".to_owned()));
+        }
+        self.chain(event.before, primary_of(&event.token))?;
+        self.engine()
+            .apply_range_drop(d.table, &d.start, d.end.as_deref())?;
+        let state = State {
+            primary: primary_of(&event.token),
+            after: event.after,
+            token: Some(event.token.clone()),
+        };
+        self.engine().store_replication_state(&state.encode())?;
         Ok(())
     }
 

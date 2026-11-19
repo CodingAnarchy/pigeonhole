@@ -81,9 +81,16 @@ fn apply(replica: &Pigeonhole, events: &[ReplicatedEvent], run: usize) {
             i += 1;
             continue;
         }
+        if events[i].is_range_drop() {
+            replica
+                .apply_range_drop(&events[i], events[i].token())
+                .unwrap();
+            i += 1;
+            continue;
+        }
         let end = (i..events.len())
             .take(run)
-            .take_while(|&j| !events[j].is_catalog())
+            .take_while(|&j| !events[j].is_catalog() && !events[j].is_range_drop())
             .last()
             .unwrap()
             + 1;
@@ -101,9 +108,14 @@ fn try_apply(
     events: &[ReplicatedEvent],
     run: usize,
 ) -> pigeonhole::Result<()> {
-    for chunk in events.chunk_by(|a, b| !a.is_catalog() && !b.is_catalog()) {
+    let alone = |e: &ReplicatedEvent| e.is_catalog() || e.is_range_drop();
+    for chunk in events.chunk_by(|a, b| !alone(a) && !alone(b)) {
         if chunk[0].is_catalog() {
             replica.apply_catalog(&chunk[0], chunk[0].token())?;
+            continue;
+        }
+        if chunk[0].is_range_drop() {
+            replica.apply_range_drop(&chunk[0], chunk[0].token())?;
             continue;
         }
         for part in chunk.chunks(run) {
@@ -1072,5 +1084,103 @@ fn a_feed_passes_a_range_drop_and_its_tokens_resume() {
         );
     }
     drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a (perf2's condition 1): a primary's range drop reaches a replica in feed
+/// order, between the commits before it and after it. The replica lags: it applies the
+/// writes of the range, the drop, and a write of the range at an older timestamp only
+/// after all of them happened, and then reads as the primary: the dropped rows gone, the
+/// older write visible. A client's feed of the primary never sees the drop.
+#[test]
+fn a_replica_applies_a_range_drop_in_feed_order() {
+    let (pv, rv) = (SimVfs::new(46), SimVfs::new(47));
+    let primary = Pigeonhole::open("/p/data.phdb", options(&pv)).unwrap();
+    let mut feed = primary.feed().open().unwrap();
+    feed.include_silent();
+    let replica = Pigeonhole::open("/r/data.phdb", options(&rv)).unwrap();
+    let t = primary
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut client = t.feed().open().unwrap();
+    for i in 0..10u8 {
+        t.mutate(&[b'r', b'0' + i])
+            .put_at("a", b"q", 100, format!("v{i}").as_bytes())
+            .commit()
+            .unwrap();
+    }
+    primary.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    t.mutate(b"r4")
+        .put_at("a", b"q", 50, b"old")
+        .commit()
+        .unwrap();
+
+    let events = ready(&mut feed);
+    let drops: Vec<usize> = (0..events.len())
+        .filter(|&i| events[i].is_range_drop())
+        .collect();
+    assert_eq!(
+        drops.len(),
+        1,
+        "one drop event, though every stream logged it"
+    );
+    assert!(
+        drops[0] + 1 < events.len() && !events[drops[0] + 1].is_catalog(),
+        "the drop comes before the write after it"
+    );
+    apply(&replica, &events, 3);
+    assert_eq!(contents(&replica), contents(&primary));
+    let rt = replica.table("t").unwrap().open().unwrap();
+    assert_eq!(
+        rows_of(&rt, None),
+        [
+            "r0=v0", "r1=v1", "r2=v2", "r4=old", "r7=v7", "r8=v8", "r9=v9"
+        ]
+    );
+
+    let mut seen = 0;
+    while let Some(ev) = client.next_event(Duration::from_millis(200)).unwrap() {
+        assert!(matches!(ev, FeedEvent::Commit(_)), "{ev:?}");
+        seen += 1;
+    }
+    assert_eq!(
+        seen, 11,
+        "the client sees every commit and nothing for the drop"
+    );
+    drop((feed, client, rt, t));
+    replica.close().unwrap();
+    primary.close().unwrap();
+}
+
+/// D331 PR 4a (the coordinator's condition): a range drop's event is written in the plain
+/// version only, so one in the silent version is refused.
+#[test]
+fn a_flagged_range_drop_event_is_refused() {
+    let vfs = SimVfs::new(48);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let mut feed = db.feed().open().unwrap();
+    feed.include_silent();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    db.drop_range(&t, b"a", None).unwrap();
+    let drop_event = ready(&mut feed)
+        .into_iter()
+        .find(ReplicatedEvent::is_range_drop)
+        .expect("the drop is delivered");
+    let mut bytes = drop_event.encode();
+    assert_eq!(bytes[0], 1, "the plain version");
+    bytes[0] = 2;
+    assert_eq!(
+        ReplicatedEvent::decode(&bytes).unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+    drop((feed, t));
     db.close().unwrap();
 }

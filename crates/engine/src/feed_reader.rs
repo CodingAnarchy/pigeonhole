@@ -145,6 +145,23 @@ pub enum Next<'a> {
     /// A catalog change (D315), in a feed of every table only: between every commit below
     /// its ceiling and every commit at or above it.
     Catalog(&'a CatalogEvent),
+    /// A range drop (D331, WAL type 7), only to a reader that includes feed-silent records
+    /// (a replica's follower): between every commit below its seqno and every commit above.
+    RangeDrop(&'a RangeDropEvent),
+}
+
+/// A range drop as a feed that includes feed-silent records delivers it (D331): rows
+/// `[start, end)` of `table` (`end` `None`: to the table's end) dropped at `seqno`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangeDropEvent {
+    /// The drop's seqno, which applies nothing.
+    pub seqno: Seqno,
+    /// The table.
+    pub table: TableId,
+    /// The range's first row.
+    pub start: Vec<u8>,
+    /// The row after the range; `None`: to the table's end.
+    pub end: Option<Vec<u8>>,
 }
 
 /// How far a feed has covered its history ([`FeedReader::position`], ICR 0114 amendment):
@@ -353,8 +370,12 @@ enum Item {
         id: Seqno,
     },
     /// A range drop (D331, type 7), at a seqno of its own, which applies nothing: the
-    /// frontier passes it, and no subscription is delivered anything for it.
-    RangeDrop,
+    /// frontier passes it. A reader that includes feed-silent records (a replica's
+    /// follower) is delivered it, in seqno order; its range is read only then.
+    RangeDrop {
+        seqno: Seqno,
+        event: Option<Box<RangeDropEvent>>,
+    },
     Other,
 }
 
@@ -378,15 +399,22 @@ enum Pending {
         /// The session that wrote the Decision.
         session: u64,
     },
+    /// A range drop, for a reader that includes feed-silent records (D331).
+    Dropped {
+        event: Box<RangeDropEvent>,
+        stream: usize,
+        start: Lsn,
+        end: Lsn,
+    },
 }
 
 impl Pending {
     /// The stream and start of its record.
     fn at(&self) -> (usize, Lsn) {
         match self {
-            Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
-                (*stream, *start)
-            }
+            Pending::Single { stream, start, .. }
+            | Pending::Decided { stream, start, .. }
+            | Pending::Dropped { stream, start, .. } => (*stream, *start),
         }
     }
 }
@@ -789,6 +817,8 @@ pub struct FeedReader {
     /// The table the last commit's changes ended with, present in `present_of`.
     present_last: Option<TableId>,
     out_catalog: CatalogEvent,
+    /// The range drop [`Next::RangeDrop`] lends (D331).
+    out_drop: RangeDropEvent,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
     /// couldn't be read): every later call fails, since going on would skip that commit.
@@ -1108,6 +1138,11 @@ fn pending_bytes(p: &Pending) -> u64 {
             Pending::Decided { participants, .. } => {
                 alloc_size(participants.capacity() * std::mem::size_of::<StreamId>())
             }
+            Pending::Dropped { event, .. } => alloc_size(
+                std::mem::size_of::<RangeDropEvent>()
+                    + event.start.capacity()
+                    + event.end.as_ref().map_or(0, Vec::capacity),
+            ),
         }
 }
 
@@ -1210,6 +1245,7 @@ enum Emitted {
     Nothing,
     Commit,
     Catalog,
+    RangeDrop,
 }
 
 impl Emitted {
@@ -1218,6 +1254,7 @@ impl Emitted {
             Emitted::Nothing => None,
             Emitted::Commit => Some(Polled::Commit),
             Emitted::Catalog => Some(Polled::Catalog),
+            Emitted::RangeDrop => Some(Polled::RangeDrop),
         }
     }
 }
@@ -1226,6 +1263,7 @@ impl Emitted {
 enum Polled {
     Commit,
     Catalog,
+    RangeDrop,
     Pending { held: bool },
     Expired,
 }
@@ -1327,6 +1365,7 @@ impl FeedReader {
             present_of: None,
             present_last: None,
             out_catalog: CatalogEvent::default(),
+            out_drop: RangeDropEvent::default(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
         // A feed of every table: the catalog its start reflects, for `Now` and a snapshot
@@ -1668,6 +1707,7 @@ impl FeedReader {
         match polled {
             Polled::Commit => Next::Commit(&self.out),
             Polled::Catalog => Next::Catalog(&self.out_catalog),
+            Polled::RangeDrop => Next::RangeDrop(&self.out_drop),
             Polled::Pending { .. } => Next::Pending,
             Polled::Expired => Next::Expired(self.expired.as_ref().expect("set")),
         }
@@ -1875,11 +1915,7 @@ impl FeedReader {
             at = at.min(r);
         }
         for p in self.ready.values() {
-            let (stream, start) = match p {
-                Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
-                    (*stream, *start)
-                }
-            };
+            let (stream, start) = p.at();
             if stream == s {
                 at = at.min(start);
             }
@@ -2239,6 +2275,7 @@ impl FeedReader {
             Pending::Single { .. } => {
                 self.silent_seen.remove(&key);
             }
+            Pending::Dropped { .. } => {}
         }
         self.ahead.lower_cutoff(key - 1);
     }
@@ -2515,9 +2552,26 @@ impl FeedReader {
                     // goes with its shares.
                     self.remove_held(id);
                 }
-                // Feed-silent (D331): nothing to deliver, and its seqno holds nothing, so
-                // the frontier passes it as any seqno with no event.
-                Item::RangeDrop => {}
+                // Feed-silent (D331): a client's feed passes its seqno as one with no event.
+                // A replica's follower takes it in seqno order; every stream holds it, and
+                // the copies share one key in `ready`.
+                Item::RangeDrop { seqno, event } => {
+                    let Some(event) = event else { continue };
+                    if seqno <= self.delivered {
+                        let st = &mut self.streams[s];
+                        st.delivered_end = st.delivered_end.max(end);
+                        continue;
+                    }
+                    self.insert_ready(
+                        seqno,
+                        Pending::Dropped {
+                            event,
+                            stream: s,
+                            start,
+                            end,
+                        },
+                    );
+                }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
                     // build writes feed marks); any other type is newer than this build.
@@ -2634,7 +2688,18 @@ impl FeedReader {
                 None => Item::Other,
             },
             WalRecord::ExternalAbort { seqno, .. } => Item::Abort { id: seqno },
-            WalRecord::RangeDrop { .. } => Item::RangeDrop,
+            WalRecord::RangeDrop { seqno, range } => Item::RangeDrop {
+                seqno,
+                event: include_silent.then(|| {
+                    let (table, start, end) = range.fields();
+                    Box::new(RangeDropEvent {
+                        seqno,
+                        table,
+                        start: start.to_vec(),
+                        end: end.map(<[u8]>::to_vec),
+                    })
+                }),
+            },
             WalRecord::Decision {
                 seqno,
                 apply_seqno,
@@ -2703,7 +2768,7 @@ impl FeedReader {
             .values()
             .filter_map(|p| match p {
                 Pending::Decided { id, .. } => Some(*id),
-                Pending::Single { .. } => None,
+                Pending::Single { .. } | Pending::Dropped { .. } => None,
             })
             .collect();
         drop_undecided(
@@ -2807,7 +2872,20 @@ impl FeedReader {
             let (_, p) = self.ready.pop_first().expect("checked");
             self.forget_ready(&p);
             self.ahead.budget = self.ahead.base;
+            let p = match p {
+                Pending::Dropped {
+                    event, stream, end, ..
+                } => {
+                    let st = &mut self.streams[stream];
+                    st.delivered_end = st.delivered_end.max(end);
+                    self.delivered = key;
+                    self.out_drop = *event;
+                    return Ok(Emitted::RangeDrop);
+                }
+                p => p,
+            };
             let (ts, raws) = match p {
+                Pending::Dropped { .. } => unreachable!("taken above"),
                 Pending::Single {
                     ts,
                     changes,
@@ -3061,6 +3139,8 @@ impl FeedReader {
                 .held
                 .range((*id, 0)..=(*id, usize::MAX))
                 .all(|(_, h)| listed(&h.changes)),
+            // No values.
+            Pending::Dropped { .. } => true,
         }
     }
 

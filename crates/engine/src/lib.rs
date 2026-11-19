@@ -82,6 +82,7 @@ pub use error::{Error, Result};
 pub use feed_reader::all_tables_token_position;
 pub use feed_reader::{
     CatalogEvent, Change, Commit, Expiry, FeedPosition, FeedReader, FeedSpec, FeedStart, Next,
+    RangeDropEvent,
 };
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};

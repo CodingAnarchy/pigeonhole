@@ -8385,9 +8385,14 @@ impl ShardState {
                         self.log_cross_record(m.seqno);
                     }
                 }
-                // D331: a Range Drop is never needed past a checkpoint: its drop's manifest
-                // commit flushes the fresh tablet through it, and a drop that didn't finish
-                // is run again, with a record of its own.
+                // D331: a Range Drop is never needed past a checkpoint (perf2's condition 3).
+                // Once its drop's manifest commit is durable, the fresh tablet is flushed
+                // through its seqno, so replay needs nothing from it. Before that commit, a
+                // checkpoint past it loses nothing: the range's writes are all below it and
+                // still in place (the drop removed none of them yet), and the drop's caller
+                // runs it again, with a record of its own. Nor is its seqno handed out
+                // again: every manifest commit, the checkpoint's own, stores a
+                // `seqno_ceiling` from the allocator, which reserved it before.
                 MemberKind::CommitRecord {
                     participants,
                     range_drop: true,

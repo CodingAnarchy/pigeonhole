@@ -146,6 +146,7 @@ fn ready(feed: &mut FeedReader) -> Result<Got, Error> {
             Next::Pending => return Ok(out),
             Next::Expired(e) => panic!("expired: {e:?}"),
             Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
+            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
         }
     }
 }
@@ -384,6 +385,7 @@ fn a_reader_process_delivers_a_separated_value() {
             Next::Pending => continue,
             Next::Expired(e) => panic!("expired: {e:?}"),
             Next::Catalog(e) => panic!("a catalog event in a per-table feed: {e:?}"),
+            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
         }
     };
     assert_eq!(c.seqno, seqno);
@@ -444,6 +446,7 @@ fn a_reader_process_feed_of_every_table_delivers_catalog_changes() {
                     })
                     .collect::<String>(),
             ),
+            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
             Next::Pending if got.len() == 4 => break,
             Next::Pending => std::thread::yield_now(),
             Next::Expired(e) => panic!("expired: {e:?}"),
@@ -509,6 +512,7 @@ fn a_reader_process_feed_of_every_table_expires_once_the_sidecar_appends_stop() 
             match all.try_next().unwrap() {
                 Next::Commit(c) => got_all.push(c.seqno),
                 Next::Catalog(e) => panic!("a change with no entry: {e:?}"),
+                Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
                 Next::Pending => break,
                 Next::Expired(e) => expired = Some(e.reason.clone()),
             }
@@ -625,6 +629,7 @@ fn a_reader_process_feed_of_every_table_expires_on_the_stop_alone() {
         match all.try_next().unwrap() {
             Next::Commit(c) => got.push(c.seqno),
             Next::Catalog(e) => panic!("no catalog change was made: {e:?}"),
+            Next::RangeDrop(e) => panic!("a range drop in a client's feed: {e:?}"),
             Next::Pending => std::thread::yield_now(),
             Next::Expired(e) => {
                 expired = Some(e.reason.clone());

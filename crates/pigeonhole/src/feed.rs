@@ -185,6 +185,13 @@ pub enum FeedEvent {
     /// Tables created or dropped, or families added: every commit before it saw the old
     /// tables, every commit after it the new ones.
     Catalog(CatalogChange),
+    /// A range drop (D331), to a replica's follower only
+    /// ([`include_silent`](Feed::include_silent)): apply it with
+    /// [`Pigeonhole::apply_range_drop`](crate::Pigeonhole::apply_range_drop). Not part of
+    /// the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    RangeDrop(crate::replication::RangeDrop),
 }
 
 /// One change to the database's tables, as a feed of every table delivers it
@@ -990,6 +997,19 @@ fn step(
             out.event = Some(FeedEvent::Catalog(change));
             Ok(Step::Ready)
         }
+        // Only a reader that includes feed-silent records gets one (a replica's follower).
+        #[cfg(feature = "__unstable-replication")]
+        Next::RangeDrop(ev) => {
+            if !events {
+                return Ok(Step::Again);
+            }
+            out.event = Some(FeedEvent::RangeDrop(
+                crate::replication::RangeDrop::from_engine(ev),
+            ));
+            Ok(Step::Ready)
+        }
+        #[cfg(not(feature = "__unstable-replication"))]
+        Next::RangeDrop(_) => Ok(Step::Again),
         // The old engine's reader, still waiting as a recovery swapped in a new engine,
         // reads the new session's records as outside its history: the new engine's reader
         // decides from the token instead (cli692's S2 on #1321).
