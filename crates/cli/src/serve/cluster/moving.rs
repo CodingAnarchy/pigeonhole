@@ -370,7 +370,6 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
     // a later attempt never takes it (simp724's M1).
     // If that fails, the record is already gone (safe: every later attempt copies and
     // matches again), and the report says the copy is still there (simp724's N1 on #2092).
-    let drop_there = format!("phdb cluster drop-partition {partition} --node <{}>", r.to);
     let aside = match m.nodes.iter().find(|n| n.id == r.to) {
         None => Value::Null,
         Some(n) => {
@@ -385,9 +384,11 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
                 Ok(Some(file)) => json!(file),
                 Ok(None) => Value::Null,
                 Err(f) => json!(format!(
-                    "not moved aside: the copy is still on node {} ({}): {drop_there}",
+                    "not moved aside: the copy is still on node {} ({}): phdb cluster \
+                     drop-partition {partition} --node {}",
                     r.to,
-                    f.message()
+                    f.message(),
+                    url_of(args, &n.address)
                 )),
             }
         }
