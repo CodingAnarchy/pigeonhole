@@ -1854,6 +1854,14 @@ pub(crate) enum ShardMsg {
     DropTablets {
         tablets: Vec<TabletId>,
     },
+    /// D331: write a Range Drop (type 7) at `seqno`, synced, on this shard's stream, and
+    /// answer once it's written. The engine holds `seqno` and releases it once every stream
+    /// has.
+    RangeDrop {
+        seqno: Seqno,
+        range: Vec<u8>,
+        reply: Notifier<Result<()>>,
+    },
     /// Start-up work (spare WAL segments).
     Start,
     /// Nothing: forces a drain so deferred members form a group.
@@ -1927,6 +1935,11 @@ enum MemberKind {
         /// variant's padding, not a `Bytes` variant of its own: a fourth variant there made
         /// every match on a member's bytes dearer (#2000's callgrind on x86).
         external_abort: bool,
+        /// D331: a Range Drop (type 7), its `bytes` the encoded range (in `Bytes::Streams`),
+        /// its `seqno` and `apply_seqno` the drop's one seqno, which the engine holds and
+        /// releases once every stream has written it. A flag beside `external_abort`, for
+        /// the same reason.
+        range_drop: bool,
     },
 }
 
@@ -2079,6 +2092,12 @@ impl Member {
                 seqno: self.seqno,
                 coordinator: StreamId(u32::from(coordinator.0)),
                 share: pigeonhole_format::wal::ExternalShare::decode(share, true)?,
+            },
+            MemberKind::CommitRecord {
+                range_drop: true, ..
+            } => WalRecord::RangeDrop {
+                seqno: self.seqno,
+                range: pigeonhole_format::wal::DroppedRange::decode(self.bytes.as_slice())?,
             },
             MemberKind::CommitRecord {
                 apply_seqno,
@@ -3613,6 +3632,8 @@ pub(crate) struct ShardState {
     creation_wake: bool,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
     aborted: HashSet<Seqno>,
+    /// D331: the Range Drops this shard is writing, each answered once its record is.
+    range_drops: HashMap<Seqno, Notifier<Result<()>>>,
     /// The highest seqno this shard asked each peer to answer for (`AwaitFlushed`, D266),
     /// until the peer's `FlushedThrough` covers it.
     awaiting: BTreeMap<ShardId, Seqno>,
@@ -3977,6 +3998,7 @@ impl ShardState {
             continuations: Continuations::default(),
             creation_wake: false,
             aborted: HashSet::new(),
+            range_drops: HashMap::new(),
             awaiting: BTreeMap::new(),
             f_waiters: BTreeMap::new(),
             ckpt_vis_wait: None,
@@ -8144,6 +8166,9 @@ impl ShardState {
                             MemberKind::Single => AppendedKind::Batch,
                             MemberKind::Prepare { .. } => AppendedKind::Prepare,
                             MemberKind::CommitRecord {
+                                range_drop: true, ..
+                            } => AppendedKind::RangeDrop,
+                            MemberKind::CommitRecord {
                                 external_abort: true,
                                 ..
                             } => AppendedKind::Abort,
@@ -8358,6 +8383,23 @@ impl ShardState {
                         let kind = LoggedKind::Prepare { slots };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                         self.log_cross_record(m.seqno);
+                    }
+                }
+                // D331: a Range Drop is never needed past a checkpoint: its drop's manifest
+                // commit flushes the fresh tablet through it, and a drop that didn't finish
+                // is run again, with a record of its own.
+                MemberKind::CommitRecord {
+                    participants,
+                    range_drop: true,
+                    ..
+                } => {
+                    if let Some(t) = m.ticket {
+                        let kind = LoggedKind::Commit {
+                            holders: Arc::clone(participants),
+                            apply: None,
+                            replayed: false,
+                        };
+                        self.log_record(t.end, m.seqno, 0, kind);
                     }
                 }
                 MemberKind::CommitRecord {
@@ -9630,9 +9672,18 @@ impl ShardState {
                 }
             }
             MemberKind::CommitRecord {
+                range_drop: true, ..
+            } => {
+                // The engine releases the seqno once every stream has written it.
+                if let Some(reply) = self.range_drops.remove(&m.seqno) {
+                    reply.notify(result.map(|_| ()));
+                }
+            }
+            MemberKind::CommitRecord {
                 participants,
                 apply_seqno,
                 external_abort: true,
+                ..
             } => self.settle_external_abort(
                 m.seqno,
                 apply_seqno,
@@ -9644,6 +9695,7 @@ impl ShardState {
                 participants,
                 apply_seqno,
                 external_abort: false,
+                ..
             } => {
                 // D286: a Buffered commit's `Decide`s went out at its decision.
                 if self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent) {
@@ -10218,11 +10270,56 @@ impl ShardState {
                 participants: shards.into(),
                 apply_seqno: abort_seqno,
                 external_abort: true,
+                range_drop: false,
             },
             durability,
             seqno: id,
             commit_ts,
             bytes: Bytes::Streams(body),
+            reply: Reply::None,
+            submitted_at: 0,
+            validate: None,
+            predicate: None,
+            ticket: None,
+            failed: None,
+            reserved: 0,
+            map_version: 0,
+            retry: None,
+            room_since: 0,
+            decoded: 0,
+            share_wait: 0,
+            rank: 0,
+            voted: false,
+        });
+        let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+    }
+
+    /// Queues a Range Drop's record (D331) at `seqno`, synced; `reply` hears once it's
+    /// written. Nothing applies at the seqno: the engine holds it from readers and releases
+    /// it once every stream has the record.
+    fn log_range_drop(
+        &mut self,
+        seqno: Seqno,
+        range: Vec<u8>,
+        reply: Notifier<Result<()>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        if self.closing {
+            reply.notify(Err(Error::Closed));
+            return;
+        }
+        self.range_drops.insert(seqno, reply);
+        self.pending.push(Member {
+            kind: MemberKind::CommitRecord {
+                participants: vec![self.id].into(),
+                apply_seqno: seqno,
+                external_abort: false,
+                range_drop: true,
+            },
+            durability: Durability::Sync,
+            seqno,
+            commit_ts: 0,
+            bytes: Bytes::Streams(range),
             reply: Reply::None,
             submitted_at: 0,
             validate: None,
@@ -10353,6 +10450,7 @@ impl ShardState {
                 participants: holders,
                 apply_seqno,
                 external_abort: false,
+                range_drop: false,
             },
             durability,
             seqno,
@@ -12681,6 +12779,11 @@ impl ShardState {
                     self.poison(crate::health::FailureCause::Internal);
                 }
             }
+            ShardMsg::RangeDrop {
+                seqno,
+                range,
+                reply,
+            } => self.log_range_drop(seqno, range, reply, ctx),
             ShardMsg::Start => {
                 self.replaying = false;
                 // After replay: a shard with nothing to flush never publishes otherwise.

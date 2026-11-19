@@ -727,6 +727,20 @@ impl Pigeonhole {
         }
     }
 
+    /// Drops rows `[start, end)` of `table` (`end` `None`: to the table's end) outright,
+    /// with no delete markers (D331 PR 4, ICR 0141): a range move's source at its cleanup,
+    /// its target at an abort. A later write of the range at an older timestamp is visible,
+    /// as if the rows had never been there, and a live snapshot still reads them. The caller
+    /// keeps the range unserved while it runs, and runs it again after a crash until it
+    /// returns. Feed-silent. `ReadOnly` on a replica; `Busy` to retry; `InvalidArgument`
+    /// for an end at or before the start. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn drop_range(&self, table: &crate::Table, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        crate::write::check_table(&self.db, table)?;
+        self.engine().drop_range(table.core.info.id, start, end)?;
+        Ok(())
+    }
+
     fn commit_part(&self, batch: WriteBatch, end: &ReplicatedEvent, max_ts: u64) -> Result<()> {
         let state = State {
             primary: primary_of(&end.token),

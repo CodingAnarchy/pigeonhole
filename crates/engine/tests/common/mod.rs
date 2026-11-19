@@ -2070,6 +2070,8 @@ impl World {
                 AppendedKind::Prepare => RecKind::Prepare,
                 AppendedKind::Commit => RecKind::Commit,
                 AppendedKind::Abort => RecKind::Abort,
+                // D331: a range drop applies nothing, and the harness drops no range.
+                AppendedKind::RangeDrop => continue,
             };
             if kind == RecKind::Batch {
                 self.appended_ts.insert(r.seqno, (epoch, r.commit_ts));

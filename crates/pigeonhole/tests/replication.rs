@@ -901,3 +901,117 @@ fn a_logged_batch_writes_another_databases_changes_by_name() {
     target.close().unwrap();
     source.close().unwrap();
 }
+
+/// Every row of `t` with a cell in family "a" qualifier "q", as `row=value`, at `snap` if
+/// given.
+fn rows_of(t: &pigeonhole::Table, snap: Option<&pigeonhole::Snapshot>) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 0..10u8 {
+        let row = [b'r', b'0' + i];
+        let text = |v: Value<'_>| match v {
+            Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            other => format!("{other:?}"),
+        };
+        let cell = match snap {
+            Some(s) => t
+                .get_at(s, &row, "a", b"q")
+                .unwrap()
+                .map(|c| text(c.typed())),
+            None => t.get(&row, "a", b"q").unwrap().map(|c| text(c.typed())),
+        };
+        if let Some(v) = cell {
+            out.push(format!("{}={v}", String::from_utf8_lossy(&row)));
+        }
+    }
+    out
+}
+
+/// D331 PR 4a (B1, the coordinator's test): a dropped range takes writes at older
+/// timestamps again, which delete markers never would. Rows `r3..r7` are dropped from the
+/// memtable and the SSTs alike, a column delete inside the range goes with them, a snapshot
+/// taken before still reads the range whole, the rows outside are untouched, and writes of
+/// the range at timestamps below the dropped versions and below the dropped marker are then
+/// visible: before a crash, after it, and after the drop is run again.
+#[test]
+fn a_dropped_range_takes_older_writes_again() {
+    let vfs = SimVfs::new(43);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..10u8 {
+        t.mutate(&[b'r', b'0' + i])
+            .put_at("a", b"q", 100, format!("v{i}").as_bytes())
+            .commit()
+            .unwrap();
+        // Half the rows in the SSTs, half in the memtable.
+        if i == 4 {
+            db.flush().unwrap();
+        }
+    }
+    t.mutate(b"r5").delete_column("a", b"q").commit().unwrap();
+    let before = db.snapshot().unwrap();
+    let whole = rows_of(&t, Some(&before));
+    assert_eq!(whole.len(), 9, "{whole:?}");
+
+    db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    let outside = ["r0=v0", "r1=v1", "r2=v2", "r7=v7", "r8=v8", "r9=v9"];
+    assert_eq!(rows_of(&t, None), outside);
+    assert_eq!(
+        rows_of(&t, Some(&before)),
+        whole,
+        "a snapshot keeps its view"
+    );
+    drop(before);
+
+    // Below the dropped versions (ts 100) and below the dropped marker: visible now.
+    for row in [&b"r3"[..], b"r5"] {
+        t.mutate(row)
+            .put_at("a", b"q", 50, b"old")
+            .commit()
+            .unwrap();
+    }
+    let expect = [
+        "r0=v0", "r1=v1", "r2=v2", "r3=old", "r5=old", "r7=v7", "r8=v8", "r9=v9",
+    ];
+    assert_eq!(rows_of(&t, None), expect);
+
+    vfs.crash(CrashKind::Process);
+    drop(t);
+    drop(db);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    assert_eq!(rows_of(&t, None), expect, "after a crash");
+    // Run again (the caller's rule after a crash): the range's own writes since go too.
+    db.drop_range(&t, b"r3", Some(b"r7")).unwrap();
+    assert_eq!(rows_of(&t, None), outside);
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(rows_of(&t, None), outside, "after compaction");
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D331 PR 4a: a range drop refuses a range that ends at or before it starts.
+#[test]
+fn a_range_drop_refuses_a_bad_range() {
+    let vfs = SimVfs::new(44);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for (start, end) in [(&b"m"[..], &b"m"[..]), (b"m", b"a")] {
+        assert_eq!(
+            db.drop_range(&t, start, Some(end)).unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+    }
+    drop(t);
+    db.close().unwrap();
+}

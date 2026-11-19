@@ -2408,6 +2408,27 @@ impl Engine {
         self.inner.drop_table(table)
     }
 
+    /// Drops rows `[start, end)` of `table` (`end` `None`: to the table's end) outright, with
+    /// no delete markers (D331, ICR 0141): a range move's source at its cleanup, its target
+    /// at an abort. A later write of the range at an older timestamp is visible, as if the
+    /// rows had never been there; a live snapshot still reads them. The range must be
+    /// unserved while this runs, and the caller runs it again after a crash until it
+    /// returns: each step does nothing once done. Feed-silent; a replica's follower runs
+    /// it too.
+    ///
+    /// `ReadOnly` on a replica; `Busy` (retry) while an externally prepared transaction is
+    /// in doubt or the balancer keeps changing the range's tablets; `Unsupported` with
+    /// tablet changes off; `InvalidArgument` for an end at or before the start.
+    pub fn drop_range(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        if is_reserved_table(table) {
+            return Err(Error::InvalidArgument(
+                "a replica's state table can't be dropped".to_owned(),
+            ));
+        }
+        self.inner.refuse_on_replica()?;
+        self.inner.drop_range(table, start, end)
+    }
+
     /// Applies one catalog change a primary's feed delivered (D315 PR 3), **with the
     /// primary's ids**, so a replica's tables and families keep them: a table created with
     /// its families, a family added, or a table dropped, as the change's `edits` hold them. A
@@ -5812,6 +5833,190 @@ impl Inner {
             .table(table)
             .cloned()
             .ok_or_else(|| Error::TableNotFound(format!("table {}", table.0)))
+    }
+
+    /// Drops `[start, end)` of `table` (D331, ICR 0141; FORMAT §10.3's Range Drop): every
+    /// entry of the range goes, with no delete markers, so a later write of the range at an
+    /// older timestamp is visible. The caller keeps the range unserved until this returns
+    /// and runs it again after a crash until it does: each step does nothing once done.
+    ///
+    /// 1. Splits the table's tablets at `start` and `end`, through the shards' tablet
+    ///    changes (which freeze and flush the tablets they split, so nothing outside the
+    ///    range is lost).
+    /// 2. Writes a Range Drop on every stream at one seqno, held from readers until every
+    ///    stream has it, then released with nothing applied.
+    /// 3. One manifest commit drops the tablets inside the range and puts one fresh tablet
+    ///    over it, flushed through that seqno in every family: replay never brings an
+    ///    earlier write of the range back, and a later one routes to the fresh tablet. The
+    ///    shards then retire the dropped tablets' memtables. A live snapshot keeps its view,
+    ///    and with it the dropped tablets' SSTs and memtables.
+    /// 4. Raises every row-cache slot to the seqno, so no cached row of the range is served.
+    ///
+    /// `Busy` (retry) while an externally prepared transaction is in doubt (D329: one may
+    /// hold rows of the range), or when the balancer changed the range's tablets between
+    /// the split and the drop three times running; `Unsupported` with tablet changes off.
+    fn drop_range(&self, table: TableId, start: &[u8], end: Option<&[u8]>) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.check_open()?;
+        let mut range = Vec::new();
+        pigeonhole_format::wal::DroppedRange::encode(&mut range, table, start, end)
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        if !self.shared.balance.enabled {
+            return Err(Error::Unsupported("a range drop needs tablet changes"));
+        }
+        if self.shared.view.load().catalog.table(table).is_none() {
+            return Err(Error::TableNotFound(format!("table {}", table.0)));
+        }
+        // D329 (simp724): a share in doubt may hold rows of the range, and its commit would
+        // write them back. Tablet-granular checks exist only on the shards; the coarse
+        // refusal is retryable and rare.
+        if !self.in_doubt().is_empty() {
+            return Err(Error::Busy);
+        }
+        self.flag_silent()?;
+        for _ in 0..3 {
+            self.split_at(table, start)?;
+            if let Some(end) = end {
+                self.split_at(table, end)?;
+            }
+            let seqno = self.log_range_drop(&range)?;
+            match self.drop_inside(table, start, end, seqno) {
+                Err(Error::Busy) => continue,
+                r => r?,
+            }
+            if let Some(epochs) = &self.shared.row_epochs {
+                epochs.raise_all(seqno);
+            }
+            return Ok(());
+        }
+        // The range's tablets kept changing under the drop: the caller drops it again.
+        Err(Error::Busy)
+    }
+
+    /// Splits `table`'s tablet holding `key` at `key`, unless `key` already starts one.
+    fn split_at(&self, table: TableId, key: &[u8]) -> Result<()> {
+        if key.is_empty() {
+            return Ok(());
+        }
+        let view = self.shared.view.load_full();
+        let Some(t) = view
+            .tablets()
+            .tablets_of(table)
+            .iter()
+            .find(|t| t.start.as_slice() <= key && t.end.as_deref().is_none_or(|e| key < e))
+        else {
+            return Err(Error::TableNotFound(format!("table {}", table.0)));
+        };
+        if t.start == key {
+            return Ok(());
+        }
+        let op = crate::shard::TabletOpKind::Split {
+            tablet: t.id,
+            keys: vec![key.to_vec()],
+            owners: vec![t.shard, t.shard],
+        };
+        self.tablet_op(t.shard, op)?.wait()
+    }
+
+    /// Writes a Range Drop of `range` (encoded) on every stream at one seqno, held from
+    /// readers until every stream has it written, then released.
+    fn log_range_drop(&self, range: &[u8]) -> Result<Seqno> {
+        let now = self.shared.clock_vfs.now_micros();
+        let (seqno, _) = self.shared.clock.reserve_decision(now, &self.shared.shm);
+        let mut waits = Vec::new();
+        let mut sent = Ok(());
+        for i in 0..self.shared.shards {
+            let (tx, rx) = completion();
+            match self
+                .shared
+                .submitter(ShardId(i as u16))
+                .submit(ShardMsg::RangeDrop {
+                    seqno,
+                    range: range.to_vec(),
+                    reply: tx,
+                }) {
+                Ok(()) => waits.push(rx),
+                Err(e) => {
+                    sent = Err(Error::from(e));
+                    break;
+                }
+            }
+        }
+        let written = sent.and_then(|()| {
+            waits
+                .into_iter()
+                .try_for_each(|rx| rx.wait().unwrap_or(Err(Error::Closed)))
+        });
+        self.shared.clock.release(seqno, &self.shared.shm);
+        self.shared.wake_visible();
+        written.map(|()| seqno)
+    }
+
+    /// Drops the tablets inside `[start, end)` and puts one fresh tablet over the range,
+    /// flushed through `seqno` in every family. `Busy` if a tablet of the table straddles
+    /// a bound (the balancer merged or split since `split_at`).
+    fn drop_inside(
+        &self,
+        table: TableId,
+        start: &[u8],
+        end: Option<&[u8]>,
+        seqno: Seqno,
+    ) -> Result<()> {
+        let (lo, hi) = (start.to_vec(), end.map(<[u8]>::to_vec));
+        let inside = Arc::new(Mutex::new(Vec::new()));
+        let out = Arc::clone(&inside);
+        self.catalog_change(move |catalog| {
+            let overlaps = |s: &[u8], e: Option<&[u8]>| {
+                hi.as_deref().is_none_or(|h| s < h) && e.is_none_or(|e| lo.as_slice() < e)
+            };
+            let mut dropped = Vec::new();
+            for t in catalog.tablets().into_iter().filter(|t| t.table == table) {
+                if !overlaps(&t.start, t.end.as_deref()) {
+                    continue;
+                }
+                let within = t.start.as_slice() >= lo.as_slice()
+                    && match (&hi, &t.end) {
+                        (None, _) => true,
+                        (Some(h), Some(e)) => e <= h,
+                        (Some(_), None) => false,
+                    };
+                if !within {
+                    // A tablet straddles a bound: the balancer changed them since the split.
+                    return Err(Error::Busy);
+                }
+                dropped.push(t.id);
+            }
+            let fresh = catalog.alloc_tablet();
+            let mut edits: Vec<Edit> = dropped
+                .iter()
+                .map(|&tablet| Edit::DropTablet { tablet })
+                .collect();
+            edits.push(Edit::PutTablet {
+                tablet: fresh,
+                table,
+                start: lo.clone(),
+                end: hi.clone(),
+            });
+            edits.extend(
+                catalog
+                    .family_ids_of(table)
+                    .into_iter()
+                    .map(|family| Edit::SetFlushed {
+                        tablet: fresh,
+                        family,
+                        seqno,
+                    }),
+            );
+            *out.lock().unwrap_or_else(PoisonError::into_inner) = dropped;
+            Ok(edits)
+        })?;
+        let tablets = std::mem::take(&mut *inside.lock().unwrap_or_else(PoisonError::into_inner));
+        self.shared.broadcast(|| ShardMsg::DropTablets {
+            tablets: tablets.clone(),
+        });
+        Ok(())
     }
 
     fn drop_table(&self, table: TableId) -> Result<()> {
