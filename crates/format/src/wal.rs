@@ -1338,6 +1338,10 @@ impl BatchBuilder {
         head: &[u8],
         tail: &[u8],
     ) -> crate::Result<()> {
+        // The xid trailer is the batch's last step (D329 2b): a push after it would land past
+        // the trailer and clear bit 30 (`write_count`), silently corrupting the record
+        // (perf2's S1 on #2076). Every engine path tags last; this catches any that doesn't.
+        debug_assert!(!self.tagged(), "a push after the batch's xid trailer");
         let value_len = head.len() + tail.len();
         check_mutation(kind, row, qualifier, value_len, |what| {
             Error::InvalidArgument { what }

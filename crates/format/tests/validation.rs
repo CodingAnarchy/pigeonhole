@@ -444,3 +444,34 @@ fn a_count_near_its_cap_keeps_its_flags_apart() {
         assert_eq!(raw & COUNT_FLAGS, flags);
     }
 }
+
+/// perf2's S1 on #2076: the xid trailer is a batch's last step; a push after it would land
+/// past the trailer and drop its flag, so debug builds refuse it.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a push after the batch's xid trailer")]
+fn a_push_after_the_xid_trailer_is_refused_in_debug_builds() {
+    use pigeonhole_format::wal::BatchBuilder;
+    use pigeonhole_format::{FamilyId, Kind, TableId};
+    let mut b = BatchBuilder::new();
+    b.push(
+        TableId(1),
+        FamilyId(2),
+        Kind::Put,
+        b"a",
+        b"q",
+        None,
+        b"\x00v",
+    )
+    .unwrap();
+    b.tag_xid(b"p1:h1-aa").unwrap();
+    let _ = b.push(
+        TableId(1),
+        FamilyId(2),
+        Kind::Put,
+        b"b",
+        b"q",
+        None,
+        b"\x00v",
+    );
+}
