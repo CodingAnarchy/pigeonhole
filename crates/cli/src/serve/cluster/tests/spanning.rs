@@ -709,6 +709,112 @@ fn a_cluster_partition_refuses_a_follower_outside_its_map_replicas() {
     });
 }
 
+/// `Transactions.Outcome` of `id` through `port`, as `token`.
+async fn outcome_as(
+    port: u16,
+    id: &str,
+    token: &str,
+) -> Result<super::super::proto::TxnOutcomeResponse, tonic::Status> {
+    let r = super::super::proto::TxnOutcomeRequest {
+        txn_id: id.to_owned(),
+    };
+    txns(port)
+        .await
+        .outcome(with(r, Some(token)))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+#[test]
+fn a_spanning_transactions_outcome_is_its_tokens_alone_while_its_session_lasts() {
+    // #2077 (audit120's S5 on #2076, and their P1–P3 on the plan): another token's
+    // `Outcome` on a live spanning transaction is NotFound and writes nothing, on the home
+    // and through any other node, so it can't learn the outcome nor make the home record an
+    // abort over it; the owner then commits. While the tombstone lasts, the owner reads the
+    // outcome and the other token still gets NotFound, though the decision row exists. A
+    // client's id dated in the future is NotFound with nothing written, and a client can't
+    // send the resolver's ResolveTxn itself.
+    use super::super::proto::{ForwardRequest, ResolveTxn, TxnOutcomeState as St, forward_request};
+    let all = format!("write t0ken-a\nwrite t0ken-b\ncluster {NODE_TOKEN}\n");
+    let t = Three::start([&all, &all, &all]);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        let r = super::super::proto::BeginRequest {
+            durability: 0,
+            route: route_row("zed"),
+            spans_partitions: true,
+        };
+        let id = txns(c)
+            .await
+            .begin(with(r, Some("t0ken-a")))
+            .await
+            .unwrap()
+            .into_inner()
+            .txn_id;
+        txn_write(
+            c,
+            &id,
+            vec![put_row("alice", "1"), put_row("zed", "1")],
+            Some("t0ken-a"),
+        )
+        .await
+        .unwrap();
+        // The home (b) answers locally; a and c forward to it.
+        for port in [b, a, c] {
+            let e = outcome_as(port, &id, "t0ken-b").await.unwrap_err();
+            assert_eq!(code(&e), "NotFound", "through {port}: {e}");
+            assert_eq!(decision_row(&t.dbs[1], &id), None, "nothing written");
+        }
+        let o = outcome_as(c, &id, "t0ken-a").await.unwrap();
+        assert_eq!(o.state(), St::InProgress, "{o:?}");
+        // The other token's asks changed nothing: the owner commits both partitions.
+        let r = super::super::proto::TxnCommitRequest {
+            txn_id: id.clone(),
+            rows: Vec::new(),
+        };
+        let reply = txns(c)
+            .await
+            .commit(with(r, Some("t0ken-a")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.parts.len(), 2, "{reply:?}");
+        assert_eq!(cell(&t.dbs[0], "alice"), Some(b"1".to_vec()));
+        assert!(decision_row(&t.dbs[1], &id).is_some_and(|v| v.starts_with(b"committed ")));
+        // The tombstone: the owner's outcome; the other token's NotFound, the row unread.
+        let o = outcome_as(c, &id, "t0ken-a").await.unwrap();
+        assert_eq!(o.state(), St::Committed, "{o:?}");
+        assert_eq!(o.parts.len(), 2, "{o:?}");
+        for port in [b, c] {
+            let e = outcome_as(port, &id, "t0ken-b").await.unwrap_err();
+            assert_eq!(code(&e), "NotFound", "through {port}: {e}");
+        }
+        // An id dated an hour ahead: no transaction, and nothing recorded for it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ahead = forged(&id, now + 3_600_000, None);
+        let e = outcome_as(c, &ahead, "t0ken-b").await.unwrap_err();
+        assert_eq!(code(&e), "NotFound", "{e}");
+        assert_eq!(decision_row(&t.dbs[1], &ahead), None, "nothing written");
+        // The resolver's call is the nodes' own: a client's token can't forward it.
+        let req = ForwardRequest {
+            partition: "p2".into(),
+            op: Some(forward_request::Op::ResolveTxn(ResolveTxn {
+                xid: id.clone(),
+                acked: String::new(),
+            })),
+            ..Default::default()
+        };
+        let e = super::super::proto::cluster_client::ClusterClient::new(channel(b).await)
+            .forward(with(req, Some("t0ken-b")))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "PermissionDenied", "{e}");
+    });
+}
+
 #[test]
 fn a_commit_decided_by_hand_acks_its_home_so_its_record_can_be_collected() {
     // #2078 (audit120's nit on #2076, Q3 on the plan): the home is lost after its commit

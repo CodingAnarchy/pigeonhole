@@ -5022,6 +5022,7 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
     - an absent row is settled as the resolver settles it;
     - "unknown" across a history change.
   - Rows are kept `--txn-outcome-retention` (24 h, owner Q4) after the last branch's acknowledgement. The retention can't be set below the transaction lifetime plus the request timeout.
+    - *As built (#2076; audit120's nit, documented in the S4 docs PR):* the retention counts from the decision's time, and a commit's row also stays until every branch has acknowledged it. A read-only spanning commit writes no row, so its outcome lasts only as long as its session's record.
 - **Engine.**
   - `prepare(xid)`, `in_doubt()` and `decide(xid, commit)` sit behind an unstable feature, and `phdb serve` is the one caller.
   - External shares survive a crash or a close in doubt, with their read and write holds reinstalled before the database admits a write, by every open (serving, `Stamp`'s, `init-partition`'s). A read-only open lists them (`in_doubt`), holds nothing and can't decide them. An open with another shard count, or one whose replay spills, is refused while any is in doubt (decide them first).
@@ -5214,6 +5215,18 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **S records each moved range in its file** and answers it `WrongPartition`, whoever sends the call, until a later move gives it back. Its row is pruned at the later of every node holding the hand-over map and the transaction lifetime plus the request timeout.
 - **Transactions open across a hand-over** answer `Conflict` when they write, whatever they read, because serve doesn't see their read sets. Read-only commits pass.
 - **The hand-over raises S's epoch in place:** a lapse, the identity row and a new lease at once, keeping S's history.
+
+**PR 4a (the engine for the copy and the drop, ICR 0141's additions; coordinator, simp724, cli692, perf2 and perf287, 2026-11-19):**
+- **A range is removed with a drop, not with delete markers.** A marker hides every version at or below its timestamp whatever the commit order (D9, D38), and a range move keeps the source's timestamps (M1). So a marker written by an abort on T, or by the cleanup on S, would hide the range's rows when a later move brings them back. **PR 5's cleanup and abort are `drop_range`.** This reverses the row-delete cleanup above, and overtakes follow-up #2053.
+- **`drop_range`:**
+  - split the table's tablets at the bounds;
+  - a Range Drop (WAL type 7, behind `incompat` bit 3) on every stream at one held seqno;
+  - one manifest commit that drops the inside tablets and puts a fresh tablet over the range, flushed through that seqno, so replay never brings it back;
+  - every row-cache slot raised to the seqno.
+
+  A live snapshot keeps its view. The caller keeps the range unserved and re-runs the drop after a crash, from its drop-pending row; the drop is idempotent. `Busy` while an external share is in doubt, naming its xids. The balancer merges the leftover tablets.
+- **Replicas apply a drop in feed order:** the feed delivers it only to a reader that includes feed-silent records, as `ReplicatedEvent` body tag 2, which builds before D331 refuse.
+- **A copy is never restarted by deleting:** it resumes. T writes S's changes as S logged them, by name, feed-silently (`LoggedBatch`), one atomic commit per chunk with its progress row.
 
 **PRs.** 1, the engine; 2, the map record and the gates; 3, the paths that must clip, the cluster feed's hold, and backups; 4, the copy and the range follower; 5, the driver, hand-over, cleanup and CLI; 6, merge. Follow-ups #2052 (SST ingest for the copy) and #2053 (dropping whole SSTs on cleanup), both Post-1.0 unless perf287's box run says otherwise.
 

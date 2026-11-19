@@ -111,9 +111,9 @@ pub const COUNT_FLAGS: u32 = SILENT_BATCH | XID_BATCH;
 /// A batch count's mutation count bits: everything below the flags.
 pub const COUNT_MASK: u32 = !COUNT_FLAGS;
 
-/// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch read without
-/// `incompat` bit 3 (D331): a reader that may have opened before the bit was set asks
-/// again on this one only.
+/// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch, or a Range
+/// Drop, read without `incompat` bit 3 (D331): a reader that may have opened before the bit
+/// was set asks again on this one only.
 pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
 
 /// Whether a record's batch carries the [`SILENT_BATCH`] mark, read at its place in the
@@ -128,6 +128,8 @@ fn marked(bytes: &[u8]) -> bool {
         Some(1) => top(20),
         Some(2) => top(24),
         Some(5) => external_marked(bytes),
+        // A Range Drop needs the bit too (D331), and is refused without it alike.
+        Some(7) => true,
         _ => false,
     }
 }
@@ -667,6 +669,8 @@ pub enum RecordType {
     ExternalPrepare = 5,
     /// An externally prepared transaction aborted, at a seqno of its own (D329).
     ExternalAbort = 6,
+    /// A table's key range dropped, at a seqno of its own (D331, `incompat` bit 3).
+    RangeDrop = 7,
 }
 
 /// A decoded WAL record, borrowing its batch bytes. Non-exhaustive: a later format may add
@@ -738,6 +742,102 @@ pub enum WalRecord<'a> {
         /// The xid and the participants (no read set, no mutations).
         share: ExternalShare<'a>,
     },
+    /// A table's key range dropped (D331, ICR 0141; `incompat` bit 3): every entry of the
+    /// range at or below `seqno` is gone, from the memtables and the SSTs alike, with no
+    /// delete markers, so a later write of the range at an older timestamp is visible. A
+    /// range move's source writes it at its cleanup, and its target at an abort. Written on
+    /// every stream at one seqno, which nothing else applies at; a replica runs the same drop
+    /// on its own tablets. Feed-silent.
+    RangeDrop {
+        /// The drop's seqno.
+        seqno: Seqno,
+        /// The table and the range.
+        range: DroppedRange<'a>,
+    },
+}
+
+/// A [`WalRecord::RangeDrop`]'s range (FORMAT §10.3): table `u32 LE`, the range's first
+/// row (varint-length bytes), then the end: `0` for the table's end, or `1` followed by
+/// the row after the range (varint-length bytes). Rows are at most [`MAX_KEY_PART`], and a
+/// bounded end is after the start. Kept as its body, read on access, so the record stays
+/// [`WalRecord`]'s size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroppedRange<'a> {
+    body: &'a [u8],
+}
+
+/// A [`DroppedRange`]'s fields: the table, the range's first row, and the row after it
+/// (`None`: the table's end).
+pub type RangeFields<'a> = (TableId, &'a [u8], Option<&'a [u8]>);
+
+impl<'a> DroppedRange<'a> {
+    /// Encodes a range into `out`. `InvalidArgument` for a row over [`MAX_KEY_PART`] or an
+    /// end at or before the start.
+    pub fn encode(
+        out: &mut Vec<u8>,
+        table: TableId,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> crate::Result<()> {
+        if start.len() > MAX_KEY_PART || end.is_some_and(|e| e.len() > MAX_KEY_PART) {
+            return Err(Error::KeyTooLarge);
+        }
+        if end.is_some_and(|e| e <= start) {
+            return Err(Error::InvalidArgument {
+                what: "a dropped range's end is after its start",
+            });
+        }
+        out.extend_from_slice(&table.0.to_le_bytes());
+        crate::varint::put_bytes(out, start);
+        match end {
+            None => out.push(0),
+            Some(e) => {
+                out.push(1);
+                crate::varint::put_bytes(out, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Decodes and checks a body. Never panics. Out of line, so the record decoder around it
+    /// keeps its inlining (#2089's callgrind).
+    #[inline(never)]
+    pub fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
+        Self::parse(bytes)?;
+        Ok(Self { body: bytes })
+    }
+
+    fn parse(bytes: &'a [u8]) -> crate::Result<RangeFields<'a>> {
+        let corrupt = |what| Error::Corrupt { what };
+        let mut r = Reader::new(bytes, "wal range drop");
+        let table = TableId(r.u32()?);
+        let start = r.bytes()?;
+        let end = match r.u8()? {
+            0 => None,
+            1 => Some(r.bytes()?),
+            _ => return Err(corrupt("wal range drop end flag")),
+        };
+        if r.remaining() != 0 {
+            return Err(corrupt("wal range drop length"));
+        }
+        if start.len() > MAX_KEY_PART || end.is_some_and(|e| e.len() > MAX_KEY_PART) {
+            return Err(corrupt("wal range drop row length"));
+        }
+        if end.is_some_and(|e| e <= start) {
+            return Err(corrupt("wal range drop bounds"));
+        }
+        Ok((table, start, end))
+    }
+
+    /// The fields: table, first row, and the row after the range (`None`: the table's end).
+    pub fn fields(&self) -> RangeFields<'a> {
+        Self::parse(self.body).expect("checked when decoded")
+    }
+
+    /// The encoded body, re-encoded unchanged by [`WalRecord::split`].
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.body
+    }
 }
 
 /// An external share's encoded fields (D329, FORMAT §10.3): `xid` (varint-length bytes),
@@ -1024,6 +1124,11 @@ impl WalRecord<'_> {
                 head[9..17].copy_from_slice(&abort_seqno.to_le_bytes());
                 (17, share.as_bytes())
             }
+            WalRecord::RangeDrop { seqno, range } => {
+                head[0] = RecordType::RangeDrop as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                (9, range.as_bytes())
+            }
         };
         (&head[..len], body)
     }
@@ -1067,8 +1172,8 @@ impl WalRecord<'_> {
         debug_assert!(
             record
                 .as_ref()
-                .map_or(true, |r| r.batch().is_some_and(|b| b.is_silent())
-                    == marked(bytes)),
+                .map_or(true, |r| matches!(r, WalRecord::RangeDrop { .. })
+                    || r.batch().is_some_and(|b| b.is_silent()) == marked(bytes)),
             "a feed-silent mark at a place the decoder doesn't read"
         );
         record
@@ -1110,8 +1215,27 @@ impl WalRecord<'_> {
             WalRecord::ExternalPrepare { share, .. } => share.batch(),
             WalRecord::Commit { .. }
             | WalRecord::Decision { .. }
-            | WalRecord::ExternalAbort { .. } => None,
+            | WalRecord::ExternalAbort { .. }
+            | WalRecord::RangeDrop { .. } => None,
         }
+    }
+
+    /// [`decode_any`](Self::decode_any)'s record of type `t`, `rest` the bytes after its
+    /// type byte: a Range Drop (D331), or an error.
+    #[cold]
+    #[inline(never)]
+    fn decode_other(t: u8, rest: &[u8]) -> crate::Result<WalRecord<'_>> {
+        if t != RecordType::RangeDrop as u8 {
+            return Err(Error::UnsupportedFeature {
+                what: "wal record type",
+                value: u64::from(t),
+            });
+        }
+        let mut r = Reader::new(rest, "wal record");
+        Ok(WalRecord::RangeDrop {
+            seqno: r.u64()?,
+            range: DroppedRange::decode(r.rest())?,
+        })
     }
 
     fn decode_any(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
@@ -1148,10 +1272,10 @@ impl WalRecord<'_> {
                 abort_seqno: r.u64()?,
                 share: ExternalShare::decode(r.rest(), false)?,
             }),
-            t => Err(Error::UnsupportedFeature {
-                what: "wal record type",
-                value: u64::from(t),
-            }),
+            // A Range Drop (D331, gated by its bit in `decode_with`), or a type this build
+            // doesn't know: out of line, so the arms above inline as they did (#2089's
+            // callgrind).
+            t => Self::decode_other(t, r.rest()),
         }
     }
 }

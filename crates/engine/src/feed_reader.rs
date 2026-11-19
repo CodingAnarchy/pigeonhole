@@ -147,6 +147,21 @@ pub enum Next<'a> {
     Catalog(&'a CatalogEvent),
 }
 
+/// A range drop as a feed that includes feed-silent records delivers it (D331): as an empty
+/// [`Next::Commit`] at the drop's seqno, which [`FeedReader::range_drop`] names: rows
+/// `[start, end)` of `table` (`end` `None`: to the table's end) dropped at `seqno`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangeDropEvent {
+    /// The drop's seqno, which applies nothing.
+    pub seqno: Seqno,
+    /// The table.
+    pub table: TableId,
+    /// The range's first row.
+    pub start: Vec<u8>,
+    /// The row after the range; `None`: to the table's end.
+    pub end: Option<Vec<u8>>,
+}
+
 /// How far a feed has covered its history ([`FeedReader::position`], ICR 0114 amendment):
 /// a seqno for its commits, and in a feed of every table a sequence for its catalog changes.
 /// Each part only grows, and they are independent: one position covers another iff both
@@ -351,6 +366,13 @@ enum Item {
     /// delivered at its own seqno.
     Abort {
         id: Seqno,
+    },
+    /// A range drop (D331, type 7), at a seqno of its own, which applies nothing: the
+    /// frontier passes it. A reader that includes feed-silent records (a replica's
+    /// follower) is delivered it, in seqno order; its range is read only then.
+    RangeDrop {
+        seqno: Seqno,
+        event: Option<Box<RangeDropEvent>>,
     },
     Other,
 }
@@ -798,6 +820,12 @@ pub struct FeedReader {
     /// The table the last commit's changes ended with, present in `present_of`.
     present_last: Option<TableId>,
     out_catalog: CatalogEvent,
+    /// The range drop the commit last delivered stands for (D331), at `drop_seqno`.
+    out_drop: Option<RangeDropEvent>,
+    drop_seqno: Seqno,
+    /// Range drops queued in `ready` as empty commits, by seqno (D331; only with
+    /// `include_silent`).
+    drops: BTreeMap<Seqno, RangeDropEvent>,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
     /// couldn't be read): every later call fails, since going on would skip that commit.
@@ -1339,6 +1367,9 @@ impl FeedReader {
             present_of: None,
             present_last: None,
             out_catalog: CatalogEvent::default(),
+            out_drop: None,
+            drop_seqno: 0,
+            drops: BTreeMap::new(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
         // A feed of every table: the catalog its start reflects, for `Now` and a snapshot
@@ -1746,6 +1777,45 @@ impl FeedReader {
         self.out_silent
     }
 
+    /// The range drop the commit last delivered stands for (D331; only ever with
+    /// [`include_silent`](Self::include_silent)): an empty commit at the drop's seqno. Not
+    /// part of the stable API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn range_drop(&self) -> Option<&RangeDropEvent> {
+        // One compare for a commit (#2089's callgrind): `drop_seqno` is set only when a
+        // drop's empty commit is delivered, and a seqno is never delivered twice.
+        if self.drop_seqno != self.out.seqno {
+            return None;
+        }
+        self.out_drop.as_ref()
+    }
+
+    /// Delivers the range drop at `key` (D331), if one is there: an empty commit at its
+    /// seqno, which [`range_drop`](Self::range_drop) names (simp724's M1 on #2089: `Next`
+    /// stays as it is). Every stream logs the drop, and their copies share one key in
+    /// `ready`: the one kept advances its stream, and the others pass as records behind
+    /// `delivered` (feed1248's note).
+    #[cold]
+    #[inline(never)]
+    fn emit_drop(&mut self, key: Seqno) -> bool {
+        // Ones behind `delivered` were passed over (read again past a cutoff).
+        self.drops.retain(|&k, _| k >= key);
+        let Some(event) = self.drops.remove(&key) else {
+            return false;
+        };
+        self.out.seqno = key;
+        self.out.ts = 0;
+        self.out.changes.clear();
+        self.out_silent = false;
+        // Nor a transaction's share (D329 2b's xid): the drop isn't one, whatever the
+        // commit before it was (#2089 landing after #2076).
+        self.out_xid = None;
+        self.out_drop = Some(event);
+        self.drop_seqno = key;
+        true
+    }
+
     /// The transaction the commit last delivered is a share of, when it's a spanning
     /// commit's (D329 2b): every share of one commit has the same. Not part of the stable
     /// API.
@@ -1893,11 +1963,7 @@ impl FeedReader {
             at = at.min(r);
         }
         for p in self.ready.values() {
-            let (stream, start) = match p {
-                Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
-                    (*stream, *start)
-                }
-            };
+            let (stream, start) = p.at();
             if stream == s {
                 at = at.min(start);
             }
@@ -2565,6 +2631,34 @@ impl FeedReader {
                     // goes with its shares.
                     self.remove_held(id);
                 }
+                // Feed-silent (D331): a client's feed passes its seqno as one with no event.
+                // A replica's follower takes it in seqno order; every stream holds it, and
+                // the copies share one key in `ready`.
+                Item::RangeDrop { seqno, event } => {
+                    let Some(event) = event else { continue };
+                    if seqno <= self.delivered {
+                        let st = &mut self.streams[s];
+                        st.delivered_end = st.delivered_end.max(end);
+                        continue;
+                    }
+                    // An empty commit at its seqno in `ready` (no variant of its own: the
+                    // commits' matches stay as they were, #2089's callgrind), its range
+                    // aside until it's delivered.
+                    self.drops.insert(seqno, *event);
+                    self.insert_ready(
+                        seqno,
+                        Pending::Single {
+                            ts: 0,
+                            changes: Raws {
+                                heads: Box::new([]),
+                                bytes: Box::new([]),
+                            },
+                            stream: s,
+                            start,
+                            end,
+                        },
+                    );
+                }
                 Item::Other => {
                     // A format 2 COMMIT is never in a fed session's segments (only this
                     // build writes feed marks); any other type is newer than this build.
@@ -2638,7 +2732,8 @@ impl FeedReader {
             WalRecord::Prepare { seqno, .. }
             | WalRecord::Decision { seqno, .. }
             | WalRecord::ExternalPrepare { seqno, .. }
-            | WalRecord::ExternalAbort { seqno, .. } => seqno.saturating_add(1),
+            | WalRecord::ExternalAbort { seqno, .. }
+            | WalRecord::RangeDrop { seqno, .. } => seqno.saturating_add(1),
             _ => 0,
         };
         let item = match record {
@@ -2699,6 +2794,18 @@ impl FeedReader {
                 None => Item::Other,
             },
             WalRecord::ExternalAbort { seqno, .. } => Item::Abort { id: seqno },
+            WalRecord::RangeDrop { seqno, range } => Item::RangeDrop {
+                seqno,
+                event: include_silent.then(|| {
+                    let (table, start, end) = range.fields();
+                    Box::new(RangeDropEvent {
+                        seqno,
+                        table,
+                        start: start.to_vec(),
+                        end: end.map(<[u8]>::to_vec),
+                    })
+                }),
+            },
             WalRecord::Decision {
                 seqno,
                 apply_seqno,
@@ -2838,6 +2945,8 @@ impl FeedReader {
                 self.catalog_seq = ev.sequence;
                 self.raise_session(session);
                 self.out_catalog = ev;
+                // No commit is delivered with it, so no drop either (feed1248 on #2089).
+                self.drop_seqno = 0;
                 return Ok(Emitted::Catalog);
             }
             let Some((&key, _)) = self.ready.first_key_value() else {
@@ -2946,6 +3055,10 @@ impl FeedReader {
             let dropped = &self.dropped_tables;
             let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
             if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
+                // A range drop's empty commit (D331), only ever with `include_silent`.
+                if !self.drops.is_empty() && self.emit_drop(key) {
+                    return Ok(Emitted::Commit);
+                }
                 continue;
             }
             self.out.seqno = key;
@@ -3231,6 +3344,7 @@ impl FeedReader {
                         WalRecord::ExternalAbort {
                             seqno, abort_seqno, ..
                         } => seqno.min(abort_seqno),
+                        WalRecord::RangeDrop { seqno, .. } => seqno,
                         // A kind this build can't key: the session can't be started in.
                         _ => continue 'sessions,
                     },

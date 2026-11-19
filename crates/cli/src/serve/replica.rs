@@ -1358,6 +1358,17 @@ impl Replica {
                     }
                     continue;
                 }
+                if event.is_range_drop() {
+                    // D331: a range drop too, in feed order: every commit before it applied
+                    // first, none after it until it's done (perf2's condition).
+                    if let Err(halt) = self.apply_run(&db, &mut run).await {
+                        return halt;
+                    }
+                    if let Err(halt) = self.apply_range_drop(on, event).await {
+                        return halt;
+                    }
+                    continue;
+                }
                 run.bytes += bytes.len();
                 run.events.push(event);
                 if (run.events.len() >= self.config.run_events.max(1) || run.bytes >= RUN_BYTES)
@@ -1485,6 +1496,25 @@ impl Replica {
             .map_err(|e| Halt::Failed(format!("applying a catalog change: {e}")));
         on.service.tables_changed();
         outcome?.map_err(|e| applying("applying a catalog change", &e))?;
+        let applied = applied.max(self.status().applied);
+        self.set_applied(applied);
+        Ok(())
+    }
+
+    /// Applies a range drop (D331): the primary's dropped rows go from this copy too, so a
+    /// later move of the range back finds nothing of them here.
+    async fn apply_range_drop(&self, on: &On<'_>, event: ReplicatedEvent) -> Result<(), Halt> {
+        let applied = event.primary_seqno();
+        let db = on
+            .service
+            .part()
+            .map_err(|e| Halt::Failed(e.message))?
+            .db
+            .clone();
+        tokio::task::spawn_blocking(move || db.apply_range_drop(&event, event.token()))
+            .await
+            .map_err(|e| Halt::Failed(format!("applying a range drop: {e}")))?
+            .map_err(|e| applying("applying a range drop", &e))?;
         let applied = applied.max(self.status().applied);
         self.set_applied(applied);
         Ok(())

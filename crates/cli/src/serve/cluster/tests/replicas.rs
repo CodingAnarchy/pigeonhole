@@ -366,7 +366,7 @@ fn a_cut_off_owners_follow_stream_ends_with_its_lease() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let dirs = [test_dir(), test_dir(), test_dir()];
     let (_stops, ports) = three_leased(&rt, &dirs);
-    let entry = (dirs[2].clone(), format!("127.0.0.1:{}", ports[2]));
+    let c_at = format!("127.0.0.1:{}", ports[2]);
     rt.block_on(async {
         set_replicas(ports[0], "p3", &["a"]).await;
         eventually("a's replica of p3 to follow c", async || {
@@ -375,10 +375,7 @@ fn a_cut_off_owners_follow_stream_ends_with_its_lease() {
             })
         })
         .await;
-        super::super::CUT_OFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(entry.clone());
+        super::super::cut_node(&dirs[2], &c_at, &dirs, true);
         let lease = u64::try_from(TEST_LEASE.as_millis()).unwrap();
         eventually("c's stream to end with p3's lease", async || {
             copy_of(ports[0], "p3").await.is_some_and(|lp| {
@@ -387,10 +384,7 @@ fn a_cut_off_owners_follow_stream_ends_with_its_lease() {
         })
         .await;
     });
-    super::super::CUT_OFF
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retain(|e| *e != entry);
+    super::super::cut_node(&dirs[2], &c_at, &dirs, false);
 }
 
 /// Design test 2: a move of p3 with its files (`phdb cluster move`) keeps its history, so

@@ -333,6 +333,22 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     // as a row read does: a filtered cursor's jump past it stops there (#1924).
     opts.one_row = one_row;
     opts.stop_jumps = one_row;
+    sst_sources_with::<CACHE_ONLY>(fam, set, filter, start, end, priority, opts, out)
+}
+
+/// [`sst_sources_range`] with its read options given: a range move's copy reads without
+/// filling the block cache (D331, perf287), as compaction does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sst_sources_with<const CACHE_ONLY: bool>(
+    fam: &FamilySsts,
+    set: &Arc<SstSet>,
+    filter: &ScanFilter,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    priority: Priority,
+    opts: ReadOptions,
+    out: &mut Vec<Source>,
+) -> Result<()> {
     let first = out.len();
     let reader = |sst: &OpenSst| {
         if CACHE_ONLY {
@@ -374,7 +390,7 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     // the rest of the SST (#1931). Built once for the scan's sources, only when one is
     // filtered (an unfiltered cursor never jumps).
     if let Some(end) = end
-        && !one_row
+        && !opts.one_row
         && !filter.is_all()
         && out.len() > first
     {
