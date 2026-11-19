@@ -1,6 +1,6 @@
 # 0140: prepared transactions with an external xid (D329 engine PR 1)
 
-**Status:** Approved.
+**Status:** Approved. Amendment 1 (the coordinator, 2026-11-17, D329 PR 2a; same feature, no new number): `prepare` with reads and no writes logs, and `Transaction::hold_reads` holds a read-only transaction's reads in memory.
 - Numbers are from the coordinator (`.coord/numbers.md`): WAL record types 5 and 6, and `incompat` bit 2.
 - The D329 design was reviewed by audit120 and cli692, and signed off by the owner.
 - perf2 reviewed this ICR's draft as engine reviewer (E1 to E3, Q1 to Q4). Bit 2 is sticky, which supersedes the draft's clearing.
@@ -14,11 +14,17 @@ The engine's cross-shard 2PC (D263) does all of that inside one commit call, but
 ## API (`pigeonhole`, behind `__unstable-txn-prepare`)
 The feature is hidden from the docs and outside the semver promise, as `__unstable-replication` is. `phdb serve` is its one caller.
 
-- **`Transaction::prepare(self, xid, durability) -> Result<Prepared>`:**
+- **`Transaction::prepare(self, xid, durability) -> Result<CommitInfo>`:** the answer's seqno is the commit's id.
   - It validates the read set and logs the shares, through the PREPARE path even for one shard, and returns once they meet `durability`. Callers ask for GroupSync at least. `Durability::None` is refused (`InvalidArgument`): a `None` decision writes no record, so a crash could bring a decided share back in doubt. A refused round doesn't retry, as a D263 round does: a retry runs as a plain commit, which would commit the share without its decision. So every transient refusal a plain commit would retry (a moved tablet, memtable room, another round's undecided share) answers an external prepare `Busy` at once, and callers retry with backoff. Re-entering the coordination with the external fields kept is a later option. `Buffered` is accepted, with the power-loss caveat of any `Buffered` write: a power loss may take an acknowledged prepare (its xid is then not in doubt, and the caller decides an unknown xid: `decide` answers `None`), or an acknowledged decision (the share comes back in doubt and is decided again). Callers that need the prepare's promise ask for GroupSync.
   - The share then holds its rows, as an undecided D263 share does, until decided.
   - A transaction with no reads and no writes is `InvalidArgument`.
-  - A read-only prepare (reads, no writes) validates and holds its reads in memory and logs nothing. `Prepared::release()` answers whether that hold was still in place (`true`) or lost to a reopen, a close or a limit (`false`).
+  - **Reads and no writes (amendment 1, D329 PR 2a):** logged like any other prepare, as a type 5 with the read set and an empty batch. It holds its reads until decided and is in doubt across a reopen; a commit decision applies nothing. This is a writing spanning transaction's read-only branch.
+- **`Transaction::hold_reads(self) -> Result<ReadHold>` (amendment 1, D329 PR 2a):** a wholly read-only spanning transaction's hold. It validates the transaction's reads and holds them in memory, logging nothing; it is never in doubt. While it holds, a write to a held row is refused at once, as over a share in doubt (a transaction's prepare `Conflict`, any other write `Busy`).
+  - `ReadHold::release(self) -> Result<bool>` answers whether the hold was still in place (`true`) or lost to a close or a recovery (`false`): `false` only ever means lost. It waits for the shards' answers, so on a thread that drives a shard (application-owned mode) it's refused (`InvalidArgument`), and the hold is released as it's dropped (perf2's S2 on #2062). Dropping it releases it.
+  - Releasing a hold wakes the commits refused over its rows, as a share's decision does (perf2's S1 on #2062).
+  - A read whose table was dropped since it was read can't be held: `Conflict`.
+  - A transaction with writes, or with no reads, is `InvalidArgument`. A read conflicting since the snapshot is `Conflict`.
+  - Live holds count against `in_doubt_limits`' share count: past it, `hold_reads` answers `Busy`. A hold is never evicted.
 - **`Pigeonhole::decide(xid, commit) -> Result<Option<Commit>>`:**
   - Commit reserves the apply seqno and timestamp, logs a Decision (type 4) and applies the shares.
   - Abort logs an External Abort (type 6) at a seqno of its own and drops them.
@@ -69,7 +75,12 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
 ## Limits
 - `EngineOptions::in_doubt_limits` (`pigeonhole::Options::in_doubt_limits`, hidden behind the feature): past either the count or the bytes, a new prepare answers `Busy`, so a home that stops deciding can't pin unbounded WAL. An open option, so an automatic recovery's new instance keeps it. The engine's default is no limit; `phdb serve` sets it from `--txn-max-in-doubt-wal-bytes` (D329 PR 2).
 - **Serve default (the coordinator, 2026-11-16):** 16 MiB of batches in doubt per partition, so 64 feed subscribers hold at most 1 GiB in the worst case (perf2's condition 2). Raising it is a deliberate operator choice. The guide states it, with the per-subscriber bound, next to `--txn-max-in-doubt-wal-bytes` (D329 PR 2, where the flag lands).
-- Not supported in PR 1, and refused with `InvalidArgument`: values large enough to be stored apart (the share's batch must be whole in its record), and prepares with no writes.
+- Not supported, and refused with `InvalidArgument`: values large enough to be stored apart (the share's batch must be whole in its record). PR 1 also refused prepares with no writes; amendment 1 (D329 PR 2a) lifts that: see `prepare` and `hold_reads` above.
 
 ## Callers
-`phdb serve` (D329 PR 2) only. Single-partition commits are unchanged. The only new branch on a commit path is `external.is_some()` in `on_prepared`.
+`phdb serve` (D329 PR 2) only. In PR 2a:
+- **A writing spanning transaction:**
+  - Each branch prepares at GroupSync, with the transaction's id as its xid.
+  - The home doesn't prepare: its own share commits at the commit point, together with its decision row.
+  - Each branch is then decided.
+- **A read-only one:** each partition's reads are held with `hold_reads` and kept for a release round. The hold is taken under the partition gate's lease term, and its release confirms the same term. Single-partition commits are unchanged. The only new branch on a commit path is `external.is_some()` in `on_prepared`.

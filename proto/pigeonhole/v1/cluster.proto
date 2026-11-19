@@ -731,6 +731,12 @@ message ForwardRequest {
     // 0139): the pool, or a hop of its graph expansion, and the hits' bodies.
     RecallPoolRequest recall_pool = 40;
     RecallBodiesRequest recall_bodies = 41;
+    // D329 (ICR 0140): a spanning transaction's home node, the coordinator, to a branch's
+    // partition owner (`partition` names it). `branch_begin` carries the client as `caller`;
+    // `branch_prepare` and `branch_decide` are the node's own, cluster scope only.
+    BranchBegin branch_begin = 45;
+    BranchPrepare branch_prepare = 46;
+    BranchDecide branch_decide = 47;
   }
 }
 
@@ -851,6 +857,38 @@ message ForwardedCaller {
 
 // A forwarded call's answer: the reply its op has on a single node. Errors travel as the
 // call's own status.
+// Opens a spanning transaction's branch on `ForwardRequest.partition` (D329), keyed by the
+// transaction's id (its xid), at that partition's snapshot now; with `renew`, renews the open
+// one instead, or answers `TransactionExpired` if it's gone (never reopening it).
+message BranchBegin {
+  string xid = 1;
+  bool renew = 2;
+}
+
+// Prepares a branch (D329): a writing transaction's durably (its reads and writes held until
+// `BranchDecide`), or with `read_only` a hold of its reads in memory, released by a
+// `BranchDecide` that names the hold.
+message BranchPrepare {
+  string xid = 1;
+  bool read_only = 2;
+}
+
+// Decides a prepared branch (D329): commit or abort, synced before the answer. With `hold`
+// (non-zero), the release of a read-only branch's hold instead, which answers only if the
+// hold lasted and the partition's lease term is still `term`; otherwise `Conflict`.
+message BranchDecide {
+  string xid = 1;
+  bool commit = 2;
+  uint64 hold = 3;
+  uint64 term = 4;
+}
+
+// A prepared branch (D329): for a read-only one, its hold and the lease term it was taken in.
+message BranchPrepared {
+  uint64 hold = 1;
+  uint64 term = 2;
+}
+
 message ForwardResponse {
   oneof reply {
     GetResponse get = 1;
@@ -886,6 +924,7 @@ message ForwardResponse {
     ForgetResponse forget = 22;
     RecallPoolResponse recall_pool = 23;
     RecallBodiesResponse recall_bodies = 24;
+    BranchPrepared branch_prepare = 25;
   }
   // The seqno the serving node read at, in the owner's numbering (D328's
   // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the

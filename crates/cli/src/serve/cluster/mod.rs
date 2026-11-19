@@ -33,6 +33,7 @@ pub(crate) mod promote;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
+pub(crate) mod spanning;
 pub(crate) mod stamp;
 #[cfg(test)]
 mod tests;
@@ -78,6 +79,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     LEASES_FEATURE,
     WRITER_TERMS_FEATURE,
     RANGE_MOVES_FEATURE,
+    spanning::SPANNING_TXNS_FEATURE,
 ];
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
@@ -2136,6 +2138,35 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             crate::serve::grpc::grpc_timeout(req.metadata().as_ref()),
         );
         let msg = req.into_inner();
+        // A spanning transaction's branch call (D329): served on the partition it names.
+        if spanning::is_branch(&msg) {
+            let caller = forward::caller_of(msg.caller, &self.0.tokens)?;
+            let Some(cluster) = shared.router.cluster.as_ref() else {
+                return Err(ApiError::unsupported("this node isn't a cluster node").into());
+            };
+            let service = {
+                let routes = cluster.node.routes();
+                let Some(routes) = routes.as_ref() else {
+                    return Err(
+                        ApiError::wrong_partition(0, "this node has no cluster map yet").into(),
+                    );
+                };
+                cluster.owned_here(routes, &msg.partition)?
+            };
+            let op = msg
+                .op
+                .ok_or_else(|| ApiError::invalid("a forward carries no call"))?;
+            let reply = spanning::serve_branch(
+                &cluster.node,
+                &cluster.spanning,
+                service,
+                &msg.partition,
+                op,
+                &caller,
+            )
+            .await?;
+            return Ok(tonic::Response::new(reply));
+        }
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
         // node's own token entry (D317 amendment 1).

@@ -321,6 +321,20 @@ impl Routes {
         self.owners.get(partition)
     }
 
+    /// Every node the map places a partition or a replica copy on, once each: `(id,
+    /// address)`.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        let mut seen = std::collections::BTreeMap::new();
+        for o in self.owners.values() {
+            seen.entry(o.node.clone())
+                .or_insert_with(|| o.address.clone());
+            for (n, a) in &o.replicas {
+                seen.entry(n.clone()).or_insert_with(|| a.clone());
+            }
+        }
+        seen.into_iter()
+    }
+
     /// Whether a node of the map is at `address`.
     pub(crate) fn has_address(&self, address: &str) -> bool {
         self.owners.values().any(|o| o.address == address)

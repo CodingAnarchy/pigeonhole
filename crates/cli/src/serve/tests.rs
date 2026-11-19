@@ -87,6 +87,7 @@ fn begin_carries_a_routing_key_for_partitions() {
                 row: b"alice".to_vec().into(),
             })),
         }),
+        spans_partitions: false,
     };
     let json = serde_json::to_value(&begin).unwrap();
     assert_eq!(json["route"]["row"]["table"], "acct");

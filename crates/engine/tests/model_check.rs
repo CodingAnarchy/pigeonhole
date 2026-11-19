@@ -120,6 +120,7 @@ fn settled_commits_trimmed_by_participants_survive_crashes() {
 #[test]
 fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
     let (mut prepared, mut committed, mut aborted, mut adopted) = (0, 0, 0, 0);
+    let mut read_only = 0;
     for shards in [1, 2, 4] {
         let mut quiet = Config::quiet(300);
         let mut crashes = Config::standard(300);
@@ -149,6 +150,7 @@ fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
                         committed += stats.external_committed;
                         aborted += stats.external_aborted;
                         adopted += stats.external_adopted;
+                        read_only += stats.external_read_only;
                     }
                     Err(f) => panic!("{f}"),
                 }
@@ -156,12 +158,14 @@ fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
         }
     }
     eprintln!(
-        "external: {prepared} in doubt, {committed} committed, {aborted} aborted, {adopted} found in doubt after a reopen"
+        "external: {prepared} in doubt, {committed} committed, {aborted} aborted, {adopted} found in doubt after a reopen, {read_only} read-only branches"
     );
     assert!(
         prepared > 0 && committed > 0 && aborted > 0,
         "no external transaction ran"
     );
+    // ICR 0140 amendment 1: read-only branches ran too.
+    assert!(read_only > 0, "no read-only branch ran");
 }
 
 #[test]

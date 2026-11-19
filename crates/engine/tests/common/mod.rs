@@ -548,6 +548,8 @@ pub struct Stats {
     pub external_aborted: usize,
     pub external_adopted: usize,
     pub external_dropped: usize,
+    /// ICR 0140 amendment 1: external prepares drawn as read-only branches (reads, no writes).
+    pub external_read_only: usize,
     /// Armed power losses that fired on background I/O and surfaced as a later step's error.
     pub background_crashes: usize,
     pub busy: usize,
@@ -5633,6 +5635,15 @@ impl World {
             }
         }
         let reads: Vec<TxnRead> = vec![(table, row, family, Some(qualifier))];
+        // ICR 0140 amendment 1 (D329 2a): one in four is a read-only branch, its read
+        // logged with an empty batch and held until decided; a commit decision applies
+        // nothing.
+        let read_only = rng.chance(250_000);
+        let ops = if read_only { Vec::new() } else { ops };
+        let shards = if read_only { Vec::new() } else { shards };
+        if read_only {
+            self.stats.external_read_only += 1;
+        }
         let batch = match store.batch(&ops) {
             Ok(b) => b,
             Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),

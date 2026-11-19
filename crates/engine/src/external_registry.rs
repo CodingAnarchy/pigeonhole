@@ -16,6 +16,11 @@
 //!   again). Two decides of one xid both reach the coordinator, whose shard thread orders
 //!   them: the second finds it decided.
 //!
+//! - **A read hold** (`hold_reads`, ICR 0140 amendment 1) counts against the share limit
+//!   while it is live ([`reserve_hold`](ExternalRegistry::reserve_hold),
+//!   [`release_hold`](ExternalRegistry::release_hold)), so holds and prepares can't pass it
+//!   together. Its token comes from the reservations' counter, so it is unique too.
+//!
 //! One lock, `entries`, a leaf: nothing is sent or waited on under it. The limits are fixed
 //! at open. Loom-modelled (`loom_tests`).
 
@@ -74,8 +79,12 @@ impl Slot {
 struct Table {
     slots: BTreeMap<Vec<u8>, Slot>,
     /// The last reservation's token: each one is new, so a prepare's late `unreserve` can't
-    /// drop a later prepare's reservation of the same xid (perf2's S3 on #2000).
+    /// drop a later prepare's reservation of the same xid (perf2's S3 on #2000). A read
+    /// hold's token comes from it too.
     last_token: u64,
+    /// Read holds live now (ICR 0140 amendment 1): counted with `slots` against the share
+    /// limit.
+    holds: usize,
 }
 
 /// See the module documentation.
@@ -123,7 +132,7 @@ impl ExternalRegistry {
         let (max_shares, max_bytes) = self.limits;
         let held: u64 = entries.values().map(Slot::bytes).sum();
         let over_bytes = max_bytes > 0 && !entries.is_empty() && held + bytes > max_bytes;
-        if (max_shares > 0 && entries.len() >= max_shares) || over_bytes {
+        if (max_shares > 0 && entries.len() + table.holds >= max_shares) || over_bytes {
             return Err(Error::Busy);
         }
         table.last_token += 1;
@@ -132,6 +141,30 @@ impl ExternalRegistry {
             .slots
             .insert(xid.to_vec(), Slot::Reserved { bytes, token });
         Ok(token)
+    }
+
+    /// Counts a read hold against the share limit (`Busy` past it) and answers its token.
+    pub(crate) fn reserve_hold(&self) -> Result<u64> {
+        let mut table = self.table();
+        let max_shares = self.limits.0;
+        if max_shares > 0 && table.slots.len() + table.holds >= max_shares {
+            return Err(Error::Busy);
+        }
+        table.holds += 1;
+        table.last_token += 1;
+        Ok(table.last_token)
+    }
+
+    /// A read hold ended (released, or its engine closed): it no longer counts.
+    pub(crate) fn release_hold(&self) {
+        let mut table = self.table();
+        table.holds = table.holds.saturating_sub(1);
+    }
+
+    /// Read holds live now (tests).
+    #[cfg(test)]
+    pub(crate) fn holds(&self) -> usize {
+        self.table().holds
     }
 
     /// Drops `xid`'s reservation `token`, if it is still that one: a prepare that logged
@@ -207,6 +240,20 @@ mod tests {
             "6 + 5 is over 10"
         );
         r.reserve(b"c", 4).unwrap();
+    }
+
+    #[test]
+    fn read_holds_count_against_the_share_limit_with_prepares() {
+        // ICR 0140 amendment 1: a live hold takes a share's place in the limit.
+        let r = ExternalRegistry::new((2, 0));
+        let a = r.reserve_hold().unwrap();
+        r.reserve(b"x", 1).unwrap();
+        assert!(matches!(r.reserve_hold(), Err(Error::Busy)));
+        assert!(matches!(r.reserve(b"y", 1), Err(Error::Busy)));
+        r.release_hold();
+        let b = r.reserve_hold().unwrap();
+        assert_ne!(a, b, "each hold's token is new");
+        assert_eq!(r.holds(), 1);
     }
 }
 
@@ -297,6 +344,33 @@ mod loom_tests {
             assert_eq!(r.lookup(b"x"), Lookup::InDoubt(entry(7)));
             assert_eq!(r.lookup(b"y"), Lookup::Absent);
             assert_eq!(r.in_doubt().len(), 1);
+        });
+    }
+
+    #[test]
+    fn loom_a_read_hold_and_a_prepare_never_pass_the_limit_together() {
+        // ICR 0140 amendment 1: with a limit of one share, a read hold and a prepare race.
+        // At most one is admitted; the other answers `Busy`. Once the winner is done, the
+        // limit is free again.
+        loom::model(|| {
+            let r = Arc::new(ExternalRegistry::new((1, 0)));
+            let h = {
+                let r = Arc::clone(&r);
+                thread::spawn(move || r.reserve_hold().is_ok())
+            };
+            let p = r.reserve(b"x", 1);
+            let held = h.join().unwrap();
+            match p {
+                Ok(_) => assert!(!held, "both passed the limit"),
+                Err(Error::Busy) => assert!(held, "both refused"),
+                Err(e) => panic!("{e:?}"),
+            }
+            if held {
+                r.release_hold();
+            } else {
+                r.remove(b"x");
+            }
+            assert!(r.reserve_hold().is_ok());
         });
     }
 
