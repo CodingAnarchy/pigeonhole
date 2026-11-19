@@ -1178,7 +1178,7 @@ async fn load(
 #[test]
 fn a_bulk_load_through_any_node_splits_by_id_across_partitions() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    let (mut stops, [p1, p2], [a, b, c], _) = three_nodes(&rt);
     // Ids on both sides of `users`' split at "m", interleaved in every message.
     let ids = |n: usize| -> Vec<String> {
         (0..n)
@@ -1251,6 +1251,14 @@ fn a_bulk_load_through_any_node_splits_by_id_across_partitions() {
         // can't connect, and the load fails naming it. p1's part, which took the first
         // message's vectors, keeps them, and the error says so.
         stops.remove(1).send(()).unwrap();
+        // Once b refuses connections: a forward that reached it while it shut down answers
+        // OutcomeUnknown instead, rightly (a Linux CI race on #2087).
+        eventually("b to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", b))
+                .await
+                .is_err()
+        })
+        .await;
         let e = load(a, messages("uv4")).await.unwrap_err();
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
         assert!(e.message().contains("partition p2"), "{e}");
