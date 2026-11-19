@@ -681,15 +681,13 @@ impl Pigeonhole {
         let (Some(first), Some(last)) = (run.first(), run.last()) else {
             return Err(invalid("an empty replicated run".to_owned()));
         };
-        if run.iter().any(ReplicatedEvent::is_catalog) {
-            return Err(invalid(
-                "a catalog change in a replicated run: apply it with apply_catalog".to_owned(),
-            ));
-        }
-        if run.iter().any(ReplicatedEvent::is_range_drop) {
-            return Err(invalid(
-                "a range drop in a replicated run: apply it with apply_range_drop".to_owned(),
-            ));
+        // One pass over the run for both (#2089's callgrind).
+        if let Some(e) = run.iter().find(|e| !matches!(e.body, Body::Commit { .. })) {
+            return Err(invalid(if e.is_catalog() {
+                "a catalog change in a replicated run: apply it with apply_catalog".to_owned()
+            } else {
+                "a range drop in a replicated run: apply it with apply_range_drop".to_owned()
+            }));
         }
         if let Some(w) = run.windows(2).find(|w| w[1].before != w[0].after) {
             return Err(invalid(format!(
@@ -956,6 +954,52 @@ pub struct CopiedChunk {
     pub cells: Vec<CopiedCell>,
     /// The row to ask for next; `None`: the range is done.
     pub next: Option<Vec<u8>>,
+}
+
+impl CopiedChunk {
+    /// The chunk as the commits a target writes it in, in order: one commit keeps only the
+    /// last mutation of a cell and timestamp (D34), so a cell the copy holds twice at one
+    /// timestamp (a value beside a delete kept with it) starts a new commit, and the
+    /// entries apply in the source's seqno order, oldest first, as they're listed.
+    ///
+    /// **Applying a chunk again is safe** (simp724), so a target writes its progress row in
+    /// the chunk's last commit only, and after a crash between two of its commits copies the
+    /// whole chunk again, at a fresh snapshot:
+    /// - an aggregate cell held whole is a put of its folded state, which writes the same
+    ///   again;
+    /// - a value kept beside its delete comes after the delete, which masks what the first
+    ///   attempt wrote before the value is written again;
+    /// - a fold that failed comes as its base (a put) before its operands, which then apply
+    ///   to that fresh base, not on top of the first attempt's.
+    ///
+    /// A standard family's operands under a named operator (D41: they run across
+    /// timestamps) are the exception: they apply twice, so their chunk must commit once.
+    pub fn batches(&self) -> Vec<&[CopiedCell]> {
+        type Key<'a> = (&'a str, &'a [u8], &'a [u8], u64, bool);
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut seen: std::collections::HashSet<Key<'_>> = std::collections::HashSet::new();
+        for (i, c) in self.cells.iter().enumerate() {
+            // A family marker is keyed apart from the family's cells (D34).
+            let key = (
+                c.family.as_str(),
+                &c.row[..],
+                &c.qualifier[..],
+                c.ts,
+                c.kind == ChangeKind::DeleteFamily,
+            );
+            if !seen.insert(key) {
+                out.push(&self.cells[start..i]);
+                start = i;
+                seen.clear();
+                seen.insert(key);
+            }
+        }
+        if start < self.cells.len() {
+            out.push(&self.cells[start..]);
+        }
+        out
+    }
 }
 
 /// One cell of a range copy, as its source logged it, for [`LoggedBatch::push`]. Not part

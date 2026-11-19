@@ -1405,12 +1405,12 @@ fn a_range_copied_at_a_snapshot_reads_as_its_source() {
         let chunk = source.copy_range(&snap, &s, &after, None, 300).unwrap();
         let mut rows: Vec<Vec<u8>> = chunk.cells.iter().map(|c| c.row.clone()).collect();
         rows.dedup();
-        let mut wb = target.logged_batch();
-        wb.mark_feed_silent();
-        for c in &chunk.cells {
-            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
-        }
-        if !wb.is_empty() {
+        for batch in chunk.batches() {
+            let mut wb = target.logged_batch();
+            wb.mark_feed_silent();
+            for c in batch {
+                wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+            }
             wb.commit().unwrap();
         }
         chunks.push(rows);
@@ -1480,7 +1480,6 @@ fn a_copied_set_family_is_settled() {
     let mut chunks = 0;
     loop {
         let chunk = source.copy_range(&snap, &s, &after, None, 400).unwrap();
-        let mut wb = target.logged_batch();
         for c in &chunk.cells {
             assert_ne!(
                 c.stored.first(),
@@ -1488,9 +1487,12 @@ fn a_copied_set_family_is_settled() {
                 "row {:?}: a set copied in its working form",
                 c.row
             );
-            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
         }
-        if !wb.is_empty() {
+        for batch in chunk.batches() {
+            let mut wb = target.logged_batch();
+            for c in batch {
+                wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+            }
             wb.commit().unwrap();
         }
         chunks += 1;
@@ -1507,6 +1509,107 @@ fn a_copied_set_family_is_settled() {
             .collect()
     };
     assert_eq!(of_t(&target), of_t(&source));
+    drop((snap, s, t));
+    target.close().unwrap();
+    source.close().unwrap();
+}
+
+/// D331 PR 4a (D34, found checking simp724's (d)): a counter's value newer than a cell
+/// delete at the same timestamp (`incr` is at timestamp 0, and a counter delete hides only
+/// what came before it) is copied beside the delete, and the target commits them apart,
+/// the delete first, so it reads the value, not nothing. A chunk whose aggregate cells are
+/// each one folded value (puts of their finished state, simp724's (d)) reads the same
+/// copied twice; a cell kept beside its delete is copied once.
+#[test]
+fn a_counter_value_beside_its_delete_survives_the_copy() {
+    use pigeonhole::Aggregation;
+    let (sv, tv) = (SimVfs::new(56), SimVfs::new(57));
+    let source = Pigeonhole::open("/s/data.phdb", options(&sv)).unwrap();
+    let target = Pigeonhole::open("/t/data.phdb", options(&tv)).unwrap();
+    let make = |db: &Pigeonhole| {
+        db.table("t")
+            .unwrap()
+            .family("n", Family::counter())
+            .family("s", Family::aggregate(Aggregation::Sum))
+            .family("set", Family::aggregate(Aggregation::Set))
+            .create_if_missing()
+            .unwrap()
+    };
+    let (s, t) = (make(&source), make(&target));
+    s.mutate(b"a").incr("n", b"q", 3).commit().unwrap();
+    s.mutate(b"a").delete_cell("n", b"q", 0).commit().unwrap();
+    s.mutate(b"a").incr("n", b"q", 4).commit().unwrap();
+    for x in 0..5 {
+        s.mutate(b"b")
+            .incr("n", b"q", 1)
+            .aggregate("s", b"q", x)
+            .commit()
+            .unwrap();
+        s.mutate(b"b")
+            .set_add("set", b"q", 7 + x as u32)
+            .commit()
+            .unwrap();
+    }
+    assert_eq!(
+        s.get(b"a", "n", b"q").unwrap().map(|c| c.as_i64()),
+        Some(Some(4))
+    );
+    let snap = source.snapshot().unwrap();
+    let chunk = source.copy_range(&snap, &s, b"", None, 1 << 20).unwrap();
+    assert!(chunk.next.is_none());
+    for batch in chunk.batches() {
+        let mut wb = target.logged_batch();
+        for c in batch {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        wb.commit().unwrap();
+    }
+    let of_t = |db: &Pigeonhole| -> Vec<String> {
+        contents(db)
+            .into_iter()
+            .filter(|l| l.starts_with("t\t"))
+            .collect()
+    };
+    assert_eq!(of_t(&target), of_t(&source));
+    assert_eq!(
+        t.get(b"a", "n", b"q").unwrap().map(|c| c.as_i64()),
+        Some(Some(4))
+    );
+    // A crash between the chunk's commits and the chunk copied again (simp724): first only
+    // its first commit, then the whole chunk once more; the delete masks the first
+    // attempt's increment before it's written again.
+    let again = source.copy_range(&snap, &s, b"", None, 1 << 20).unwrap();
+    let batches = again.batches();
+    assert!(
+        batches.len() > 1,
+        "the delete and its value are committed apart"
+    );
+    for batch in [batches[0]].into_iter().chain(batches.iter().copied()) {
+        let mut wb = target.logged_batch();
+        for c in batch {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        wb.commit().unwrap();
+    }
+    assert_eq!(of_t(&target), of_t(&source), "the chunk applied again");
+    // Row b's cells are each one folded value, copied as puts: twice reads the same.
+    let b_chunk = source.copy_range(&snap, &s, b"b", None, 1 << 20).unwrap();
+    assert!(
+        b_chunk
+            .cells
+            .iter()
+            .all(|c| c.kind == pigeonhole::ChangeKind::Put),
+        "{:?}",
+        b_chunk.cells
+    );
+    for batch in b_chunk.batches() {
+        let mut wb = target.logged_batch();
+        for c in batch {
+            wb.push(&t, &c.row, &c.family, c.kind, &c.qualifier, c.ts, &c.stored);
+        }
+        wb.commit().unwrap();
+    }
+    assert_eq!(of_t(&target), of_t(&source), "a folded chunk copied twice");
     drop((snap, s, t));
     target.close().unwrap();
     source.close().unwrap();

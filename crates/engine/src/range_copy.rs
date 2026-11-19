@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use pigeonhole_compaction::{GcPolicy, MergingCursor, StreamGc};
+use pigeonhole_compaction::{GcPolicy, MergeOperator, MergingCursor, StreamGc};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::key::{Kind, decode_key, encode_row_prefix, split_suffix};
 use pigeonhole_format::scan::ScanFilter;
@@ -57,6 +57,9 @@ pub struct RangeChunk {
 /// One family's GC output, kept until its row is taken.
 struct FamilyStream {
     family: FamilyId,
+    /// A counter or aggregate family: its base is per `(column, ts)`.
+    aggregate: bool,
+    merge: Option<Arc<dyn MergeOperator>>,
     cursor: MergingCursor<AtOrBelow<Source>>,
     gc: StreamGc,
     /// Cells read and not yet taken, in key order.
@@ -76,6 +79,8 @@ impl FamilyStream {
                 out.push((k.to_vec(), v.to_vec()));
                 Ok::<(), Error>(())
             })?;
+            // One step's output is one unit: a family marker, or one `(column, ts)` group.
+            let mut group = Vec::with_capacity(out.len());
             for (k, v) in out {
                 let parts = decode_key(&k)?;
                 let mut row = Vec::new();
@@ -94,7 +99,7 @@ impl FamilyStream {
                     Some(b) => b.to_vec(),
                     None => v,
                 };
-                self.buf.push_back(CopiedCell {
+                group.push(CopiedCell {
                     family: self.family,
                     kind: parts.kind,
                     row,
@@ -103,8 +108,39 @@ impl FamilyStream {
                     stored,
                 });
             }
+            self.settle(&mut group);
+            self.buf.extend(group);
         }
         Ok(())
+    }
+
+    /// Puts one `(column, ts)` group in the order a target applies it, and makes a lone
+    /// aggregate operand a base.
+    /// - **Several entries** (an aggregate value newer than a delete kept beside it, a fold
+    ///   that failed): one commit keeps only the last mutation of a cell and timestamp
+    ///   (D34), so the target commits them apart, oldest first, as the source's seqnos
+    ///   ordered them (key order is newest first).
+    /// - **A lone aggregate operand** (the fold of every source, simp724's (d)): written as
+    ///   a put of its finished value, which an aggregate family reads as the base its later
+    ///   operands apply to, per `(column, ts)`, as D291's checkpoints are. A put is
+    ///   idempotent, so a chunk copied twice reads the same. A standard family's operands
+    ///   run across timestamps (D41), so they stay operands.
+    fn settle(&self, group: &mut [CopiedCell]) {
+        if group.len() > 1 {
+            group.reverse();
+            return;
+        }
+        let ([c], true, Some(op)) = (group, self.aggregate, &self.merge) else {
+            return;
+        };
+        if c.kind != Kind::Merge {
+            return;
+        }
+        let mut base = c.stored.clone();
+        if op.finish(None, &mut base).is_ok() {
+            c.kind = Kind::Put;
+            c.stored = base;
+        }
     }
 }
 
@@ -247,6 +283,8 @@ fn open(
     );
     Ok(FamilyStream {
         family,
+        aggregate: meta.options.kind.is_aggregate(),
+        merge: meta.merge_op.clone(),
         cursor,
         gc,
         buf: VecDeque::new(),

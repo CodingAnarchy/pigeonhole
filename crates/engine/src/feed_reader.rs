@@ -1772,8 +1772,40 @@ impl FeedReader {
     /// [`include_silent`](Self::include_silent)): an empty commit at the drop's seqno. Not
     /// part of the stable API.
     #[doc(hidden)]
+    #[inline]
     pub fn range_drop(&self) -> Option<&RangeDropEvent> {
-        self.out_drop.as_ref()
+        // Kept, not cleared at each commit (#2089's callgrind): it stands for the commit
+        // delivered only while that commit is its empty one.
+        self.out_drop
+            .as_ref()
+            .filter(|d| d.seqno == self.out.seqno && self.out.changes.is_empty())
+    }
+
+    /// Delivers the range drop first in `ready` (D331): an empty commit at its seqno, which
+    /// [`range_drop`](Self::range_drop) names (simp724's M1 on #2089: `Next` stays as it
+    /// is). Every stream logs the drop, and their copies share one key in `ready`: the one
+    /// kept (the last read) advances its stream, and the others pass as records behind
+    /// `delivered` (feed1248's note).
+    #[cold]
+    #[inline(never)]
+    fn emit_drop(&mut self) {
+        let (key, p) = self.ready.pop_first().expect("checked");
+        self.forget_ready(&p);
+        self.ahead.budget = self.ahead.base;
+        let Pending::Dropped {
+            event, stream, end, ..
+        } = p
+        else {
+            unreachable!("checked")
+        };
+        let st = &mut self.streams[stream];
+        st.delivered_end = st.delivered_end.max(end);
+        self.delivered = key;
+        self.out.seqno = event.seqno;
+        self.out.ts = 0;
+        self.out.changes.clear();
+        self.out_silent = false;
+        self.out_drop = Some(*event);
     }
 
     /// The silent notes held now (test hook), each checked against what the reader keeps: a
@@ -2844,11 +2876,17 @@ impl FeedReader {
                 self.out_drop = None;
                 return Ok(Emitted::Catalog);
             }
-            let Some((&key, _)) = self.ready.first_key_value() else {
+            let Some((&key, first)) = self.ready.first_key_value() else {
                 return Ok(Emitted::Nothing);
             };
             if key > limit {
                 return Ok(Emitted::Nothing);
+            }
+            // A range drop (D331), only ever for a reader that includes feed-silent
+            // records: out of the commits' way (#2089's callgrind).
+            if matches!(first, Pending::Dropped { .. }) {
+                self.emit_drop();
+                return Ok(Emitted::Commit);
             }
             // Before anything is taken: the view can fail (a reader process's attachment
             // whose writer is gone, or whose view is being republished), and a failure here
@@ -2876,30 +2914,8 @@ impl FeedReader {
             let (_, p) = self.ready.pop_first().expect("checked");
             self.forget_ready(&p);
             self.ahead.budget = self.ahead.base;
-            let p = match p {
-                Pending::Dropped {
-                    event, stream, end, ..
-                } => {
-                    // Every stream logs the drop, and their copies share one key in `ready`:
-                    // the one kept (the last read) advances its stream, and the others pass
-                    // as records behind `delivered` (feed1248's note).
-                    let st = &mut self.streams[stream];
-                    st.delivered_end = st.delivered_end.max(end);
-                    self.delivered = key;
-                    // An empty commit at its seqno (simp724's M1 on #2089: `Next` stays as
-                    // it is), which `range_drop` names.
-                    self.out.seqno = event.seqno;
-                    self.out.ts = 0;
-                    self.out.changes.clear();
-                    self.out_silent = false;
-                    self.out_drop = Some(*event);
-                    return Ok(Emitted::Commit);
-                }
-                p => p,
-            };
-            self.out_drop = None;
             let (ts, raws) = match p {
-                Pending::Dropped { .. } => unreachable!("taken above"),
+                Pending::Dropped { .. } => unreachable!("taken by emit_drop"),
                 Pending::Single {
                     ts,
                     changes,
