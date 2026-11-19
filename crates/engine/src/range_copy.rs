@@ -147,7 +147,7 @@ pub(crate) fn copy_range(
         };
         let mut streams = families
             .iter()
-            .map(|&f| open(view, snapshot.seqno, now, t, f, from))
+            .map(|&f| open(view, snapshot.seqno, now, t, f, from, to))
             .collect::<Result<Vec<_>>>()?;
         loop {
             for s in &mut streams {
@@ -184,7 +184,7 @@ pub(crate) fn copy_range(
     Ok(chunk)
 }
 
-/// One family's stream over tablet `t` from row `from`: its sources at `seqno`, under
+/// One family's stream over tablet `t` from row `from` to `to`: its sources at `seqno`, under
 /// compaction's GC.
 fn open(
     view: &View,
@@ -193,6 +193,7 @@ fn open(
     t: &TabletEntry,
     family: FamilyId,
     from: &[u8],
+    to: Option<&[u8]>,
 ) -> Result<FamilyStream> {
     let meta = view
         .catalog
@@ -212,8 +213,10 @@ fn open(
             fam,
             &view.ssts,
             &all,
-            None,
-            None,
+            // Only the SSTs the chunk's rows can be in (perf287's should-fix on B2): every
+            // other one's index would be read again for each chunk, uncached.
+            (!from.is_empty()).then_some(from),
+            to,
             l.priority,
             read,
             &mut sources,
