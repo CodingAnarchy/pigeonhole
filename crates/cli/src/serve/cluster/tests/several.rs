@@ -893,6 +893,89 @@ fn bad_row(row: &str) -> crate::serve::proto::RowWrites {
     w
 }
 
+/// `row`'s increment of the counter `n:c` by `delta`.
+fn incr_row(row: &str, delta: i64) -> crate::serve::proto::RowWrites {
+    use crate::serve::proto::{Incr, RowKey, RowWrites, Write, write};
+    RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+        }),
+        writes: vec![Write {
+            op: Some(write::Op::Incr(Incr {
+                family: "n".into(),
+                qualifier: b"c".to_vec().into(),
+                timestamp: None,
+                delta,
+            })),
+        }],
+    }
+}
+
+/// `row`'s counter `n:c` through `port` (0 when absent).
+async fn counter(port: u16, row: &str) -> i64 {
+    let reply = data(port)
+        .await
+        .get(crate::serve::proto::GetRequest {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+            family: "n".into(),
+            qualifier: b"c".to_vec().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    reply.cell.map_or(0, |c| {
+        i64::from_le_bytes(c.value[..8].try_into().expect("a counter's 8 bytes"))
+    })
+}
+
+/// Adds the counter family `n` to `users` through `port`, then waits until every node's
+/// partitions have taken that map.
+async fn add_counter(ports: &[u16], port: u16) {
+    use crate::serve::proto::schema_client::SchemaClient;
+    use crate::serve::proto::{
+        Aggregation, AggregationKind, CreateTableRequest, FamilySpec, family_spec,
+    };
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    SchemaClient::new(channel)
+        .create_table(CreateTableRequest {
+            name: "users".into(),
+            families: vec![FamilySpec {
+                name: "n".into(),
+                kind: Some(family_spec::Kind::Aggregate(Aggregation {
+                    kind: AggregationKind::Sum as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            if_missing: true,
+            placement: None,
+        })
+        .await
+        .unwrap();
+    let want = version(port).await;
+    for &p in ports {
+        eventually("every partition to take the map with n", async || {
+            client(p)
+                .await
+                .status(StatusRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .partitions
+                .iter()
+                .all(|lp| lp.reconciled_version >= want)
+        })
+        .await;
+    }
+}
+
 #[test]
 fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
     // audit120's M3b: rows a call already sent to a branch can't be applied twice by a
@@ -907,17 +990,19 @@ fn a_spanning_call_is_all_or_nothing_like_one_nodes() {
             .await
     };
     t.rt.block_on(async {
+        // An increment, so applying alice's row twice would show (audit120's note on #2062).
+        add_counter(&t.ports, c).await;
         // A bad home row: refused before alice's row went to p1; the transaction goes on,
-        // and its corrected commit writes alice once.
+        // and its corrected commit counts alice's increment once.
         let id = begin_spanning(b).await;
-        let e = commit(id.clone(), vec![put_row("alice", "1"), bad_row("zed")])
+        let e = commit(id.clone(), vec![incr_row("alice", 1), bad_row("zed")])
             .await
             .unwrap_err();
         assert_eq!(code(&e), "InvalidArgument", "{e}");
-        commit(id.clone(), vec![put_row("alice", "1"), put_row("zed", "1")])
+        commit(id.clone(), vec![incr_row("alice", 1), put_row("zed", "1")])
             .await
             .unwrap();
-        assert_eq!(get_row(c, "alice").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(counter(c, "alice").await, 1, "counted once");
         // A bad row for the second branch (p2), after p1 took its rows: the transaction
         // ends, its retry answers that outcome, and p1's row is never committed.
         let id = begin_spanning(b).await;

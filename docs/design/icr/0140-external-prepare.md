@@ -1,6 +1,6 @@
 # 0140: prepared transactions with an external xid (D329 engine PR 1)
 
-**Status:** Approved. Amendment 1 (the coordinator, 2026-11-17, D329 PR 2a; same feature, no new number): `prepare` with reads and no writes logs, and `Transaction::hold_reads` holds a read-only transaction's reads in memory.
+**Status:** Approved. Amendment 1 (the coordinator, 2026-11-17, D329 PR 2a; same feature, no new number): `prepare` with reads and no writes logs, and `Transaction::hold_reads` holds a read-only transaction's reads in memory. Amendment 2 (the coordinator, 2026-11-18, D329 PR 2b; same feature, no new number): a spanning commit's shares carry its xid, which the change feed delivers.
 - Numbers are from the coordinator (`.coord/numbers.md`): WAL record types 5 and 6, and `incompat` bit 2.
 - The D329 design was reviewed by audit120 and cli692, and signed off by the owner.
 - perf2 reviewed this ICR's draft as engine reviewer (E1 to E3, Q1 to Q4). Bit 2 is sticky, which supersedes the draft's clearing.
@@ -84,3 +84,25 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
   - The home doesn't prepare: its own share commits at the commit point, together with its decision row.
   - Each branch is then decided.
 - **A read-only one:** each partition's reads are held with `hold_reads` and kept for a release round. The hold is taken under the partition gate's lease term, and its release confirms the same term. Single-partition commits are unchanged. The only new branch on a commit path is `external.is_some()` in `on_prepared`.
+
+## Amendment 2: the xid on the feed (D329 PR 2b)
+Ruled by the coordinator, 2026-11-18, after perf2's and feed1248's reviews. It replaces the ledger's earlier WAL record type 7, which is released.
+
+- **Format:**
+  - Bit 30 of a batch's `count` (`XID_BATCH`) says the batch ends in an xid trailer: the xid (1–255 bytes), then its length byte (FORMAT.md §10.3).
+  - It's gated by `incompat` bit 2, set before the first tagged batch.
+  - Every count reader masks both flag bits (`COUNT_MASK`).
+  - An External Prepare's batch never carries the bit.
+- **Writing it:**
+  - `pigeonhole::Transaction::tag_xid(xid)` (hidden, behind `__unstable-txn-prepare`; the engine's `Txn::tag_xid` and `WriteBatch::tag_xid`) tags a commit.
+  - The engine writes the trailer into the routed batch as its last step, after routing, so no `push` follows it and the shard's commit message doesn't grow.
+  - Every rebuild after it (large values, counter writes, the split into shares, a retry) carries it.
+- **Reading it:**
+  - `BatchRef::xid()` reads the trailer.
+  - The feed reader notes a tagged commit's xid where it keeps the commit (bounded by what's ready or held), and delivers it on `feed_reader::Commit::xid`.
+  - `pigeonhole::feed::Commit::xid() -> Option<&[u8]>` exposes it (hidden, behind the feature).
+  - Every share of one commit carries the same xid; debug builds assert it.
+- **Replication:**
+  - A replicated event of a tagged commit is version 3: a flags byte (bit 0 silent, bit 1 xid; others refused), the xid, then version 1's fields. Versions 1 and 2 are unchanged.
+  - A replica applies the share tagged, one tagged share per applied part, so its feed carries the xid too.
+- **Callers:** `phdb serve` tags a spanning commit's home share (home-only ones included) and fills `FeedEvent.xid`. A branch's share is an External Prepare, whose xid its share names.

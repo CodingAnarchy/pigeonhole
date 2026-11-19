@@ -225,6 +225,13 @@ impl std::fmt::Debug for Sessions {
     }
 }
 
+/// What a session is, as [`Sessions::peek`] finds it.
+pub(crate) enum Peek {
+    Live,
+    Done(Outcome),
+    Gone,
+}
+
 /// What a transaction call found. Moved once, from the table to the call, never stored, so
 /// the guard (which holds the transaction by value) isn't boxed.
 #[allow(clippy::large_enum_variant)]
@@ -382,7 +389,13 @@ impl Sessions {
         let Some(p) = &self.partition else {
             return Err(ApiError::internal("a spanning transaction off a cluster"));
         };
-        let id = new_id()?;
+        // The first 48 bits are the begin time in ms (the rest random): its home tells a
+        // decision record GC'd past retention from one never written (D329 2b).
+        let mut id = new_id()?;
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        id[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
         let xid: Arc<str> = format!("{p}:h{history_epoch}-{}", hex(&id)).into();
         self.insert_at(
             id,
@@ -447,6 +460,30 @@ impl Sessions {
             Some(xid.into()),
             None,
         )
+    }
+
+    /// What session `id` is now, without taking it (D329's `Outcome` and resolver): open or
+    /// committing (`Live`), its recorded outcome, or gone. A spanning id is looked up by its
+    /// exact text, whoever its client; a plain one only for `principal`.
+    pub(crate) fn peek(&self, id: &str, principal: Principal) -> Peek {
+        let Some((key, xid)) = self.parse_txn(id) else {
+            return Peek::Gone;
+        };
+        let now = Instant::now();
+        let mut t = self.lock();
+        t.expire(&key, now, &self.leases);
+        let Some(e) = t
+            .map
+            .get(&key)
+            .filter(|e| e.xid.as_deref() == xid && (xid.is_some() || e.principal == principal))
+        else {
+            return Peek::Gone;
+        };
+        match &e.state {
+            State::Txn(_) | State::Committing => Peek::Live,
+            State::Done(o) => Peek::Done(o.clone()),
+            State::Expired | State::Snapshot(_) | State::Mcp(_) => Peek::Gone,
+        }
     }
 
     /// Takes branch `xid` out for the home node's own call (D329: its prepare or abort),
@@ -970,6 +1007,12 @@ pub(crate) fn spanning_parts(id: &str) -> Option<(&str, u64, &str)> {
         return None;
     }
     Some((home, epoch.parse().ok()?, hex))
+}
+
+/// When spanning transaction `id` began, in ms since the epoch (its id's first 48 bits).
+pub(crate) fn spanning_begun_ms(id: &str) -> Option<u64> {
+    let (_, _, hex) = spanning_parts(id)?;
+    u64::from_str_radix(hex.get(..12)?, 16).ok()
 }
 
 fn parse_id(s: &str) -> Option<Id> {

@@ -2039,6 +2039,83 @@ fn a_member_ended_idle_mid_pass_resumes_from_its_last_token_with_nothing_lost_or
     });
 }
 
+#[test]
+fn a_spanning_commits_events_carry_its_xid_on_every_partition_and_no_other_commit_does() {
+    // D329 2b: each partition's share of a spanning commit, the home's included, is
+    // delivered with the transaction's id, so a subscriber can group them; a home-only
+    // opted-in commit carries it too (feed1248's F3). A plain commit carries none, and an
+    // aborted spanning transaction delivers nothing.
+    use super::spanning::{abort, begin_spanning, commit_parts};
+    let t = Three::start();
+    let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        let mut s = subscribe(c, users()).await.unwrap();
+        put(a, "plain", "v").await;
+        // Home p2 (zed), branch p1 (alice).
+        let id = begin_spanning(c, "zed").await.unwrap();
+        commit_parts(c, &id, vec![put_row("alice", "1"), put_row("zed", "1")])
+            .await
+            .unwrap();
+        let gone = begin_spanning(c, "zoe").await.unwrap();
+        txn_write(
+            c,
+            &gone,
+            vec![put_row("abe", "1"), put_row("zoe", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        abort(c, &gone).await.unwrap();
+        let home_only = begin_spanning(b, "zack").await.unwrap();
+        commit_parts(b, &home_only, vec![put_row("zack", "1")])
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            let e = tokio::time::timeout(Duration::from_secs(10), s.message())
+                .await
+                .expect("a commit within 10 s")
+                .unwrap()
+                .expect("the stream ended");
+            if let Some(Event::Commit(c)) = &e.event {
+                for ch in &c.changes {
+                    got.push((
+                        String::from_utf8(ch.row.to_vec()).unwrap(),
+                        e.partition.clone(),
+                        String::from_utf8(e.xid.to_vec()).unwrap(),
+                    ));
+                }
+            }
+        }
+        got.sort();
+        let row = |r: &str, p: &str, x: &str| (r.to_owned(), p.to_owned(), x.to_owned());
+        assert_eq!(
+            got,
+            [
+                row("alice", "p1", &id),
+                row("plain", "p2", ""),
+                row("zack", "p2", &home_only),
+                row("zed", "p2", &id),
+            ]
+        );
+        // Nothing of the aborted one follows.
+        let quiet = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match s.message().await {
+                    Ok(Some(FeedEvent {
+                        event: Some(Event::Commit(c)),
+                        ..
+                    })) => return c,
+                    Ok(Some(_)) => continue,
+                    other => panic!("{other:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(quiet.is_err(), "an aborted transaction delivered {quiet:?}");
+    });
+}
+
 /// D331 PR 3b: `users` `[c, f)` moving from p1 to p2 at `phase` (none: done), as map
 /// `version`, with the move's last seqno `final_seqno` from HANDING_OVER on.
 fn moving_users(

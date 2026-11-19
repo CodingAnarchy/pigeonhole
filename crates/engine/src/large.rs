@@ -327,7 +327,7 @@ pub(crate) fn separate(
                 &encode_blob_stored(&ptr),
             )?;
         }
-        Ok(())
+        crate::engine::carry_xid(&builder, &mut out)
     })();
     if let Err(e) = written {
         for (_, _, mut sink) in sinks {
