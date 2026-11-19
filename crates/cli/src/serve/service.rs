@@ -2392,7 +2392,7 @@ impl Service {
                     reason: reason.to_owned(),
                     ..Default::default()
                 };
-                match self.peek_txn(&r.txn_id, caller) {
+                match self.peek_txn(&r.txn_id, Some(caller.principal)) {
                     Peek::Live => Ok(answer(
                         S::InProgress,
                         "the transaction is open or committing",
@@ -2411,7 +2411,7 @@ impl Service {
                         },
                         &e.message,
                     )),
-                    Peek::Gone => Err(ApiError::not_found(
+                    Peek::Gone | Peek::Foreign => Err(ApiError::not_found(
                         "no such transaction (its outcome is kept only while its session's \
                          record is)",
                     )),
@@ -5269,8 +5269,19 @@ impl Service {
 
     /// What transaction `id` is now, for `caller` (D329's `Outcome` and resolver), without
     /// taking it.
-    pub(crate) fn peek_txn(&self, id: &str, caller: &Caller) -> super::sessions::Peek {
-        self.sessions.peek(id, caller.principal)
+    /// Transaction `id`'s session as `principal` sees it (`None`: the node's own call,
+    /// [`super::sessions::Sessions::peek`]).
+    pub(crate) fn peek_txn(
+        &self,
+        id: &str,
+        principal: Option<super::auth::Principal>,
+    ) -> super::sessions::Peek {
+        self.sessions.peek(id, principal)
+    }
+
+    /// `--txn-lifetime-ms`.
+    pub(crate) fn txn_lifetime(&self) -> std::time::Duration {
+        self.sessions.txn_lifetime()
     }
 
     /// Spanning transaction `xid`'s decision row on this home partition (D329), read now:

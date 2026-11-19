@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::super::auth::Caller;
+use super::super::auth::{Caller, Principal};
 use super::super::errors::ApiError;
 use super::super::proto;
 use super::super::proto::forward_request::Op;
@@ -149,6 +149,19 @@ fn read_decision(value: &[u8]) -> Result<(bool, Vec<String>), ApiError> {
     }
 }
 
+/// Who asks [`settle`] (#2077, audit120's S5 on #2076).
+#[derive(Clone, Copy)]
+pub(crate) enum Asker {
+    /// A client's `Outcome`: only its own transaction's session answers. Another
+    /// principal's is `NotFound`, and nothing further is read or written for it, so a
+    /// client can't learn another's outcome while its session lives, nor make its home
+    /// record an abort over it.
+    Client(Principal),
+    /// The node's own call (the resolver's `ResolveTxn`, which only `Cluster.Forward`
+    /// carries): a spanning session answers whoever its client is.
+    Node,
+}
+
 /// What became of transaction `id`, at its home `home` (D329): `Outcome`'s answer, and the
 /// resolver's. Its live session answers in progress; its recorded outcome answers as it is
 /// (but an unknown commit, which only the decision row settles); then a spanning
@@ -159,7 +172,7 @@ pub(crate) async fn settle(
     node: &Node,
     home: &Service,
     id: &str,
-    caller: &Caller,
+    asker: Asker,
 ) -> Result<proto::TxnOutcomeResponse, ApiError> {
     use super::super::sessions::Peek;
     use proto::TxnOutcomeState as S;
@@ -168,7 +181,14 @@ pub(crate) async fn settle(
         reason: reason.to_owned(),
         ..Default::default()
     };
-    match home.peek_txn(id, caller) {
+    let principal = match asker {
+        Asker::Client(p) => Some(p),
+        Asker::Node => None,
+    };
+    match home.peek_txn(id, principal) {
+        // Another client's transaction, its session still here: not found, and nothing
+        // more (its decision row isn't read, and no abort is recorded over it).
+        Peek::Foreign => return Err(ApiError::not_found("no such transaction")),
         Peek::Live => {
             return Ok(answer(
                 S::InProgress,
@@ -205,7 +225,16 @@ pub(crate) async fn settle(
             // found, never presumed aborted (D329 2b; audit120's M1 on #2076).
             let begun = super::super::sessions::spanning_begun_ms(id).unwrap_or(0);
             let horizon = u64::try_from(home.outcome_horizon().as_millis()).unwrap_or(u64::MAX);
-            if begun.saturating_add(horizon) <= now_ms() {
+            let now = now_ms();
+            // A client's id dated later than any transaction could have begun (#2077): no
+            // transaction, so nothing is recorded for it.
+            let lifetime = u64::try_from(home.txn_lifetime().as_millis()).unwrap_or(u64::MAX);
+            if matches!(asker, Asker::Client(_)) && begun > now.saturating_add(lifetime) {
+                return Err(ApiError::not_found(
+                    "no such transaction: its id's begin time is in the future",
+                ));
+            }
+            if begun.saturating_add(horizon) <= now {
                 return Err(ApiError::not_found(
                     "no record of the transaction: its outcome is kept for \
                      --txn-outcome-retention after it ends",
@@ -515,7 +544,7 @@ pub(crate) async fn serve_branch(
                     .ack_decision(&r.xid, std::slice::from_ref(&r.acked))
                     .await?;
             }
-            let settled = settle(node, &service, &r.xid, caller).await?;
+            let settled = settle(node, &service, &r.xid, Asker::Node).await?;
             Reply::ResolveTxn(proto::TxnResolution {
                 state: settled.state,
                 reason: settled.reason,
