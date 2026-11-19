@@ -228,7 +228,6 @@ impl ReplicatedEvent {
     /// newer encoding.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
-        let version = bytes.first().copied();
         let silent = match r.u8()? {
             EVENT_VERSION => false,
             SILENT_EVENT_VERSION => true,
@@ -292,31 +291,11 @@ impl ReplicatedEvent {
                 }
                 Body::Catalog(ev)
             }
-            2 => {
-                let seqno = r.u64()?;
-                let range = pigeonhole_format::wal::DroppedRange::decode(r.0)
-                    .map_err(|_| invalid("a replicated range drop".to_owned()))?;
-                r.0 = &[];
-                let (table, start, end) = range.fields();
-                Body::RangeDrop(RangeDrop {
-                    seqno,
-                    table,
-                    start: start.to_vec(),
-                    end: end.map(<[u8]>::to_vec),
-                })
-            }
+            2 => Body::RangeDrop(decode_drop(bytes, &mut r)?),
             _ => return Err(invalid("a replicated event's body".to_owned())),
         };
         if silent && matches!(body, Body::Catalog(_)) {
             return Err(invalid("a feed-silent catalog change".to_owned()));
-        }
-        // A drop is written in the plain version only. Keyed on the version byte itself,
-        // not on the flags one version reads, so a later flags form (D329 PR 2b's version 3)
-        // is refused too, whichever lands first (feed1248's M1 on #2089).
-        if matches!(body, Body::RangeDrop(_)) && version != Some(EVENT_VERSION) {
-            return Err(invalid(
-                "a range drop in a version other than the plain one".to_owned(),
-            ));
         }
         if !r.0.is_empty() {
             return Err(invalid(
@@ -330,6 +309,31 @@ impl ReplicatedEvent {
             body,
         })
     }
+}
+
+/// A range drop's body (tag 2), the rest of `r`, out of the commits' way (#2089's
+/// callgrind). Written in the plain version only: keyed on the event's version byte itself,
+/// not the flags one version reads, so a later flags form (D329 PR 2b's version 3) is refused
+/// too (feed1248's M1 on #2089).
+#[cold]
+#[inline(never)]
+fn decode_drop(event: &[u8], r: &mut Reader<'_>) -> Result<RangeDrop> {
+    if event.first() != Some(&EVENT_VERSION) {
+        return Err(invalid(
+            "a range drop in a version other than the plain one".to_owned(),
+        ));
+    }
+    let seqno = r.u64()?;
+    let range = pigeonhole_format::wal::DroppedRange::decode(r.0)
+        .map_err(|_| invalid("a replicated range drop".to_owned()))?;
+    r.0 = &[];
+    let (table, start, end) = range.fields();
+    Ok(RangeDrop {
+        seqno,
+        table,
+        start: start.to_vec(),
+        end: end.map(<[u8]>::to_vec),
+    })
 }
 
 /// [`ReplicatedEvent::encode`]'s version.

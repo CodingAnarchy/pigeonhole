@@ -869,9 +869,19 @@ impl Feed {
     /// reader names ([`FeedReader::range_drop`](pigeonhole_engine::FeedReader::range_drop);
     /// only with `include_silent`). An event call gets it as [`FeedEvent::RangeDrop`]; a
     /// commits-only call passes it over (true).
-    #[inline]
+    #[inline(always)]
     fn drop_passed(&mut self, events: bool) -> bool {
-        // A field test for every commit (#2089's callgrind); the rest only for a drop.
+        // One compare for a commit (#2089's callgrind); the rest only for a drop.
+        if self.reader.range_drop().is_none() {
+            return false;
+        }
+        self.drop_taken(events)
+    }
+
+    /// [`drop_passed`](Self::drop_passed) for a delivery that is a drop's.
+    #[cold]
+    #[inline(never)]
+    fn drop_taken(&mut self, events: bool) -> bool {
         let Some(_drop) = self.reader.range_drop() else {
             return false;
         };

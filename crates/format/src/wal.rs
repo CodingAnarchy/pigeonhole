@@ -121,7 +121,16 @@ fn marked(bytes: &[u8]) -> bool {
 #[cold]
 #[inline(never)]
 fn external_marked(bytes: &[u8]) -> bool {
-    WalRecord::decode_any(bytes, true).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
+    WalRecord::decode_any(bytes).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
+}
+
+/// A Range Drop in a file without `incompat` bit 3 (D331), out of the decoder's way.
+#[cold]
+#[inline(never)]
+fn range_drop_without_bit() -> Error {
+    Error::Corrupt {
+        what: "wal range drop in a file without incompat bit 3",
+    }
 }
 
 /// [`SILENT_WITHOUT_BIT`]'s error, out of the decoder's way.
@@ -763,7 +772,9 @@ impl<'a> DroppedRange<'a> {
         Ok(())
     }
 
-    /// Decodes and checks a body. Never panics.
+    /// Decodes and checks a body. Never panics. Out of line, so the record decoder around it
+    /// keeps its inlining (#2089's callgrind).
+    #[inline(never)]
     pub fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
         Self::parse(bytes)?;
         Ok(Self { body: bytes })
@@ -1120,7 +1131,12 @@ impl WalRecord<'_> {
         if !silent_ok && marked(bytes) {
             return Err(silent_without_bit());
         }
-        let record = Self::decode_any(bytes, silent_ok);
+        // D331's bit gates a Range Drop as it gates the silent mark: tested only without the
+        // bit, so `decode_any` stays as it was (#2089's callgrind).
+        if !silent_ok && bytes.first() == Some(&(RecordType::RangeDrop as u8)) {
+            return Err(range_drop_without_bit());
+        }
+        let record = Self::decode_any(bytes);
         // The mark's places in the bytes agree with the decoded batch (perf2's nit on #2055).
         debug_assert!(
             record
@@ -1152,7 +1168,7 @@ impl WalRecord<'_> {
         }
     }
 
-    fn decode_any(bytes: &[u8], has_bit3: bool) -> crate::Result<WalRecord<'_>> {
+    fn decode_any(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
         let mut r = Reader::new(bytes, "wal record");
         match r.u8()? {
             1 => Ok(WalRecord::Batch {
@@ -1186,14 +1202,10 @@ impl WalRecord<'_> {
                 abort_seqno: r.u64()?,
                 share: ExternalShare::decode(r.rest(), false)?,
             }),
-            // D331's bit gates it, as it gates the silent mark: without the bit, a 7 is a
-            // record this file can't hold.
-            7 if has_bit3 => Ok(WalRecord::RangeDrop {
+            // Gated by D331's bit in `decode_with`.
+            7 => Ok(WalRecord::RangeDrop {
                 seqno: r.u64()?,
                 range: DroppedRange::decode(r.rest())?,
-            }),
-            7 => Err(Error::Corrupt {
-                what: "wal range drop in a file without incompat bit 3",
             }),
             t => Err(Error::UnsupportedFeature {
                 what: "wal record type",

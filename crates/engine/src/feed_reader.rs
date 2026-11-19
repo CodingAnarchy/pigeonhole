@@ -397,22 +397,15 @@ enum Pending {
         /// The session that wrote the Decision.
         session: u64,
     },
-    /// A range drop, for a reader that includes feed-silent records (D331).
-    Dropped {
-        event: Box<RangeDropEvent>,
-        stream: usize,
-        start: Lsn,
-        end: Lsn,
-    },
 }
 
 impl Pending {
     /// The stream and start of its record.
     fn at(&self) -> (usize, Lsn) {
         match self {
-            Pending::Single { stream, start, .. }
-            | Pending::Decided { stream, start, .. }
-            | Pending::Dropped { stream, start, .. } => (*stream, *start),
+            Pending::Single { stream, start, .. } | Pending::Decided { stream, start, .. } => {
+                (*stream, *start)
+            }
         }
     }
 }
@@ -815,8 +808,12 @@ pub struct FeedReader {
     /// The table the last commit's changes ended with, present in `present_of`.
     present_last: Option<TableId>,
     out_catalog: CatalogEvent,
-    /// The range drop the commit last delivered stands for (D331), if it does.
+    /// The range drop the commit last delivered stands for (D331), at `drop_seqno`.
     out_drop: Option<RangeDropEvent>,
+    drop_seqno: Seqno,
+    /// Range drops queued in `ready` as empty commits, by seqno (D331; only with
+    /// `include_silent`).
+    drops: BTreeMap<Seqno, RangeDropEvent>,
     expired: Option<Expiry>,
     /// An error that ended the reader once a commit was already taken (a blob value that
     /// couldn't be read): every later call fails, since going on would skip that commit.
@@ -1136,11 +1133,6 @@ fn pending_bytes(p: &Pending) -> u64 {
             Pending::Decided { participants, .. } => {
                 alloc_size(participants.capacity() * std::mem::size_of::<StreamId>())
             }
-            Pending::Dropped { event, .. } => alloc_size(
-                std::mem::size_of::<RangeDropEvent>()
-                    + event.start.capacity()
-                    + event.end.as_ref().map_or(0, Vec::capacity),
-            ),
         }
 }
 
@@ -1361,6 +1353,8 @@ impl FeedReader {
             present_last: None,
             out_catalog: CatalogEvent::default(),
             out_drop: None,
+            drop_seqno: 0,
+            drops: BTreeMap::new(),
         };
         let token_start = matches!(spec.start, FeedStart::Token(_));
         // A feed of every table: the catalog its start reflects, for `Now` and a snapshot
@@ -1774,38 +1768,34 @@ impl FeedReader {
     #[doc(hidden)]
     #[inline]
     pub fn range_drop(&self) -> Option<&RangeDropEvent> {
-        // Kept, not cleared at each commit (#2089's callgrind): it stands for the commit
-        // delivered only while that commit is its empty one.
-        self.out_drop
-            .as_ref()
-            .filter(|d| d.seqno == self.out.seqno && self.out.changes.is_empty())
+        // One compare for a commit (#2089's callgrind): `drop_seqno` is set only when a
+        // drop's empty commit is delivered, and a seqno is never delivered twice.
+        if self.drop_seqno != self.out.seqno {
+            return None;
+        }
+        self.out_drop.as_ref()
     }
 
-    /// Delivers the range drop first in `ready` (D331): an empty commit at its seqno, which
-    /// [`range_drop`](Self::range_drop) names (simp724's M1 on #2089: `Next` stays as it
-    /// is). Every stream logs the drop, and their copies share one key in `ready`: the one
-    /// kept (the last read) advances its stream, and the others pass as records behind
+    /// Delivers the range drop at `key` (D331), if one is there: an empty commit at its
+    /// seqno, which [`range_drop`](Self::range_drop) names (simp724's M1 on #2089: `Next`
+    /// stays as it is). Every stream logs the drop, and their copies share one key in
+    /// `ready`: the one kept advances its stream, and the others pass as records behind
     /// `delivered` (feed1248's note).
     #[cold]
     #[inline(never)]
-    fn emit_drop(&mut self) {
-        let (key, p) = self.ready.pop_first().expect("checked");
-        self.forget_ready(&p);
-        self.ahead.budget = self.ahead.base;
-        let Pending::Dropped {
-            event, stream, end, ..
-        } = p
-        else {
-            unreachable!("checked")
+    fn emit_drop(&mut self, key: Seqno) -> bool {
+        // Ones behind `delivered` were passed over (read again past a cutoff).
+        self.drops.retain(|&k, _| k >= key);
+        let Some(event) = self.drops.remove(&key) else {
+            return false;
         };
-        let st = &mut self.streams[stream];
-        st.delivered_end = st.delivered_end.max(end);
-        self.delivered = key;
-        self.out.seqno = event.seqno;
+        self.out.seqno = key;
         self.out.ts = 0;
         self.out.changes.clear();
         self.out_silent = false;
-        self.out_drop = Some(*event);
+        self.out_drop = Some(event);
+        self.drop_seqno = key;
+        true
     }
 
     /// The silent notes held now (test hook), each checked against what the reader keeps: a
@@ -2309,7 +2299,6 @@ impl FeedReader {
             Pending::Single { .. } => {
                 self.silent_seen.remove(&key);
             }
-            Pending::Dropped { .. } => {}
         }
         self.ahead.lower_cutoff(key - 1);
     }
@@ -2596,10 +2585,18 @@ impl FeedReader {
                         st.delivered_end = st.delivered_end.max(end);
                         continue;
                     }
+                    // An empty commit at its seqno in `ready` (no variant of its own: the
+                    // commits' matches stay as they were, #2089's callgrind), its range
+                    // aside until it's delivered.
+                    self.drops.insert(seqno, *event);
                     self.insert_ready(
                         seqno,
-                        Pending::Dropped {
-                            event,
+                        Pending::Single {
+                            ts: 0,
+                            changes: Raws {
+                                heads: Box::new([]),
+                                bytes: Box::new([]),
+                            },
                             stream: s,
                             start,
                             end,
@@ -2802,7 +2799,7 @@ impl FeedReader {
             .values()
             .filter_map(|p| match p {
                 Pending::Decided { id, .. } => Some(*id),
-                Pending::Single { .. } | Pending::Dropped { .. } => None,
+                Pending::Single { .. } => None,
             })
             .collect();
         drop_undecided(
@@ -2873,20 +2870,14 @@ impl FeedReader {
                 self.raise_session(session);
                 self.out_catalog = ev;
                 // No commit is delivered with it, so no drop either (feed1248 on #2089).
-                self.out_drop = None;
+                self.drop_seqno = 0;
                 return Ok(Emitted::Catalog);
             }
-            let Some((&key, first)) = self.ready.first_key_value() else {
+            let Some((&key, _)) = self.ready.first_key_value() else {
                 return Ok(Emitted::Nothing);
             };
             if key > limit {
                 return Ok(Emitted::Nothing);
-            }
-            // A range drop (D331), only ever for a reader that includes feed-silent
-            // records: out of the commits' way (#2089's callgrind).
-            if matches!(first, Pending::Dropped { .. }) {
-                self.emit_drop();
-                return Ok(Emitted::Commit);
             }
             // Before anything is taken: the view can fail (a reader process's attachment
             // whose writer is gone, or whose view is being republished), and a failure here
@@ -2915,7 +2906,6 @@ impl FeedReader {
             self.forget_ready(&p);
             self.ahead.budget = self.ahead.base;
             let (ts, raws) = match p {
-                Pending::Dropped { .. } => unreachable!("taken by emit_drop"),
                 Pending::Single {
                     ts,
                     changes,
@@ -2981,6 +2971,10 @@ impl FeedReader {
             let dropped = &self.dropped_tables;
             let kept = |r: &RawRef<'_>| dropped.is_empty() || !dropped.contains(&r.table);
             if !packs.iter().flat_map(Raws::iter).any(|r| kept(&r)) {
+                // A range drop's empty commit (D331), only ever with `include_silent`.
+                if !self.drops.is_empty() && self.emit_drop(key) {
+                    return Ok(Emitted::Commit);
+                }
                 continue;
             }
             self.out.seqno = key;
@@ -3169,8 +3163,6 @@ impl FeedReader {
                 .held
                 .range((*id, 0)..=(*id, usize::MAX))
                 .all(|(_, h)| listed(&h.changes)),
-            // No values.
-            Pending::Dropped { .. } => true,
         }
     }
 
