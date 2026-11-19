@@ -5022,6 +5022,7 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
     - an absent row is settled as the resolver settles it;
     - "unknown" across a history change.
   - Rows are kept `--txn-outcome-retention` (24 h, owner Q4) after the last branch's acknowledgement. The retention can't be set below the transaction lifetime plus the request timeout.
+    - *As built (#2076; audit120's nit, documented in the S4 docs PR):* the retention counts from the decision's time, and a commit's row also stays until every branch has acknowledged it. A read-only spanning commit writes no row, so its outcome lasts only as long as its session's record.
 - **Engine.**
   - `prepare(xid)`, `in_doubt()` and `decide(xid, commit)` sit behind an unstable feature, and `phdb serve` is the one caller.
   - External shares survive a crash or a close in doubt, with their read and write holds reinstalled before the database admits a write, by every open (serving, `Stamp`'s, `init-partition`'s). A read-only open lists them (`in_doubt`), holds nothing and can't decide them. An open with another shard count, or one whose replay spills, is refused while any is in doubt (decide them first).
