@@ -705,13 +705,13 @@ impl Node {
                     let (node, peer, address, map) =
                         (Arc::clone(self), peer.clone(), address.clone(), map.clone());
                     pushes.spawn(async move {
-                        let took = tokio::time::timeout(
+                        let pushed = tokio::time::timeout(
                             node.peers.push_timeout,
                             node.push_to(&address, map),
                         )
                         .await
-                        .is_ok_and(|r| r.is_ok());
-                        (peer, took)
+                        .unwrap_or_else(|_| Err("timed out".to_owned()));
+                        (peer, pushed)
                     });
                 }
                 // Newer than the map this node now holds: its install was refused (a forced
@@ -722,7 +722,12 @@ impl Node {
         }
         // An answerer that was behind counts once it took the map. One that didn't blocks
         // the round: it answered with an older map, and may be an old owner that hasn't taken
-        // the move yet (audit120's F2). A peer that never answered doesn't block.
+        // the move yet (audit120's F2). A peer that never answered doesn't block, and nor
+        // does one whose term fence refused the map (#2073): it voted in an election that
+        // lost, so it takes no map below that term, and with no majority holding its own map
+        // it holds no lease either. It counts as one that never answered; were it to block,
+        // no node would confirm anything, the writer's lease included, and the writer could
+        // never adopt the term that lets it take the map.
         let mut behind = Vec::new();
         let mut holding: Vec<(String, String)> = answers
             .iter()
@@ -734,8 +739,22 @@ impl Node {
             })
             .map(|(peer, address, _)| (peer.clone(), address.clone()))
             .collect();
-        for (peer, took) in pushes.join_all().await {
-            if took {
+        let writer = super::schema::writer(&map) == self.id;
+        for (peer, pushed) in pushes.join_all().await {
+            if let Err(e) = &pushed
+                && e.contains(super::VOTED_ABOVE)
+            {
+                // The writer's duties look at it (#2073).
+                if writer {
+                    let now = self.grants.clock().now();
+                    self.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .refused(&peer, now, self.grants.lease());
+                }
+                continue;
+            }
+            if pushed.is_ok() {
                 holders += usize::from(members.contains(peer.as_str()));
                 if members.contains(peer.as_str())
                     && let Some((_, address, _)) = answers.iter().find(|(p, _, _)| *p == peer)

@@ -713,7 +713,7 @@ Its steps:
   The map keeps the last 16 finished events, and every pending one.
 - `Partition.failover = 8` (`FailoverMode`: INHERIT, OFF, ON). The map's flag is the master switch: OFF opts P out, and ON is INHERIT's behaviour.
 - `Partition.failover_count = 11`: P's failovers, ever; it never goes down.
-- `LeaseRequest.pre_vote = 9` (bool): an election's pre-vote (Raft's). A candidate asks for real votes, and records its own, only once a majority would vote. A node answers it as the vote, recording, granting and fencing nothing, and says yes only once the writer lease has been out there for the failover margin (simp724). Without it, a node cut off from every other ran an election it couldn't win; its recorded vote then fenced the live writer's lower-term maps from it for good once it rejoined (found by §8 test 2). A build without leases answers `Unimplemented`, as to a vote: no pre-vote. A vote that's really held and lost can still strand its candidate; the fix (the live writer adopts the higher term) is a 1.3.0 follow-up.
+- `LeaseRequest.pre_vote = 9` (bool): an election's pre-vote (Raft's). A candidate asks for real votes, and records its own, only once a majority would vote. A node answers it as the vote, recording, granting and fencing nothing, and says yes only once the writer lease has been out there for the failover margin (simp724). Without it, a node cut off from every other ran an election it couldn't win; its recorded vote then fenced the live writer's lower-term maps from it for good once it rejoined (found by §8 test 2). A build without leases answers `Unimplemented`, as to a vote: no pre-vote. A vote that's really held and lost can still strand its candidate; the live writer then adopts its term (#2073, below).
 - `LeasePart.in_doubt_xids = 4` and `.in_doubt_count = 5`: an owner's in-doubt external shares of P, sent with its renewals while the map has failover on, as the operator pastes them into `phdb cluster txn decide` (UTF-8; hex only for an xid that isn't). They're empty in an answer.
 - `NodeStatus.failover_blocked = 12`: on the writer, each down partition it doesn't fail over, and why.
 - `NodeStatus.grants = 13`: every partition lease the node grants that still runs (`LeaseWithheld`: partition, holder, time left). The writer's survey reads it.
@@ -731,7 +731,7 @@ Its steps:
   - the owner answers and serves P, or the operator fenced (`FENCE_REASON_OPERATOR`) or closed it there. An owner that answers but has lost its lease reports Fenced awaiting its peers, and counts as down;
   - any other node still grants P's lease to its owner (`NodeStatus.grants`: the owner is alive, cut off from the writer alone).
 - A node that doesn't answer the survey is unknown, not granting. The grant round still keeps two owners from serving at once.
-- A partition blocked after a survey is surveyed again only after the failover margin, or when the map changes (perf287 on #2069). A newly down partition is surveyed at once.
+- A partition blocked after a survey is surveyed again only once it's due, or when the map changes (perf287 on #2069). It's due when the grant it waits on ends ("node X still grants its lease"), else after the failover margin. A newly down partition is surveyed at once, and a survey any down partition is due takes every down partition, so none keeps a stale reason through another's survey (perf2's S2 on #2069, #2073).
 
 **The replica:** of P's replicas, the one with the highest applied seqno (then map order) whose copy:
 - is FOLLOWING or BEHIND;
@@ -766,6 +766,25 @@ No other move takes P to an epoch at or below a pending one's.
 **Metrics:** `pigeonhole_cluster_failovers_total{partition}` (from `failover_count`) and `pigeonhole_cluster_writer_term`, from the node's map: every node shows the same.
 
 **`phdb cluster status`** adds `failover_blocked` (the writer's) and `failovers` (the map's events). Each node's JSON has its `grants`.
+
+#### A node stranded by a lost vote (#2073, simp724's design)
+**The problem.** A candidate that passes its pre-vote but loses its real vote has recorded its own vote for term N. Say it was cut off between the rounds. The install term fence then refuses every map below N. If the live writer stays at a lower term, the node never takes its maps: its partitions stay fenced, and it routes on an old map. The node mustn't simply take a lower-term map, which would break the vote's promise.
+
+**Worse: it stopped every other node's leases too.** Each node's lease round pushes its map to a peer that answers with an older one. A peer that didn't take it blocked the round (audit120's F2 on #1899), so with the stranded node refusing every push, no node confirmed a lease, the writer's included.
+- **Now:** a peer whose push the term fence refuses counts as one that never answered, not as behind.
+- **Why that's safe:** the stranded node takes no map below its vote, and no majority holds its old map, so it holds no lease. It's as harmless as a peer that's cut off, and a peer that never answers doesn't block a round either.
+- **Also:** the writer's own rounds note the refusal for the adopt duty below.
+
+**The fix: the live writer adopts the term.**
+- **How the writer notices**, with no new wire field:
+  - it notes each node it answers with `newer_map_version` (the Lease handler), and each node whose map push the term fence refuses (matched by the refusal's marker, as a divergent push's is);
+  - once one has been behind for a lease, the writer's duties ask its `Status`. `NodeStatus.writer_term` is the highest term it knows, a vote's included, so one above the map's is a refused term N.
+- **The election:** the writer holds an election at N + 1 (pre-vote, vote, a WRITER event from it to itself), and the stranded node takes the term-N + 1 map. Every voter has this writer's lease running, so a ballot from the holder of a voter's live writer lease, at the map's term, passes the pre-vote's margin check. That's the holder only: any other candidate still waits the margin out.
+- **The guards:**
+  - **Only a live writer:** it goes ahead only while it holds a writer lease from a renewal round that began after it saw the node behind. Had term N won, this writer's lease would have lapsed, and it does nothing.
+  - **No storm:** at most one attempt per refused term per lease, retried while the node stays behind.
+
+The seeded model loses a real vote now and then. In a settle phase at the end, every node holds the writer's map and has no vote above it. It also checks that no vote is recorded while another node holds a live writer lease.
 
 ## D331 PR 2: range moves in the map, and the range gates (1.3.0, #1499)
 **The map records each range move in flight, and every partition a move names gates the range's calls.** No data moves yet: the copy is PR 4, and the driver and CLI are PR 5. Additive on the wire.

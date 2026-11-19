@@ -190,6 +190,10 @@ impl Node {
     /// The election (module doc), after a lease round: only while `failover` is on, this node
     /// isn't the writer, and the writer lease has been out here for the failover margin.
     pub(crate) async fn maybe_elect(self: &Arc<Self>) {
+        #[cfg(test)]
+        if super::seam(&super::NO_ELECTION, &self.dir) {
+            return;
+        }
         let Ok(map) = self.get_map() else { return };
         let margin = self.peers.failover_after;
         let ready = map.failover
@@ -293,6 +297,9 @@ impl Node {
         // meanwhile ends the duties.
         rt.spawn(async move {
             if let Some(node) = claimed.0.upgrade() {
+                node.maybe_adopt_term().await;
+            }
+            if let Some(node) = claimed.0.upgrade() {
                 node.maybe_elect().await;
             }
             if let Some(node) = claimed.0.upgrade() {
@@ -300,6 +307,84 @@ impl Node {
             }
             drop(claimed);
         });
+    }
+
+    /// #2073 (simp724's design): a node that voted in an election that lost takes no map
+    /// below that term (the term fence), so it stays on its old map with its partitions
+    /// fenced. The live writer adopts the term: an election at the one above, which its
+    /// majority grants (the holder's exception in the pre-vote). It never loosens a vote's
+    /// promise, and a term that really won isn't disturbed: the writer goes ahead only while
+    /// it holds a writer lease from a round that began after it saw the node behind (were
+    /// that term the winner, this lease would have lapsed). One attempt per refused term per
+    /// lease, while the node stays behind.
+    pub(crate) async fn maybe_adopt_term(self: &Arc<Self>) {
+        #[cfg(test)]
+        if super::seam(&super::NO_ADOPT, &self.dir) {
+            return;
+        }
+        let Ok(map) = self.get_map() else { return };
+        if schema::writer(&map) != self.id || self.writer_may_change(&map).is_err() {
+            return;
+        }
+        let now = self.grants.clock().now();
+        let lease = self.grants.lease();
+        let due = self
+            .stranded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .due(&map, now, lease);
+        if due.is_empty() {
+            return;
+        }
+        // Each one's highest known term, from its `Status`: one above the map's is a vote
+        // the fence holds it to.
+        let mut refused: Option<(u64, u64, String)> = None;
+        for (id, st) in self.survey(&map).await {
+            let (Some(st), Some(&(_, seen))) = (st, due.iter().find(|(d, _)| *d == id)) else {
+                continue;
+            };
+            if st.writer_term > map.writer_term
+                && refused.as_ref().is_none_or(|(n, ..)| st.writer_term > *n)
+            {
+                refused = Some((st.writer_term, seen, id));
+            }
+        }
+        let Some((n, seen, on)) = refused else { return };
+        let (term, end) = *self
+            .writer_lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if term != map.writer_term || end <= super::lease::holder_end(seen, lease) {
+            return;
+        }
+        let now = self.grants.clock().now();
+        if !self
+            .stranded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_term(n, now, lease)
+        {
+            return;
+        }
+        // The survey took time: still this map's writer, with its lease (simp724's (a)).
+        let still = self
+            .get_map()
+            .is_ok_and(|m| (m.writer_term, m.map_version) == (map.writer_term, map.map_version))
+            && self.writer_may_change(&map).is_ok();
+        if !still {
+            return;
+        }
+        match self.elect(&map, n + 1).await {
+            Ok(()) => eprintln!(
+                "phdb serve: took writer term {} above term {n}, which node {on} voted for in \
+                 an election that lost, so that it takes the map again (#2073)",
+                n + 1
+            ),
+            Err(e) => eprintln!(
+                "phdb serve: taking writer term {} above node {on}'s vote for term {n}: {e}",
+                n + 1
+            ),
+        }
     }
 
     fn elect_since(&self) -> std::sync::MutexGuard<'_, Option<tokio::time::Instant>> {
@@ -376,6 +461,11 @@ impl Node {
             Ok(r) if !r.granted.is_empty() => granted.push((self.id.clone(), None)),
             Ok(r) => why.push(format!("{}: {}", self.id, refusal(&r))),
             Err(e) => why.push(format!("{}: {}", self.id, e.message)),
+        }
+        #[cfg(test)]
+        if !req.pre_vote && super::seam(&super::DROP_VOTES, &self.dir) {
+            why.push("its vote requests were dropped (a test's seam)".to_owned());
+            return (granted, why);
         }
         let mut asks = tokio::task::JoinSet::new();
         for n in map.nodes.iter().filter(|n| n.id != self.id) {
@@ -510,6 +600,64 @@ impl Node {
 }
 
 /// Why a vote wasn't granted, from its answer.
+/// The writer's watch for nodes a lost election stranded (#2073).
+#[derive(Debug, Default)]
+pub(crate) struct Stranded {
+    /// Each suspect, and since when on the lease clock: a node the writer kept answering
+    /// with its newer map, or whose push the term fence refused.
+    suspects: std::collections::HashMap<String, u64>,
+    /// The refused term last tried, and when: one attempt per term per lease (simp724).
+    tried: Option<(u64, u64)>,
+}
+
+impl Stranded {
+    /// The writer answered `node`'s lease request with its newer map at `now`.
+    pub(crate) fn behind(&mut self, node: &str, now: u64) {
+        self.suspects.entry(node.to_owned()).or_insert(now);
+    }
+
+    /// `node` asked at a map no older than the writer's.
+    pub(crate) fn caught_up(&mut self, node: &str) {
+        self.suspects.remove(node);
+    }
+
+    /// The term fence refused the writer's push to `node` at `now`: it's looked at on the
+    /// next duty, not after a lease more.
+    pub(crate) fn refused(&mut self, node: &str, now: u64, lease: Duration) {
+        let since = now.saturating_sub(nanos(lease));
+        let at = self.suspects.entry(node.to_owned()).or_insert(since);
+        *at = (*at).min(since);
+    }
+
+    /// The suspects of `map` behind for a lease or more at `now`, each with since when.
+    /// One the map no longer lists is dropped.
+    fn due(&mut self, map: &ClusterMap, now: u64, lease: Duration) -> Vec<(String, u64)> {
+        self.suspects
+            .retain(|id, _| map.nodes.iter().any(|n| n.id == *id));
+        self.suspects
+            .iter()
+            .filter(|(_, since)| now.saturating_sub(**since) >= nanos(lease))
+            .map(|(id, since)| (id.clone(), *since))
+            .collect()
+    }
+
+    /// Whether to try refused term `n` at `now`: not tried within a lease.
+    fn try_term(&mut self, n: u64, now: u64, lease: Duration) -> bool {
+        if self
+            .tried
+            .is_some_and(|(t, at)| t == n && now.saturating_sub(at) < nanos(lease))
+        {
+            return false;
+        }
+        self.tried = Some((n, now));
+        true
+    }
+}
+
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn refusal(r: &LeaseResponse) -> String {
     if let Some(w) = r.withheld.first() {
         return format!(
@@ -610,6 +758,9 @@ mod model {
         /// Every map written, by `(term, version)`: its contents' tag.
         written: HashMap<(u64, u64), u64>,
         tag: u64,
+        /// Whether an election can lose its vote after its pre-vote passed (#2073): off in the
+        /// settle phase.
+        lose_votes: bool,
     }
 
     impl World {
@@ -721,24 +872,39 @@ mod model {
         /// [`Self::ballot`], then the pre-vote's invariant (D330 PR 2, simp724): a node that
         /// can't reach a majority records no vote, its own or another's, so isolation never
         /// raises a term.
-        fn elect(&mut self, i: usize, margin: Duration, seed: u64) {
+        /// And (#2073, simp724): no vote is recorded while another node holds a live writer
+        /// lease. With `adopt`, `i` is the writer adopting a term a lost election left.
+        fn elect(&mut self, i: usize, margin: Duration, seed: u64, adopt: bool) {
             let reachable = (0..NODES).filter(|&j| self.reach(i, j)).count();
+            let other = (0..NODES).find(|&j| j != i && self.holds(j));
             let before: Vec<u64> = self.nodes.iter().map(|n| n.grants.voted()).collect();
-            self.ballot(i, margin, seed);
+            self.ballot(i, margin, seed, adopt);
+            let after: Vec<u64> = self.nodes.iter().map(|n| n.grants.voted()).collect();
             if reachable * 2 <= NODES {
-                let after: Vec<u64> = self.nodes.iter().map(|n| n.grants.voted()).collect();
                 assert_eq!(
                     before, after,
                     "seed {seed}: n{i}, reaching {reachable} of {NODES}, recorded a vote"
+                );
+            }
+            if let Some(j) = other {
+                assert_eq!(
+                    before, after,
+                    "seed {seed}: n{i}'s election recorded a vote while n{j} holds the writer lease"
                 );
             }
         }
 
         /// The election as `elect` runs it: the pre-vote, then the vote, through the grantors'
         /// own [`Grants::pre_vote`] and [`Grants::vote`].
-        fn ballot(&mut self, i: usize, margin: Duration, seed: u64) {
+        fn ballot(&mut self, i: usize, margin: Duration, seed: u64, adopt: bool) {
             let mine = self.nodes[i].map.clone();
-            if schema::writer(&mine) == id(i) || self.nodes[i].grants.writer_lapsed() < margin {
+            if adopt {
+                if schema::writer(&mine) != id(i) || !self.holds(i) {
+                    return;
+                }
+            } else if schema::writer(&mine) == id(i)
+                || self.nodes[i].grants.writer_lapsed() < margin
+            {
                 return;
             }
             let mut term = self.nodes[i].grants.term_floor(&mine);
@@ -746,6 +912,10 @@ mod model {
                 if self.reach(i, j) {
                     term = term.max(self.nodes[j].grants.term_floor(&self.nodes[j].map));
                 }
+            }
+            // The writer adopts only a term above its map's that a node it reaches holds.
+            if adopt && term <= mine.writer_term {
+                return;
             }
             term += 1;
             let t0 = self.nodes[i].clock.now();
@@ -777,6 +947,13 @@ mod model {
                 })
                 .count();
             if would * 2 <= NODES {
+                return;
+            }
+            // A vote lost between the rounds (#2073): the candidate's own is recorded, and
+            // no other node's.
+            if !adopt && self.lose_votes && self.rng.below(6) == 0 {
+                let n = &self.nodes[i];
+                n.grants.vote(&n.map, &req, |_| Ok(())).unwrap();
                 return;
             }
             let mut voters = Vec::new();
@@ -842,6 +1019,7 @@ mod model {
             rng,
             written: HashMap::new(),
             tag: 0,
+            lose_votes: true,
         };
         let margin = LEASE * 2;
         for _ in 0..3_000 {
@@ -858,10 +1036,11 @@ mod model {
             }
             for _ in 0..3 {
                 let i = usize::try_from(w.rng.below(NODES as u64)).unwrap();
-                match w.rng.below(4) {
+                match w.rng.below(5) {
                     0 | 1 => w.renew(i),
                     2 => w.change(i, seed),
-                    _ => w.elect(i, margin, seed),
+                    3 => w.elect(i, margin, seed, false),
+                    _ => w.elect(i, margin, seed, true),
                 }
             }
             let holders: Vec<usize> = (0..NODES).filter(|&i| w.holds(i)).collect();
@@ -873,6 +1052,50 @@ mod model {
         // Elections happened at all (the model isn't vacuous).
         let top = w.nodes.iter().map(|n| n.map.writer_term).max().unwrap();
         assert!(top > 0, "seed {seed}: no election in the run");
+        // Settle (#2073): every node up, no vote lost. Every node then holds the writer's map,
+        // and none is left with a vote above it: a lost election strands no one.
+        w.lose_votes = false;
+        for n in &mut w.nodes {
+            n.up = true;
+        }
+        for _ in 0..1_500 {
+            for n in &w.nodes {
+                let ns = i64::try_from(STEP.as_nanos()).unwrap();
+                n.clock.advance(Duration::from_nanos(
+                    u64::try_from(ns + ns * n.drift / 1000).unwrap(),
+                ));
+            }
+            for _ in 0..3 {
+                let i = usize::try_from(w.rng.below(NODES as u64)).unwrap();
+                match w.rng.below(4) {
+                    0 | 1 => w.renew(i),
+                    2 => w.elect(i, margin, seed, false),
+                    _ => w.elect(i, margin, seed, true),
+                }
+            }
+            let holders: Vec<usize> = (0..NODES).filter(|&i| w.holds(i)).collect();
+            assert!(
+                holders.len() <= 1,
+                "seed {seed}: writer leases held at once by {holders:?} (settling)"
+            );
+        }
+        let maps: Vec<(u64, u64)> = w
+            .nodes
+            .iter()
+            .map(|n| (n.map.writer_term, n.map.map_version))
+            .collect();
+        assert!(
+            maps.iter().all(|m| *m == maps[0]),
+            "seed {seed}: settled nodes hold different maps: {maps:?}"
+        );
+        for (i, n) in w.nodes.iter().enumerate() {
+            assert!(
+                n.grants.voted() <= n.map.writer_term,
+                "seed {seed}: n{i} is left with a vote for term {} above its map's {}",
+                n.grants.voted(),
+                n.map.writer_term
+            );
+        }
     }
 
     #[test]

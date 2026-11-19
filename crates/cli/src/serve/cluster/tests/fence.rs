@@ -2427,9 +2427,10 @@ fn an_owner_cut_off_from_every_node_takes_no_write_once_failed_over_and_serves_n
 }
 
 #[test]
-fn a_blocked_partition_is_surveyed_again_only_after_the_margin() {
+fn a_blocked_partition_is_surveyed_again_only_when_its_block_can_have_ended() {
     // perf287's S1 on #2069: while test 7's cut holds, p3 stays blocked ("still grants");
-    // the writer surveys again only after the failover margin, not on every lease round.
+    // the writer surveys again when that grant can have run out (simp724's nit on #2069,
+    // #2073), not on every lease round.
     let t = failover_rig(true);
     let [a, _, c] = t.ports;
     let pair = |from: usize, to: u16| (t.dirs[from].clone(), format!("127.0.0.1:{to}"));
@@ -2454,10 +2455,11 @@ fn a_blocked_partition_is_surveyed_again_only_after_the_margin() {
         let held = TEST_LEASE * 4;
         tokio::time::sleep(held).await;
         let more = surveys() - before;
-        // The margin is 2·L: at most one survey per margin, plus one at an edge. A lease round
-        // every L/3 would have made twelve.
+        // b renews its grant to c each round, so it has up to L left at each survey: about
+        // one survey per L, plus one at an edge. A lease round every L/3 would have made
+        // twelve.
         assert!(
-            more <= 3,
+            more <= 5,
             "{more} surveys in {held:?} of a blocked partition"
         );
         assert!(blocked_for(a, "waiting: node b").await, "still reported");
@@ -2467,4 +2469,131 @@ fn a_blocked_partition_is_surveyed_again_only_after_the_margin() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|e| *e != ac && *e != ca);
+}
+
+#[test]
+fn a_node_stranded_by_a_lost_vote_takes_the_live_map_once_the_writer_adopts_its_term() {
+    // #2073: with a, the writer, cut off, c passes its pre-vote but its vote requests are
+    // dropped, so it records its own vote and loses (b holds no election). Healed, a is the
+    // writer again, at the lower term, and c's term fence refuses its next map. a adopts the
+    // term above c's vote, and c takes the map and serves p3 again. Before a adopts it
+    // (held off by a seam), c, refusing every push, mustn't stop a's and b's leases: a
+    // fence-refused push counts as no answer, not as behind (relaxing audit120's F2 on
+    // #1899).
+    let t = failover_rig(true);
+    let [a, b, c] = t.ports;
+    // p3 opts out of failover, so it's still c's when c takes the map: while c is stranded
+    // its lease lapses, and the writer would otherwise fail it over to b.
+    t.rt.block_on(async {
+        let mut m = map_of(a).await;
+        m.map_version += 1;
+        for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+            p.set_failover(crate::serve::proto::FailoverMode::Off);
+        }
+        set_at(a, m).await.unwrap();
+    });
+    let seams = || {
+        [
+            (&super::super::NO_ELECTION, t.dirs[1].clone()),
+            (&super::super::DROP_VOTES, t.dirs[2].clone()),
+        ]
+    };
+    for (seam, dir) in seams() {
+        seam.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(dir);
+    }
+    super::super::NO_ADOPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(t.dirs[0].clone());
+    cut(&t, 0, true);
+    let voted = t.rt.block_on(async {
+        eventually_within(FAILOVER_WINDOW, "c to lose an election", async || {
+            status_of(c).await.writer_term > 0
+        })
+        .await;
+        status_of(c).await.writer_term
+    });
+    for (seam, dir) in seams() {
+        seam.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|d| *d != dir);
+    }
+    cut(&t, 0, false);
+    t.rt.block_on(async {
+        // a's next map, once it holds its writer lease again: c's term fence refuses it.
+        let mut last = None;
+        let mut changed = false;
+        for _ in 0..200 {
+            let mut m = map_of(a).await;
+            m.map_version += 1;
+            match set_at(a, m).await {
+                Ok(_) => {
+                    changed = true;
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(changed, "a changed no map: {last:?}");
+        // Still stranded, held there by the seam: a and b keep their partition leases, and a
+        // its writer lease, past any lease from before the change.
+        eventually_within(Duration::from_secs(10), "p1 to serve on a", async || {
+            state(a, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+        tokio::time::sleep(TEST_LEASE * 3).await;
+        let (ours, theirs) = (map_of(a).await, map_of(c).await);
+        assert!(
+            theirs.map_version < ours.map_version,
+            "c took a's map: {theirs:?}"
+        );
+        assert_eq!(
+            state(a, "p1").await,
+            LocalPartitionState::Serving,
+            "p1 on a"
+        );
+        assert_eq!(
+            state(b, "p2").await,
+            LocalPartitionState::Serving,
+            "p2 on b"
+        );
+        let st = status_of(a).await;
+        assert!(st.writer_lease_remaining_ms > 0, "a's writer lease: {st:?}");
+        super::super::NO_ADOPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|d| *d != t.dirs[0]);
+        eventually_within(Duration::from_secs(20), "c to take a's map", async || {
+            let (ours, theirs) = (map_of(a).await, map_of(c).await);
+            ours.writer == "a"
+                && ours.writer_term > voted
+                && (theirs.writer_term, theirs.map_version) == (ours.writer_term, ours.map_version)
+        })
+        .await;
+        let st = status_of(c).await;
+        assert!(st.writer_term <= map_of(c).await.writer_term, "{st:?}");
+        eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+            state(c, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        eventually("a write through c", async || {
+            try_put(c, "zed", "after").await.is_ok()
+        })
+        .await;
+        // The election is recorded: a WRITER event from a to a, above c's vote.
+        let m = map_of(a).await;
+        assert!(
+            m.failovers.iter().any(|e| {
+                e.kind() == crate::serve::proto::FailoverKind::Writer
+                    && e.from == "a"
+                    && e.to == "a"
+                    && e.writer_term > voted
+            }),
+            "{:?}",
+            m.failovers
+        );
+    });
 }

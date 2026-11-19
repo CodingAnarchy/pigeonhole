@@ -252,6 +252,30 @@ pub(crate) static OLD_INDEXES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 #[cfg(test)]
 pub(crate) static HOLD_STATUS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// A fault seam (tests, #2073): nodes that hold no election while their cluster directory is
+/// listed.
+#[cfg(test)]
+pub(crate) static NO_ELECTION: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): candidates whose real vote requests reach no peer, past a
+/// pre-vote that did: an election lost between the two rounds. Its own vote is recorded.
+#[cfg(test)]
+pub(crate) static DROP_VOTES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): writers that don't adopt a stranded node's term, so a test
+/// can watch the cluster with the node still stranded.
+#[cfg(test)]
+pub(crate) static NO_ADOPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Whether the seam `list` names this node's directory `dir`.
+#[cfg(test)]
+pub(crate) fn seam(list: &Mutex<Vec<PathBuf>>, dir: &Path) -> bool {
+    list.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}
+
 /// How [`OLD_NEAREST`] has a node act.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -427,6 +451,8 @@ pub(crate) struct Node {
     /// The writer's failover state (D330 PR 2): when it took office, the last survey, the
     /// promote in progress.
     failovers: failover::Failovers,
+    /// The writer's watch for nodes a lost election stranded (#2073).
+    stranded: Mutex<writer::Stranded>,
     /// The node's device ceiling (D332): the highest one-second rate of its partitions'
     /// device bytes within `--balance-window`, fed by [`Node::watch_device`].
     device_ceiling: load::DeviceCeiling,
@@ -514,6 +540,7 @@ impl Node {
             elect_since: Mutex::new(None),
             duties: std::sync::atomic::AtomicBool::new(false),
             failovers: failover::Failovers::default(),
+            stranded: Mutex::new(writer::Stranded::default()),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -614,8 +641,8 @@ impl Node {
             let voted = self.grants.voted();
             if map.writer_term < voted {
                 return Err(ApiError::failed_precondition(format!(
-                    "the map is at writer term {}, but this node voted for term {voted}: it's \
-                     from a writer that has been replaced (D330)",
+                    "the map is at writer term {}, but {VOTED_ABOVE} {voted}: it's from a writer \
+                     that has been replaced (D330)",
                     map.writer_term
                 )));
             }
@@ -1060,6 +1087,17 @@ impl Node {
                     && e.contains(DIVERGENT)
                 {
                     node.state().divergent.insert(id.clone());
+                }
+                // A node the term fence keeps from this map: it voted in an election that
+                // lost (#2073). The writer's duties look at it.
+                if let Err(e) = &result
+                    && e.contains(VOTED_ABOVE)
+                {
+                    let now = node.grants.clock().now();
+                    node.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .refused(&id, now, node.grants.lease());
                 }
                 NodePush {
                     node: id,
@@ -1850,6 +1888,10 @@ impl Node {
 /// would be sturdier across versions, once a client other than a node needs it.
 const DIVERGENT: &str = "divergent map";
 
+/// The marker the term fence's refusal carries (D330), so a writer whose push it refuses
+/// looks at the node (#2073). Matched in the message, as [`DIVERGENT`] is.
+const VOTED_ABOVE: &str = "this node voted for term";
+
 /// The `Cluster` service over gRPC.
 #[derive(Debug, Clone)]
 /// The `Cluster` service: the node, and on a node that serves data (not a bare node in a
@@ -1973,7 +2015,23 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         if self.0.is_vote(&mine, &req) {
             return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
         }
-        Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
+        let r = self.0.grants.grant(&mine, &req)?;
+        // The writer notes an asker it answers with its newer map (#2073): one that stays
+        // behind may be stranded by the term fence.
+        if schema::writer(&mine) == self.0.id {
+            let now = self.0.grants.clock().now();
+            let mut s = self
+                .0
+                .stranded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if r.newer_map_version != 0 {
+                s.behind(&req.node_id, now);
+            } else {
+                s.caught_up(&req.node_id);
+            }
+        }
+        Ok(tonic::Response::new(r))
     }
 
     /// Node to node (D326 PR 2): a node gave up partitions it closed. Cluster scope.
