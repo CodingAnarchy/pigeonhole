@@ -1296,6 +1296,18 @@ pub(crate) fn unanswered(e: &ApiError) -> bool {
     )
 }
 
+/// Whether an ack sent with `answer` is still owed (audit120's Q2 on #2078): only while the
+/// home gave no answer ([`unanswered`], or not asked this pass) or is still committing. A
+/// COMMITTED answer took the ack; an aborted or unknown record, or the home's own error
+/// about it, never will.
+pub(crate) fn keep_ack(answer: &Option<Result<proto::TxnResolution, ApiError>>) -> bool {
+    match answer {
+        None => true,
+        Some(Ok(r)) => r.state == proto::TxnOutcomeState::InProgress as i32,
+        Some(Err(e)) => unanswered(e),
+    }
+}
+
 /// A resolver pass's asks, one home's in turn and up to `limit` homes at once (#2078), each
 /// through `ask`. Once a home gives no answer ([`unanswered`]), its remaining asks this
 /// pass aren't made (`None`), so a dead home costs one request timeout, not one per share,
@@ -1409,6 +1421,11 @@ pub(crate) fn start_resolver(
                             continue;
                         };
                         let Some(home) = home_of(&text) else {
+                            cluster.spanning.note(
+                                partition,
+                                text.as_bytes(),
+                                Some("not a spanning transaction's id".into()),
+                            );
                             continue;
                         };
                         by_home.entry(home).or_default().push(Ask::Share {
@@ -1456,14 +1473,7 @@ pub(crate) fn start_resolver(
                 for (a, answer) in asked {
                     match a {
                         Ask::Ack { partition, xid } => {
-                            // Kept only while the home gives no answer, or is still
-                            // committing: a COMMITTED answer took the ack, and an aborted or
-                            // unknown record never will (audit120's Q2 on #2078).
-                            let keep = match &answer {
-                                None => true,
-                                Some(Ok(r)) => r.state == St::InProgress as i32,
-                                Some(Err(e)) => unanswered(e),
-                            };
+                            let keep = keep_ack(&answer);
                             cluster.spanning.ack_sent((xid, partition), keep);
                         }
                         Ask::Share { partition, xid } => {
@@ -1553,11 +1563,73 @@ pub(crate) fn start_resolver(
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, Ask, ask_homes, collectable, proto, with_acks};
+    use super::{
+        ApiError, Ask, MAX_ACKS, Spanning, ask_homes, collectable, keep_ack, proto, with_acks,
+    };
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
+    fn an_ack_is_kept_only_while_its_home_gives_no_answer_or_is_still_committing() {
+        // audit120's Q2 and S1 on #2078.
+        use proto::TxnOutcomeState as St;
+        let said = |s: St| {
+            Some(Ok(proto::TxnResolution {
+                state: s as i32,
+                reason: String::new(),
+            }))
+        };
+        assert!(keep_ack(&None), "not asked this pass");
+        assert!(keep_ack(&said(St::InProgress)));
+        assert!(keep_ack(&Some(Err(ApiError::deadline_exceeded()))));
+        assert!(keep_ack(&Some(Err(ApiError::partition_unavailable(
+            "cut off"
+        )))));
+        assert!(!keep_ack(&said(St::Committed)), "taken");
+        assert!(!keep_ack(&said(St::Aborted)), "a marker never takes it");
+        assert!(
+            !keep_ack(&said(St::Unknown)),
+            "a lost record never takes it"
+        );
+        assert!(
+            !keep_ack(&Some(Err(ApiError::not_found("no record")))),
+            "the home's own word"
+        );
+    }
+
+    #[test]
+    fn an_owed_ack_is_due_now_kept_after_a_backoff_dropped_when_done_and_capped() {
+        // audit120's S1 on #2078: queued due now; a kept one isn't due again until its
+        // backoff (doubling from a second); a done one goes; past the cap a new one drops.
+        let s = Spanning::new();
+        let key = ("p2:h1-00".to_owned(), "p1".to_owned());
+        s.queue_ack(&key.0, &key.1);
+        assert_eq!(s.due_acks(Instant::now()), vec![key.clone()]);
+        s.ack_sent(key.clone(), true);
+        assert!(
+            s.due_acks(Instant::now()).is_empty(),
+            "kept, not due before its backoff"
+        );
+        let later = |ms| Instant::now() + Duration::from_millis(ms);
+        assert_eq!(s.due_acks(later(1100)), vec![key.clone()]);
+        s.ack_sent(key.clone(), true);
+        assert!(s.due_acks(later(1100)).is_empty(), "the backoff doubled");
+        assert_eq!(s.due_acks(later(2100)), vec![key.clone()]);
+        s.ack_sent(key.clone(), false);
+        assert!(s.due_acks(later(120_000)).is_empty(), "done");
+        for i in 0..MAX_ACKS {
+            s.queue_ack(&format!("p2:h1-{i:032x}"), "p1");
+        }
+        s.queue_ack("p2:h1-over", "p1");
+        let due = s.due_acks(Instant::now());
+        assert_eq!(due.len(), MAX_ACKS, "capped");
+        assert!(
+            !due.iter().any(|(x, _)| x == "p2:h1-over"),
+            "the one past the cap dropped"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_dead_home_costs_one_ask_a_pass_and_the_other_homes_go_on_beside_it() {
         // #2078 (audit120's S3 on #2076, Q1 on the plan): three shares of a home that never
         // answers cost one ask and one wait, not three; a live home's share is answered
@@ -1575,7 +1647,8 @@ mod tests {
         let asked: Arc<Mutex<Vec<String>>> = Arc::default();
         let log = Arc::clone(&asked);
         let wait = Duration::from_millis(300);
-        let started = std::time::Instant::now();
+        // Paused time (audit120's N1): the sleeps advance it exactly, whatever the runner.
+        let started = tokio::time::Instant::now();
         let out = ask_homes(homes, 2, move |a| {
             let log = Arc::clone(&log);
             async move {
