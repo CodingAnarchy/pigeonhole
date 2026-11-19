@@ -723,11 +723,14 @@ impl Node {
         // An answerer that was behind counts once it took the map. One that didn't blocks
         // the round: it answered with an older map, and may be an old owner that hasn't taken
         // the move yet (audit120's F2). A peer that never answered doesn't block, and nor
-        // does one whose term fence refused the map (#2073): it voted in an election that
-        // lost, so it takes no map below that term, and with no majority holding its own map
-        // it holds no lease either. It counts as one that never answered; were it to block,
-        // no node would confirm anything, the writer's lease included, and the writer could
-        // never adopt the term that lets it take the map.
+        // does one whose term fence refused the map (#2073): it voted above the map's term,
+        // and takes no map below it. It counts as one that never answered. That's safe by
+        // D326, not by F2 (audit120's S1 on #2083): it can't renew a lease once a majority
+        // holds a newer map, a lease it still holds is withheld from any other node by its
+        // grantors until it runs out, and a round that leaves it out still needs a majority of
+        // holders and of grants. Were it to block, a node stranded by a lost vote would stop
+        // every node's leases, the writer's included, and the writer could never adopt the
+        // term that lets it take the map.
         let mut behind = Vec::new();
         let mut holding: Vec<(String, String)> = answers
             .iter()

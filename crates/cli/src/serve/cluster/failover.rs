@@ -283,8 +283,9 @@ impl Node {
         for d in down {
             // Due again once the grant it may wait on ends (simp724's nit on #2069), else
             // after the margin.
-            let again = still_granted(&d, &statuses)
-                .map_or(margin, |(_, g)| g.remaining_ms.saturating_mul(1_000_000));
+            let again = still_granted(&d, &statuses).map_or(margin, |(_, g)| {
+                nanos(Duration::from_millis(g.remaining_ms))
+            });
             due.push((d.p.id.clone(), now.saturating_add(again)));
             match self.qualify(&map, &d, &statuses, now) {
                 Ok(to) if chosen.is_none() => chosen = Some((d, to)),

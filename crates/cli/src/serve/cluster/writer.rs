@@ -603,9 +603,11 @@ impl Node {
 /// The writer's watch for nodes a lost election stranded (#2073).
 #[derive(Debug, Default)]
 pub(crate) struct Stranded {
-    /// Each suspect, and since when on the lease clock: a node the writer kept answering
-    /// with its newer map, or whose push the term fence refused.
-    suspects: std::collections::HashMap<String, u64>,
+    /// Each suspect, on the lease clock: since when it counts as behind (a refusal's is
+    /// backdated a lease, so it's due at once), and when the writer first really saw it
+    /// behind, for the adopt guard (simp724's nit on #2083). A node the writer kept
+    /// answering with its newer map, or whose push the term fence refused.
+    suspects: std::collections::HashMap<String, Suspect>,
     /// The refused term last tried, and when: one attempt per term per lease (simp724).
     tried: Option<(u64, u64)>,
 }
@@ -613,7 +615,10 @@ pub(crate) struct Stranded {
 impl Stranded {
     /// The writer answered `node`'s lease request with its newer map at `now`.
     pub(crate) fn behind(&mut self, node: &str, now: u64) {
-        self.suspects.entry(node.to_owned()).or_insert(now);
+        self.suspects.entry(node.to_owned()).or_insert(Suspect {
+            since: now,
+            seen: now,
+        });
     }
 
     /// `node` asked at a map no older than the writer's.
@@ -625,19 +630,22 @@ impl Stranded {
     /// next duty, not after a lease more.
     pub(crate) fn refused(&mut self, node: &str, now: u64, lease: Duration) {
         let since = now.saturating_sub(nanos(lease));
-        let at = self.suspects.entry(node.to_owned()).or_insert(since);
-        *at = (*at).min(since);
+        let s = self
+            .suspects
+            .entry(node.to_owned())
+            .or_insert(Suspect { since, seen: now });
+        s.since = s.since.min(since);
     }
 
-    /// The suspects of `map` behind for a lease or more at `now`, each with since when.
-    /// One the map no longer lists is dropped.
+    /// The suspects of `map` behind for a lease or more at `now`, each with when the writer
+    /// first saw it behind. One the map no longer lists is dropped.
     fn due(&mut self, map: &ClusterMap, now: u64, lease: Duration) -> Vec<(String, u64)> {
         self.suspects
             .retain(|id, _| map.nodes.iter().any(|n| n.id == *id));
         self.suspects
             .iter()
-            .filter(|(_, since)| now.saturating_sub(**since) >= nanos(lease))
-            .map(|(id, since)| (id.clone(), *since))
+            .filter(|(_, s)| now.saturating_sub(s.since) >= nanos(lease))
+            .map(|(id, s)| (id.clone(), s.seen))
             .collect()
     }
 
@@ -652,6 +660,15 @@ impl Stranded {
         self.tried = Some((n, now));
         true
     }
+}
+
+/// A [`Stranded`] suspect's two times, on the lease clock.
+#[derive(Clone, Copy, Debug)]
+struct Suspect {
+    /// Since when it counts as behind.
+    since: u64,
+    /// When the writer first saw it behind: B2's guard needs a lease round begun after.
+    seen: u64,
 }
 
 fn nanos(d: Duration) -> u64 {
@@ -669,6 +686,57 @@ fn refusal(r: &LeaseResponse) -> String {
         return format!("in its start grace for {} ms more", r.grace_remaining_ms);
     }
     format!("it knows writer term {}", r.writer_term)
+}
+
+/// #2073's suspects (simp724's nit on #2083): a refused push is due at once, but the adopt
+/// guard keeps the time the writer really saw it.
+#[cfg(test)]
+mod stranded {
+    use std::time::Duration;
+
+    use super::super::proto::{ClusterMap, Node as MapNode};
+    use super::Stranded;
+
+    const L: Duration = Duration::from_secs(3);
+    const S: u64 = 1_000_000_000;
+
+    fn map() -> ClusterMap {
+        ClusterMap {
+            nodes: ["a", "b", "c"]
+                .map(|id| MapNode {
+                    id: id.into(),
+                    ..MapNode::default()
+                })
+                .into(),
+            ..ClusterMap::default()
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_due_at_once_and_keeps_its_real_time_for_the_guard() {
+        let mut s = Stranded::default();
+        s.behind("b", 100 * S);
+        s.refused("c", 100 * S, L);
+        // b only once it has been behind for a lease; c at once, seen when refused.
+        assert_eq!(s.due(&map(), 101 * S, L), vec![("c".to_owned(), 100 * S)]);
+        let mut due = s.due(&map(), 103 * S, L);
+        due.sort();
+        assert_eq!(
+            due,
+            vec![("b".to_owned(), 100 * S), ("c".to_owned(), 100 * S)]
+        );
+        // A later refusal of b makes it due at once, but keeps its first sighting.
+        let mut s2 = Stranded::default();
+        s2.behind("b", 100 * S);
+        s2.refused("b", 101 * S, L);
+        assert_eq!(s2.due(&map(), 101 * S, L), vec![("b".to_owned(), 100 * S)]);
+        // Caught up, or no longer in the map: gone.
+        s2.caught_up("b");
+        assert!(s2.due(&map(), 200 * S, L).is_empty());
+        s.suspects.clear();
+        s.refused("d", 100 * S, L);
+        assert!(s.due(&map(), 200 * S, L).is_empty());
+    }
 }
 
 /// D330 PR 1's seeded model, the writer half (design §8 test 5, with simp724's addition):

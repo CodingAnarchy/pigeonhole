@@ -772,7 +772,12 @@ No other move takes P to an epoch at or below a pending one's.
 
 **Worse: it stopped every other node's leases too.** Each node's lease round pushes its map to a peer that answers with an older one. A peer that didn't take it blocked the round (audit120's F2 on #1899), so with the stranded node refusing every push, no node confirmed a lease, the writer's included.
 - **Now:** a peer whose push the term fence refuses counts as one that never answered, not as behind.
-- **Why that's safe:** the stranded node takes no map below its vote, and no majority holds its old map, so it holds no lease. It's as harmless as a peer that's cut off, and a peer that never answers doesn't block a round either.
+- **Why that's safe** (D326, not F2; audit120's S1 on #2083):
+  - the node can't renew a lease once a majority holds a newer map;
+  - its grantors withhold from any other node a lease it still holds, until that lease runs out;
+  - a round that leaves it out still needs a majority of holders and of grants.
+
+  F2 predates D326, and the grant rule now covers the old-owner case it was written for. The fence's marker also matches a voter in an election that won or is still running. Then the pusher is a replaced writer, and its majority includes a voter that refuses the push or refuses its writer lease.
 - **Also:** the writer's own rounds note the refusal for the adopt duty below.
 
 **The fix: the live writer adopts the term.**
