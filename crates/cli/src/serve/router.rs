@@ -265,7 +265,7 @@ impl Router {
     }
 
     /// `Admin.PartitionUpload` (D317): `stream`'s file of a partition this node doesn't
-    /// have open, staged for the stamp that installs it. Admin scope; a cluster node only.
+    /// have open, staged for the stamp that installs it. Admin scope, or a node's cluster token for a relocation's set (D332); a cluster node only.
     pub(crate) async fn partition_upload(
         &self,
         caller: &Caller,
@@ -291,6 +291,15 @@ impl Router {
                 "an upload's first message carries its header",
             ));
         };
+        // A node's own token uploads only what a move needs (simp724's S1 on #2094): a
+        // restore is an admin's upload.
+        if caller.scope == super::auth::Scope::Cluster
+            && header.purpose() != super::proto::PartitionUploadPurpose::Relocate
+        {
+            return Err(ApiError::permission_denied(
+                "upload a partition for anything but a move: a restore is an admin's upload",
+            ));
+        }
         let partitions = self.partitions();
         let open = |p: &str| partitions.iter().any(|(id, _)| id == p);
         let mut writing = uploads.begin(header, open)?;

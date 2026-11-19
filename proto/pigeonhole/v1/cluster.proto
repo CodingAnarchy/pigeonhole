@@ -68,27 +68,28 @@ service Cluster {
   // (`fenced.json`). Its writes then answer `Fenced` (not committed: retry once it's
   // unfenced, or at its new node); its reads go on. Answers once every write admitted before
   // the flag has answered. `FailedPrecondition` for a partition this node doesn't hold.
-  // Admin scope.
+  // Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
   rpc Fence(PartitionRequest) returns (LocalPartition);
   // Clears the fence, after reopening the partition if it's closed. `FailedPrecondition`
   // unless this node's map names it as the partition's node at the epoch in its file.
-  // Admin scope.
+  // Admin scope, or a node's cluster token (the map's writer undoing its own move's fence:
+  // D332, D331 PR 5).
   rpc Unfence(PartitionRequest) returns (LocalPartition);
   // D317 amendment 2: closes a fenced partition, so its files are final. Its feed streams
   // and scans end with `PartitionUnavailable`, and so do its calls from then on. Answers
   // `CLOSED` at once; `files` fills in once they're hashed (`Status`). `FailedPrecondition`
-  // unless it's fenced. Admin scope.
+  // unless it's fenced. Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
   rpc Close(PartitionRequest) returns (LocalPartition);
   // Moves a partition's files left on this node, after it moved away, into
   // `<cluster dir>/.phdb-dropped/` (nothing is deleted). `FailedPrecondition` while this
-  // node's map names it as the partition's node, or while it's open. Admin scope.
+  // node's map names it as the partition's node, or while it's open. Admin scope, or a node's cluster token (the map's writer running a move: D332, D331 PR 5).
   rpc DropPartition(PartitionRequest) returns (LocalPartition);
   // `phdb cluster relocate`'s first step, on the partition's new node: installs a complete
   // staged file set (`Admin.PartitionUpload`), if one is staged, then rewrites the file's
   // identity from `from_epoch` to `to_epoch`. A file already at `to_epoch` is a no-op, so a
   // rerun resumes. The reply's `files` is the set this call installed (none: empty).
   // `FailedPrecondition` while the partition is open here, or for a file of another
-  // cluster, partition or epoch. Admin scope.
+  // cluster, partition or epoch. Admin scope, or a node's cluster token.
   rpc Stamp(StampRequest) returns (LocalPartition);
   // Node to node (D326): a lease round's request for this node's grant of the partitions it
   // names, for `--cluster-lease-ms` on this node's clock from its receipt. This node grants

@@ -186,7 +186,7 @@ fn info_flush_and_compact_cover_the_nodes_own_partitions() {
 #[test]
 fn a_moves_calls_take_a_nodes_cluster_token_and_still_refuse_a_clients() {
     // The coordinator's scope ruling (D332 PR 3, D331 PR 5): the map's writer runs a move
-    // with its own cluster token, so Fence, Close, DropPartition, BackupDownload and
+    // with its own cluster token, so Fence, Unfence, Close, DropPartition, BackupDownload and
     // PartitionUpload take Scope::Cluster beside Admin. A client's write token is still
     // refused each one.
     let tokens = format!("write t0ken-w\nadmin t0ken-adm\ncluster {NODE_TOKEN}\n");
@@ -223,6 +223,10 @@ fn a_moves_calls_take_a_nodes_cluster_token_and_still_refuse_a_clients() {
                 "Close",
             );
             refused(
+                c().await.unfence(with(req(), Some(token))).await.map(drop),
+                "Unfence",
+            );
+            refused(
                 c().await
                     .drop_partition(with(req(), Some(token)))
                     .await
@@ -235,6 +239,7 @@ fn a_moves_calls_take_a_nodes_cluster_token_and_still_refuse_a_clients() {
                     .backup_download(with(
                         crate::serve::proto::BackupDownloadRequest {
                             partition: "p1".into(),
+                            fenced_file: Some("p1.phdb".into()),
                             ..Default::default()
                         },
                         Some(token),
@@ -254,5 +259,62 @@ fn a_moves_calls_take_a_nodes_cluster_token_and_still_refuse_a_clients() {
                 "PartitionUpload",
             );
         }
+        // Upload status: the cluster token, not a client's (audit120's S2).
+        for (token, denied) in [(NODE_TOKEN, false), ("t0ken-w", true)] {
+            let r = admin(a)
+                .await
+                .partition_upload_status(with(
+                    crate::serve::proto::PartitionUploadStatusRequest {
+                        upload_id: "0123456789abcdef".repeat(2),
+                        partition: "p1".into(),
+                    },
+                    Some(token),
+                ))
+                .await;
+            assert_eq!(
+                r.as_ref()
+                    .is_err_and(|e| e.code() == tonic::Code::PermissionDenied),
+                denied,
+                "PartitionUploadStatus with {token}: {r:?}"
+            );
+        }
+        // Still admin only for the cluster token (audit120's S2): a download that isn't a
+        // partition's closed set or a replica's bootstrap.
+        let e = admin(a)
+            .await
+            .backup_download(with(
+                crate::serve::proto::BackupDownloadRequest::default(),
+                Some(NODE_TOKEN),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.code(),
+            tonic::Code::PermissionDenied,
+            "a whole download: {e}"
+        );
+        // A restore is an admin's upload: the cluster token is refused one (simp724's S1).
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(crate::serve::proto::PartitionUploadChunk {
+            header: Some(crate::serve::proto::PartitionUploadHeader {
+                partition: "p1".into(),
+                purpose: crate::serve::proto::PartitionUploadPurpose::Restore as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let e = admin(a)
+            .await
+            .partition_upload(with(super::upload::Chunks(rx), Some(NODE_TOKEN)))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied, "{e}");
+        assert!(
+            e.message().contains("a restore is an admin's upload"),
+            "{e}"
+        );
     });
 }

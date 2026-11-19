@@ -1926,7 +1926,8 @@ impl ClusterGrpc {
 
 #[tonic::async_trait]
 impl proto::cluster_server::Cluster for ClusterGrpc {
-    /// `phdb cluster fence P --node N` (D317 ticket 6): admin scope.
+    /// `phdb cluster fence P --node N` (D317 ticket 6): admin scope, or a node's cluster token
+    /// (a move the map's writer runs, D332).
     async fn fence(
         &self,
         req: Request<proto::PartitionRequest>,
@@ -1938,19 +1939,22 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
-    /// `phdb cluster unfence P --node N` (D317 ticket 6): admin scope.
+    /// `phdb cluster unfence P --node N` (D317 ticket 6): admin scope, or a node's cluster
+    /// token (a move the map's writer runs lifts its own fence on abort, D332).
     async fn unfence(
         &self,
         req: Request<proto::PartitionRequest>,
     ) -> Result<tonic::Response<proto::LocalPartition>, Status> {
-        self.caller(&req, &[Scope::Admin], "unfence a partition")?;
+        // A move the writer runs lifts its own fence on abort (the coordinator, #2094).
+        self.caller(&req, &[Scope::Admin, Scope::Cluster], "unfence a partition")?;
         let req = req.into_inner();
         let id = req.partition;
         self.0.unfence(&id, req.force).await?;
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
-    /// `phdb cluster close P --node N` (D317 amendment 2): admin scope.
+    /// `phdb cluster close P --node N` (D317 amendment 2): admin scope, or a node's cluster
+    /// token (a move the map's writer runs, D332).
     async fn close(
         &self,
         req: Request<proto::PartitionRequest>,
@@ -1961,7 +1965,8 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         Ok(tonic::Response::new(self.local(&id).await?))
     }
 
-    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): admin scope.
+    /// `phdb cluster drop-partition P --node N` (D317 ticket 6): admin scope, or a node's
+    /// cluster token (a move the map's writer runs, D332).
     async fn drop_partition(
         &self,
         req: Request<proto::PartitionRequest>,
