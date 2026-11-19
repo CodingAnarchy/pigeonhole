@@ -787,6 +787,8 @@ fn external_pins(
             .unwrap_or_default();
         let mut rec = Recovery::open_read_only(vfs, path, stream, db_id, checkpoint)?;
         rec.accept_silent(silent_ok);
+        // Tagged batches only behind `incompat` bit 2 (D329 2b): this pass runs only with it.
+        rec.accept_xid(true);
         while let Some((_, record)) = rec.next_record()? {
             match record {
                 WalRecord::Prepare { seqno, .. } => {
@@ -1603,6 +1605,9 @@ impl Engine {
                 Recovery::open(&vfs, path, stream, db_id, checkpoint)?
             };
             rec.accept_silent(silent_ok);
+            rec.accept_xid(
+                pager.features().incompat & pigeonhole_format::wal::INCOMPAT_EXTERNAL_PREPARE != 0,
+            );
             let mut records = Vec::new();
             while let Some((end, record)) = rec.next_record()? {
                 match record {
@@ -2447,9 +2452,23 @@ impl Engine {
     /// [`REPLICA_TABLE`]: pigeonhole_format::manifest::REPLICA_TABLE
     pub fn apply_replicated(
         &self,
+        batch: WriteBatch,
+        state: &[u8],
+        max_ts: Timestamp,
+    ) -> Result<CommitInfo> {
+        self.apply_replicated_with(batch, state, max_ts, None)
+    }
+
+    /// [`apply_replicated`](Self::apply_replicated) for a run of one spanning commit's share
+    /// (D329 2b): committed tagged with `xid`, so this replica's own feed delivers it as
+    /// the primary's does. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn apply_replicated_with(
+        &self,
         mut batch: WriteBatch,
         state: &[u8],
         max_ts: Timestamp,
+        xid: Option<&[u8]>,
     ) -> Result<CommitInfo> {
         if batch.is_empty() || !batch.logged() || !batch.row_deletes.is_empty() {
             return Err(Error::InvalidArgument(
@@ -2458,7 +2477,9 @@ impl Engine {
         }
         self.push_replication_state(&mut batch, state)?;
         self.inner.shared.clock.seed_ts(max_ts);
-        self.commit(batch, Some(Durability::GroupSync))
+        self.inner.shared.refuse_blocking_on_driver("commit")?;
+        self.inner
+            .commit_blocking_with(batch, Some(Durability::GroupSync), xid)
     }
 
     /// Holds the change feed's retained history from now on (D331, ICR 0141): retention
@@ -2730,6 +2751,19 @@ impl Engine {
         self.inner.in_doubt()
     }
 
+    /// [`in_doubt`](Self::in_doubt), with each share's batch bytes (what it keeps in the
+    /// WAL, as the in-doubt limit counts it): `(xid, nanoseconds since prepared, bytes)`.
+    pub fn in_doubt_shares(&self) -> Vec<(Vec<u8>, u64, u64)> {
+        let now = self.inner.shared.vfs.monotonic_nanos();
+        self.inner
+            .shared
+            .external
+            .in_doubt()
+            .into_iter()
+            .map(|(xid, e)| (xid, now.saturating_sub(e.prepared_at), e.bytes))
+            .collect()
+    }
+
     /// [`commit`](Self::commit), returning each counter cell `batch` incremented or set,
     /// after this commit (D314): its value as a read at the commit's seqno sees it, with a TTL judged at
     /// the commit's timestamp, in the order the batch first wrote each cell. `batch`
@@ -2750,6 +2784,7 @@ impl Engine {
             None,
             None,
             Some(Arc::clone(&out)),
+            None,
             NoAdmission,
         )? {
             Routed::Sent {
@@ -2782,6 +2817,7 @@ impl Engine {
             None,
             None,
             Some(Arc::clone(&out)),
+            None,
             NoAdmission,
         )? {
             Routed::Sent {
@@ -3055,14 +3091,22 @@ impl Engine {
         let inner = &self.inner;
         let Some(a) = &inner.admission else {
             return inner
-                .route_and_send_with(batch, durability, None, None, returning, NoAdmission)
+                .route_and_send_with(batch, durability, None, None, returning, None, NoAdmission)
                 .and_then(|routed| inner.submission(routed))
                 .map(PendingCommit::from);
         };
         // D236: routed once; the charge goes to the shard the request is sent to (a
         // cross-shard commit's coordinator), on that shard's own count.
         let bytes = crate::admission::batch_bytes(&batch);
-        match inner.route_and_send_with(batch, durability, None, None, returning, (&**a, bytes))? {
+        match inner.route_and_send_with(
+            batch,
+            durability,
+            None,
+            None,
+            returning,
+            None,
+            (&**a, bytes),
+        )? {
             Routed::Held(prepared) => {
                 let shard = usize::from(prepared.target.0);
                 let admit = crate::Admit::new(Some(a), shard, bytes);
@@ -3143,6 +3187,7 @@ impl Engine {
             snapshot,
             reads: Vec::new(),
             batch: WriteBatch::new(),
+            xid: None,
         })
     }
 
@@ -5835,6 +5880,19 @@ impl Inner {
     /// Separates the puts of `builder` above the inline limit into blob files (#230). Waits
     /// for a manifest commit when there is one; the waiting thread drives that commit
     /// itself (`manifest::commit_from_thread`, as `shrink` does), so it may drive a shard.
+    /// Tags routed batch `builder` with `xid`, a spanning commit's (D329 2b), as its last
+    /// step, behind `incompat` bit 2. Rebuilds after it (large values, the split into
+    /// shares, a retry) carry it; the counter pass in `route` runs before it, on a batch with
+    /// no trailer yet. Nothing for an untagged batch.
+    #[inline]
+    fn tag_routed(&self, xid: Option<&[u8]>, builder: &mut BatchBuilder) -> Result<()> {
+        if let Some(xid) = xid {
+            self.flag_external()?;
+            builder.tag_xid(xid)?;
+        }
+        Ok(())
+    }
+
     fn separate_large(
         &self,
         builder: BatchBuilder,
@@ -5955,7 +6013,22 @@ impl Inner {
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
-        let routed = self.route_and_send(batch, durability, validate, predicate, NoAdmission)?;
+        self.submit_with(batch, durability, validate, predicate, None)
+    }
+
+    /// [`submit`](Self::submit) for a transaction that may be a spanning commit's share
+    /// (D329 2b, `xid`). Inlined, so `submit`'s constant `None` folds away (perf2 on #2076).
+    #[inline(always)]
+    pub(crate) fn submit_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        validate: Option<Arc<Validate>>,
+        predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        xid: Option<&[u8]>,
+    ) -> Result<Submission> {
+        let routed =
+            self.route_and_send(batch, durability, validate, predicate, xid, NoAdmission)?;
         self.submission(routed)
     }
 
@@ -6286,15 +6359,20 @@ impl Inner {
         durability: Option<Durability>,
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
+        xid: Option<&[u8]>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
-        self.route_and_send_with(batch, durability, validate, predicate, None, admit)
+        self.route_and_send_with(batch, durability, validate, predicate, None, xid, admit)
     }
 
     /// [`route_and_send`](Self::route_and_send), for a commit that may return its
     /// incremented counters (D314): `returning` is `None` on every other path, a constant the
     /// inlined body folds away.
     #[inline(always)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a constant at its inlined call sites, which fold away (returning, xid)"
+    )]
     pub(crate) fn route_and_send_with<A: Admitter>(
         &self,
         batch: WriteBatch,
@@ -6302,6 +6380,7 @@ impl Inner {
         validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
         returning: Option<crate::shard::ReturnSlot>,
+        xid: Option<&[u8]>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {
         if self.read_only {
@@ -6312,7 +6391,11 @@ impl Inner {
         // One tablet map for the whole routing: its version goes with a cross-shard commit,
         // which a participant moving a tablet refuses and the coordinator retries.
         let view = self.shared.view.load();
-        let (builder, mut shards) = self.route(batch, &view)?;
+        let (mut builder, mut shards) = self.route(batch, &view)?;
+        // A spanning commit's share (D329 2b): `xid` comes with the commit, not on the
+        // batch, so a `WriteBatch` moved through every commit carries nothing for it; `None`
+        // on every other path, a constant the inlined body folds away (perf2's N1 on #2076).
+        self.tag_routed(xid, &mut builder)?;
         let (builder, large) = self.separate_large(builder)?;
         // Every shard that owns a row the transaction read validates it at PREPARE, so two
         // transactions cannot each read what the other writes (write skew).
@@ -6422,7 +6505,19 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        match self.route_and_send(batch, durability, None, None, NoAdmission)? {
+        self.commit_blocking_with(batch, durability, None)
+    }
+
+    /// [`commit_blocking`](Self::commit_blocking) for a replica's run of a spanning commit's
+    /// share (D329 2b, `xid`). Inlined, so `commit_blocking`'s constant `None` folds away.
+    #[inline(always)]
+    fn commit_blocking_with(
+        &self,
+        batch: WriteBatch,
+        durability: Option<Durability>,
+        xid: Option<&[u8]>,
+    ) -> Result<CommitInfo> {
+        match self.route_and_send(batch, durability, None, None, xid, NoAdmission)? {
             // Caller-runs (D321): the commit's shard, which this thread may run itself while
             // its spinning wait goes on. A cross-shard commit's coordinator refuses it (only
             // single-shard commits are a caller's to run).
@@ -7362,6 +7457,27 @@ type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 /// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
 /// the last write.
 ///
+/// Tags `to`, a batch rebuilt from `from`, with `from`'s xid if it has one (D329 2b): the
+/// rebuild's last step, so its pushes never meet the trailer. One bit test for an untagged
+/// batch.
+#[inline]
+pub(crate) fn carry_xid(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    // One byte's test for an untagged batch (perf2's N1 on #2076); the copy out of line.
+    if from.is_tagged() {
+        return carry_xid_cold(from, to);
+    }
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn carry_xid_cold(from: &BatchBuilder, to: &mut BatchBuilder) -> Result<()> {
+    match from.batch().xid() {
+        Some(xid) => Ok(to.tag_xid(xid)?),
+        None => Ok(()),
+    }
+}
+
 /// `combines`: the batch has two or more counter puts or operands, or a write to convert. Without
 /// one, the only change is the fixed timestamp, and the batch is copied straight through: no
 /// map, no list of writes, and the copy sized once (#1795: a lone `incr`'s rebuilt batch grew
@@ -7372,6 +7488,8 @@ fn prepare_counter_writes(
     catalog: &Catalog,
     combines: bool,
 ) -> Result<BatchBuilder> {
+    // Runs inside `route`, before `tag_routed`: the batch has no xid trailer to carry yet.
+    debug_assert!(!batch.is_tagged(), "a tagged batch before routing");
     // Each write may gain an 8-byte timestamp.
     let mut out = BatchBuilder::with_capacity(batch.batch().as_bytes().len() + 8 * batch.len());
     if batch.is_silent() {

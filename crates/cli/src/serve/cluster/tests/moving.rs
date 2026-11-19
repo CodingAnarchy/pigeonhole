@@ -1101,14 +1101,29 @@ fn a_moves_wait_for_a_majority_to_take_its_map_gives_up_at_its_timeout() {
             .unwrap()
             .into_inner()
     });
+    // Each stopped node's port is held by this test once the node lets it go (#2074): a
+    // parallel test's node can't then bind it and answer this test's dials at its own map
+    // version. A dial here connects and never gets an answer, so it counts as missing.
+    let mut held = Vec::new();
     for i in [1, 2] {
         let _ = t.stops.remove(1);
         let port = t.ports[i];
-        t.rt.block_on(eventually("the node to stop", async || {
-            tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_err()
-        }));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(l) => {
+                    held.push(l);
+                    break;
+                }
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "node {i}'s port {port} wasn't freed: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
     }
     t.rt.block_on(async {
         let args = super::super::cli::NodeArgs {

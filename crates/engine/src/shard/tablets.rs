@@ -1281,6 +1281,13 @@ impl ShardState {
                 }
             }
         }
+        // Its shares' xid, if a spanning commit's (D329 2b): every share carries the same.
+        if failed.is_none()
+            && let Some((_, part)) = r.parts.first()
+            && let Err(e) = crate::engine::carry_xid(part, &mut builder)
+        {
+            failed = Some(e);
+        }
         if let Some(e) = failed {
             self.release_shards(r.submitted_at, r.first_seqno, &r.prev_shards, ctx);
             r.reply.notify(Err(e));
@@ -3467,6 +3474,10 @@ pub(crate) fn split_by_shard(
         };
         part.1
             .push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
+    }
+    // Every share of a spanning commit's batch carries its xid (D329 2b).
+    for (_, part) in &mut parts {
+        crate::engine::carry_xid(builder, part)?;
     }
     Ok(parts.into_iter().map(|(s, b)| (s, Arc::new(b))).collect())
 }

@@ -343,7 +343,10 @@ pub(crate) fn served_options(cli: &Cli, args: &ServeArgs) -> Options {
     if let Some(bytes) = args.change_feed {
         options = options.change_feed(pigeonhole::FeedRetention::bytes(bytes));
     }
-    options
+    // D329: shares held in doubt per partition, by count and by the WAL bytes they keep:
+    // past either, a new prepare is refused, so a home that stops deciding can't pin the log
+    // without bound.
+    options.in_doubt_limits(args.txn_max_in_doubt, args.txn_max_in_doubt_wal_bytes)
 }
 
 /// A single node's options: [`served_options`], with `--create`, the shard count and the

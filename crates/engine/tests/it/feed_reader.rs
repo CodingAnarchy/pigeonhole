@@ -2668,3 +2668,88 @@ fn a_skip_index_stays_within_its_cap_and_its_merged_jumps_stay_exact() {
     drop(r);
     db.close().unwrap();
 }
+
+#[test]
+fn a_spanning_commits_shares_carry_its_xid_on_the_feed() {
+    // D329 2b (ICR 0140 amendment 2): a tagged commit's event carries its xid, a single
+    // commit's, a cross-shard round's (every share tagged by the split) and an external
+    // round's alike; an untagged one has none. Across a reopen the WAL's trailers give them
+    // back. The reader's notes are bounded by what it keeps: none once it has drained
+    // (feed1248's condition), a re-read of delivered commits included.
+    let vfs = SimVfs::new(3141);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, b) = tables(&db);
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    // A spanning commit's home share: a transaction tagged with its xid.
+    let tagged = |rows: &[(&Arc<TableInfo>, &[u8])], xid: &[u8]| {
+        let mut txn = db.begin().unwrap();
+        for (t, row) in rows {
+            put(txn.batch(), t, row, b"v");
+        }
+        txn.tag_xid(xid);
+        txn.commit(Some(Durability::GroupSync)).unwrap().seqno
+    };
+    let one = tagged(&[(&a, b"t1")], b"p1:h1-aa");
+    let plain = single(&db, &b, b"plain", Durability::GroupSync);
+    let round = tagged(&[(&a, b"x-a"), (&b, b"x-b")], b"p1:h1-bb");
+    // An external round: its share's own xid.
+    let mut txn = db.begin().unwrap();
+    txn.batch()
+        .put(
+            a.id,
+            a.families[0].id,
+            b"e-a",
+            b"q",
+            None,
+            ValueRef::Bytes(b"v"),
+        )
+        .unwrap();
+    txn.prepare(b"p1:h1-cc", Durability::GroupSync).unwrap();
+    db.decide(b"p1:h1-cc", true).unwrap().expect("in doubt");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let c = next(&mut r);
+        seen.push((c.seqno, rows(&c).len(), r.xid().map(|x| x.to_vec())));
+    }
+    assert_eq!(seen[0], (one, 1, Some(b"p1:h1-aa".to_vec())));
+    assert_eq!(seen[1], (plain, 1, None));
+    assert_eq!(
+        seen[2],
+        (round, 2, Some(b"p1:h1-bb".to_vec())),
+        "both shares tagged"
+    );
+    assert_eq!(
+        seen[3].2.as_deref(),
+        Some(&b"p1:h1-cc"[..]),
+        "an external round"
+    );
+    assert_eq!(r.notes(), 0, "nothing noted once drained");
+    drop(r);
+    db.close().unwrap();
+    // A reopen replays the trailers: a feed from the oldest re-reads every commit, tags too.
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let a = db.table("a").unwrap();
+    let b = db.table("b").unwrap();
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Oldest)).unwrap();
+    let mut xids = Vec::new();
+    loop {
+        next(&mut r);
+        if let Some(x) = r.xid() {
+            xids.push(x.to_vec());
+        }
+        if xids.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(
+        xids,
+        [
+            b"p1:h1-aa".to_vec(),
+            b"p1:h1-bb".to_vec(),
+            b"p1:h1-cc".to_vec()
+        ]
+    );
+    assert_eq!(r.notes(), 0);
+    drop(r);
+    db.close().unwrap();
+}
