@@ -730,9 +730,9 @@ impl Shared {
         }
     }
 
-    /// Inlined: every commit asks, and a call here showed in the commit shapes once
-    /// routing grew (#2076).
-    #[inline]
+    /// Always inlined: every commit asks, and a call here showed in the commit shapes once
+    /// routing grew (#2076; `#[inline]` alone left it out of line in commit-one).
+    #[inline(always)]
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
     }

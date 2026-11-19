@@ -1486,6 +1486,13 @@ impl<'a> BatchRef<'a> {
         self.count == 0
     }
 
+    /// The count's top byte, where its flags live ([`SILENT_BATCH`] as 0x80, [`XID_BATCH`]
+    /// as 0x40): a reader that tests both reads it once (#2076's feed shapes).
+    #[inline]
+    pub fn count_flags(&self) -> u8 {
+        self.bytes.get(3).copied().unwrap_or(0)
+    }
+
     /// Whether the batch is feed-silent ([`SILENT_BATCH`], D331): read from its count's
     /// top byte, so a `BatchRef` stays two words and a count (#2055's feed shapes).
     #[inline]

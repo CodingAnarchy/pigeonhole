@@ -2594,8 +2594,10 @@ impl FeedReader {
         // A feed-silent batch (D331, ICR 0141): checked against `incompat` bit 3 and passed
         // over for a subscription, out of line. The cursors take the mark, so this one test
         // per batch is the feed path's whole cost (#2055's feed shapes); `pack` is as it was.
-        let filter = |batch: BatchRef<'_>| {
-            if batch.is_silent() {
+        // `silent` from the batch's count flags, which the caller read once for this and the
+        // xid's bit (#2076's feed shapes).
+        let filter = |batch: BatchRef<'_>, silent: bool| {
+            if silent {
                 silent_batch(shared, batch, tables, prefix, include_silent)
             } else {
                 pack(batch, tables, prefix)
@@ -2656,33 +2658,41 @@ impl FeedReader {
                 seqno,
                 commit_ts,
                 batch,
-            } => Item::Single {
-                seqno: {
-                    note_read_xid(&mut self.read_xid, batch.xid());
-                    seqno
-                },
-                ts: commit_ts,
-                changes: filter(batch)?,
-                silent: include_silent && batch.is_silent(),
-            },
-            WalRecord::Prepare { seqno, batch, .. } => Item::Prepare {
-                id: {
-                    note_read_xid(&mut self.read_xid, batch.xid());
-                    seqno
-                },
-                changes: filter(batch)?,
-                external: false,
-                silent: include_silent && batch.is_silent(),
-            },
+            } => {
+                let flags = batch.count_flags();
+                if flags & XID_FLAG != 0 {
+                    set_read_xid_of(&mut self.read_xid, batch);
+                }
+                let silent = flags & SILENT_FLAG != 0;
+                Item::Single {
+                    seqno,
+                    ts: commit_ts,
+                    changes: filter(batch, silent)?,
+                    silent: include_silent && silent,
+                }
+            }
+            WalRecord::Prepare { seqno, batch, .. } => {
+                let flags = batch.count_flags();
+                if flags & XID_FLAG != 0 {
+                    set_read_xid_of(&mut self.read_xid, batch);
+                }
+                let silent = flags & SILENT_FLAG != 0;
+                Item::Prepare {
+                    id: seqno,
+                    changes: filter(batch, silent)?,
+                    external: false,
+                    silent: include_silent && silent,
+                }
+            }
             // D329: an external share is held as a D263 one is, delivered at its Decision's
             // apply seqno, or dropped by its abort.
             WalRecord::ExternalPrepare { seqno, share, .. } => match share.batch() {
                 Some(batch) => Item::Prepare {
                     id: {
-                        note_read_xid(&mut self.read_xid, Some(share.xid()));
+                        set_read_xid(&mut self.read_xid, share.xid());
                         seqno
                     },
-                    changes: filter(batch)?,
+                    changes: filter(batch, batch.is_silent())?,
                     external: true,
                     silent: include_silent && batch.is_silent(),
                 },
@@ -3735,12 +3745,18 @@ fn set_out_xid(out: &mut Option<Arc<[u8]>>, xids: &mut HashMap<Seqno, Arc<[u8]>>
     *out = xids.remove(&key);
 }
 
-/// Sets the reader's slot for the record just read to `xid` (D329 2b): one test for an
-/// untagged record, the copy out of line.
-#[inline(always)]
-fn note_read_xid(slot: &mut Option<Arc<[u8]>>, xid: Option<&[u8]>) {
-    if let Some(x) = xid {
-        set_read_xid(slot, x);
+
+/// The count's flags (`BatchRef::count_flags`): the silent mark and the xid trailer's bit.
+const SILENT_FLAG: u8 = (pigeonhole_format::wal::SILENT_BATCH >> 24) as u8;
+const XID_FLAG: u8 = (pigeonhole_format::wal::XID_BATCH >> 24) as u8;
+
+/// Sets the reader's slot for the record just read to `batch`'s xid (D329 2b), out of
+/// line: only a spanning commit's share has one.
+#[cold]
+#[inline(never)]
+fn set_read_xid_of(slot: &mut Option<Arc<[u8]>>, batch: BatchRef<'_>) {
+    if let Some(x) = batch.xid() {
+        *slot = Some(Arc::from(x));
     }
 }
 
