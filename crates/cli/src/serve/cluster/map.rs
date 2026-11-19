@@ -1161,7 +1161,7 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
                     _ => {
                         return Err(format!(
                             "move {id:?}'s HANDED_OVER map relocates partition {:?} from epoch \
-                             {} to node {:?} at its next epoch, and nothing else (D332 PR 2)",
+                             {} to node {:?} at its next epoch (D332 PR 2)",
                             m.from, m.from_epoch, m.to
                         ));
                     }

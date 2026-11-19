@@ -963,7 +963,7 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
   - never at CATCHING_UP (simp724's Q1);
   - `from_epoch` set, and no seqnos.
 - **Where P must be:** before HANDED_OVER, still on its node at `from_epoch`; from it, on `to` past it. So a map that moves P any other way, a failover's promote among them, has to drop the record (simp724's M2). `promote::run` drops it in its map.
-- **The steps:** COPYING goes straight to HANDING_OVER. HANDED_OVER must be the relocation to `to` at `max(epoch, floor) + 1` from `from_epoch`, naming itself.
+- **The steps:** COPYING goes straight to HANDING_OVER. HANDED_OVER's map must put P on `to` at `max(epoch, floor) + 1`, from its node at `from_epoch`, and name itself; it checks P's node and epoch, the relocation's own `copies` keep its history, and the rest of the map is held to the usual change rules (simp724's N2 on #2092).
 - **One move per partition, whatever the kind.**
 
 **Attempts (simp724's M1):** each run writes a fresh record, replacing an earlier attempt's not yet at its commit point, and copies, stamps and matches the old node's closed set again. A rerun past the commit point finishes the record it finds.
@@ -980,7 +980,7 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 - the feed's barriers and reroutes;
 - reconcile's keep;
 - routing's replica check: copies keep serving reads during a relocation;
-- the restore's clip, which needs nothing for NODE because the backup map's placement decides it;
+- the restore's clip, which needs nothing for NODE because the backup map's placement decides it. A copy a cleared NODE move staged or stamped on its target is left there, outside the map; `drop-partition` on that node moves it aside (ai1249's should on #2092);
 - `#2087`'s pinning.
 
 `LocalPartition.moves` shows a NODE record with no table. `restore_partition` stays refused while one names P.

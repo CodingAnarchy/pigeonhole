@@ -529,7 +529,9 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
     // placements already say who held each moved range then: a move before HANDED_OVER is
     // rolled back (the source's), one at or after it forward (the target's). Each restored
     // file is clipped to those placements when it opens (its stamp marked it). A NODE move
-    // (D332 PR 2) needs neither: the backup's map already places the whole partition.
+    // (D332 PR 2) needs neither: the backup's map already places the whole partition. A
+    // copy it staged or stamped on its target stays there, outside the map: the operator
+    // moves it aside with `drop-partition` on that node (ai1249's should on #2092).
     m.moves.clear();
     for p in &mut m.partitions {
         p.epoch = jobs

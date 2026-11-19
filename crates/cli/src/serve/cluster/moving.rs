@@ -348,14 +348,30 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
     advance(args, partition, &r.id, None).await?;
     // The target's copy, if the move got as far as staging or stamping one, goes aside:
     // a later attempt never takes it (simp724's M1).
-    let mut aside = Value::Null;
-    if let Some(n) = m.nodes.iter().find(|n| n.id == r.to) {
-        let at = At::new(args, &n.id, &n.address).await?;
-        if at.local(partition).await?.is_some() {
-            let lp = at.call(partition, "drop").await?;
-            aside = json!(lp.file);
+    // If that fails, the record is already gone (safe: every later attempt copies and
+    // matches again), and the report says the copy is still there (simp724's N1 on #2092).
+    let drop_there = format!("phdb cluster drop-partition {partition} --node <{}>", r.to);
+    let aside = match m.nodes.iter().find(|n| n.id == r.to) {
+        None => Value::Null,
+        Some(n) => {
+            let tried = async {
+                let at = At::new(args, &n.id, &n.address).await?;
+                match at.local(partition).await? {
+                    Some(_) => at.call(partition, "drop").await.map(|lp| Some(lp.file)),
+                    None => Ok(None),
+                }
+            };
+            match tried.await {
+                Ok(Some(file)) => json!(file),
+                Ok(None) => Value::Null,
+                Err(f) => json!(format!(
+                    "not moved aside: the copy is still on node {} ({}): {drop_there}",
+                    r.to,
+                    f.message()
+                )),
+            }
         }
-    }
+    };
     let owner = m
         .partitions
         .iter()
