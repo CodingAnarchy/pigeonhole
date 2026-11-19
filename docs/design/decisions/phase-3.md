@@ -5215,6 +5215,18 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
 - **Transactions open across a hand-over** answer `Conflict` when they write, whatever they read, because serve doesn't see their read sets. Read-only commits pass.
 - **The hand-over raises S's epoch in place:** a lapse, the identity row and a new lease at once, keeping S's history.
 
+**PR 4a (the engine for the copy and the drop, ICR 0141's additions; coordinator, simp724, cli692, perf2 and perf287, 2026-11-19):**
+- **A range is removed with a drop, not with delete markers.** A marker hides every version at or below its timestamp whatever the commit order (D9, D38), and a range move keeps the source's timestamps (M1). So a marker written by an abort on T, or by the cleanup on S, would hide the range's rows when a later move brings them back. **PR 5's cleanup and abort are `drop_range`.** This reverses the row-delete cleanup above, and overtakes follow-up #2053.
+- **`drop_range`:**
+  - split the table's tablets at the bounds;
+  - a Range Drop (WAL type 7, behind `incompat` bit 3) on every stream at one held seqno;
+  - one manifest commit that drops the inside tablets and puts a fresh tablet over the range, flushed through that seqno, so replay never brings it back;
+  - every row-cache slot raised to the seqno.
+
+  A live snapshot keeps its view. The caller keeps the range unserved and re-runs the drop after a crash, from its drop-pending row; the drop is idempotent. `Busy` while an external share is in doubt, naming its xids. The balancer merges the leftover tablets.
+- **Replicas apply a drop in feed order:** the feed delivers it only to a reader that includes feed-silent records, as `ReplicatedEvent` body tag 2, which builds before D331 refuse.
+- **A copy is never restarted by deleting:** it resumes. T writes S's changes as S logged them, by name, feed-silently (`LoggedBatch`), one atomic commit per chunk with its progress row.
+
 **PRs.** 1, the engine; 2, the map record and the gates; 3, the paths that must clip, the cluster feed's hold, and backups; 4, the copy and the range follower; 5, the driver, hand-over, cleanup and CLI; 6, merge. Follow-ups #2052 (SST ingest for the copy) and #2053 (dropping whole SSTs on cleanup), both Post-1.0 unless perf287's box run says otherwise.
 
 **Design:** `.coord/cli692-design-1499.md` (with simp724's, perf287's and Amendment 5's reviews), `.coord/ai1249-plan-1499.md`.

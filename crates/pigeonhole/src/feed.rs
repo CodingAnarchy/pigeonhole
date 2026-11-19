@@ -82,12 +82,6 @@ impl Change {
         self.ids
     }
 
-    /// The stored value, its tag byte first; empty for deletes.
-    #[cfg(feature = "__unstable-replication")]
-    pub(crate) fn stored(&self) -> &[u8] {
-        &self.stored
-    }
-
     /// The table's name. Empty only for a family created after the feed opened whose table
     /// was dropped before the feed reached this change: its name went with the table.
     pub fn table(&self) -> &str {
@@ -117,6 +111,16 @@ impl Change {
     /// Its timestamp: the one the write gave, or else its commit's.
     pub fn timestamp(&self) -> u64 {
         self.ts
+    }
+
+    /// The value as the engine stored it, tag byte first (empty for the deletes): what a
+    /// range move's target writes again with
+    /// [`LoggedBatch::push`](crate::replication::LoggedBatch::push) (D331 PR 4). Not part of
+    /// the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    pub fn stored(&self) -> &[u8] {
+        &self.stored
     }
 
     /// The value written or merged, as the read API types it; `None` for the deletes.
@@ -194,6 +198,13 @@ pub enum FeedEvent {
     /// Tables created or dropped, or families added: every commit before it saw the old
     /// tables, every commit after it the new ones.
     Catalog(CatalogChange),
+    /// A range drop (D331), to a replica's follower only
+    /// ([`include_silent`](Feed::include_silent)): apply it with
+    /// [`Pigeonhole::apply_range_drop`](crate::Pigeonhole::apply_range_drop). Not part of
+    /// the stable API.
+    #[cfg(feature = "__unstable-replication")]
+    #[doc(hidden)]
+    RangeDrop(crate::replication::RangeDrop),
 }
 
 /// One change to the database's tables, as a feed of every table delivers it
@@ -731,6 +742,9 @@ impl Feed {
             match step(&mut self.out, &self.db, self.generation, next, events)? {
                 Step::Ready => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     return Ok(true);
                 }
                 // A catalog change a commits-only call passes over, or a superseded
@@ -763,6 +777,9 @@ impl Feed {
             return match step(&mut self.out, &self.db, self.generation, next, events)? {
                 Step::Ready => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     Ok(true)
                 }
                 Step::Again => continue,
@@ -801,6 +818,9 @@ impl Feed {
             return match step(&mut self.out, &self.db, self.generation, next, events) {
                 Ok(Step::Ready) => {
                     self.note_delivery();
+                    if self.drop_passed(events) {
+                        continue;
+                    }
                     Poll::Ready(Ok(()))
                 }
                 Ok(Step::Again) => continue,
@@ -862,6 +882,47 @@ impl Feed {
     }
 
     /// A delivery happened: the span from the last one's end to the stream's position now.
+    /// D331: a range drop comes from the engine as an empty commit at its seqno, which the
+    /// reader names ([`FeedReader::range_drop`](pigeonhole_engine::FeedReader::range_drop);
+    /// only with `include_silent`). An event call gets it as [`FeedEvent::RangeDrop`]; a
+    /// commits-only call passes it over (true).
+    #[inline(always)]
+    fn drop_passed(&mut self, events: bool) -> bool {
+        // One flag for a commit (#2089's callgrind): only a feed that includes feed-silent
+        // records gets a drop.
+        if !self.include_silent || self.reader.range_drop().is_none() {
+            return false;
+        }
+        self.drop_taken(events)
+    }
+
+    /// [`drop_passed`](Self::drop_passed) for a delivery that is a drop's.
+    #[cold]
+    #[inline(never)]
+    fn drop_taken(&mut self, events: bool) -> bool {
+        let Some(_drop) = self.reader.range_drop() else {
+            return false;
+        };
+        // Only a commit can stand for a drop: a catalog change delivered after one leaves
+        // the reader's drop behind it (feed1248 on #2089).
+        if events && !matches!(self.out.event, Some(FeedEvent::Commit(_))) {
+            return false;
+        }
+        if !events {
+            return true;
+        }
+        #[cfg(feature = "__unstable-replication")]
+        {
+            self.out.event = Some(FeedEvent::RangeDrop(
+                crate::replication::RangeDrop::from_engine(_drop),
+            ));
+            false
+        }
+        // Without the feature no feed includes feed-silent records, so none gets a drop.
+        #[cfg(not(feature = "__unstable-replication"))]
+        true
+    }
+
     fn note_delivery(&mut self) {
         let after = stream_position(&self.reader);
         self.span = (self.span.1, after);

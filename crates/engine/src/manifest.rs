@@ -503,6 +503,11 @@ pub(crate) enum ReqKind {
     Catalog(CatalogChange),
     /// A tablet split, merge or move: publishes a new tablet map.
     Tablets(TabletChange),
+    /// Sets `incompat` bits in both superblock pages if the file lacks any (D329's bit 2,
+    /// D331's bit 3), here under the writer's exclusion: a superblock write overlapping a
+    /// pump's root commit in flight fails ("root commits overlap"), as #2089's crash sweep
+    /// found on macOS.
+    Incompat(u64),
 }
 
 /// One queued manifest change.
@@ -849,6 +854,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         let is_tablets = matches!(kind, ReqKind::Tablets(_));
         let own: Result<Vec<Edit>> = match kind {
             ReqKind::Edits(e) => Ok(e),
+            ReqKind::Incompat(bits) => writer.flag_incompat(bits).map(|()| Vec::new()),
             ReqKind::Catalog(f) => f(&mut catalog),
             ReqKind::Tablets(f) => f(&mut catalog).map(|(edits, o)| {
                 owners = o;

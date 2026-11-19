@@ -563,7 +563,7 @@ pub(crate) struct CompactionWork {
 /// holds. A base it can't read is not folded: the run stays apart and the read that needs it
 /// reports the error.
 #[derive(Debug)]
-struct BaseBlobs(Arc<SstSet>);
+pub(crate) struct BaseBlobs(pub(crate) Arc<SstSet>);
 
 impl pigeonhole_compaction::BlobFetch for BaseBlobs {
     fn fetch(&self, ptr: &pigeonhole_format::value::BlobPointer) -> Option<pigeonhole_cache::Cell> {
