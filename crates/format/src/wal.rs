@@ -96,9 +96,9 @@ pub const INCOMPAT_FEED_SILENT: u64 = 1 << 3;
 /// replication. The mutation count is the low 31 bits.
 pub const SILENT_BATCH: u32 = 1 << 31;
 
-/// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch read without
-/// `incompat` bit 3 (D331): a reader that may have opened before the bit was set asks
-/// again on this one only.
+/// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch, or a Range
+/// Drop, read without `incompat` bit 3 (D331): a reader that may have opened before the bit
+/// was set asks again on this one only.
 pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
 
 /// Whether a record's batch carries the [`SILENT_BATCH`] mark, read at its place in the
@@ -113,6 +113,8 @@ fn marked(bytes: &[u8]) -> bool {
         Some(1) => top(20),
         Some(2) => top(24),
         Some(5) => external_marked(bytes),
+        // A Range Drop needs the bit too (D331), and is refused without it alike.
+        Some(7) => true,
         _ => false,
     }
 }
@@ -122,15 +124,6 @@ fn marked(bytes: &[u8]) -> bool {
 #[inline(never)]
 fn external_marked(bytes: &[u8]) -> bool {
     WalRecord::decode_any(bytes).is_ok_and(|r| r.batch().is_some_and(|b| b.is_silent()))
-}
-
-/// A Range Drop in a file without `incompat` bit 3 (D331), out of the decoder's way.
-#[cold]
-#[inline(never)]
-fn range_drop_without_bit() -> Error {
-    Error::Corrupt {
-        what: "wal range drop in a file without incompat bit 3",
-    }
 }
 
 /// [`SILENT_WITHOUT_BIT`]'s error, out of the decoder's way.
@@ -1131,18 +1124,13 @@ impl WalRecord<'_> {
         if !silent_ok && marked(bytes) {
             return Err(silent_without_bit());
         }
-        // D331's bit gates a Range Drop as it gates the silent mark: tested only without the
-        // bit, so `decode_any` stays as it was (#2089's callgrind).
-        if !silent_ok && bytes.first() == Some(&(RecordType::RangeDrop as u8)) {
-            return Err(range_drop_without_bit());
-        }
         let record = Self::decode_any(bytes);
         // The mark's places in the bytes agree with the decoded batch (perf2's nit on #2055).
         debug_assert!(
             record
                 .as_ref()
-                .map_or(true, |r| r.batch().is_some_and(|b| b.is_silent())
-                    == marked(bytes)),
+                .map_or(true, |r| matches!(r, WalRecord::RangeDrop { .. })
+                    || r.batch().is_some_and(|b| b.is_silent()) == marked(bytes)),
             "a feed-silent mark at a place the decoder doesn't read"
         );
         record
@@ -1166,6 +1154,24 @@ impl WalRecord<'_> {
             | WalRecord::ExternalAbort { .. }
             | WalRecord::RangeDrop { .. } => None,
         }
+    }
+
+    /// [`decode_any`](Self::decode_any)'s record of type `t`, `rest` the bytes after its
+    /// type byte: a Range Drop (D331), or an error.
+    #[cold]
+    #[inline(never)]
+    fn decode_other(t: u8, rest: &[u8]) -> crate::Result<WalRecord<'_>> {
+        if t != RecordType::RangeDrop as u8 {
+            return Err(Error::UnsupportedFeature {
+                what: "wal record type",
+                value: u64::from(t),
+            });
+        }
+        let mut r = Reader::new(rest, "wal record");
+        Ok(WalRecord::RangeDrop {
+            seqno: r.u64()?,
+            range: DroppedRange::decode(r.rest())?,
+        })
     }
 
     fn decode_any(bytes: &[u8]) -> crate::Result<WalRecord<'_>> {
@@ -1202,15 +1208,10 @@ impl WalRecord<'_> {
                 abort_seqno: r.u64()?,
                 share: ExternalShare::decode(r.rest(), false)?,
             }),
-            // Gated by D331's bit in `decode_with`.
-            7 => Ok(WalRecord::RangeDrop {
-                seqno: r.u64()?,
-                range: DroppedRange::decode(r.rest())?,
-            }),
-            t => Err(Error::UnsupportedFeature {
-                what: "wal record type",
-                value: u64::from(t),
-            }),
+            // A Range Drop (D331, gated by its bit in `decode_with`), or a type this build
+            // doesn't know: out of line, so the arms above inline as they did (#2089's
+            // callgrind).
+            t => Self::decode_other(t, r.rest()),
         }
     }
 }

@@ -37,8 +37,9 @@ pub(crate) enum Body {
     },
     Catalog(CatalogEvent),
     /// A range drop (D331): rows `[start, end)` of `table` dropped, with the primary's
-    /// table id. Body tag 2; never silent.
-    RangeDrop(RangeDrop),
+    /// table id. Body tag 2; never silent. Boxed, so every event keeps its size (#2089's
+    /// callgrind).
+    RangeDrop(Box<RangeDrop>),
 }
 
 /// A range drop a primary's feed delivers to a replica's follower (D331,
@@ -112,7 +113,7 @@ impl ReplicatedEvent {
                 silent,
             },
             FeedEvent::Catalog(change) => Body::Catalog(change.raw().clone()),
-            FeedEvent::RangeDrop(d) => Body::RangeDrop(d.clone()),
+            FeedEvent::RangeDrop(d) => Body::RangeDrop(Box::new(d.clone())),
         };
         Self {
             before,
@@ -291,7 +292,7 @@ impl ReplicatedEvent {
                 }
                 Body::Catalog(ev)
             }
-            2 => Body::RangeDrop(decode_drop(bytes, &mut r)?),
+            2 => Body::RangeDrop(Box::new(decode_drop(bytes, &mut r)?)),
             _ => return Err(invalid("a replicated event's body".to_owned())),
         };
         if silent && matches!(body, Body::Catalog(_)) {
@@ -685,13 +686,10 @@ impl Pigeonhole {
         let (Some(first), Some(last)) = (run.first(), run.last()) else {
             return Err(invalid("an empty replicated run".to_owned()));
         };
-        // One pass over the run for both (#2089's callgrind).
-        if let Some(e) = run.iter().find(|e| !matches!(e.body, Body::Commit { .. })) {
-            return Err(invalid(if e.is_catalog() {
-                "a catalog change in a replicated run: apply it with apply_catalog".to_owned()
-            } else {
-                "a range drop in a replicated run: apply it with apply_range_drop".to_owned()
-            }));
+        if run.iter().any(ReplicatedEvent::is_catalog) {
+            return Err(invalid(
+                "a catalog change in a replicated run: apply it with apply_catalog".to_owned(),
+            ));
         }
         if let Some(w) = run.windows(2).find(|w| w[1].before != w[0].after) {
             return Err(invalid(format!(
@@ -712,8 +710,13 @@ impl Pigeonhole {
         let cap = self.engine().max_replicated_part_bytes();
         let mut part_bytes = 0;
         for event in run {
+            // A range drop in the run is refused here, at no cost to a run of commits (#2089's
+            // callgrind). A part committed before it stays, with its own token: the replica
+            // has applied the run up to there, and resumes from it.
             let Body::Commit { changes, .. } = &event.body else {
-                unreachable!("checked above");
+                return Err(invalid(
+                    "a range drop in a replicated run: apply it with apply_range_drop".to_owned(),
+                ));
             };
             let bytes: usize = changes
                 .iter()

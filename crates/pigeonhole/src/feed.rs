@@ -871,8 +871,9 @@ impl Feed {
     /// commits-only call passes it over (true).
     #[inline(always)]
     fn drop_passed(&mut self, events: bool) -> bool {
-        // One compare for a commit (#2089's callgrind); the rest only for a drop.
-        if self.reader.range_drop().is_none() {
+        // One flag for a commit (#2089's callgrind): only a feed that includes feed-silent
+        // records gets a drop.
+        if !self.include_silent || self.reader.range_drop().is_none() {
             return false;
         }
         self.drop_taken(events)
