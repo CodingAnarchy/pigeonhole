@@ -1408,3 +1408,190 @@ fn a_scan_never_goes_back_in_time_across_a_source_change() {
         .unwrap()
         .retain(|(d, _)| *d != dirs[0]);
 }
+
+/// D331 (cli692's M2): a range move's hand-over raises its source's epoch on the same node
+/// and keeps its history, so the source's replica copy keeps following it, with no second
+/// bootstrap. Each step through the writer's `SetMap`, which checks it as a change.
+#[test]
+fn a_hand_over_keeps_the_sources_replica_following_without_a_bootstrap() {
+    use crate::serve::proto::{MoveKind, MovePhase, RangeMove, SplitKey, split_key};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    assert_eq!(bootstraps_in(&dirs[0]), 1, "the first bootstrap");
+    let key = |s: &str| SplitKey {
+        key: Some(split_key::Key::Text(s.into())),
+    };
+    rt.block_on(async {
+        let a = ports[0];
+        // `r`'s range from "m" on, from p3 (c's) to p2 (b's).
+        step(a, &|m, _| {
+            m.moves.push(RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "r".into(),
+                start: Some(key("m")),
+                end: None,
+                from: "p3".into(),
+                to: "p2".into(),
+                phase: MovePhase::Copying as i32,
+                ..Default::default()
+            });
+        })
+        .await;
+        for phase in [MovePhase::CatchingUp, MovePhase::HandingOver] {
+            step(a, &|m, _| m.moves[0].phase = phase as i32).await;
+        }
+        step(a, &|m, version| {
+            let t = m.tables.iter_mut().find(|t| t.name == "r").unwrap();
+            *t = super::super::map::handed_over(t, b"m", None, "p2");
+            let p3 = m.partitions.iter_mut().find(|p| p.id == "p3").unwrap();
+            p3.epoch += 1;
+            m.moves[0].phase = MovePhase::HandedOver as i32;
+            m.moves[0].handed_over_term = m.writer_term;
+            m.moves[0].handed_over_version = version;
+        })
+        .await;
+        // p3 is at its new epoch on c, its history kept, and takes writes again.
+        let after = put_after_move(a, "r", "k2").await;
+        eventually_within(
+            Duration::from_secs(30),
+            "a's replica of p3 to follow c past a write at its new epoch",
+            async || {
+                copy_of(a, "p3").await.is_some_and(|lp| {
+                    lp.replica_state() == ReplicaState::Following
+                        && lp.replica_of == "c"
+                        && lp.replica_applied_seqno >= after
+                })
+            },
+        )
+        .await;
+        let m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let p3 = m.partitions.iter().find(|p| p.id == "p3").unwrap();
+        assert!(
+            p3.epoch > p3.history_epoch,
+            "{p3:?}: history kept across the raise"
+        );
+    });
+    assert_eq!(
+        bootstraps_in(&dirs[0]),
+        1,
+        "it went on following: no bootstrap since"
+    );
+}
+
+/// Sets the writer's map, changed by `f` (given the new version), retried while a node
+/// is still taking its peers' maps.
+async fn step(a: u16, f: &dyn Fn(&mut ClusterMap, u64)) {
+    let mut last = None;
+    for _ in 0..100 {
+        let mut m = client(a)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let expected = m.map_version;
+        m.map_version += 1;
+        f(&mut m, expected + 1);
+        match client(a)
+            .await
+            .set_map(SetMapRequest {
+                force: false,
+                expected_map_version: expected,
+                map: Some(m),
+                copies: Vec::new(),
+            })
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("set the map: {last:?}");
+}
+
+/// D331 PR 3 (simp724's S4, cli692's M1): a move's rows reach the replica copies of both its
+/// sides through their followers. A copy of the source gets its moved-away row (and keeps
+/// the range's span from the map until it does), and a copy of the target its serving row,
+/// which it serves the range from.
+#[test]
+fn a_moves_rows_reach_the_copies_of_both_its_sides() {
+    use crate::serve::proto::{MoveKind, MovePhase, RangeMove, SplitKey, split_key};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (dirs, ports, _stops, _dbs) = following(&rt);
+    let key = |s: &str| SplitKey {
+        key: Some(split_key::Key::Text(s.into())),
+    };
+    let rows_in = |dir: &Path| {
+        crate::serve::replica::ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|(p, _, _)| p.starts_with(dir))
+            .map(|(_, moved, serving)| (*moved, *serving))
+    };
+    rt.block_on(async {
+        let (a, c) = (ports[0], ports[2]);
+        // c holds a copy of p2 (b's): the target's.
+        set_replicas(a, "p2", &["c"]).await;
+        eventually_within(
+            Duration::from_secs(30),
+            "c's replica of p2 to follow b",
+            async || {
+                copy_of(c, "p2")
+                    .await
+                    .is_some_and(|lp| lp.replica_state() == ReplicaState::Following)
+            },
+        )
+        .await;
+        // `r` from "m" on, from p3 (c's; a holds its copy) to p2.
+        step(a, &|m, _| {
+            m.moves.push(RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "r".into(),
+                start: Some(key("m")),
+                end: None,
+                from: "p3".into(),
+                to: "p2".into(),
+                phase: MovePhase::Copying as i32,
+                ..Default::default()
+            });
+        })
+        .await;
+        for phase in [MovePhase::CatchingUp, MovePhase::HandingOver] {
+            step(a, &|m, _| m.moves[0].phase = phase as i32).await;
+        }
+        step(a, &|m, version| {
+            let t = m.tables.iter_mut().find(|t| t.name == "r").unwrap();
+            *t = super::super::map::handed_over(t, b"m", None, "p2");
+            let p3 = m.partitions.iter_mut().find(|p| p.id == "p3").unwrap();
+            p3.epoch += 1;
+            m.moves[0].phase = MovePhase::HandedOver as i32;
+            m.moves[0].handed_over_term = m.writer_term;
+            m.moves[0].handed_over_version = version;
+        })
+        .await;
+        step(a, &|m, _| m.moves[0].phase = MovePhase::Cleaning as i32).await;
+        step(a, &|m, _| m.moves.clear()).await;
+        // Writes on both owners move their copies' followers past the rows.
+        put_after_move(a, "r", "k2").await;
+        put_after_move(a, "r", "zz").await;
+        eventually_within(
+            Duration::from_secs(30),
+            "a's copy of p3 to hold the moved-away row, c's of p2 the serving row",
+            async || {
+                rows_in(&dirs[0]).is_some_and(|(moved, _)| moved == 1)
+                    && rows_in(&dirs[2]).is_some_and(|(_, serving)| serving == 1)
+            },
+        )
+        .await;
+    });
+}

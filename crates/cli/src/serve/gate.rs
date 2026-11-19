@@ -144,6 +144,8 @@ pub(crate) struct WriteGate {
     term: AtomicU64,
     /// Woken when the last write finishes while fenced.
     drained: Notify,
+    /// The ranges a move gates (D331): read beside the gate on every call.
+    ranges: super::ranges::RangeGate,
 }
 
 impl WriteGate {
@@ -160,7 +162,14 @@ impl WriteGate {
             clock,
             term: AtomicU64::new(0),
             drained: Notify::new(),
+            ranges: super::ranges::RangeGate::default(),
         })
+    }
+
+    /// The partition's range gate (D331).
+    #[inline]
+    pub(crate) fn ranges(&self) -> &super::ranges::RangeGate {
+        &self.ranges
     }
 
     /// Admits a write, or answers `Fenced`: the operator's fence, or no live lease. The

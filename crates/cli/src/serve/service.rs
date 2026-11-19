@@ -700,6 +700,55 @@ impl<'a> Touch<'a> {
     }
 }
 
+/// The barriers a cluster component starting at `start` carries for serving rows `rows`
+/// (D331 PR 3b): every row's, wherever it starts (feed1248's point 2: a start past `t_from`
+/// may come from a checkpoint taken while the merge held the part, with the source still
+/// below `final_seqno`). One past `t_from` (or from now) carries no token, so the merge's
+/// position for the component stays where it starts; the merge lifts it at once once the
+/// source's part is past `final_seqno`, gone or absent.
+fn barriers_for(
+    rows: Vec<super::ranges::Moved>,
+    start: Option<&proto::subscribe_request::Start>,
+) -> Vec<super::feed::Barrier> {
+    use proto::subscribe_request::Start as S;
+    let from = match start {
+        None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => u64::MAX,
+        Some(S::FromOldest(true)) => 0,
+        Some(S::Resume(t)) => super::cluster::token::token_seqno(t).unwrap_or(0),
+    };
+    rows.into_iter()
+        .map(|m| super::feed::Barrier {
+            t_from: m.seqno,
+            token: if from <= m.seqno {
+                m.token.into()
+            } else {
+                prost::bytes::Bytes::new()
+            },
+            move_id: m.id,
+            source: m.source,
+            final_seqno: m.final_seqno,
+        })
+        .collect()
+}
+
+/// How a subscription of this server's database starts ([`Service::subscribe_part`]): a
+/// client's own on a single node (the default), or one partition's part of a cluster
+/// subscription.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PartStart {
+    /// Commits through this seqno after the start are passed over (`skip_through`).
+    pub skip: u64,
+    /// A cluster component: it announces its start, and carries D331's barriers.
+    pub announce: bool,
+    /// A cluster feed hub's component (#1798).
+    pub internal: bool,
+    /// D331 PR 3b: start at the partition's hand-over for the tables.
+    pub from_hand_over: bool,
+    /// D331 PR 3b: end (cleanly, for the merge) past this seqno: a component of tables a
+    /// range move took from this partition whole.
+    pub ends_at: Option<u64>,
+}
+
 /// `Data.Scan`'s index in `RPCS`: its outcome is counted when its stream ends.
 pub(crate) const SCAN: usize = 7;
 
@@ -2101,6 +2150,16 @@ impl Service {
             }
             _ => (None, None),
         };
+        // D331: a range a move fences, moved away or doesn't serve here yet. One load while
+        // no move names the partition. A transaction's `Commit` is checked where it's
+        // answered, its rows as writes, with its snapshot (`commit`).
+        if let Some(gate) = &self.gate
+            && !matches!(op, ServiceOp::Commit(_))
+            && let Some(ranges) = &*gate.ranges().load()
+        {
+            ranges.check(&op, op.writes())?;
+        }
+        self.copy_ranges(&op)?;
         // D332: a cluster partition's sampled loads. A read's first key, one read in 64 per
         // thread; a call's CPU per poll, one in 16 per thread. An unsampled call touches
         // nothing shared (perf287's must).
@@ -2803,10 +2862,14 @@ impl Service {
         // The caller's scope, as admission checks it; the budget is the fanning-out node's.
         self.check(&op.admit(), caller)?;
         // Its partition's lease, before the read and again after it took its snapshot
-        // (D326, audit120's S3).
+        // (D326, audit120's S3); and its ranges a move gates (D331).
         if let Some(gate) = &self.gate {
             gate.serving()?;
+            if let Some(ranges) = &*gate.ranges().load() {
+                ranges.check(&op, false)?;
+            }
         }
+        self.copy_ranges(&op)?;
         let reply = self.fanout_read(op, caller).await?;
         if let Some(gate) = &self.gate {
             gate.serving()?;
@@ -4339,6 +4402,7 @@ impl Service {
             .ok_or_else(|| ApiError::internal("a replica scan on a service that isn't one"))?;
         let op = ServiceOp::Scan(r);
         let budget = self.admit(&op.admit(), caller, None).await?;
+        self.copy_ranges(&op)?;
         let ServiceOp::Scan(r) = op else {
             unreachable!("made a scan just above")
         };
@@ -4350,6 +4414,20 @@ impl Service {
             .bounded(replica, max_lag_ms);
         drop(budget);
         opener.open(r, Some(slot), None, Some(Arc::clone(&self.metrics)))
+    }
+
+    /// D331 PR 3: on a cluster replica copy (it has no `WriteGate`), the copy's range gate,
+    /// which its follower keeps: a copy of a move's target serves the range once it has
+    /// applied the target's serving row, and a copy of its source refuses a moved range as
+    /// the source does. One load, `None` on every other service.
+    #[inline]
+    fn copy_ranges(&self, op: &ServiceOp) -> Result<(), ApiError> {
+        if let Some(replica) = &self.replica
+            && let Some(ranges) = &*replica.ranges().load()
+        {
+            ranges.check(op, false)?;
+        }
+        Ok(())
     }
 
     /// A `--max-scans` slot, or `Overloaded`.
@@ -4646,7 +4724,21 @@ impl Service {
             ));
         }
         drop(budget);
-        self.subscribe_part(r, caller, 0, false, false).await
+        self.subscribe_part(r, caller, PartStart::default()).await
+    }
+
+    /// D331 PR 3b: the last seqno of a range move that took table `table` from this
+    /// partition, while its moved-away row is here: a cluster component of it reads up to
+    /// there (the latest, for several).
+    pub(crate) fn moved_away(&self, table: &str) -> Option<u64> {
+        self.gate
+            .as_ref()?
+            .ranges()
+            .moved_rows()
+            .into_iter()
+            .filter(|m| m.table == table)
+            .map(|m| m.final_seqno)
+            .max()
     }
 
     /// A subscription of this server's database: a single node's `Feed.Subscribe`, or one
@@ -4654,14 +4746,25 @@ impl Service {
     /// commits the client already handled ([`super::feed::Spec::skip`]) and which
     /// `announce`s its start ([`super::feed::Spec::announce`]). Holds a `--max-streams`
     /// place either way.
+    ///
+    /// D331 PR 3b, on a cluster partition a range move gave a range of these tables: a
+    /// cluster component (`announce`) that starts at or before a move's hand-over carries
+    /// its barrier ([`super::feed::Barrier`]), and `from_hand_over` starts it at the earliest
+    /// hand-over of these tables here, not at `r`'s start (a resume that gained this
+    /// partition through a move; `FeedExpired` if no move did).
     pub(crate) async fn subscribe_part(
         &self,
-        r: proto::SubscribeRequest,
+        mut r: proto::SubscribeRequest,
         caller: &Caller,
-        skip: u64,
-        announce: bool,
-        internal: bool,
+        part: PartStart,
     ) -> Result<super::feed::FeedEvents, ApiError> {
+        let PartStart {
+            skip,
+            announce,
+            internal,
+            from_hand_over,
+            ends_at,
+        } = part;
         use super::feed::Start;
         use proto::subscribe_request::Start as S;
         let slot = self.stream_slot()?;
@@ -4675,6 +4778,11 @@ impl Service {
         for name in &names {
             tables.push(self.table(name).await?);
         }
+        let barriers = if announce {
+            self.hand_overs(&names, &mut r, from_hand_over)?
+        } else {
+            Vec::new()
+        };
         let start = match r.start {
             None | Some(S::FromOldest(false)) => Start::Now,
             Some(S::FromOldest(true)) => Start::Oldest,
@@ -4720,6 +4828,62 @@ impl Service {
                 Some(gate) => events.leased(Arc::clone(gate)),
                 None => Ok(events),
             })
+            .map(|events| {
+                // A cluster component of a cluster partition watches for a hand-over it
+                // takes while running (D331 PR 3b).
+                let watch = self
+                    .gate
+                    .as_ref()
+                    .filter(|_| announce)
+                    .map(|g| (Arc::clone(g), names.clone()));
+                events.with_barriers(barriers, ends_at, watch)
+            })
+    }
+
+    /// The range moves' hand-overs a cluster component of `tables` here carries (D331 PR
+    /// 3b): one barrier for each serving row of these tables, whatever the start.
+    /// `from_hand_over` first sets `r`'s start to the earliest of their tokens. None on a
+    /// partition no move gave a range.
+    fn hand_overs(
+        &self,
+        tables: &[String],
+        r: &mut proto::SubscribeRequest,
+        from_hand_over: bool,
+    ) -> Result<Vec<super::feed::Barrier>, ApiError> {
+        use proto::subscribe_request::Start as S;
+        let rows: Vec<super::ranges::Moved> = self
+            .gate
+            .as_ref()
+            .map(|g| g.ranges().serving_rows())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| !m.token.is_empty() && tables.contains(&m.table))
+            .collect();
+        if from_hand_over {
+            // A move into this partition that hasn't reached CLEANING (or whose serving row
+            // isn't here yet) is no gap: it serves none of the range yet, so the resume asks
+            // again shortly (cli692's M1 on PR 3b). No move at all is one.
+            let handing = self
+                .gate
+                .as_ref()
+                .and_then(|g| g.ranges().load().as_ref().cloned())
+                .is_some_and(|s| tables.iter().any(|t| s.awaits_hand_over(t)));
+            if rows.is_empty() && handing {
+                return Err(ApiError::partition_unavailable(
+                    "this partition is taking a range of these tables over from another, \
+                     and doesn't serve it yet: resume again shortly",
+                ));
+            }
+            let first = rows.iter().min_by_key(|m| m.seqno).ok_or_else(|| {
+                ApiError::from_code(
+                    pigeonhole::ErrorCode::FeedExpired,
+                    "no range move gave this partition a range of these tables, so a \
+                     resume has no hand-over to start it at: subscribe again",
+                )
+            })?;
+            r.start = Some(S::Resume(first.token.clone().into()));
+        }
+        Ok(barriers_for(rows, r.start.as_ref()))
     }
 
     /// The feed fan-out's limits: a cluster subscription's buffer and idle limit are a
@@ -4871,6 +5035,17 @@ impl Service {
             Some(gate) if g.wrote() || !rows.is_empty() => Some(gate.enter()?),
             _ => None,
         };
+        // D331: the rows it carries, as writes, and M3, a transaction open across a range's
+        // fence or hand-over, as simp724 agreed it ([`super::ranges`]); one load.
+        if let Some(gate) = &self.gate
+            && let Some(ranges) = &*gate.ranges().load()
+        {
+            ranges.commit(
+                &r.rows,
+                g.txn().snapshot_seqno(),
+                g.wrote() || !rows.is_empty(),
+            )?;
+        }
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);
         }
@@ -6417,6 +6592,49 @@ mod text_part_tests {
             .unwrap();
         assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
         filled(&index, "x").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod barriers_for_tests {
+    use super::{barriers_for, proto};
+    use proto::subscribe_request::Start as S;
+
+    /// D331 PR 3b (feed1248's point 2): a component of a move's target gets the move's
+    /// barrier wherever it starts. At or before `t_from` it carries the hand-over's token;
+    /// past it (a checkpoint taken while the merge held the part) or from now, none, so the
+    /// merge's position doesn't move. Mutant: give only starts at or before `t_from` a
+    /// barrier, and the start past it gets none.
+    #[test]
+    fn every_start_gets_the_barrier() {
+        let token = |seqno: u64| {
+            let mut t = vec![1u8];
+            t.extend_from_slice(&[7u8; 16]);
+            t.extend_from_slice(&1u32.to_le_bytes());
+            t.extend_from_slice(&seqno.to_le_bytes());
+            t
+        };
+        let row = super::super::ranges::Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            seqno: 10,
+            source: "p1".into(),
+            final_seqno: 99,
+            token: token(10),
+            ..Default::default()
+        };
+        let at = |start: Option<S>| barriers_for(vec![row.clone()], start.as_ref());
+        let before = at(Some(S::Resume(token(5).into())));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].token.as_ref(), token(10).as_slice());
+        let exactly = at(Some(S::Resume(token(10).into())));
+        assert_eq!(exactly[0].token.as_ref(), token(10).as_slice());
+        for start in [Some(S::Resume(token(20).into())), None] {
+            let past = at(start);
+            assert_eq!(past.len(), 1, "a start past t_from still gets it");
+            assert!(past[0].token.is_empty());
+            assert_eq!((past[0].t_from, past[0].final_seqno), (10, 99));
+        }
     }
 }
 

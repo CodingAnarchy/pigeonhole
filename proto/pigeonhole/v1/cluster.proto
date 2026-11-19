@@ -173,6 +173,11 @@ enum FenceReason {
   // The partition's lease ran out on this node (D326): its renewals stopped reaching a
   // majority of the map's nodes, so it stopped serving until a renewal does.
   FENCE_REASON_LEASE_LAPSED = 3;
+  // A range of the partition is being handed over to another partition (D331): writes
+  // touching it answer `Fenced` until the move's map gives it to the target, then
+  // `WrongPartition`. The partition's other keys take writes; this is reported only in
+  // `MoveStatus.fenced`, never as the partition's `fence_reason`. Retry-safe.
+  FENCE_REASON_RANGE_MOVING = 4;
 }
 
 // The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
@@ -221,6 +226,85 @@ message ClusterMap {
   // partition's epoch), which is never dropped. A writer's change keeps them; a `set-map`
   // that drops or alters a pending one is refused.
   repeated FailoverEvent failovers = 13;
+  // D331: the range moves in flight, each a table's key range going from one partition to
+  // another through `MovePhase`s. The map's writer advances them; every node derives its
+  // partitions' range gates from them. A partition is in at most one at a time, as source
+  // or target. Set only once every node keeps them (`map_features`: `range_moves`).
+  repeated RangeMove moves = 14;
+}
+
+// D331: one range move, `[start, end)` of `table` from partition `from` to partition `to`.
+message RangeMove {
+  // The move's id: 1-64 of `[a-z0-9_-]`, unique among `moves`.
+  string id = 1;
+  MoveKind kind = 2;
+  string table = 3;
+  // The range's first key; absent: the table's first key.
+  SplitKey start = 4;
+  // The key after the range; absent: to the table's end.
+  SplitKey end = 5;
+  // The source partition, S.
+  string from = 6;
+  // The target partition, T (for a split, the partition the split added).
+  string to = 7;
+  MovePhase phase = 8;
+  // S's seqno the copy was taken at, once T reported the copy done; 0 before.
+  uint64 snapshot_seqno = 9;
+  // S's visible seqno once its range fence drained (from HANDING_OVER): every write to the
+  // range S took is at or below it. 0 until S reports it.
+  uint64 final_seqno = 10;
+  // The `(writer_term, map_version)` of the map that gave the range to T, set in that map
+  // itself (from HANDED_OVER): a node holding it, or any map ordered after it, is past the
+  // move's commit point.
+  uint64 handed_over_version = 11;
+  uint64 handed_over_term = 12;
+}
+
+// D331: what a range move is for.
+enum MoveKind {
+  MOVE_KIND_UNSPECIFIED = 0;
+  // `phdb cluster move-range`: to an existing partition.
+  MOVE_KIND_RANGE = 1;
+  // `phdb cluster split`: to a partition the split added.
+  MOVE_KIND_PARTITION = 2;
+  // D332: a whole partition relocated to another node (no table or range; `to` names the
+  // node). Validated by D332's balancer PR; refused until then.
+  MOVE_KIND_NODE = 3;
+  // PR 6 (merge) adds MOVE_KIND_MERGE = 4.
+}
+
+// D331: where a range move is. A move goes forward one phase per map; before HANDED_OVER it
+// may be removed (an abort), and from CLEANING it is removed once S's copy is gone.
+enum MovePhase {
+  MOVE_PHASE_UNSPECIFIED = 0;
+  // T copies the range from S's snapshots. S serves it; T answers it `PartitionUnavailable`.
+  MOVE_PHASE_COPYING = 1;
+  // T follows S's feed for the range.
+  MOVE_PHASE_CATCHING_UP = 2;
+  // S fences the range's writes (`Fenced`, RANGE_MOVING) and drains them; reads go on.
+  MOVE_PHASE_HANDING_OVER = 3;
+  // The commit point: the map gives the range to T and raises S's epoch. S answers the
+  // range `WrongPartition`; T still answers it `PartitionUnavailable` until CLEANING.
+  MOVE_PHASE_HANDED_OVER = 4;
+  // T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
+  // ended); S deletes its copy.
+  MOVE_PHASE_CLEANING = 5;
+  // PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
+  // the merged-away source waits for its transaction outcomes before it's dropped. The
+  // phases stay in order, so "from HANDED_OVER on" includes it.
+}
+
+// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
+message MoveStatus {
+  string id = 1;
+  string table = 2;
+  MovePhase phase = 3;
+  // This partition is the move's source (else its target).
+  bool source = 4;
+  // The source fences the range's writes.
+  bool fenced = 5;
+  // The partition serves the range here.
+  bool serving = 6;
 }
 
 // D330: one failover of a partition to a replica, or one writer election, as the writer
@@ -518,6 +602,11 @@ message LocalPartition {
   uint64 in_doubt_wal_bytes = 24;
   // Each, with why it's still in doubt (its home unreachable, or its home's history changed).
   repeated InDoubtShare in_doubt_shares = 25;
+  // D331: the range moves naming this partition, as source or target.
+  repeated MoveStatus moves = 27;
+  // D331: for a move's target, its range follower's lag behind the source, in milliseconds
+  // (0 when it has none).
+  uint64 move_follower_lag_ms = 28;
   // D332: the partition's load on this node, for the cluster balancer, each an exponential
   // average over `--balance-window` (each 30 s reading weighing `1 − e^(−30/window)`). 0 for a
   // replica copy, and until the first interval ends.
@@ -909,6 +998,11 @@ message ForwardSubscribeRequest {
   // Pass over commits up to this seqno after the token (the cluster's `skip_through`), at
   // most 64 of them; 0: none.
   uint64 skip_through = 5;
+  // D331: start the component at this partition's hand-over position for the request's
+  // tables (the earliest of its serving rows' tokens), not `request`'s start: a cluster
+  // resume whose token lacks this partition because a range move gave it the tables since.
+  // `FeedExpired` if no move did, or its feed has trimmed past that position.
+  bool from_hand_over = 6;
 }
 
 // D326: a node's lease round asks each node of its map, itself included, for a grant.

@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::ToSocketAddrs;
 
-use crate::serve::proto::{ClusterMap, SplitKey, split_key};
+use crate::serve::proto::{ClusterMap, MovePhase, RangeMove, SplitKey, TablePlacement, split_key};
 
 /// The reserved table-name prefix: the cluster's own tables (`__phdb_cluster`), hidden from
 /// and refused to user calls.
@@ -223,7 +223,217 @@ pub(crate) fn validate(map: &ClusterMap, loopback_only: bool) -> Result<(), Refu
         validate_memory(m, &partitions, &tables)?;
     }
     validate_indexes(map, &partitions, &tables)?;
+    validate_moves(map)?;
     Ok(())
+}
+
+/// A move's phase, `Unspecified` for a value this build doesn't know.
+pub(crate) fn phase(m: &RangeMove) -> MovePhase {
+    MovePhase::try_from(m.phase).unwrap_or(MovePhase::Unspecified)
+}
+
+/// D331: a move's range as bytes, `[start, end)`: an absent start is the table's first key
+/// (the empty key), an absent end the table's end.
+pub(crate) fn move_range(m: &RangeMove) -> Result<(Vec<u8>, Option<Vec<u8>>), Refusal> {
+    let start = m.start.as_ref().map(split_key_bytes).transpose()?;
+    let end = m.end.as_ref().map(split_key_bytes).transpose()?;
+    Ok((start.unwrap_or_default(), end))
+}
+
+/// One range of a table, `(start, end, partition)`: `end` `None` for the last.
+pub(crate) type PlacedRange<'t> = (Vec<u8>, Option<Vec<u8>>, &'t str);
+
+/// A table's ranges in key order.
+pub(crate) fn table_ranges(t: &TablePlacement) -> Vec<PlacedRange<'_>> {
+    let keys: Vec<Vec<u8>> = t
+        .splits
+        .iter()
+        .map(|k| split_key_bytes(k).unwrap_or_default())
+        .collect();
+    t.partitions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let start = if i == 0 {
+                Vec::new()
+            } else {
+                keys[i - 1].clone()
+            };
+            (start, keys.get(i).cloned(), p.as_str())
+        })
+        .collect()
+}
+
+/// Whether `[start, end)` lies inside one range of `t` that partition `p` holds.
+pub(crate) fn inside(t: &TablePlacement, start: &[u8], end: Option<&[u8]>, p: &str) -> bool {
+    table_ranges(t).iter().any(|(lo, hi, q)| {
+        *q == p
+            && lo.as_slice() <= start
+            && match (end, hi) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(e), Some(h)) => e <= h.as_slice(),
+            }
+    })
+}
+
+/// The indexes that follow `table` (#1722): a range of such a table can't move by key (a
+/// text index's postings and a vector index's lists hold ids from both sides of any range),
+/// so D331 refuses to move it in 1.3.0 (the coordinator, 2026-11-18; #2066 lifts it).
+pub(crate) fn followed_by<'m>(map: &'m ClusterMap, table: &str) -> Vec<&'m str> {
+    map.indexes
+        .iter()
+        .filter(|i| i.follows == table)
+        .map(|i| i.name.as_str())
+        .collect()
+}
+
+/// Checks the range moves (D331): each well formed, on a placed, ungrouped table no index
+/// follows, between two listed partitions, inside a range of its source before the
+/// hand-over and of its target from it; and each partition in at most one move.
+fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
+    let tables: HashMap<&str, &TablePlacement> =
+        map.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+    let partitions: HashSet<&str> = map.partitions.iter().map(|p| p.id.as_str()).collect();
+    let mut ids = HashSet::new();
+    let mut busy: HashMap<&str, &str> = HashMap::new();
+    for m in &map.moves {
+        if !id_ok(&m.id) {
+            return Err(format!("move id {:?} must be 1-64 of [a-z0-9_-]", m.id));
+        }
+        if !ids.insert(m.id.as_str()) {
+            return Err(format!("move {:?} is listed twice", m.id));
+        }
+        let id = &m.id;
+        let phase = phase(m);
+        if phase == MovePhase::Unspecified {
+            return Err(format!("move {id:?} has no phase this build knows"));
+        }
+        if !matches!(
+            crate::serve::proto::MoveKind::try_from(m.kind),
+            Ok(crate::serve::proto::MoveKind::Range | crate::serve::proto::MoveKind::Partition)
+        ) {
+            return Err(format!("move {id:?} has no kind this build knows"));
+        }
+        let Some(t) = tables.get(m.table.as_str()) else {
+            return Err(format!(
+                "move {id:?} is of table {:?}, which the map doesn't place",
+                m.table
+            ));
+        };
+        if !t.group.is_empty() {
+            return Err(format!(
+                "move {id:?}: table {:?} is in co-location group {:?}, which moves only whole \
+                 (relocate its partition instead)",
+                m.table, t.group
+            ));
+        }
+        if let Some(i) = followed_by(map, &m.table).first() {
+            return Err(format!(
+                "move {id:?}: index {i:?} follows table {:?}, and a range of a table an index \
+                 follows can't move in this version (#2066): drop the index, or move the \
+                 whole partition",
+                m.table
+            ));
+        }
+        if m.from == m.to {
+            return Err(format!(
+                "move {id:?} is from partition {:?} to itself",
+                m.from
+            ));
+        }
+        for p in [&m.from, &m.to] {
+            if !partitions.contains(p.as_str()) {
+                return Err(format!(
+                    "move {id:?} names partition {p:?}, which the map doesn't list"
+                ));
+            }
+            if let Some(other) = busy.insert(p.as_str(), id.as_str()) {
+                return Err(format!(
+                    "partition {p:?} is in moves {other:?} and {id:?}: a partition is in one \
+                     move at a time"
+                ));
+            }
+        }
+        let (start, end) = move_range(m).map_err(|e| format!("move {id:?}: {e}"))?;
+        if end.as_ref().is_some_and(|e| *e <= start) {
+            return Err(format!(
+                "move {id:?}'s range is empty: its end isn't after its start"
+            ));
+        }
+        let handed = phase >= MovePhase::HandedOver;
+        let holder = if handed { &m.to } else { &m.from };
+        if !inside(t, &start, end.as_deref(), holder) {
+            return Err(format!(
+                "move {id:?}'s range of table {:?} isn't inside one range partition {holder:?} \
+                 holds{}",
+                m.table,
+                if handed {
+                    " (from HANDED_OVER, the target holds it)"
+                } else {
+                    " (before HANDED_OVER, the source holds it)"
+                }
+            ));
+        }
+        if m.final_seqno != 0 && phase < MovePhase::HandingOver {
+            return Err(format!("move {id:?} has a final_seqno before HANDING_OVER"));
+        }
+        let pair = (m.handed_over_term, m.handed_over_version);
+        if handed != (pair != (0, 0)) || pair > (map.writer_term, map.map_version) {
+            return Err(format!(
+                "move {id:?}'s handed-over map (term {}, version {}) must be set from \
+                 HANDED_OVER on, only then, and not after this map",
+                m.handed_over_term, m.handed_over_version
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `t` with `[start, end)` given to partition `to` (D331's hand-over): the range's ends
+/// become split keys where they aren't, and every range inside it goes to `to`.
+pub(crate) fn handed_over(
+    t: &TablePlacement,
+    start: &[u8],
+    end: Option<&[u8]>,
+    to: &str,
+) -> TablePlacement {
+    // Each range's start: its split key as the table has it (none for the first), the
+    // move's new ones in canonical form (cli692's N3).
+    let mut cuts: Vec<(Vec<u8>, Option<SplitKey>, String)> = Vec::new();
+    for (i, (lo, hi, p)) in table_ranges(t).into_iter().enumerate() {
+        let own = i.checked_sub(1).map(|j| t.splits[j].clone());
+        let mut points = vec![(lo.clone(), own)];
+        // Cut this range at the move's ends where they fall strictly inside it.
+        for k in [Some(start), end].into_iter().flatten() {
+            if k > lo.as_slice() && hi.as_deref().is_none_or(|h| k < h) {
+                points.push((k.to_vec(), Some(canonical_key(k))));
+            }
+        }
+        points.sort_by(|x, y| x.0.cmp(&y.0));
+        for (pt, key) in points {
+            let moved = pt.as_slice() >= start && end.is_none_or(|e| pt.as_slice() < e);
+            cuts.push((pt, key, if moved { to.to_owned() } else { p.to_owned() }));
+        }
+    }
+    let mut out = t.clone();
+    out.splits = cuts
+        .iter()
+        .skip(1)
+        .filter_map(|(_, k, _)| k.clone())
+        .collect();
+    out.partitions = cuts.into_iter().map(|(_, _, p)| p).collect();
+    out
+}
+
+/// A split key for `bytes` in canonical form: `text` when they're UTF-8, else `raw`.
+fn canonical_key(bytes: &[u8]) -> SplitKey {
+    SplitKey {
+        key: Some(match std::str::from_utf8(bytes) {
+            Ok(s) => split_key::Key::Text(s.to_owned()),
+            Err(_) => split_key::Key::Raw(bytes.to_vec().into()),
+        }),
+    }
 }
 
 /// Checks the indexes' placements (#1722, ICR 0138): each a unique name that no table or
@@ -610,11 +820,27 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
                 .collect()
         };
         if keys(t) != keys(n) || t.partitions != n.partitions {
-            return Err(format!(
-                "table {:?}'s split keys or partitions changed: a placement is fixed once \
-                 written (moving ranges is later work, #1499)",
-                t.name
-            ));
+            // D331: the one change a placement takes, a move's hand-over.
+            let handover = new.moves.iter().find(|m| {
+                m.table == t.name
+                    && phase(m) == MovePhase::HandedOver
+                    && old
+                        .moves
+                        .iter()
+                        .any(|o| o.id == m.id && phase(o) == MovePhase::HandingOver)
+            });
+            let expected = handover.and_then(|m| {
+                let (start, end) = move_range(m).ok()?;
+                Some(handed_over(t, &start, end.as_deref(), &m.to))
+            });
+            if !expected.is_some_and(|e| keys(&e) == keys(n) && e.partitions == n.partitions) {
+                return Err(format!(
+                    "table {:?}'s split keys or partitions changed: a placement is fixed once \
+                     written, except by a range move's hand-over (D331), which gives exactly \
+                     the move's range to its target",
+                    t.name
+                ));
+            }
         }
         if t.group != n.group {
             return Err(format!("table {:?}'s co-location group changed", t.name));
@@ -696,6 +922,7 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         }
         used.extend(i.partitions.iter().map(String::as_str));
     }
+    validate_move_steps(old, new)?;
     let new_partitions: HashMap<&str, _> =
         new.partitions.iter().map(|p| (p.id.as_str(), p)).collect();
     for p in &old.partitions {
@@ -707,6 +934,109 @@ pub(crate) fn validate_change(old: &ClusterMap, new: &ClusterMap) -> Result<(), 
         }
     }
     validate_epochs(old, new)
+}
+
+/// D330's pending promote of partition `p` in `map`, if one is live: a PARTITION event
+/// still PENDING whose `to_epoch` is above the partition's epoch.
+fn pending_promote<'m>(
+    map: &'m ClusterMap,
+    p: &str,
+) -> Option<&'m crate::serve::proto::FailoverEvent> {
+    use crate::serve::proto::{FailoverKind, FailoverState};
+    let epoch = map.partitions.iter().find(|q| q.id == p)?.epoch;
+    map.failovers.iter().find(|e| {
+        e.kind() == FailoverKind::Partition
+            && e.partition == p
+            && e.state() == FailoverState::Pending
+            && e.to_epoch > epoch
+    })
+}
+
+/// D331: each move takes one step per map. A forced map (a recovery) skips these steps,
+/// so it may drop a move at any phase, HANDED_OVER included (cli692's N2): the table layer
+/// it carries says who holds the range then, and `validate` still holds it to a range its
+/// holder holds. One appears at COPYING; one kept keeps its
+/// range, partitions and kind and stays in its phase or goes to the next; one goes away
+/// before HANDED_OVER (an abort) or from CLEANING (done), never in HANDED_OVER. The step to
+/// HANDED_OVER names this map as the hand-over and raises the source's epoch by one, on
+/// the same node (S1).
+fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal> {
+    let before: HashMap<&str, &RangeMove> = old.moves.iter().map(|m| (m.id.as_str(), m)).collect();
+    let after: HashSet<&str> = new.moves.iter().map(|m| m.id.as_str()).collect();
+    for o in &old.moves {
+        if !after.contains(o.id.as_str()) && phase(o) == MovePhase::HandedOver {
+            return Err(format!(
+                "move {:?} is past its commit point (HANDED_OVER): it goes on to CLEANING, \
+                 and can't be removed",
+                o.id
+            ));
+        }
+    }
+    for m in &new.moves {
+        let id = &m.id;
+        let Some(o) = before.get(id.as_str()) else {
+            if phase(m) != MovePhase::Copying {
+                return Err(format!("move {id:?} must start at COPYING"));
+            }
+            // Not while a promote of its source or target is pending (cli692's N1 on PR 2):
+            // the promote's map moves the partition to another node and epoch under the
+            // copy, and the move's hand-over raises the same epoch.
+            for p in [&m.from, &m.to] {
+                if let Some(e) = pending_promote(new, p) {
+                    return Err(format!(
+                        "move {id:?} can't start while partition {p:?} has a pending promote \
+                         (to node {:?} at epoch {}): finish or abandon it first",
+                        e.to, e.to_epoch
+                    ));
+                }
+            }
+            continue;
+        };
+        if (o.kind, &o.table, &o.from, &o.to) != (m.kind, &m.table, &m.from, &m.to)
+            || move_range(o)? != move_range(m)?
+        {
+            return Err(format!(
+                "move {id:?}'s table, range, partitions or kind changed: a move keeps them"
+            ));
+        }
+        let (was, now) = (phase(o) as i32, phase(m) as i32);
+        if now != was && now != was + 1 {
+            return Err(format!(
+                "move {id:?} went from phase {:?} to {:?}: a move goes forward one phase per map",
+                phase(o),
+                phase(m)
+            ));
+        }
+        if phase(m) == MovePhase::HandedOver && phase(o) == MovePhase::HandingOver {
+            if (m.handed_over_term, m.handed_over_version) != (new.writer_term, new.map_version) {
+                return Err(format!(
+                    "move {id:?}'s hand-over map must be this map (term {}, version {})",
+                    new.writer_term, new.map_version
+                ));
+            }
+            let epoch = |map: &ClusterMap| {
+                map.partitions
+                    .iter()
+                    .find(|p| p.id == m.from)
+                    .map(|p| (p.node.clone(), p.epoch))
+            };
+            match (epoch(old), epoch(new)) {
+                (Some((a, e)), Some((b, f))) if a == b && f == e + 1 => {}
+                _ => {
+                    return Err(format!(
+                        "move {id:?}'s hand-over raises its source {:?}'s epoch by one, on the \
+                         same node (D331's S1)",
+                        m.from
+                    ));
+                }
+            }
+        } else if (o.handed_over_term, o.handed_over_version)
+            != (m.handed_over_term, m.handed_over_version)
+        {
+            return Err(format!("move {id:?}'s hand-over map changed"));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `a` and `b` list the same node ids (in any order).
@@ -799,11 +1129,26 @@ pub(crate) fn with_history(
             }
         }
     }
+    // D331's S1: a hand-over raises its source's epoch with its files in place, open on the
+    // same node, so the partition's history goes on.
+    let handing: HashSet<&str> = new
+        .moves
+        .iter()
+        .filter(|m| {
+            phase(m) == MovePhase::HandedOver
+                && old
+                    .moves
+                    .iter()
+                    .any(|o| o.id == m.id && phase(o) == MovePhase::HandingOver)
+        })
+        .map(|m| m.from.as_str())
+        .collect();
     let mut out = new.clone();
     for p in &mut out.partitions {
         p.history_epoch = match before.get(p.id.as_str()) {
             Some(o) if p.epoch == o.epoch => o.history_epoch,
             Some(o) if copies.contains(&p.id) => o.history_epoch,
+            Some(o) if handing.contains(p.id.as_str()) && o.node == p.node => o.history_epoch,
             _ => p.epoch,
         };
     }
@@ -816,12 +1161,17 @@ pub(crate) fn canonical(map: &ClusterMap) -> ClusterMap {
     let mut m = map.clone();
     let memory = m.memory.iter_mut().flat_map(|p| p.splits.iter_mut());
     let indexes = m.indexes.iter_mut().flat_map(|i| i.splits.iter_mut());
+    let moves = m
+        .moves
+        .iter_mut()
+        .flat_map(|r| r.start.iter_mut().chain(r.end.iter_mut()));
     for k in m
         .tables
         .iter_mut()
         .flat_map(|t| t.splits.iter_mut())
         .chain(memory)
         .chain(indexes)
+        .chain(moves)
     {
         if let Ok(b) = split_key_bytes(k) {
             k.key = Some(match String::from_utf8(b) {
@@ -918,6 +1268,7 @@ mod tests {
             failover: false,
             failover_rejoin: false,
             failovers: Vec::new(),
+            moves: Vec::new(),
         }
     }
 
@@ -1275,6 +1626,257 @@ mod tests {
         validate(&m, false).unwrap();
         m.nodes[1].address = "localhost:7002".into();
         validate(&m, true).unwrap();
+    }
+
+    /// D331: `users` `[c, f)` from p1 to p2, at `phase`.
+    fn moving(phase: MovePhase) -> ClusterMap {
+        let mut m = map();
+        m.moves.push(RangeMove {
+            id: "mv1".into(),
+            kind: crate::serve::proto::MoveKind::Range as i32,
+            table: "users".into(),
+            start: Some(text("c")),
+            end: Some(text("f")),
+            from: "p1".into(),
+            to: "p2".into(),
+            phase: phase as i32,
+            ..Default::default()
+        });
+        m
+    }
+
+    #[test]
+    fn a_move_names_a_movable_range_its_source_holds() {
+        validate(&moving(MovePhase::Copying), true).unwrap();
+        let bad = |f: &dyn Fn(&mut ClusterMap), says: &str| {
+            let mut m = moving(MovePhase::Copying);
+            f(&mut m);
+            refused(validate(&m, true), says);
+        };
+        bad(&|m| m.moves[0].id = "Bad Id".into(), "move id");
+        bad(&|m| m.moves[0].phase = 0, "no phase");
+        bad(&|m| m.moves[0].kind = 0, "no kind");
+        bad(&|m| m.moves[0].table = "nope".into(), "doesn't place");
+        bad(
+            &|m| {
+                m.moves[0].table = "orders".into();
+                m.moves[0].from = "p3".into();
+            },
+            "co-location group",
+        );
+        bad(&|m| m.moves[0].to = "p9".into(), "doesn't list");
+        bad(&|m| m.moves[0].to = "p1".into(), "to itself");
+        bad(&|m| m.moves[0].end = Some(text("c")), "range is empty");
+        // Across p1's range's end (`m`), and a range p1 doesn't hold.
+        bad(&|m| m.moves[0].end = Some(text("n")), "isn't inside");
+        bad(&|m| m.moves[0].end = None, "isn't inside");
+        bad(
+            &|m| {
+                m.moves[0].start = Some(text("p"));
+                m.moves[0].end = None;
+            },
+            "isn't inside",
+        );
+        // Across two adjacent ranges that p1 holds both of (simp724's nit): still not inside
+        // one.
+        let mut both = moving(MovePhase::Copying);
+        both.tables[0].partitions = vec!["p1".into(), "p1".into()];
+        both.moves[0].end = Some(text("p"));
+        refused(validate(&both, true), "isn't inside");
+        bad(&|m| m.moves[0].final_seqno = 7, "final_seqno");
+        bad(&|m| m.moves[0].handed_over_version = 1, "handed-over map");
+        // One move per partition, as source or target.
+        bad(
+            &|m| {
+                let mut two = m.moves[0].clone();
+                two.id = "mv2".into();
+                two.start = Some(text("g"));
+                two.end = Some(text("h"));
+                two.to = "p3".into();
+                m.moves.push(two);
+            },
+            "one move at a time",
+        );
+        bad(&|m| m.moves.push(m.moves[0].clone()), "listed twice");
+        // From HANDED_OVER the target holds the range, and the hand-over map is named.
+        let mut m = moving(MovePhase::HandedOver);
+        m.moves[0].handed_over_version = 1;
+        refused(validate(&m, true), "inside one range partition \"p2\"");
+        m.tables[0] = handed_over(&m.tables[0], b"c", Some(b"f"), "p2");
+        validate(&m, true).unwrap();
+        m.moves[0].handed_over_version = 2;
+        refused(validate(&m, true), "not after this map");
+    }
+
+    #[test]
+    fn a_table_an_index_follows_never_moves_even_in_a_forced_map() {
+        // The coordinator, 2026-11-18: a text index's postings and a vector index's lists
+        // hold ids from both sides of any range (#2066).
+        let mut m = with_indexes();
+        m.moves = moving(MovePhase::Copying).moves;
+        refused(
+            validate(&m, true),
+            "index \"users_vec\" follows table \"users\"",
+        );
+    }
+
+    #[test]
+    fn a_hand_over_cuts_the_range_out_and_gives_it_to_the_target() {
+        let t = &map().tables[0];
+        let keys = |t: &TablePlacement| -> Vec<Vec<u8>> {
+            t.splits
+                .iter()
+                .map(|k| split_key_bytes(k).unwrap())
+                .collect()
+        };
+        // Inside p1's range: two new split keys.
+        let h = handed_over(t, b"c", Some(b"f"), "p2");
+        assert_eq!(keys(&h), [b"c".to_vec(), b"f".to_vec(), b"m".to_vec()]);
+        assert_eq!(h.partitions, ["p1", "p2", "p1", "p2"]);
+        // To the table's end from inside p2's range: one.
+        let h = handed_over(t, b"p", None, "p1");
+        assert_eq!(keys(&h), [b"m".to_vec(), b"p".to_vec()]);
+        assert_eq!(h.partitions, ["p1", "p2", "p1"]);
+        // A whole range: none.
+        let h = handed_over(t, b"m", None, "p3");
+        assert_eq!(keys(&h), [b"m".to_vec()]);
+        assert_eq!(h.partitions, ["p1", "p3"]);
+        // The table's own keys keep their form; new ones are canonical (cli692's N3).
+        let mut raw_m = t.clone();
+        raw_m.splits = vec![raw(b"m")];
+        let h = handed_over(&raw_m, b"c", Some(b"f"), "p2");
+        assert_eq!(h.splits, [text("c"), text("f"), raw(b"m")]);
+        let h = handed_over(&raw_m, b"\xfe", Some(b"\xff"), "p1");
+        assert_eq!(h.splits, [raw(b"m"), raw(b"\xfe"), raw(b"\xff")]);
+    }
+
+    #[test]
+    fn a_forced_map_may_drop_a_handed_over_move_and_keeps_the_targets_placement() {
+        // cli692's N2: a recovery's forced map skips the step rules, so it can drop a move
+        // past its commit point; the placement it carries still names who holds the range,
+        // and `validate` still holds it to that.
+        let mut handed = moving(MovePhase::HandedOver);
+        handed.map_version = 5;
+        handed.moves[0].handed_over_version = 5;
+        handed.tables[0] = handed_over(&handed.tables[0], b"c", Some(b"f"), "p2");
+        handed.partitions[0].epoch = 2;
+        validate(&handed, true).unwrap();
+        let mut forced = handed.clone();
+        forced.map_version = 6;
+        forced.moves.clear();
+        validate(&forced, true).unwrap();
+        validate_catch_up(&handed, &forced).unwrap();
+        validate_epochs(&handed, &forced).unwrap();
+        assert_eq!(forced.tables[0].partitions, ["p1", "p2", "p1", "p2"]);
+        // A change through the writer couldn't.
+        refused(validate_change(&handed, &forced), "past its commit point");
+    }
+
+    /// cli692's N1 on PR 2: a move doesn't start while its source or target has a pending
+    /// promote (D330); one already finished (its partition at the promote's epoch) is no bar.
+    #[test]
+    fn a_move_doesnt_start_while_its_source_or_target_has_a_pending_promote() {
+        for p in ["p1", "p2"] {
+            let epoch = map().partitions.iter().find(|q| q.id == p).unwrap().epoch;
+            let mut old = map();
+            old.failovers.push(pending(p, "c", epoch + 1));
+            let mut new = moving(MovePhase::Copying);
+            new.map_version = old.map_version + 1;
+            new.failovers = old.failovers.clone();
+            refused(validate_change(&old, &new), "pending promote");
+            // Finished: the partition is at the promote's epoch.
+            let mut old = map();
+            old.failovers.push(pending(p, "c", epoch));
+            new.failovers = old.failovers.clone();
+            validate_change(&old, &new).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_move_goes_one_phase_per_map_and_its_hand_over_is_the_one_reshape() {
+        let at = |phase: MovePhase, version: u64| {
+            let mut m = moving(phase);
+            m.map_version = version;
+            m
+        };
+        // It appears at COPYING, and only there.
+        validate_change(&map(), &at(MovePhase::Copying, 2)).unwrap();
+        refused(
+            validate_change(&map(), &at(MovePhase::CatchingUp, 2)),
+            "start at COPYING",
+        );
+        // Forward one phase at a time, or staying.
+        validate_change(&at(MovePhase::Copying, 1), &at(MovePhase::Copying, 2)).unwrap();
+        validate_change(&at(MovePhase::Copying, 1), &at(MovePhase::CatchingUp, 2)).unwrap();
+        refused(
+            validate_change(&at(MovePhase::Copying, 1), &at(MovePhase::HandingOver, 2)),
+            "one phase per map",
+        );
+        refused(
+            validate_change(&at(MovePhase::CatchingUp, 1), &at(MovePhase::Copying, 2)),
+            "one phase per map",
+        );
+        // Its range, partitions and kind are fixed.
+        let mut other = at(MovePhase::Copying, 2);
+        other.moves[0].end = Some(text("e"));
+        refused(
+            validate_change(&at(MovePhase::Copying, 1), &other),
+            "keeps them",
+        );
+        // Removed before the commit point (an abort), not at it.
+        let mut gone = map();
+        gone.map_version = 2;
+        validate_change(&at(MovePhase::HandingOver, 1), &gone).unwrap();
+
+        // The hand-over: this map named, the range given to p2, p1's epoch up by one.
+        let before = at(MovePhase::HandingOver, 4);
+        let mut after = at(MovePhase::HandedOver, 5);
+        after.moves[0].handed_over_version = 5;
+        after.tables[0] = handed_over(&after.tables[0], b"c", Some(b"f"), "p2");
+        after.partitions[0].epoch = 2;
+        validate_change(&before, &after).unwrap();
+        // It keeps p1's history (cli692's M2), and p1 stays on its node.
+        let derived = with_history(&before, &after, &[]).unwrap();
+        assert_eq!(derived.partitions[0].history_epoch, 0);
+        let mut wrong = after.clone();
+        wrong.moves[0].handed_over_version = 4;
+        refused(validate_change(&before, &wrong), "must be this map");
+        let mut wrong = after.clone();
+        wrong.partitions[0].epoch = 1;
+        refused(validate_change(&before, &wrong), "raises its source");
+        let mut wrong = after.clone();
+        wrong.tables[0] = handed_over(&map().tables[0], b"c", Some(b"g"), "p2");
+        refused(
+            validate_change(&before, &wrong),
+            "except by a range move's hand-over",
+        );
+        // The same reshape with no hand-over step is refused.
+        let mut reshaped = map();
+        reshaped.map_version = 2;
+        reshaped.tables[0] = handed_over(&map().tables[0], b"c", Some(b"f"), "p2");
+        refused(
+            validate_change(&map(), &reshaped),
+            "except by a range move's hand-over",
+        );
+        // Past the commit point it only goes on: never removed in HANDED_OVER; from CLEANING
+        // it's done.
+        let mut handed = after.clone();
+        handed.map_version = 6;
+        let mut gone = handed.clone();
+        gone.map_version = 7;
+        gone.moves.clear();
+        refused(validate_change(&handed, &gone), "past its commit point");
+        let mut cleaning = handed.clone();
+        cleaning.map_version = 7;
+        cleaning.moves[0].phase = MovePhase::Cleaning as i32;
+        validate_change(&handed, &cleaning).unwrap();
+        gone.map_version = 8;
+        validate_change(&cleaning, &gone).unwrap();
+        // A later step keeps the hand-over's map.
+        let mut moved = cleaning.clone();
+        moved.map_version = 8;
+        moved.moves[0].handed_over_version = 7;
+        refused(validate_change(&cleaning, &moved), "hand-over map changed");
     }
 
     #[test]

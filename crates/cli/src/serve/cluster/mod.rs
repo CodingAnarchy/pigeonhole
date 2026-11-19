@@ -25,6 +25,7 @@ pub(crate) mod load;
 pub(crate) mod map;
 mod memfan;
 pub(crate) mod memwatch;
+mod moves;
 pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
@@ -77,8 +78,13 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     INDEX_BULK_LOAD_FEATURE,
     LEASES_FEATURE,
     WRITER_TERMS_FEATURE,
+    RANGE_MOVES_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
+/// field from its copy, read as divergent, and gate no moving range.
+pub(crate) const RANGE_MOVES_FEATURE: &str = "range_moves";
 
 /// [`MAP_FEATURES`]' name for a build that serves `Cluster.Lease` (D326 amendment 1, #2048):
 /// a peer whose `Lease` answers `Unimplemented` counts as granting only if its `Status`
@@ -165,6 +171,7 @@ pub(crate) const WRITER_TERMS_FEATURE: &str = "writer_terms";
 pub(crate) const LOCK_FILE: &str = ".lock";
 /// The header a node's calls to its peers carry its map version in.
 const MAP_VERSION_HEADER: &str = "x-pigeonhole-map-version";
+
 /// The header a node's calls to its peers carry its id in, so a pull knows whom to ask.
 pub(crate) const NODE_ID_HEADER: &str = "x-pigeonhole-node-id";
 
@@ -246,6 +253,30 @@ pub(crate) static OLD_INDEXES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// is listed, as a stalled peer's wouldn't.
 #[cfg(test)]
 pub(crate) static HOLD_STATUS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): nodes that hold no election while their cluster directory is
+/// listed.
+#[cfg(test)]
+pub(crate) static NO_ELECTION: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): candidates whose real vote requests reach no peer, past a
+/// pre-vote that did: an election lost between the two rounds. Its own vote is recorded.
+#[cfg(test)]
+pub(crate) static DROP_VOTES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A fault seam (tests, #2073): writers that don't adopt a stranded node's term, so a test
+/// can watch the cluster with the node still stranded.
+#[cfg(test)]
+pub(crate) static NO_ADOPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Whether the seam `list` names this node's directory `dir`.
+#[cfg(test)]
+pub(crate) fn seam(list: &Mutex<Vec<PathBuf>>, dir: &Path) -> bool {
+    list.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|d| d == dir)
+}
 
 /// How [`OLD_NEAREST`] has a node act.
 #[cfg(test)]
@@ -422,6 +453,8 @@ pub(crate) struct Node {
     /// The writer's failover state (D330 PR 2): when it took office, the last survey, the
     /// promote in progress.
     failovers: failover::Failovers,
+    /// The writer's watch for nodes a lost election stranded (#2073).
+    stranded: Mutex<writer::Stranded>,
     /// The node's device ceiling (D332): the highest one-second rate of its partitions'
     /// device bytes within `--balance-window`, fed by [`Node::watch_device`].
     device_ceiling: load::DeviceCeiling,
@@ -509,6 +542,7 @@ impl Node {
             elect_since: Mutex::new(None),
             duties: std::sync::atomic::AtomicBool::new(false),
             failovers: failover::Failovers::default(),
+            stranded: Mutex::new(writer::Stranded::default()),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -609,8 +643,8 @@ impl Node {
             let voted = self.grants.voted();
             if map.writer_term < voted {
                 return Err(ApiError::failed_precondition(format!(
-                    "the map is at writer term {}, but this node voted for term {voted}: it's \
-                     from a writer that has been replaced (D330)",
+                    "the map is at writer term {}, but {VOTED_ABOVE} {voted}: it's from a writer \
+                     that has been replaced (D330)",
                     map.writer_term
                 )));
             }
@@ -691,6 +725,10 @@ impl Node {
         // A partition the map now gives this node opens (D317 ticket 6, §3).
         self.open_missing_soon();
         self.end_moved_feeds(version);
+        // D331: each partition's range gate, and a source's hand-over.
+        if let Some(m) = &installed {
+            self.apply_moves(m);
+        }
         self.wake_copies(&moved);
         Ok(version)
     }
@@ -846,6 +884,11 @@ impl Node {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
                     .await?;
             }
+            // So does the first range move (D331).
+            if current.moves.is_empty() && !map.moves.is_empty() {
+                self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -870,6 +913,10 @@ impl Node {
             }
             if !map.indexes.is_empty() {
                 self.every_node_keeps(&map, INDEXES_FEATURE, "an index placement")
+                    .await?;
+            }
+            if !map.moves.is_empty() {
+                self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
                     .await?;
             }
             if map::uses_failover(&map) || map.writer_term > 0 {
@@ -1042,6 +1089,17 @@ impl Node {
                     && e.contains(DIVERGENT)
                 {
                     node.state().divergent.insert(id.clone());
+                }
+                // A node the term fence keeps from this map: it voted in an election that
+                // lost (#2073). The writer's duties look at it.
+                if let Err(e) = &result
+                    && e.contains(VOTED_ABOVE)
+                {
+                    let now = node.grants.clock().now();
+                    node.stranded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .refused(&id, now, node.grants.lease());
                 }
                 NodePush {
                     node: id,
@@ -1520,6 +1578,10 @@ impl Node {
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
                 }
             }
+            // D331: the moves naming it (the follower's lag comes with PR 4's follower).
+            if let Some(m) = &map {
+                lp.moves = crate::serve::ranges::statuses(m, &id);
+            }
         }
         let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
             || (String::new(), self.grants.voted(), Duration::ZERO),
@@ -1843,6 +1905,10 @@ impl Node {
 /// would be sturdier across versions, once a client other than a node needs it.
 const DIVERGENT: &str = "divergent map";
 
+/// The marker the term fence's refusal carries (D330), so a writer whose push it refuses
+/// looks at the node (#2073). Matched in the message, as [`DIVERGENT`] is.
+const VOTED_ABOVE: &str = "this node voted for term";
+
 /// The `Cluster` service over gRPC.
 #[derive(Debug, Clone)]
 /// The `Cluster` service: the node, and on a node that serves data (not a bare node in a
@@ -2028,7 +2094,23 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         if self.0.is_vote(&mine, &req) {
             return Ok(tonic::Response::new(self.0.vote_async(mine, req).await?));
         }
-        Ok(tonic::Response::new(self.0.grants.grant(&mine, &req)?))
+        let r = self.0.grants.grant(&mine, &req)?;
+        // The writer notes an asker it answers with its newer map (#2073): one that stays
+        // behind may be stranded by the term fence.
+        if schema::writer(&mine) == self.0.id {
+            let now = self.0.grants.clock().now();
+            let mut s = self
+                .0
+                .stranded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if r.newer_map_version != 0 {
+                s.behind(&req.node_id, now);
+            } else {
+                s.caught_up(&req.node_id);
+            }
+        }
+        Ok(tonic::Response::new(r))
     }
 
     /// Node to node (D326 PR 2): a node gave up partitions it closed. Cluster scope.
@@ -2678,10 +2760,13 @@ pub(crate) fn run(
         .map_err(|e| Failure::usage(&e))?;
     let parts: Vec<(String, super::service::Service)> = opened
         .iter()
-        .map(|o| {
+        .map(|o| -> Result<_, Failure> {
             // Fenced from the start (D317 ticket 6), until a peer's map confirms it.
             let epoch = mine.iter().find(|(p, _)| *p == o.id).map_or(0, |(_, e)| *e);
             let gate = node.open_gate(&o.id, epoch);
+            // D331: its range gate, before it serves.
+            node.arm_ranges(&gate, &o.id, &o.db, || ())
+                .map_err(|e| Failure::usage(&format!("partition {}: {e}", o.id)))?;
             let config = super::service::PartitionConfig {
                 backups: Arc::clone(&backups),
                 placement: Some(Arc::clone(&placement)),
@@ -2692,9 +2777,9 @@ pub(crate) fn run(
             // A text index rebuild a fence or a shutdown stopped carries on once the
             // partition takes writes (#1756).
             part.resume_text_rebuilds();
-            (o.id.clone(), part)
+            Ok((o.id.clone(), part))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let serving = if mine.is_empty() {
         format!(
             "no partition, routing only, as cluster node {id} of {}; map version {version}",
@@ -3108,6 +3193,37 @@ fn open_replica_copy(
     Ok(db)
 }
 
+/// D331 PR 3: a restored file (its stamp left the clip marker) is clipped to the map in
+/// `dir` before it serves ([`moves::clip_restored`]); the marker stays until the clip is done,
+/// so a clip that stopped runs again at the next open.
+fn clip_if_restored(
+    dir: &Path,
+    db: &pigeonhole::Pigeonhole,
+    partition: &str,
+) -> Result<(), String> {
+    if !crate::serve::ranges::clip_pending(db)? {
+        return Ok(());
+    }
+    let map = read_map(dir)?.ok_or("no cluster map to clip to")?;
+    let c = moves::clip_restored(db, &map, partition)?;
+    eprintln!(
+        "phdb serve: partition {partition}: the restored file is clipped to the map: {} rows \
+         outside its ranges deleted{}",
+        c.deleted,
+        if c.in_doubt == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {} cluster transaction(s) in doubt here could still write outside them, so \
+                 the clip runs again at the next open: decide them (phdb cluster txn decide), \
+                 then reopen the partition",
+                c.in_doubt
+            )
+        }
+    );
+    Ok(())
+}
+
 /// Opens partition `partition`'s file in `dir`, checking its identity row against the map:
 /// this cluster's, this partition's, at the map's epoch. A file that says otherwise was
 /// stamped for another cluster or partition, or the map moved past it: refused, not served.
@@ -3138,7 +3254,15 @@ fn open_partition(
         epoch,
     };
     match identity::read(&db) {
-        Ok(Some(id)) if id == want => Ok(Some(db)),
+        Ok(Some(id)) if id == want => match clip_if_restored(dir, &db, partition) {
+            Ok(()) => Ok(Some(db)),
+            Err(e) => {
+                let _ = db.close();
+                Err(Failure::usage(&format!(
+                    "partition {partition:?}: clipping the restored file to the map: {e}"
+                )))
+            }
+        },
         Ok(Some(id))
             if id.cluster_id == want.cluster_id
                 && id.partition_id == want.partition_id
@@ -3146,6 +3270,27 @@ fn open_partition(
         {
             let _ = db.close();
             Ok(None)
+        }
+        // D331 (simp724's B3): one epoch below a map that hands a range of it over, at that
+        // epoch: a crash after the map's persist and before the source's stamp. The open
+        // finishes the hand-over (the moved-away row, then the stamp) before it serves.
+        Ok(Some(id))
+            if id.cluster_id == want.cluster_id
+                && id.partition_id == want.partition_id
+                && id.epoch + 1 == epoch
+                && let Ok(Some(map)) = read_map(dir)
+                && let Some(m) = moves::handing_over(&map, partition) =>
+        {
+            match moves::finish_hand_over(&db, m, epoch, dir) {
+                Ok(_) => Ok(Some(db)),
+                Err(e) => {
+                    let _ = db.close();
+                    Err(Failure::usage(&format!(
+                        "partition {partition:?}: finishing move {:?}'s hand-over: {e}",
+                        m.id
+                    )))
+                }
+            }
         }
         found => {
             let _ = db.close();

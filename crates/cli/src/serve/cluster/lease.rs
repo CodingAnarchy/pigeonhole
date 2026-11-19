@@ -509,8 +509,14 @@ impl Grants {
             return Ok(out);
         }
         if let Some(margin) = pre_vote {
+            // The holder of this node's live writer lease, at the map's term, passes: it's
+            // the live writer adopting a term a lost election left above its own (#2073,
+            // simp724's point 1). Any other candidate waits out the margin.
+            let holder = by
+                .get(&req.node_id)
+                .is_some_and(|g| g.parts.get(WRITER_LEASE) == Some(&mine.writer_term));
             let lapsed = self.writer_lapsed();
-            if lapsed < margin {
+            if !holder && lapsed < margin {
                 out.withheld.push(LeaseWithheld {
                     partition: WRITER_LEASE.to_owned(),
                     holder: super::schema::writer(mine).to_owned(),
@@ -1005,6 +1011,50 @@ mod tests {
             .pre_vote(&v1, &pre(ask_writer("c", 1, 4, 2, 1)), margin)
             .unwrap();
         assert!(r.granted.is_empty() && r.writer_term == 1, "{r:?}");
+    }
+
+    #[test]
+    fn the_live_writer_passes_its_own_pre_vote_and_vote_for_a_higher_term_and_no_one_else() {
+        // #2073 (simp724's point 1): the writer adopting a term a lost election left. Its
+        // own lease runs on every voter, so the margin can't have passed; the holder's
+        // ballot at the lease's term is let through, and only the holder's.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        let v1 = termed(4, "a", 1);
+        let margin = Duration::from_secs(5);
+        let pre = |req: LeaseRequest| LeaseRequest {
+            pre_vote: true,
+            ..req
+        };
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        // Another candidate: withheld, a's lease runs.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("b", 1, 4, 1, 3)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty() && r.withheld[0].holder == "a", "{r:?}");
+        // a itself, at a term above a lost election's 2: its pre-vote and vote pass.
+        let r = g
+            .pre_vote(&v1, &pre(ask_writer("a", 1, 4, 2, 3)), margin)
+            .unwrap();
+        assert_eq!(granted(&r), [WRITER_LEASE]);
+        assert_eq!(g.voted(), 0, "a pre-vote records nothing");
+        let r = g
+            .vote(&v1, &ask_writer("a", 1, 4, 3, 3), |_| Ok(()))
+            .unwrap();
+        assert_eq!((granted(&r), g.voted()), (vec![WRITER_LEASE], 3));
+        // A grant of the writer lease at another term than the map's isn't the holder's.
+        let (g, _clock) = grants(Duration::from_secs(10));
+        assert_eq!(
+            granted(&grant(&g, &v1, &ask_writer("a", 1, 4, 1, 1))),
+            [WRITER_LEASE]
+        );
+        let v2 = termed(5, "a", 2);
+        let r = g
+            .pre_vote(&v2, &pre(ask_writer("a", 2, 5, 2, 3)), margin)
+            .unwrap();
+        assert!(r.granted.is_empty(), "{r:?}");
     }
 
     #[test]
