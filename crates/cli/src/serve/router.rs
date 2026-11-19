@@ -43,6 +43,8 @@ pub(crate) struct Cluster {
     pub(crate) spanning: Arc<spanning::Spanning>,
     /// The range moves' copies this node serves as their source (D331 PR 4b).
     pub(crate) range_copies: Arc<super::cluster::range_copy::Sources>,
+    /// The range moves this node follows as their target (D331 PR 4b).
+    pub(crate) range_follows: Arc<super::cluster::range_follow::Followers>,
 }
 
 impl Cluster {
@@ -256,6 +258,7 @@ impl Router {
                     4 << 30,
                     2,
                 )),
+                range_follows: Arc::default(),
             }),
         }
     }
@@ -479,6 +482,9 @@ impl Router {
         super::replica::Replica::render_copies(&followers, &mut text);
         // The map's failover counts and writer term (D330).
         cluster.node.render_failover_metrics(&mut text);
+        // D331 PR 4b: the range moves followed here, and copies refused for the cap.
+        cluster.range_follows.render_metrics(&mut text);
+        cluster.range_copies.render_metrics(&mut text);
         text
     }
 
@@ -1149,6 +1155,10 @@ impl Router {
         let Some(cluster) = &self.cluster else {
             return Err(ApiError::unsupported("this node isn't a cluster node"));
         };
+        // D331 PR 4b: a range move's catch-up stream (raw, range-bound) is its own.
+        if req.raw || req.range_start.is_some() || req.range_end.is_some() {
+            return super::cluster::range_feed::serve(cluster, req).await;
+        }
         super::cluster::feed::serve(&cluster.node, &cluster.parts, req).await
     }
 

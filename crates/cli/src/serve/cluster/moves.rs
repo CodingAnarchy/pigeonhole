@@ -154,6 +154,16 @@ impl Node {
             .map(|c| std::sync::Arc::clone(&c.range_copies))
     }
 
+    /// The range moves this node follows as a target (D331 PR 4b), once it serves.
+    pub(super) fn range_follows(&self) -> Option<std::sync::Arc<super::range_follow::Followers>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        shared
+            .router
+            .cluster
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.range_follows))
+    }
+
     /// After an install publishes `map` (under the install lock): every partition served
     /// here settles to it. **Blocking**, on the install's thread.
     pub(super) fn apply_moves(&self, map: &ClusterMap) {
@@ -163,8 +173,10 @@ impl Node {
         let Some(cluster) = shared.router.cluster.as_ref() else {
             return;
         };
-        // D331 PR 4b: copies this node no longer serves as their source let go.
+        // D331 PR 4b: copies this node no longer serves as their source let go, and the
+        // moves it follows as their target start or stop (M2).
         cluster.range_copies.release_gone(map, &self.id);
+        cluster.range_follows.sync(map, &self.id, &shared);
         let mut raised = false;
         for (id, service) in cluster.parts.load().iter() {
             let (Some((gate, _)), Ok(part)) = (self.fences.gate(id), service.part()) else {

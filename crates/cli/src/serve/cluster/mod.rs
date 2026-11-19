@@ -31,6 +31,8 @@ pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod promote;
 pub(crate) mod range_copy;
+pub(crate) mod range_feed;
+pub(crate) mod range_follow;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -1582,10 +1584,21 @@ impl Node {
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).
             if let Some(m) = &map {
                 lp.moves = crate::serve::ranges::statuses(m, &id);
-                // PR 4b: a source whose move's retention hold lapsed.
+                // PR 4b: a source whose move's retention hold lapsed; a target's follower.
                 if let Some(copies) = self.range_copies() {
                     for s in lp.moves.iter_mut().filter(|s| s.source) {
                         s.retention_lapsed = copies.lapsed(&s.id);
+                    }
+                }
+                if let Some(follows) = self.range_follows() {
+                    for s in lp.moves.iter_mut().filter(|s| !s.source) {
+                        if let Some(p) = follows.progress(&s.id) {
+                            s.copied_bytes =
+                                p.copied_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                            s.copy_done = p.copy_done.load(std::sync::atomic::Ordering::Relaxed);
+                            s.source_applied_seqno =
+                                p.applied.load(std::sync::atomic::Ordering::Acquire);
+                        }
                     }
                 }
             }

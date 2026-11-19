@@ -142,15 +142,15 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
         // Its lease lapsed, and it can't ask at epoch 2 with its file at 1: no writes.
         assert!(try_put(c, "alice", "2").await.is_err());
         // CLEANING: the next map finishes a's hand-over (the stamp, then the lease at
-        // epoch 2, asked at once), and p2 serves the range (empty here: PR 4 copies it) and
-        // takes its writes.
+        // epoch 2, asked at once), and p2 serves the range and takes its writes.
         push(&ports, &moving(&v1, 6, Some(MovePhase::Cleaning))).await;
         eventually("p1 takes writes at epoch 2", async || {
             try_put(c, "alice", "2").await.is_ok()
         })
         .await;
         try_put(c, "zed", "2").await.unwrap();
-        assert_eq!(get_row(c, "d").await.unwrap(), None);
+        // p2 serves the range as b's follower copied it (D331 PR 4b).
+        assert_eq!(get_row(c, "d").await.unwrap(), Some(b"2".to_vec()));
         try_put(c, "d", "5").await.unwrap();
         // Done: the record goes, and the range stays p2's.
         push(&ports, &moving(&v1, 7, None)).await;
@@ -534,4 +534,128 @@ fn an_open_finishes_a_hand_over_past_a_promotes_floor_and_no_further() {
             );
         }
     }
+}
+
+/// Partition `p`'s view of move `id` on the node at `port`, as its `Status` reports it.
+async fn move_status(port: u16, p: &str, id: &str) -> Option<crate::serve::proto::MoveStatus> {
+    client(port)
+        .await
+        .status(StatusRequest {})
+        .await
+        .ok()?
+        .into_inner()
+        .partitions
+        .into_iter()
+        .find(|lp| lp.id == p)?
+        .moves
+        .into_iter()
+        .find(|m| m.id == id)
+}
+
+/// D331 PR 4b: a range move's target copies its range from the source chunk by chunk, then
+/// catches up on the source's history of it from the copy's first token through the move's
+/// last seqno: writes during the copy and the catch-up all arrive, and nothing outside the
+/// range does. The progress rows sit beside the moved-away and serving rows without
+/// showing in either (cli692's M4).
+#[test]
+fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    let (b, c) = (ports[1], ports[2]);
+    rt.block_on(async {
+        eventually("p1 takes writes", async || {
+            try_put(c, "d", "0").await.is_ok()
+        })
+        .await;
+        // The range's bounds and both sides of each: `c` is in, `f` is out.
+        for row in ["b", "c", "e", "f"] {
+            try_put(c, row, "0").await.unwrap();
+        }
+        // COPYING: b's follower copies [c, f) from a.
+        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        try_put(c, "d", "1").await.unwrap();
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+        let s = move_status(b, "p2", "mv1").await.unwrap();
+        assert!(s.copied_bytes > 0, "{s:?}");
+        // CATCHING_UP: a write now arrives by the catch-up.
+        push(&ports, &moving(&v1, 3, Some(MovePhase::CatchingUp))).await;
+        try_put(c, "e", "2").await.unwrap();
+        try_put(c, "zed", "2").await.unwrap();
+        // HANDING_OVER, then HANDED_OVER with p1's last seqno before the fence.
+        push(&ports, &moving(&v1, 4, Some(MovePhase::HandingOver))).await;
+        let last = db_a.visible_seqno();
+        let mut handed = moving(&v1, 5, Some(MovePhase::HandedOver));
+        handed.moves[0].final_seqno = last;
+        push(&ports, &handed).await;
+        eventually("b's catch-up passes the move's last seqno", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.source_applied_seqno >= last)
+        })
+        .await;
+        let mut cleaning = moving(&v1, 6, Some(MovePhase::Cleaning));
+        cleaning.moves[0].final_seqno = last;
+        push(&ports, &cleaning).await;
+        eventually("p2 serves the range", async || {
+            get_row(c, "e")
+                .await
+                .is_ok_and(|v| v == Some(b"2".to_vec()))
+        })
+        .await;
+        assert_eq!(get_row(c, "c").await.unwrap(), Some(b"0".to_vec()));
+        assert_eq!(get_row(c, "d").await.unwrap(), Some(b"1".to_vec()));
+    });
+    // Nothing outside the range reached p2 (`zed` is p2's own, past the split at `m`).
+    let t = db_b.table("users").unwrap().open().unwrap();
+    for row in ["b", "f"] {
+        assert!(t.get(row.as_bytes(), "f", b"q").unwrap().is_none(), "{row}");
+    }
+    // M4: the progress rows are in `moved`, and neither reader sees them.
+    let ids: Vec<String> = crate::serve::ranges::read_serving(&db_b)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(ids, ["mv1"]);
+    assert!(crate::serve::ranges::read_moved(&db_b).unwrap().is_empty());
+    let progress = db_b
+        .table(super::super::identity::TABLE)
+        .unwrap()
+        .open()
+        .unwrap();
+    assert!(
+        progress
+            .get(b"copy/mv1", "moved", b"done")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        progress
+            .get(b"follow/mv1", "moved", b"token")
+            .unwrap()
+            .is_some()
+    );
+    let _ = (db_a.close(), db_b.close());
 }

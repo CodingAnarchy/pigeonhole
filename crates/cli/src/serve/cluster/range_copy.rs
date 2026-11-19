@@ -12,7 +12,7 @@
 //! - **The rate:** every move's copy reads on this node share one token bucket at
 //!   `--move-rate-bytes` (cli692): it's the node's copy bandwidth.
 //! - **Release** (cli692's M2 and should): the hold and the slot go when the move leaves
-//!   COPYING through HANDING_OVER or the map, when this node stops owning the source, or
+//!   COPYING through HANDED_OVER (the target catches up to `final_seqno` then) or the map, when this node stops owning the source, or
 //!   when the target stops asking for [`IDLE`]. A lapsed hold is reported in the source's
 //!   `MoveStatus.retention_lapsed`, and the move must be aborted (a restart of the source
 //!   loses the hold too, so the target's resume finds history gone).
@@ -97,6 +97,33 @@ impl Sources {
         }
     }
 
+    /// `pigeonhole_cluster_move_copies_refused_total`: range copies refused here for a full
+    /// `--max-move-followers`.
+    pub(crate) fn render_metrics(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            text,
+            "# HELP pigeonhole_cluster_move_copies_refused_total Range move copies this node \
+             refused as their source for a full --max-move-followers (D331).\n# TYPE \
+             pigeonhole_cluster_move_copies_refused_total counter\n\
+             pigeonhole_cluster_move_copies_refused_total {}",
+            self.refused.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Move `id`'s target is still reading (its catch-up stream, which asks for no chunks):
+    /// its hold and slot don't go idle.
+    pub(crate) fn touch(&self, id: &str) {
+        if let Some(s) = self
+            .copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(id)
+        {
+            s.asked = Instant::now();
+        }
+    }
+
     /// Whether move `id`'s hold here lapsed (`MoveStatus.retention_lapsed`).
     pub(crate) fn lapsed(&self, id: &str) -> bool {
         self.copies
@@ -107,7 +134,7 @@ impl Sources {
     }
 
     /// Drops the holds and slots of copies this node no longer serves: the move left
-    /// COPYING through HANDING_OVER, or the map, or names another source; this node no
+    /// COPYING through HANDED_OVER, or the map, or names another source; this node no
     /// longer owns the source, or owns it at another epoch than `from_epoch` (M2); or the
     /// target stopped asking ([`IDLE`]). Each map
     /// install calls it.
@@ -129,7 +156,7 @@ impl Sources {
                     &m.id == id
                         && !super::map::node_move(m)
                         && m.from == s.partition
-                        && (MovePhase::Copying..=MovePhase::HandingOver)
+                        && (MovePhase::Copying..=MovePhase::HandedOver)
                             .contains(&super::map::phase(m))
                         && owned(m)
                 });
@@ -299,8 +326,9 @@ impl Sources {
     }
 }
 
-/// A change kind's logged number (FORMAT §2), as `RangeCopyCell.kind` carries it.
-fn logged_kind(k: pigeonhole::ChangeKind) -> u32 {
+/// A change kind's logged number (FORMAT §2), as `RangeCopyCell.kind` and
+/// `RawChange.kind` carry it.
+pub(super) fn logged_kind(k: pigeonhole::ChangeKind) -> u32 {
     use pigeonhole::ChangeKind as K;
     match k {
         K::Put => 1,

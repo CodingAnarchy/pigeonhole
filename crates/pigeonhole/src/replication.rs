@@ -76,6 +76,14 @@ impl RangeDrop {
     pub fn seqno(&self) -> u64 {
         self.seqno
     }
+
+    /// Whether the drop removes any of rows `[start, end)` of `table` (`end` `None`: to the
+    /// table's end): a range move's catch-up stream ends on one that does (D331 PR 4b).
+    pub fn overlaps(&self, table: &crate::Table, start: &[u8], end: Option<&[u8]>) -> bool {
+        table.core.info.id == self.table
+            && end.is_none_or(|e| self.start.as_slice() < e)
+            && self.end.as_deref().is_none_or(|e| start < e)
+    }
 }
 
 /// One change of a replicated commit, as the primary logged it.
