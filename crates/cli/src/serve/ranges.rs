@@ -853,6 +853,9 @@ pub(crate) fn statuses(map: &ClusterMap, partition: &str) -> Vec<MoveStatus> {
                 } else {
                     phase >= MovePhase::Cleaning
                 },
+                // D331 PR 4b: the copy's progress and the hold's lapse, filled in by the
+                // range follower and the source's copy server.
+                ..MoveStatus::default()
             }
         })
         .collect()
