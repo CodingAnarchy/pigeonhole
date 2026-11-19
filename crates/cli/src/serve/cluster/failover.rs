@@ -55,9 +55,10 @@ pub(crate) struct Failovers {
     office: Mutex<(u64, u64)>,
     /// Each down partition not failed over, and why, as the last check found them.
     blocked: Mutex<BTreeMap<String, String>>,
-    /// When each blocked partition was last surveyed, on the lease clock, and at which map
-    /// version (perf287's S1 on #2069): it's surveyed again only after the failover margin
-    /// or a map change, not every lease round.
+    /// When each blocked partition that went through the last survey is due another, on the
+    /// lease clock, and the map version it was surveyed at (perf287's S1 on #2069): after
+    /// the failover margin, or when the grant it waits on ends (simp724's nit), or on a map
+    /// change, not every lease round.
     surveyed: Mutex<HashMap<String, (u64, u64)>>,
 }
 
@@ -100,21 +101,21 @@ impl Failovers {
     }
 
     /// Whether blocked partition `id` is due a survey at `now` under map `version`: never
-    /// surveyed, or `margin` since, or the map changed since.
-    fn survey_due(&self, id: &str, now: u64, version: u64, margin: u64) -> bool {
+    /// surveyed, or its due time passed, or the map changed since.
+    fn survey_due(&self, id: &str, now: u64, version: u64) -> bool {
         self.surveyed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
-            .is_none_or(|(at, v)| *v != version || now.saturating_sub(*at) >= margin)
+            .is_none_or(|(due, v)| *v != version || now >= *due)
     }
 
-    fn note_surveyed(&self, ids: &[String], now: u64, version: u64) {
+    /// The partitions a survey left blocked, each with when it's due again. Only those that
+    /// went through it (perf2's S2 on #2069): one that wasn't keeps no stale stamp.
+    fn note_surveyed(&self, due: Vec<(String, u64)>, version: u64) {
         let mut s = self.surveyed.lock().unwrap_or_else(PoisonError::into_inner);
         s.clear();
-        for id in ids {
-            s.insert(id.clone(), (now, version));
-        }
+        s.extend(due.into_iter().map(|(id, at)| (id, (at, version))));
     }
 }
 
@@ -124,6 +125,37 @@ fn nanos(d: Duration) -> u64 {
 
 fn millis(ns: u64) -> u64 {
     ns / 1_000_000
+}
+
+/// Another node that still grants down partition `d`'s lease to its owner, and that grant,
+/// from the survey's `statuses`. The owner's own grant to itself isn't a majority's: it
+/// renews that one even cut off from every grantor, so only the others' count.
+fn still_granted<'a>(
+    d: &Down,
+    statuses: &'a HashMap<String, NodeStatus>,
+) -> Option<(&'a String, &'a proto::LeaseWithheld)> {
+    statuses
+        .iter()
+        .filter(|(id, _)| **id != d.p.node)
+        .find_map(|(id, st)| {
+            st.grants
+                .iter()
+                .find(|g| g.partition == d.p.id && g.holder == d.p.node && g.remaining_ms > 0)
+                .map(|g| (id, g))
+        })
+}
+
+/// The down partitions a pass surveys (perf2's S2 on #2069): every one once any is due, since
+/// the survey is the cost, so none keeps a stale reason through another's survey; or, if
+/// none is due, none, each keeping its last reason (`Err`).
+fn survey_or_keep(down: Vec<Down>) -> Result<Vec<Down>, Vec<(String, String)>> {
+    if !down.is_empty() && down.iter().all(|d| d.kept.is_some()) {
+        return Err(down
+            .into_iter()
+            .map(|d| (d.p.id, d.kept.unwrap_or_default()))
+            .collect());
+    }
+    Ok(down)
 }
 
 /// A partition the writer finds down: its map entry, and when its owner's grant here ran
@@ -136,6 +168,9 @@ struct Down {
     renewed: Option<u64>,
     in_doubt_xids: Vec<String>,
     in_doubt_count: u64,
+    /// Its last blocked reason while it isn't due a survey: kept unless another down
+    /// partition's survey runs anyway.
+    kept: Option<String>,
 }
 
 impl Node {
@@ -184,15 +219,13 @@ impl Node {
                 blocked.insert(p.id.clone(), "no replicas".to_owned());
                 continue;
             }
-            // Not due a survey (perf287's S1): its last reason stands.
-            if !self
-                .failovers
-                .survey_due(&p.id, now, map.map_version, margin)
-                && let Some(why) = self.failovers.blocked_reason(&p.id)
-            {
-                blocked.insert(p.id.clone(), why);
-                continue;
-            }
+            // Not due a survey (perf287's S1): its last reason stands, unless another down
+            // partition's survey runs anyway (perf2's S2 on #2069).
+            let kept = if self.failovers.survey_due(&p.id, now, map.map_version) {
+                None
+            } else {
+                self.failovers.blocked_reason(&p.id)
+            };
             let (in_doubt_xids, in_doubt_count) = self
                 .grants
                 .last_grant(&p.id)
@@ -204,8 +237,16 @@ impl Node {
                 renewed: until.map(|u| u.saturating_sub(lease)),
                 in_doubt_xids,
                 in_doubt_count,
+                kept,
             });
         }
+        let down = match survey_or_keep(down) {
+            Ok(down) => down,
+            Err(kept) => {
+                blocked.extend(kept);
+                Vec::new()
+            }
+        };
         if down.is_empty() {
             self.failovers.set_blocked(blocked);
             return;
@@ -238,7 +279,14 @@ impl Node {
         }
         let now = self.grants.clock().now();
         let mut chosen = None;
+        let mut due = Vec::new();
         for d in down {
+            // Due again once the grant it may wait on ends (simp724's nit on #2069), else
+            // after the margin.
+            let again = still_granted(&d, &statuses).map_or(margin, |(_, g)| {
+                nanos(Duration::from_millis(g.remaining_ms))
+            });
+            due.push((d.p.id.clone(), now.saturating_add(again)));
             match self.qualify(&map, &d, &statuses, now) {
                 Ok(to) if chosen.is_none() => chosen = Some((d, to)),
                 // One promote at a time: the others wait for a later round.
@@ -253,9 +301,9 @@ impl Node {
                 }
             }
         }
-        // The ones still blocked are surveyed again after the margin or a map change.
-        let still: Vec<String> = blocked.keys().cloned().collect();
-        self.failovers.note_surveyed(&still, now, map.map_version);
+        // The ones the survey left blocked are due again as above, or on a map change.
+        due.retain(|(id, _)| blocked.contains_key(id));
+        self.failovers.note_surveyed(due, map.map_version);
         let Some((d, to)) = chosen else {
             self.failovers.set_blocked(blocked);
             return;
@@ -372,19 +420,7 @@ impl Node {
         // answer the survey is unknown, not granting (simp724): the writer goes on, since
         // waiting on silence would never fail over a partition whose grantors are down too,
         // and the grant round still keeps two owners from serving at once.
-        // The owner's own grant to itself isn't a majority's: it renews that one even cut
-        // off from every grantor, so only the others' grants count.
-        if let Some((id, g)) =
-            statuses
-                .iter()
-                .filter(|(id, _)| **id != p.node)
-                .find_map(|(id, st)| {
-                    st.grants
-                        .iter()
-                        .find(|g| g.partition == p.id && g.holder == p.node && g.remaining_ms > 0)
-                        .map(|g| (id, g))
-                })
-        {
+        if let Some((id, g)) = still_granted(d, statuses) {
             return Err(format!(
                 "waiting: node {id} still grants its lease to node {} ({} ms left)",
                 p.node, g.remaining_ms
@@ -662,5 +698,84 @@ impl Promoter for NodeOps {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn down(id: &str, kept: Option<&str>) -> Down {
+        Down {
+            p: proto::Partition {
+                id: id.into(),
+                node: "c".into(),
+                ..Default::default()
+            },
+            renewed: None,
+            in_doubt_xids: Vec::new(),
+            in_doubt_count: 0,
+            kept: kept.map(str::to_owned),
+        }
+    }
+
+    /// perf2's S2 on #2069: P1, blocked and not due, goes through the survey that P2, newly
+    /// down, brings, so its reason is refreshed; with neither due, both keep theirs.
+    #[test]
+    fn a_survey_any_partition_is_due_takes_every_down_partition() {
+        let both = survey_or_keep(vec![down("p1", Some("waiting")), down("p2", None)])
+            .map(|d| d.into_iter().map(|d| d.p.id).collect::<Vec<_>>());
+        assert_eq!(both, Ok(vec!["p1".to_owned(), "p2".to_owned()]));
+        let kept =
+            survey_or_keep(vec![down("p1", Some("a")), down("p2", Some("b"))]).map(|d| d.len());
+        assert_eq!(
+            kept,
+            Err(vec![
+                ("p1".to_owned(), "a".to_owned()),
+                ("p2".to_owned(), "b".to_owned())
+            ])
+        );
+        assert_eq!(survey_or_keep(Vec::new()).map(|d| d.len()), Ok(0));
+    }
+
+    /// A partition is due again at its own time (simp724's nit: a grant's end, else the
+    /// margin), or on a map change; one the last survey didn't take is due at once.
+    #[test]
+    fn a_blocked_partition_is_due_at_its_own_time_or_on_a_map_change() {
+        let f = Failovers::default();
+        f.note_surveyed(vec![("p1".into(), 500), ("p2".into(), 2_000)], 7);
+        assert!(!f.survey_due("p1", 499, 7));
+        assert!(f.survey_due("p1", 500, 7));
+        assert!(!f.survey_due("p2", 500, 7));
+        assert!(f.survey_due("p2", 500, 8), "a map change");
+        assert!(f.survey_due("p3", 0, 7), "not in the last survey");
+        // The next survey's stamps replace them: one it didn't take keeps none.
+        f.note_surveyed(vec![("p2".into(), 3_000)], 7);
+        assert!(f.survey_due("p1", 0, 7));
+    }
+
+    /// The still-granting grant comes from another node only: the owner's own grant to
+    /// itself isn't a majority's.
+    #[test]
+    fn only_another_nodes_grant_to_the_owner_holds_a_partition() {
+        let grant = |ms| proto::LeaseWithheld {
+            partition: "p1".into(),
+            holder: "c".into(),
+            remaining_ms: ms,
+        };
+        let st = |grants| NodeStatus {
+            grants,
+            ..Default::default()
+        };
+        let d = down("p1", None);
+        let own: HashMap<String, NodeStatus> = [("c".to_owned(), st(vec![grant(900)]))].into();
+        assert!(still_granted(&d, &own).is_none());
+        let other: HashMap<String, NodeStatus> = [
+            ("b".to_owned(), st(vec![grant(400)])),
+            ("c".to_owned(), st(vec![grant(900)])),
+        ]
+        .into();
+        let (id, g) = still_granted(&d, &other).unwrap();
+        assert_eq!((id.as_str(), g.remaining_ms), ("b", 400));
     }
 }
