@@ -4681,11 +4681,35 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
         // at once, four through each node, all land, and every node ends with the same map,
         // with no divergence. Before the single writer, two entry nodes' compare-and-sets
         // each made the same next version, and one table was lost.
+        //
+        // The writer makes them one at a time, so the last waits behind the other eleven
+        // (about 35 ms each on a Mac, in a staircase): on a loaded runner that can pass the
+        // request timeout, and the call answers `OutcomeUnknown` or `DeadlineExceeded` while
+        // its change is still queued (#2121, Windows CI). Such a create is sent again with
+        // `if_missing`, which is safe to repeat, as a client would. A create that answered
+        // success but lost its table (the bug above) is still caught below.
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..12usize {
             let (port, part) = (ports[i % 3], ["p1", "p2", "p3"][i % 3]);
-            let req = create(&format!("c{i}"), fams(&["f"]), on(&[], &[part]), false);
-            tasks.spawn(async move { (i, schema(port).await.create_table(req).await) });
+            let first = create(&format!("c{i}"), fams(&["f"]), on(&[], &[part]), false);
+            let again = create(&format!("c{i}"), fams(&["f"]), on(&[], &[part]), true);
+            tasks.spawn(async move {
+                let mut r = schema(port).await.create_table(first).await;
+                for _ in 0..3 {
+                    match &r {
+                        Err(e)
+                            if matches!(
+                                code(e).as_str(),
+                                "OutcomeUnknown" | "DeadlineExceeded" | "PartitionUnavailable"
+                            ) =>
+                        {
+                            r = schema(port).await.create_table(again.clone()).await;
+                        }
+                        _ => break,
+                    }
+                }
+                (i, r)
+            });
         }
         while let Some(done) = tasks.join_next().await {
             let (i, r) = done.unwrap();
