@@ -659,3 +659,113 @@ fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
     );
     let _ = (db_a.close(), db_b.close());
 }
+
+/// B4 (D331 PR 4b), on an aggregate family: increments that land after the copy's first
+/// token and before a later chunk's snapshot are in that chunk's copy and in the catch-up
+/// both. The catch-up passes over them, so the moved counter is exact. The follower is held
+/// before its second chunk while they land.
+#[test]
+fn a_counter_moved_in_a_later_chunk_counts_each_increment_once() {
+    use super::several::{add_counter, counter, incr_row};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    let (b, c) = (ports[1], ports[2]);
+    let incr = async |row: &str, by: i64| {
+        data(c)
+            .await
+            .mutate(crate::serve::proto::MutateRequest {
+                writes: Some(incr_row(row, by)),
+                durability: 0,
+            })
+            .await
+            .unwrap();
+    };
+    rt.block_on(async {
+        eventually("p1 takes writes", async || {
+            try_put(c, "c", "0").await.is_ok()
+        })
+        .await;
+        add_counter(&ports, c).await;
+        // Rows before `d` large enough that the first chunk ends before it.
+        let big = "x".repeat(700 << 10);
+        for row in ["c1", "c2", "c3", "c4"] {
+            try_put(c, row, &big).await.unwrap();
+        }
+        for _ in 0..5 {
+            incr("d", 1).await;
+        }
+        let base = client(c)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let v = base.map_version;
+        // Held before chunk 1: chunk 0 (and the copy's first token) is taken, `d` isn't.
+        let (release, held) = tokio::sync::oneshot::channel();
+        super::super::range_follow::HOLD_CHUNK
+            .lock()
+            .unwrap()
+            .push(((dirs[1].clone(), 1), held));
+        push(&ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
+        eventually("b copies the first chunk", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copied_bytes > 0)
+        })
+        .await;
+        for _ in 0..5 {
+            incr("d", 1).await;
+        }
+        let _ = release.send(());
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+        push(&ports, &moving(&base, v + 2, Some(MovePhase::CatchingUp))).await;
+        for _ in 0..5 {
+            incr("d", 1).await;
+        }
+        push(&ports, &moving(&base, v + 3, Some(MovePhase::HandingOver))).await;
+        let last = db_a.visible_seqno();
+        let mut handed = moving(&base, v + 4, Some(MovePhase::HandedOver));
+        handed.moves[0].final_seqno = last;
+        push(&ports, &handed).await;
+        eventually("b's catch-up passes the move's last seqno", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.source_applied_seqno >= last)
+        })
+        .await;
+        let mut cleaning = moving(&base, v + 5, Some(MovePhase::Cleaning));
+        cleaning.moves[0].final_seqno = last;
+        push(&ports, &cleaning).await;
+        eventually("p2 serves the range", async || {
+            get_row(c, "c")
+                .await
+                .is_ok_and(|v| v == Some(b"0".to_vec()))
+        })
+        .await;
+        assert_eq!(counter(c, "d").await, 15, "each increment counted once");
+    });
+    let _ = (db_a.close(), db_b.close());
+}

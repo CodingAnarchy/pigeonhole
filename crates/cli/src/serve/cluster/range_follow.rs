@@ -361,6 +361,8 @@ impl Follower {
             after: head.next.clone().unwrap_or_default().into(),
             max_bytes: CHUNK_BYTES,
         };
+        #[cfg(test)]
+        hold_chunk(&cx.shared, head.n).await;
         let resp = ask_chunk(&cx.shared, &cx.m.from, req).await?;
         let first = if head.first.is_empty() {
             if resp.token.is_empty() {
@@ -635,6 +637,36 @@ impl HeadWrite {
             put(b, t, &chunk, b"end", next);
         }
         put(b, t, &chunk, b"snap", self.snapshot.to_string().as_bytes());
+    }
+}
+
+/// A hold seam (tests): the follower on the node in a listed cluster directory waits,
+/// once, before it asks for the listed chunk, until the sender sends or is dropped.
+#[cfg(test)]
+pub(crate) static HOLD_CHUNK: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
+
+/// [`HOLD_CHUNK`]'s entry: the node's cluster directory and the chunk's number, and the
+/// release.
+#[cfg(test)]
+pub(crate) type HeldChunk = (
+    (std::path::PathBuf, u64),
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+#[cfg(test)]
+async fn hold_chunk(shared: &Shared, n: u64) {
+    let Some(cluster) = shared.router.cluster.as_ref() else {
+        return;
+    };
+    let wait = {
+        let mut armed = HOLD_CHUNK.lock().unwrap_or_else(PoisonError::into_inner);
+        armed
+            .iter()
+            .position(|((d, k), _)| d == cluster.node.dir() && *k == n)
+            .map(|i| armed.swap_remove(i).1)
+    };
+    if let Some(wait) = wait {
+        let _ = wait.await;
     }
 }
 
