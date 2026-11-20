@@ -175,6 +175,44 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
 }
 
 /// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
+/// A stopped node's port, held for its restart: bound but not listening, so a parallel
+/// test's node can't take it in between (it would fail the restart with AddrInUse, as on
+/// #2100's macOS run), while a dial of it is still refused, as a stopped node's is. Taken as
+/// soon as the node lets the port go, retrying for up to five seconds while the OS frees it
+/// (as #2074's fix in `moving.rs` does with a listener).
+struct HeldPort(socket2::Socket);
+
+impl HeldPort {
+    fn take(port: u16) -> Self {
+        use socket2::{Domain, Socket, Type};
+        let at: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            // As std's `TcpListener::bind` does on Unix: a closed connection's TIME_WAIT
+            // doesn't hold the port.
+            #[cfg(unix)]
+            s.set_reuse_address(true).unwrap();
+            match s.bind(&at.into()) {
+                Ok(()) => return Self(s),
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "port {port} wasn't freed for the restart: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// The restarted node's listener, on the port held.
+    fn listen(self) -> std::net::TcpListener {
+        self.0.listen(1024).unwrap();
+        self.0.into()
+    }
+}
+
 async fn eventually(what: &str, cond: impl AsyncFnMut() -> bool) {
     eventually_within(Duration::from_secs(5), what, cond).await;
 }
