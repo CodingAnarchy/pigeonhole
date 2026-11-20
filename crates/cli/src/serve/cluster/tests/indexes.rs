@@ -487,7 +487,7 @@ fn the_first_index_waits_for_every_node_to_keep_indexes() {
 #[test]
 fn a_vector_search_across_partitions_is_exact_with_every_list_probed() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (mut stops, _dbs, [a, _b, c], _) = three_nodes(&rt);
+    let (mut stops, _dbs, [a, b, c], _) = three_nodes(&rt);
     rt.block_on(async {
         let mut api = VectorsClient::new(channel(c).await);
         let mut own = vector_index("own");
@@ -578,6 +578,14 @@ fn a_vector_search_across_partitions_is_exact_with_every_list_probed() {
         // b (p2, below "k") stops: a search within p1's range goes on, one needing p2
         // fails, and so does a check, naming p2.
         stops.remove(1).send(()).unwrap();
+        // Once b refuses connections: a call that reached it while it shut down can answer
+        // otherwise (a forward reset after it was sent is OutcomeUnknown, rightly).
+        eventually("b to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", b))
+                .await
+                .is_err()
+        })
+        .await;
         let mut api = VectorsClient::new(channel(a).await);
         let search = |prefix: &[u8]| VectorSearchRequest {
             index: "own".into(),
@@ -742,7 +750,7 @@ fn skewed_corpus() -> Vec<(String, String)> {
 #[test]
 fn a_text_search_across_partitions_scores_as_one_index() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (mut stops, [p1, p2], [a, _b, c], _) = three_nodes(&rt);
+    let (mut stops, [p1, p2], [a, b, c], _) = three_nodes(&rt);
     // A new index fills from its source in the background, and a strict search on a
     // partition still filling answers Unavailable, so each step waits for its fill.
     let filled = |db: &pigeonhole::Pigeonhole, index: &str| {
@@ -948,6 +956,14 @@ fn a_text_search_across_partitions_scores_as_one_index() {
         // b (p2, from "m") stops. A search needs every partition's statistics, so even one
         // whose prefix is in p1 fails, unless it allows a partial answer.
         stops.remove(1).send(()).unwrap();
+        // Once b refuses connections: a call that reached it while it shut down can answer
+        // otherwise (a forward reset after it was sent is OutcomeUnknown, rightly).
+        eventually("b to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", b))
+                .await
+                .is_err()
+        })
+        .await;
         let mut api = TextClient::new(channel(a).await);
         let e = api.search(search("alpha", "a")).await.unwrap_err();
         assert_eq!(code(&e), "PartitionUnavailable", "{e}");
@@ -1125,6 +1141,14 @@ fn a_text_rebuild_runs_on_every_partition_of_its_index() {
 
         // b (p2) stops: ut's rebuild fails, naming p2.
         stops.remove(1).send(()).unwrap();
+        // Once b refuses connections: a call that reached it while it shut down can answer
+        // otherwise (a forward reset after it was sent is OutcomeUnknown, rightly).
+        eventually("b to stop", async || {
+            tokio::net::TcpStream::connect(("127.0.0.1", b))
+                .await
+                .is_err()
+        })
+        .await;
         let e = api
             .rebuild(TextIndexRequest { index: "ut".into() })
             .await
