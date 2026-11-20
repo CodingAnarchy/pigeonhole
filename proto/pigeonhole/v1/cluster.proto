@@ -934,7 +934,41 @@ message ForwardRequest {
     TxnOutcomeRequest txn_outcome = 52;
     // D331 PR 4b: one chunk of a range move's copy, from the move's target to its source.
     RangeCopyRequest range_copy = 49;
+    // D332: a partition's tablets and their sampled loads, from the map's writer to the
+    // partition's owner, for the balancer's split. Cluster scope only.
+    TabletsRequest tablets = 51;
   }
+}
+
+// D332: the partition whose tablets the balancer asks for.
+message TabletsRequest {
+  string partition = 1;
+}
+
+// D332: a partition's tablets, as its owner holds them now.
+message TabletsReply {
+  repeated TabletInfo tablets = 1;
+  // How many reads each sampled read stands for: the partition's sampled reads in the
+  // current balance window, times the sampling interval, over the keys kept.
+  double read_each = 2;
+  // The partition's epoch here: an answer from an owner that's since been replaced
+  // names an older one.
+  uint64 epoch = 3;
+}
+
+// D332: one tablet of a table in a partition (the engine's `tablets()`, ICR 0142).
+message TabletInfo {
+  string table = 1;
+  // Its first key; the table's first tablet has the empty key.
+  bytes start = 2;
+  // Its end, exclusive; empty for the table's last tablet.
+  bytes end = 3;
+  // Its SST bytes (a shared SST's divided among its tablets).
+  uint64 bytes = 4;
+  // The engine's moving average of rows written to it per balancer interval.
+  double write_load = 5;
+  // The partition's sampled read keys that fall in it (each standing for `read_each`).
+  uint64 reads = 6;
 }
 
 // Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
@@ -1151,6 +1185,8 @@ message ForwardResponse {
     TxnOutcomeResponse txn_outcome = 30;
     // D331 PR 4b: `range_copy`'s chunk.
     RangeCopyResponse range_copy = 27;
+    // D332: `tablets`'s answer.
+    TabletsReply tablets = 29;
   }
   // The seqno the serving node read at, in the owner's numbering (D328's
   // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the

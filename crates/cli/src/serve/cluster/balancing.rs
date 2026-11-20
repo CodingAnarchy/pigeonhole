@@ -212,6 +212,140 @@ pub(crate) fn views(
     (nodes, parts)
 }
 
+/// D332: partition `partition`'s tablets, answered by its owner for the map's writer
+/// (`Forward`'s `tablets` arm, cluster scope): the engine's `tablets()` and the partition's
+/// sampled read keys counted per tablet, with its epoch, so the writer drops an answer from
+/// an owner since replaced.
+pub(crate) async fn serve_tablets(
+    cluster: &crate::serve::router::Cluster,
+    partition: &str,
+) -> Result<proto::TabletsReply, crate::serve::errors::ApiError> {
+    use crate::serve::errors::ApiError;
+    let map = cluster.node.get_map()?;
+    let Some(p) = map.partitions.iter().find(|p| p.id == partition) else {
+        return Err(ApiError::wrong_partition(
+            map.map_version,
+            format!("no partition {partition:?} in the map"),
+        ));
+    };
+    let Some(service) = cluster
+        .here(partition)
+        .filter(|_| p.node == cluster.node.id())
+    else {
+        return Err(ApiError::wrong_partition(
+            map.map_version,
+            format!("partition {partition:?} isn't served here"),
+        ));
+    };
+    let part = service.part()?;
+    let (db, load, epoch) = (part.db.clone(), Arc::clone(&part.load), p.epoch);
+    // In memory, but a walk of every tablet's SSTs: off the async workers (perf287).
+    let (tablets, (keys, each)) =
+        tokio::task::spawn_blocking(move || (db.tablets(), load.read_keys()))
+            .await
+            .map_err(|e| ApiError::internal(format!("a partition's tablets: {e}")))?;
+    Ok(proto::TabletsReply {
+        tablets: tablets
+            .into_iter()
+            .map(|t| {
+                let reads = keys
+                    .iter()
+                    .filter(|k| {
+                        k.table == t.table
+                            && k.key[..] >= t.start[..]
+                            && t.end.as_deref().is_none_or(|e| k.key[..] < *e)
+                    })
+                    .count() as u64;
+                proto::TabletInfo {
+                    table: t.table,
+                    start: t.start.into(),
+                    end: t.end.unwrap_or_default().into(),
+                    bytes: t.bytes,
+                    write_load: t.write_load,
+                    reads,
+                }
+            })
+            .collect(),
+        read_each: each,
+        epoch,
+    })
+}
+
+impl Node {
+    /// The policy's tablets for split candidate `p` (D332 PR 5's design §1): asked of its
+    /// owner, bounded by the push timeout. `None` when the owner can't answer, or answers
+    /// at another epoch than the map's (a stale owner).
+    async fn tablets_of(&self, map: &ClusterMap, p: &PartView) -> Option<Vec<balance::Tablet>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        let cluster = shared.router.cluster.as_ref()?;
+        let epoch = map.partitions.iter().find(|q| q.id == p.id)?.epoch;
+        let reply = if p.node == self.id {
+            serve_tablets(cluster, &p.id).await.ok()?
+        } else {
+            let address = &map.nodes.iter().find(|n| n.id == p.node)?.address;
+            let fwd = proto::ForwardRequest {
+                map_version: map.map_version,
+                caller: Some(
+                    super::forward::forwarded_caller(&crate::serve::auth::Caller::anonymous())
+                        .ok()?,
+                ),
+                partition: p.id.clone(),
+                op: Some(proto::forward_request::Op::Tablets(proto::TabletsRequest {
+                    partition: p.id.clone(),
+                })),
+                ..Default::default()
+            };
+            match cluster
+                .forwarder
+                .send(address, fwd, self.peers.push_timeout, false)
+                .await
+                .ok()?
+                .reply
+            {
+                Some(proto::forward_response::Reply::Tablets(r)) => r,
+                _ => return None,
+            }
+        };
+        if reply.epoch != epoch {
+            return None;
+        }
+        let report: Vec<balance::TabletReport> = reply
+            .tablets
+            .into_iter()
+            .map(|t| balance::TabletReport {
+                table: t.table,
+                start: t.start.to_vec(),
+                bytes: t.bytes,
+                write_load: t.write_load,
+                reads: t.reads,
+            })
+            .collect();
+        Some(balance::tablet_loads(&report, p.load))
+    }
+}
+
+/// The split candidate whose tablets a pass asks for: a partition over
+/// `partition_max_bytes` or `partition_max_load`, not pinned, busy or moving only whole, the
+/// one furthest over (by the larger of its two ratios).
+fn split_candidate(parts: &[PartView], b: &Bounds) -> Option<usize> {
+    parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.pinned && !p.busy && !p.whole_only)
+        .map(|(i, p)| {
+            let size = p.bytes as f64 / b.partition_max_bytes.max(1) as f64;
+            let load = if b.partition_max_load > 0.0 {
+                p.load / b.partition_max_load
+            } else {
+                0.0
+            };
+            (i, size.max(load))
+        })
+        .filter(|(_, over)| *over > 1.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
 /// `m` with `e` appended to its events, the oldest dropped past [`map::BALANCER_EVENTS`].
 fn push_event(m: &mut ClusterMap, e: BalancerEvent) {
     m.balancer_events.push(e);
@@ -394,8 +528,16 @@ impl Node {
                 .last_grant(p)
                 .is_some_and(|g| g.in_doubt_count > 0)
         };
-        let (nodes, parts) = views(&map, &statuses, in_doubt);
+        let (nodes, mut parts) = views(&map, &statuses, in_doubt);
         let bounds = bounds_of(&map);
+        // The tablets of one split candidate a pass, the furthest over its bound (D332 PR
+        // 5's design §1): before `decide`, which counts each pass's conditions once.
+        if let Some(i) = split_candidate(&parts, &bounds) {
+            let p = parts[i].clone();
+            if let Some(t) = self.tablets_of(&map, &p).await {
+                parts[i].tablets = t;
+            }
+        }
         let at = wall_ms();
         let decision = {
             let mut r = self.balancing();

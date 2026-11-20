@@ -325,6 +325,55 @@ fn split_point(p: &PartView) -> Option<(String, Vec<u8>, f64)> {
     best
 }
 
+/// One tablet as its owner reports it (`TabletInfo`): its table, range start, bytes, write
+/// load and the partition's sampled reads that fall in it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct TabletReport {
+    pub(crate) table: String,
+    pub(crate) start: Vec<u8>,
+    pub(crate) bytes: u64,
+    pub(crate) write_load: f64,
+    pub(crate) reads: u64,
+}
+
+/// The policy's tablets for a partition of `load`, from its owner's report (perf287 on the
+/// D332 PR 5 design): each tablet's load is `load` times its share, the larger of its share
+/// of the sampled reads and its share of the write load, renormalised so the shares sum to
+/// one. A measure that's zero across the partition is left out, so a write-hot partition's
+/// tablets aren't judged by reads alone, nor a read-hot one's by writes. With neither
+/// measured, every load is 0 and [`split_point`] weighs by bytes.
+pub(crate) fn tablet_loads(report: &[TabletReport], load: f64) -> Vec<Tablet> {
+    let reads: u64 = report.iter().map(|t| t.reads).sum();
+    let writes: f64 = report.iter().map(|t| t.write_load.max(0.0)).sum();
+    let share = |t: &TabletReport| {
+        let r = if reads > 0 {
+            t.reads as f64 / reads as f64
+        } else {
+            0.0
+        };
+        let w = if writes > 0.0 {
+            t.write_load.max(0.0) / writes
+        } else {
+            0.0
+        };
+        r.max(w)
+    };
+    let total: f64 = report.iter().map(share).sum();
+    report
+        .iter()
+        .map(|t| Tablet {
+            table: t.table.clone(),
+            start: t.start.clone(),
+            bytes: t.bytes,
+            load: if total > 0.0 {
+                load * share(t) / total
+            } else {
+                0.0
+            },
+        })
+        .collect()
+}
+
 /// A node's load and size per unit of weight.
 fn per_weight(n: &NodeView, parts: &[PartView]) -> (f64, f64) {
     let (mut load, mut bytes) = (0.0, 0.0);
@@ -1104,5 +1153,60 @@ mod tests {
             panic!("{d:?}")
         };
         assert!(why.contains("no partition on it can move"), "{why}");
+    }
+    #[test]
+    fn a_tablets_load_is_its_larger_share_of_reads_or_writes() {
+        // perf287 on the D332 PR 5 design: a write-hot tablet the reads never touch is still
+        // the hot side, and a read-hot one with no writes too; shares renormalise to the
+        // partition's load.
+        let r = |start: &str, write_load: f64, reads: u64| TabletReport {
+            table: "users".into(),
+            start: start.as_bytes().to_vec(),
+            bytes: 1 << 20,
+            write_load,
+            reads,
+        };
+        let t = tablet_loads(&[r("", 0.0, 10), r("g", 90.0, 0), r("m", 10.0, 10)], 0.8);
+        let loads: Vec<f64> = t.iter().map(|t| t.load).collect();
+        assert!((loads.iter().sum::<f64>() - 0.8).abs() < 1e-9, "{loads:?}");
+        assert!(
+            loads[1] > loads[0] && loads[1] > loads[2],
+            "write-hot g: {loads:?}"
+        );
+        // No measure at all: every load 0, so the split weighs by bytes.
+        let t = tablet_loads(&[r("", 0.0, 0), r("g", 0.0, 0)], 0.8);
+        assert!(t.iter().all(|t| t.load == 0.0));
+    }
+
+    #[test]
+    fn a_write_only_hot_tablet_is_the_splits_hot_side() {
+        // perf287: P's reads are spread, but its writes all go to [m, t): the split cuts at
+        // m or t, not where the reads alone would halve it.
+        let nodes = [node("a"), node("b")];
+        let r = |start: &str, write_load: f64, reads: u64| TabletReport {
+            table: "users".into(),
+            start: start.as_bytes().to_vec(),
+            bytes: 1 << 20,
+            write_load,
+            reads,
+        };
+        let mut p = part("p1", "a", 0.8, 1 << 30);
+        p.tablets = tablet_loads(
+            &[
+                r("", 0.0, 10),
+                r("g", 0.0, 10),
+                r("m", 100.0, 10),
+                r("t", 0.0, 10),
+            ],
+            0.8,
+        );
+        p.ranges = vec![span("", None)];
+        let parts = [p, part("p2", "b", 0.1, 1 << 30)];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
+        assert!(
+            matches!(&d, Decision::Act(Action::Split { key, .. }, _) if key == b"m" || key == b"t"),
+            "{d:?}"
+        );
     }
 }
