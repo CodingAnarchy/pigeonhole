@@ -922,8 +922,7 @@ A node writes a partition only while its newest map names it for the partition a
     - `load_cpu` is the partition's share of the node's cores: its shards' busy time, or their group-sync time if larger, plus sampled request CPU (one call in 16 per thread). The sampled CPU includes the reads' work on the server's read pools. CPU outside its service calls isn't counted (request decoding and encoding, framing, sockets).
     - `load_device` is its bytes per second at its files over the node's ceiling: the highest one-second rate of the same counters, summed over the node's partitions, within the window. It's per node and measured, with no flag. These are the engine's own estimates, for every file of the partition (metadata such as the manifest included): reads the OS page cache served count too. A newly opened partition's counts start from its open, so its open doesn't count toward the ceiling.
     - Use them to compare partitions, not as absolute CPU or disk use.
-  - **The cluster balancer (1.3.0, D332). Off by default.** With the map's `"balancer": "BALANCER_MODE_ON"` (set with `phdb cluster set-map`), the map's writer moves whole partitions off a node whose size or load per unit of weight stays above the mean for long enough, one move at a time with a rest after each. It pins a partition that keeps moving. `phdb cluster balancer status|pause|resume|pin|unpin` controls it, and `status` says what the last pass decided and why. Splitting and merging partitions come with the online split.
-    - **A balancer move is a `phdb cluster move`:** it fences and closes the partition on its old node, copies its files whole and opens them on the new one. So, as with a manual move, it **ends the transactions open on that partition and its pinned snapshots**: their calls fail, and the client begins them again once the partition serves on its new node. Meanwhile writes answer `Fenced` and reads `PartitionUnavailable`, for about as long as copying the files takes (the downtime under `phdb cluster move` below): retry them. A partition with prepared cross-partition transaction shares still in doubt is never moved, and transactions homed there keep their outcomes, since the move keeps the partition's history.
+  - **The cluster balancer (1.3.0, D332). Off by default.** The map's writer can move whole partitions to even out the nodes' size and load: [The cluster balancer](#the-cluster-balancer).
   - `--cluster-lease-ms` must be at least 3 times `--cluster-push-timeout-ms`, and not 0. **Every node must take the same value:** a node refuses to grant a lease to one whose `--cluster-lease-ms` differs (`FailedPrecondition`, naming both values, in the asking node's log), since a node with a longer lease than its peers' could serve past their grants. Change it on every node by restarting them one at a time only if a majority keeps one value throughout; otherwise stop them all and start them with the new value.
   - **During a rolling upgrade from 1.2** (#2047), a 1.2 node doesn't grant leases (it answers `Cluster.Lease` with `Unimplemented`). A 1.3 node counts each 1.2 node that holds the round's map as granting (a node whose `Status` lacks the `leases` feature), so the first node upgraded serves as soon as it restarts, as a 1.2 node would, and logs once per such peer that it does. A 1.3 node that reports `leases` but whose `Cluster.Lease` answers `Unimplemented` counts as nothing, and the log says to check what sits between the nodes: a proxy or ingress in front of a node must route every `/pigeonhole.v1.Cluster/` call, `Lease` and `Release` included. While any node runs 1.2, the guarantee is 1.2's (a majority holds the map naming the node), not the lease's: a 1.2 node withholds nothing, so after `relocate --old-unreachable` or a forced map, an old owner on the other side of a cut may serve until its lease runs out. A 1.2 node that doesn't answer counts as nothing, as any node does: a 1.3 node cut off still stops within its lease. Finish the upgrade before relying on the lease, and don't `relocate --old-unreachable` mid-upgrade unless the old node is known to be down.
   - **Backups aren't gated by the lease:** `phdb cluster backup`, `Admin.Backup` and `Admin.BackupDownload` copy a partition whether or not its node holds the lease. A copy of a fenced or closed partition is what a move or a recovery needs.
@@ -1151,6 +1150,82 @@ Any node still takes any call, before, during and after.
 - **A replica cut off with its owner.** If P's owner and its only replica are on the same side of a split, away from the majority, there's nothing to promote.
 - **Rejoin the old owner.** It becomes a replica again only by the steps above.
 - **Lose nothing.** See [What can be lost](#what-can-be-lost).
+
+### The cluster balancer
+**New in 1.3.0 (D332, ICR 0117). Off by default.** With the balancer on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, one move at a time. It reacts only to imbalance that lasts: a node must stay over its bound for minutes before anything moves, and what a move touched then rests for half an hour.
+
+#### Turning it on
+- **`phdb cluster balancer resume --node URL`** turns it on (the map's `"balancer": "BALANCER_MODE_ON"`), from off or paused. You can also set the field with `phdb cluster set-map`.
+- **What it needs:** every node on a build that keeps the `balancer` map feature (1.3.0). Until then the map can't turn it on.
+- **`phdb cluster balancer pause --node URL`** (PAUSED) lets a move in flight finish and starts no other. Setting the map's `balancer` to OFF does the same, and the balancer does nothing more.
+- The mode, the bounds and the pins are map fields, so every node agrees on them and a new writer keeps them.
+
+#### What it does
+Every 30 s, the writer reads each node's open partitions (their size from the file system, with no read of their files, and their load: the "Partition load" note under [Fencing and relocation](#fencing-and-relocation)), and compares each node with the mean of the nodes that answered:
+- **A node's share is per unit of its weight.** Give a bigger machine a bigger `weight` in the map's `nodes` (an integer; 0 or unset counts as 1). A node with weight 2 is expected to hold twice the bytes and load of a node with weight 1.
+- **A node is over its bound** when its size or load per unit of weight is above `size_ratio` or `load_ratio` (default 1.25) times the mean.
+- **The move:** once a node has been over its bound for `passes` passes in a row (default 10, so about 5 minutes), the writer moves one of its partitions to the node that brings both closest to the mean.
+  - The move never takes the target over its own bound, and never puts a partition on a node that holds one of its replicas.
+  - Ties go to the smaller partition.
+  - A partition whose copy wouldn't finish within the dwell (reckoned at 64 MiB/s) isn't moved. At the defaults that's over about 112 GiB, beyond `partition_max_bytes`, so it matters only with a short dwell.
+- **It keeps going on the same node** while that node stays above `1 + 0.4 × (ratio − 1)` (1.1 at the default ratio), so it doesn't stop just under the bound and start again a pass later.
+- **The rest (`dwell_ms`, default 30 minutes):** the partition moved, and both nodes, aren't moved from or to again until it ends. With the defaults, the cluster changes at most a few times an hour.
+- **One move at a time, cluster-wide.** Nothing starts while any move is in flight, an operator's `phdb cluster move` or range move included.
+- **A node that didn't answer** is neither a source nor a target, and its count of passes starts again.
+
+**A balancer move is a [`phdb cluster move`](#fencing-and-relocation)** run by the writer with its cluster token, and recorded in the map under an id starting `bal-`:
+- **During the move:** the partition is fenced and closed on its old node, its files are copied whole and it opens on the new one. Writes answer `Fenced` and reads `PartitionUnavailable` for about as long as the copy takes: retry them.
+  - **How long:** the copy runs as fast as the disks and network allow; a whole move isn't held to a rate. As a planning figure, at 64 MiB/s that's about 16 s per GiB, so about 8.5 minutes for a 32 GiB partition.
+  - **Where an outage of that length matters,** keep the balancer paused or off and move partitions by hand in a window, or pin the ones that must stay up.
+- **Open transactions and pinned snapshots** on that partition end with the move. Clients begin them again once it serves on its new node.
+- **Kept:** the partition's history, so change-feed tokens resume and spanning transactions homed there keep their outcomes. A partition with prepared spanning-transaction shares still in doubt is never moved.
+- **Protect the cluster token** as you protect an admin token ([Securing a cluster](#running-a-cluster)): it's what the writer moves partitions with.
+
+#### What it leaves alone
+- **A pinned partition.** `phdb cluster balancer pin P --node URL` keeps P on its node; `unpin` lets the balancer act on it again. An operator's pin never expires.
+- **A partition that keeps moving.** One moved `max_moves` times (default 3) within `bounce_window_ms` (default 24 h) is pinned by the balancer, with the reason "bouncing". That pin expires after another bounce window. An operator's `pin` or `unpin` replaces it.
+- **A pinned range.** A table's `pinned_ranges` in the map (each a `start` and `end` split key, half-open) keeps those keys where they are. A partition holding one is never moved.
+- **A partition in any move,** or with spanning-transaction shares in doubt.
+
+#### Splits and merges
+The balancer also judges partitions too big (over `partition_max_bytes`, default 32 GiB) or too hot (over `partition_max_load`, default 0.5 of a node), and small, cold ones (under `partition_min_bytes`, default 4 GiB). Splitting and merging them use the online split and merge (D331). Until those land, `status` names the partition and says its split or merge waits.
+- **A split** will cut at a tablet boundary that halves the partition, never inside a pinned range. If the best cut leaves over 80% on one side (a hot key), the partition is reported as unsplittable instead.
+- **A merge** will join a partition only with a neighbour (one holding the next range of one of its tables), and only while the two together stay under **half** of `partition_max_bytes` and `partition_max_load`. So a merge never makes a partition the next pass would split.
+- **Never split or merged:** a table in a co-location group, or one an index follows. Those partitions move only whole.
+
+#### The bounds
+Set them in the map's `balance` with `set-map`. Each field left at 0 takes its default:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `size_ratio`, `load_ratio` | 1.25 | A node's bound, as a multiple of the mean per unit of weight. Must be above 1. |
+| `passes` | 10 | Passes in a row (30 s each) a condition must hold before an action. |
+| `dwell_ms` | 1,800,000 (30 min) | How long what an action touched rests. |
+| `max_moves`, `bounce_window_ms` | 3, 86,400,000 (24 h) | A partition moved this often within the window is pinned. |
+| `partition_max_bytes` | 32 GiB | Over this, a partition is too big (a split). |
+| `partition_max_load` | 0.5 | Over this share of a node, a partition is too hot (a split). At most 1. |
+| `partition_min_bytes` | 4 GiB | Under this, and cold, a partition is small (a merge). At most a quarter of `partition_max_bytes`. |
+
+#### Seeing it
+- **`phdb cluster balancer status --node URL`** shows:
+  - the mode and the writer;
+  - `state`: the writer's last decision and why. Examples: "skip: within bounds", "skip: node a is over its bound, but no partition on it can move within the bounds", "moving p3 from a to c (bal-…): node a is at 1.43x the mean size", "paused", "waiting: move … is in flight";
+  - the pinned partitions, and whether the balancer or an operator pinned each;
+  - the bounds in force;
+  - the last 32 events: each move, the balancer's pins and their expiry, and each abort, with its partition, nodes, reason and time.
+- **A pass that does nothing changes nothing in the map.** Its reason is only in `state`, not an event.
+- **Each partition's `moves_history`** in the map keeps its last 8 balancer moves and pins.
+- **`/metrics` on the writer:**
+  - `pigeonhole_cluster_balancer_actions_total{kind}`: `move`, `pin` (a pin or its expiry) and `abort`. It counts from the writer's start;
+  - `pigeonhole_cluster_node_load_ratio{node}`: each node's load per unit of weight over the mean, at the last pass.
+
+#### When the writer changes
+A new writer, after a failover or a forced map, keeps the mode, bounds and pins from the map. Its counts of passes start again, so it waits out `passes` before acting.
+- **A balancer move the old writer left behind:**
+  - **Before its commit point** (the map still gives the partition to its old node), the new writer aborts it: the target's copy goes aside, the partition serves on its old node again, and an ABORT event says so.
+  - **Past it,** the new writer finishes the move.
+- **With the balancer off (not paused),** such a move stays recorded. A paused balancer still aborts or finishes it. Run it again with `phdb cluster move`, or end it with `phdb cluster move P --abort`.
+- **The writer's lease bounds the balancer's moves at every term:** a writer cut off from the majority can't advance one.
 
 ### Backup and restore
 - **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json`.
