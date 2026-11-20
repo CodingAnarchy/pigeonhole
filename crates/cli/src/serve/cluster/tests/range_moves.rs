@@ -1072,7 +1072,9 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
     let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
     let (b, c) = (ports[1], ports[2]);
     let mut recorded_before = None;
-    // Never released: only the follower's stop wakes it from the hold.
+    // Never released: only the follower's stop wakes it from the hold. The sender must live
+    // to the test's end: a bare `_` would drop it at once, which wakes the hold too, with no
+    // stop at all (cli692 on #2115).
     let (_held_for_good, held) = tokio::sync::oneshot::channel::<()>();
     super::super::range_follow::HOLD_COMMIT
         .lock()
