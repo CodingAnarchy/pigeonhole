@@ -7239,8 +7239,8 @@ impl serde::Serialize for FeedEvent {
                 feed_event::Event::MoveBarrier(v) => {
                     struct_ser.serialize_field("move_barrier", v)?;
                 }
-                feed_event::Event::RawCommit(v) => {
-                    struct_ser.serialize_field("raw_commit", v)?;
+                feed_event::Event::RawCommits(v) => {
+                    struct_ser.serialize_field("raw_commits", v)?;
                 }
             }
         }
@@ -7263,8 +7263,8 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
             "partitionState",
             "move_barrier",
             "moveBarrier",
-            "raw_commit",
-            "rawCommit",
+            "raw_commits",
+            "rawCommits",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -7276,7 +7276,7 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
             Progress,
             PartitionState,
             MoveBarrier,
-            RawCommit,
+            RawCommits,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -7305,7 +7305,7 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
                             "progress" => Ok(GeneratedField::Progress),
                             "partitionState" | "partition_state" => Ok(GeneratedField::PartitionState),
                             "moveBarrier" | "move_barrier" => Ok(GeneratedField::MoveBarrier),
-                            "rawCommit" | "raw_commit" => Ok(GeneratedField::RawCommit),
+                            "rawCommits" | "raw_commits" => Ok(GeneratedField::RawCommits),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -7381,11 +7381,11 @@ impl<'de> serde::Deserialize<'de> for FeedEvent {
                             event__ = map_.next_value::<::std::option::Option<_>>()?.map(feed_event::Event::MoveBarrier)
 ;
                         }
-                        GeneratedField::RawCommit => {
+                        GeneratedField::RawCommits => {
                             if event__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("rawCommit"));
+                                return Err(serde::de::Error::duplicate_field("rawCommits"));
                             }
-                            event__ = map_.next_value::<::std::option::Option<_>>()?.map(feed_event::Event::RawCommit)
+                            event__ = map_.next_value::<::std::option::Option<_>>()?.map(feed_event::Event::RawCommits)
 ;
                         }
                     }
@@ -15694,6 +15694,9 @@ impl serde::Serialize for MoveStatus {
         if self.retention_lapsed {
             len += 1;
         }
+        if !self.follower_error.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MoveStatus", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -15731,6 +15734,9 @@ impl serde::Serialize for MoveStatus {
         if self.retention_lapsed {
             struct_ser.serialize_field("retention_lapsed", &self.retention_lapsed)?;
         }
+        if !self.follower_error.is_empty() {
+            struct_ser.serialize_field("follower_error", &self.follower_error)?;
+        }
         struct_ser.end()
     }
 }
@@ -15755,6 +15761,8 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
             "sourceAppliedSeqno",
             "retention_lapsed",
             "retentionLapsed",
+            "follower_error",
+            "followerError",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15769,6 +15777,7 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
             CopyDone,
             SourceAppliedSeqno,
             RetentionLapsed,
+            FollowerError,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -15800,6 +15809,7 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                             "copyDone" | "copy_done" => Ok(GeneratedField::CopyDone),
                             "sourceAppliedSeqno" | "source_applied_seqno" => Ok(GeneratedField::SourceAppliedSeqno),
                             "retentionLapsed" | "retention_lapsed" => Ok(GeneratedField::RetentionLapsed),
+                            "followerError" | "follower_error" => Ok(GeneratedField::FollowerError),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -15829,6 +15839,7 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                 let mut copy_done__ = None;
                 let mut source_applied_seqno__ = None;
                 let mut retention_lapsed__ = None;
+                let mut follower_error__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -15895,6 +15906,12 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                             }
                             retention_lapsed__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::FollowerError => {
+                            if follower_error__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("followerError"));
+                            }
+                            follower_error__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(MoveStatus {
@@ -15908,6 +15925,7 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                     copy_done: copy_done__.unwrap_or_default(),
                     source_applied_seqno: source_applied_seqno__.unwrap_or_default(),
                     retention_lapsed: retention_lapsed__.unwrap_or_default(),
+                    follower_error: follower_error__.unwrap_or_default(),
                 })
             }
         }
@@ -22132,6 +22150,97 @@ impl<'de> serde::Deserialize<'de> for RawCommit {
             }
         }
         deserializer.deserialize_struct("pigeonhole.v1.RawCommit", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for RawCommits {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.commits.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RawCommits", len)?;
+        if !self.commits.is_empty() {
+            struct_ser.serialize_field("commits", &self.commits)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for RawCommits {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "commits",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Commits,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "commits" => Ok(GeneratedField::Commits),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = RawCommits;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct pigeonhole.v1.RawCommits")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<RawCommits, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut commits__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Commits => {
+                            if commits__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("commits"));
+                            }
+                            commits__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(RawCommits {
+                    commits: commits__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("pigeonhole.v1.RawCommits", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for ReadRowRequest {

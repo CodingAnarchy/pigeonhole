@@ -1747,13 +1747,22 @@ pub mod feed_event {
         #[prost(message, tag = "8")]
         MoveBarrier(super::MoveBarrier),
         /// D331 PR 4b: internal to a range move's catch-up (`ForwardSubscribeRequest.raw`),
-        /// never sent to a client: one commit's changes in the move's range, as logged.
+        /// never sent to a client: the commits ready at once, each with its changes in the
+        /// move's range as logged, oldest first (#2108). The event's token is the position after
+        /// the last.
         #[prost(message, tag = "9")]
-        RawCommit(super::RawCommit),
+        RawCommits(super::RawCommits),
     }
 }
 /// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 /// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
+/// D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
+/// commits.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RawCommits {
+    #[prost(message, repeated, tag = "1")]
+    pub commits: ::prost::alloc::vec::Vec<RawCommit>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RawCommit {
     #[prost(uint64, tag = "1")]
@@ -7318,6 +7327,11 @@ pub struct MoveStatus {
     /// lost to a restart of the source); the move can't catch up and must be aborted.
     #[prost(bool, tag = "10")]
     pub retention_lapsed: bool,
+    /// On the target: why its range follower stopped for good (the source's history expired,
+    /// a range drop of the range, a row left partly copied, the source failed over); empty
+    /// while it runs or once it's done. PR 5's driver aborts the move on it.
+    #[prost(string, tag = "11")]
+    pub follower_error: ::prost::alloc::string::String,
 }
 /// D330: one failover of a partition to a replica, or one writer election, as the writer
 /// that made it recorded it in the map.
@@ -8236,9 +8250,10 @@ pub struct ForwardSubscribeRequest {
     #[prost(bool, tag = "6")]
     pub from_hand_over: bool,
     /// D331 PR 4b, a range move's catch-up (internal): the rows `[range_start, range_end)` of
-    /// the request's one table, an absent bound open. With `raw`, each commit's changes in
-    /// the range come as `FeedEvent.raw_commit`, stored values and kinds as logged; accepted
-    /// only for the bounds of a live move from this partition (COPYING through HANDING_OVER).
+    /// the request's one table, an absent bound open. With `raw`, the commits' changes in the
+    /// range come as `FeedEvent.raw_commits`, the commits ready at once batched, stored values
+    /// and kinds as logged; accepted
+    /// only for the bounds of a live move from this partition (COPYING through HANDED_OVER).
     #[prost(message, optional, tag = "7")]
     pub range_start: ::core::option::Option<SplitKey>,
     #[prost(message, optional, tag = "8")]

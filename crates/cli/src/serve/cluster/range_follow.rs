@@ -11,13 +11,14 @@
 //! - **Progress** (in `__phdb_cluster`'s `moved` family, beside the moved-away and serving
 //!   rows, which every reader takes by their own prefixes, M4): `copy/<id>` holds the next
 //!   row to ask for, the copy's first token, the chunk count and `done`; `copy/<id>/<n>`
-//!   holds chunk `n`'s end row and snapshot seqno; `follow/<id>` the catch-up's token. A
-//!   chunk's progress goes in its last commit only (simp724): a crash between two of its
-//!   commits copies the whole chunk again at a fresh snapshot, which
-//!   [`CopiedChunk::batches`] makes safe.
-//! - **A chunk holding a merge** commits whole (its D34 split only): a named operator's
-//!   operands apply twice if a crash splits them (simp724's (b)). One past
-//!   [`MERGE_CHUNK_CAP`] stops the move, naming the table, family and row.
+//!   holds record `n`'s end row and snapshot seqno; `follow/<id>` the catch-up's token.
+//! - **Nothing is copied twice** (cli692's M-a on #2107): a chunk is written as commits of
+//!   whole rows of about 256 KiB, each with its own record (ending just past its last row)
+//!   and the head's `next`, so a resume asks only after the last row written. A row too big
+//!   for one commit, or holding a cell twice at one timestamp (D34), spans several under the
+//!   head's `partial`. A stop waits for such a row unless much of it is left or it takes too
+//!   long; a crash or such a stop leaves `partial`, and the resume stops the move, naming the
+//!   row, rather than copy it again.
 //! - **The catch-up** (B4): a change to row `k` is applied only if its seqno is above the
 //!   snapshot of `k`'s chunk, which already holds everything at or below it.
 //! - **Stopping** (simp724's M2, cli692's M2): on a map that no longer gives the move, or
@@ -25,8 +26,8 @@
 //!   abort waits for it before it drops the range.
 //! - **Failures** retry with a backoff (a missing family on the target is the schema
 //!   reconcile's lag, B3), except those that can't heal: a resume past the source's history
-//!   (`FeedExpired`), a range drop of the range on the source, or a chunk past the merge
-//!   cap. Those are reported, and the follower stops until the move is aborted.
+//!   (`FeedExpired`), a range drop of the range on the source, or a row left partly copied.
+//!   Those are reported, and the follower stops until the move is aborted.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,8 +56,8 @@ const CHUNK_BYTES: u64 = 2 << 20;
 /// much at cell boundaries.
 const SUB_COMMIT: usize = 256 << 10;
 
-/// The most a chunk holding a merge may write in its one commit (`k` × the read unit).
-const MERGE_CHUNK_CAP: usize = 4 * CHUNK_BYTES as usize;
+/// The most of a row a stopped follower still writes before it honours the stop.
+const ROW_FINISH: usize = 4 * SUB_COMMIT;
 
 /// The least time between two catch-up commits that only move its token.
 const TOKEN_EVERY: Duration = Duration::from_secs(1);
@@ -88,6 +89,9 @@ pub(crate) struct Progress {
 /// The range followers this node runs, by move id.
 #[derive(Debug, Default)]
 pub(crate) struct Followers {
+    /// Set by [`stop_all`](Self::stop_all): a map installed during shutdown starts nothing
+    /// (cli692's N1 on #2107).
+    closed: AtomicBool,
     running: Mutex<HashMap<String, Running>>,
     /// Stopped followers' tasks, until they end: a later follower of the same move waits
     /// for its predecessor first, so two never write the range at once (M1).
@@ -123,6 +127,11 @@ impl Followers {
             })
             .collect();
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        // Under the lock: `stop_all` sets `closed` before it takes it, so either it drains
+        // what this adds, or this sees `closed`.
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let mut stopping = self.stopping.lock().unwrap_or_else(PoisonError::into_inner);
         stopping.retain(|_, t| !t.is_finished());
         let gone: Vec<String> = running
@@ -149,6 +158,8 @@ impl Followers {
                 stop: rx,
                 progress: Arc::clone(&progress),
                 after: stopping.remove(&m.id),
+                #[cfg(test)]
+                asked: 0,
             };
             let task = rt.spawn(follower.run());
             running.insert(
@@ -165,6 +176,7 @@ impl Followers {
     /// Stops every follower and waits until each has (an apply in flight finishes first): at
     /// the server's shutdown, before the partitions' databases close.
     pub(crate) async fn stop_all(&self) {
+        self.closed.store(true, Ordering::Release);
         let stopped: Vec<Running> = self
             .running
             .lock()
@@ -227,6 +239,9 @@ struct Follower {
     progress: Arc<Progress>,
     /// A stopped follower of the same move, still finishing a commit: waited for first.
     after: Option<tokio::task::JoinHandle<()>>,
+    /// Chunks this follower has asked for (the tests' hold seams count them).
+    #[cfg(test)]
+    asked: u64,
 }
 
 /// What a step left to do.
@@ -342,6 +357,19 @@ impl Follower {
             .find(|m| m.id == self.id)
             .cloned()
             .ok_or_else(|| Failed::Stop("the map no longer has the move".into()))?;
+        // cli692's S2 on #2107: the source failed over (its epoch moved off the one the copy
+        // began at): its history from the copy's token is another's, and the move must be
+        // aborted. A record from before `from_epoch` existed (0) isn't compared.
+        if let Some(p) = map.partitions.iter().find(|p| p.id == m.from)
+            && m.from_epoch != 0
+            && p.epoch != m.from_epoch
+        {
+            return Err(Failed::Stop(format!(
+                "the source {:?} is at epoch {}, not {} as when the copy began (it failed \
+                 over)",
+                m.from, p.epoch, m.from_epoch
+            )));
+        }
         let service = cluster.here(&m.to).ok_or_else(|| {
             Failed::Retry(ApiError::partition_unavailable(format!(
                 "its target {:?} isn't open here yet",
@@ -382,9 +410,18 @@ impl Follower {
         self.catch_up(&cx, &head).await
     }
 
-    /// Asks the source for the chunk after `head` and writes it, its progress in its last
-    /// commit.
+    /// Asks the source for the chunk after `head` and writes it ([`build_commits`]), each
+    /// commit with its own progress, so nothing is ever copied twice (cli692's M-a on
+    /// #2107).
     async fn copy_chunk(&mut self, cx: &Ctx, head: &Head) -> Result<(), Failed> {
+        if let Some(row) = &head.partial {
+            return Err(Failed::Stop(format!(
+                "a crash (or a stop past its bound) left row {:?} of table {:?} partly copied: \
+                 abort the move and run it again",
+                String::from_utf8_lossy(row),
+                cx.m.table
+            )));
+        }
         let req = proto::RangeCopyRequest {
             move_id: self.id.clone(),
             table: cx.m.table.clone(),
@@ -392,18 +429,17 @@ impl Follower {
             max_bytes: CHUNK_BYTES,
         };
         #[cfg(test)]
-        hold_at(&HOLD_CHUNK, &cx.shared, head.n, &mut self.stop).await;
-        let resp = ask_chunk(&cx.shared, &cx.m.from, req).await?;
-        let first = if head.first.is_empty() {
-            if resp.token.is_empty() {
-                return Err(Failed::Retry(ApiError::internal(
-                    "the source sent the copy's first chunk without its token",
-                )));
-            }
-            resp.token.to_vec()
-        } else {
-            head.first.clone()
+        let asked = {
+            self.asked += 1;
+            hold_at(&HOLD_CHUNK, &cx.shared, self.asked, &mut self.stop).await;
+            self.asked
         };
+        let resp = ask_chunk(&cx.shared, &cx.m.from, req).await?;
+        if head.first.is_empty() && resp.token.is_empty() {
+            return Err(Failed::Retry(ApiError::internal(
+                "the source sent the copy's first chunk without its token",
+            )));
+        }
         let chunk = CopiedChunk {
             cells: resp
                 .cells
@@ -422,56 +458,87 @@ impl Follower {
             next: resp.next.map(|n| n.to_vec()),
         };
         #[cfg(test)]
-        hold_at(&HOLD_COMMIT, &cx.shared, head.n, &mut self.stop).await;
-        let bytes: usize = chunk.cells.iter().map(cell_bytes).sum();
-        let commits = sub_commits(&chunk);
-        if chunk.cells.iter().any(|c| c.kind == ChangeKind::Merge) && bytes > MERGE_CHUNK_CAP {
-            let c = chunk
-                .cells
-                .iter()
-                .find(|c| c.kind == ChangeKind::Merge)
-                .expect("a merge");
-            return Err(Failed::Stop(format!(
-                "a chunk of table {:?} holding merges (family {:?}, row {:?}) is {bytes} bytes, \
-                 past the {MERGE_CHUNK_CAP} a chunk with merges may commit at once",
-                cx.m.table,
-                c.family,
-                String::from_utf8_lossy(&c.row)
-            )));
-        }
-        let progress = HeadWrite {
-            id: self.id.clone(),
-            n: head.n,
-            next: chunk.next.clone(),
-            first: (head.first.is_empty()).then_some(first),
-            bytes: head.bytes + bytes as u64,
-            snapshot: resp.snapshot_seqno,
-        };
-        let last = commits.len().saturating_sub(1);
+        hold_at(&HOLD_COMMIT, &cx.shared, asked, &mut self.stop).await;
+        let done = chunk.next.is_none();
+        let mut commits = build_commits(&chunk.cells);
         if commits.is_empty() {
-            if *self.stop.borrow() {
-                return Ok(());
+            // Nothing left in the range (or, never seen, an empty chunk before its end): the
+            // progress alone.
+            commits.push(Commit {
+                cells: Vec::new(),
+                step: Step2::Rows(None),
+            });
+        }
+        let mut at = Progressed {
+            n: head.n,
+            bytes: head.bytes,
+            first: head.first.is_empty().then(|| resp.token.to_vec()),
+        };
+        let last = commits.len() - 1;
+        // Per commit inside a row, the bytes of the row from it on.
+        let mut row_left = vec![0usize; commits.len()];
+        for i in (0..commits.len()).rev() {
+            let b: usize = commits[i].cells.iter().map(cell_bytes).sum();
+            row_left[i] = match commits[i].step {
+                Step2::RowMid | Step2::RowFirst(_) if i + 1 < commits.len() => b + row_left[i + 1],
+                _ => b,
+            };
+        }
+        let mut stopped_at: Option<tokio::time::Instant> = None;
+        let bound = cx.shared.limits.request_timeout;
+        for (i, c) in commits.into_iter().enumerate() {
+            #[cfg(test)]
+            if matches!(c.step, Step2::RowMid | Step2::RowLast(_)) {
+                hold_at(&HOLD_ROW, &cx.shared, asked, &mut self.stop).await;
             }
-            self.commit(cx, Vec::new(), Some(progress)).await?;
-        } else {
-            for (i, cells) in commits.into_iter().enumerate() {
-                if *self.stop.borrow() {
-                    // Stopped before a commit of the chunk: the next follower copies it again,
-                    // whole.
+            if *self.stop.borrow() {
+                let inside = matches!(c.step, Step2::RowMid | Step2::RowLast(_));
+                // A stop waits for the row it's inside, if little of it is left (simp724) and
+                // for at most `bound` (cli692), on the M-a proposal: else `partial` stays, as
+                // after a crash.
+                let since = *stopped_at.get_or_insert_with(tokio::time::Instant::now);
+                if !inside || row_left[i] > ROW_FINISH || since.elapsed() >= bound {
                     return Ok(());
                 }
-                let p = (i == last).then(|| progress.clone());
-                self.commit(cx, cells, p).await?;
             }
+            // The head's `bytes` counts this commit's too.
+            let bytes: usize = c.cells.iter().map(cell_bytes).sum();
+            at.bytes += bytes as u64;
+            let progress = match &c.step {
+                Step2::Rows(last_row) => Some(at.record(
+                    &self.id,
+                    // The copy's last commit: its record reaches the range's end.
+                    if i == last && done {
+                        None
+                    } else {
+                        Some(just_past(last_row.as_deref().unwrap_or_default()))
+                    },
+                    i == last && done,
+                    resp.snapshot_seqno,
+                )),
+                Step2::RowLast(row) => Some(at.record(
+                    &self.id,
+                    if i == last && done {
+                        None
+                    } else {
+                        Some(just_past(row))
+                    },
+                    i == last && done,
+                    resp.snapshot_seqno,
+                )),
+                Step2::RowFirst(row) => Some(at.partial(&self.id, row)),
+                Step2::RowMid => None,
+            };
+            self.commit(cx, c.cells, progress).await?;
+            self.progress
+                .copied_bytes
+                .store(at.bytes, Ordering::Relaxed);
         }
-        self.progress
-            .copied_bytes
-            .store(head.bytes + bytes as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Writes `cells` (copied, by name) and, if any, the chunk's progress, as one
-    /// feed-silent commit through the target's gate.
+    /// Writes `cells` (copied, by name) and, if any, `progress`, as one feed-silent commit
+    /// through the target's gate.
     async fn commit(
         &self,
         cx: &Ctx,
@@ -509,6 +576,9 @@ impl Follower {
             return Ok(Step::Done);
         }
         let mut events = open_stream(&cx.shared, &cx.m, token.clone()).await?;
+        // The last event's token, and the last one stored (at most once a second when nothing
+        // is applied): the end is judged on the former.
+        let mut latest = token.clone();
         let mut stored = token;
         let mut stored_at = tokio::time::Instant::now();
         let mut m = cx.m.clone();
@@ -522,16 +592,18 @@ impl Follower {
             let ev = match ev {
                 Some(Ok(ev)) => ev,
                 Some(Err(e)) if e.code == "MovedAway" => {
-                    // The source passed the move's last seqno; its last position came first.
+                    // The source passed the move's last seqno; its last position came first
+                    // (feed1248's Q1 on #2107: judged on that, not the last token stored).
                     let m = self.ctx()?.m;
-                    if self.finished(&m, &stored) {
+                    if self.finished(&m, &latest) {
+                        if stored != latest {
+                            self.follow(cx, Vec::new(), latest).await?;
+                        }
                         return Ok(Step::Done);
                     }
                     return Err(Failed::Retry(e));
                 }
-                Some(Err(e))
-                    if e.code == "FailedPrecondition" && e.message.contains("range drop") =>
-                {
+                Some(Err(e)) if e.code == "RangeDropped" => {
                     return Err(Failed::Stop(e.message));
                 }
                 Some(Err(e)) => return Err(e.into()),
@@ -544,24 +616,27 @@ impl Follower {
             let token = ev.token.to_vec();
             let seqno = super::token::token_seqno(&token);
             match ev.event {
-                Some(proto::feed_event::Event::RawCommit(c)) => {
-                    let cells: Vec<CopiedCell> = c
-                        .changes
-                        .into_iter()
-                        .filter(|ch| c.seqno > chunk_snapshot(&chunks, &ch.row))
-                        .map(|ch| {
-                            Ok(CopiedCell {
+                Some(proto::feed_event::Event::RawCommits(batch)) => {
+                    // One commit for the event's commits, which share no key (the source
+                    // batches so, D34), with their token; B4 per commit, the lag per commit.
+                    let mut cells: Vec<CopiedCell> = Vec::new();
+                    for c in batch.commits {
+                        let lag = now_micros().saturating_sub(c.timestamp) / 1000;
+                        self.progress.lag_ms.store(lag, Ordering::Relaxed);
+                        for ch in c.changes {
+                            if c.seqno <= chunk_snapshot(&chunks, &ch.row) {
+                                continue;
+                            }
+                            cells.push(CopiedCell {
                                 family: ch.family,
                                 kind: change_kind(ch.kind)?,
                                 row: ch.row.to_vec(),
                                 qualifier: ch.qualifier.to_vec(),
                                 ts: ch.timestamp,
                                 stored: ch.stored.to_vec(),
-                            })
-                        })
-                        .collect::<Result<_, ApiError>>()?;
-                    let lag = now_micros().saturating_sub(c.timestamp) / 1000;
-                    self.progress.lag_ms.store(lag, Ordering::Relaxed);
+                            });
+                        }
+                    }
                     if !cells.is_empty() || stored_at.elapsed() >= TOKEN_EVERY {
                         self.follow(cx, cells, token.clone()).await?;
                         stored.clone_from(&token);
@@ -578,6 +653,7 @@ impl Follower {
                 }
                 _ => continue,
             }
+            latest.clone_from(&token);
             if let Some(s) = seqno {
                 self.progress.applied.store(s, Ordering::Release);
             }
@@ -631,53 +707,121 @@ impl Follower {
 /// One range copy's head row, `copy/<id>`.
 #[derive(Debug, Default)]
 struct Head {
-    /// The row to ask for next; `None` before the first chunk.
+    /// The row to ask for next: just past the last row written; `None` before the first.
     next: Option<Vec<u8>>,
     /// The source's feed token at the first chunk's snapshot.
     first: Vec<u8>,
-    /// Chunks written.
+    /// Records written (`copy/<id>/<n>`).
     n: u64,
     bytes: u64,
     done: bool,
+    /// A row whose commits began and didn't end: left only by a crash, or a stop past its
+    /// bound.
+    partial: Option<Vec<u8>>,
 }
 
-/// A chunk's progress, written in its last commit.
+/// Where a chunk's commits have got to: the next record's number, the bytes copied, and
+/// the copy's first token while it's still to be written.
+struct Progressed {
+    n: u64,
+    bytes: u64,
+    first: Option<Vec<u8>>,
+}
+
+impl Progressed {
+    /// The progress of a commit that ends at a row boundary: its record (`end` just past its
+    /// last row, `None` to the range's end), the head's `next`, and `partial` cleared.
+    fn record(&mut self, id: &str, end: Option<Vec<u8>>, done: bool, snap: u64) -> HeadWrite {
+        let w = HeadWrite {
+            id: id.to_owned(),
+            first: self.first.take(),
+            step: HeadStep::Record {
+                n: self.n,
+                end,
+                done,
+                snap,
+            },
+            bytes: self.bytes,
+        };
+        self.n += 1;
+        w
+    }
+
+    /// The progress of a row's first commit when the row spans several: `partial`.
+    fn partial(&mut self, id: &str, row: &[u8]) -> HeadWrite {
+        HeadWrite {
+            id: id.to_owned(),
+            first: self.first.take(),
+            step: HeadStep::Partial(row.to_vec()),
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// A commit's progress, written in it.
 #[derive(Debug, Clone)]
 struct HeadWrite {
     id: String,
-    /// The chunk's number (the head's count before it).
-    n: u64,
-    /// The source's next row; `None`: the copy is done.
-    next: Option<Vec<u8>>,
-    /// The copy's first token, on its first chunk.
+    /// The copy's first token, on its first commit.
     first: Option<Vec<u8>>,
+    step: HeadStep,
+    /// The bytes copied through this commit.
     bytes: u64,
-    snapshot: u64,
+}
+
+#[derive(Debug, Clone)]
+enum HeadStep {
+    /// Record `n`: the rows up to `end` copied at snapshot `snap`; the head's `next` moves
+    /// there and `partial` clears.
+    Record {
+        n: u64,
+        end: Option<Vec<u8>>,
+        done: bool,
+        snap: u64,
+    },
+    /// A row's commits begin.
+    Partial(Vec<u8>),
 }
 
 impl HeadWrite {
     fn push(&self, b: &mut pigeonhole::replication::LoggedBatch<'_>, t: &pigeonhole::Table) {
         let head = [b"copy/".as_slice(), self.id.as_bytes()].concat();
-        let chunk = chunk_row(&self.id, self.n);
-        match &self.next {
-            Some(next) => put(b, t, &head, b"next", next),
-            None => put(b, t, &head, b"done", b"1"),
-        }
         if let Some(first) = &self.first {
             put(b, t, &head, b"first", first);
         }
-        put(b, t, &head, b"n", (self.n + 1).to_string().as_bytes());
         put(b, t, &head, b"bytes", self.bytes.to_string().as_bytes());
-        if let Some(next) = &self.next {
-            put(b, t, &chunk, b"end", next);
+        match &self.step {
+            HeadStep::Record { n, end, done, snap } => {
+                let record = chunk_row(&self.id, *n);
+                if let Some(end) = end {
+                    put(b, t, &head, b"next", end);
+                    put(b, t, &record, b"end", end);
+                }
+                if *done {
+                    put(b, t, &head, b"done", b"1");
+                }
+                put(b, t, &head, b"partial", b"");
+                put(b, t, &head, b"n", (n + 1).to_string().as_bytes());
+                put(b, t, &record, b"snap", snap.to_string().as_bytes());
+            }
+            HeadStep::Partial(row) => {
+                // Non-empty, so a row with the empty key is told from none.
+                put(b, t, &head, b"partial", &[b"r".as_slice(), row].concat());
+            }
         }
-        put(b, t, &chunk, b"snap", self.snapshot.to_string().as_bytes());
     }
 }
 
+/// The smallest key after `row`: a record ends just past its last row (cli692 on the M-a
+/// proposal), never at the source's next row, so a row inserted between them later is
+/// another record's.
+fn just_past(row: &[u8]) -> Vec<u8> {
+    [row, &[0u8]].concat()
+}
+
 /// A hold seam (tests): the follower on the node in a listed cluster directory waits,
-/// once, before it asks for the listed chunk, until the sender sends or is dropped, or the
-/// follower is stopped (then it commits nothing more).
+/// once, before it asks for its listed chunk (counted from 1 by that follower), until the
+/// sender sends or is dropped, or the follower is stopped.
 #[cfg(test)]
 pub(crate) static HOLD_CHUNK: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
 
@@ -685,6 +829,11 @@ pub(crate) static HOLD_CHUNK: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
 /// comes while it waits is the follower's own to honour, as the source already served it.
 #[cfg(test)]
 pub(crate) static HOLD_COMMIT: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
+
+/// [`HOLD_CHUNK`]'s seam before a commit inside a row that spans several, in the listed
+/// chunk: a stop that comes while it waits meets the row.
+#[cfg(test)]
+pub(crate) static HOLD_ROW: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
 
 /// [`HOLD_CHUNK`]'s entry: the node's cluster directory and the chunk's number, and the
 /// release.
@@ -772,6 +921,9 @@ fn read_head(db: &Pigeonhole, id: &str) -> Result<Head, ApiError> {
         n: number(b"n")?,
         bytes: number(b"bytes")?,
         done: get(b"done")?.is_some(),
+        partial: get(b"partial")?
+            .filter(|p| !p.is_empty())
+            .map(|p| p[1..].to_vec()),
     })
 }
 
@@ -779,7 +931,9 @@ fn read_head(db: &Pigeonhole, id: &str) -> Result<Head, ApiError> {
 /// snapshot seqno.
 type Chunks = Vec<(Option<Vec<u8>>, u64)>;
 
-/// The copy's chunks ([`Chunks`]).
+/// The copy's records ([`Chunks`]), consecutive ones at one snapshot merged (perf287 on the
+/// M-a proposal): a chunk's commits share its snapshot, so B4 needs only the boundaries
+/// where the snapshot changes, about one entry per chunk.
 fn read_chunks(db: &Pigeonhole, id: &str) -> Result<Chunks, ApiError> {
     let t = progress_table(db)?;
     let prefix = format!("copy/{id}/").into_bytes();
@@ -792,7 +946,19 @@ fn read_chunks(db: &Pigeonhole, id: &str) -> Result<Chunks, ApiError> {
             .ok_or_else(|| ApiError::internal(format!("range copy {id:?}'s chunk is malformed")))?;
         out.push((row.get(FAMILY, b"end").map(|c| c.value().to_vec()), snap));
     }
-    Ok(out)
+    Ok(merge_records(out))
+}
+
+/// `records` with consecutive ones at one snapshot merged into the last of them.
+fn merge_records(records: Chunks) -> Chunks {
+    let mut out: Chunks = Vec::with_capacity(records.len());
+    for (end, snap) in records {
+        match out.last_mut() {
+            Some(last) if last.1 == snap => last.0 = end,
+            _ => out.push((end, snap)),
+        }
+    }
+    out
 }
 
 /// The catch-up's token, once it has stored one.
@@ -808,30 +974,88 @@ fn chunk_snapshot(chunks: &[(Option<Vec<u8>>, u64)], row: &[u8]) -> u64 {
     chunks.get(i).map_or(0, |(_, s)| *s)
 }
 
-/// `chunk` as its commits: its D34 split, then (a chunk holding no merge) cut further at
-/// cell boundaries into commits of about [`SUB_COMMIT`].
-fn sub_commits(chunk: &CopiedChunk) -> Vec<Vec<CopiedCell>> {
-    let merges = chunk.cells.iter().any(|c| c.kind == ChangeKind::Merge);
+/// One commit of a chunk, and what it ends.
+#[derive(Debug, Clone, PartialEq)]
+struct Commit {
+    cells: Vec<CopiedCell>,
+    step: Step2,
+}
+
+/// Where a chunk's commit ends.
+#[derive(Debug, Clone, PartialEq)]
+enum Step2 {
+    /// Whole rows, the last of them this one (`None`: no row).
+    Rows(Option<Vec<u8>>),
+    /// The first commit of a row that spans several.
+    RowFirst(Vec<u8>),
+    /// A middle one.
+    RowMid,
+    /// Its last.
+    RowLast(Vec<u8>),
+}
+
+/// `cells` (a chunk's, rows whole, in row order) as its commits (cli692's M-a on #2107):
+/// whole rows packed to about [`SUB_COMMIT`]; a row too big for one, or holding a cell
+/// twice at one timestamp (D34: one commit keeps only the last), alone in several, cut
+/// before the cell that would pass the size or repeat a key.
+fn build_commits(cells: &[CopiedCell]) -> Vec<Commit> {
+    type Key<'a> = (&'a str, &'a [u8], u64, bool);
     let mut out = Vec::new();
-    for batch in chunk.batches() {
-        if merges {
-            out.push(batch.to_vec());
-            continue;
+    let mut rows: Vec<CopiedCell> = Vec::new();
+    let mut rows_bytes = 0usize;
+    let flush = |out: &mut Vec<Commit>, rows: &mut Vec<CopiedCell>, bytes: &mut usize| {
+        if let Some(last) = rows.last().map(|c| c.row.clone()) {
+            out.push(Commit {
+                cells: std::mem::take(rows),
+                step: Step2::Rows(Some(last)),
+            });
         }
-        let mut cur = Vec::new();
-        let mut bytes = 0;
-        for c in batch {
-            if !cur.is_empty() && bytes + cell_bytes(c) > SUB_COMMIT {
-                out.push(std::mem::take(&mut cur));
+        *bytes = 0;
+    };
+    for row in cells.chunk_by(|a, b| a.row == b.row) {
+        // The row's parts.
+        let mut parts: Vec<Vec<CopiedCell>> = vec![Vec::new()];
+        let mut seen: std::collections::HashSet<Key<'_>> = std::collections::HashSet::new();
+        let mut bytes = 0usize;
+        for c in row {
+            let key = (
+                c.family.as_str(),
+                &c.qualifier[..],
+                c.ts,
+                c.kind == ChangeKind::DeleteFamily,
+            );
+            let part = parts.last_mut().expect("a part");
+            if !part.is_empty() && (seen.contains(&key) || bytes + cell_bytes(c) > SUB_COMMIT) {
+                parts.push(Vec::new());
+                seen.clear();
                 bytes = 0;
             }
+            seen.insert(key);
             bytes += cell_bytes(c);
-            cur.push(c.clone());
+            parts.last_mut().expect("a part").push(c.clone());
         }
-        if !cur.is_empty() {
-            out.push(cur);
+        if let [whole] = &parts[..] {
+            let b: usize = whole.iter().map(cell_bytes).sum();
+            if !rows.is_empty() && rows_bytes + b > SUB_COMMIT {
+                flush(&mut out, &mut rows, &mut rows_bytes);
+            }
+            rows_bytes += b;
+            rows.extend(whole.iter().cloned());
+            continue;
+        }
+        flush(&mut out, &mut rows, &mut rows_bytes);
+        let key = row[0].row.clone();
+        let n = parts.len();
+        for (i, cells) in parts.into_iter().enumerate() {
+            let step = match i {
+                0 => Step2::RowFirst(key.clone()),
+                _ if i + 1 == n => Step2::RowLast(key.clone()),
+                _ => Step2::RowMid,
+            };
+            out.push(Commit { cells, step });
         }
     }
+    flush(&mut out, &mut rows, &mut rows_bytes);
     out
 }
 
@@ -1023,27 +1247,104 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_is_cut_into_commits_of_about_the_cap_unless_it_holds_a_merge() {
-        let chunk = CopiedChunk {
-            cells: (0..10)
-                .map(|i| cell(&format!("r{i}"), ChangeKind::Put, SUB_COMMIT / 3))
-                .collect(),
-            next: None,
-        };
-        let commits = sub_commits(&chunk);
+    fn whole_rows_are_packed_to_the_cap_and_cut_only_between_rows() {
+        let cells: Vec<CopiedCell> = (0..10)
+            .flat_map(|i| {
+                let row = format!("r{i}");
+                [
+                    cell(&row, ChangeKind::Put, SUB_COMMIT / 6),
+                    CopiedCell {
+                        qualifier: b"q2".to_vec(),
+                        ..cell(&row, ChangeKind::Put, SUB_COMMIT / 6)
+                    },
+                ]
+            })
+            .collect();
+        let commits = build_commits(&cells);
         assert!(commits.len() >= 4, "{}", commits.len());
-        assert_eq!(commits.iter().map(Vec::len).sum::<usize>(), 10);
-        assert!(
-            commits
-                .iter()
-                .all(|c| c.iter().map(cell_bytes).sum::<usize>() <= SUB_COMMIT)
-        );
-        let mut merged = chunk.clone();
-        merged.cells[3].kind = ChangeKind::Merge;
+        assert_eq!(commits.iter().map(|c| c.cells.len()).sum::<usize>(), 20);
+        for c in &commits {
+            assert!(c.cells.iter().map(cell_bytes).sum::<usize>() <= SUB_COMMIT);
+            let Step2::Rows(Some(last)) = &c.step else {
+                panic!("{:?}", c.step)
+            };
+            assert_eq!(&c.cells.last().unwrap().row, last);
+            // Both of a row's cells in one commit.
+            assert_eq!(c.cells.len() % 2, 0);
+        }
+    }
+
+    #[test]
+    fn a_big_row_or_one_with_a_repeated_key_spans_commits_marked_as_a_row() {
+        // r1 three times the cap, between two small rows.
+        let mut cells = vec![cell("r0", ChangeKind::Put, 8)];
+        cells.extend((0..3).map(|i| CopiedCell {
+            qualifier: format!("q{i}").into_bytes(),
+            ..cell("r1", ChangeKind::Put, SUB_COMMIT - 64)
+        }));
+        cells.push(cell("r2", ChangeKind::Put, 8));
+        let steps: Vec<Step2> = build_commits(&cells).into_iter().map(|c| c.step).collect();
         assert_eq!(
-            sub_commits(&merged).len(),
-            1,
-            "a chunk with a merge commits once"
+            steps,
+            [
+                Step2::Rows(Some(b"r0".to_vec())),
+                Step2::RowFirst(b"r1".to_vec()),
+                Step2::RowMid,
+                Step2::RowLast(b"r1".to_vec()),
+                Step2::Rows(Some(b"r2".to_vec())),
+            ]
         );
+        // A value beside its delete at one timestamp (D34): two commits.
+        let mut del = cell("r1", ChangeKind::DeleteCell, 0);
+        del.stored.clear();
+        let cells = vec![del, cell("r1", ChangeKind::Put, 8)];
+        let steps: Vec<Step2> = build_commits(&cells).into_iter().map(|c| c.step).collect();
+        assert_eq!(
+            steps,
+            [
+                Step2::RowFirst(b"r1".to_vec()),
+                Step2::RowLast(b"r1".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_records_answer_b4_as_the_full_list_does() {
+        // perf287 on the M-a proposal: records of one chunk share its snapshot.
+        let mut x = 0x2107u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..50 {
+            let mut full: Chunks = Vec::new();
+            let mut snap = 1;
+            for k in 0..(next() % 40 + 1) {
+                if next() % 3 == 0 {
+                    snap += 1 + next() % 5;
+                }
+                full.push((Some(format!("k{k:03}").into_bytes()), snap));
+            }
+            if next() % 2 == 0 {
+                full.last_mut().unwrap().0 = None;
+            }
+            let merged = merge_records(full.clone());
+            assert!(merged.len() <= full.len());
+            for k in 0..45 {
+                for row in [
+                    format!("k{k:03}"),
+                    format!("k{k:03}\0"),
+                    format!("k{k:03}a"),
+                ] {
+                    assert_eq!(
+                        chunk_snapshot(&full, row.as_bytes()),
+                        chunk_snapshot(&merged, row.as_bytes()),
+                        "{row} in {full:?}"
+                    );
+                }
+            }
+        }
     }
 }

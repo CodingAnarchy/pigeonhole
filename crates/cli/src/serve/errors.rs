@@ -454,6 +454,19 @@ impl ApiError {
     /// D331 PR 3b, internal to a cluster subscription: a source's component of tables a
     /// range move took from it whole has read up to the move's last seqno, and ends here.
     /// The merge retires the part; a client never sees it.
+    /// D331 PR 4b: a range move's catch-up stream ended by a range drop on its source that
+    /// removed some of its range. Internal to the target's follower, which stops the move
+    /// on it; never a client's.
+    pub(crate) fn range_dropped(message: impl Into<String>) -> Self {
+        Self::new(
+            "RangeDropped",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
     pub(crate) fn moved_away(message: impl Into<String>) -> Self {
         Self::new(
             "MovedAway",

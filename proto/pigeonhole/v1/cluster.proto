@@ -321,6 +321,10 @@ message MoveStatus {
   // On the source: the move's feed retention hold lapsed (past `--move-retention-cap`, or
   // lost to a restart of the source); the move can't catch up and must be aborted.
   bool retention_lapsed = 10;
+  // On the target: why its range follower stopped for good (the source's history expired,
+  // a range drop of the range, a row left partly copied, the source failed over); empty
+  // while it runs or once it's done. PR 5's driver aborts the move on it.
+  string follower_error = 11;
 }
 
 // D330: one failover of a partition to a replica, or one writer election, as the writer
@@ -1024,9 +1028,10 @@ message ForwardSubscribeRequest {
   // `FeedExpired` if no move did, or its feed has trimmed past that position.
   bool from_hand_over = 6;
   // D331 PR 4b, a range move's catch-up (internal): the rows `[range_start, range_end)` of
-  // the request's one table, an absent bound open. With `raw`, each commit's changes in
-  // the range come as `FeedEvent.raw_commit`, stored values and kinds as logged; accepted
-  // only for the bounds of a live move from this partition (COPYING through HANDING_OVER).
+  // the request's one table, an absent bound open. With `raw`, the commits' changes in the
+  // range come as `FeedEvent.raw_commits`, the commits ready at once batched, stored values
+  // and kinds as logged; accepted
+  // only for the bounds of a live move from this partition (COPYING through HANDED_OVER).
   SplitKey range_start = 7;
   SplitKey range_end = 8;
   bool raw = 9;

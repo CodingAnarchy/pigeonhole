@@ -80,7 +80,11 @@ pub(crate) async fn serve(
             req.partition
         )));
     };
-    let slot = service.stream_slot()?;
+    // cli692's S1 on #2107: a stale owner whose lease ran out serves no stream.
+    let gate = service.gate().cloned();
+    if let Some(g) = &gate {
+        g.serving()?;
+    }
     let db = service.part()?.db.clone();
     let t = db.table(table)?.open()?;
     let mut feed = t
@@ -95,17 +99,20 @@ pub(crate) async fn serve(
     let stream = Stream {
         node: Arc::clone(node),
         sources: Arc::clone(&cluster.range_copies),
+        gate,
         partition: req.partition,
         move_id: m.id.clone(),
         table: t,
-        start,
-        end,
+        range: super::route::PartRange {
+            partition: String::new(),
+            start,
+            end,
+        },
         quiet: limits.quiet,
         sink,
     };
     tokio::spawn(async move {
         let outcome = stream.run(feed).await;
-        drop(slot);
         if let Err(e) = outcome
             && !stream.sink.is_closed()
         {
@@ -177,13 +184,78 @@ struct Stream {
     node: Arc<Node>,
     /// The copies served here: the stream keeps its move's hold from going idle.
     sources: Arc<super::range_copy::Sources>,
+    /// The source's gate: the stream ends once its lease does.
+    gate: Option<Arc<crate::serve::gate::WriteGate>>,
     partition: String,
     move_id: String,
     table: pigeonhole::Table,
-    start: Vec<u8>,
-    end: Option<Vec<u8>>,
+    /// The move's range of its table (`partition` unused).
+    range: super::route::PartRange,
     quiet: Duration,
     sink: Sink,
+}
+
+/// The most commits one event carries, and about the most bytes (T's commit unit).
+const BATCH_COMMITS: usize = 1024;
+const BATCH_BYTES: usize = 256 << 10;
+
+/// The commits one event carries (#2108, perf287): what's ready at once, oldest first, at
+/// most [`BATCH_COMMITS`] and about [`BATCH_BYTES`]. The target applies an event as one
+/// commit, and one commit keeps only the last mutation of a cell and timestamp (D34), so no
+/// two of a batch's commits touch one key (a second increment at one timestamp would be
+/// lost): a commit that would starts the next batch. Its own changes never repeat one (its
+/// source commit kept only the last). The keys are hashed: a collision only ends a batch
+/// early.
+#[derive(Default)]
+struct Batch {
+    commits: Vec<proto::RawCommit>,
+    bytes: usize,
+    /// The keys of its commits' changes, once it holds two.
+    keys: std::collections::HashSet<u64>,
+}
+
+impl Batch {
+    fn full(&self) -> bool {
+        self.commits.len() >= BATCH_COMMITS || self.bytes >= BATCH_BYTES
+    }
+
+    /// Adds `c`, or hands it back when one of its changes repeats a key the batch holds.
+    fn add(&mut self, c: proto::RawCommit) -> Result<(), proto::RawCommit> {
+        if !self.commits.is_empty() {
+            if self.commits.len() == 1 {
+                let first: Vec<u64> = self.commits[0].changes.iter().map(key_of).collect();
+                self.keys.extend(first);
+            }
+            let keys: Vec<u64> = c.changes.iter().map(key_of).collect();
+            if keys.iter().any(|k| self.keys.contains(k)) {
+                return Err(c);
+            }
+            self.keys.extend(keys);
+        }
+        self.bytes += c
+            .changes
+            .iter()
+            .map(|ch| ch.row.len() + ch.qualifier.len() + ch.stored.len() + ch.family.len() + 16)
+            .sum::<usize>();
+        self.commits.push(c);
+        Ok(())
+    }
+}
+
+/// A change's cell and timestamp, hashed: (family, row, qualifier, timestamp, whether it's a
+/// family delete), as D34 keys a commit's mutations.
+fn key_of(ch: &proto::RawChange) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    (
+        &ch.family,
+        &ch.row,
+        &ch.qualifier,
+        ch.timestamp,
+        ch.kind == 5,
+    )
+        .hash(&mut h);
+    h.finish()
 }
 
 /// What the stream read next, owned (the feed lends its events).
@@ -198,34 +270,45 @@ enum Read {
 
 impl Stream {
     /// Sends the range's history until the move ends it, the target goes away, or it fails.
+    /// Each event carries the commits ready at once ([`Batch`], #2108): the first is waited
+    /// for, the rest are only what's there.
     async fn run(&self, mut feed: pigeonhole::Feed) -> Result<(), ApiError> {
         let mut sent = Bytes::new();
         let mut quiet = tokio::time::Instant::now() + self.quiet;
         let mut looked = tokio::time::Instant::now();
+        // A commit read whose changes repeat a key the last batch held: the next one's first.
+        let mut carry: Option<proto::RawCommit> = None;
         loop {
-            let read = tokio::select! {
-                biased;
-                () = self.sink.closed() => return Ok(()),
-                r = tokio::time::timeout(MAP_TICK, next(&mut feed, self)) => r,
-            };
-            let token = Bytes::copy_from_slice(feed.token().as_bytes());
-            let event = match read {
-                Ok(read) => match read? {
-                    Read::Commit(Some(c)) => Some(proto::feed_event::Event::RawCommit(c)),
-                    Read::Commit(None) | Read::Passed => None,
-                    Read::Dropped(seqno) => {
-                        return Err(ApiError::failed_precondition(format!(
-                            "a range drop at seqno {seqno} on partition {:?} removed rows of \
-                             range move {:?}'s range: the move must be aborted",
-                            self.partition, self.move_id
-                        )));
-                    }
-                },
-                // Quiet: the end may have come (the map's, not the feed's).
-                Err(_) => None,
-            };
+            let mut batch = Batch::default();
+            if let Some(c) = carry.take() {
+                batch.add(c).expect("an empty batch takes any commit");
+            } else {
+                let read = tokio::select! {
+                    biased;
+                    () = self.sink.closed() => return Ok(()),
+                    r = tokio::time::timeout(MAP_TICK, next(&mut feed, self)) => r,
+                };
+                // Quiet (`Err`): the end may have come (the map's, not the feed's).
+                if let Ok(read) = read {
+                    self.absorb(read?, &mut batch, &mut carry)?;
+                }
+            }
+            // The position after the batch's last commit.
+            let mut token = Bytes::copy_from_slice(feed.token().as_bytes());
+            while !batch.full() && carry.is_none() {
+                let Some(ev) = feed.try_next_event().map_err(ApiError::from)? else {
+                    break;
+                };
+                let read = self.read(ev);
+                if self.absorb(read, &mut batch, &mut carry)? {
+                    token = Bytes::copy_from_slice(feed.token().as_bytes());
+                }
+            }
             let now = tokio::time::Instant::now();
-            if let Some(event) = event {
+            if !batch.commits.is_empty() {
+                let event = proto::feed_event::Event::RawCommits(proto::RawCommits {
+                    commits: batch.commits,
+                });
                 self.send(token.clone(), event).await?;
                 sent = token.clone();
                 quiet = now + self.quiet;
@@ -243,6 +326,9 @@ impl Stream {
                 continue;
             }
             looked = tokio::time::Instant::now();
+            if let Some(g) = &self.gate {
+                g.serving()?;
+            }
             self.sources.touch(&self.move_id);
             if self.ended(&token).await? {
                 return Err(ApiError::moved_away(format!(
@@ -251,6 +337,31 @@ impl Stream {
                     self.move_id
                 )));
             }
+        }
+    }
+
+    /// Takes `read` into `batch`: true if the stream's position moved past it, false if it's
+    /// left in `carry` for the next batch (it repeats a key the batch holds).
+    fn absorb(
+        &self,
+        read: Read,
+        batch: &mut Batch,
+        carry: &mut Option<proto::RawCommit>,
+    ) -> Result<bool, ApiError> {
+        match read {
+            Read::Commit(Some(c)) => match batch.add(c) {
+                Ok(()) => Ok(true),
+                Err(c) => {
+                    *carry = Some(c);
+                    Ok(false)
+                }
+            },
+            Read::Commit(None) | Read::Passed => Ok(true),
+            Read::Dropped(seqno) => Err(ApiError::range_dropped(format!(
+                "a range drop at seqno {seqno} on partition {:?} removed rows of range move \
+                 {:?}'s range: the move must be aborted",
+                self.partition, self.move_id
+            ))),
         }
     }
 
@@ -290,11 +401,6 @@ impl Stream {
             .await
     }
 
-    /// `row` is in the range.
-    fn holds(&self, row: &[u8]) -> bool {
-        row >= self.start.as_slice() && self.end.as_deref().is_none_or(|e| row < e)
-    }
-
     /// `ev` as the stream sends it.
     fn read(&self, ev: &pigeonhole::FeedEvent) -> Read {
         match ev {
@@ -302,7 +408,7 @@ impl Stream {
                 let changes: Vec<proto::RawChange> = c
                     .changes()
                     .iter()
-                    .filter(|ch| self.holds(ch.row()))
+                    .filter(|ch| self.range.holds(ch.row()))
                     .map(|ch| proto::RawChange {
                         family: ch.family().to_owned(),
                         kind: super::range_copy::logged_kind(ch.kind()),
@@ -319,7 +425,7 @@ impl Stream {
                 }))
             }
             pigeonhole::FeedEvent::RangeDrop(d)
-                if d.overlaps(&self.table, &self.start, self.end.as_deref()) =>
+                if d.overlaps(&self.table, &self.range.start, self.range.end.as_deref()) =>
             {
                 Read::Dropped(d.seqno())
             }
@@ -336,4 +442,54 @@ async fn next(feed: &mut pigeonhole::Feed, s: &Stream) -> Result<Read, ApiError>
         std::task::Poll::Pending => std::task::Poll::Pending,
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incr(seqno: u64, row: &str, ts: u64) -> proto::RawCommit {
+        proto::RawCommit {
+            seqno,
+            timestamp: 0,
+            changes: vec![proto::RawChange {
+                family: "n".into(),
+                kind: 2,
+                row: Bytes::copy_from_slice(row.as_bytes()),
+                qualifier: Bytes::from_static(b"c"),
+                timestamp: ts,
+                stored: Bytes::from_static(&[1, 1, 0, 0, 0, 0, 0, 0, 0]),
+            }],
+        }
+    }
+
+    #[test]
+    fn two_increments_at_one_timestamp_never_share_a_batch() {
+        // The coordinator's D34 rule (#2108): one commit on the target keeps only the last
+        // mutation of a cell and timestamp, so the second increment starts the next batch.
+        let mut b = Batch::default();
+        b.add(incr(1, "r", 7)).unwrap();
+        b.add(incr(2, "s", 7)).unwrap();
+        b.add(incr(3, "r", 8)).unwrap();
+        let back = b.add(incr(4, "r", 7)).unwrap_err();
+        assert_eq!(back.seqno, 4);
+        assert_eq!(
+            b.commits.iter().map(|c| c.seqno).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        // It opens the next batch.
+        let mut next = Batch::default();
+        next.add(back).unwrap();
+        assert_eq!(next.commits.len(), 1);
+    }
+
+    #[test]
+    fn a_batch_is_full_at_its_commit_count() {
+        let mut b = Batch::default();
+        for i in 0..BATCH_COMMITS as u64 {
+            assert!(!b.full());
+            b.add(incr(i, &format!("r{i}"), 1)).unwrap();
+        }
+        assert!(b.full());
+    }
 }

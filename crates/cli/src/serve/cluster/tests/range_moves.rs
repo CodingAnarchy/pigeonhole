@@ -5,7 +5,7 @@
 //! file.
 
 use super::*;
-use crate::serve::proto::{MoveKind, MovePhase, PushMapRequest, RangeMove};
+use crate::serve::proto::{MoveKind, MovePhase, PartitionRequest, PushMapRequest, RangeMove};
 
 async fn try_put(port: u16, row: &str, value: &str) -> Result<(), tonic::Status> {
     data(port)
@@ -536,6 +536,29 @@ fn an_open_finishes_a_hand_over_past_a_promotes_floor_and_no_further() {
     }
 }
 
+/// Whether the follower on the node in `dir` has taken its armed hold in `seam` (the seams
+/// are shared by the tests running at once: each looks at its own).
+fn taken(seam: &std::sync::Mutex<Vec<super::super::range_follow::HeldChunk>>, dir: &Path) -> bool {
+    !seam.lock().unwrap().iter().any(|((d, _), _)| d == dir)
+}
+
+/// Whether the follower on the node in `dir` has taken its armed hold in `seam` (the seams
+/// are shared by the tests running at once: each looks at its own).
+fn taken(seam: &std::sync::Mutex<Vec<super::super::range_follow::HeldChunk>>, dir: &Path) -> bool {
+    !seam.lock().unwrap().iter().any(|((d, _), _)| d == dir)
+}
+
+/// The records move `mv1`'s copy has written in `db` (the head's `n`).
+fn records(db: &pigeonhole::Pigeonhole) -> Option<Vec<u8>> {
+    db.table(super::super::identity::TABLE)
+        .ok()?
+        .open()
+        .ok()?
+        .get(b"copy/mv1", "moved", b"n")
+        .ok()?
+        .map(|c| c.value().to_vec())
+}
+
 /// Partition `p`'s view of move `id` on the node at `port`, as its `Status` reports it.
 async fn move_status(port: u16, p: &str, id: &str) -> Option<crate::serve::proto::MoveStatus> {
     client(port)
@@ -599,9 +622,12 @@ fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
         .await;
         let s = move_status(b, "p2", "mv1").await.unwrap();
         assert!(s.copied_bytes > 0, "{s:?}");
-        // CATCHING_UP: a write now arrives by the catch-up.
+        // CATCHING_UP: a write now arrives by the catch-up. So do the range's first row and
+        // not the row at its end (feed1248's S2 on #2107: the bounds on the stream itself).
         push(&ports, &moving(&v1, 3, Some(MovePhase::CatchingUp))).await;
         try_put(c, "e", "2").await.unwrap();
+        try_put(c, "c", "3").await.unwrap();
+        try_put(c, "f", "3").await.unwrap();
         try_put(c, "zed", "2").await.unwrap();
         // HANDING_OVER, then HANDED_OVER with p1's last seqno before the fence.
         push(&ports, &moving(&v1, 4, Some(MovePhase::HandingOver))).await;
@@ -624,8 +650,13 @@ fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
                 .is_ok_and(|v| v == Some(b"2".to_vec()))
         })
         .await;
-        assert_eq!(get_row(c, "c").await.unwrap(), Some(b"0".to_vec()));
+        assert_eq!(get_row(c, "c").await.unwrap(), Some(b"3".to_vec()));
         assert_eq!(get_row(c, "d").await.unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            get_row(c, "f").await.unwrap(),
+            Some(b"3".to_vec()),
+            "f is p1's still"
+        );
     });
     // Nothing outside the range reached p2 (`zed` is p2's own, past the split at `m`).
     let t = db_b.table("users").unwrap().open().unwrap();
@@ -723,7 +754,7 @@ fn a_counter_moved_in_a_later_chunk_counts_each_increment_once() {
         super::super::range_follow::HOLD_CHUNK
             .lock()
             .unwrap()
-            .push(((dirs[1].clone(), 1), held));
+            .push(((dirs[1].clone(), 2), held));
         push(&ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
         eventually("b copies the first chunk", async || {
             move_status(b, "p2", "mv1")
@@ -854,7 +885,7 @@ fn a_target_restarted_between_chunks_and_in_its_catch_up_resumes_and_counts_once
     super::super::range_follow::HOLD_CHUNK
         .lock()
         .unwrap()
-        .push(((dirs[1].clone(), 1), held));
+        .push(((dirs[1].clone(), 2), held));
     rt.block_on(async {
         push(&ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
         eventually("b copies the first chunk", async || {
@@ -1017,7 +1048,7 @@ fn a_raw_catch_up_stream_is_served_only_for_a_live_moves_exact_range() {
 
 /// simp724's M2 (D331 PR 4b): a map that takes the move away stops its follower between
 /// commits. Held after its second chunk arrived and before its first commit, then released
-/// after that map: it commits nothing more, and its progress stays at the first chunk.
+/// after that map: it commits nothing more, and its records stay the first chunk's.
 #[test]
 fn a_follower_stopped_mid_copy_commits_nothing_more() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1040,11 +1071,12 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
     let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
     let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
     let (b, c) = (ports[1], ports[2]);
+    let mut recorded_before = None;
     let (release, held) = tokio::sync::oneshot::channel();
     super::super::range_follow::HOLD_COMMIT
         .lock()
         .unwrap()
-        .push(((dirs[1].clone(), 1), held));
+        .push(((dirs[1].clone(), 2), held));
     rt.block_on(async {
         eventually("p1 takes writes", async || {
             try_put(c, "c", "0").await.is_ok()
@@ -1067,6 +1099,7 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         let mut aborted = v1.clone();
         aborted.map_version = 3;
         push(&ports, &aborted).await;
+        recorded_before = records(&db_b);
         let _ = release.send(());
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
@@ -1075,15 +1108,517 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         users.get(b"d", "f", b"q").unwrap().is_none(),
         "the second chunk wasn't written"
     );
-    let progress = db_b
-        .table(super::super::identity::TABLE)
-        .unwrap()
-        .open()
-        .unwrap();
-    let n = progress
-        .get(b"copy/mv1", "moved", b"n")
-        .unwrap()
-        .map(|c| c.value().to_vec());
-    assert_eq!(n.as_deref(), Some(&b"1"[..]), "one chunk recorded");
+    assert_eq!(records(&db_b), recorded_before, "no record after the stop");
+    assert!(recorded_before.is_some(), "the first chunk's records");
     let _ = (db_a.close(), db_b.close());
+}
+
+/// Three nodes as the PR 4b tests run them: p1 on a, p2 on b, c routing. The databases of a
+/// and b, the map, the ports, the directories and the stop senders.
+struct Three {
+    rt: tokio::runtime::Runtime,
+    v1: ClusterMap,
+    ports: Vec<u16>,
+    dirs: Vec<PathBuf>,
+    db_a: pigeonhole::Pigeonhole,
+    db_b: pigeonhole::Pigeonhole,
+    _stops: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn three() -> Three {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (s_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (s_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (s_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    rt.block_on(eventually("p1 takes writes", async || {
+        try_put(ports[2], "c", "0").await.is_ok()
+    }));
+    Three {
+        rt,
+        v1,
+        ports,
+        dirs,
+        db_a: db_a.unwrap(),
+        db_b: db_b.unwrap(),
+        _stops: vec![s_a, s_b, s_c],
+    }
+}
+
+/// `row`'s puts of `cells` values of `bytes` each, qualifiers `q0`.. (one commit).
+fn wide_row(row: &str, cells: usize, bytes: usize) -> crate::serve::proto::RowWrites {
+    use crate::serve::proto::{Put, RowKey, RowWrites, Value, Write, value, write};
+    RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: row.as_bytes().to_vec().into(),
+        }),
+        writes: (0..cells)
+            .map(|i| Write {
+                op: Some(write::Op::Put(Put {
+                    family: "f".into(),
+                    qualifier: format!("q{i}").into_bytes().into(),
+                    timestamp: None,
+                    value: Some(Value {
+                        kind: Some(value::Kind::Bytes(vec![b'w'; bytes].into())),
+                    }),
+                })),
+            })
+            .collect(),
+    }
+}
+
+async fn mutate(port: u16, writes: crate::serve::proto::RowWrites) {
+    data(port)
+        .await
+        .mutate(crate::serve::proto::MutateRequest {
+            writes: Some(writes),
+            durability: 0,
+        })
+        .await
+        .unwrap();
+}
+
+/// The move from COPYING to CLEANING after `base` (versions from `v`), the follower's last
+/// seqno checked, once its copy is done.
+async fn finish_move(t: &Three, base: &ClusterMap, v: u64) {
+    let (b, ports) = (t.ports[1], &t.ports);
+    eventually("b copies the range", async || {
+        move_status(b, "p2", "mv1")
+            .await
+            .is_some_and(|s| s.copy_done)
+    })
+    .await;
+    push(ports, &moving(base, v, Some(MovePhase::CatchingUp))).await;
+    push(ports, &moving(base, v + 1, Some(MovePhase::HandingOver))).await;
+    let last = t.db_a.visible_seqno();
+    let mut handed = moving(base, v + 2, Some(MovePhase::HandedOver));
+    handed.moves[0].final_seqno = last;
+    push(ports, &handed).await;
+    eventually("b's catch-up passes the move's last seqno", async || {
+        move_status(b, "p2", "mv1")
+            .await
+            .is_some_and(|s| s.source_applied_seqno >= last)
+    })
+    .await;
+    let mut cleaning = moving(base, v + 3, Some(MovePhase::Cleaning));
+    cleaning.moves[0].final_seqno = last;
+    push(ports, &cleaning).await;
+}
+
+/// cli692's M-a on #2107, with simp724's and cli692's checks on its fix: nothing is copied
+/// twice. Held before its second chunk, the follower has written the first chunk's rows,
+/// each commit with its own record. Meanwhile S deletes one of them and compacts the delete
+/// away, and counters are incremented in rows just past each of them (`last ++ 0x00`,
+/// where a record ends). The deleted row reaches T through the catch-up, and each counter
+/// counts each increment once.
+#[test]
+fn a_row_deleted_and_compacted_on_the_source_after_its_copy_is_gone_on_the_target() {
+    use super::several::{add_counter, counter, incr_row};
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let big = "x".repeat(700 << 10);
+    let base = t.rt.block_on(async {
+        add_counter(&t.ports, c).await;
+        for row in ["c1", "c2", "c3", "c4"] {
+            try_put(c, row, &big).await.unwrap();
+        }
+        client(c)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    let v = base.map_version;
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    super::super::range_follow::HOLD_CHUNK
+        .lock()
+        .unwrap()
+        .push(((t.dirs[1].clone(), 2), held));
+    let gaps = ["c\0", "c1\0", "c2\0", "c3\0", "c4\0"];
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
+        eventually("b copies the first chunk", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copied_bytes > 0)
+        })
+        .await;
+        let mut gone = put_row("c1", "");
+        gone.writes = vec![crate::serve::proto::Write {
+            op: Some(crate::serve::proto::write::Op::DeleteRow(
+                crate::serve::proto::DeleteRow {},
+            )),
+        }];
+        mutate(c, gone).await;
+        for g in gaps {
+            for _ in 0..5 {
+                mutate(c, incr_row(g, 1)).await;
+            }
+        }
+    });
+    t.db_a.flush().unwrap();
+    t.db_a.compact().unwrap();
+    drop(release);
+    t.rt.block_on(async {
+        finish_move(&t, &base, v + 2).await;
+        eventually("p2 serves the range", async || {
+            get_row(c, "c2").await.is_ok_and(|v| v.is_some())
+        })
+        .await;
+        assert_eq!(
+            get_row(c, "c1").await.unwrap(),
+            None,
+            "deleted on the source"
+        );
+        for g in gaps {
+            assert_eq!(counter(c, g).await, 5, "{g:?} counted once");
+        }
+    });
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// simp724 on the M-a fix: a stop that comes inside a row spanning several commits, with
+/// little of it left, waits for the row, so nothing is left half-copied, and the move goes
+/// on once the map gives it back.
+#[test]
+fn a_stop_inside_a_small_split_row_finishes_the_row_and_the_move_goes_on() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    super::super::range_follow::HOLD_ROW
+        .lock()
+        .unwrap()
+        .push(((t.dirs[1].clone(), 1), held));
+    t.rt.block_on(async {
+        // Three cells of 200 KB: three commits, about 600 KB, under the 1 MiB a stop waits for.
+        mutate(c, wide_row("d", 3, 200 << 10)).await;
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        eventually_within(
+            Duration::from_secs(60),
+            "b holds inside the row",
+            async || taken(&super::super::range_follow::HOLD_ROW, &t.dirs[1]),
+        )
+        .await;
+        let mut aborted = t.v1.clone();
+        aborted.map_version = 3;
+        push(&t.ports, &aborted).await;
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The move again: the row was finished, so the copy goes on.
+        let mut back = t.v1.clone();
+        back.map_version = 3;
+        push(&t.ports, &moving(&back, 4, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done && s.follower_error.is_empty())
+        })
+        .await;
+    });
+    let users = t.db_b.table("users").unwrap().open().unwrap();
+    for q in ["q0", "q1", "q2"] {
+        assert!(users.get(b"d", "f", q.as_bytes()).unwrap().is_some(), "{q}");
+    }
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// simp724 on the M-a fix: a stop inside a row with more of it left than a stop waits for
+/// leaves the row marked partial, as a crash would, and the next follower stops the move,
+/// naming the row, rather than copy any of it again.
+#[test]
+fn a_row_left_partly_copied_stops_the_move_naming_it() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    super::super::range_follow::HOLD_ROW
+        .lock()
+        .unwrap()
+        .push(((t.dirs[1].clone(), 1), held));
+    t.rt.block_on(async {
+        // Six cells of 250 KB: about 1.5 MB, past the 1 MiB a stop waits for. A commit
+        // each, under the request limit; one row all the same.
+        for i in 0..6 {
+            let mut one = wide_row("d", 1, 250 << 10);
+            if let Some(crate::serve::proto::write::Op::Put(p)) = &mut one.writes[0].op {
+                p.qualifier = format!("q{i}").into_bytes().into();
+            }
+            mutate(c, one).await;
+        }
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        eventually_within(
+            Duration::from_secs(60),
+            "b holds inside the row",
+            async || taken(&super::super::range_follow::HOLD_ROW, &t.dirs[1]),
+        )
+        .await;
+        let mut aborted = t.v1.clone();
+        aborted.map_version = 3;
+        push(&t.ports, &aborted).await;
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut back = t.v1.clone();
+        back.map_version = 3;
+        push(&t.ports, &moving(&back, 4, Some(MovePhase::Copying))).await;
+        eventually("b's follower stops, naming the row", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.follower_error.contains("row \"d\""))
+        })
+        .await;
+        let s = move_status(b, "p2", "mv1").await.unwrap();
+        assert!(!s.copy_done, "{s:?}");
+    });
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// `moving` with the move's `from_epoch` set: the source's epoch when it began copying.
+fn moving_from(v1: &ClusterMap, version: u64, phase: Option<MovePhase>, epoch: u64) -> ClusterMap {
+    let mut m = moving(v1, version, phase);
+    for mv in &mut m.moves {
+        mv.from_epoch = epoch;
+    }
+    m
+}
+
+/// cli692's M1 on the design, tested (M-b on #2107): every follower commit goes through the
+/// target's gate. Fenced with a chunk in hand, the follower writes nothing; unfenced, the
+/// copy goes on.
+#[test]
+fn a_fenced_target_takes_no_copy_until_unfenced() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let (release, held) = tokio::sync::oneshot::channel::<()>();
+    super::super::range_follow::HOLD_COMMIT
+        .lock()
+        .unwrap()
+        .push(((t.dirs[1].clone(), 2), held));
+    let big = "x".repeat(700 << 10);
+    let mut before = None;
+    t.rt.block_on(async {
+        for row in ["c1", "c2", "c3", "c4"] {
+            try_put(c, row, &big).await.unwrap();
+        }
+        try_put(c, "d", "1").await.unwrap();
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        eventually_within(
+            Duration::from_secs(60),
+            "b holds its second chunk",
+            async || taken(&super::super::range_follow::HOLD_COMMIT, &t.dirs[1]),
+        )
+        .await;
+        client(b)
+            .await
+            .fence(PartitionRequest {
+                partition: "p2".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        before = records(&t.db_b);
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(records(&t.db_b), before, "nothing written while fenced");
+        let users = t.db_b.table("users").unwrap().open().unwrap();
+        assert!(users.get(b"d", "f", b"q").unwrap().is_none());
+        client(b)
+            .await
+            .unfence(PartitionRequest {
+                partition: "p2".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        eventually("b copies the range once unfenced", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+    });
+    let users = t.db_b.table("users").unwrap().open().unwrap();
+    assert!(users.get(b"d", "f", b"q").unwrap().is_some());
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// cli692's M4 (M-b on #2107), across a reopen: the target's progress rows sit in `moved`
+/// beside the gates' rows, and a target reopened mid-copy gates nothing by them: its own
+/// rows take writes and reads as before.
+#[test]
+fn a_target_reopened_mid_copy_gates_nothing_by_its_progress_rows() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let (stop_b, db_b) = {
+        let mut stops = t._stops;
+        let s = stops.remove(1);
+        ((s, stops), t.db_b.clone())
+    };
+    let (stop_b, rest) = stop_b;
+    t.rt.block_on(async {
+        try_put(c, "d", "1").await.unwrap();
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+    });
+    assert!(records(&db_b).is_some(), "progress rows written");
+    let _ = stop_b.send(());
+    t.rt.block_on(eventually("b to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", b))
+            .await
+            .is_err()
+    }));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", b)).unwrap();
+    let limits = crate::serve::server_tests::limits();
+    let (_stop_b2, _) = data_node_on(
+        &t.rt,
+        &t.dirs[1],
+        "b",
+        Some("p2"),
+        listener,
+        limits,
+        Some(db_b.clone()),
+    );
+    t.rt.block_on(async {
+        eventually("p2 takes its own rows' writes again", async || {
+            try_put(c, "zed", "2").await.is_ok()
+        })
+        .await;
+        assert_eq!(get_row(c, "zed").await.unwrap(), Some(b"2".to_vec()));
+    });
+    assert!(crate::serve::ranges::read_moved(&db_b).unwrap().is_empty());
+    drop(rest);
+    let _ = (t.db_a.close(), db_b.close());
+}
+
+/// cli692's S2 on #2107: a source that fails over mid-move (its epoch moves off the one the
+/// copy began at) stops the follower for good, and `MoveStatus.follower_error` says why.
+#[test]
+fn a_source_failed_over_mid_catch_up_stops_the_follower() {
+    let t = three();
+    let b = t.ports[1];
+    t.rt.block_on(async {
+        push(
+            &t.ports,
+            &moving_from(&t.v1, 2, Some(MovePhase::Copying), 1),
+        )
+        .await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+        push(
+            &t.ports,
+            &moving_from(&t.v1, 3, Some(MovePhase::CatchingUp), 1),
+        )
+        .await;
+        let mut moved = moving_from(&t.v1, 4, Some(MovePhase::CatchingUp), 1);
+        moved
+            .partitions
+            .iter_mut()
+            .filter(|p| p.id == "p1")
+            .for_each(|p| p.epoch = 2);
+        push(&t.ports, &moved).await;
+        eventually("b's follower stops, saying why", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.follower_error.contains("failed over"))
+        })
+        .await;
+    });
+    let _ = (t.db_a.close(), t.db_b.close());
+}
+
+/// cli692's S6 and the coordinator's D34 rule on #2108: a commit straddling the range's end
+/// brings only its in-range row, and two increments at one timestamp in two source commits
+/// both count, however the catch-up batches them.
+#[test]
+fn a_straddling_commit_brings_its_in_range_part_and_same_timestamp_increments_both_count() {
+    use super::several::{add_counter, counter};
+    use crate::serve::proto::{BatchRequest, Incr, RowKey, RowWrites, Write, write};
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let incr_at = |ts: u64| RowWrites {
+        row: Some(RowKey {
+            table: "users".into(),
+            row: b"d".to_vec().into(),
+        }),
+        writes: vec![Write {
+            op: Some(write::Op::Incr(Incr {
+                family: "n".into(),
+                qualifier: b"c".to_vec().into(),
+                timestamp: Some(ts),
+                delta: 1,
+            })),
+        }],
+    };
+    let base = t.rt.block_on(async {
+        add_counter(&t.ports, c).await;
+        client(c)
+            .await
+            .get_map(GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    let v = base.map_version;
+    t.rt.block_on(async {
+        push(&t.ports, &moving(&base, v + 1, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+        // During the catch-up: one commit with e (in) and g (out); then two increments of
+        // d at one timestamp, as two commits.
+        data(c)
+            .await
+            .batch(BatchRequest {
+                rows: vec![put_row("e", "5"), put_row("g", "5")],
+                durability: 0,
+            })
+            .await
+            .unwrap();
+        mutate(c, incr_at(1_000_000)).await;
+        mutate(c, incr_at(1_000_000)).await;
+        finish_move(&t, &base, v + 2).await;
+        eventually("p2 serves the range", async || {
+            get_row(c, "e")
+                .await
+                .is_ok_and(|v| v == Some(b"5".to_vec()))
+        })
+        .await;
+        assert_eq!(counter(c, "d").await, 2, "both increments");
+        assert_eq!(
+            get_row(c, "g").await.unwrap(),
+            Some(b"5".to_vec()),
+            "g is p1's"
+        );
+    });
+    let users = t.db_b.table("users").unwrap().open().unwrap();
+    assert!(
+        users.get(b"g", "f", b"q").unwrap().is_none(),
+        "g never reached p2"
+    );
+    let _ = (t.db_a.close(), t.db_b.close());
 }

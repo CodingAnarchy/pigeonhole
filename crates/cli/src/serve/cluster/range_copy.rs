@@ -33,6 +33,9 @@ const IDLE: Duration = Duration::from_secs(120);
 /// each family's sources per chunk is paid back over this much.
 const MIN_READ: u64 = 2 << 20;
 
+/// The most a chunk waits for the node's rate before it's answered.
+const MAX_WAIT: Duration = Duration::from_secs(2);
+
 /// Per family, what a chunk reads at least.
 const PER_FAMILY: u64 = 128 << 10;
 
@@ -49,6 +52,12 @@ pub(crate) struct Sources {
     max_followers: usize,
     /// Copies refused for a full `--max-move-followers` (a metric).
     pub(crate) refused: AtomicU64,
+    /// Moves whose target asked for a later chunk with no hold here (this node restarted,
+    /// or the target went idle): reported lapsed until the map drops them (cli692's S4 on
+    /// #2107).
+    lost: Mutex<std::collections::HashSet<String>>,
+    /// Whether the idle sweep runs ([`Sources::sweep_idle`]).
+    sweeping: std::sync::atomic::AtomicBool,
 }
 
 /// One move's copy served here.
@@ -79,6 +88,8 @@ impl Sources {
             cap,
             max_followers: max_followers.max(1),
             refused: AtomicU64::new(0),
+            lost: Mutex::default(),
+            sweeping: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -124,13 +135,61 @@ impl Sources {
         }
     }
 
-    /// Whether move `id`'s hold here lapsed (`MoveStatus.retention_lapsed`).
+    /// Whether move `id`'s hold here lapsed (`MoveStatus.retention_lapsed`): past its cap,
+    /// or lost (its target asked for a later chunk with none here).
     pub(crate) fn lapsed(&self, id: &str) -> bool {
         self.copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .is_some_and(|s| s.hold.lapsed())
+            || self
+                .lost
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(id)
+    }
+
+    /// Drops the copies whose target stopped asking ([`IDLE`]), between map installs too
+    /// (cli692's S3 on #2107): a target's node that died in a quiet cluster leaves no map
+    /// to release them. Runs while any copy is held here.
+    fn release_idle(&self) -> bool {
+        let now = Instant::now();
+        let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+        copies.retain(|_, s| now.duration_since(s.asked) < IDLE);
+        !copies.is_empty()
+    }
+
+    /// Starts the idle sweep if it isn't running: every quarter of [`IDLE`], until no copy
+    /// is held.
+    fn sweep_idle(self: &std::sync::Arc<Self>) {
+        if self.sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.sweeping.store(false, Ordering::Release);
+            return;
+        };
+        let me = std::sync::Arc::downgrade(self);
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(IDLE / 4).await;
+                let Some(me) = me.upgrade() else { return };
+                if !me.release_idle() {
+                    me.sweeping.store(false, Ordering::Release);
+                    // A copy begun since the check starts it again.
+                    if me
+                        .copies
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_empty()
+                        || me.sweeping.swap(true, Ordering::AcqRel)
+                    {
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     /// Drops the holds and slots of copies this node no longer serves: the move left
@@ -162,11 +221,15 @@ impl Sources {
                 });
                 live && now.duration_since(s.asked) < IDLE
             });
+        self.lost
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id| map.moves.iter().any(|m| &m.id == id));
     }
 
     /// One chunk of move `r.move_id`'s copy from `partition` (this node's).
     pub(crate) async fn serve(
-        &self,
+        self: &std::sync::Arc<Self>,
         cluster: &Cluster,
         partition: &str,
         r: RangeCopyRequest,
@@ -216,6 +279,11 @@ impl Sources {
                 format!("partition {partition:?} isn't served here"),
             ));
         };
+        // cli692's S1 on #2107: a stale owner whose lease ran out serves nothing, before or
+        // after its read.
+        if let Some(g) = service.gate() {
+            g.serving()?;
+        }
         let db = service.part()?.db.clone();
         let table = db.table(&m.table)?.open()?;
         let bound = |k: &Option<proto::SplitKey>| {
@@ -231,8 +299,29 @@ impl Sources {
         };
         let first = r.after.is_empty();
         let token = if first {
-            self.begin(&m.id, partition, &db, &table)?
+            let token = self.begin(&m.id, partition, &db, &table)?;
+            self.sweep_idle();
+            token
         } else {
+            // A later chunk with no hold here (cli692's S4 on #2107): this node restarted,
+            // or the target was idle past [`IDLE`]. The source's history from the copy's
+            // first token may be gone, so the move can't catch up: refuse, and report it.
+            let held = self
+                .copies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&m.id);
+            if !held {
+                self.lost
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(m.id.clone());
+                return Err(ApiError::failed_precondition(format!(
+                    "range move {:?}'s source holds no feed retention for it (the source's node \
+                     restarted, or its target stopped asking): abort the move",
+                    m.id
+                )));
+            }
             Vec::new()
         };
         if let Some(s) = self
@@ -259,9 +348,14 @@ impl Sources {
             .iter()
             .map(|c| (c.row.len() + c.qualifier.len() + c.stored.len()) as u64)
             .sum();
+        if let Some(g) = service.gate() {
+            g.serving()?;
+        }
+        // The node's rate: at most 2 s here, so a slow rate never outlasts the target's call;
+        // the bucket keeps the rest owed, and the next chunk waits it out (cli692's nit).
         let wait = self.take(bytes);
         if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+            tokio::time::sleep(wait.min(MAX_WAIT)).await;
         }
         Ok(RangeCopyResponse {
             cells: chunk
@@ -387,6 +481,19 @@ mod tests {
         );
         drop(s);
         db.close().unwrap();
+    }
+
+    #[test]
+    fn the_nodes_moves_share_one_bucket() {
+        // cli692's throttle: `--move-rate-bytes` is the node's, across its moves. A second's
+        // worth taken by one leaves the next read, of any move, a second's wait.
+        let s = Sources::new(1 << 20, u64::MAX, 2);
+        assert_eq!(s.take(1 << 20), Duration::ZERO, "a full bucket");
+        let wait = s.take(1 << 20);
+        assert!(
+            wait > Duration::from_millis(900) && wait <= Duration::from_secs(1),
+            "{wait:?}"
+        );
     }
 
     #[test]

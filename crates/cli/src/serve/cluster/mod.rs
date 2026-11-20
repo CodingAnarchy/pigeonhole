@@ -1598,6 +1598,12 @@ impl Node {
                             s.copy_done = p.copy_done.load(std::sync::atomic::Ordering::Relaxed);
                             s.source_applied_seqno =
                                 p.applied.load(std::sync::atomic::Ordering::Acquire);
+                            s.follower_error = p
+                                .failed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                                .unwrap_or_default();
                         }
                     }
                 }
