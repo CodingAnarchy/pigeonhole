@@ -174,7 +174,6 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("the move or relocation finishes within 2 minutes")
 }
 
-/// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
 /// A stopped node's port, held for its restart: bound but not listening, so a parallel
 /// test's node can't take it in between (it would fail the restart with AddrInUse, as on
 /// #2100's macOS run), while a dial of it is still refused, as a stopped node's is. Taken as
@@ -213,6 +212,7 @@ impl HeldPort {
     }
 }
 
+/// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
 async fn eventually(what: &str, cond: impl AsyncFnMut() -> bool) {
     eventually_within(Duration::from_secs(5), what, cond).await;
 }
