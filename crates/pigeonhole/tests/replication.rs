@@ -1211,7 +1211,8 @@ fn a_range_drop_event_round_trips_and_a_flagged_one_is_refused() {
         let e = ReplicatedEvent::decode(&v3).unwrap_err();
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert!(
-            e.to_string().contains("a range drop in a version other than the plain one"),
+            e.to_string()
+                .contains("a range drop in a version other than the plain one"),
             "{e}"
         );
     }

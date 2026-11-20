@@ -915,3 +915,175 @@ fn a_target_restarted_between_chunks_and_in_its_catch_up_resumes_and_counts_once
     });
     let _ = (db_a.close(), db_b.close());
 }
+
+/// feed1248's G1 and cli692's M3 (D331 PR 4b): a range move's catch-up stream is served only
+/// raw, only by the source's owner, only for exactly a live move's bounds, and only from a
+/// token. A range bound on any other forwarded subscription is refused.
+#[test]
+fn a_raw_catch_up_stream_is_served_only_for_a_live_moves_exact_range() {
+    use crate::serve::proto::{ForwardSubscribeRequest, SubscribeRequest, subscribe_request};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    let token = db_a
+        .table("users")
+        .unwrap()
+        .open()
+        .unwrap()
+        .feed()
+        .open()
+        .unwrap()
+        .token()
+        .as_bytes()
+        .to_vec();
+    let req =
+        |raw: bool, end: &str, start: Option<subscribe_request::Start>| ForwardSubscribeRequest {
+            partition: "p1".into(),
+            request: Some(SubscribeRequest {
+                tables: vec!["users".into()],
+                start,
+                ..Default::default()
+            }),
+            range_start: Some(text("c")),
+            range_end: Some(text(end)),
+            raw,
+            ..Default::default()
+        };
+    let from_token = || Some(subscribe_request::Start::Resume(token.clone().into()));
+    rt.block_on(async {
+        eventually("p1 takes writes", async || {
+            try_put(c, "d", "0").await.is_ok()
+        })
+        .await;
+        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        let refused = |port: u16, r: ForwardSubscribeRequest| async move {
+            client(port)
+                .await
+                .forward_subscribe(r)
+                .await
+                .err()
+                .map(|e| code(&e).to_owned())
+        };
+        assert_eq!(
+            refused(a, req(false, "f", from_token())).await.as_deref(),
+            Some("InvalidArgument"),
+            "a range bound without raw"
+        );
+        assert_eq!(
+            refused(a, req(true, "g", from_token())).await.as_deref(),
+            Some("WrongPartition"),
+            "bounds no move has"
+        );
+        assert_eq!(
+            refused(b, req(true, "f", from_token())).await.as_deref(),
+            Some("WrongPartition"),
+            "not the source's owner"
+        );
+        assert_eq!(
+            refused(
+                a,
+                req(true, "f", Some(subscribe_request::Start::FromOldest(true)))
+            )
+            .await
+            .as_deref(),
+            Some("InvalidArgument"),
+            "not from a token"
+        );
+        assert_eq!(
+            refused(a, req(true, "f", from_token())).await,
+            None,
+            "the move's own stream"
+        );
+    });
+    let _ = (db_a.close(), db_b.close());
+}
+
+/// simp724's M2 (D331 PR 4b): a map that takes the move away stops its follower between
+/// commits. Held after its second chunk arrived and before its first commit, then released
+/// after that map: it commits nothing more, and its progress stays at the first chunk.
+#[test]
+fn a_follower_stopped_mid_copy_commits_nothing_more() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    let (b, c) = (ports[1], ports[2]);
+    let (release, held) = tokio::sync::oneshot::channel();
+    super::super::range_follow::HOLD_COMMIT
+        .lock()
+        .unwrap()
+        .push(((dirs[1].clone(), 1), held));
+    rt.block_on(async {
+        eventually("p1 takes writes", async || {
+            try_put(c, "c", "0").await.is_ok()
+        })
+        .await;
+        let big = "x".repeat(700 << 10);
+        for row in ["c1", "c2", "c3", "c4"] {
+            try_put(c, row, &big).await.unwrap();
+        }
+        try_put(c, "d", "1").await.unwrap();
+        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        eventually("b copies the first chunk", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copied_bytes > 0)
+        })
+        .await;
+        // The move goes from the map (an abort at COPYING) while the chunk is in hand, then
+        // the follower wakes: only its own stop keeps it from committing.
+        let mut aborted = v1.clone();
+        aborted.map_version = 3;
+        push(&ports, &aborted).await;
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+    let users = db_b.table("users").unwrap().open().unwrap();
+    assert!(
+        users.get(b"d", "f", b"q").unwrap().is_none(),
+        "the second chunk wasn't written"
+    );
+    let progress = db_b
+        .table(super::super::identity::TABLE)
+        .unwrap()
+        .open()
+        .unwrap();
+    let n = progress
+        .get(b"copy/mv1", "moved", b"n")
+        .unwrap()
+        .map(|c| c.value().to_vec());
+    assert_eq!(n.as_deref(), Some(&b"1"[..]), "one chunk recorded");
+    let _ = (db_a.close(), db_b.close());
+}

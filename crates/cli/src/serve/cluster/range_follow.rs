@@ -392,7 +392,7 @@ impl Follower {
             max_bytes: CHUNK_BYTES,
         };
         #[cfg(test)]
-        hold_chunk(&cx.shared, head.n, &mut self.stop).await;
+        hold_at(&HOLD_CHUNK, &cx.shared, head.n, &mut self.stop).await;
         let resp = ask_chunk(&cx.shared, &cx.m.from, req).await?;
         let first = if head.first.is_empty() {
             if resp.token.is_empty() {
@@ -421,6 +421,8 @@ impl Follower {
                 .collect::<Result<_, ApiError>>()?,
             next: resp.next.map(|n| n.to_vec()),
         };
+        #[cfg(test)]
+        hold_at(&HOLD_COMMIT, &cx.shared, head.n, &mut self.stop).await;
         let bytes: usize = chunk.cells.iter().map(cell_bytes).sum();
         let commits = sub_commits(&chunk);
         if chunk.cells.iter().any(|c| c.kind == ChangeKind::Merge) && bytes > MERGE_CHUNK_CAP {
@@ -679,6 +681,11 @@ impl HeadWrite {
 #[cfg(test)]
 pub(crate) static HOLD_CHUNK: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
 
+/// [`HOLD_CHUNK`]'s seam after the chunk arrived and before its first commit: a stop that
+/// comes while it waits is the follower's own to honour, as the source already served it.
+#[cfg(test)]
+pub(crate) static HOLD_COMMIT: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
+
 /// [`HOLD_CHUNK`]'s entry: the node's cluster directory and the chunk's number, and the
 /// release.
 #[cfg(test)]
@@ -688,12 +695,17 @@ pub(crate) type HeldChunk = (
 );
 
 #[cfg(test)]
-async fn hold_chunk(shared: &Shared, n: u64, stop: &mut watch::Receiver<bool>) {
+async fn hold_at(
+    seam: &Mutex<Vec<HeldChunk>>,
+    shared: &Shared,
+    n: u64,
+    stop: &mut watch::Receiver<bool>,
+) {
     let Some(cluster) = shared.router.cluster.as_ref() else {
         return;
     };
     let wait = {
-        let mut armed = HOLD_CHUNK.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut armed = seam.lock().unwrap_or_else(PoisonError::into_inner);
         armed
             .iter()
             .position(|((d, k), _)| d == cluster.node.dir() && *k == n)
