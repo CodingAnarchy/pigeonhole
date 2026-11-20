@@ -1046,8 +1046,9 @@ fn a_raw_catch_up_stream_is_served_only_for_a_live_moves_exact_range() {
 }
 
 /// simp724's M2 (D331 PR 4b): a map that takes the move away stops its follower between
-/// commits. Held after its second chunk arrived and before its first commit, then released
-/// after that map: it commits nothing more, and its records stay the first chunk's.
+/// commits. Held after its second chunk arrived and before its first commit, and woken
+/// only by that map's stop: it commits nothing more, and its records stay the first
+/// chunk's.
 #[test]
 fn a_follower_stopped_mid_copy_commits_nothing_more() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1071,7 +1072,10 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
     let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
     let (b, c) = (ports[1], ports[2]);
     let mut recorded_before = None;
-    let (release, held) = tokio::sync::oneshot::channel();
+    // Never released: only the follower's stop wakes it from the hold. The sender must live
+    // to the test's end: a bare `_` would drop it at once, which wakes the hold too, with no
+    // stop at all (cli692 on #2115).
+    let (_held_for_good, held) = tokio::sync::oneshot::channel::<()>();
     super::super::range_follow::HOLD_COMMIT
         .lock()
         .unwrap()
@@ -1087,19 +1091,25 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         }
         try_put(c, "d", "1").await.unwrap();
         push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
-        eventually("b copies the first chunk", async || {
-            move_status(b, "p2", "mv1")
-                .await
-                .is_some_and(|s| s.copied_bytes > 0)
-        })
+        // The follower holds its second chunk: the first chunk's commits are all in (#2107's
+        // Windows flake: a count read while they still landed moved after it).
+        eventually_within(
+            Duration::from_secs(60),
+            "b holds its second chunk",
+            async || taken(&super::super::range_follow::HOLD_COMMIT, &dirs[1]),
+        )
         .await;
-        // The move goes from the map (an abort at COPYING) while the chunk is in hand, then
-        // the follower wakes: only its own stop keeps it from committing.
+        // The move goes from the map (an abort at COPYING) while the chunk is in hand. The
+        // hold is never released, so only the stop wakes the follower, and its own check
+        // must keep it from committing.
         let mut aborted = v1.clone();
         aborted.map_version = 3;
         push(&ports, &aborted).await;
+        eventually("b takes the abort", async || {
+            move_status(b, "p2", "mv1").await.is_none()
+        })
+        .await;
         recorded_before = records(&db_b);
-        let _ = release.send(());
         tokio::time::sleep(Duration::from_millis(500)).await;
     });
     let users = db_b.table("users").unwrap().open().unwrap();
