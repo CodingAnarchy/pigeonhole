@@ -1,2 +1,0 @@
-### Changed
-- `phdb serve`: under the thread mask, `ReadRow` pages within the default 1 MiB budget run on threads of their own (`phdb-serve-lite`, as many as the network threads) on the network threads' CPUs, the shards' SMT siblings included, instead of the blocking threads, which stay on the free cores. A page that finds them all busy runs on the blocking threads, and larger pages and every heavy call stay there (#1880).

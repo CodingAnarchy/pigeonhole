@@ -1,2 +1,0 @@
-### Added
-- `phdb serve` clusters: a `MultiGet`, `Scan`, `Vectors.Nearest` or `Graph.Traverse` sent with `x-pigeonhole-read-replica-max-lag-ms: N` takes each partition's part from a replica fresh within N ms, then the owner (D328, #1851). A scan checks the bound on every page, and if a replica falls behind partway, the partition's pages continue from the last page's position on the next replica or the owner, with no row skipped or repeated. Each scan page's `served_seqno` is the seqno it was read at.

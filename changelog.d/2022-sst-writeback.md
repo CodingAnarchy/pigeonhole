@@ -1,2 +1,0 @@
-### Fixed
-- Under sustained `GroupSync` writes on Linux, put latency no longer climbs through a long session (p99.9 to 30–50 ms after several minutes at 55K puts/s on the reference machine). An SST's output now starts its writeback as it's written, so a flush or compaction no longer sends a whole output to the disk at once, ahead of the WAL's small synced writes (D334, #1991). There's no change to durability or the file format.

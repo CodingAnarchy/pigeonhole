@@ -1,2 +1,0 @@
-### Security
-- **`Transactions.Outcome` on a spanning transaction answers only its own client** (#2077). While the transaction's session or its record lasts, another token's `Outcome` on its id gets `NotFound`. The home reads nothing further for it and records nothing: before this, it could read the outcome and parts, or make the home record an abort over a live transaction. A client's id dated in the future is `NotFound`, with nothing recorded. Once the record is gone, the decided outcome is read by id alone, as before.
