@@ -467,11 +467,10 @@ impl Sessions {
 
     /// What session `id` is now, without taking it (D329's `Outcome` and resolver): open or
     /// committing (`Live`), its recorded outcome, or gone. A spanning id is looked up by its
-    /// exact text, whoever its client; a plain one only for `principal`.
-    /// `principal`: the client asking, whose own entry alone answers; `None` for the node's
-    /// own call (D329's resolver), which a spanning entry answers whoever its client is. A
-    /// spanning entry of another principal is [`Peek::Foreign`] (#2077); a plain one,
-    /// [`Peek::Gone`], as before.
+    /// exact text. `principal` is the client asking, whose own entry alone answers: another
+    /// principal's spanning entry is [`Peek::Foreign`] (#2077), and its plain one
+    /// [`Peek::Gone`]. `None` is the node's own call (the resolver), which a spanning entry
+    /// answers whoever its client is.
     pub(crate) fn peek(&self, id: &str, principal: Option<Principal>) -> Peek {
         let Some((key, xid)) = self.parse_txn(id) else {
             return Peek::Gone;
