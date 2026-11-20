@@ -84,6 +84,9 @@ pub(crate) struct Progress {
     pub done: AtomicBool,
     /// Why it stopped for good, if it did (the move must be aborted).
     pub failed: Mutex<Option<String>>,
+    /// What it waits for before it copies (`MoveStatus.follower_waiting`, D331 PR 5): an
+    /// earlier move's drop of an overlapping range here. Empty when it waits for nothing.
+    pub waiting: Mutex<String>,
 }
 
 /// The range followers this node runs, by move id.
@@ -195,6 +198,28 @@ impl Followers {
             .map(|(_, t)| t)
             .collect();
         for task in stopped.into_iter().map(|r| r.task).chain(earlier) {
+            let _ = task.await;
+        }
+    }
+
+    /// Waits until move `id`'s stopped follower here has ended (D331 PR 5, simp724's M2):
+    /// an abort's drop of its range runs after its last commit. A follower still wanted
+    /// (the map still gives it the move) isn't waited for.
+    pub(crate) async fn join(&self, id: &str) {
+        if self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(id)
+        {
+            return;
+        }
+        let task = self
+            .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        if let Some(task) = task {
             let _ = task.await;
         }
     }
@@ -405,6 +430,29 @@ impl Follower {
             .copied_bytes
             .store(head.bytes, Ordering::Relaxed);
         if !head.done {
+            if head.n == 0 && head.partial.is_none() {
+                // D331 PR 5 (cli692's Must 4): an earlier move's drop of an overlapping range
+                // here runs to its end before this copy begins, said in the status.
+                let waiting = super::range_drop::pending_overlap(&cx.db, &cx.m)
+                    .map_err(|e| Failed::Retry(ApiError::internal(e)))?;
+                *self
+                    .progress
+                    .waiting
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = waiting
+                    .as_ref()
+                    .map(|id| {
+                        format!("waiting for move {id:?}'s drop of an overlapping range here")
+                    })
+                    .unwrap_or_default();
+                if let Some(id) = waiting {
+                    return Err(Failed::Retry(ApiError::partition_unavailable(format!(
+                        "waiting for move {id:?}'s drop of an overlapping range here"
+                    ))));
+                }
+                // The range, so a reconcile finds it after the map dropped the move.
+                record_range(&cx.db, &cx.m)?;
+            }
             self.copy_chunk(&cx, &head).await?;
             return Ok(Step::More);
         }
@@ -927,6 +975,79 @@ fn read_head(db: &Pigeonhole, id: &str) -> Result<Head, ApiError> {
             .filter(|p| !p.is_empty())
             .map(|p| p[1..].to_vec()),
     })
+}
+
+/// Records move `m`'s table and range in its copy's head row (D331 PR 5), unless there: a
+/// reconcile reads them once the map no longer has the move.
+fn record_range(db: &Pigeonhole, m: &RangeMove) -> Result<(), ApiError> {
+    let t = progress_table(db)?;
+    let row = [b"copy/".as_slice(), m.id.as_bytes()].concat();
+    if t.get(&row, FAMILY, b"table")?.is_some() {
+        return Ok(());
+    }
+    let (start, end) = super::map::move_range(m).map_err(ApiError::internal)?;
+    let mut w = t
+        .mutate(&row)
+        .put(FAMILY, b"table", m.table.as_bytes())
+        .put(FAMILY, b"start", &start);
+    if let Some(end) = &end {
+        w = w.put(FAMILY, b"end", end);
+    }
+    w.commit()?;
+    Ok(())
+}
+
+/// A copy's table and range, as its head row records them.
+pub(crate) type CopyRange = (String, Vec<u8>, Option<Vec<u8>>);
+
+/// The copies whose progress `db` holds, by move id, each with its range when its head
+/// records it (D331 PR 5).
+pub(crate) fn copies(db: &Pigeonhole) -> Result<Vec<(String, Option<CopyRange>)>, ApiError> {
+    let t = db.table(identity::TABLE)?.open()?;
+    if !t.families().contains(&FAMILY) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for row in t.scan_prefix(b"copy/").family(FAMILY).iter()? {
+        let row = row?;
+        let id = &row.key()[b"copy/".len()..];
+        // A head row only: a record's key is `copy/<id>/<n>`.
+        if id.contains(&b'/') {
+            continue;
+        }
+        let cell = |q: &[u8]| row.get(FAMILY, q).map(|c| c.value().to_vec());
+        let range = match (cell(b"table"), cell(b"start")) {
+            (Some(table), Some(start)) => Some((
+                String::from_utf8_lossy(&table).into_owned(),
+                start,
+                cell(b"end"),
+            )),
+            _ => None,
+        };
+        out.push((String::from_utf8_lossy(id).into_owned(), range));
+    }
+    Ok(out)
+}
+
+/// Deletes move `id`'s progress rows (`copy/<id>`, its records and `follow/<id>`).
+pub(crate) fn prune(db: &Pigeonhole, id: &str) -> Result<(), ApiError> {
+    let t = progress_table(db)?;
+    let mut rows = vec![
+        [b"copy/".as_slice(), id.as_bytes()].concat(),
+        [b"follow/".as_slice(), id.as_bytes()].concat(),
+    ];
+    let prefix = format!("copy/{id}/").into_bytes();
+    for row in t.scan_prefix(&prefix).family(FAMILY).iter()? {
+        rows.push(row?.key().to_vec());
+    }
+    for chunk in rows.chunks(256) {
+        let mut b = db.write_batch();
+        for r in chunk {
+            b.delete_row(&t, r);
+        }
+        b.commit()?;
+    }
+    Ok(())
 }
 
 /// A copy's chunks, in row order: each one's end row (`None`: to the range's end) and

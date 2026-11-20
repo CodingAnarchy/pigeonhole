@@ -33,6 +33,7 @@ pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod promote;
 pub(crate) mod range_copy;
+pub(crate) mod range_drop;
 pub(crate) mod range_feed;
 pub(crate) mod range_fence;
 pub(crate) mod range_follow;

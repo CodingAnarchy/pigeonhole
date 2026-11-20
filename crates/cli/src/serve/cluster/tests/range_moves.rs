@@ -173,12 +173,15 @@ fn a_range_move_gates_each_phase_on_its_source_and_its_target() {
         ("mv1", &b"c"[..], Some(&b"f"[..]))
     );
     assert_eq!(moved[0].version, 5);
-    // p1's copy of the range wasn't written after the fence.
+    // p1's copy of the range wasn't written after the fence, and CLEANING dropped it (D331
+    // PR 5); the rest of p1 stays.
     let t = db_a.table("users").unwrap().open().unwrap();
-    assert_eq!(
-        t.get(b"d", "f", b"q").unwrap().map(|c| c.value().to_vec()),
-        Some(b"2".to_vec())
-    );
+    let value = |row: &[u8]| t.get(row, "f", b"q").unwrap().map(|c| c.value().to_vec());
+    assert_ne!(value(b"d"), Some(b"3".to_vec()), "a write after the fence");
+    rt.block_on(eventually("p1 drops the moved range", async || {
+        value(b"d").is_none()
+    }));
+    assert_eq!(value(b"alice"), Some(b"2".to_vec()));
     let _ = db_a.close();
 }
 
@@ -1124,7 +1127,13 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
         users.get(b"d", "f", b"q").unwrap().is_none(),
         "the second chunk wasn't written"
     );
-    assert_eq!(records(&db_b), recorded_before, "no record after the stop");
+    // No record after the stop: the first chunk's, or none once the abort's reconcile
+    // (D331 PR 5) pruned them.
+    let after = records(&db_b);
+    assert!(
+        after.is_none() || after == recorded_before,
+        "a record after the stop"
+    );
     assert!(recorded_before.is_some(), "the first chunk's records");
     let _ = (db_a.close(), db_b.close());
 }
@@ -1202,7 +1211,11 @@ fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
         users.get(b"d", "f", b"q").unwrap().is_none(),
         "the second chunk wasn't written"
     );
-    assert_eq!(records(&db_b), recorded_before, "no record after the stop");
+    let after = records(&db_b);
+    assert!(
+        after.is_none() || after == recorded_before,
+        "a record after the stop"
+    );
     assert!(recorded_before.is_some(), "the first chunk's records");
     assert!(
         !crate::serve::ranges::read_serving(&db_b)
@@ -1307,6 +1320,158 @@ fn a_fenced_source_reports_its_fence_seqno_past_every_range_write() {
             Some(seqno)
         );
     });
+}
+
+/// D331 PR 5: at CLEANING the source drops the moved range from a drop row, keeps the rest
+/// of the partition, says so (`dropped`), and clears the row.
+#[test]
+fn a_cleaning_source_drops_the_moved_range_and_says_so() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        for row in ["c1", "d", "e9"] {
+            try_put(c, row, "v").await.unwrap();
+        }
+        try_put(c, "a", "kept").await.unwrap();
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        finish_move(&t, &t.v1, 3).await;
+        eventually("a drops the moved range", async || {
+            move_status(a, "p1", "mv1").await.is_some_and(|s| s.dropped)
+        })
+        .await;
+    });
+    let users = t.db_a.table("users").unwrap().open().unwrap();
+    for row in [&b"c1"[..], b"d", b"e9"] {
+        assert!(
+            users.get(row, "f", b"q").unwrap().is_none(),
+            "{row:?} left on S"
+        );
+    }
+    assert!(
+        users.get(b"a", "f", b"q").unwrap().is_some(),
+        "outside the range"
+    );
+    assert!(
+        super::super::range_drop::read_pending(&t.db_a)
+            .unwrap()
+            .is_empty()
+    );
+    // T serves it.
+    let target = t.db_b.table("users").unwrap().open().unwrap();
+    assert!(target.get(b"d", "f", b"q").unwrap().is_some());
+}
+
+/// simp724's M2 on the D331 PR 5 design: a target taking an aborting map stops its
+/// follower, drops what it copied of the range, prunes its progress rows and says so; a
+/// later move of the same range copies afresh.
+#[test]
+fn an_aborting_moves_target_drops_its_copy_and_a_new_move_copies_afresh() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    t.rt.block_on(async {
+        for row in ["c1", "d", "e9"] {
+            try_put(c, row, "v").await.unwrap();
+        }
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+        push(&t.ports, &moving(&t.v1, 3, Some(MovePhase::Aborting))).await;
+        eventually("b drops its copy", async || {
+            move_status(b, "p2", "mv1").await.is_some_and(|s| s.dropped)
+        })
+        .await;
+    });
+    let users = t.db_b.table("users").unwrap().open().unwrap();
+    assert!(
+        users.get(b"d", "f", b"q").unwrap().is_none(),
+        "the copy is dropped"
+    );
+    assert!(
+        super::super::range_follow::copies(&t.db_b)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        super::super::range_drop::read_pending(&t.db_b)
+            .unwrap()
+            .is_empty()
+    );
+    // The record goes; a new move of the range copies it again, whole.
+    t.rt.block_on(async {
+        let mut v4 = t.v1.clone();
+        v4.map_version = 4;
+        push(&t.ports, &v4).await;
+        let mut again = moving(&t.v1, 5, Some(MovePhase::Copying));
+        again.moves[0].id = "mv2".into();
+        push(&t.ports, &again).await;
+        eventually("b copies the range again", async || {
+            move_status(b, "p2", "mv2")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+    });
+    assert!(users.get(b"d", "f", b"q").unwrap().is_some());
+}
+
+/// simp724's M2: a target down when the abort lands (the map it comes back to has no
+/// record) drops its copy at open, from its own progress rows, before it serves.
+#[test]
+fn a_target_down_when_its_move_aborted_drops_its_copy_at_open() {
+    let t = three();
+    let (b, c) = (t.ports[1], t.ports[2]);
+    let Three {
+        rt,
+        v1,
+        ports,
+        dirs,
+        db_b,
+        mut _stops,
+        ..
+    } = t;
+    rt.block_on(async {
+        for row in ["c1", "d"] {
+            try_put(c, row, "v").await.unwrap();
+        }
+        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        eventually("b copies the range", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.copy_done)
+        })
+        .await;
+    });
+    let _ = _stops.swap_remove(1).send(());
+    rt.block_on(eventually("b to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", b))
+            .await
+            .is_err()
+    }));
+    // The abort's maps landed while b was down: the last has no record.
+    let mut gone = v1.clone();
+    gone.map_version = 4;
+    super::super::write_map(&dirs[1], &super::super::map::canonical_json(&gone)).unwrap();
+    let listener = HeldPort::take(b).listen();
+    let (_stop, _) = data_node_on(
+        &rt,
+        &dirs[1],
+        "b",
+        Some("p2"),
+        listener,
+        crate::serve::server_tests::limits(),
+        Some(db_b.clone()),
+    );
+    rt.block_on(eventually("b drops the copy", async || {
+        super::super::range_follow::copies(&db_b).is_ok_and(|c| c.is_empty())
+            && super::super::range_drop::read_pending(&db_b).is_ok_and(|p| p.is_empty())
+    }));
+    let users = db_b.table("users").unwrap().open().unwrap();
+    assert!(users.get(b"d", "f", b"q").unwrap().is_none());
+    let _ = db_b.close();
 }
 
 /// `row`'s puts of `cells` values of `bytes` each, qualifiers `q0`.. (one commit).
@@ -1517,14 +1682,34 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
             async || taken(&super::super::range_follow::HOLD_ROW, &t.dirs[1]),
         )
         .await;
-        let mut aborted = t.v1.clone();
-        aborted.map_version = 3;
-        push(&t.ports, &aborted).await;
-        let _ = release.send(());
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut back = t.v1.clone();
-        back.map_version = 3;
-        push(&t.ports, &moving(&back, 4, Some(MovePhase::Copying))).await;
+    });
+    // b's server stops inside the row, past the 1 MiB a stop finishes (D331 PR 5: an abort
+    // would drop the copy, so a restart under the same record leaves the row partial).
+    let Three {
+        rt,
+        dirs,
+        db_a,
+        db_b,
+        mut _stops,
+        ..
+    } = t;
+    let _ = _stops.swap_remove(1).send(());
+    let _ = release.send(());
+    rt.block_on(eventually("b to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", b))
+            .await
+            .is_err()
+    }));
+    let (_stop_b2, _) = data_node_on(
+        &rt,
+        &dirs[1],
+        "b",
+        Some("p2"),
+        HeldPort::take(b).listen(),
+        crate::serve::server_tests::limits(),
+        Some(db_b.clone()),
+    );
+    rt.block_on(async {
         eventually("b's follower stops, naming the row", async || {
             move_status(b, "p2", "mv1")
                 .await
@@ -1534,7 +1719,7 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
         let s = move_status(b, "p2", "mv1").await.unwrap();
         assert!(!s.copy_done, "{s:?}");
     });
-    let _ = (t.db_a.close(), t.db_b.close());
+    let _ = (c, db_a.close(), db_b.close());
 }
 
 /// `moving` with the move's `from_epoch` set: the source's epoch when it began copying.

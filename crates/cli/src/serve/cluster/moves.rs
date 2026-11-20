@@ -133,7 +133,13 @@ impl Node {
         gate.ranges()
             .load_rows(ranges::read_moved(db)?, ranges::read_serving(db)?);
         let raised = match self.get_map() {
-            Ok(map) => self.settle(gate, id, db, &map)?,
+            Ok(map) => {
+                // D331 PR 5: its drop rows (an abort's reconcile, a cleanup) before it serves.
+                if let Some(drops) = self.range_drops() {
+                    drops.write_rows(&map, id, db)?;
+                }
+                self.settle(gate, id, db, &map)?
+            }
             Err(_) => false,
         };
         join();
@@ -141,7 +147,8 @@ impl Node {
         if raised {
             self.ask_after_raise();
         }
-        // D331 PR 5: a fence it holds as a move's source reports its seqno.
+        // D331 PR 5: a fence it holds as a move's source reports its seqno, and its drops
+        // run (their rows written above, before it served).
         if let (Some(shared), Ok(map), Some((gate, _))) = (
             self.server.get().and_then(|o| o.shared.upgrade()),
             self.get_map(),
@@ -151,8 +158,21 @@ impl Node {
             cluster
                 .range_fences
                 .sync(&self.me, &map, id, &gate, db, shared.limits.request_timeout);
+            cluster
+                .range_drops
+                .start(db, Some(&cluster.range_follows))?;
         }
         Ok(())
+    }
+
+    /// The range moves' drops this node's partitions run (D331 PR 5), once it serves.
+    pub(super) fn range_drops(&self) -> Option<std::sync::Arc<super::range_drop::Drops>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        shared
+            .router
+            .cluster
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.range_drops))
     }
 
     /// The range moves' fences this node's partitions hold as their source (D331 PR 5), once
@@ -186,7 +206,25 @@ impl Node {
         let (Some(cluster), Ok(map)) = (shared.router.cluster.as_ref(), self.get_map()) else {
             return;
         };
+        // D331 PR 5: the drops a restart owes (a target down when its move aborted, a
+        // cleanup cut short), their rows before the followers start (cli692's Must 4).
+        let parts: Vec<_> = cluster
+            .parts
+            .load()
+            .iter()
+            .filter_map(|(id, service)| Some((id.clone(), service.part().ok()?.db.clone())))
+            .collect();
+        for (id, db) in &parts {
+            if let Err(e) = cluster.range_drops.write_rows(&map, id, db) {
+                eprintln!("phdb serve: partition {id} couldn't record its range drops: {e}");
+            }
+        }
         cluster.range_follows.sync(&map, &self.id, &shared);
+        for (id, db) in &parts {
+            if let Err(e) = cluster.range_drops.start(db, Some(&cluster.range_follows)) {
+                eprintln!("phdb serve: partition {id} couldn't start its range drops: {e}");
+            }
+        }
     }
 
     /// The range moves this node follows as a target (D331 PR 4b), once it serves.
@@ -211,6 +249,20 @@ impl Node {
         // D331 PR 4b: copies this node no longer serves as their source let go, and the
         // moves it follows as their target start or stop (M2).
         cluster.range_copies.release_gone(map, &self.id);
+        // D331 PR 5: the drop rows the map calls for, before the followers take it (a new
+        // move's follower sees an overlapping drop's row: cli692's Must 4).
+        for (id, service) in cluster.parts.load().iter() {
+            let Ok(part) = service.part() else {
+                continue;
+            };
+            if let Err(e) = cluster.range_drops.write_rows(map, id, &part.db) {
+                eprintln!(
+                    "phdb serve: partition {id} couldn't record map version {}'s range drops: \
+                     {e}; the next map or its next open does",
+                    map.map_version
+                );
+            }
+        }
         cluster.range_follows.sync(map, &self.id, &shared);
         cluster.range_fences.forget_gone(map);
         let mut raised = false;
@@ -228,6 +280,13 @@ impl Node {
                 &part.db,
                 shared.limits.request_timeout,
             );
+            // And its drops run, after the followers stopped (a target's joins its own).
+            if let Err(e) = cluster
+                .range_drops
+                .start(&part.db, Some(&cluster.range_follows))
+            {
+                eprintln!("phdb serve: partition {id} couldn't start its range drops: {e}");
+            }
             match settled {
                 Ok(up) => raised |= up,
                 Err(e) => eprintln!(

@@ -232,10 +232,15 @@ impl Node {
                         s.retention_lapsed = copies.lapsed(&s.id);
                     }
                 }
-                // PR 5: a source's fence seqno, once its fence drained.
+                // PR 5: a source's fence seqno, once its fence drained; either side's drop.
                 if let Some(fences) = self.range_fences() {
                     for s in lp.moves.iter_mut().filter(|s| s.source) {
                         s.fence_seqno = fences.seqno(&s.id);
+                    }
+                }
+                if let Some(drops) = self.range_drops() {
+                    for s in &mut lp.moves {
+                        s.dropped = drops.dropped(&s.id);
                     }
                 }
                 if let Some(follows) = self.range_follows() {
@@ -252,6 +257,11 @@ impl Node {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .clone()
                                 .unwrap_or_default();
+                            s.follower_waiting = p
+                                .waiting
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
                         }
                     }
                 }
