@@ -44,7 +44,7 @@ use crate::serve::Shared;
 use crate::serve::auth::Caller;
 use crate::serve::errors::ApiError;
 use crate::serve::gate::WriteGate;
-use crate::serve::proto::{self, MovePhase, RangeMove};
+use crate::serve::proto::{self, RangeMove};
 
 /// The progress rows' family in `__phdb_cluster` (the moved-away rows').
 const FAMILY: &str = "moved";
@@ -122,7 +122,7 @@ impl Followers {
             .iter()
             .filter(|m| {
                 !super::map::node_move(m)
-                    && (MovePhase::Copying..=MovePhase::HandedOver).contains(&super::map::phase(m))
+                    && super::map::follows(super::map::phase(m))
                     && map.partitions.iter().any(|p| p.id == m.to && p.node == me)
             })
             .collect();
@@ -678,7 +678,7 @@ impl Follower {
         if at > 0 {
             self.progress.applied.fetch_max(at, Ordering::AcqRel);
         }
-        super::map::phase(m) >= MovePhase::HandedOver && m.final_seqno != 0 && at >= m.final_seqno
+        super::map::committed(super::map::phase(m)) && m.final_seqno != 0 && at >= m.final_seqno
     }
 
     /// Writes `cells` (the catch-up's, by name) and the catch-up's token as one feed-silent

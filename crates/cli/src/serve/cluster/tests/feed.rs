@@ -2122,7 +2122,7 @@ fn moving_users(
     use crate::serve::proto::{MoveKind, MovePhase, RangeMove};
     let mut m = the_map(version, &[ports[0], ports[1], ports[2]]);
     m.partitions.retain(|p| p.id != "p3");
-    let handed = phase.is_none_or(|p| p >= MovePhase::HandedOver);
+    let handed = phase.is_none_or(super::super::map::committed);
     if handed {
         m.tables[0] = super::super::map::handed_over(&m.tables[0], b"c", Some(b"f"), "p2");
         m.partitions[0].epoch = 2;
@@ -2137,7 +2137,7 @@ fn moving_users(
             from: "p1".into(),
             to: "p2".into(),
             phase: phase as i32,
-            final_seqno: if phase >= MovePhase::HandingOver {
+            final_seqno: if phase == MovePhase::HandingOver || super::super::map::committed(phase) {
                 final_seqno
             } else {
                 0
@@ -2406,7 +2406,7 @@ async fn move_orders_to(
         version += 1;
         let mut m = base.clone();
         m.map_version = version;
-        let handed = phase >= MovePhase::HandedOver;
+        let handed = super::super::map::committed(phase);
         if handed {
             let t = m.tables.iter_mut().find(|t| t.name == "orders").unwrap();
             *t = super::super::map::handed_over(t, start.as_bytes(), None, "p2");
@@ -2425,7 +2425,7 @@ async fn move_orders_to(
             from: "p1".into(),
             to: "p2".into(),
             phase: phase as i32,
-            final_seqno: if phase >= MovePhase::HandingOver {
+            final_seqno: if phase == MovePhase::HandingOver || super::super::map::committed(phase) {
                 final_seqno
             } else {
                 0

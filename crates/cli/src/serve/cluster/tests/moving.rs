@@ -1009,6 +1009,7 @@ fn a_stamp_that_installs_nothing_or_restores_keeps_the_operators_fence() {
                 restore_from_cluster_id: String::new(),
                 promote: false,
                 replica_epoch: 0,
+                create: false,
             })
             .await
             .unwrap()

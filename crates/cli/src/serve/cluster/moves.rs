@@ -34,9 +34,9 @@ use crate::serve::ranges::{self, Moved};
 
 /// The move `map` hands `partition` over in as its source, from HANDED_OVER on, if any.
 pub(super) fn handing_over<'m>(map: &'m ClusterMap, partition: &str) -> Option<&'m RangeMove> {
-    map.moves.iter().find(|m| {
-        !map::node_move(m) && m.from == partition && map::phase(m) >= MovePhase::HandedOver
-    })
+    map.moves
+        .iter()
+        .find(|m| !map::node_move(m) && m.from == partition && map::committed(map::phase(m)))
 }
 
 /// `db`'s D310 feed token now for a feed of `table` (D331 PR 3b's `t_from`), `None` when
@@ -273,7 +273,7 @@ impl Node {
         for m in map.moves.iter().filter(|m| {
             !map::node_move(m)
                 && m.to == id
-                && map::phase(m) >= MovePhase::Cleaning
+                && map::target_serves(map::phase(m))
                 && !gate.ranges().has_serving(&m.id)
         }) {
             let (start, end) = map::move_range(m)?;
@@ -527,5 +527,36 @@ fn delete_silently(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::proto::MoveKind;
+
+    // D331 PR 5: an aborting move is before its commit point, so its source never runs its
+    // hand-over (ABORTING is above HANDED_OVER in number, out of the phases' order).
+    #[test]
+    fn an_aborting_moves_source_hands_nothing_over() {
+        let at = |phase: MovePhase| {
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "users".into(),
+                from: "p1".into(),
+                to: "p2".into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            ClusterMap {
+                moves: vec![r],
+                ..Default::default()
+            }
+        };
+        assert!(handing_over(&at(MovePhase::Aborting), "p1").is_none());
+        assert!(handing_over(&at(MovePhase::HandingOver), "p1").is_none());
+        assert!(handing_over(&at(MovePhase::HandedOver), "p1").is_some());
+        assert!(handing_over(&at(MovePhase::Cleaning), "p1").is_some());
     }
 }

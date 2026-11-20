@@ -311,6 +311,7 @@ fn a_stamp_onto_a_node_holding_the_partitions_replica_is_refused() {
                 restore_from_cluster_id: String::new(),
                 promote: false,
                 replica_epoch: 0,
+                create: false,
             })
             .await
             .unwrap_err();

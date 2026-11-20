@@ -502,6 +502,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
                     restore_from_cluster_id: restore_from.clone(),
                     promote: false,
                     replica_epoch: 0,
+                    create: false,
                 },
                 token.as_deref(),
             )?)

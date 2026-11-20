@@ -7199,6 +7199,12 @@ pub struct StampRequest {
     /// still record, so the stamp acts on the copy that was checked.
     #[prost(uint64, tag = "8")]
     pub replica_epoch: u64,
+    /// D331 PR 5: a split's new partition, which has no file yet. The node creates it empty,
+    /// with its identity at `to_epoch` and marked split-created for `create_move`, before the
+    /// map change that adds it: create-new (a path that exists is never replaced), idempotent
+    /// for an empty file with that identity, refused for anything else under the id.
+    #[prost(bool, tag = "9")]
+    pub create: bool,
 }
 /// The partition map (D317 §1): one versioned document, the same in gRPC, HTTP/JSON and the
 /// map file (`<cluster dir>/cluster-map.json`, canonical proto3 JSON).
@@ -7398,6 +7404,11 @@ pub struct RangeMove {
     /// promoted it mid-move). 0 on a record from before this field.
     #[prost(uint64, tag = "13")]
     pub from_epoch: u64,
+    /// D331 PR 5: the target partition's epoch when the move entered COPYING. The move aborts
+    /// if it changes before the commit point (a failover of the target). 0: unknown, not
+    /// compared.
+    #[prost(uint64, tag = "14")]
+    pub to_epoch: u64,
 }
 /// D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7434,6 +7445,19 @@ pub struct MoveStatus {
     /// while it runs or once it's done. PR 5's driver aborts the move on it.
     #[prost(string, tag = "11")]
     pub follower_error: ::prost::alloc::string::String,
+    /// D331 PR 5, on the source: its visible seqno once the range's fence drained and no share
+    /// was in doubt (from HANDING_OVER); 0 until then. The driver records it as `final_seqno`.
+    #[prost(uint64, tag = "12")]
+    pub fence_seqno: u64,
+    /// D331 PR 5, on the source (CLEANING) or a split's new partition (ABORTING): the range's
+    /// drop finished.
+    #[prost(bool, tag = "13")]
+    pub dropped: bool,
+    /// D331 PR 5, on the target: what its follower waits for before copying (an earlier move's
+    /// drop of an overlapping range here); empty when it waits for nothing. For people and the
+    /// driver's timeout, never an error.
+    #[prost(string, tag = "14")]
+    pub follower_waiting: ::prost::alloc::string::String,
 }
 /// D330: one failover of a partition to a replica, or one writer election, as the writer
 /// that made it recorded it in the map.
@@ -8785,11 +8809,17 @@ pub enum MovePhase {
     HandedOver = 4,
     /// T serves the range (S has taken the HANDED_OVER map, or its old lease has provably
     /// ended); S deletes its copy.
-    ///
+    Cleaning = 5,
     /// PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
     /// the merged-away source waits for its transaction outcomes before it's dropped. The
     /// phases stay in order, so "from HANDED_OVER on" includes it.
-    Cleaning = 5,
+    /// D331 PR 5: an abort under way, from COPYING, CATCHING_UP or HANDING_OVER: before the
+    /// commit point and inactive. S serves the range as if no move named it (no fence), T
+    /// serves none of it and drops what it copied, and a split's new partition goes once its
+    /// node reports it empty; then the record goes. It is OUT OF the phases' order: every
+    /// comparison of phases excludes it explicitly (`map::past_commit`, `map::active`), never
+    /// by number.
+    Aborting = 7,
 }
 impl MovePhase {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -8804,6 +8834,7 @@ impl MovePhase {
             Self::HandingOver => "MOVE_PHASE_HANDING_OVER",
             Self::HandedOver => "MOVE_PHASE_HANDED_OVER",
             Self::Cleaning => "MOVE_PHASE_CLEANING",
+            Self::Aborting => "MOVE_PHASE_ABORTING",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -8815,6 +8846,7 @@ impl MovePhase {
             "MOVE_PHASE_HANDING_OVER" => Some(Self::HandingOver),
             "MOVE_PHASE_HANDED_OVER" => Some(Self::HandedOver),
             "MOVE_PHASE_CLEANING" => Some(Self::Cleaning),
+            "MOVE_PHASE_ABORTING" => Some(Self::Aborting),
             _ => None,
         }
     }

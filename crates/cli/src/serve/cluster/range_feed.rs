@@ -30,7 +30,7 @@ use prost::bytes::Bytes;
 use super::Node;
 use crate::serve::errors::ApiError;
 use crate::serve::feed::{FeedEvents, Out, Sink};
-use crate::serve::proto::{self, MovePhase, subscribe_request::Start as S};
+use crate::serve::proto::{self, subscribe_request::Start as S};
 use crate::serve::router::Cluster;
 
 /// How often the stream looks at the map for its move's end when the feed is quiet.
@@ -148,7 +148,7 @@ fn live_move(
                 ),
             )
         })?;
-    if !(MovePhase::Copying..=MovePhase::HandedOver).contains(&super::map::phase(m)) {
+    if !super::map::follows(super::map::phase(m)) {
         return Err(ApiError::failed_precondition(format!(
             "range move {:?} is at {:?}: it has no catch-up stream",
             m.id,
@@ -409,7 +409,7 @@ impl Stream {
             ));
         };
         source_here(self.node.id(), &map, m)?;
-        let done = super::map::phase(m) >= MovePhase::HandedOver
+        let done = super::map::committed(super::map::phase(m))
             && m.final_seqno != 0
             && super::token::token_seqno(token).is_some_and(|s| s >= m.final_seqno);
         if done {

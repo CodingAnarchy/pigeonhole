@@ -84,6 +84,7 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     LEASES_FEATURE,
     WRITER_TERMS_FEATURE,
     RANGE_MOVES_FEATURE,
+    MOVE_ABORTING_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
     BALANCER_FEATURE,
 ];
@@ -96,6 +97,11 @@ pub(crate) const BALANCER_FEATURE: &str = "balancer";
 /// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
 /// field from its copy, read as divergent, and gate no moving range.
 pub(crate) const RANGE_MOVES_FEATURE: &str = "range_moves";
+
+/// [`MAP_FEATURES`]' name for `MOVE_PHASE_ABORTING` (D331 PR 5): a node without it refuses a
+/// map holding the phase. Every range move needs it on every node before it starts, so its
+/// abort can always be written.
+pub(crate) const MOVE_ABORTING_FEATURE: &str = "move_aborting";
 
 /// [`MAP_FEATURES`]' name for a build that serves `Cluster.Lease` (D326 amendment 1, #2048):
 /// a peer whose `Lease` answers `Unimplemented` counts as granting only if its `Status`
@@ -928,6 +934,11 @@ impl Node {
                 self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
                     .await?;
             }
+            // And every range move's start, or an abort's record (D331 PR 5).
+            if map::starts_range_move(&current, &map) {
+                self.every_node_keeps(&map, MOVE_ABORTING_FEATURE, "a range move")
+                    .await?;
+            }
             // And the first use of the balancer's fields (D332).
             if !map::uses_balancer(&current) && map::uses_balancer(&map) {
                 self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
@@ -961,6 +972,10 @@ impl Node {
             }
             if !map.moves.is_empty() {
                 self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
+                    .await?;
+            }
+            if map.moves.iter().any(|m| !map::node_move(m)) {
+                self.every_node_keeps(&map, MOVE_ABORTING_FEATURE, "a range move")
                     .await?;
             }
             if map::uses_balancer(&map) {

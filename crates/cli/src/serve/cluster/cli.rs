@@ -843,6 +843,7 @@ pub(super) async fn relocate_as(
                 restore_from_cluster_id: String::new(),
                 promote: false,
                 replica_epoch: 0,
+                create: false,
             },
             new_token.as_deref(),
         )?)

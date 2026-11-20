@@ -148,6 +148,11 @@ message StampRequest {
   // With `promote`: the epoch the CLI found in the copy's identity row, which the file must
   // still record, so the stamp acts on the copy that was checked.
   uint64 replica_epoch = 8;
+  // D331 PR 5: a split's new partition, which has no file yet. The node creates it empty,
+  // with its identity at `to_epoch` and marked split-created for `create_move`, before the
+  // map change that adds it: create-new (a path that exists is never replaced), idempotent
+  // for an empty file with that identity, refused for anything else under the id.
+  bool create = 9;
 }
 
 // A partition's state on its node (D317 ticket 6).
@@ -350,6 +355,10 @@ message RangeMove {
   // move's HANDED_OVER map is refused if the partition's epoch changed since (a failover
   // promoted it mid-move). 0 on a record from before this field.
   uint64 from_epoch = 13;
+  // D331 PR 5: the target partition's epoch when the move entered COPYING. The move aborts
+  // if it changes before the commit point (a failover of the target). 0: unknown, not
+  // compared.
+  uint64 to_epoch = 14;
 }
 
 // D331: what a range move is for.
@@ -384,6 +393,13 @@ enum MovePhase {
   // PR 6 adds MOVE_PHASE_AWAITING_OUTCOMES = 6, after CLEANING and for MERGE moves only:
   // the merged-away source waits for its transaction outcomes before it's dropped. The
   // phases stay in order, so "from HANDED_OVER on" includes it.
+  // D331 PR 5: an abort under way, from COPYING, CATCHING_UP or HANDING_OVER: before the
+  // commit point and inactive. S serves the range as if no move named it (no fence), T
+  // serves none of it and drops what it copied, and a split's new partition goes once its
+  // node reports it empty; then the record goes. It is OUT OF the phases' order: every
+  // comparison of phases excludes it explicitly (`map::past_commit`, `map::active`), never
+  // by number.
+  MOVE_PHASE_ABORTING = 7;
 }
 
 // D331: a range move as a node holding one of its partitions sees it (`LocalPartition.moves`).
@@ -409,6 +425,16 @@ message MoveStatus {
   // a range drop of the range, a row left partly copied, the source failed over); empty
   // while it runs or once it's done. PR 5's driver aborts the move on it.
   string follower_error = 11;
+  // D331 PR 5, on the source: its visible seqno once the range's fence drained and no share
+  // was in doubt (from HANDING_OVER); 0 until then. The driver records it as `final_seqno`.
+  uint64 fence_seqno = 12;
+  // D331 PR 5, on the source (CLEANING) or a split's new partition (ABORTING): the range's
+  // drop finished.
+  bool dropped = 13;
+  // D331 PR 5, on the target: what its follower waits for before copying (an earlier move's
+  // drop of an overlapping range here); empty when it waits for nothing. For people and the
+  // driver's timeout, never an error.
+  string follower_waiting = 14;
 }
 
 // D330: one failover of a partition to a replica, or one writer election, as the writer

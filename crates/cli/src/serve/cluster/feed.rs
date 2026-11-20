@@ -659,14 +659,7 @@ impl Merge {
         // serves none of the range before, and only then has the hand-over position a
         // resume starts it at (cli692's M1 on PR 3b). Read once a map version.
         let moves = self.ctx.node.get_map().map(|m| m.moves).unwrap_or_default();
-        let handing = |table: &str, p: &str| {
-            moves.iter().any(|m| {
-                !super::map::node_move(m)
-                    && m.table == table
-                    && m.to == p
-                    && super::map::phase(m) < crate::serve::proto::MovePhase::Cleaning
-            })
-        };
+        let handing = |table: &str, p: &str| handing(&moves, table, p);
         let prefix = &self.ctx.prefix;
         let (t, p) = gained(
             &self.parts,
@@ -1001,6 +994,17 @@ fn poll_parts(
         }
     }
     Poll::Pending
+}
+
+/// Whether one of `moves` still hands `table`'s range to partition `p`: a range move to it
+/// before CLEANING, or aborting (D331 PR 5), whose target never serves the range.
+fn handing(moves: &[crate::serve::proto::RangeMove], table: &str, p: &str) -> bool {
+    moves.iter().any(|m| {
+        !super::map::node_move(m)
+            && m.table == table
+            && m.to == p
+            && !super::map::target_serves(super::map::phase(m))
+    })
 }
 
 /// The first of `tables` with a partition (`partitions_of`) that no live part of `parts`
@@ -1980,6 +1984,29 @@ pub(super) mod tests {
             Some(("users", "p1".to_owned()))
         );
         assert_eq!(gained(&parts, &["users"], on, |_, p| p == "p1"), None);
+    }
+
+    // D331 PR 5: a move's target counts only from CLEANING on; an aborting move's never does
+    // (ABORTING is above CLEANING in number, out of the phases' order).
+    #[test]
+    fn an_aborting_moves_target_is_still_handed_and_never_gains_the_range() {
+        use crate::serve::proto::{MoveKind, MovePhase, RangeMove};
+        let at = |phase: MovePhase| {
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "users".into(),
+                from: "p1".into(),
+                to: "p2".into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            vec![r]
+        };
+        assert!(handing(&at(MovePhase::HandedOver), "users", "p2"));
+        assert!(!handing(&at(MovePhase::Cleaning), "users", "p2"));
+        assert!(handing(&at(MovePhase::Aborting), "users", "p2"));
+        assert!(!handing(&at(MovePhase::Aborting), "orders", "p2"));
     }
 
     #[test]

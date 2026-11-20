@@ -285,7 +285,7 @@ async fn start_record(
     let prefix = how.prefix;
     if let Some(r) = m.moves.iter().find(|r| r.from == p.id || r.to == p.id) {
         let ours =
-            super::map::node_move(r) && r.to == to && super::map::phase(r) < MovePhase::HandedOver;
+            super::map::node_move(r) && r.to == to && !super::map::committed(super::map::phase(r));
         if !ours {
             return Err(Failure::usage(&format!(
                 "move {:?} names partition {} ({:?}, at {:?}): finish it, or abort it before \
@@ -386,7 +386,7 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
         )));
     };
     let phase = super::map::phase(&r);
-    if phase >= MovePhase::HandedOver {
+    if super::map::committed(phase) {
         return Err(Failure::usage(&format!(
             "move {} of {partition} is at {phase:?}, past its commit point: the map already \
              gives {partition} to node {}. Let it finish: run phdb cluster move {partition} \
@@ -1197,6 +1197,7 @@ async fn stamp(
             restore_from_cluster_id: String::new(),
             promote: false,
             replica_epoch: 0,
+            create: false,
         },
         new.token.as_deref(),
     )?)

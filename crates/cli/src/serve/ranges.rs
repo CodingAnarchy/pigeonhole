@@ -689,11 +689,11 @@ fn derive(
                 _ => {}
             }
         } else if m.to == partition
-            && (phase < MovePhase::Cleaning || !serving.iter().any(|r| r.id == m.id))
+            && (!map::target_serves(phase) || !serving.iter().any(|r| r.id == m.id))
         {
             // Served from CLEANING on, once its serving row is in the file (written before
             // the gate opens it, so nothing of the range lands here below its `t_from`).
-            let cleaning = phase >= MovePhase::Cleaning;
+            let cleaning = map::target_serves(phase);
             spans.extend(span(m, Rule::Unserved).map(|s| Span {
                 awaits_row: cleaning,
                 ..s
@@ -846,12 +846,11 @@ pub(crate) fn statuses(map: &ClusterMap, partition: &str) -> Vec<MoveStatus> {
                 phase: m.phase,
                 source,
                 fenced: !node && source && phase == MovePhase::HandingOver,
-                serving: if node {
-                    phase >= MovePhase::Cleaning
-                } else if source {
-                    phase < MovePhase::HandedOver
+                // An aborting move's source serves the range; its target serves none of it.
+                serving: if node || !source {
+                    map::target_serves(phase)
                 } else {
-                    phase >= MovePhase::Cleaning
+                    !map::committed(phase)
                 },
                 // D331 PR 4b: the copy's progress and the hold's lapse, filled in by the
                 // range follower and the source's copy server.
@@ -1392,5 +1391,44 @@ mod tests {
         );
         let s = statuses(&map(Some(MovePhase::Cleaning)), "p1");
         assert!(!s[0].serving);
+        // D331 PR 5: an aborting move's source serves the range, unfenced; its target serves
+        // none of it.
+        let s = statuses(&map(Some(MovePhase::Aborting)), "p1");
+        assert!(s[0].source && !s[0].fenced && s[0].serving);
+        let t = statuses(&map(Some(MovePhase::Aborting)), "p2");
+        assert!(!t[0].serving);
+    }
+
+    // D331 PR 5: ABORTING is out of the phases' order (above CLEANING in number), and the
+    // gate reads it as before the commit point and inactive.
+    #[test]
+    fn an_aborting_move_gates_its_target_and_leaves_its_source_serving() {
+        let aborting = map(Some(MovePhase::Aborting));
+        let t = gate(&aborting, "p2", Vec::new(), 10)
+            .state
+            .load_full()
+            .expect("gated");
+        assert_eq!(code(&t, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        assert_eq!(code(&t, &put("d")).as_deref(), Some("PartitionUnavailable"));
+        // Even with a serving row in its file, which only CLEANING opens.
+        let serving = Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"f".to_vec()),
+            version: 5,
+            seqno: 30,
+            ..Default::default()
+        };
+        let t = gate_serving(&aborting, "p2", Vec::new(), vec![serving], 31)
+            .state
+            .load_full()
+            .expect("gated");
+        assert_eq!(code(&t, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        // The source: no fence, no moved-away span.
+        if let Some(s) = gate(&aborting, "p1", Vec::new(), 10).state.load_full() {
+            assert_eq!(code(&s, &put("d")), None);
+            assert_eq!(code(&s, &get("d")), None);
+        }
     }
 }

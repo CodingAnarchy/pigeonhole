@@ -502,6 +502,7 @@ pub(crate) async fn run(
                 restore_from_cluster_id: String::new(),
                 promote: true,
                 replica_epoch: e_b,
+                create: false,
             },
         )
         .await?;
@@ -551,7 +552,7 @@ pub(crate) async fn run(
     m2.moves.retain(|r| {
         !(super::map::node_move(r)
             && r.from == partition
-            && super::map::phase(r) < proto::MovePhase::HandedOver)
+            && !super::map::committed(super::map::phase(r)))
     });
     for q in m2.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();

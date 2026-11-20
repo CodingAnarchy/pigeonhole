@@ -312,9 +312,7 @@ pub(crate) fn qualify(
     // A whole-partition move of P past its commit point (D332 PR 2): P is on the move's
     // target, and only finishing the move serves it.
     if let Some(m) = map.moves.iter().find(|m| {
-        super::map::node_move(m)
-            && m.from == p.id
-            && super::map::phase(m) >= proto::MovePhase::HandedOver
+        super::map::node_move(m) && m.from == p.id && super::map::committed(super::map::phase(m))
     }) {
         return Err(format!(
             "move {} (relocating it to node {}) is past its commit point: let it finish, or \

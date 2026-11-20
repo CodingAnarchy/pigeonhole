@@ -237,8 +237,7 @@ impl Sources {
                     &m.id == id
                         && !super::map::node_move(m)
                         && m.from == s.partition
-                        && (MovePhase::Copying..=MovePhase::HandedOver)
-                            .contains(&super::map::phase(m))
+                        && super::map::follows(super::map::phase(m))
                         && owned(m)
                 });
                 live && now.duration_since(s.asked) < IDLE

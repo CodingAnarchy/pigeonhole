@@ -42,7 +42,7 @@ fn moving(v1: &ClusterMap, version: u64, phase: Option<MovePhase>) -> ClusterMap
         m.partitions[0].epoch = 2;
         return m;
     };
-    let handed = phase >= MovePhase::HandedOver;
+    let handed = super::super::map::committed(phase);
     m.moves.push(RangeMove {
         id: "mv1".into(),
         kind: MoveKind::Range as i32,
@@ -1041,6 +1041,13 @@ fn a_raw_catch_up_stream_is_served_only_for_a_live_moves_exact_range() {
             None,
             "the move's own stream"
         );
+        // D331 PR 5: an aborting move has no stream (ABORTING is above HANDED_OVER in
+        // number, out of the phases' order).
+        push(&ports, &moving(&v1, 3, Some(MovePhase::Aborting))).await;
+        eventually("a refuses the aborting move's stream", async || {
+            refused(a, req(true, "f", from_token())).await.as_deref() == Some("FailedPrecondition")
+        })
+        .await;
     });
     let _ = (db_a.close(), db_b.close());
 }
@@ -1119,6 +1126,100 @@ fn a_follower_stopped_mid_copy_commits_nothing_more() {
     );
     assert_eq!(records(&db_b), recorded_before, "no record after the stop");
     assert!(recorded_before.is_some(), "the first chunk's records");
+    let _ = (db_a.close(), db_b.close());
+}
+
+/// D331 PR 5: an aborting move is before its commit point and inactive. Taken mid-copy, the
+/// follower stops between commits and records nothing more; the copy server lends no more
+/// chunks; the target serves none of the range and writes no serving row; the source
+/// serves it, unfenced, and hands nothing over.
+#[test]
+fn an_aborting_move_stops_its_follower_and_leaves_the_range_its_sources() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listeners: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    let mut v1 = the_map(1, &[ports[0], ports[1], ports[2]]);
+    v1.partitions.retain(|p| p.id != "p3");
+    let dirs: Vec<PathBuf> = (0..3).map(|_| test_dir()).collect();
+    for dir in &dirs {
+        super::super::write_map(dir, &super::super::map::canonical_json(&v1)).unwrap();
+    }
+    let mut it = listeners.into_iter();
+    let (_stop_a, db_a) = data_node(&rt, &dirs[0], "a", Some("p1"), it.next().unwrap());
+    let (_stop_b, db_b) = data_node(&rt, &dirs[1], "b", Some("p2"), it.next().unwrap());
+    let (_stop_c, _) = data_node(&rt, &dirs[2], "c", None, it.next().unwrap());
+    let (db_a, db_b) = (db_a.unwrap(), db_b.unwrap());
+    let (a, b, c) = (ports[0], ports[1], ports[2]);
+    let mut recorded_before = None;
+    // Never released, as in a_follower_stopped_mid_copy_commits_nothing_more: only the
+    // follower's stop wakes it.
+    let (_held_for_good, held) = tokio::sync::oneshot::channel::<()>();
+    super::super::range_follow::HOLD_COMMIT
+        .lock()
+        .unwrap()
+        .push(((dirs[1].clone(), 2), held));
+    rt.block_on(async {
+        eventually("p1 takes writes", async || {
+            try_put(c, "c", "0").await.is_ok()
+        })
+        .await;
+        let big = "x".repeat(700 << 10);
+        for row in ["c1", "c2", "c3", "c4"] {
+            try_put(c, row, &big).await.unwrap();
+        }
+        try_put(c, "d", "1").await.unwrap();
+        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        eventually_within(
+            Duration::from_secs(60),
+            "b holds its second chunk",
+            async || taken(&super::super::range_follow::HOLD_COMMIT, &dirs[1]),
+        )
+        .await;
+        push(&ports, &moving(&v1, 3, Some(MovePhase::Aborting))).await;
+        eventually("b takes the abort", async || {
+            move_status(b, "p2", "mv1")
+                .await
+                .is_some_and(|s| s.phase == MovePhase::Aborting as i32)
+        })
+        .await;
+        recorded_before = records(&db_b);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let t = move_status(b, "p2", "mv1").await.unwrap();
+        assert!(!t.serving, "the target serves none of it");
+        let s = move_status(a, "p1", "mv1").await.unwrap();
+        assert!(s.serving && !s.fenced, "the source serves it, unfenced");
+        // The source takes the range's writes (the target's gate refusing them is
+        // ranges.rs's an_aborting_move_gates_its_target_and_leaves_its_source_serving).
+        try_put(c, "d", "2").await.unwrap();
+    });
+    let users = db_b.table("users").unwrap().open().unwrap();
+    assert!(
+        users.get(b"d", "f", b"q").unwrap().is_none(),
+        "the second chunk wasn't written"
+    );
+    assert_eq!(records(&db_b), recorded_before, "no record after the stop");
+    assert!(recorded_before.is_some(), "the first chunk's records");
+    assert!(
+        !crate::serve::ranges::read_serving(&db_b)
+            .unwrap()
+            .iter()
+            .any(|r| r.id == "mv1"),
+        "no serving row on the target"
+    );
+    assert!(
+        crate::serve::ranges::read_moved(&db_a).unwrap().is_empty(),
+        "the source wrote no moved-away row"
+    );
+    assert_eq!(
+        super::super::identity::read(&db_a).unwrap().unwrap().epoch,
+        1,
+        "the source's epoch wasn't raised"
+    );
     let _ = (db_a.close(), db_b.close());
 }
 
