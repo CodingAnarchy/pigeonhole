@@ -454,6 +454,29 @@ impl ApiError {
     /// D331 PR 3b, internal to a cluster subscription: a source's component of tables a
     /// range move took from it whole has read up to the move's last seqno, and ends here.
     /// The merge retires the part; a client never sees it.
+    pub(crate) fn moved_away(message: impl Into<String>) -> Self {
+        Self::new(
+            "MovedAway",
+            0,
+            message,
+            tonic::Code::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    }
+
+    /// D331 PR 4b: a range move's source holds no feed retention for it any more (it
+    /// restarted, or its target went idle), so the move can't catch up. Internal to the
+    /// target's follower, which stops the move on it (cli692 on #2107).
+    pub(crate) fn move_lapsed(message: impl Into<String>) -> Self {
+        Self::new(
+            "MoveLapsed",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
     /// D331 PR 4b: a range move's catch-up stream ended by a range drop on its source that
     /// removed some of its range. Internal to the target's follower, which stops the move
     /// on it; never a client's.
@@ -464,16 +487,6 @@ impl ApiError {
             message,
             tonic::Code::FailedPrecondition,
             StatusCode::CONFLICT,
-        )
-    }
-
-    pub(crate) fn moved_away(message: impl Into<String>) -> Self {
-        Self::new(
-            "MovedAway",
-            0,
-            message,
-            tonic::Code::Unavailable,
-            StatusCode::SERVICE_UNAVAILABLE,
         )
     }
 

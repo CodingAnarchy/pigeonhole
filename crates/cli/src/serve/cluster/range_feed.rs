@@ -165,7 +165,7 @@ fn source_here(me: &str, map: &proto::ClusterMap, m: &proto::RangeMove) -> Resul
     let ok = map
         .partitions
         .iter()
-        .any(|p| p.id == m.from && p.node == me && (m.from_epoch == 0 || p.epoch == m.from_epoch));
+        .any(|p| p.id == m.from && p.node == me && super::map::source_epoch_holds(m, p.epoch));
     if ok {
         Ok(())
     } else {
@@ -198,6 +198,10 @@ struct Stream {
 /// The most commits one event carries, and about the most bytes (T's commit unit).
 const BATCH_COMMITS: usize = 1024;
 const BATCH_BYTES: usize = 256 << 10;
+/// The most events read for one batch, in range or not (perf287 on #2107): a catch-up deep
+/// in a partition's history whose moved range takes few of its writes would otherwise read
+/// on without end.
+const BATCH_READS: usize = 4 * BATCH_COMMITS;
 
 /// The commits one event carries (#2108, perf287): what's ready at once, oldest first, at
 /// most [`BATCH_COMMITS`] and about [`BATCH_BYTES`]. The target applies an event as one
@@ -212,25 +216,32 @@ struct Batch {
     bytes: usize,
     /// The keys of its commits' changes, once it holds two.
     keys: std::collections::HashSet<u64>,
+    /// The feed's events read for it, in range or not.
+    reads: usize,
+    /// A commit's keys while it's checked against `keys`.
+    scratch: Vec<u64>,
 }
 
 impl Batch {
     fn full(&self) -> bool {
-        self.commits.len() >= BATCH_COMMITS || self.bytes >= BATCH_BYTES
+        self.commits.len() >= BATCH_COMMITS
+            || self.bytes >= BATCH_BYTES
+            || self.reads >= BATCH_READS
     }
 
     /// Adds `c`, or hands it back when one of its changes repeats a key the batch holds.
     fn add(&mut self, c: proto::RawCommit) -> Result<(), proto::RawCommit> {
         if !self.commits.is_empty() {
             if self.commits.len() == 1 {
-                let first: Vec<u64> = self.commits[0].changes.iter().map(key_of).collect();
+                let first = self.commits[0].changes.iter().map(key_of);
                 self.keys.extend(first);
             }
-            let keys: Vec<u64> = c.changes.iter().map(key_of).collect();
-            if keys.iter().any(|k| self.keys.contains(k)) {
+            self.scratch.clear();
+            self.scratch.extend(c.changes.iter().map(key_of));
+            if self.scratch.iter().any(|k| self.keys.contains(k)) {
                 return Err(c);
             }
-            self.keys.extend(keys);
+            self.keys.extend(self.scratch.iter().copied());
         }
         self.bytes += c
             .changes
@@ -245,17 +256,21 @@ impl Batch {
 /// A change's cell and timestamp, hashed: (family, row, qualifier, timestamp, whether it's a
 /// family delete), as D34 keys a commit's mutations.
 fn key_of(ch: &proto::RawChange) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::hash::DefaultHasher::new();
-    (
-        &ch.family,
-        &ch.row,
-        &ch.qualifier,
-        ch.timestamp,
-        ch.kind == 5,
-    )
-        .hash(&mut h);
-    h.finish()
+    // FNV-1a (perf287: a cheaper hash than SipHash; a collision only ends a batch early),
+    // each field's length in, so field boundaries count.
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+            h = (h ^ u64::from(b)).wrapping_mul(PRIME);
+        }
+    };
+    eat(ch.family.as_bytes());
+    eat(&ch.row);
+    eat(&ch.qualifier);
+    eat(&ch.timestamp.to_le_bytes());
+    eat(&[u8::from(ch.kind == 5)]);
+    h
 }
 
 /// What the stream read next, owned (the feed lends its events).
@@ -279,6 +294,9 @@ impl Stream {
         // A commit read whose changes repeat a key the last batch held: the next one's first.
         let mut carry: Option<proto::RawCommit> = None;
         loop {
+            // A catch-up behind on a backlog finds every read ready: give the worker back
+            // when its budget is spent (perf287 on #2107), as S's writes run there too.
+            tokio::task::coop::consume_budget().await;
             let mut batch = Batch::default();
             if let Some(c) = carry.take() {
                 batch.add(c).expect("an empty batch takes any commit");
@@ -348,6 +366,7 @@ impl Stream {
         batch: &mut Batch,
         carry: &mut Option<proto::RawCommit>,
     ) -> Result<bool, ApiError> {
+        batch.reads += 1;
         match read {
             Read::Commit(Some(c)) => match batch.add(c) {
                 Ok(()) => Ok(true),
@@ -481,6 +500,19 @@ mod tests {
         let mut next = Batch::default();
         next.add(back).unwrap();
         assert_eq!(next.commits.len(), 1);
+    }
+
+    #[test]
+    fn a_batch_is_full_after_its_reads_even_of_commits_out_of_range() {
+        // perf287 on #2107: reads that bring nothing count too, so a catch-up deep in a
+        // history its range takes few writes of still ends each batch.
+        let mut b = Batch::default();
+        for _ in 0..BATCH_READS - 1 {
+            b.reads += 1;
+            assert!(!b.full());
+        }
+        b.reads += 1;
+        assert!(b.full() && b.commits.is_empty());
     }
 
     #[test]

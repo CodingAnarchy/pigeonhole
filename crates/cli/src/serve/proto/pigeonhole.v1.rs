@@ -1754,8 +1754,6 @@ pub mod feed_event {
         RawCommits(super::RawCommits),
     }
 }
-/// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
-/// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
 /// D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
 /// commits.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1763,6 +1761,7 @@ pub struct RawCommits {
     #[prost(message, repeated, tag = "1")]
     pub commits: ::prost::alloc::vec::Vec<RawCommit>,
 }
+/// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RawCommit {
     #[prost(uint64, tag = "1")]
@@ -1790,6 +1789,7 @@ pub struct RawChange {
     #[prost(bytes = "bytes", tag = "6")]
     pub stored: ::prost::bytes::Bytes,
 }
+/// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MoveBarrier {
     #[prost(string, tag = "1")]

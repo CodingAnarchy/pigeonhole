@@ -258,6 +258,9 @@ enum Failed {
 
 impl From<ApiError> for Failed {
     fn from(e: ApiError) -> Self {
+        if e.code == "MoveLapsed" {
+            return Failed::Stop(e.message);
+        }
         if e.code == "FeedExpired" {
             Failed::Stop(format!(
                 "the source's history no longer reaches the copy's position: {}",
@@ -361,8 +364,7 @@ impl Follower {
         // began at): its history from the copy's token is another's, and the move must be
         // aborted. A record from before `from_epoch` existed (0) isn't compared.
         if let Some(p) = map.partitions.iter().find(|p| p.id == m.from)
-            && m.from_epoch != 0
-            && p.epoch != m.from_epoch
+            && !super::map::source_epoch_holds(&m, p.epoch)
         {
             return Err(Failed::Stop(format!(
                 "the source {:?} is at epoch {}, not {} as when the copy began (it failed \

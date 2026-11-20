@@ -573,7 +573,8 @@ async fn move_status(port: u16, p: &str, id: &str) -> Option<crate::serve::proto
 /// catches up on the source's history of it from the copy's first token through the move's
 /// last seqno: writes during the copy and the catch-up all arrive, and nothing outside the
 /// range does. The progress rows sit beside the moved-away and serving rows without
-/// showing in either (cli692's M4).
+/// showing in either (cli692's M4). The move records `from_epoch`, which the hand-over
+/// raises the source past at HANDED_OVER, and the follower goes on (cli692 on #2107).
 #[test]
 fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -606,7 +607,7 @@ fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
             try_put(c, row, "0").await.unwrap();
         }
         // COPYING: b's follower copies [c, f) from a.
-        push(&ports, &moving(&v1, 2, Some(MovePhase::Copying))).await;
+        push(&ports, &moving_from(&v1, 2, Some(MovePhase::Copying), 1)).await;
         try_put(c, "d", "1").await.unwrap();
         eventually("b copies the range", async || {
             move_status(b, "p2", "mv1")
@@ -618,15 +619,19 @@ fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
         assert!(s.copied_bytes > 0, "{s:?}");
         // CATCHING_UP: a write now arrives by the catch-up. So do the range's first row and
         // not the row at its end (feed1248's S2 on #2107: the bounds on the stream itself).
-        push(&ports, &moving(&v1, 3, Some(MovePhase::CatchingUp))).await;
+        push(&ports, &moving_from(&v1, 3, Some(MovePhase::CatchingUp), 1)).await;
         try_put(c, "e", "2").await.unwrap();
         try_put(c, "c", "3").await.unwrap();
         try_put(c, "f", "3").await.unwrap();
         try_put(c, "zed", "2").await.unwrap();
         // HANDING_OVER, then HANDED_OVER with p1's last seqno before the fence.
-        push(&ports, &moving(&v1, 4, Some(MovePhase::HandingOver))).await;
+        push(
+            &ports,
+            &moving_from(&v1, 4, Some(MovePhase::HandingOver), 1),
+        )
+        .await;
         let last = db_a.visible_seqno();
-        let mut handed = moving(&v1, 5, Some(MovePhase::HandedOver));
+        let mut handed = moving_from(&v1, 5, Some(MovePhase::HandedOver), 1);
         handed.moves[0].final_seqno = last;
         push(&ports, &handed).await;
         eventually("b's catch-up passes the move's last seqno", async || {
@@ -635,7 +640,7 @@ fn a_range_moves_target_copies_its_range_and_catches_up_to_the_last_seqno() {
                 .is_some_and(|s| s.source_applied_seqno >= last)
         })
         .await;
-        let mut cleaning = moving(&v1, 6, Some(MovePhase::Cleaning));
+        let mut cleaning = moving_from(&v1, 6, Some(MovePhase::Cleaning), 1);
         cleaning.moves[0].final_seqno = last;
         push(&ports, &cleaning).await;
         eventually("p2 serves the range", async || {

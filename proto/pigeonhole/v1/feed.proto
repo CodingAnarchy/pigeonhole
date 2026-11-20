@@ -83,14 +83,13 @@ message FeedEvent {
   bytes xid = 7;
 }
 
-// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
-// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
 // D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
 // commits.
 message RawCommits {
   repeated RawCommit commits = 1;
 }
 
+// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
 message RawCommit {
   uint64 seqno = 1;
   uint64 timestamp = 2;
@@ -109,6 +108,7 @@ message RawChange {
   bytes stored = 6;
 }
 
+// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 message MoveBarrier {
   string move_id = 1;
   // The move's source partition.

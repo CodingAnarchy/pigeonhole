@@ -33,7 +33,7 @@ const IDLE: Duration = Duration::from_secs(120);
 /// each family's sources per chunk is paid back over this much.
 const MIN_READ: u64 = 2 << 20;
 
-/// The most a chunk waits for the node's rate before it's answered.
+/// The most a chunk waits for the node's rate: past it, the chunk is refused `Overloaded`.
 const MAX_WAIT: Duration = Duration::from_secs(2);
 
 /// Per family, what a chunk reads at least.
@@ -93,19 +93,27 @@ impl Sources {
         }
     }
 
-    /// How long a read of `bytes` must wait to keep this node's copies at the rate.
-    fn take(&self, bytes: u64) -> Duration {
+    /// Takes `bytes` from the bucket (negative gives back), and how long the read must wait
+    /// to keep the node at its rate; or, past `max_wait` of waiting, takes nothing and says
+    /// how long (cli692 on #2107: a chunk is refused `Overloaded` rather than run up a debt
+    /// a capped sleep never pays).
+    fn reserve(&self, bytes: f64, max_wait: Duration) -> Result<Duration, Duration> {
         let mut b = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let rate = self.rate as f64;
         b.tokens = (b.tokens + now.duration_since(b.at).as_secs_f64() * rate).min(rate);
         b.at = now;
-        b.tokens -= bytes as f64;
-        if b.tokens >= 0.0 {
+        let left = b.tokens - bytes;
+        let wait = if left >= 0.0 {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(-b.tokens / rate)
+            Duration::from_secs_f64(-left / rate)
+        };
+        if wait > max_wait {
+            return Err(wait);
         }
+        b.tokens = left;
+        Ok(wait)
     }
 
     /// `pigeonhole_cluster_move_copies_refused_total`: range copies refused here for a full
@@ -208,7 +216,7 @@ impl Sources {
                     map.partitions.iter().any(|p| {
                         p.id == s.partition
                             && p.node == me
-                            && (m.from_epoch == 0 || p.epoch == m.from_epoch)
+                            && super::map::source_epoch_holds(m, p.epoch)
                     })
                 };
                 let live = map.moves.iter().any(|m| {
@@ -265,7 +273,7 @@ impl Sources {
                 format!("no partition {partition:?} in the map"),
             ));
         };
-        if m.from_epoch != 0 && p.epoch != m.from_epoch {
+        if !super::map::source_epoch_holds(m, p.epoch) {
             return Err(ApiError::failed_precondition(format!(
                 "range move {:?}'s source {partition:?} is at epoch {}, not {} as it was when \
                  copying began",
@@ -316,7 +324,7 @@ impl Sources {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .insert(m.id.clone());
-                return Err(ApiError::failed_precondition(format!(
+                return Err(ApiError::move_lapsed(format!(
                     "range move {:?}'s source holds no feed retention for it (the source's node \
                      restarted, or its target stopped asking): abort the move",
                     m.id
@@ -335,6 +343,14 @@ impl Sources {
         let families = table.families().len() as u64;
         let table = table.clone();
         let read = r.max_bytes.max(MIN_READ).max(families * PER_FAMILY);
+        // The node's rate, for the read's worth before it's read: past [`MAX_WAIT`] of debt,
+        // `Overloaded` (retry-safe; the target backs off), so the rate holds however slow.
+        let wait = self.reserve(read as f64, MAX_WAIT).map_err(|w| {
+            ApiError::overloaded(format!(
+                "this node's range copies are at --move-rate-bytes: ask again in about {} ms",
+                w.as_millis()
+            ))
+        })?;
         let chunk = tokio::task::spawn_blocking(move || {
             let snap = db.snapshot()?;
             let chunk = db.copy_range(&snap, &table, &after, end.as_deref(), read as usize)?;
@@ -351,11 +367,10 @@ impl Sources {
         if let Some(g) = service.gate() {
             g.serving()?;
         }
-        // The node's rate: at most 2 s here, so a slow rate never outlasts the target's call;
-        // the bucket keeps the rest owed, and the next chunk waits it out (cli692's nit).
-        let wait = self.take(bytes);
+        // What was read, not the estimate: the rest back in the bucket (or more out of it).
+        let _ = self.reserve(bytes as f64 - read as f64, Duration::MAX);
         if !wait.is_zero() {
-            tokio::time::sleep(wait.min(MAX_WAIT)).await;
+            tokio::time::sleep(wait).await;
         }
         Ok(RangeCopyResponse {
             cells: chunk
@@ -494,11 +509,23 @@ mod tests {
         // cli692's throttle: `--move-rate-bytes` is the node's, across its moves. A second's
         // worth taken by one leaves the next read, of any move, a second's wait.
         let s = Sources::new(1 << 20, u64::MAX, 2);
-        assert_eq!(s.take(1 << 20), Duration::ZERO, "a full bucket");
-        let wait = s.take(1 << 20);
+        let mib = f64::from(1 << 20);
+        assert_eq!(
+            s.reserve(mib, MAX_WAIT),
+            Ok(Duration::ZERO),
+            "a full bucket"
+        );
+        let wait = s.reserve(mib, MAX_WAIT).unwrap();
         assert!(
             wait > Duration::from_millis(900) && wait <= Duration::from_secs(1),
             "{wait:?}"
+        );
+        // Past `MAX_WAIT` of debt, a read is refused and takes nothing (cli692 on #2107).
+        assert!(s.reserve(4.0 * mib, MAX_WAIT).is_err());
+        let again = s.reserve(mib, MAX_WAIT).unwrap();
+        assert!(
+            again <= Duration::from_secs(2) + Duration::from_millis(50),
+            "{again:?}"
         );
     }
 

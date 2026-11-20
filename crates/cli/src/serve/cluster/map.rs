@@ -288,6 +288,24 @@ pub(crate) fn followed_by<'m>(map: &'m ClusterMap, table: &str) -> Vec<&'m str> 
         .collect()
 }
 
+/// Whether range move `m`'s source, at `epoch` in a map, is still the history its copy
+/// began on (cli692 on #2107): `from_epoch` before HANDED_OVER; from HANDED_OVER on, above
+/// it, since the hand-over raises the source's epoch (to `max(from_epoch, floor) + 1`, as
+/// [`validate_move_steps`] checks), and failover is blocked past the commit point, so the
+/// hand-over's is the only raise there. The exact value isn't recomputed: a promote's floor
+/// may leave the map once the epoch passed it. A record from before `from_epoch` (0) isn't
+/// compared.
+pub(crate) fn source_epoch_holds(m: &RangeMove, epoch: u64) -> bool {
+    if m.from_epoch == 0 {
+        return true;
+    }
+    if phase(m) >= MovePhase::HandedOver {
+        epoch > m.from_epoch
+    } else {
+        epoch == m.from_epoch
+    }
+}
+
 /// Whether `m` is a whole partition's relocation (D332 PR 2's `MOVE_KIND_NODE`), not a
 /// range move: it gates no range, sends no barrier and hands nothing over, so every reader
 /// of the map's moves that acts on a range skips it.
