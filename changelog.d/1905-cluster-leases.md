@@ -1,7 +1,0 @@
-### Changed
-- **A cluster partition serves, reads and writes, only while a majority of the map's nodes grant it a lease** (D326). A node cut off from the majority stops serving within `--cluster-lease-ms` (new, default 10000; at least 3 × `--cluster-push-timeout-ms`). Its writes answer `Fenced`, its reads `PartitionUnavailable`, and a write whose commit outran the lease `OutcomeUnknown`. A node that granted a partition to one node withholds it from every other until that grant runs out, so after `relocate --old-unreachable` or a forced map the new node serves only once the old node has stopped. Grants are timed on each node's own clock, which counts time the machine was suspended.
-- **Reads on a cluster partition now need its lease too.** Before, a restarted node that had missed a move could serve stale reads.
-- **A cluster node that starts grants no lease for a lease and 1% more.** A whole cluster restarting serves that much later. `Cluster.Status` gains `NodeStatus.grace_remaining_ms` and `LocalPartition.lease_remaining_ms`, `Admin.Info` gains `PartitionInfo.lease_remaining_ms`, `FenceReason` gains `LEASE_LAPSED`, and `phdb cluster status` shows `fenced (lease lapsed)`.
-- **`phdb cluster unfence --force` lifts only the operator's fence:** it no longer makes a partition serve without its peers.
-- **A two-node cluster with one node down stops serving within the lease.** Run three nodes, or a single node.
-- **After a map that changes the nodes, the next change waits a lease** once a majority of the nodes before and after it hold it.

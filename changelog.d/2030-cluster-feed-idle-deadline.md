@@ -1,2 +1,0 @@
-### Fixed
-- **A `phdb serve` cluster's feed subscription dropped for idling now ends with `DeadlineExceeded`**, as a single node's does (#2030, #2021). A subscriber that left events untaken for `--stream-idle-ms` gets what was queued for it, then `DeadlineExceeded` with the `--stream-idle-ms` message. Before, the stream ended cleanly, so a client could take the drop for a real end and stop following the feed instead of resuming from its last token.

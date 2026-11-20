@@ -1,3 +1,0 @@
-### Fixed
-- **A cluster node that lost a writer election no longer stays fenced** (#2073, unreleased). Its vote for the higher term made it refuse the live writer's maps. Every other node's lease renewals waited on it too, so the whole cluster's partitions lapsed. A node fenced this way no longer holds up the others' renewals, and the writer takes a term above its vote, so the node takes the writer's map again.
-- **A partition the failover check keeps blocked is checked again on time** (#2073, unreleased). One waiting on another node's grant to its owner is checked when that grant ends, and one blocked for any reason is no longer passed over while other partitions keep going down.
