@@ -328,6 +328,51 @@ fn a_retention_hold_keeps_the_history_until_dropped_or_its_cap() {
     db.close().unwrap();
 }
 
+/// D331 (#2107's catch-up, found by its tests): a token taken after a retention hold, from a
+/// snapshot, resumes after the writes and flushes that follow. A snapshot's token starts
+/// each stream's scan at its checkpoint (it doesn't know the snapshot's place in the log),
+/// which can be segments behind the head: a hold taken from each stream's head left those
+/// to retention, and the token read as expired, though nothing after the snapshot was gone.
+/// With one table, only its stream fills segments; with eight streams sharing the feed's
+/// retention, that stream keeps too little to cover them without the hold.
+#[test]
+fn a_snapshot_token_taken_under_a_hold_resumes_after_flushes() {
+    let vfs = SimVfs::new(3328);
+    let mut o = common::options(Arc::clone(&vfs), 8, 16 << 20);
+    // The smallest retention: two segments per stream.
+    o.feed = Some(feed(1));
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let (a, _) = tables(&db);
+    // The table's stream rolls past several segments, with no checkpoint since.
+    for i in 0..12u32 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            a.id,
+            a.families[0].id,
+            format!("big{i}").as_bytes(),
+            b"q",
+            None,
+            ValueRef::Bytes(&[7u8; 60_000]),
+        )
+        .unwrap();
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    }
+    let hold = db.hold_feed_retention(u64::MAX).unwrap();
+    let snap = db.snapshot().unwrap();
+    let token = db
+        .feed(spec(&[&a], FeedStart::Snapshot(snap)))
+        .unwrap()
+        .token();
+    write_past_retention(&db, &a, 2);
+    assert_eq!(
+        resumes(&db, &a, token),
+        Some(400),
+        "the hold kept the snapshot token's history"
+    );
+    drop(hold);
+    db.close().unwrap();
+}
+
 /// On a replica database a direct silent write is refused like any other; a replica takes
 /// silent batches only as its primary's logged ones.
 #[test]
