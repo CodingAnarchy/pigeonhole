@@ -1893,3 +1893,45 @@ fn the_first_silent_commit_flags_its_bit_under_the_writers_exclusion() {
     drop(t);
     db.close().unwrap();
 }
+
+/// D331 PR 4b (feed1248's G2): a feed that includes silent records gets a range drop as
+/// an event, and a range move's catch-up asks whether it removes any of its range:
+/// half-open at both ends, an open end to the table's end, and only in its own table.
+#[test]
+fn a_range_drop_event_tells_which_ranges_it_removes() {
+    let vfs = SimVfs::new(63);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let make = |name: &str| {
+        db.table(name)
+            .unwrap()
+            .family("a", Family::default())
+            .create_if_missing()
+            .unwrap()
+    };
+    let (t, other) = (make("t"), make("u"));
+    t.mutate(b"r6").put("a", b"q", b"v").commit().unwrap();
+    let mut feed = t.feed().open().unwrap();
+    feed.include_silent();
+    db.drop_range(&t, b"r5", Some(b"r9")).unwrap();
+    let removed = loop {
+        match feed.next_event(Duration::from_secs(5)).unwrap() {
+            Some(FeedEvent::RangeDrop(d)) => break d.clone(),
+            Some(_) => {}
+            None => panic!("no range drop event"),
+        }
+    };
+    let overlaps = |s: &[u8], e: Option<&[u8]>| removed.overlaps(&t, s, e);
+    assert!(overlaps(b"r5", Some(b"r9")));
+    assert!(overlaps(b"r4", Some(b"r6")), "across its start");
+    assert!(overlaps(b"r8", None), "an open end");
+    assert!(overlaps(b"", None), "the whole table");
+    assert!(!overlaps(b"r9", None), "its end is excluded");
+    assert!(!overlaps(b"r0", Some(b"r5")), "a range ending at its start");
+    assert!(
+        !removed.overlaps(&other, b"r5", Some(b"r9")),
+        "another table"
+    );
+    drop(feed);
+    drop((t, other));
+    db.close().unwrap();
+}

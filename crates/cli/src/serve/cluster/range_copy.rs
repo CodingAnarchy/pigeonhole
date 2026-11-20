@@ -339,3 +339,79 @@ pub(super) fn logged_kind(k: pigeonhole::ChangeKind) -> u32 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole::{Family, FeedRetention, Options, Pigeonhole};
+
+    /// A partition's database with a change feed, in small WAL segments so a few
+    /// megabytes of writes pass its retention.
+    fn db(name: &str) -> (Pigeonhole, pigeonhole::Table) {
+        let dir = crate::test_dir::fresh(&format!("phdb-range-copy-{name}-"));
+        let db = Pigeonhole::open(
+            dir.join("p.phdb"),
+            Options::default()
+                .create_if_missing(true)
+                .shards(1)
+                .wal_segment_size(256 << 10)
+                .change_feed(FeedRetention::bytes(1 << 20)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        (db, t)
+    }
+
+    #[test]
+    fn a_full_follower_cap_refuses_a_new_moves_copy_and_counts_it() {
+        let (db, t) = db("cap");
+        let s = Sources::new(1 << 20, u64::MAX, 2);
+        let first = s.begin("m1", "p1", &db, &t).unwrap();
+        s.begin("m2", "p1", &db, &t).unwrap();
+        let e = s.begin("m3", "p1", &db, &t).unwrap_err();
+        assert_eq!(e.code, "Overloaded", "{}", e.message);
+        assert!(e.message.contains("--max-move-followers"), "{}", e.message);
+        // A target that restarted asks again: its move keeps its slot and its token.
+        assert_eq!(s.begin("m1", "p1", &db, &t).unwrap(), first);
+        assert_eq!(s.refused.load(Ordering::Relaxed), 1);
+        let mut text = String::new();
+        s.render_metrics(&mut text);
+        assert!(
+            text.contains("pigeonhole_cluster_move_copies_refused_total 1"),
+            "{text}"
+        );
+        drop(s);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn a_hold_past_its_cap_is_reported_lapsed() {
+        let (db, t) = db("lapse");
+        let s = Sources::new(1 << 20, 1, 2);
+        s.begin("m1", "p1", &db, &t).unwrap();
+        assert!(!s.lapsed("m1"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut i = 0u32;
+        // The cap is enforced by the feed's maintenance, as checkpoints move: values the log
+        // keeps inline, flushed as they go (the engine's own lapse test writes so).
+        while !s.lapsed("m1") && Instant::now() < deadline {
+            for _ in 0..40 {
+                t.mutate(format!("r{i}").as_bytes())
+                    .put("f", b"q", &[7u8; 20_000])
+                    .commit()
+                    .unwrap();
+                i += 1;
+            }
+            db.flush().unwrap();
+        }
+        assert!(s.lapsed("m1"), "the move's hold lapsed past its cap");
+        assert!(!s.lapsed("m2"), "no such move");
+        drop(s);
+        db.close().unwrap();
+    }
+}
