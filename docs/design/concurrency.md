@@ -477,11 +477,13 @@ Uncertainties: `Drivers`, `LiveSeqnos`, `MaintenanceGuard`, `Waiter`/`Notifier` 
 
 ## Appendix C: The other `engine/src` files (manifest, snapshot, read path, flush, compaction, wakers)
 
-Files covered: admission.rs, catalog.rs, compact.rs, error.rs, feed.rs, feed_reader.rs, flush.rs, large.rs, lib.rs, maintenance.rs,
-manifest.rs, nonblocking.rs, options.rs, read.rs, row_cache.rs, snapshot.rs, source.rs,
-waker.rs, write.rs. catalog.rs, error.rs, lib.rs, options.rs, large.rs, maintenance.rs and
-nonblocking.rs declare no primitive of their own (large.rs, maintenance.rs and nonblocking.rs
-use `Shared` fields declared in shard.rs; see "Used here, declared elsewhere" below).
+Files covered: admission.rs, catalog.rs, compact.rs, error.rs, feed.rs, feed_reader.rs (and its
+modules feed_reader/catalog.rs, history.rs, read_ahead.rs and token.rs, #1988), flush.rs, large.rs,
+lib.rs, maintenance.rs, manifest.rs, nonblocking.rs, options.rs, read.rs, row_cache.rs, snapshot.rs,
+source.rs, waker.rs, write.rs. catalog.rs, error.rs, lib.rs, options.rs, large.rs, maintenance.rs,
+nonblocking.rs and feed_reader's four modules declare no primitive of their own (large.rs,
+maintenance.rs and nonblocking.rs use `Shared` fields declared in shard.rs; see "Used here,
+declared elsewhere" below).
 
 **40 rows** (30 struct fields / statics + 10 `thread_local!`s), giving 34 production primitives after taking out the 3 test-only rows (`FlushTask::install_seqnos`, `SeqnoCell.0`, `BETWEEN_ROW_FAMILIES`; 2 test hooks, since `SeqnoCell.0` holds `install_seqnos`' atomics) and the handles counted elsewhere. `FlushItem::guard` and `CompactionWork::guard` are handles to the `PurgeGuard` cells appendix A counts (`ShardState::guarded`, `CompactionGuard::state`), and `SstSink::sst_ids` to `Shared::sst_ids`; they are not counted again: **34 production primitives** in this appendix.
 
