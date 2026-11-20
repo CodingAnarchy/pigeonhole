@@ -610,7 +610,8 @@ fn a_partition_restored_alone_to_another_node_while_its_node_is_down() {
         put_row(a, "y-later", 100).await;
         // c's process stops: its p3 can't be fenced or closed.
         let _ = stops.remove(2).send(());
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Until c refuses, not a fixed sleep (#2105).
+        stopped(ports[2]).await;
         let e = restore(&args(a), &part_args(&out, "p3", Some("b")))
             .await
             .err()

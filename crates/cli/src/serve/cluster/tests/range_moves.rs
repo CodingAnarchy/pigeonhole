@@ -844,7 +844,7 @@ fn a_target_restarted_between_chunks_and_in_its_catch_up_resumes_and_counts_once
                 .await
                 .is_err()
         }));
-        let listener = std::net::TcpListener::bind(("127.0.0.1", b)).unwrap();
+        let listener = HeldPort::take(b).listen();
         let limits = crate::serve::server_tests::limits();
         let (stop, _) = data_node_on(
             &rt,
@@ -1494,7 +1494,7 @@ fn a_target_reopened_mid_copy_gates_nothing_by_its_progress_rows() {
             .await
             .is_err()
     }));
-    let listener = std::net::TcpListener::bind(("127.0.0.1", b)).unwrap();
+    let listener = HeldPort::take(b).listen();
     let limits = crate::serve::server_tests::limits();
     let (_stop_b2, _) = data_node_on(
         &t.rt,
