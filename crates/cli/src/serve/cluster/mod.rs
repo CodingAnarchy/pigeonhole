@@ -34,6 +34,7 @@ pub(crate) mod position;
 pub(crate) mod promote;
 pub(crate) mod range_copy;
 pub(crate) mod range_feed;
+pub(crate) mod range_fence;
 pub(crate) mod range_follow;
 mod restore;
 pub(crate) mod route;
@@ -1659,6 +1660,12 @@ impl Node {
                 if let Some(copies) = self.range_copies() {
                     for s in lp.moves.iter_mut().filter(|s| s.source) {
                         s.retention_lapsed = copies.lapsed(&s.id);
+                    }
+                }
+                // PR 5: a source's fence seqno, once its fence drained.
+                if let Some(fences) = self.range_fences() {
+                    for s in lp.moves.iter_mut().filter(|s| s.source) {
+                        s.fence_seqno = fences.seqno(&s.id);
                     }
                 }
                 if let Some(follows) = self.range_follows() {

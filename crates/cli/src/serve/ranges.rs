@@ -288,6 +288,9 @@ enum Rule {
     /// the PR 2 review: a forced map): its copy here may be cleaned, so serving it would
     /// answer rows as absent.
     Returned,
+    /// Nothing refused: a source's range a move before its commit point copies (D331 PR 5),
+    /// whose writes in a transaction its in-doubt watch tags ([`RangeGate::prepared`]).
+    Watch,
 }
 
 /// One gated range of one table.
@@ -383,6 +386,7 @@ impl RangeState {
                     continue;
                 }
                 refused = match s.rule {
+                    Rule::Watch => continue,
                     Rule::Fenced if !write => continue,
                     Rule::Fenced => Some(ApiError::range_moving(format!(
                         "partition {:?} is handing table {table:?}'s range over to another \
@@ -464,6 +468,21 @@ impl RangeState {
 }
 
 impl RangeState {
+    /// The moves whose watched ranges (D331 PR 5) `rows` write: a transaction's tags.
+    pub(crate) fn watched(&self, rows: &[super::proto::RowWrites]) -> Vec<String> {
+        let mut moves = Vec::new();
+        for s in self.spans.iter().filter(|s| s.rule == Rule::Watch) {
+            let hit = rows
+                .iter()
+                .filter_map(|r| r.row.as_ref())
+                .any(|k| k.table == s.table && s.overlaps(Touch::Row(&k.row)));
+            if hit && !moves.contains(&s.move_id) {
+                moves.push(s.move_id.clone());
+            }
+        }
+        moves
+    }
+
     /// Whether every key of `table` is in a range this partition moved away (feed1248's M3
     /// on PR 3b): its `Moved` spans cover the table from its first key on, unbroken.
     pub(crate) fn moved_whole(&self, table: &str) -> bool {
@@ -520,6 +539,20 @@ pub(crate) struct RangeGate {
     /// cluster component of the partition looks for a new hand-over's barrier, or for its
     /// tables having moved away whole (feed1248's M3 on PR 3b), when it moves.
     rows_version: std::sync::atomic::AtomicU64,
+    /// D331 PR 5's in-doubt watch (simp724's rule on the design): raised as each move's
+    /// watch begins here, after the state that holds its `Watch` span is stored; a
+    /// transaction's first write reads it before the state (both `SeqCst`), so one that
+    /// reads it at or past a watch's begin sees that watch's span.
+    watch_seq: std::sync::atomic::AtomicU64,
+    watch: Mutex<WatchBook>,
+}
+
+/// What the in-doubt watch knows: when each watching move's watch began here, and each
+/// prepared share's [`Watched`](super::sessions::Watched), by xid, while it's in doubt.
+#[derive(Debug, Default)]
+struct WatchBook {
+    begun: std::collections::HashMap<String, u64>,
+    prepared: std::collections::HashMap<Vec<u8>, super::sessions::Watched>,
 }
 
 impl RangeGate {
@@ -626,7 +659,29 @@ impl RangeGate {
             prev.as_deref(),
             visible,
         );
+        let watching: Vec<String> = next
+            .as_ref()
+            .map(|s| {
+                s.spans
+                    .iter()
+                    .filter(|s| s.rule == Rule::Watch)
+                    .map(|s| s.move_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         self.state.store(next.map(Arc::new));
+        // Each new watch begins after its span is in the stored state.
+        {
+            let mut book = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+            book.begun.retain(|id, _| watching.contains(id));
+            for id in watching {
+                book.begun.entry(id).or_insert_with(|| {
+                    self.watch_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1
+                });
+            }
+        }
         self.pending
             .store(pending, std::sync::atomic::Ordering::Release);
         self.rows_version
@@ -636,6 +691,41 @@ impl RangeGate {
     /// Whether the state waits for a row the file doesn't hold yet (see `pending`).
     pub(crate) fn pending(&self) -> bool {
         self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// D331 PR 5: the watch sequence a transaction's write reads before it loads the state
+    /// (its first write's is the one kept).
+    pub(crate) fn watch_seq(&self) -> u64 {
+        self.watch_seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records branch `xid`'s prepared share and what its writes were seen to touch.
+    pub(crate) fn prepared(&self, xid: &[u8], watched: super::sessions::Watched) {
+        self.watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .prepared
+            .insert(xid.to_vec(), watched);
+    }
+
+    /// The shares of `in_doubt` (the partition's in-doubt xids now) that may touch move
+    /// `id`'s range (simp724's rule): all but those whose first write came at or after the
+    /// move's watch began here and that wrote none of its range. A move not watched here
+    /// counts every one. Forgets the prepared shares no longer in doubt.
+    pub(crate) fn in_doubt_on(&self, id: &str, in_doubt: &[Vec<u8>]) -> usize {
+        let mut book = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+        book.prepared.retain(|xid, _| in_doubt.contains(xid));
+        let Some(&begun) = book.begun.get(id) else {
+            return in_doubt.len();
+        };
+        in_doubt
+            .iter()
+            .filter(|xid| {
+                !book.prepared.get(*xid).is_some_and(|w| {
+                    w.first.is_some_and(|f| f >= begun) && !w.moves.iter().any(|m| m == id)
+                })
+            })
+            .count()
     }
 }
 
@@ -674,6 +764,9 @@ fn derive(
         }
         let phase = map::phase(m);
         if m.from == partition {
+            if map::before_commit(phase) {
+                spans.extend(span(m, Rule::Watch));
+            }
             match phase {
                 MovePhase::HandingOver => spans.extend(span(m, Rule::Fenced)),
                 MovePhase::HandedOver | MovePhase::Cleaning => {
@@ -1397,6 +1490,82 @@ mod tests {
         assert!(s[0].source && !s[0].fenced && s[0].serving);
         let t = statuses(&map(Some(MovePhase::Aborting)), "p2");
         assert!(!t[0].serving);
+    }
+
+    // D331 PR 5, simp724's rule: a share in doubt is clear of a move only when its first
+    // write came at or after the move's watch began here and it wrote none of the range.
+    #[test]
+    fn a_share_in_doubt_holds_a_moves_fence_unless_it_provably_missed_the_range() {
+        use crate::serve::sessions::Watched;
+        let g = RangeGate::default();
+        let before = g.watch_seq();
+        // A share written before any watch, prepared before it began.
+        g.prepared(
+            b"x-early",
+            Watched {
+                first: Some(before),
+                moves: Vec::new(),
+            },
+        );
+        g.update(&map(Some(MovePhase::Copying)), "p1", 10);
+        let begun = g.watch_seq();
+        assert!(begun > before, "the watch began");
+        // Written after, off the range; written after, on it; never recorded (from before a
+        // restart); and a write before the watch prepared after it (simp724's (g)).
+        g.prepared(
+            b"x-off",
+            Watched {
+                first: Some(begun),
+                moves: Vec::new(),
+            },
+        );
+        g.prepared(
+            b"x-on",
+            Watched {
+                first: Some(begun),
+                moves: vec!["mv1".into()],
+            },
+        );
+        g.prepared(
+            b"x-straddle",
+            Watched {
+                first: Some(before),
+                moves: Vec::new(),
+            },
+        );
+        let all = |xs: &[&[u8]]| xs.iter().map(|x| x.to_vec()).collect::<Vec<_>>();
+        assert_eq!(g.in_doubt_on("mv1", &all(&[b"x-off"])), 0);
+        for x in [&b"x-early"[..], b"x-on", b"x-unknown", b"x-straddle"] {
+            assert_eq!(g.in_doubt_on("mv1", &all(&[x, b"x-off"])), 1, "{x:?}");
+        }
+        // A move not watched here counts every share.
+        assert_eq!(g.in_doubt_on("mv9", &all(&[b"x-off"])), 1);
+        // Decided shares are forgotten.
+        assert_eq!(g.in_doubt_on("mv1", &[]), 0);
+        assert_eq!(
+            g.in_doubt_on("mv1", &all(&[b"x-on"])),
+            1,
+            "unknown once forgotten"
+        );
+        // The watch is the source's, before the commit point only, and refuses nothing.
+        let t = g.state.load_full().expect("a watch span");
+        assert_eq!(code(&t, &put("d")), None);
+        assert_eq!(
+            t.watched(&[proto::RowWrites {
+                row: Some(proto::RowKey {
+                    table: "users".into(),
+                    row: prost::bytes::Bytes::from_static(b"d"),
+                }),
+                ..Default::default()
+            }]),
+            ["mv1"]
+        );
+        g.update(&map(Some(MovePhase::HandedOver)), "p1", 10);
+        assert!(
+            g.state
+                .load_full()
+                .is_none_or(|s| s.watched(&[]).is_empty())
+        );
     }
 
     // D331 PR 5: ABORTING is out of the phases' order (above CLEANING in number), and the

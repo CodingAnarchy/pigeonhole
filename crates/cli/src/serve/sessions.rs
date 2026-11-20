@@ -87,6 +87,19 @@ struct Entry {
     /// A spanning transaction's home session: what each partition did (`None` while a call
     /// has it out, as the transaction).
     span: Option<Span>,
+    /// What a range move's in-doubt watch needs of its writes (D331 PR 5): out of the entry
+    /// with the transaction.
+    watched: Watched,
+}
+
+/// A transaction's writes as D331 PR 5's in-doubt watch sees them (simp724's rule): the
+/// partition's watch sequence at its first write, and the moves whose watched ranges it
+/// wrote. Its branch's prepare records both
+/// ([`RangeGate::prepared`](super::ranges::RangeGate::prepared)).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Watched {
+    pub(crate) first: Option<u64>,
+    pub(crate) moves: Vec<String>,
 }
 
 /// A spanning transaction's coordinator state (D329), kept in its home session's entry:
@@ -359,6 +372,7 @@ impl Sessions {
                 opened: now,
                 xid,
                 span,
+                watched: Watched::default(),
             },
         );
         Ok(())
@@ -564,6 +578,7 @@ impl Sessions {
                     durability: e.durability,
                     wrote: e.wrote,
                     span: e.span.take(),
+                    watched: std::mem::take(&mut e.watched),
                     ended: false,
                 }))
             }
@@ -764,13 +779,21 @@ impl Sessions {
     }
 
     /// Puts a call's transaction back, or (with `None`) records that the call lost it.
-    fn put_back(&self, id: &Id, txn: Option<Transaction>, wrote: bool, span: Option<Span>) {
+    fn put_back(
+        &self,
+        id: &Id,
+        txn: Option<Transaction>,
+        wrote: bool,
+        span: Option<Span>,
+        watched: Watched,
+    ) {
         let now = Instant::now();
         let mut t = self.lock();
         if let Some(e) = t.map.get_mut(id) {
             e.busy = 0;
             e.wrote |= wrote;
             e.span = span;
+            e.watched = watched;
             e.renew(now);
             e.state = match txn {
                 Some(txn) => State::Txn(Some(txn)),
@@ -830,6 +853,8 @@ pub(crate) struct TxnGuard {
     wrote: bool,
     /// A spanning transaction's coordinator state, out of its entry with the transaction.
     span: Option<Span>,
+    /// The entry's [`Watched`], put back with the transaction.
+    watched: Watched,
     ended: bool,
 }
 
@@ -860,6 +885,23 @@ impl TxnGuard {
     /// Whether the transaction has buffered writes from a `TxnWrite`.
     pub(crate) fn wrote(&self) -> bool {
         self.wrote
+    }
+
+    /// Records a write for D331 PR 5's in-doubt watch: `seq`, the partition's watch sequence
+    /// read before its range state, if it's the first; and the moves whose watched ranges
+    /// it touched.
+    pub(crate) fn note_write(&mut self, seq: u64, moves: Vec<String>) {
+        self.watched.first.get_or_insert(seq);
+        for m in moves {
+            if !self.watched.moves.contains(&m) {
+                self.watched.moves.push(m);
+            }
+        }
+    }
+
+    /// What the in-doubt watch has seen of the transaction's writes.
+    pub(crate) fn watched(&self) -> &Watched {
+        &self.watched
     }
 
     /// A spanning transaction's coordinator state (D329): `None` for any other session.
@@ -897,8 +939,13 @@ impl TxnGuard {
 impl Drop for TxnGuard {
     fn drop(&mut self) {
         if !self.ended {
-            self.sessions
-                .put_back(&self.id, self.txn.take(), self.wrote, self.span.take());
+            self.sessions.put_back(
+                &self.id,
+                self.txn.take(),
+                self.wrote,
+                self.span.take(),
+                std::mem::take(&mut self.watched),
+            );
         }
     }
 }

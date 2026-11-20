@@ -1268,6 +1268,47 @@ fn three() -> Three {
     }
 }
 
+/// D331 PR 5 (feedback F1–F3): a source at HANDING_OVER reports its fence's seqno once the
+/// writes admitted before the fence finished, at or past every write to the range it took;
+/// writes outside the range go on, and the seqno it reports stays the same.
+#[test]
+fn a_fenced_source_reports_its_fence_seqno_past_every_range_write() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    t.rt.block_on(async {
+        for i in 0..20 {
+            try_put(c, "d", &i.to_string()).await.unwrap();
+        }
+        push(&t.ports, &moving(&t.v1, 2, Some(MovePhase::Copying))).await;
+        push(&t.ports, &moving(&t.v1, 3, Some(MovePhase::CatchingUp))).await;
+        try_put(c, "e", "last").await.unwrap();
+        let last = t.db_a.visible_seqno();
+        assert_eq!(
+            move_status(a, "p1", "mv1").await.map(|s| s.fence_seqno),
+            Some(0),
+            "no fence before HANDING_OVER"
+        );
+        push(&t.ports, &moving(&t.v1, 4, Some(MovePhase::HandingOver))).await;
+        let mut seqno = 0;
+        eventually("a reports its fence seqno", async || {
+            seqno = move_status(a, "p1", "mv1")
+                .await
+                .map_or(0, |s| s.fence_seqno);
+            seqno != 0
+        })
+        .await;
+        assert!(seqno >= last, "{seqno} < {last}");
+        // The range is fenced; the rest of p1 takes writes, and the seqno stays.
+        assert_eq!(code(&try_put(c, "d", "x").await.unwrap_err()), "Fenced");
+        try_put(c, "a", "1").await.unwrap();
+        assert!(t.db_a.visible_seqno() > seqno);
+        assert_eq!(
+            move_status(a, "p1", "mv1").await.map(|s| s.fence_seqno),
+            Some(seqno)
+        );
+    });
+}
+
 /// `row`'s puts of `cells` values of `bytes` each, qualifiers `q0`.. (one commit).
 fn wide_row(row: &str, cells: usize, bytes: usize) -> crate::serve::proto::RowWrites {
     use crate::serve::proto::{Put, RowKey, RowWrites, Value, Write, value, write};

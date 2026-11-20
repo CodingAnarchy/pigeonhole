@@ -141,7 +141,29 @@ impl Node {
         if raised {
             self.ask_after_raise();
         }
+        // D331 PR 5: a fence it holds as a move's source reports its seqno.
+        if let (Some(shared), Ok(map), Some((gate, _))) = (
+            self.server.get().and_then(|o| o.shared.upgrade()),
+            self.get_map(),
+            self.fences.gate(id),
+        ) && let Some(cluster) = shared.router.cluster.as_ref()
+        {
+            cluster
+                .range_fences
+                .sync(&self.me, &map, id, &gate, db, shared.limits.request_timeout);
+        }
         Ok(())
+    }
+
+    /// The range moves' fences this node's partitions hold as their source (D331 PR 5), once
+    /// it serves.
+    pub(super) fn range_fences(&self) -> Option<std::sync::Arc<super::range_fence::Fences>> {
+        let shared = self.server.get().and_then(|o| o.shared.upgrade())?;
+        shared
+            .router
+            .cluster
+            .as_ref()
+            .map(|c| std::sync::Arc::clone(&c.range_fences))
     }
 
     /// The range copies this node serves as a source (D331 PR 4b), once it serves.
@@ -190,12 +212,23 @@ impl Node {
         // moves it follows as their target start or stop (M2).
         cluster.range_copies.release_gone(map, &self.id);
         cluster.range_follows.sync(map, &self.id, &shared);
+        cluster.range_fences.forget_gone(map);
         let mut raised = false;
         for (id, service) in cluster.parts.load().iter() {
             let (Some((gate, _)), Ok(part)) = (self.fences.gate(id), service.part()) else {
                 continue;
             };
-            match self.settle(&gate, id, &part.db, map) {
+            let settled = self.settle(&gate, id, &part.db, map);
+            // D331 PR 5: its fences as a move's source report their seqnos.
+            cluster.range_fences.sync(
+                &self.me,
+                map,
+                id,
+                &gate,
+                &part.db,
+                shared.limits.request_timeout,
+            );
+            match settled {
                 Ok(up) => raised |= up,
                 Err(e) => eprintln!(
                     "phdb serve: partition {id} couldn't take map version {}'s range moves: \
