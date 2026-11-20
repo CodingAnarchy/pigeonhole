@@ -27,9 +27,9 @@ Pigeonhole 1.3.0 grows `phdb serve`'s clusters. Files stay in format 4; read "Up
 - **Clusters: the cluster token now fences, unfences, closes, copies and drops partitions on a peer** (for the writer's moves). Protect it as you protect an admin token.
 - **Rolling back to 1.2:**
   - A **packed text index** (`Index::pack`, `--text-pack`) can't be opened by 1.2. Nothing packs unless you ask.
-  - A partition that took part in a **transaction across partitions** sets `incompat` bit 2 (D329), and one that held a **range move's** copy or cleanup sets bit 3 (D331): 1.2 refuses either file (`UnsupportedFeature`). *(Draft: bit 2 has no entry of its own below; #2062 and #2076 changed the format without a fragment line. Confirm the wording with the D329 owner.)*
+  - A partition that took part in a **transaction across partitions** that wrote (its home, once it reached the commit point, or any branch) sets `incompat` bit 2 (D329), and so does a replica copy that applied such a share; a read-only one sets nothing. A partition that held a **range move's** copy or cleanup sets bit 3 (D331). 1.2 refuses a file with either bit (`UnsupportedFeature`).
   - A **token of a feed of every table** taken by 1.3 (version 3) is refused by 1.2.0 (`InvalidArgument`); 1.2.1 and later resume it.
-  - Don't roll a cluster node back once the map has an index, a memory placement or a writer term; a forced map from a 1.3 node recovers it. *(Draft: confirm with the D330 owner what a 1.2 node does with a map carrying a term.)*
+  - Don't roll a cluster node back to 1.2 once the map has an index or a memory placement (a forced map from a 1.3 node recovers it), or a writer term (failover turned on, or any forced map since the upgrade): upgrade that node back to 1.3, then force a map if it still reads as divergent.
 - **Shared memory:** the layout version is unchanged, so 1.2 and 1.3 reader processes work with either writer. A 1.3 writer sets a flag a 1.3 reader uses to expire a feed of every table once the feed's sidecar can't be written; a 1.2 reader ignores it and waits, as before.
 - **Behaviour changes to know:**
   - `Schema.DropTable` of a text index's source table is refused with `FailedPrecondition`; drop the indexes first.
