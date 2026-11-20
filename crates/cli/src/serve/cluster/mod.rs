@@ -32,6 +32,9 @@ pub(crate) mod moving;
 pub(crate) mod open;
 pub(crate) mod position;
 pub(crate) mod promote;
+pub(crate) mod range_copy;
+pub(crate) mod range_feed;
+pub(crate) mod range_follow;
 mod restore;
 pub(crate) mod route;
 pub(crate) mod schema;
@@ -1637,6 +1640,29 @@ impl Node {
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).
             if let Some(m) = &map {
                 lp.moves = crate::serve::ranges::statuses(m, &id);
+                // PR 4b: a source whose move's retention hold lapsed; a target's follower.
+                if let Some(copies) = self.range_copies() {
+                    for s in lp.moves.iter_mut().filter(|s| s.source) {
+                        s.retention_lapsed = copies.lapsed(&s.id);
+                    }
+                }
+                if let Some(follows) = self.range_follows() {
+                    for s in lp.moves.iter_mut().filter(|s| !s.source) {
+                        if let Some(p) = follows.progress(&s.id) {
+                            s.copied_bytes =
+                                p.copied_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                            s.copy_done = p.copy_done.load(std::sync::atomic::Ordering::Relaxed);
+                            s.source_applied_seqno =
+                                p.applied.load(std::sync::atomic::Ordering::Acquire);
+                            s.follower_error = p
+                                .failed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone()
+                                .unwrap_or_default();
+                        }
+                    }
+                }
             }
         }
         let (writer, writer_term, writer_lease) = map.as_ref().map_or_else(
@@ -2325,6 +2351,20 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
             .await?;
             return Ok(tonic::Response::new(reply));
         }
+        // D331 PR 4b: a range move's copy chunk, answered by the source's copy server.
+        if let Some(proto::forward_request::Op::RangeCopy(r)) = msg.op {
+            let Some(cluster) = shared.router.cluster.as_ref() else {
+                return Err(ApiError::unsupported("this node isn't a cluster node").into());
+            };
+            let chunk = cluster
+                .range_copies
+                .serve(cluster, &msg.partition, r)
+                .await?;
+            return Ok(tonic::Response::new(proto::ForwardResponse {
+                reply: Some(proto::forward_response::Reply::RangeCopy(chunk)),
+                ..Default::default()
+            }));
+        }
         let op = forward::op_of(msg.op)?;
         // A schema change at the map's writer takes its caller's scope uncapped, from this
         // node's own token entry (D317 amendment 1).
@@ -2895,6 +2935,11 @@ pub(crate) fn run(
     let shared = Arc::new(super::Shared {
         router: super::router::Router::cluster(service, Arc::clone(&node), parts)
             .max_uploads(args.max_uploads)
+            .range_moves(
+                args.move_rate_bytes,
+                args.move_retention_cap,
+                args.max_move_followers,
+            )
             .memory_recipe(recipe),
         // The data calls' tokens: the same file the node's own calls read.
         tokens: super::tokens(args)?,
@@ -2922,15 +2967,18 @@ pub(crate) fn run(
         },
     );
     // A node that restarts with a map takes a newer one from its peers, then pushes; and
-    // D329's resolver starts once it serves.
+    // D329's resolver starts once it serves, as do the range moves it follows as a target
+    // (D331 PR 4b), each from its progress rows.
     let resolver =
         spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
     let sync = start_sync(&node, version);
+    let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
         if let Some(sync) = sync {
             sync();
         }
         resolver();
+        follows.start_range_follows();
     }));
     super::serve_shared(
         super::Serving {

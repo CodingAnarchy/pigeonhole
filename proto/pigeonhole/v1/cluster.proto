@@ -397,6 +397,18 @@ message MoveStatus {
   bool fenced = 5;
   // The partition serves the range here.
   bool serving = 6;
+  // D331 PR 4b, on the target: the bytes copied so far, whether the copy is done, and the
+  // source's seqno its catch-up has passed (PR 5 checks it against `final_seqno`).
+  uint64 copied_bytes = 7;
+  bool copy_done = 8;
+  uint64 source_applied_seqno = 9;
+  // On the source: the move's feed retention hold lapsed (past `--move-retention-cap`, or
+  // lost to a restart of the source); the move can't catch up and must be aborted.
+  bool retention_lapsed = 10;
+  // On the target: why its range follower stopped for good (the source's history expired,
+  // a range drop of the range, a row left partly copied, the source failed over); empty
+  // while it runs or once it's done. PR 5's driver aborts the move on it.
+  string follower_error = 11;
 }
 
 // D330: one failover of a partition to a replica, or one writer election, as the writer
@@ -877,6 +889,8 @@ message ForwardRequest {
     // A client's `Transactions.Outcome` for a transaction whose home this node isn't
     // (D329): the client's caller rides `caller`, write scope.
     TxnOutcomeRequest txn_outcome = 52;
+    // D331 PR 4b: one chunk of a range move's copy, from the move's target to its source.
+    RangeCopyRequest range_copy = 49;
   }
 }
 
@@ -1092,6 +1106,8 @@ message ForwardResponse {
     BranchPrepared branch_prepare = 25;
     TxnResolution resolve_txn = 26;
     TxnOutcomeResponse txn_outcome = 30;
+    // D331 PR 4b: `range_copy`'s chunk.
+    RangeCopyResponse range_copy = 27;
   }
   // The seqno the serving node read at, in the owner's numbering (D328's
   // `x-pigeonhole-served-seqno`): a replica copy's applied seqno after the read, or the
@@ -1117,6 +1133,51 @@ message ForwardSubscribeRequest {
   // resume whose token lacks this partition because a range move gave it the tables since.
   // `FeedExpired` if no move did, or its feed has trimmed past that position.
   bool from_hand_over = 6;
+  // D331 PR 4b, a range move's catch-up (internal): the rows `[range_start, range_end)` of
+  // the request's one table, an absent bound open. With `raw`, the commits' changes in the
+  // range come as `FeedEvent.raw_commits`, the commits ready at once batched, stored values
+  // and kinds as logged; accepted
+  // only for the bounds of a live move from this partition (COPYING through HANDED_OVER).
+  SplitKey range_start = 7;
+  SplitKey range_end = 8;
+  bool raw = 9;
+}
+
+// D331 PR 4b: one chunk of a range move's copy (`ForwardRequest.range_copy`). The source
+// serves it only as the partition's owner at the map's epoch, for a live move naming it as
+// `from` in COPYING.
+message RangeCopyRequest {
+  string move_id = 1;
+  string table = 2;
+  // The row to start at; empty: the move's start.
+  bytes after = 3;
+  // The most bytes to read for the chunk (it ends at a row boundary past them).
+  uint64 max_bytes = 4;
+}
+
+// D331 PR 4b: a range copy's chunk, as a compaction would write it at its snapshot.
+message RangeCopyResponse {
+  repeated RangeCopyCell cells = 1;
+  // The row to ask for next; absent: the range is done.
+  optional bytes next = 2;
+  // The chunk's snapshot.
+  uint64 snapshot_seqno = 3;
+  // The source's feed token at the first chunk's snapshot (the catch-up starts there);
+  // empty on later chunks.
+  bytes token = 4;
+}
+
+// One cell of a range copy, as its source logged it.
+message RangeCopyCell {
+  string family = 1;
+  // The logged kind (FORMAT §2: put 1, merge 2, cell delete 3, column delete 4, family
+  // delete 5).
+  uint32 kind = 2;
+  bytes row = 3;
+  bytes qualifier = 4;
+  uint64 timestamp = 5;
+  // The stored value, tag byte first; empty for a delete.
+  bytes stored = 6;
 }
 
 // D326: a node's lease round asks each node of its map, itself included, for a grant.

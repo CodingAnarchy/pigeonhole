@@ -464,6 +464,32 @@ impl ApiError {
         )
     }
 
+    /// D331 PR 4b: a range move's source holds no feed retention for it any more (it
+    /// restarted, or its target went idle), so the move can't catch up. Internal to the
+    /// target's follower, which stops the move on it (cli692 on #2107).
+    pub(crate) fn move_lapsed(message: impl Into<String>) -> Self {
+        Self::new(
+            "MoveLapsed",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
+    /// D331 PR 4b: a range move's catch-up stream ended by a range drop on its source that
+    /// removed some of its range. Internal to the target's follower, which stops the move
+    /// on it; never a client's.
+    pub(crate) fn range_dropped(message: impl Into<String>) -> Self {
+        Self::new(
+            "RangeDropped",
+            0,
+            message,
+            tonic::Code::FailedPrecondition,
+            StatusCode::CONFLICT,
+        )
+    }
+
     /// D331: a write touching a range its partition is handing over to another (reason
     /// `RANGE_MOVING`), refused before anything is written. Unlike the operator's fence it's
     /// retry-safe and short: the range takes writes again at its target once the hand-over's

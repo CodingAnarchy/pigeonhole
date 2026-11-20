@@ -1330,13 +1330,22 @@ fn data_node_served(
     };
     let resolver =
         super::spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
         if let Some(sync) = sync {
             sync();
         }
         resolver();
+        follows.start_range_follows();
     }));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    // Stopped at the server's stop, before its listener closes, as `run` stops them (D331
+    // PR 4b).
+    let follows = shared
+        .router
+        .cluster
+        .as_ref()
+        .map(|c| Arc::clone(&c.range_follows));
     let app = crate::serve::http::router(shared);
     rt.spawn(async move {
         listener.set_nonblocking(true).unwrap();
@@ -1347,6 +1356,9 @@ fn data_node_served(
             app,
             async {
                 let _ = stopped.await;
+                if let Some(follows) = follows {
+                    follows.stop_all().await;
+                }
             },
             Duration::from_millis(100),
             None,

@@ -2579,15 +2579,14 @@ impl Engine {
 
     /// Holds the change feed's retained history from now on (D331, ICR 0141): a feed token
     /// from now, or of a snapshot opened after it (not one opened before), resumes until the
-    /// hold is dropped, or
-    /// until the database retains more than `cap_bytes` of history, when the hold lapses
-    /// ([`FeedRetentionHold::lapsed`]) and retention trims as before. It keeps each WAL
-    /// stream from its checkpoint, where a snapshot's token starts reading. A range move
-    /// takes one before its copy's first snapshot, so its catch-up from that snapshot's token
-    /// finds the history there however long the copy takes, or the move learns it can't. The WAL
-    /// grows by the writes made while it holds. `InvalidArgument` without the change feed;
-    /// `Busy` before every stream has opened.
-    /// Not part of the stable API.
+    /// hold is dropped, or until the database retains more than `cap_bytes` of history, when
+    /// the hold lapses ([`FeedRetentionHold::lapsed`]) and retention trims as before. It
+    /// keeps each WAL stream from its checkpoint, where a snapshot's token starts reading. A
+    /// range move takes one before its copy's first snapshot, so its catch-up from that
+    /// snapshot's token finds the history there however long the copy takes, or the move
+    /// learns it can't. The WAL grows by the writes made while it holds. `InvalidArgument`
+    /// without the change feed; `Busy` before every stream has opened. Not part of the stable
+    /// API.
     #[doc(hidden)]
     pub fn hold_feed_retention(&self, cap_bytes: u64) -> Result<FeedRetentionHold> {
         let shared = &self.inner.shared;

@@ -277,6 +277,20 @@ pub(crate) struct ServeArgs {
     /// relocation's files, D317); more are refused (`Overloaded`).
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub max_uploads: usize,
+    /// A cluster node's copy bandwidth for range moves, in bytes a second (D331): every
+    /// move copying from one of its partitions shares it. The catch-up that follows a copy
+    /// isn't counted. 64 MiB/s until the reference machine's run sizes it.
+    #[arg(long, value_name = "BYTES", default_value_t = 64 << 20)]
+    pub move_rate_bytes: u64,
+    /// The most change-feed history a range move's source keeps for its catch-up, in bytes
+    /// (D331): past it the hold lapses, and the move must be aborted rather than catch up
+    /// from history that's gone. 4 GiB until the reference machine's run sizes it.
+    #[arg(long, value_name = "BYTES", default_value_t = 4 << 30)]
+    pub move_retention_cap: u64,
+    /// Range moves a cluster node copies from its partitions at once (D331); a further
+    /// move's copy is refused (`Overloaded`) until one ends.
+    #[arg(long, value_name = "N", default_value_t = 2)]
+    pub max_move_followers: usize,
     /// Turn the change feed on, keeping up to this many bytes of history: `Feed.Subscribe`
     /// and replicas (`Replication.Follow`) read it. Without it, a database whose feed is on
     /// keeps it (the open inherits it). A replica that falls further behind than this
