@@ -230,6 +230,9 @@ pub(crate) enum Peek {
     Live,
     Done(Outcome),
     Gone,
+    /// A spanning transaction's entry that another principal owns (#2077, audit120's S5 on
+    /// #2076): a client's `Outcome` answers it `NotFound` and reads nothing further.
+    Foreign,
 }
 
 /// What a transaction call found. Moved once, from the table to the call, never stored, so
@@ -464,26 +467,36 @@ impl Sessions {
 
     /// What session `id` is now, without taking it (D329's `Outcome` and resolver): open or
     /// committing (`Live`), its recorded outcome, or gone. A spanning id is looked up by its
-    /// exact text, whoever its client; a plain one only for `principal`.
-    pub(crate) fn peek(&self, id: &str, principal: Principal) -> Peek {
+    /// exact text. `principal` is the client asking, whose own entry alone answers: another
+    /// principal's spanning entry is [`Peek::Foreign`] (#2077), and its plain one
+    /// [`Peek::Gone`]. `None` is the node's own call (the resolver), which a spanning entry
+    /// answers whoever its client is.
+    pub(crate) fn peek(&self, id: &str, principal: Option<Principal>) -> Peek {
         let Some((key, xid)) = self.parse_txn(id) else {
             return Peek::Gone;
         };
         let now = Instant::now();
         let mut t = self.lock();
         t.expire(&key, now, &self.leases);
-        let Some(e) = t
-            .map
-            .get(&key)
-            .filter(|e| e.xid.as_deref() == xid && (xid.is_some() || e.principal == principal))
-        else {
+        let Some(e) = t.map.get(&key).filter(|e| e.xid.as_deref() == xid) else {
             return Peek::Gone;
         };
+        match principal {
+            Some(p) if e.principal != p && xid.is_some() => return Peek::Foreign,
+            Some(p) if e.principal != p => return Peek::Gone,
+            None if xid.is_none() => return Peek::Gone,
+            _ => {}
+        }
         match &e.state {
             State::Txn(_) | State::Committing => Peek::Live,
             State::Done(o) => Peek::Done(o.clone()),
             State::Expired | State::Snapshot(_) | State::Mcp(_) => Peek::Gone,
         }
+    }
+
+    /// `--txn-lifetime-ms`: the longest a transaction lives.
+    pub(crate) fn txn_lifetime(&self) -> Duration {
+        self.leases.txn_lifetime
     }
 
     /// Takes branch `xid` out for the home node's own call (D329: its prepare or abort),
@@ -1258,6 +1271,38 @@ mod tests {
             if c.commit.as_ref().is_some_and(|c| c.seqno == info.seqno)));
         assert_eq!(s.sweep(Instant::now() + Duration::from_secs(31)), 1);
         assert_eq!(s.take(&id, p(1)).err().unwrap().code, "NotFound");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spanning_session_is_foreign_to_another_principal_and_any_to_the_nodes_own_call() {
+        // #2077 (audit120's S5 on #2076): a client sees only its own spanning transaction;
+        // another principal's is `Foreign` (so its `Outcome` stops at NotFound), while the
+        // node's own call (`None`, the resolver) finds it whoever its client is. Live, and
+        // as a lost commit's tombstone (OutcomeUnknown), which settles from the decision row
+        // for its own client only. A plain id of another principal stays `Gone`.
+        let (db, dir) = db("peek");
+        let s = Sessions::sharing(leases(), Some("p2".into()), Arc::default());
+        let xid = s
+            .begin_spanning(p(1), db.transaction().unwrap(), None, 7)
+            .unwrap();
+        assert!(matches!(s.peek(&xid, Some(p(1))), Peek::Live));
+        assert!(matches!(s.peek(&xid, None), Peek::Live));
+        assert!(matches!(s.peek(&xid, Some(p(2))), Peek::Foreign));
+        let (txn, _, ticket) = open(s.take(&xid, p(1))).commit();
+        drop(txn);
+        ticket.finish(Err(ApiError::outcome_unknown(
+            "the commit point's answer was lost",
+        )));
+        let unknown = |k: Peek| matches!(k, Peek::Done(Err(e)) if e.code == "OutcomeUnknown");
+        assert!(unknown(s.peek(&xid, Some(p(1)))));
+        assert!(unknown(s.peek(&xid, None)));
+        assert!(matches!(s.peek(&xid, Some(p(2))), Peek::Foreign));
+        let plain = s.begin(p(1), db.transaction().unwrap(), None).unwrap();
+        assert!(matches!(s.peek(&plain, Some(p(1))), Peek::Live));
+        assert!(matches!(s.peek(&plain, Some(p(2))), Peek::Gone));
+        assert!(matches!(s.peek(&plain, None), Peek::Gone));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

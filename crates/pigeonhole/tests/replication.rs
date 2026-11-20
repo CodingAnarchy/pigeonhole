@@ -1949,3 +1949,64 @@ fn a_range_drop_event_tells_which_ranges_it_removes() {
     drop((t, other));
     db.close().unwrap();
 }
+
+/// D331 (#2107's catch-up, found by its tests): a token taken just after a retention hold
+/// resumes after the writes, flushes and compactions that follow, whatever the shard count.
+/// Each stream keeps a share of the change feed's retention, so with many shards a stream
+/// keeps about one segment. A stream whose last record ended a sealed segment, behind an
+/// empty head, is positioned in that sealed segment: the hold has to keep it, or the next
+/// retention pass recycles it and the token reads as expired, though nothing after it is
+/// gone. Run at 4 shards (where it passed) and at the counts where it failed.
+#[test]
+fn a_token_under_a_retention_hold_resumes_at_any_shard_count() {
+    for shards in [4usize, 8, 10, 16] {
+        let seed = 64 + shards as u64;
+        let vfs = SimVfs::new(seed);
+        let db = Pigeonhole::open(
+            "/d/data.phdb",
+            Options::default()
+                .vfs(Arc::clone(&vfs) as _)
+                .shards(shards)
+                .wal_segment_size(1 << 20)
+                .change_feed(FeedRetention::bytes(16 << 20)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        for i in 0..4u32 {
+            t.mutate(format!("c{i}").as_bytes())
+                .put("f", b"q", &[1u8; 700 << 10])
+                .commit()
+                .unwrap();
+        }
+        let hold = db.hold_feed_retention(4 << 30).unwrap();
+        let snap = db.snapshot().unwrap();
+        let token = t.feed().from_snapshot(&snap).open().unwrap().token();
+        drop(snap);
+        for i in 0..30u32 {
+            t.mutate(format!("d{i}").as_bytes())
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let mut feed = t.feed().resume(&token).open().unwrap();
+        feed.include_silent();
+        let mut n = 0;
+        loop {
+            match feed.next_event(Duration::from_millis(200)) {
+                Ok(Some(_)) => n += 1,
+                Ok(None) => break,
+                Err(e) => panic!("{shards} shards (seed {seed}): after {n} events: {e}"),
+            }
+        }
+        assert!(n >= 30, "{shards} shards (seed {seed}): {n} events");
+        drop((feed, hold, t));
+        db.close().unwrap();
+    }
+}

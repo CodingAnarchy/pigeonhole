@@ -174,6 +174,44 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("the move or relocation finishes within 2 minutes")
 }
 
+/// A stopped node's port, held for its restart: bound but not listening, so a parallel
+/// test's node can't take it in between (it would fail the restart with AddrInUse, as on
+/// #2100's macOS run), while a dial of it is still refused, as a stopped node's is. Taken as
+/// soon as the node lets the port go, retrying for up to five seconds while the OS frees it
+/// (as #2074's fix in `moving.rs` does with a listener).
+struct HeldPort(socket2::Socket);
+
+impl HeldPort {
+    fn take(port: u16) -> Self {
+        use socket2::{Domain, Socket, Type};
+        let at: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            // As std's `TcpListener::bind` does on Unix: a closed connection's TIME_WAIT
+            // doesn't hold the port.
+            #[cfg(unix)]
+            s.set_reuse_address(true).unwrap();
+            match s.bind(&at.into()) {
+                Ok(()) => return Self(s),
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "port {port} wasn't freed for the restart: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// The restarted node's listener, on the port held.
+    fn listen(self) -> std::net::TcpListener {
+        self.0.listen(1024).unwrap();
+        self.0.into()
+    }
+}
+
 /// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
 async fn eventually(what: &str, cond: impl AsyncFnMut() -> bool) {
     eventually_within(Duration::from_secs(5), what, cond).await;
@@ -2192,6 +2230,27 @@ impl Three {
     }
 }
 
+#[test]
+fn a_cut_off_entry_cuts_only_its_own_clusters_dials() {
+    // #2095: a test that ends or panics with a node still cut leaves its entry; a later
+    // test's node that binds the same port mustn't be cut by it. The address matches only a
+    // dial from the cut node's own cluster; the node itself is cut whatever it dials.
+    let (mine, peer, other) = (test_dir(), test_dir(), test_dir());
+    let at = "127.0.0.1:1";
+    super::cut_node(&mine, at, &[mine.clone(), peer.clone()], true);
+    assert!(
+        super::cut_off(&mine, "127.0.0.1:2"),
+        "the cut node's own dials"
+    );
+    assert!(super::cut_off(&peer, at), "its peer's dial of it");
+    assert!(
+        !super::cut_off(&other, at),
+        "another cluster's dial of the same address"
+    );
+    super::cut_node(&mine, at, &[mine.clone(), peer.clone()], false);
+    assert!(!super::cut_off(&peer, at), "joined again");
+}
+
 impl Drop for Three {
     fn drop(&mut self) {
         self.stops.clear();
@@ -3650,16 +3709,14 @@ impl QualifierVectors {
         }
     }
 
-    /// Cuts node `i` off from its peers both ways, or joins it again (`CUT_OFF`).
+    /// Cuts node `i` off from its peers both ways, or joins it again (`cut_node`).
     fn cut(&self, i: usize, off: bool) {
-        let entry = (self.dirs[i].clone(), format!("127.0.0.1:{}", self.ports[i]));
-        let mut cut = super::CUT_OFF
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cut.retain(|e| *e != entry);
-        if off {
-            cut.push(entry);
-        }
+        super::cut_node(
+            &self.dirs[i],
+            &format!("127.0.0.1:{}", self.ports[i]),
+            &self.dirs,
+            off,
+        );
     }
 
     /// The oracle's ranking of [`Self::QUERY`]'s `k` nearest under `select`.

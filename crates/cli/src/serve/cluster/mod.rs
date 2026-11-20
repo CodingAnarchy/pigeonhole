@@ -217,12 +217,37 @@ fn write_map(dir: &Path, json: &str) -> std::io::Result<()> {
     write_synced(dir, MAP_FILE, json.as_bytes())
 }
 
-/// A fault seam (tests): nodes cut off from their peers, each by its cluster directory and
-/// its address. A cut node's dials of its peers fail, and so do its peers' dials of it, for
-/// maps, pushes and leases; its process runs on and answers its own clients (D326's cut-off
-/// owner). One entry per node, so tests running at once don't cut each other's.
+/// A fault seam (tests): nodes cut off from their peers. A cut node's dials of its peers
+/// fail, and so do its peers' dials of it, for maps, pushes and leases; its process runs on
+/// and answers its own clients (D326's cut-off owner). Set through [`cut_node`].
 #[cfg(test)]
-pub(crate) static CUT_OFF: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+static CUT_OFF: Mutex<Vec<Cut>> = Mutex::new(Vec::new());
+
+/// One cut node: its directory, its address, and its cluster's node directories. Its
+/// address matches only a dial from one of those directories, so an entry a finished or
+/// panicked test left can't cut a later test's node that took the same port (#2095).
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cut {
+    dir: PathBuf,
+    address: String,
+    cluster: Vec<PathBuf>,
+}
+
+/// Cuts the node in `dir` at `address` off from its peers in `cluster` (its cluster's node
+/// directories) both ways, or joins it again (`off` false).
+#[cfg(test)]
+pub(crate) fn cut_node(dir: &Path, address: &str, cluster: &[PathBuf], off: bool) {
+    let mut cut = CUT_OFF.lock().unwrap_or_else(PoisonError::into_inner);
+    cut.retain(|c| !(c.dir == dir && c.address == address));
+    if off {
+        cut.push(Cut {
+            dir: dir.to_owned(),
+            address: address.to_owned(),
+            cluster: cluster.to_vec(),
+        });
+    }
+}
 
 /// A fault seam (tests): the node in each directory can't reach the paired address, one way
 /// (D330 PR 2's test 7: an owner cut off from the writer alone). List both ways to cut a
@@ -307,7 +332,7 @@ fn cut_off(dir: &Path, address: &str) -> bool {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
-        .any(|(d, a)| d == dir || a == address)
+        .any(|c| c.dir == dir || (c.address == address && c.cluster.iter().any(|d| d == dir)))
         || CUT_BETWEEN
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2061,6 +2086,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         service
             .decide_branch(&r.xid, r.commit, 0, 0, &cluster.spanning, &r.partition)
             .await?;
+        // A commit applied by hand acks its home too, so its record can be collected: owed,
+        // and sent by the resolver's next pass, not waited for here (#2078, audit120's Q3).
+        if r.commit {
+            cluster.spanning.queue_ack(&r.xid, &r.partition);
+        }
         Ok(tonic::Response::new(self.local(&r.partition).await?))
     }
 

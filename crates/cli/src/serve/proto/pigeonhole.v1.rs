@@ -5000,6 +5000,14 @@ pub struct TxnOutcomeRequest {
     #[prost(string, tag = "1")]
     pub txn_id: ::prost::alloc::string::String,
 }
+/// A commit that wrote is answered from its decision row, kept for --txn-outcome-retention
+/// from the decision (and, for a commit, until every branch acknowledged it). A read-only
+/// spanning commit has no decision row: it's answered COMMITTED only while its session's
+/// record lasts (one --txn-idle-ms after its Commit, not across a restart of its home's
+/// node), then ABORTED (the first ask records it, for a retention), then NotFound. It wrote
+/// nothing either way, so Commit's own answer is the one to rely on for whether its reads
+/// held. From a full retention after a transaction began, a missing row is NotFound, never
+/// a presumed abort.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxnOutcomeResponse {
     #[prost(enumeration = "TxnOutcomeState", tag = "1")]
@@ -5316,8 +5324,11 @@ pub mod transactions_client {
         /// transaction begun with `spans_partitions`, from its home partition's decision record,
         /// kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
         /// and changes nothing. Once the session is gone, a transaction never committed is made
-        /// final as `ABORTED`, which is why it needs write scope. `NotFound` past retention, and
-        /// for other transactions once their session's record is gone.
+        /// final as `ABORTED`, which is why it needs write scope; so is a read-only one that
+        /// committed, once its session's record is gone (TxnOutcomeResponse says why). `NotFound`
+        /// past retention, and for other transactions once their session's record is gone. While
+        /// its session's record lasts, a transaction's outcome answers only the token that owns it
+        /// (another's is `NotFound`, #2077); after that, the decided outcome answers by id alone.
         pub async fn outcome(
             &mut self,
             request: impl tonic::IntoRequest<super::TxnOutcomeRequest>,
@@ -5392,8 +5403,11 @@ pub mod transactions_server {
         /// transaction begun with `spans_partitions`, from its home partition's decision record,
         /// kept for `--txn-outcome-retention`. While its session lives it answers `IN_PROGRESS`
         /// and changes nothing. Once the session is gone, a transaction never committed is made
-        /// final as `ABORTED`, which is why it needs write scope. `NotFound` past retention, and
-        /// for other transactions once their session's record is gone.
+        /// final as `ABORTED`, which is why it needs write scope; so is a read-only one that
+        /// committed, once its session's record is gone (TxnOutcomeResponse says why). `NotFound`
+        /// past retention, and for other transactions once their session's record is gone. While
+        /// its session's record lasts, a transaction's outcome answers only the token that owns it
+        /// (another's is `NotFound`, #2077); after that, the decided outcome answers by id alone.
         async fn outcome(
             &self,
             request: tonic::Request<super::TxnOutcomeRequest>,
