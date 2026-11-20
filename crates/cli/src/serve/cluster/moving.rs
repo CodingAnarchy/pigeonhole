@@ -101,7 +101,7 @@ impl At {
     async fn local(&self, p: &str) -> Result<Option<LocalPartition>, Failure> {
         let (mut c, _) = connect(&self.args, &self.args.node).await?;
         let st = c
-            .status(request(StatusRequest {}, self.token.as_deref())?)
+            .status(request(StatusRequest::default(), self.token.as_deref())?)
             .await
             .map_err(|s| self.failed("status", &s))?
             .into_inner();
@@ -242,14 +242,22 @@ async fn map_now(args: &NodeArgs) -> Result<ClusterMap, Failure> {
         .into_inner())
 }
 
-/// Sets `m` as the move's record change, waiting out a writer still taking its peers'
-/// maps after a restart (a retry-safe refusal, up to 30 s): a move started just after the
-/// writer did, which needed no map change before its last step until D332 PR 2, mustn't
-/// fail for it (#2092's Linux CI).
-async fn set_record(args: &NodeArgs, m: &ClusterMap) -> Result<(), Failure> {
+/// Sets the move's record change, `change` applied to the map as it is now (its version
+/// raised), waiting out a writer still taking its peers' maps after a restart (a
+/// retry-safe refusal, up to 30 s): a move started just after the writer did, which needed
+/// no map change before its last step until D332 PR 2, mustn't fail for it (#2092's Linux
+/// CI). Each try reads the map again and applies `change` to it, so a map that landed
+/// meanwhile isn't overwritten or refused as stale (simp724's should on #2092); each is
+/// still compare-and-set.
+async fn set_record(
+    args: &NodeArgs,
+    change: impl Fn(&ClusterMap) -> Result<ClusterMap, Failure>,
+) -> Result<(), Failure> {
     let until = Instant::now() + Duration::from_secs(30);
     loop {
-        match set_map(args, m.clone(), false, Vec::new()).await {
+        let mut m = change(&map_now(args).await?)?;
+        m.map_version += 1;
+        match set_map(args, m, false, Vec::new()).await {
             Ok(_) => return Ok(()),
             Err(f)
                 if f.message().contains("still taking its peers' maps")
@@ -272,7 +280,9 @@ async fn start_record(
     m: &ClusterMap,
     p: &proto::Partition,
     to: &str,
+    how: &Start<'_>,
 ) -> Result<Option<String>, Failure> {
+    let prefix = how.prefix;
     if let Some(r) = m.moves.iter().find(|r| r.from == p.id || r.to == p.id) {
         let ours =
             super::map::node_move(r) && r.to == to && super::map::phase(r) < MovePhase::HandedOver;
@@ -291,22 +301,39 @@ async fn start_record(
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    let id = format!("node-{ms}");
-    let mut next = m.clone();
-    next.map_version += 1;
-    next.moves
-        .retain(|r| !(super::map::node_move(r) && r.from == p.id));
-    let mut r = RangeMove {
-        id: id.clone(),
-        kind: crate::serve::proto::MoveKind::Node as i32,
-        from: p.id.clone(),
-        to: to.to_owned(),
-        from_epoch: p.epoch,
-        ..RangeMove::default()
+    let id = format!("{prefix}-{ms}");
+    let start = |now: &ClusterMap| {
+        // P where this run read it: or the move stops, before anything changes.
+        if !now
+            .partitions
+            .iter()
+            .any(|q| q.id == p.id && q.node == p.node && q.epoch == p.epoch)
+        {
+            return Err(Failure::usage(&format!(
+                "the map changed under the move's start: {} isn't on node {:?} at epoch {} \
+                 any more. Check the map, then run the move again",
+                p.id, p.node, p.epoch
+            )));
+        }
+        let mut next = now.clone();
+        next.moves
+            .retain(|r| !(super::map::node_move(r) && r.from == p.id));
+        let mut r = RangeMove {
+            id: id.clone(),
+            kind: crate::serve::proto::MoveKind::Node as i32,
+            from: p.id.clone(),
+            to: to.to_owned(),
+            from_epoch: p.epoch,
+            ..RangeMove::default()
+        };
+        r.set_phase(MovePhase::Copying);
+        next.moves.push(r);
+        if let Some(with) = how.with {
+            with(&mut next)?;
+        }
+        Ok(next)
     };
-    r.set_phase(MovePhase::Copying);
-    next.moves.push(r);
-    match set_record(args, &next).await {
+    match set_record(args, start).await {
         Ok(()) => Ok(Some(id)),
         Err(f)
             if f.message()
@@ -325,23 +352,25 @@ async fn advance(
     id: &str,
     phase: Option<MovePhase>,
 ) -> Result<(), Failure> {
-    let mut m = map_now(args).await?;
-    let Some(i) = m.moves.iter().position(|r| r.id == id) else {
-        let (node, epoch) = m
-            .partitions
-            .iter()
-            .find(|q| q.id == partition)
-            .map_or((String::new(), 0), |q| (q.node.clone(), q.epoch));
-        return Err(record_gone(id, partition, &node, epoch));
-    };
-    m.map_version += 1;
-    match phase {
-        Some(phase) => m.moves[i].set_phase(phase),
-        None => {
-            m.moves.remove(i);
+    set_record(args, |now: &ClusterMap| {
+        let mut m = now.clone();
+        let Some(i) = m.moves.iter().position(|r| r.id == id) else {
+            let (node, epoch) = m
+                .partitions
+                .iter()
+                .find(|q| q.id == partition)
+                .map_or((String::new(), 0), |q| (q.node.clone(), q.epoch));
+            return Err(record_gone(id, partition, &node, epoch));
+        };
+        match phase {
+            Some(phase) => m.moves[i].set_phase(phase),
+            None => {
+                m.moves.remove(i);
+            }
         }
-    }
-    set_record(args, &m).await
+        Ok(m)
+    })
+    .await
 }
 
 /// `phdb cluster move P --abort` (D332 PR 2): removes P's move record before its commit
@@ -370,7 +399,6 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
     // a later attempt never takes it (simp724's M1).
     // If that fails, the record is already gone (safe: every later attempt copies and
     // matches again), and the report says the copy is still there (simp724's N1 on #2092).
-    let drop_there = format!("phdb cluster drop-partition {partition} --node <{}>", r.to);
     let aside = match m.nodes.iter().find(|n| n.id == r.to) {
         None => Value::Null,
         Some(n) => {
@@ -385,9 +413,11 @@ pub(super) async fn abort(args: &NodeArgs, partition: &str) -> Result<Report, Fa
                 Ok(Some(file)) => json!(file),
                 Ok(None) => Value::Null,
                 Err(f) => json!(format!(
-                    "not moved aside: the copy is still on node {} ({}): {drop_there}",
+                    "not moved aside: the copy is still on node {} ({}): phdb cluster \
+                     drop-partition {partition} --node {}",
                     r.to,
-                    f.message()
+                    f.message(),
+                    url_of(args, &n.address)
                 )),
             }
         }
@@ -437,6 +467,45 @@ pub(super) async fn run(
     to: &str,
     drop_source: bool,
     timeout: Option<Duration>,
+) -> Result<Report, Failure> {
+    run_as(
+        args,
+        partition,
+        to,
+        drop_source,
+        timeout,
+        &Start {
+            prefix: "node",
+            ..Start::default()
+        },
+    )
+    .await
+}
+
+/// A record's map change added to (`Start::with`): an error stops the move before it starts.
+pub(super) type WithRecord<'a> = &'a (dyn Fn(&mut ClusterMap) -> Result<(), Failure> + Sync);
+
+/// Who starts a move, and what goes with its record (D332 PR 3).
+#[derive(Default)]
+pub(super) struct Start<'a> {
+    /// The record's id is `<prefix>-<ms>`: `node` for the CLI's, `bal` for the balancer's,
+    /// which a new writer tells apart.
+    pub prefix: &'a str,
+    /// Applied to the map that adds the record, in the same change: the balancer's event
+    /// and history land only with the record (audit120's S1 on #2103).
+    pub with: Option<WithRecord<'a>>,
+    /// Called once the record has landed, with its id: the move has started.
+    pub on_started: Option<&'a (dyn Fn(&str) + Sync)>,
+}
+
+/// [`run`], started as `start` says.
+pub(super) async fn run_as(
+    args: &NodeArgs,
+    partition: &str,
+    to: &str,
+    drop_source: bool,
+    timeout: Option<Duration>,
+    start: &Start<'_>,
 ) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
     let mut m = c
@@ -537,7 +606,10 @@ pub(super) async fn run(
     let next = super::promote::next_epoch(&m, &p);
 
     // The move's record, before OLD fences (D332 PR 2).
-    let record = start_record(args, &m, &p, to).await?;
+    let record = start_record(args, &m, &p, to, start).await?;
+    if let (Some(id), Some(f)) = (&record, start.on_started) {
+        f(id);
+    }
 
     // 1. Fenced and closed on OLD, its files hashed.
     let started = Instant::now();

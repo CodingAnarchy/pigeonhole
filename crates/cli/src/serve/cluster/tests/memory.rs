@@ -321,7 +321,7 @@ fn one_node(
 async fn reconcile_errors(port: u16) -> Vec<String> {
     let status = client(port)
         .await
-        .status(super::super::proto::StatusRequest {})
+        .status(super::super::proto::StatusRequest::default())
         .await
         .unwrap()
         .into_inner();
@@ -1014,6 +1014,7 @@ fn a_move_ends_a_watch_and_its_token_from_before_resumes_after() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, _dbs, [a, b, c]) = three_nodes(&rt);
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,

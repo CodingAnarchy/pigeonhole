@@ -617,6 +617,7 @@ mod tests {
             nodes: ["a", "b", "c"]
                 .iter()
                 .map(|n| MapNode {
+                    weight: Default::default(),
                     id: (*n).into(),
                     address: format!("127.0.0.1:{}", 1000 + u16::from(n.as_bytes()[0])),
                 })
@@ -762,6 +763,7 @@ mod tests {
         let g = Grants::new(Arc::clone(&clock), lease);
         let alone = ClusterMap {
             nodes: vec![MapNode {
+                weight: Default::default(),
                 id: "a".into(),
                 address: "127.0.0.1:1".into(),
             }],

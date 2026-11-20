@@ -461,6 +461,7 @@ impl Router {
         super::replica::Replica::render_copies(&followers, &mut text);
         // The map's failover counts and writer term (D330).
         cluster.node.render_failover_metrics(&mut text);
+        cluster.node.render_balancer_metrics(&mut text);
         text
     }
 

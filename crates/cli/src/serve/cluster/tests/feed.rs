@@ -775,6 +775,7 @@ fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
     let t = Three::start();
     let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,
@@ -1283,7 +1284,7 @@ fn a_component_that_subscribes_as_its_partition_closes_leaves_an_allow_partial_s
             eventually("p2's database to close on b", async || {
                 client(b)
                     .await
-                    .status(StatusRequest {})
+                    .status(StatusRequest::default())
                     .await
                     .unwrap()
                     .into_inner()
@@ -1691,6 +1692,7 @@ fn a_planned_move_with_its_release_lost_resumes_on_the_new_node_once_its_lease_s
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(t.dirs[0].clone());
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,

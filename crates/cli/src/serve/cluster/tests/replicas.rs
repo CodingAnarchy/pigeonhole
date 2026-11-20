@@ -12,7 +12,7 @@ use crate::serve::proto::{
 async fn copy_of(port: u16, p: &str) -> Option<LocalPartition> {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -135,6 +135,7 @@ fn following(
 /// The node args of a `phdb cluster` command through node `port`.
 fn args_at(port: u16) -> super::super::cli::NodeArgs {
     super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,
@@ -256,7 +257,7 @@ fn a_replica_copy_bootstraps_follows_and_closes_when_the_map_drops_it() {
         assert!(copy_of(ports[1], "p3").await.is_none());
         let c = client(ports[2])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();

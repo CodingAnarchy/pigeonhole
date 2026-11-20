@@ -33,7 +33,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -138,20 +138,48 @@ pub(crate) struct ReadKey {
 /// `Status` and the node's device watcher.
 #[derive(Debug)]
 pub(crate) struct PartitionLoad {
+    /// This open's id: unique per open, so the device ceiling never takes a reopen's
+    /// counters for an earlier open's (simp724's nit on #2063).
+    pub(crate) id: u64,
     /// Sampled request CPU, already scaled by [`CPU_EVERY`], in nanoseconds since open.
     cpu_nanos: AtomicU64,
-    /// Sampled reads since open (each standing for [`READ_EVERY`]).
-    reads: AtomicU64,
-    slots: Box<[ArcSwapOption<ReadKey>]>,
+    /// Two reservoirs of sampled read keys, the current one and the window before it
+    /// (perf287 on #2063): [`Self::rotate`] swaps them once a `--balance-window`, so split
+    /// keys come from the window, not from every read since open.
+    reservoirs: [Reservoir; 2],
+    /// Which of `reservoirs` takes reads now (0 or 1).
+    current: AtomicUsize,
     window: Mutex<Window>,
 }
 
-impl Default for PartitionLoad {
+/// One window's sampled read keys (Algorithm R) and how many sampled reads it saw.
+#[derive(Debug)]
+struct Reservoir {
+    reads: AtomicU64,
+    slots: Box<[ArcSwapOption<ReadKey>]>,
+}
+
+impl Default for Reservoir {
     fn default() -> Self {
         Self {
-            cpu_nanos: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             slots: (0..READ_SLOTS).map(|_| ArcSwapOption::empty()).collect(),
+        }
+    }
+}
+
+/// The reads a current reservoir needs before [`PartitionLoad::read_keys`] takes it over
+/// the window before (perf287).
+const ENOUGH_READS: u64 = 1_024;
+
+impl Default for PartitionLoad {
+    fn default() -> Self {
+        static OPENS: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: OPENS.fetch_add(1, Ordering::Relaxed),
+            cpu_nanos: AtomicU64::new(0),
+            reservoirs: [Reservoir::default(), Reservoir::default()],
+            current: AtomicUsize::new(0),
             window: Mutex::new(Window::default()),
         }
     }
@@ -175,6 +203,9 @@ struct Window {
     cpu: f64,
     device_rate: f64,
     intervals: u64,
+    /// When the current reservoir began (perf287's nit on #2103: by time, so a fold after a
+    /// gap doesn't stretch the window).
+    rotated_at: Option<Instant>,
 }
 
 /// A partition's folded load (`LocalPartition`'s fields).
@@ -203,13 +234,17 @@ impl PartitionLoad {
     /// [`READ_SLOTS`] fill it, and the `n`th replaces a random one with chance
     /// `READ_SLOTS / n`, so the keys kept are a uniform sample of every sampled read.
     pub(crate) fn add_read(&self, table: &str, key: &[u8]) {
-        let n = self.reads.fetch_add(1, Ordering::Relaxed);
+        // Acquire, with rotate's Release: a read that sees the new reservoir sees it emptied
+        // (perf287's nit on #2103). A read that took the old one just before can still land
+        // there: one sampled key, in the window it belongs to.
+        let r = &self.reservoirs[self.current.load(Ordering::Acquire) & 1];
+        let n = r.reads.fetch_add(1, Ordering::Relaxed);
         let slot = if n < READ_SLOTS as u64 {
             n
         } else {
             draw_below(n + 1)
         };
-        if let Some(s) = self.slots.get(usize::try_from(slot).unwrap_or(usize::MAX)) {
+        if let Some(s) = r.slots.get(usize::try_from(slot).unwrap_or(usize::MAX)) {
             s.store(Some(Arc::new(ReadKey {
                 table: table.to_owned(),
                 key: key.to_vec(),
@@ -217,19 +252,42 @@ impl PartitionLoad {
         }
     }
 
-    /// The read keys kept now, and how many reads each stands for (all sampled reads since
-    /// open, times [`READ_EVERY`], over the keys kept).
+    /// Starts a new window's reservoir: the current one becomes the window before, and the
+    /// one before is emptied to take reads (perf287). Called by the fold once a
+    /// `--balance-window`.
+    fn rotate(&self) {
+        let next = (self.current.load(Ordering::Acquire) + 1) & 1;
+        let r = &self.reservoirs[next];
+        for s in &r.slots {
+            s.store(None);
+        }
+        r.reads.store(0, Ordering::Relaxed);
+        self.current.store(next, Ordering::Release);
+    }
+
+    /// The read keys of the current window, or of the window before while the current one
+    /// has seen fewer than [`ENOUGH_READS`] (perf287), and how many reads each stands for
+    /// (its window's sampled reads, times [`READ_EVERY`], over the keys kept).
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "D332 PR 3's balancer picks split keys from it")
+        expect(
+            dead_code,
+            reason = "the balancer picks split keys from it once D331 PR 5's split lands"
+        )
     )]
     pub(crate) fn read_keys(&self) -> (Vec<ReadKey>, f64) {
-        let keys: Vec<ReadKey> = self
+        let cur = self.current.load(Ordering::Acquire) & 1;
+        let r = if self.reservoirs[cur].reads.load(Ordering::Relaxed) >= ENOUGH_READS {
+            &self.reservoirs[cur]
+        } else {
+            &self.reservoirs[cur ^ 1]
+        };
+        let keys: Vec<ReadKey> = r
             .slots
             .iter()
             .filter_map(|s| s.load_full().map(|k| (*k).clone()))
             .collect();
-        let reads = self.reads.load(Ordering::Relaxed) as f64 * f64::from(READ_EVERY);
+        let reads = r.reads.load(Ordering::Relaxed) as f64 * f64::from(READ_EVERY);
         let each = if keys.is_empty() {
             0.0
         } else {
@@ -285,6 +343,17 @@ impl PartitionLoad {
                 }
                 w.intervals += 1;
                 w.start = Some((now, reading, cpu_now));
+                // A new window's reservoir once a window has passed (perf287). alpha is
+                // 1 - e^(-interval/window): the window, back from it.
+                let ratio = -(1.0 - alpha).ln();
+                if ratio > 0.0 {
+                    let window = interval.mul_f64(1.0 / ratio);
+                    let began = *w.rotated_at.get_or_insert(now);
+                    if now.saturating_duration_since(began) >= window {
+                        self.rotate();
+                        w.rotated_at = Some(now);
+                    }
+                }
             }
             Some(_) => {}
         }
@@ -403,7 +472,7 @@ struct Ceiling {
     pending: u64,
     /// Each open partition's total at the last reading, by its open (an id the caller
     /// keeps unique per open).
-    totals: HashMap<usize, u64>,
+    totals: HashMap<u64, u64>,
     /// Each second's rate, with when it ended, oldest first.
     rates: std::collections::VecDeque<(Instant, f64)>,
 }
@@ -419,7 +488,7 @@ impl DeviceCeiling {
     /// Takes the device bytes of every partition open now (`(open, total)`) at `now`,
     /// called about once a second: a second or more after the last rate, the rises since
     /// join the window as one.
-    pub(crate) fn note(&self, now: Instant, parts: &[(usize, u64)]) {
+    pub(crate) fn note(&self, now: Instant, parts: &[(u64, u64)]) {
         let mut c = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let risen: u64 = parts
             .iter()
@@ -492,6 +561,9 @@ impl super::Node {
         {
             return;
         }
+        // The thread CPU clock's first read measures its rate on Windows (a 10 ms spin):
+        // done here, once at the node's start, never on a sampled request (perf287 on #2063).
+        let _ = pigeonhole_io::sys::thread_cpu_nanos();
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             self.watching_device
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -508,12 +580,12 @@ impl super::Node {
                     continue;
                 };
                 let parts = shared.router.partitions();
-                // Each partition by its open: its load's address, unique while it's open.
-                let totals: Vec<(usize, u64)> = parts
+                // Each partition by its open's id (simp724's nit on #2063).
+                let totals: Vec<(u64, u64)> = parts
                     .iter()
                     .map(|(_, p)| {
                         let (r, w) = p.db.device_bytes();
-                        (Arc::as_ptr(&p.load) as usize, r.saturating_add(w))
+                        (p.load.id, r.saturating_add(w))
                     })
                     .collect();
                 node.device_ceiling.note(Instant::now(), &totals);
@@ -603,6 +675,40 @@ mod tests {
         assert!(
             (64..=192).contains(&first_half),
             "{first_half} of {READ_SLOTS} from the first half"
+        );
+    }
+
+    #[test]
+    fn a_late_hot_key_fills_the_reservoir_within_two_windows() {
+        // perf287 on #2063: the reservoir is per window, so a key that turns hot late is the
+        // read keys' majority once its window has enough reads, not diluted by every read
+        // since open.
+        let l = PartitionLoad::default();
+        for i in 0..READ_SLOTS * 40 {
+            l.add_read("t", format!("k{i:06}").as_bytes());
+        }
+        l.rotate();
+        // A new window with too few reads yet: the window before stands.
+        for _ in 0..10 {
+            l.add_read("t", b"hot");
+        }
+        let (keys, _) = l.read_keys();
+        assert!(keys.iter().all(|k| k.key != b"hot"), "the window before");
+        for i in 0..ENOUGH_READS * 2 {
+            let key = if i % 10 == 0 {
+                format!("k{i:06}").into_bytes()
+            } else {
+                b"hot".to_vec()
+            };
+            l.add_read("t", &key);
+        }
+        let (keys, each) = l.read_keys();
+        let hot = keys.iter().filter(|k| k.key == b"hot").count();
+        assert!(hot * 4 > keys.len() * 3, "{hot} of {} keys hot", keys.len());
+        let reads = (ENOUGH_READS * 2 + 10) as f64 * f64::from(READ_EVERY);
+        assert!(
+            (each * keys.len() as f64 - reads).abs() < 1e-6,
+            "this window's reads"
         );
     }
 

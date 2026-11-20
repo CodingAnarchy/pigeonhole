@@ -792,7 +792,7 @@ impl Promoter for NodeOps {
             let timeout = node.peers.push_timeout;
             tokio::time::timeout(timeout, async {
                 let mut c = node.client(&address).await?;
-                c.status(node.request(StatusRequest {})?)
+                c.status(node.request(StatusRequest::default())?)
                     .await
                     .map(tonic::Response::into_inner)
                     .map_err(|s| s.message().to_owned())

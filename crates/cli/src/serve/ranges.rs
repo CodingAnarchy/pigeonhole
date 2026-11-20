@@ -885,6 +885,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 7,
             nodes: vec![Node {
+                weight: Default::default(),
                 id: "a".into(),
                 address: "127.0.0.1:7001".into(),
             }],

@@ -10,6 +10,7 @@ use crate::serve::proto::{BackupDownloadRequest, admin_client::AdminClient};
 
 pub(super) fn args(port: u16) -> NodeArgs {
     NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,
@@ -213,6 +214,7 @@ fn a_table_created_during_a_backup_is_in_the_map_it_keeps() {
             let mut m = three_way(&[ports[0], ports[1], ports[2]]);
             m.map_version = 2;
             m.tables.push(TablePlacement {
+                pinned_ranges: Default::default(),
                 name: "orders".into(),
                 group: String::new(),
                 families: Vec::new(),
