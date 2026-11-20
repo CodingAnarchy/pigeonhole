@@ -908,6 +908,7 @@ fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
         .await;
     });
     let _ = stops.remove(2).send(());
+    rt.block_on(stopped(ports[2]));
     rt.block_on(async {
         let r = within(super::super::promote::promote(
             &args_at(ports[0]),
@@ -1302,6 +1303,7 @@ fn bounded_reads_answer_from_the_replica_while_the_owner_is_down() {
             .is_ok_and(|(_, by, _)| by.as_deref() == Some("replica"))
     }));
     let _ = stops.remove(2).send(());
+    rt.block_on(stopped(ports[2]));
     rt.block_on(async {
         let multi_get = |bound: bool| {
             let mut req = tonic::Request::new(crate::serve::proto::MultiGetRequest {

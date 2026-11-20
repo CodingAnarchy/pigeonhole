@@ -219,6 +219,18 @@ impl HeldPort {
     }
 }
 
+/// Waits until a stopped node's port refuses connections (#2105): a call before then can
+/// reach the node mid-shutdown and be reset after it was sent (`OutcomeUnknown`, not the
+/// `PartitionUnavailable` a stopped node gets).
+async fn stopped(port: u16) {
+    eventually("the node to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    })
+    .await;
+}
+
 /// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
 async fn eventually(what: &str, cond: impl AsyncFnMut() -> bool) {
     eventually_within(Duration::from_secs(5), what, cond).await;
