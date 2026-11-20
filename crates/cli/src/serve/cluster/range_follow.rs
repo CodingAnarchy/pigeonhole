@@ -775,9 +775,12 @@ fn read_head(db: &Pigeonhole, id: &str) -> Result<Head, ApiError> {
     })
 }
 
-/// The copy's chunks, in row order: each one's end row (`None`: to the range's end) and
+/// A copy's chunks, in row order: each one's end row (`None`: to the range's end) and
 /// snapshot seqno.
-fn read_chunks(db: &Pigeonhole, id: &str) -> Result<Vec<(Option<Vec<u8>>, u64)>, ApiError> {
+type Chunks = Vec<(Option<Vec<u8>>, u64)>;
+
+/// The copy's chunks ([`Chunks`]).
+fn read_chunks(db: &Pigeonhole, id: &str) -> Result<Chunks, ApiError> {
     let t = progress_table(db)?;
     let prefix = format!("copy/{id}/").into_bytes();
     let mut out = Vec::new();

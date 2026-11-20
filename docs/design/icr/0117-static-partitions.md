@@ -941,6 +941,53 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 - A target's serving row goes only once its own feed floor has passed `t_from`.
 - A source's moved-away row goes only once its feed retention has passed `final_seqno`, plus PR 2's bounds.
 
+## D331 PR 4b: a range move's copy and catch-up (1.3.0, #1499)
+**A range move's target copies its range from the source, then applies the source's history of it through the move's `final_seqno`.** The design was reviewed by cli692 (M1–M4), feed1248 (G1, G2), simp724 (the copy's idempotence, D34) and perf287 (the cost). PR 5's driver moves the phases. This PR runs what each phase needs.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ForwardRequest.range_copy = 49`, `ForwardResponse.range_copy = 27`: `RangeCopyRequest { move_id, table, after, max_bytes }`, `RangeCopyResponse { cells, next, snapshot_seqno, token }`, `RangeCopyCell { family, kind, row, qualifier, timestamp, stored }`.
+- `ForwardSubscribeRequest.range_start = 7`, `range_end = 8` (`SplitKey`, half-open, absent = open), `raw = 9`.
+- `FeedEvent.raw_commit = 9`: `RawCommit { seqno, timestamp, changes }`, `RawChange { family, kind, row, qualifier, timestamp, stored }`. Kinds are FORMAT §2's logged numbers; `stored` is the value's stored form, tag byte first.
+- `MoveStatus.copied_bytes = 7`, `copy_done = 8`, `source_applied_seqno = 9`, `retention_lapsed = 10`.
+- Flags: `--move-rate-bytes` (64 MiB/s), `--move-retention-cap` (4 GiB), `--max-move-followers` (2).
+
+**The source:**
+- **The copy** (`range_copy`):
+  - It's served only by the source's owner in its map, at the move's `from_epoch` (M3), for a range move naming it as `from`, at COPYING.
+  - The first chunk takes the move's feed retention hold (`--move-retention-cap`) and its follower slot (`--max-move-followers`; past it, `Overloaded`, counted in `pigeonhole_cluster_move_copies_refused_total`). It records the feed token at its snapshot. Asked again, the move keeps both.
+  - Each chunk is `Pigeonhole::copy_range` at a fresh snapshot: whole rows, at least 2 MiB or 128 KiB per family read. All of a node's copies share one token bucket at `--move-rate-bytes`.
+  - The hold and slot go when the move leaves COPYING through HANDED_OVER or the map, when the source moves off this node or its epoch, or after 120 s without a chunk or a catch-up tick. A lapsed hold shows in `retention_lapsed`, and the move must be aborted.
+- **The catch-up stream** (`ForwardSubscribe` with `raw`):
+  - It's served only by the source's owner at `from_epoch`, for exactly a live move's bounds, from COPYING through HANDED_OVER, from a token, with no client options (G1). A range bound without `raw` is refused.
+  - It reads its own feed of the table, feed-silent commits included and durable only. It never joins a hub's ring.
+  - It sends each commit's in-range changes as a `RawCommit` (a commit straddling a bound sends its in-range part), and anything else as `Progress`: a commit with nothing in range, a catalog change, a range drop outside the range, a quiet table.
+  - A range drop that removes any of the range ends it with an error (G2). Once the move is handed over and the stream has passed `final_seqno`, it ends with `MovedAway`. The map is read at most every 200 ms.
+
+**The target's follower:** one per range move whose `to` the map gives this node, from COPYING through HANDED_OVER. It starts on a map install and when the server starts, and stops on a map that no longer gives it the move (M2).
+- **Every commit** is a feed-silent `LoggedBatch`, by name, through the target's `WriteGate`, under its lease (M1).
+- **The copy:**
+  - Each chunk is written in its D34 split (`CopiedChunk::batches`), cut into commits of about 256 KiB. A chunk holding a merge commits whole (simp724's (b)), and one past 8 MiB stops the move, naming the table, family and row.
+  - The chunk's progress goes in its last commit only. A crash between two of its commits copies it again at a fresh snapshot, which the split makes safe.
+- **Progress rows** (`__phdb_cluster`, family `moved`, beside the moved-away and serving rows, which their readers take by prefix, M4):
+  - `copy/<id>`: `next`, `first` (the copy's token), `n`, `bytes`, `done`;
+  - `copy/<id>/<n>`: the chunk's `end` and `snap`;
+  - `follow/<id>`: the catch-up's `token`, written with the changes it applied, or alone at most once a second.
+- **The catch-up** starts from `follow/<id>`'s token, else the copy's first. B4: a change to row `k` applies only if its seqno is above the snapshot of `k`'s chunk. It's done once its position passes a handed-over move's `final_seqno`.
+- **Stopping:**
+  - A follower stops only between commits, and checks before each one.
+  - A later follower of the same move waits for a stopped one to end.
+  - At shutdown, every follower stops and is joined in the shutdown signal, before the listener closes.
+  - A resume past the source's history (`FeedExpired`), a range drop of the range, or the merge cap stops a follower for good, reported in its log. The move must be aborted.
+- **Status:** `MoveStatus.copied_bytes`, `copy_done` and `source_applied_seqno` on the target; `pigeonhole_cluster_move_follower_lag_ms{move}`.
+
+**pigeonhole:** `RangeDrop::overlaps(table, start, end)`, doc-hidden behind `__unstable-replication` (G2).
+
+**For PR 5:**
+- It moves the phases (from CATCHING_UP to HANDED_OVER only once `source_applied_seqno` is past the fence's last seqno).
+- It waits for a follower's stop before an abort's `drop_range`.
+- It checks for a drop-pending row before a copy starts.
+- It prunes the `copy/` and `follow/` rows.
+
 ## D332 PR 2: whole-partition moves recorded in the map (1.3.0, #1485)
 **`phdb cluster move P --to N` keeps a record of itself in `ClusterMap.moves`,** so a move stopped by a crash, of the CLI or of the writer, is seen. `status` shows it, failover takes it into account, and a rerun finishes it.
 
