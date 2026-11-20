@@ -280,8 +280,9 @@ async fn start_record(
     m: &ClusterMap,
     p: &proto::Partition,
     to: &str,
-    prefix: &str,
+    how: &Start<'_>,
 ) -> Result<Option<String>, Failure> {
+    let prefix = how.prefix;
     if let Some(r) = m.moves.iter().find(|r| r.from == p.id || r.to == p.id) {
         let ours =
             super::map::node_move(r) && r.to == to && super::map::phase(r) < MovePhase::HandedOver;
@@ -327,6 +328,9 @@ async fn start_record(
         };
         r.set_phase(MovePhase::Copying);
         next.moves.push(r);
+        if let Some(with) = how.with {
+            with(&mut next)?;
+        }
         Ok(next)
     };
     match set_record(args, start).await {
@@ -464,18 +468,44 @@ pub(super) async fn run(
     drop_source: bool,
     timeout: Option<Duration>,
 ) -> Result<Report, Failure> {
-    run_as(args, partition, to, drop_source, timeout, "node").await
+    run_as(
+        args,
+        partition,
+        to,
+        drop_source,
+        timeout,
+        &Start {
+            prefix: "node",
+            ..Start::default()
+        },
+    )
+    .await
 }
 
-/// [`run`], its record's id `<prefix>-<ms>`: `node` for the CLI's, `bal` for the balancer's
-/// (D332 PR 3), which a new writer tells apart.
+/// A record's map change added to (`Start::with`): an error stops the move before it starts.
+pub(super) type WithRecord<'a> = &'a (dyn Fn(&mut ClusterMap) -> Result<(), Failure> + Sync);
+
+/// Who starts a move, and what goes with its record (D332 PR 3).
+#[derive(Default)]
+pub(super) struct Start<'a> {
+    /// The record's id is `<prefix>-<ms>`: `node` for the CLI's, `bal` for the balancer's,
+    /// which a new writer tells apart.
+    pub prefix: &'a str,
+    /// Applied to the map that adds the record, in the same change: the balancer's event
+    /// and history land only with the record (audit120's S1 on #2103).
+    pub with: Option<WithRecord<'a>>,
+    /// Called once the record has landed, with its id: the move has started.
+    pub on_started: Option<&'a (dyn Fn(&str) + Sync)>,
+}
+
+/// [`run`], started as `start` says.
 pub(super) async fn run_as(
     args: &NodeArgs,
     partition: &str,
     to: &str,
     drop_source: bool,
     timeout: Option<Duration>,
-    prefix: &str,
+    start: &Start<'_>,
 ) -> Result<Report, Failure> {
     let (mut c, token) = connect(args, &args.node).await?;
     let mut m = c
@@ -576,7 +606,10 @@ pub(super) async fn run_as(
     let next = super::promote::next_epoch(&m, &p);
 
     // The move's record, before OLD fences (D332 PR 2).
-    let record = start_record(args, &m, &p, to, prefix).await?;
+    let record = start_record(args, &m, &p, to, start).await?;
+    if let (Some(id), Some(f)) = (&record, start.on_started) {
+        f(id);
+    }
 
     // 1. Fenced and closed on OLD, its files hashed.
     let started = Instant::now();

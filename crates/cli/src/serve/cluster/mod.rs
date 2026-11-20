@@ -1628,9 +1628,10 @@ impl Node {
                 if let Some(part) = open.get(&id) {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
-                    // Its size from the file system, no read of the file (perf287).
-                    lp.file_bytes = std::fs::metadata(self.dir.join(format!("{id}.phdb")))
-                        .map_or(0, |m| m.len());
+                    // Its size from the file system, no read of the file (perf287): the
+                    // path the database opened, not one built from the id (CodeQL on
+                    // #2103).
+                    lp.file_bytes = std::fs::metadata(part.db.path()).map_or(0, |m| m.len());
                 }
             }
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).

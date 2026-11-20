@@ -36,11 +36,24 @@ pub(crate) struct NodeArgs {
     pub own: Option<Box<Own>>,
 }
 
-/// A node's own cluster token and CA, for the moves its writer runs (D332).
-#[derive(Debug, Clone, Default)]
+/// A node's own cluster token and CA, for the moves its writer runs (D332), and the node
+/// itself: the move's map changes are set there in process, not through `SetMap`, which
+/// takes the admin scope only (audit120's M1 on #2103, the coordinator's ruling).
+#[derive(Clone, Default)]
 pub(crate) struct Own {
     pub token: Option<String>,
     pub ca: Option<tonic::transport::Certificate>,
+    pub node: std::sync::Weak<super::Node>,
+}
+
+/// Never the token (audit120's nit on #2103).
+impl std::fmt::Debug for Own {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Own")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("ca", &self.ca.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// `phdb cluster balancer`'s subcommands (D332).
@@ -1124,6 +1137,14 @@ pub(crate) async fn set_map(
         !force || copies.is_empty(),
         "a forced map marks nothing copied"
     );
+    // The writer's own move: set in process (audit120's M1 on #2103).
+    if !force && let Some(node) = args.own.as_ref().and_then(|o| o.node.upgrade()) {
+        let reply = node
+            .set_own_map(m, copies)
+            .await
+            .map_err(|e| Failure::usage(&format!("{}: {}", args.node, e.message)))?;
+        return Ok(set_map_report(&args.node, &reply, None));
+    }
     let (mut c, token) = connect(args, &args.node).await?;
     let current = match c
         .get_map(request(GetMapRequest {}, token.as_deref())?)
@@ -1276,6 +1297,15 @@ pub(crate) async fn set_map(
         .map_err(|s| Failure::usage(&format!("{at}: {}", s.message())))?
         .into_inner()
     };
+    Ok(set_map_report(&at, &reply, forced_unchecked))
+}
+
+/// `phdb cluster set-map`'s report of `reply`, from node `at`.
+fn set_map_report(
+    at: &str,
+    reply: &crate::serve::proto::SetMapResponse,
+    forced_unchecked: Option<Vec<String>>,
+) -> Report {
     let mut summary = vec![
         ("node", json!(at)),
         ("map_version", json!(reply.map_version)),
@@ -1305,7 +1335,7 @@ pub(crate) async fn set_map(
         "pushed".into(),
         serde_json::to_value(&reply.pushed).expect("NodePush serializes"),
     );
-    Ok(r)
+    r
 }
 
 pub(super) async fn status(args: &NodeArgs) -> Result<Report, Failure> {

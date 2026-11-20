@@ -1005,12 +1005,18 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 - **The bounds on a move:** it never puts the target over the bound, its copy must fit in the dwell, and it never lands on a replica's node.
 - **Bouncing:** a partition moved `max_moves` times in the bounce window is auto-pinned. The auto-pin is its `pinned` with a PIN history entry, and it expires a window later. An operator's pin or unpin clears those entries, so an operator's pin never expires (simp724's S2).
 - **Never a candidate:** a pinned partition, one in any move's record, or one with in-doubt shares. For splits and merges, also a table in a group or followed by an index.
+- **Pinned ranges** (`TablePlacement.pinned_ranges`): a partition holding one never moves or merges, and never splits inside it. A split key lies strictly inside one of the partition's own ranges in the map, never at a hole a range move or drop left in its file (ai1249's M1 and M2 on #2103).
+- **Merges** go only into a neighbour, a partition holding a range next to one of its own (ai1249's S2 on #2103).
+- **Read holds and open transactions** aren't inputs (`Status` doesn't carry them). A move fences and closes the partition first, so a transaction or pinned snapshot open on it ends with the old copy, as for `phdb cluster move` (simp724's M2 on #2103).
 
-**The loop** (`balancing.rs`): one of the writer's duties, once a pass (30 s), while the map's balancer is ON or PAUSED and this node holds the writer lease, at any term.
+**The loop** (`balancing.rs`): one of the writer's duties, once a pass (30 s), while the map's balancer is ON or PAUSED and this node holds the writer lease, at any term. Each pass runs on a task of its own, one at a time, so the writer's other duties (failover among them) never wait on its calls to other nodes (perf287 on #2103).
 - **An earlier writer's `bal-` NODE move** before its commit point is aborted (simp724's M1): its record goes, the target's copy aside, the partition is unfenced on its node, and an ABORT event is recorded. From its commit point it's finished.
 - **Waiting:** nothing starts while any move is in flight, or while PAUSED.
 - **The survey and the decision:** an `open_only` survey (no closed file is read, and the file bytes come from the file system: perf287), then the decision.
-- **The action:** a whole move runs `phdb cluster move`'s steps on a task of its own, with the writer's cluster token (#2094), its record `bal-<ms>`, after a map change that records its event and history.
+- **The action:** a whole move runs `phdb cluster move`'s steps on a task of its own, with the writer's cluster token (#2094), its record `bal-<ms>`.
+  - **Its map changes are set in process,** not through `SetMap`, which takes the admin scope only (audit120's M1 on #2103, the coordinator's ruling: no new scope).
+  - **Each needs the writer lease, at any term,** so a writer cut off at term 0 can't advance its move (simp724's M1 on #2103).
+  - **Its MOVE event and history** go in the map change that records the move, and its dwell starts once that has landed, so a move that can't start isn't recorded or counted (audit120's and simp724's S1).
 - **A pass that does nothing changes nothing in the map** (simp724's M2, perf287's should-fix 1). Its reason is `NodeStatus.balancer`. The counters are in memory, new with each writer term.
 
 **The CLI:** `phdb cluster balancer status|pause|resume|pin|unpin`.
@@ -1018,10 +1024,10 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 **Metrics:** `pigeonhole_cluster_balancer_actions_total{kind}` and `pigeonhole_cluster_node_load_ratio{node}`, on the writer.
 
 **Also:**
-- the sampled read keys are per `--balance-window` (two reservoirs, swapped once a window: perf287);
+- the sampled read keys are per `--balance-window` (two reservoirs, swapped once a window has passed by the clock: perf287);
 - the device ceiling keys each open by an id;
 - the thread CPU clock warms at start;
 - a move's record writes re-read the map on each retry.
 
-**Not yet:** splits and merges (D331 PR 5, PR 6), `--move-rate-bytes` (D331 PR 4b; the copy-time check uses its 64 MiB/s default), and the guide (PR 4).
+**Not yet:** splits and merges (D331 PR 5, PR 6; until then a too-big or too-hot partition's state says its split waits for D331 PR 5, since no tablets are surveyed), `--move-rate-bytes` (D331 PR 4b; the copy-time check uses its 64 MiB/s default), and the guide (PR 4).
 

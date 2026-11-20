@@ -42,9 +42,14 @@ async fn unfence(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
 
 /// Partition `p`'s line in node `port`'s Status.
 async fn local(port: u16, p: &str) -> LocalPartition {
+    local_as(port, p, None).await
+}
+
+/// [`local`], with `token`.
+async fn local_as(port: u16, p: &str, token: Option<&str>) -> LocalPartition {
     let s = client(port)
         .await
-        .status(StatusRequest::default())
+        .status(with(StatusRequest::default(), token))
         .await
         .unwrap()
         .into_inner();
@@ -409,12 +414,19 @@ struct Rig {
     dirs: [PathBuf; 3],
     stops: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
     dbs: Vec<Option<pigeonhole::Pigeonhole>>,
+    /// Every node's token file (empty: none).
+    tokens: String,
 }
 
 const NODES: [(&str, &str); 3] = [("a", "p1"), ("b", "p2"), ("c", "p3")];
 
 impl Rig {
     fn start() -> Self {
+        Self::start_with("")
+    }
+
+    /// [`Rig::start`], each node with the token file `tokens`.
+    fn start_with(tokens: &str) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -427,7 +439,7 @@ impl Rig {
         let mut dbs = Vec::new();
         for ((l, dir), (id, p)) in listeners.into_iter().zip(&dirs).zip(NODES) {
             super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, "", limits, None, false);
+            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, tokens, limits, None, false);
             stops.push(Some(stop));
             dbs.push(db);
         }
@@ -437,6 +449,7 @@ impl Rig {
             dirs,
             stops,
             dbs,
+            tokens: tokens.to_owned(),
         }
     }
 
@@ -462,7 +475,7 @@ impl Rig {
             NODES[i].0,
             Some(NODES[i].1),
             l,
-            "",
+            &self.tokens,
             crate::serve::server_tests::limits(),
             self.dbs[i].clone(),
             true,
@@ -1622,9 +1635,14 @@ fn a_paused_old_owner_never_commits_once_a_new_owner_took_writes() {
 
 /// Node `port`'s map.
 async fn map_of(port: u16) -> crate::serve::proto::ClusterMap {
+    map_of_as(port, None).await
+}
+
+/// [`map_of`], with `token`.
+async fn map_of_as(port: u16, token: Option<&str>) -> crate::serve::proto::ClusterMap {
     client(port)
         .await
-        .get_map(crate::serve::proto::GetMapRequest {})
+        .get_map(with(crate::serve::proto::GetMapRequest {}, token))
         .await
         .unwrap()
         .into_inner()
@@ -1632,9 +1650,14 @@ async fn map_of(port: u16) -> crate::serve::proto::ClusterMap {
 
 /// Node `port`'s status.
 async fn status_of(port: u16) -> crate::serve::proto::NodeStatus {
+    status_of_as(port, None).await
+}
+
+/// [`status_of`], with `token`.
+async fn status_of_as(port: u16, token: Option<&str>) -> crate::serve::proto::NodeStatus {
     client(port)
         .await
-        .status(StatusRequest::default())
+        .status(with(StatusRequest::default(), token))
         .await
         .unwrap()
         .into_inner()
@@ -1642,15 +1665,27 @@ async fn status_of(port: u16) -> crate::serve::proto::NodeStatus {
 
 /// Sets `map` at node `port` (the writer), over its current version.
 async fn set_at(port: u16, map: crate::serve::proto::ClusterMap) -> Result<u64, tonic::Status> {
+    set_at_as(port, map, None).await
+}
+
+/// [`set_at`], with `token`.
+async fn set_at_as(
+    port: u16,
+    map: crate::serve::proto::ClusterMap,
+    token: Option<&str>,
+) -> Result<u64, tonic::Status> {
     let expected = map.map_version - 1;
     client(port)
         .await
-        .set_map(crate::serve::proto::SetMapRequest {
-            map: Some(map),
-            expected_map_version: expected,
-            copies: Vec::new(),
-            force: false,
-        })
+        .set_map(with(
+            crate::serve::proto::SetMapRequest {
+                map: Some(map),
+                expected_map_version: expected,
+                copies: Vec::new(),
+                force: false,
+            },
+            token,
+        ))
         .await
         .map(|r| r.into_inner().map_version)
 }
@@ -1669,32 +1704,37 @@ async fn with_failover(port: u16, on: bool) -> crate::serve::proto::ClusterMap {
 /// grace is over: a restarted node grants nothing in it, so a test that cuts a node off
 /// sooner leaves the rest short of a majority (a Windows CI failure on #2069).
 fn writer_leased(t: &mut Rig) {
+    writer_leased_as(t, None);
+}
+
+/// [`writer_leased`], asking with `token`.
+fn writer_leased_as(t: &mut Rig, token: Option<&str>) {
     for i in 0..3 {
         t.stop(i);
         t.restart(i);
     }
     let [a, b, c] = t.ports;
     t.rt.block_on(async {
-        writer_lease_held(a, b).await;
+        writer_lease_held_as(a, b, token).await;
         for port in [a, b, c] {
             eventually("every node's start grace to end", async || {
-                status_of(port).await.grace_remaining_ms == 0
+                status_of_as(port, token).await.grace_remaining_ms == 0
             })
             .await;
         }
     });
 }
 
-async fn writer_lease_held(a: u16, b: u16) {
+async fn writer_lease_held_as(a: u16, b: u16, token: Option<&str>) {
     eventually("p1 to serve on a", async || {
-        state(a, "p1").await == LocalPartitionState::Serving
+        local_as(a, "p1", token).await.state() == LocalPartitionState::Serving
     })
     .await;
     eventually("b to grant a's writer lease", async || {
-        status_of(b).await.writer_lease_remaining_ms > 0
+        status_of_as(b, token).await.writer_lease_remaining_ms > 0
     })
     .await;
-    let st = status_of(a).await;
+    let st = status_of_as(a, token).await;
     assert_eq!((st.writer.as_str(), st.writer_term), ("a", 0), "{st:?}");
     assert!(st.writer_lease_remaining_ms > 0, "{st:?}");
 }
@@ -2938,10 +2978,22 @@ fn a_new_writer_finishes_or_aborts_a_whole_partition_move_its_old_writer_left() 
     }
 }
 
-/// Sets the map's balancer to `mode` at the writer `a` (retrying while its lease comes
-/// back), with the balancer's pass at 100 ms on every node (D332 PR 3's tests). The new
-/// map's version.
-async fn balancer_mode(t: &Rig, mode: crate::serve::proto::BalancerMode) -> u64 {
+/// The balancer's tests' token file: an admin token beside the nodes' cluster token, so
+/// the map's writer runs its moves with the cluster token alone (audit120's M1 on #2103).
+fn balancer_tokens() -> String {
+    format!("admin {BALANCER_ADMIN}\ncluster {NODE_TOKEN}\n")
+}
+
+const BALANCER_ADMIN: &str = "adm1n-bal";
+
+/// Changes the map at the writer `a` by `change` (retrying while its lease comes back),
+/// with the balancer's pass at 100 ms on every node (D332 PR 3's tests), asking with
+/// `token`. The new map's version.
+async fn balancer_map(
+    t: &Rig,
+    token: Option<&str>,
+    change: impl Fn(&mut crate::serve::proto::ClusterMap),
+) -> u64 {
     for dir in &t.dirs {
         let mut pass = super::super::balancing::PASS_FOR
             .lock()
@@ -2953,16 +3005,40 @@ async fn balancer_mode(t: &Rig, mode: crate::serve::proto::BalancerMode) -> u64 
     let a = t.ports[0];
     let mut last = None;
     for _ in 0..100 {
-        let mut m = map_of(a).await;
+        let mut m = map_of_as(a, token).await;
         m.map_version += 1;
-        m.set_balancer(mode);
-        match set_at(a, m).await {
+        change(&mut m);
+        match set_at_as(a, m, token).await {
             Ok(v) => return v,
             Err(e) => last = Some(e),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("set the balancer: {last:?}");
+}
+
+/// Sets the map's balancer to `mode`: [`balancer_map`].
+async fn balancer_mode(t: &Rig, mode: crate::serve::proto::BalancerMode) -> u64 {
+    balancer_map(t, None, |m| m.set_balancer(mode)).await
+}
+
+/// Turns the balancer on over a skewed cluster: node c weighs ten, so a and b each hold ten
+/// times c's share of the bytes per unit of weight (1.43x the mean), over a `size_ratio`
+/// of 1.2 after one pass. The move goes to c; the dwell is long, so it's the only one.
+async fn balance_skewed(t: &Rig, token: Option<&str>) -> u64 {
+    balancer_map(t, token, |m| {
+        for n in m.nodes.iter_mut().filter(|n| n.id == "c") {
+            n.weight = 10;
+        }
+        m.balance = Some(crate::serve::proto::BalanceBounds {
+            size_ratio: 1.2,
+            passes: 1,
+            dwell_ms: 600_000,
+            ..Default::default()
+        });
+        m.set_balancer(crate::serve::proto::BalancerMode::On);
+    })
+    .await
 }
 
 /// Waits until the writer at `port` reports a balancer state `ok` takes, up to `limit`;
@@ -2980,6 +3056,42 @@ async fn balancer_until(port: u16, limit: Duration, ok: impl Fn(&str) -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Waits up to `limit` until the map at `port` has `done`, asking with `token`; the panic
+/// shows the writer's balancer state, the moves and the events.
+async fn map_until(
+    port: u16,
+    token: Option<&str>,
+    limit: Duration,
+    what: &str,
+    done: impl Fn(&crate::serve::proto::ClusterMap) -> bool,
+) -> crate::serve::proto::ClusterMap {
+    let until = tokio::time::Instant::now() + limit;
+    loop {
+        let m = map_of_as(port, token).await;
+        if done(&m) {
+            return m;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "{what}: the writer's balancer state {:?}; moves {:?}; events {:?}",
+            status_of_as(port, token).await.balancer,
+            m.moves,
+            m.balancer_events
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The `bal-` record in `m`, with its partition and phase.
+fn bal_record(
+    m: &crate::serve::proto::ClusterMap,
+) -> Option<(String, String, crate::serve::proto::MovePhase)> {
+    m.moves
+        .iter()
+        .find(|r| r.id.starts_with("bal-"))
+        .map(|r| (r.id.clone(), r.from.clone(), super::super::map::phase(r)))
 }
 
 #[test]
@@ -3008,13 +3120,135 @@ fn a_paused_or_idle_balancer_changes_no_map() {
 }
 
 #[test]
-fn a_balancer_move_an_earlier_writer_left_before_its_commit_point_is_aborted() {
-    // simp724's M1 on the D332 PR 3 plan: a `bal-` move of p1 to c stopped after its stamp
-    // (HANDING_OVER), as an earlier writer would leave it. The writer's balancer doesn't take
-    // it up: it aborts it. The record goes, c's copy goes aside, p1 is unfenced and serves on
-    // a again, and an ABORT event is recorded.
-    use crate::serve::cluster::moving::{STOP, Step};
+fn a_skewed_cluster_balances_by_a_whole_move_with_tokens_configured() {
+    use crate::serve::proto::BalancerEventKind;
+    // simp724's S2 and audit120's M1 on #2103: every node has tokens, and the writer runs
+    // its move with its cluster token alone, its map changes set in process. Node c weighs
+    // ten, so a is over its size bound: the balancer moves a's p1 to c. One MOVE event, p1's
+    // history, the record gone, p1 serving on c; nothing else moves within the dwell.
+    let mut t = Rig::start_with(&balancer_tokens());
+    let tok = Some(BALANCER_ADMIN);
+    writer_leased_as(&mut t, tok);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        balance_skewed(&t, tok).await;
+        let m = map_until(a, tok, Duration::from_secs(30), "p1 moved to c", |m| {
+            m.moves.is_empty() && m.partitions.iter().any(|p| p.id == "p1" && p.node == "c")
+        })
+        .await;
+        let moves: Vec<_> = m
+            .balancer_events
+            .iter()
+            .filter(|e| e.kind() == BalancerEventKind::Move)
+            .collect();
+        assert_eq!(moves.len(), 1, "{:?}", m.balancer_events);
+        assert_eq!(
+            (
+                moves[0].partition.as_str(),
+                moves[0].from.as_str(),
+                moves[0].to.as_str()
+            ),
+            ("p1", "a", "c")
+        );
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(p1.moves_history.len(), 1, "{p1:?}");
+        eventually_within(Duration::from_secs(10), "p1 to serve on c", async || {
+            local_as(c, "p1", tok).await.state() == LocalPartitionState::Serving
+        })
+        .await;
+        // Within the dwell: no second move.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of_as(a, tok).await;
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        assert_eq!(
+            m.balancer_events
+                .iter()
+                .filter(|e| e.kind() == BalancerEventKind::Move)
+                .count(),
+            1
+        );
+    });
+}
+
+/// simp724's M1 on the D332 PR 3 plan: a `bal-` move of p1 to c stopped after its stamp
+/// (HANDING_OVER), as an earlier writer would leave it. The writer's balancer doesn't take
+/// it up: it aborts it. The record goes, c's copy goes aside, p1 is unfenced and serves on
+/// a again, and an ABORT event is recorded. With `tokens`, under the cluster token alone
+/// (audit120's M1 on #2103).
+fn an_earlier_writers_move_is_aborted(tokens: &str) {
+    use crate::serve::cluster::moving::{STOP, Start, Step};
     use crate::serve::proto::{BalancerEventKind, MovePhase};
+    let mut t = Rig::start_with(tokens);
+    let tok = (!tokens.is_empty()).then_some(BALANCER_ADMIN);
+    writer_leased_as(&mut t, tok);
+    let [a, _, c] = t.ports;
+    let args = super::super::cli::NodeArgs {
+        node: format!("http://127.0.0.1:{c}"),
+        token_file: None,
+        ca: None,
+        own: tok.map(|tok| {
+            Box::new(super::super::cli::Own {
+                token: Some(tok.to_owned()),
+                ..Default::default()
+            })
+        }),
+    };
+    t.rt.block_on(async {
+        STOP.lock()
+            .unwrap()
+            .push((args.node.clone(), Step::Stamped));
+        let start = Start {
+            prefix: "bal",
+            ..Start::default()
+        };
+        within(super::super::moving::run_as(
+            &args, "p1", "c", false, None, &start,
+        ))
+        .await
+        .err()
+        .expect("stopped after the stamp");
+        let (id, from, phase) = bal_record(&map_of_as(a, tok).await).expect("recorded");
+        assert_eq!((from.as_str(), phase), ("p1", MovePhase::HandingOver));
+        balancer_map(&t, tok, |m| {
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        // The map's record of it, not the writer's state: "aborted" lasts one pass, and the
+        // next pass's reason replaces it.
+        map_until(a, tok, Duration::from_secs(20), "the move aborted", |m| {
+            bal_record(m).is_none()
+                && m.balancer_events
+                    .iter()
+                    .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
+        })
+        .await;
+        assert!(!t.dirs[2].join("p1.phdb").exists(), "c's copy went aside");
+        eventually_within(
+            Duration::from_secs(10),
+            "p1 to serve on a again",
+            async || local_as(a, "p1", tok).await.state() == LocalPartitionState::Serving,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn a_balancer_move_an_earlier_writer_left_before_its_commit_point_is_aborted() {
+    an_earlier_writers_move_is_aborted("");
+}
+
+#[test]
+fn a_balancer_move_an_earlier_writer_left_is_aborted_with_tokens_configured() {
+    an_earlier_writers_move_is_aborted(&balancer_tokens());
+}
+
+#[test]
+fn a_balancer_move_an_earlier_writer_left_past_its_commit_point_is_finished() {
+    use crate::serve::proto::{BalancerEventKind, MovePhase};
+    // The plan's test: a `bal-` move of p1 to c stopped once the map gave p1 to c
+    // (HANDED_OVER), as an earlier writer would leave it. The writer's balancer finishes it:
+    // the record goes, p1 serves on c, and nothing is aborted.
+    use crate::serve::cluster::moving::{STOP, Start, Step};
     let mut t = Rig::start();
     writer_leased(&mut t);
     let [a, _, c] = t.ports;
@@ -3025,50 +3259,108 @@ fn a_balancer_move_an_earlier_writer_left_before_its_commit_point_is_aborted() {
         own: None,
     };
     t.rt.block_on(async {
-        try_put(a, "alice", "1").await.unwrap();
-        STOP.lock()
-            .unwrap()
-            .push((args.node.clone(), Step::Stamped));
+        STOP.lock().unwrap().push((args.node.clone(), Step::Mapped));
+        let start = Start {
+            prefix: "bal",
+            ..Start::default()
+        };
         within(super::super::moving::run_as(
-            &args, "p1", "c", false, None, "bal",
+            &args, "p1", "c", false, None, &start,
         ))
         .await
         .err()
-        .expect("stopped after the stamp");
-        let record = async || {
-            super::super::moving::record_of(&map_of(a).await, "p1")
-                .map(|r| (r.id.clone(), super::super::map::phase(r)))
-        };
-        let (id, phase) = record().await.expect("recorded");
-        assert!(id.starts_with("bal-"), "{id}");
-        assert_eq!(phase, MovePhase::HandingOver);
+        .expect("stopped after the relocation map");
+        let (_, _, phase) = bal_record(&map_of(a).await).expect("recorded");
+        assert_eq!(phase, MovePhase::HandedOver);
         balancer_mode(&t, crate::serve::proto::BalancerMode::On).await;
-        // The map's record of it, not the writer's state: "aborted" lasts one pass, and the
-        // next pass's reason replaces it.
-        let until = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let m = map_of(a).await;
-            let aborted = m
-                .balancer_events
+        let m = map_until(a, None, Duration::from_secs(20), "the move finished", |m| {
+            bal_record(m).is_none()
+        })
+        .await;
+        assert!(
+            m.partitions.iter().any(|p| p.id == "p1" && p.node == "c"),
+            "{:?}",
+            m.partitions
+        );
+        assert!(
+            !m.balancer_events
                 .iter()
-                .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id);
-            if aborted && record().await.is_none() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < until,
-                "the writer's balancer state: {:?}; moves {:?}; events {:?}",
-                status_of(a).await.balancer,
-                m.moves,
-                m.balancer_events
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(!t.dirs[2].join("p1.phdb").exists(), "c's copy went aside");
+                .any(|e| e.kind() == BalancerEventKind::Abort),
+            "{:?}",
+            m.balancer_events
+        );
+        eventually_within(Duration::from_secs(10), "p1 to serve on c", async || {
+            state(c, "p1").await == LocalPartitionState::Serving
+        })
+        .await;
+    });
+}
+
+#[test]
+fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
+    use crate::serve::proto::{BalancerEventKind, MovePhase};
+    // simp724's M1 on #2103 (the plan's Amendment 2): the writer's lease bounds its
+    // balancer moves at every term, term 0 included. The balancer's move of p1 to c is held
+    // just before its stamp; a is cut off and its writer lease runs out; released, the move
+    // stamps c's copy but can't set its next map, so the record stays at COPYING and p1 on
+    // a. Joined again, the writer aborts it (it's before its commit point).
+    use crate::serve::cluster::moving::HOLD_BEFORE_STAMP;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let a = t.ports[0];
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    HOLD_BEFORE_STAMP.lock().unwrap().push((
+        format!("http://127.0.0.1:{a}"),
+        reached_tx,
+        release_rx,
+    ));
+    t.rt.block_on(async {
+        assert_eq!(map_of(a).await.writer_term, 0);
+        balance_skewed(&t, None).await;
+        within(reached_rx)
+            .await
+            .expect("the move reached its stamp");
+        let (_, _, phase) = bal_record(&map_of(a).await).expect("recorded");
+        assert_eq!(phase, MovePhase::Copying);
+    });
+    cut(&t, 0, true);
+    t.rt.block_on(async {
         eventually_within(
             Duration::from_secs(10),
-            "p1 to serve on a again",
-            async || state(a, "p1").await == LocalPartitionState::Serving,
+            "a's writer lease to run out",
+            async || status_of(a).await.writer_lease_remaining_ms == 0,
+        )
+        .await;
+    });
+    let (id, from) = t.rt.block_on(async {
+        let (id, from, _) = bal_record(&map_of(a).await).expect("recorded");
+        release_tx.send(()).expect("the move waits");
+        // Passes enough for the move to try its next map, and the writer to try an abort.
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        let m = map_of(a).await;
+        let (still, _, phase) = bal_record(&m).expect("still recorded");
+        assert_eq!((still.as_str(), phase), (id.as_str(), MovePhase::Copying));
+        assert!(
+            m.partitions.iter().any(|p| p.id == from && p.node == "a"),
+            "{:?}",
+            m.partitions
+        );
+        (id, from)
+    });
+    cut(&t, 0, false);
+    t.rt.block_on(async {
+        map_until(a, None, Duration::from_secs(30), "the move aborted", |m| {
+            bal_record(m).is_none()
+                && m.balancer_events
+                    .iter()
+                    .any(|e| e.kind() == BalancerEventKind::Abort && e.move_id == id)
+        })
+        .await;
+        eventually_within(
+            Duration::from_secs(10),
+            "the partition to serve on a",
+            async || state(a, &from).await == LocalPartitionState::Serving,
         )
         .await;
     });

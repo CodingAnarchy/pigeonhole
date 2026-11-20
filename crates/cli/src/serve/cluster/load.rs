@@ -203,6 +203,9 @@ struct Window {
     cpu: f64,
     device_rate: f64,
     intervals: u64,
+    /// When the current reservoir began (perf287's nit on #2103: by time, so a fold after a
+    /// gap doesn't stretch the window).
+    rotated_at: Option<Instant>,
 }
 
 /// A partition's folded load (`LocalPartition`'s fields).
@@ -231,7 +234,10 @@ impl PartitionLoad {
     /// [`READ_SLOTS`] fill it, and the `n`th replaces a random one with chance
     /// `READ_SLOTS / n`, so the keys kept are a uniform sample of every sampled read.
     pub(crate) fn add_read(&self, table: &str, key: &[u8]) {
-        let r = &self.reservoirs[self.current.load(Ordering::Relaxed) & 1];
+        // Acquire, with rotate's Release: a read that sees the new reservoir sees it emptied
+        // (perf287's nit on #2103). A read that took the old one just before can still land
+        // there: one sampled key, in the window it belongs to.
+        let r = &self.reservoirs[self.current.load(Ordering::Acquire) & 1];
         let n = r.reads.fetch_add(1, Ordering::Relaxed);
         let slot = if n < READ_SLOTS as u64 {
             n
@@ -250,13 +256,13 @@ impl PartitionLoad {
     /// one before is emptied to take reads (perf287). Called by the fold once a
     /// `--balance-window`.
     fn rotate(&self) {
-        let next = (self.current.load(Ordering::Relaxed) + 1) & 1;
+        let next = (self.current.load(Ordering::Acquire) + 1) & 1;
         let r = &self.reservoirs[next];
         for s in &r.slots {
             s.store(None);
         }
         r.reads.store(0, Ordering::Relaxed);
-        self.current.store(next, Ordering::Relaxed);
+        self.current.store(next, Ordering::Release);
     }
 
     /// The read keys of the current window, or of the window before while the current one
@@ -270,7 +276,7 @@ impl PartitionLoad {
         )
     )]
     pub(crate) fn read_keys(&self) -> (Vec<ReadKey>, f64) {
-        let cur = self.current.load(Ordering::Relaxed) & 1;
+        let cur = self.current.load(Ordering::Acquire) & 1;
         let r = if self.reservoirs[cur].reads.load(Ordering::Relaxed) >= ENOUGH_READS {
             &self.reservoirs[cur]
         } else {
@@ -337,16 +343,16 @@ impl PartitionLoad {
                 }
                 w.intervals += 1;
                 w.start = Some((now, reading, cpu_now));
-                // A new window's reservoir once a window's intervals have passed (perf287).
-                // alpha is 1 - e^(-interval/window): the intervals in a window, back from it.
+                // A new window's reservoir once a window has passed (perf287). alpha is
+                // 1 - e^(-interval/window): the window, back from it.
                 let ratio = -(1.0 - alpha).ln();
-                let per_window = if ratio > 0.0 {
-                    (1.0 / ratio).round().max(1.0) as u64
-                } else {
-                    u64::MAX
-                };
-                if w.intervals.is_multiple_of(per_window) {
-                    self.rotate();
+                if ratio > 0.0 {
+                    let window = interval.mul_f64(1.0 / ratio);
+                    let began = *w.rotated_at.get_or_insert(now);
+                    if now.saturating_duration_since(began) >= window {
+                        self.rotate();
+                        w.rotated_at = Some(now);
+                    }
                 }
             }
             Some(_) => {}

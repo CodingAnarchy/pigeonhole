@@ -14,7 +14,8 @@
 //!    bound; ties go to the smaller partition. Its copy must fit in the dwell at
 //!    `--move-rate-bytes` (perf287's should-fix 2).
 //! 3. **Merge** a partition under `partition_min_bytes` and a tenth of its node's mean load
-//!    into a neighbour (preferably the one holding the adjacent range of its largest table),
+//!    into a neighbour, one holding a range next to one of its own (only those: ai1249's S2
+//!    on #2103, so placements don't fragment),
 //!    if the two together stay under half of the max size and load (Amendment 3).
 //!
 //! Every action waits for its condition to hold `passes` consecutive passes; a node acted on
@@ -24,9 +25,17 @@
 //! `bounce_window` later, unless an operator's pin cleared it: simp724's S2).
 //!
 //! **Never a candidate** (simp724's S1, ai1249's (4)): a pinned partition; one in any range
-//! move's record, as source or target; one with in-doubt shares, a live read hold or an open
-//! spanning transaction homed there; for a split or merge, a table in a co-location group or
-//! one an index follows. A node that didn't answer this pass, or whose numbers are older than
+//! move's record, as source or target; one with in-doubt shares; for a split or merge, a
+//! table in a co-location group or one an index follows. A partition holding a pinned range
+//! (`TablePlacement.pinned_ranges`) never moves or merges, and never splits inside the pin
+//! (ai1249's M2 on #2103). A split key lies strictly inside one of P's own ranges in the map,
+//! never at a hole a range move or drop left in its file (ai1249's M1).
+//!
+//! Read holds and open transactions aren't inputs (simp724's M2 on #2103: `Status` doesn't
+//! carry them): a move fences and closes P on its node first, so a transaction or pinned
+//! snapshot open on it there ends with the old copy, as for `phdb cluster move`. A spanning
+//! transaction homed on P keeps its outcome: the move copies P's files whole, history
+//! included. A node that didn't answer this pass, or whose numbers are older than
 //! a window, is neither a source nor a target, and its streaks reset (Amendment 1's S2).
 //! The counters live in the writer's memory only, and start again with each writer (S3).
 
@@ -107,16 +116,36 @@ pub(crate) struct PartView {
     pub(crate) pinned: bool,
     /// Its balancer history (`Partition.moves_history`): kind and time.
     pub(crate) history: Vec<(Kind, u64)>,
-    /// It's in a range move's record, has in-doubt shares, a live read hold or an open
-    /// spanning transaction homed here: never a candidate (S1).
+    /// It's in a range move's record, or has in-doubt shares: never a candidate (S1).
     pub(crate) busy: bool,
     /// A table here is in a co-location group, or followed by an index: never split or
     /// merged (ai1249's (4)).
     pub(crate) whole_only: bool,
     /// Its tablets, when the loop fetched them (a split candidate's).
     pub(crate) tablets: Vec<Tablet>,
-    /// The partitions holding the ranges next to this one's in its largest table.
+    /// The partitions holding a range next to one of its own, in any table it holds.
     pub(crate) neighbours: Vec<String>,
+    /// Its own ranges in the map, of every table it holds.
+    pub(crate) ranges: Vec<KeySpan>,
+    /// The tables' pinned ranges that overlap its own (`TablePlacement.pinned_ranges`).
+    pub(crate) pinned_ranges: Vec<KeySpan>,
+}
+
+/// A key range of one table, `[start, end)`: `end` `None` to the table's end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeySpan {
+    pub(crate) table: String,
+    pub(crate) start: Vec<u8>,
+    pub(crate) end: Option<Vec<u8>>,
+}
+
+impl KeySpan {
+    /// Whether `key` lies strictly inside: above the start and below the end.
+    fn strictly_holds(&self, table: &str, key: &[u8]) -> bool {
+        self.table == table
+            && self.start.as_slice() < key
+            && self.end.as_deref().is_none_or(|e| key < e)
+    }
 }
 
 /// An action the policy chose.
@@ -264,7 +293,14 @@ fn split_point(p: &PartView) -> Option<(String, Vec<u8>, f64)> {
         let outside = total - ts.iter().map(|t| weight(t)).sum::<f64>();
         let mut below = outside;
         for t in ts.iter() {
-            if !t.start.is_empty() {
+            // Strictly inside one of P's own ranges, and outside every pin (ai1249's M1, M2
+            // on #2103).
+            let ok = p.ranges.iter().any(|r| r.strictly_holds(table, &t.start))
+                && !p
+                    .pinned_ranges
+                    .iter()
+                    .any(|r| r.strictly_holds(table, &t.start));
+            if ok {
                 let larger = below.max(total - below) / total;
                 if best.as_ref().is_none_or(|(_, _, s)| larger < *s) {
                     best = Some((table.to_owned(), t.start.clone(), larger));
@@ -374,8 +410,24 @@ pub(crate) fn decide(
             });
             continue;
         }
+        // The loop surveys no tablets until D331 PR 5's split (ai1249's S1 on #2103).
+        if p.tablets.is_empty() {
+            skip.get_or_insert_with(|| {
+                format!(
+                    "{} is too {}: a split waits for D331 PR 5",
+                    p.id,
+                    if too_big { "big" } else { "hot" }
+                )
+            });
+            continue;
+        }
         let Some((table, at, larger)) = split_point(p) else {
-            skip.get_or_insert_with(|| format!("{} has no tablet boundary to split at", p.id));
+            skip.get_or_insert_with(|| {
+                format!(
+                    "{} has no tablet boundary inside its own ranges, outside a pin, to split at",
+                    p.id
+                )
+            });
             continue;
         };
         if larger > 0.8 {
@@ -437,7 +489,10 @@ pub(crate) fn decide(
         }
         let by_load = lr - b.load_ratio >= sr - b.size_ratio;
         let mut best: Option<(&PartView, String, f64)> = None;
-        for p in parts.iter().filter(|p| p.node == n.id && eligible(p)) {
+        for p in parts
+            .iter()
+            .filter(|p| p.node == n.id && eligible(p) && p.pinned_ranges.is_empty())
+        {
             if counters.resting(&p.id, now) {
                 continue;
             }
@@ -509,7 +564,10 @@ pub(crate) fn decide(
     }
 
     // 3. Merges of small, cold partitions.
-    for p in parts.iter().filter(|p| eligible(p) && !p.whole_only) {
+    for p in parts
+        .iter()
+        .filter(|p| eligible(p) && !p.whole_only && p.pinned_ranges.is_empty())
+    {
         let key = format!("merge:{}", p.id);
         let node_mean = stats.iter().find(|s| s.0.id == p.node).map_or(0.0, |s| s.1);
         let small = p.bytes < b.partition_min_bytes && p.load < node_mean.max(mean_load) / 10.0;
@@ -530,6 +588,7 @@ pub(crate) fn decide(
             q.id != p.id
                 && eligible(q)
                 && !q.whole_only
+                && q.pinned_ranges.is_empty()
                 && !counters.resting(&q.id, now)
                 && ((p.bytes + q.bytes) as f64) < b.partition_max_bytes as f64 / 2.0
                 && p.load + q.load < b.partition_max_load / 2.0
@@ -538,13 +597,7 @@ pub(crate) fn decide(
             .neighbours
             .iter()
             .filter_map(|id| parts.iter().find(|q| q.id == *id))
-            .find(|q| fits(q))
-            .or_else(|| {
-                parts
-                    .iter()
-                    .filter(|q| fits(q))
-                    .min_by(|a, b| a.load.total_cmp(&b.load))
-            });
+            .find(|q| fits(q));
         if let Some(q) = target {
             return Decision::Act(
                 Action::Merge {
@@ -654,6 +707,115 @@ mod tests {
 
     /// Node a holds four partitions at 0.1 each; b and c 0.1 each: a is at 2x the mean, and
     /// any one partition moved off it lands within the bound.
+    /// `users`' range `[start, end)`.
+    fn span(start: &str, end: Option<&str>) -> KeySpan {
+        KeySpan {
+            table: "users".into(),
+            start: start.as_bytes().to_vec(),
+            end: end.map(|e| e.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn a_split_key_lies_strictly_inside_ps_own_ranges_and_outside_every_pin() {
+        // ai1249's M1 and M2 on #2103: P holds users' [, g) and [m, ), with a hole at
+        // [g, m) a range move left; its file keeps tablet edges at g and m. Neither is
+        // strictly inside one of P's ranges, so the split takes t; with [s, ) pinned, none.
+        let nodes = [node("a"), node("b")];
+        let tab = |start: &str, load: f64| Tablet {
+            table: "users".into(),
+            start: start.as_bytes().to_vec(),
+            bytes: 1 << 20,
+            load,
+        };
+        let mut p = part("p1", "a", 0.8, 1 << 30);
+        p.tablets = vec![tab("", 0.3), tab("g", 0.0), tab("m", 0.3), tab("t", 0.2)];
+        p.ranges = vec![span("", Some("g")), span("m", None)];
+        let parts = [p.clone(), part("p2", "b", 0.1, 1 << 30)];
+        let b = bounds();
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
+        assert!(
+            matches!(&d, Decision::Act(Action::Split { key, .. }, _) if key == b"t"),
+            "{d:?}"
+        );
+        p.pinned_ranges = vec![span("s", None)];
+        let parts = [p, part("p2", "b", 0.1, 1 << 30)];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
+        let Decision::Skip(why) = d else {
+            panic!("{d:?}")
+        };
+        assert!(
+            why.contains("inside its own ranges, outside a pin"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_partition_holding_a_pinned_range_never_moves_or_merges() {
+        // ai1249's M2 on #2103: a is hot, but every partition on it holds a pinned range.
+        let nodes = [node("a"), node("b"), node("c")];
+        let mut parts = spread();
+        for p in parts.iter_mut().filter(|p| p.node == "a") {
+            p.pinned_ranges = vec![span("", None)];
+        }
+        let b = bounds();
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
+        let Decision::Skip(why) = d else {
+            panic!("{d:?}")
+        };
+        assert!(why.contains("no partition on it can move"), "{why}");
+        // Small and cold, next to p2, but holding a pin: not merged.
+        let mut p1 = part("p1", "a", 0.001, 1 << 20);
+        p1.neighbours = vec!["p2".into()];
+        p1.pinned_ranges = vec![span("", None)];
+        let parts = [
+            p1,
+            part("p2", "a", 0.01, 1 << 20),
+            part("p3", "b", 0.3, 8 << 30),
+        ];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes[..2], &parts, &Bounds::default(), &mut c, &mut t, 10);
+        assert!(
+            !matches!(&d, Decision::Act(Action::Merge { from, .. }, _) if from == "p1"),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn a_split_with_no_tablets_surveyed_waits_for_the_split_driver() {
+        // ai1249's S1 on #2103: the loop surveys no tablets until D331 PR 5.
+        let nodes = [node("a"), node("b")];
+        let mut p = part("p1", "a", 0.8, 1 << 30);
+        p.ranges = vec![span("", None)];
+        let parts = [p, part("p2", "b", 0.75, 1 << 30)];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
+        let Decision::Skip(why) = d else {
+            panic!("{d:?}")
+        };
+        assert!(why.contains("a split waits for D331 PR 5"), "{why}");
+    }
+
+    #[test]
+    fn a_small_partition_merges_only_into_a_neighbour() {
+        // ai1249's S2 on #2103: p2 would fit, but it isn't next to p1.
+        let nodes = [node("a"), node("b")];
+        let parts = [
+            part("p1", "a", 0.001, 1 << 20),
+            part("p2", "a", 0.01, 1 << 20),
+            part("p3", "b", 0.3, 8 << 30),
+        ];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &Bounds::default(), &mut c, &mut t, 10);
+        assert!(
+            !matches!(&d, Decision::Act(Action::Merge { .. }, _)),
+            "{d:?}"
+        );
+    }
+
     fn spread() -> Vec<PartView> {
         let mut parts: Vec<PartView> = (0..4)
             .map(|i| part(&format!("p{i}"), "a", 0.1, (1 << 30) + i as u64))
@@ -714,6 +876,7 @@ mod tests {
             load,
         };
         p.tablets = vec![tab("", 0.2), tab("g", 0.2), tab("m", 0.3), tab("t", 0.1)];
+        p.ranges = vec![span("", None)];
         let parts = [p, part("p2", "b", 0.1, 1 << 30)];
         let b = bounds();
         let (mut c, mut t) = (Counters::default(), 0);
@@ -743,6 +906,7 @@ mod tests {
             load,
         };
         p.tablets = vec![tab("", 0.01), tab("k", 0.9), tab("l", 0.01)];
+        p.ranges = vec![span("", None)];
         let parts = [p.clone(), part("p2", "b", 0.75, 1 << 30)];
         let b = bounds();
         let (mut c, mut t) = (Counters::default(), 0);

@@ -58,6 +58,8 @@ pub(crate) struct Run {
     actions: HashMap<&'static str, u64>,
     /// Each node's load per unit of weight over the mean, at the last pass.
     ratios: Vec<(String, f64)>,
+    /// A pass is running ([`Node::spawn_balance`]).
+    passing: bool,
 }
 
 fn wall_ms() -> u64 {
@@ -153,6 +155,39 @@ pub(crate) fn views(
                     }
                 }
             }
+            // Its own ranges, and the pins that overlap them (ai1249's M1, M2 on #2103).
+            let mut ranges = Vec::new();
+            let mut pinned_ranges = Vec::new();
+            for t in &tables {
+                let own: Vec<balance::KeySpan> = map::table_ranges(t)
+                    .into_iter()
+                    .filter(|(_, _, q)| *q == p.id)
+                    .map(|(start, end, _)| balance::KeySpan {
+                        table: t.name.clone(),
+                        start,
+                        end,
+                    })
+                    .collect();
+                for pin in &t.pinned_ranges {
+                    let key = |k: &Option<proto::SplitKey>| {
+                        k.as_ref()
+                            .map(|k| map::split_key_bytes(k).unwrap_or_default())
+                    };
+                    let (start, end) = (key(&pin.start).unwrap_or_default(), key(&pin.end));
+                    let overlaps = own.iter().any(|r| {
+                        end.as_ref().is_none_or(|e| r.start < *e)
+                            && r.end.as_ref().is_none_or(|e| start < *e)
+                    });
+                    if overlaps {
+                        pinned_ranges.push(balance::KeySpan {
+                            table: t.name.clone(),
+                            start,
+                            end,
+                        });
+                    }
+                }
+                ranges.extend(own);
+            }
             PartView {
                 id: p.id.clone(),
                 node: p.node.clone(),
@@ -169,6 +204,8 @@ pub(crate) fn views(
                 whole_only,
                 tablets: Vec::new(),
                 neighbours,
+                ranges,
+                pinned_ranges,
             }
         })
         .collect();
@@ -239,6 +276,39 @@ impl Node {
     }
 
     /// The balancer's pass, if due (the module doc).
+    /// Runs a balancer pass on a task of its own, unless one is running: its calls to other
+    /// nodes (an abort, a pin, a survey) can wait on a node that's down, and the writer's
+    /// other duties, failover among them, mustn't wait on them (perf287's question on
+    /// #2103).
+    pub(crate) fn spawn_balance(self: &Arc<Self>) {
+        {
+            let mut r = self.balancing();
+            if r.passing {
+                return;
+            }
+            r.passing = true;
+        }
+        /// Clears `passing` however the pass ends, a panic included.
+        struct Done(std::sync::Weak<Node>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                if let Some(node) = self.0.upgrade() {
+                    node.balancing().passing = false;
+                }
+            }
+        }
+        let done = Done(Arc::downgrade(self));
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        rt.spawn(async move {
+            if let Some(node) = done.0.upgrade() {
+                node.maybe_balance().await;
+            }
+            drop(done);
+        });
+    }
+
     pub(crate) async fn maybe_balance(self: &Arc<Self>) {
         let Ok(map) = self.get_map() else { return };
         let mode = map.balancer();
@@ -257,8 +327,13 @@ impl Node {
         {
             let mut r = self.balancing();
             if r.term != Some(map.writer_term) {
+                // A new term's counters; the move in flight, the running pass and the
+                // metric's totals carry over.
                 *r = Run {
                     term: Some(map.writer_term),
+                    moving: r.moving.take(),
+                    actions: std::mem::take(&mut r.actions),
+                    passing: r.passing,
                     ..Run::default()
                 };
             }
@@ -285,7 +360,7 @@ impl Node {
                     "finishing move {} of {} to node {} (past its commit point)",
                     rec.id, rec.from, rec.to
                 ));
-                self.spawn_move(&map, &rec.from, &rec.to);
+                self.spawn_move(&map, &rec.from, &rec.to, None);
             }
             return;
         }
@@ -368,45 +443,89 @@ impl Node {
         .map_err(|e| e.message)
     }
 
+    /// Starts the move `a` on a task of its own (see [`Self::spawn_move`]). Its MOVE event
+    /// and history go in the map change that records the move, and the dwell starts once
+    /// that has landed: a move that can't start isn't recorded or counted (audit120's S1,
+    /// simp724's S1 on #2103).
     async fn start_move(self: &Arc<Self>, map: &ClusterMap, a: Action, why: &str, at: u64) {
-        let Action::Move {
-            partition,
-            from,
-            to,
-        } = &a
-        else {
+        let Action::Move { partition, to, .. } = &a else {
             return;
         };
-        // The decision's inputs, under CAS (S4): P still on `from`, in no move.
-        let mut m = map.clone();
-        m.map_version += 1;
-        let mut e = event(BalancerEventKind::Move, partition, why, at);
-        e.from = from.clone();
-        e.to = to.clone();
-        push_event(&mut m, e);
-        push_history(&mut m, partition, BalancerEventKind::Move, at);
-        if let Err(e) = self.balancer_change(map, m).await {
-            self.set_balancer_state(format!("skip: moving {partition} to {to}: {e}"));
-            return;
-        }
-        {
-            let mut r = self.balancing();
-            r.counters.took(&a, at, &bounds_of(map));
-            *r.actions.entry("move").or_insert(0) += 1;
-        }
-        self.set_balancer_state(format!("moving {partition} from {from} to {to}: {why}"));
-        self.spawn_move(map, partition, to);
+        self.set_balancer_state(format!("starting the move of {partition} to {to}: {why}"));
+        self.spawn_move(map, partition, to, Some((a.clone(), why.to_owned(), at)));
     }
 
     /// Runs `phdb cluster move`'s steps for `partition` to `to` on a task of its own, with
-    /// this node's cluster token (#2094), its record a `bal-` one.
-    fn spawn_move(self: &Arc<Self>, map: &ClusterMap, partition: &str, to: &str) {
+    /// this node's cluster token (#2094), its map changes set here in process (audit120's
+    /// M1 on #2103), its record a `bal-` one. `start`, for a new move: the action, why and
+    /// when, recorded with the record. `None` finishes an earlier writer's move.
+    fn spawn_move(
+        self: &Arc<Self>,
+        map: &ClusterMap,
+        partition: &str,
+        to: &str,
+        start: Option<(Action, String, u64)>,
+    ) {
         let Some(args) = self.own_args(map) else {
             return;
         };
         let (p, to, node) = (partition.to_owned(), to.to_owned(), Arc::downgrade(self));
+        let bounds = bounds_of(map);
         let task = tokio::spawn(async move {
-            let out = super::moving::run_as(&args, &p, &to, false, None, "bal").await;
+            let with = |m: &mut ClusterMap| -> Result<(), crate::exit::Failure> {
+                let Some((
+                    Action::Move {
+                        partition,
+                        from,
+                        to,
+                    },
+                    why,
+                    at,
+                )) = &start
+                else {
+                    return Ok(());
+                };
+                // The decision's inputs (S4): no other move began meanwhile.
+                if m.moves.iter().any(|r| r.from != *partition) {
+                    return Err(crate::exit::Failure::usage(
+                        "another move started since the balancer decided",
+                    ));
+                }
+                let mut e = event(BalancerEventKind::Move, partition, why, *at);
+                e.from = from.clone();
+                e.to = to.clone();
+                push_event(m, e);
+                push_history(m, partition, BalancerEventKind::Move, *at);
+                Ok(())
+            };
+            let started = |id: &str| {
+                let Some(node) = node.upgrade() else { return };
+                if let Some((
+                    a @ Action::Move {
+                        partition,
+                        from,
+                        to,
+                    },
+                    why,
+                    at,
+                )) = &start
+                {
+                    {
+                        let mut r = node.balancing();
+                        r.counters.took(a, *at, &bounds);
+                        *r.actions.entry("move").or_insert(0) += 1;
+                    }
+                    node.set_balancer_state(format!(
+                        "moving {partition} from {from} to {to} ({id}): {why}"
+                    ));
+                }
+            };
+            let how = super::moving::Start {
+                prefix: "bal",
+                with: Some(&with),
+                on_started: Some(&started),
+            };
+            let out = super::moving::run_as(&args, &p, &to, false, None, &how).await;
             if let Err(f) = &out {
                 eprintln!(
                     "phdb serve: the balancer's move of {p} to {to} stopped: {}",
@@ -423,9 +542,44 @@ impl Node {
         self.balancing().moving = Some(task);
     }
 
+    /// A map change of this writer's own balancer move, set here in process (audit120's M1
+    /// on #2103: `SetMap` takes the admin scope, and the writer holds only the cluster
+    /// token), compare-and-set against the map `m` was built from. Under the writer lease at
+    /// any term (simp724's M1 on #2103, the plan's Amendment 2): a writer cut off at term 0
+    /// can't go on moving.
+    pub(crate) async fn set_own_map(
+        self: &Arc<Self>,
+        m: ClusterMap,
+        copies: Vec<String>,
+    ) -> Result<proto::SetMapResponse, crate::serve::errors::ApiError> {
+        let current = self.get_map()?;
+        if schema::writer(&current) == self.id && self.writer_lease_remaining(&current).is_zero() {
+            return Err(crate::serve::errors::ApiError::partition_unavailable(
+                "this writer holds no writer lease: the balancer's move changes no map without \
+                 it (D332)",
+            ));
+        }
+        let expected = m.map_version.saturating_sub(1);
+        self.set_map(SetMapRequest {
+            map: Some(m),
+            expected_map_version: expected,
+            copies,
+            force: false,
+        })
+        .await
+    }
+
     /// This node as `phdb cluster` reaches it, with its own cluster token and CA.
-    fn own_args(&self, map: &ClusterMap) -> Option<super::cli::NodeArgs> {
-        let n = map.nodes.iter().find(|n| n.id == self.id)?;
+    /// `None`, said in the balancer's state, when the map doesn't list this node (audit120's
+    /// nit on #2103).
+    fn own_args(self: &Arc<Self>, map: &ClusterMap) -> Option<super::cli::NodeArgs> {
+        let Some(n) = map.nodes.iter().find(|n| n.id == self.id) else {
+            self.set_balancer_state(format!(
+                "waiting: the map doesn't list this node ({}), so it can't run a move",
+                self.id
+            ));
+            return None;
+        };
         Some(super::cli::NodeArgs {
             node: format!("{}://{}", self.peers.scheme, n.address),
             token_file: None,
@@ -433,6 +587,7 @@ impl Node {
             own: Some(Box::new(super::cli::Own {
                 token: self.peers.token.clone(),
                 ca: self.peers.ca.clone(),
+                node: Arc::downgrade(self),
             })),
         })
     }
