@@ -39,7 +39,10 @@ A range move (D331) copies a key range from partition S to partition T, follows 
 
 ## A feed retention hold
 - `Engine::hold_feed_retention(cap_bytes) -> FeedRetentionHold`, and `Pigeonhole::hold_feed_retention` under `__unstable-replication`, both doc-hidden.
-- **What it holds:** every stream's history from its current segment on (a stream's head segment is never trimmed). It holds until the guard is dropped, or until the database retains more than `cap_bytes` of history.
+- **What it holds:** every stream's history from its checkpoint's segment on (retention never trims at or past a stream's checkpoint). It holds until the guard is dropped, or until the database retains more than `cap_bytes` of history.
+  - **Why the checkpoint, not the head** (fixed before 1.3.0, found by #2107's tests): a feed token taken from a snapshot doesn't know the snapshot's place in each stream's log, so it starts each stream's scan at that stream's checkpoint, which can be segments behind its head. A hold from the head left those segments to retention, so a snapshot token taken right after the hold could expire at the next flush, though nothing after the snapshot was gone. With many shards each stream keeps only about one segment of retention, which is how the tests met it.
+  - **What it guarantees:** a token from now, or of a snapshot opened after the hold, resumes while the hold lasts. Checkpoints only move forward, so such a token starts each stream at or past its checkpoint at the hold. A snapshot opened *before* the hold may carry an older checkpoint, and its token isn't covered (simp724): a range move takes the hold before its copy's first snapshot.
+  - **The cost** beyond a head-only hold: each stream's unflushed log at the hold, which the memtable budget bounds.
 - **The cap:** past it, the hold lapses. It's dropped, `lapsed()` turns true, and retention trims again, so a reader it was for finds its position gone and expires. A move then aborts with "the copy outran the source's feed retention".
 - **Mechanism:** `FeedMarks::set_hold(epoch)`. A stream's retention pass stops its floor below the held epoch, and never lowers it.
 - The engine keeps every hold in one leaf-locked list. Each shard's feed maintenance lapses holds past their cap, at one atomic load while none is held.
