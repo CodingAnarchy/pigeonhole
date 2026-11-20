@@ -202,9 +202,13 @@ const BATCH_BYTES: usize = 256 << 10;
 /// in a partition's history whose moved range takes few of its writes would otherwise read
 /// on without end.
 const BATCH_READS: usize = 4 * BATCH_COMMITS;
+/// How long a busy stream waits for more commits before it sends a batch (perf287's re-run
+/// on #2107: the timer's grain; about 5 commits a message at 5,000 a second).
+const LINGER: Duration = Duration::from_millis(1);
 
-/// The commits one event carries (#2108, perf287): what's ready at once, oldest first, at
-/// most [`BATCH_COMMITS`] and about [`BATCH_BYTES`]. The target applies an event as one
+/// The commits one event carries (#2108, perf287): what's ready, plus what comes within
+/// [`LINGER`] while the stream is busy, oldest first, at most [`BATCH_COMMITS`] and about
+/// [`BATCH_BYTES`]. The target applies an event as one
 /// commit, and one commit keeps only the last mutation of a cell and timestamp (D34), so no
 /// two of a batch's commits touch one key (a second increment at one timestamp would be
 /// lost): a commit that would starts the next batch. Its own changes never repeat one (its
@@ -285,14 +289,16 @@ enum Read {
 
 impl Stream {
     /// Sends the range's history until the move ends it, the target goes away, or it fails.
-    /// Each event carries the commits ready at once ([`Batch`], #2108): the first is waited
-    /// for, the rest are only what's there.
+    /// Each event carries a [`Batch`] (#2108): the first commit is waited for, the rest
+    /// gathered by [`fill`].
     async fn run(&self, mut feed: pigeonhole::Feed) -> Result<(), ApiError> {
         let mut sent = Bytes::new();
         let mut quiet = tokio::time::Instant::now() + self.quiet;
         let mut looked = tokio::time::Instant::now();
         // A commit read whose changes repeat a key the last batch held: the next one's first.
         let mut carry: Option<proto::RawCommit> = None;
+        // Whether the last batch carried commits.
+        let mut busy = false;
         loop {
             // A catch-up behind on a backlog finds every read ready: give the worker back
             // when its budget is spent (perf287 on #2107), as S's writes run there too.
@@ -313,15 +319,19 @@ impl Stream {
             }
             // The position after the batch's last commit.
             let mut token = Bytes::copy_from_slice(feed.token().as_bytes());
-            while !batch.full() && carry.is_none() {
-                let Some(ev) = feed.try_next_event().map_err(ApiError::from)? else {
-                    break;
-                };
-                let read = self.read(ev);
-                if self.absorb(read, &mut batch, &mut carry)? {
-                    token = Bytes::copy_from_slice(feed.token().as_bytes());
-                }
+            // While busy (the last batch carried commits), wait up to [`LINGER`] for more
+            // (perf287's re-run: a follower that keeps up is woken by each commit, so what's
+            // ready at once is one); after a quiet poll, the first commit goes at once.
+            let linger = busy.then(|| tokio::time::Instant::now() + LINGER);
+            let mut reads = FeedReads {
+                feed: &mut feed,
+                stream: self,
+            };
+            let absorb = |read, batch: &mut Batch, carry: &mut _| self.absorb(read, batch, carry);
+            if let Some(t) = fill(&mut reads, &mut batch, &mut carry, linger, absorb).await? {
+                token = t;
             }
+            busy = !batch.commits.is_empty();
             let now = tokio::time::Instant::now();
             if !batch.commits.is_empty() {
                 let event = proto::feed_event::Event::RawCommits(proto::RawCommits {
@@ -453,6 +463,69 @@ impl Stream {
     }
 }
 
+/// What [`fill`] reads from: the stream's feed ([`FeedReads`]), or a test's script.
+trait Reads {
+    /// The next event, if one is ready now.
+    fn ready(&mut self) -> Result<Option<Read>, ApiError>;
+    /// The next event, waited for.
+    fn wait(&mut self) -> impl std::future::Future<Output = Result<Read, ApiError>> + Send;
+    /// The position just after what's been read.
+    fn token(&self) -> Bytes;
+}
+
+/// The stream's feed, read as the stream reads it.
+struct FeedReads<'a> {
+    feed: &'a mut pigeonhole::Feed,
+    stream: &'a Stream,
+}
+
+impl Reads for FeedReads<'_> {
+    fn ready(&mut self) -> Result<Option<Read>, ApiError> {
+        Ok(self
+            .feed
+            .try_next_event()
+            .map_err(ApiError::from)?
+            .map(|ev| self.stream.read(ev)))
+    }
+
+    fn wait(&mut self) -> impl std::future::Future<Output = Result<Read, ApiError>> + Send {
+        next(self.feed, self.stream)
+    }
+
+    fn token(&self) -> Bytes {
+        Bytes::copy_from_slice(self.feed.token().as_bytes())
+    }
+}
+
+/// Adds to `batch` what `reads` has ready, and, with `linger` set (the stream is busy),
+/// what comes before it, until the batch is full or `carry` holds a commit for the next.
+/// `absorb` takes each event in. The token after the last event taken in, if any.
+async fn fill(
+    reads: &mut impl Reads,
+    batch: &mut Batch,
+    carry: &mut Option<proto::RawCommit>,
+    linger: Option<tokio::time::Instant>,
+    mut absorb: impl FnMut(Read, &mut Batch, &mut Option<proto::RawCommit>) -> Result<bool, ApiError>,
+) -> Result<Option<Bytes>, ApiError> {
+    let mut token = None;
+    while !batch.full() && carry.is_none() {
+        let read = match reads.ready()? {
+            Some(read) => read,
+            None => {
+                let Some(at) = linger else { break };
+                match tokio::time::timeout_at(at, reads.wait()).await {
+                    Ok(read) => read?,
+                    Err(_) => break,
+                }
+            }
+        };
+        if absorb(read, batch, carry)? {
+            token = Some(reads.token());
+        }
+    }
+    Ok(token)
+}
+
 /// The feed's next event, as the stream reads it.
 async fn next(feed: &mut pigeonhole::Feed, s: &Stream) -> Result<Read, ApiError> {
     std::future::poll_fn(|cx| match feed.poll_next_event(cx) {
@@ -513,6 +586,97 @@ mod tests {
         }
         b.reads += 1;
         assert!(b.full() && b.commits.is_empty());
+    }
+
+    /// A script of events, each due at its time.
+    struct Script {
+        due: std::collections::VecDeque<(tokio::time::Instant, proto::RawCommit)>,
+        taken: u64,
+    }
+
+    impl Reads for Script {
+        fn ready(&mut self) -> Result<Option<Read>, ApiError> {
+            let now = tokio::time::Instant::now();
+            if !self.due.front().is_some_and(|(at, _)| *at <= now) {
+                return Ok(None);
+            }
+            self.taken += 1;
+            Ok(self.due.pop_front().map(|(_, c)| Read::Commit(Some(c))))
+        }
+
+        async fn wait(&mut self) -> Result<Read, ApiError> {
+            match self.due.front() {
+                Some((at, _)) => tokio::time::sleep_until(*at).await,
+                None => std::future::pending().await,
+            }
+            self.taken += 1;
+            Ok(Read::Commit(self.due.pop_front().map(|(_, c)| c)))
+        }
+
+        fn token(&self) -> Bytes {
+            Bytes::copy_from_slice(&self.taken.to_le_bytes())
+        }
+    }
+
+    fn script(after_us: &[u64]) -> Script {
+        let now = tokio::time::Instant::now();
+        Script {
+            due: after_us
+                .iter()
+                .enumerate()
+                .map(|(i, us)| {
+                    (
+                        now + Duration::from_micros(*us),
+                        incr(i as u64 + 1, &format!("r{i}"), 1),
+                    )
+                })
+                .collect(),
+            taken: 0,
+        }
+    }
+
+    fn absorb(
+        read: Read,
+        batch: &mut Batch,
+        carry: &mut Option<proto::RawCommit>,
+    ) -> Result<bool, ApiError> {
+        if let Read::Commit(Some(c)) = read
+            && let Err(c) = batch.add(c)
+        {
+            *carry = Some(c);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_stream_gathers_what_comes_within_its_linger() {
+        // perf287's re-run on #2107: commits 0.3 ms apart share a message while the stream
+        // is busy; one past the linger waits for the next.
+        let mut s = script(&[0, 300, 600, 5_000]);
+        let start = tokio::time::Instant::now();
+        let mut batch = Batch::default();
+        let mut carry = None;
+        let token = fill(&mut s, &mut batch, &mut carry, Some(start + LINGER), absorb)
+            .await
+            .unwrap();
+        assert_eq!(batch.commits.len(), 3);
+        assert_eq!(token, Some(Bytes::copy_from_slice(&3u64.to_le_bytes())));
+        assert_eq!(start.elapsed(), LINGER, "it waited out its linger");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_stream_sends_its_first_commit_at_once() {
+        // After a quiet poll, no linger: what's ready goes, and nothing is waited for.
+        let mut s = script(&[0, 300]);
+        let start = tokio::time::Instant::now();
+        let mut batch = Batch::default();
+        let mut carry = None;
+        fill(&mut s, &mut batch, &mut carry, None, absorb)
+            .await
+            .unwrap();
+        assert_eq!(batch.commits.len(), 1);
+        assert_eq!(start.elapsed(), Duration::ZERO, "nothing waited for");
     }
 
     #[test]
