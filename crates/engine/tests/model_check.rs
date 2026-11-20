@@ -116,11 +116,15 @@ fn settled_commits_trimmed_by_participants_survive_crashes() {
 /// later (commit or abort) or left in doubt across crashes and closes, beside the usual
 /// workload, faults, crashes and tablet changes. A share in doubt holds its rows, so a
 /// write to them answers `Busy` (a single) or `Conflict` (a PREPARE): the quiet runs assert
-/// instead that every plain commit's `Busy` met such a share.
+/// instead that every plain commit's `Busy` met such a share. Read holds (#2059,
+/// `Txn::submit_hold_reads`) run beside them: a held row refuses writes the same way, and a
+/// release answers whether the hold lasted (`false` only after a crash between).
 #[test]
 fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
     let (mut prepared, mut committed, mut aborted, mut adopted) = (0, 0, 0, 0);
     let mut read_only = 0;
+    let (mut held, mut released_held, mut released_lost) = (0, 0, 0);
+    let (mut stale, mut undecided) = (0, 0);
     for shards in [1, 2, 4] {
         let mut quiet = Config::quiet(300);
         let mut crashes = Config::standard(300);
@@ -131,6 +135,7 @@ fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
             cfg.shards = shards;
             cfg.tablet_changes = true;
             cfg.external_ppm = 150_000;
+            cfg.hold_ppm = 40_000;
         }
         for cfg in [&quiet, &crashes, &moving] {
             for seed in seeds() {
@@ -151,6 +156,11 @@ fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
                         aborted += stats.external_aborted;
                         adopted += stats.external_adopted;
                         read_only += stats.external_read_only;
+                        held += stats.holds_taken;
+                        released_held += stats.holds_released_held;
+                        released_lost += stats.holds_released_lost;
+                        stale += stats.holds_stale_at_submit;
+                        undecided += stats.holds_undecided_at_submit;
                     }
                     Err(f) => panic!("{f}"),
                 }
@@ -166,6 +176,15 @@ fn external_prepares_decides_and_crashes_with_shares_in_doubt() {
     );
     // ICR 0140 amendment 1: read-only branches ran too.
     assert!(read_only > 0, "no read-only branch ran");
+    // #2059: holds were taken, released while still held, and lost to a crash.
+    eprintln!(
+        "holds: {held} taken, {released_held} released held, {released_lost} released lost; \
+         submitted over a stale read {stale}, over an undecided write {undecided}"
+    );
+    assert!(
+        held > 0 && released_held > 0 && released_lost > 0,
+        "holds didn't run every way: {held} taken, {released_held} held, {released_lost} lost"
+    );
 }
 
 #[test]

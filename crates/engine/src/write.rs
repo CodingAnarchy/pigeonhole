@@ -1209,6 +1209,126 @@ impl ReadHold {
     }
 }
 
+impl ReadHold {
+    /// [`release`](Self::release) without waiting (#2059): the [`PendingRelease`] resolves
+    /// to whether the hold was still in place on every shard (`false` only ever means lost to
+    /// a close or a recovery). It never blocks, so a thread that drives a shard may call it
+    /// (D88) and poll the answer while it runs the shards.
+    pub fn submit_release(mut self) -> PendingRelease {
+        self.done = true;
+        let Some(engine) = self.engine.upgrade() else {
+            return PendingRelease {
+                held: false,
+                waiting: Vec::new(),
+            };
+        };
+        let (held, waiting) = engine.submit_release_reads(self.token, &self.shards, true);
+        PendingRelease {
+            held,
+            waiting: waiting.into_iter().map(Some).collect(),
+        }
+    }
+}
+
+/// A read hold's release in flight ([`ReadHold::submit_release`], #2059): resolves to whether
+/// the hold was still in place on every shard.
+#[derive(Debug)]
+#[must_use = "the release's answer comes from polling it"]
+pub struct PendingRelease {
+    held: bool,
+    waiting: Vec<Option<pigeonhole_runtime::Waiter<bool>>>,
+}
+
+impl std::future::Future for PendingRelease {
+    type Output = bool;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        let this = &mut *self;
+        let mut pending = false;
+        for slot in &mut this.waiting {
+            let Some(rx) = slot else { continue };
+            match std::pin::Pin::new(rx).poll(cx) {
+                std::task::Poll::Ready(answer) => {
+                    this.held &= answer == Some(true);
+                    *slot = None;
+                }
+                std::task::Poll::Pending => pending = true,
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(this.held)
+        }
+    }
+}
+
+/// A read hold being taken ([`Txn::submit_hold_reads`], #2059): resolves to the
+/// [`ReadHold`], or to the refusal [`Txn::hold_reads`] would give. Dropped before it resolves,
+/// it releases whatever its shards hold.
+#[derive(Debug)]
+#[must_use = "the hold comes from polling it, and dropping it releases it"]
+pub struct PendingHold {
+    engine: std::sync::Weak<Inner>,
+    sub: Option<crate::engine::HoldSubmission>,
+}
+
+impl std::future::Future for PendingHold {
+    type Output = crate::Result<ReadHold>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = &mut *self;
+        let sub = this.sub.as_mut().expect("polled after it resolved");
+        let mut pending = false;
+        let mut answers = Vec::new();
+        for (shard, slot) in &mut sub.waiting {
+            let Some(rx) = slot else { continue };
+            match std::pin::Pin::new(rx).poll(cx) {
+                std::task::Poll::Ready(answer) => {
+                    answers.push((*shard, answer));
+                    *slot = None;
+                }
+                std::task::Poll::Pending => pending = true,
+            }
+        }
+        for (shard, answer) in answers {
+            sub.answered(shard, answer);
+        }
+        if pending {
+            return std::task::Poll::Pending;
+        }
+        let sub = this.sub.take().expect("taken once");
+        let Some(engine) = this.engine.upgrade() else {
+            // The engine closed meanwhile: whatever was held went with it.
+            return std::task::Poll::Ready(Err(crate::Error::Closed));
+        };
+        std::task::Poll::Ready(engine.finish_hold(sub).map(|(token, shards)| ReadHold {
+            engine: Arc::downgrade(&engine),
+            token,
+            shards,
+            done: false,
+        }))
+    }
+}
+
+impl Drop for PendingHold {
+    fn drop(&mut self) {
+        // Unresolved: release on every shard asked, answered or not. A shard's messages run
+        // in order, so a release sent now follows its hold request.
+        if let Some(sub) = self.sub.take()
+            && let Some(e) = self.engine.upgrade()
+        {
+            e.release_reads(sub.token, &sub.asked(), false);
+        }
+    }
+}
+
 impl Drop for ReadHold {
     fn drop(&mut self) {
         if !self.done
@@ -1500,6 +1620,31 @@ impl Txn {
             token,
             shards,
             done: false,
+        })
+    }
+
+    /// [`hold_reads`](Self::hold_reads) without waiting (#2059): the [`PendingHold`] resolves
+    /// to the [`ReadHold`] or to the refusal `hold_reads` gives. It never blocks, so a thread
+    /// that drives a shard may call it (D88) and poll it while it runs the shards. Refused at
+    /// once as `hold_reads` is: `InvalidArgument` for writes or no reads, `ReadOnly` on a
+    /// replica or a read-only open.
+    pub fn submit_hold_reads(self) -> crate::Result<PendingHold> {
+        let Txn {
+            engine,
+            snapshot,
+            reads,
+            batch,
+            xid: _,
+        } = self;
+        if !batch.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "a read hold is for a transaction without writes: prepare it instead".to_owned(),
+            ));
+        }
+        let sub = engine.submit_hold_reads(Validate::new(snapshot, reads))?;
+        Ok(PendingHold {
+            engine: Arc::downgrade(&engine),
+            sub: Some(sub),
         })
     }
 
