@@ -154,6 +154,19 @@ impl Node {
             .map(|c| std::sync::Arc::clone(&c.range_copies))
     }
 
+    /// At start: the range moves the map gives this node as their target follow again,
+    /// each from its progress rows (D331 PR 4b). A follower waits until its target is open
+    /// here and holds a lease before it writes.
+    pub(super) fn start_range_follows(&self) {
+        let Some(shared) = self.server.get().and_then(|o| o.shared.upgrade()) else {
+            return;
+        };
+        let (Some(cluster), Ok(map)) = (shared.router.cluster.as_ref(), self.get_map()) else {
+            return;
+        };
+        cluster.range_follows.sync(&map, &self.id, &shared);
+    }
+
     /// The range moves this node follows as a target (D331 PR 4b), once it serves.
     pub(super) fn range_follows(&self) -> Option<std::sync::Arc<super::range_follow::Followers>> {
         let shared = self.server.get().and_then(|o| o.shared.upgrade())?;

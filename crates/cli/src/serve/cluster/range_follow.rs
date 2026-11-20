@@ -89,6 +89,9 @@ pub(crate) struct Progress {
 #[derive(Debug, Default)]
 pub(crate) struct Followers {
     running: Mutex<HashMap<String, Running>>,
+    /// Stopped followers' tasks, until they end: a later follower of the same move waits
+    /// for its predecessor first, so two never write the range at once (M1).
+    stopping: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug)]
@@ -102,8 +105,8 @@ impl Followers {
     /// After an install of `map`: starts a follower for each range move whose target `map`
     /// gives this node (`me`), from COPYING through HANDED_OVER, and stops those of moves it
     /// no longer does (M2). A stopped follower finishes the commit it's in (it stops only
-    /// between commits); its task is awaited in the background, and a panic in it logged.
-    /// PR 5's abort adds a wait for it before it drops the range (simp724's M2).
+    /// between commits); a later follower of the same move waits for it to end first. PR 5's
+    /// abort adds a wait for it before it drops the range (simp724's M2).
     pub(crate) fn sync(&self, map: &proto::ClusterMap, me: &str, shared: &Arc<Shared>) {
         // Every follower runs on the server's runtime: without one (no follower started),
         // there's nothing to stop either.
@@ -120,6 +123,8 @@ impl Followers {
             })
             .collect();
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stopping = self.stopping.lock().unwrap_or_else(PoisonError::into_inner);
+        stopping.retain(|_, t| !t.is_finished());
         let gone: Vec<String> = running
             .keys()
             .filter(|id| !wanted.iter().any(|m| &&m.id == id))
@@ -130,13 +135,7 @@ impl Followers {
                 continue;
             };
             r.stop.send_replace(true);
-            rt.spawn(async move {
-                if let Err(e) = r.task.await
-                    && e.is_panic()
-                {
-                    eprintln!("phdb serve: range move {id:?}'s follower panicked: {e}");
-                }
-            });
+            stopping.insert(id, r.task);
         }
         for m in wanted {
             if running.contains_key(&m.id) {
@@ -149,6 +148,7 @@ impl Followers {
                 id: m.id.clone(),
                 stop: rx,
                 progress: Arc::clone(&progress),
+                after: stopping.remove(&m.id),
             };
             let task = rt.spawn(follower.run());
             running.insert(
@@ -159,6 +159,31 @@ impl Followers {
                     progress,
                 },
             );
+        }
+    }
+
+    /// Stops every follower and waits until each has (an apply in flight finishes first): at
+    /// the server's shutdown, before the partitions' databases close.
+    pub(crate) async fn stop_all(&self) {
+        let stopped: Vec<Running> = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .map(|(_, r)| r)
+            .collect();
+        for r in &stopped {
+            r.stop.send_replace(true);
+        }
+        let earlier: Vec<tokio::task::JoinHandle<()>> = self
+            .stopping
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .map(|(_, t)| t)
+            .collect();
+        for task in stopped.into_iter().map(|r| r.task).chain(earlier) {
+            let _ = task.await;
         }
     }
 
@@ -200,6 +225,8 @@ struct Follower {
     id: String,
     stop: watch::Receiver<bool>,
     progress: Arc<Progress>,
+    /// A stopped follower of the same move, still finishing a commit: waited for first.
+    after: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// What a step left to do.
@@ -243,6 +270,9 @@ struct Ctx {
 
 impl Follower {
     async fn run(mut self) {
+        if let Some(earlier) = self.after.take() {
+            let _ = earlier.await;
+        }
         let mut backoff = MIN_BACKOFF;
         let mut last_error = String::new();
         loop {
@@ -362,7 +392,7 @@ impl Follower {
             max_bytes: CHUNK_BYTES,
         };
         #[cfg(test)]
-        hold_chunk(&cx.shared, head.n).await;
+        hold_chunk(&cx.shared, head.n, &mut self.stop).await;
         let resp = ask_chunk(&cx.shared, &cx.m.from, req).await?;
         let first = if head.first.is_empty() {
             if resp.token.is_empty() {
@@ -417,12 +447,15 @@ impl Follower {
         };
         let last = commits.len().saturating_sub(1);
         if commits.is_empty() {
+            if *self.stop.borrow() {
+                return Ok(());
+            }
             self.commit(cx, Vec::new(), Some(progress)).await?;
         } else {
             for (i, cells) in commits.into_iter().enumerate() {
-                if i < last && *self.stop.borrow() {
-                    // Stopped between two commits of a chunk: the next follower copies it
-                    // again, whole.
+                if *self.stop.borrow() {
+                    // Stopped before a commit of the chunk: the next follower copies it again,
+                    // whole.
                     return Ok(());
                 }
                 let p = (i == last).then(|| progress.clone());
@@ -641,7 +674,8 @@ impl HeadWrite {
 }
 
 /// A hold seam (tests): the follower on the node in a listed cluster directory waits,
-/// once, before it asks for the listed chunk, until the sender sends or is dropped.
+/// once, before it asks for the listed chunk, until the sender sends or is dropped, or the
+/// follower is stopped (then it commits nothing more).
 #[cfg(test)]
 pub(crate) static HOLD_CHUNK: Mutex<Vec<HeldChunk>> = Mutex::new(Vec::new());
 
@@ -654,7 +688,7 @@ pub(crate) type HeldChunk = (
 );
 
 #[cfg(test)]
-async fn hold_chunk(shared: &Shared, n: u64) {
+async fn hold_chunk(shared: &Shared, n: u64, stop: &mut watch::Receiver<bool>) {
     let Some(cluster) = shared.router.cluster.as_ref() else {
         return;
     };
@@ -666,7 +700,10 @@ async fn hold_chunk(shared: &Shared, n: u64) {
             .map(|i| armed.swap_remove(i).1)
     };
     if let Some(wait) = wait {
-        let _ = wait.await;
+        tokio::select! {
+            _ = wait => {}
+            _ = stop.wait_for(|s| *s) => {}
+        }
     }
 }
 
