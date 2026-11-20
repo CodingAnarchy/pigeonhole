@@ -6419,6 +6419,22 @@ impl Inner {
     /// holds count), or for a read whose tablet is moving. Refused on a replica, and on a
     /// read-only open (`ReadOnly`).
     pub(crate) fn hold_reads(&self, validate: Arc<Validate>) -> Result<(u64, Vec<ShardId>)> {
+        let mut sub = self.submit_hold_reads(validate)?;
+        let answers: Vec<_> = sub
+            .waiting
+            .iter_mut()
+            .map(|(shard, rx)| (*shard, rx.take().expect("not yet answered").wait()))
+            .collect();
+        for (shard, answer) in answers {
+            sub.answered(shard, answer);
+        }
+        self.finish_hold(sub)
+    }
+
+    /// [`hold_reads`](Self::hold_reads) without waiting (#2059): sends each shard its reads
+    /// and returns the answers to come. [`finish_hold`](Self::finish_hold) turns them into
+    /// the hold, or releases what was held and returns the refusal.
+    pub(crate) fn submit_hold_reads(&self, validate: Arc<Validate>) -> Result<HoldSubmission> {
         if self.read_only || self.replica.load(Ordering::Relaxed) {
             return Err(Error::ReadOnly);
         }
@@ -6441,9 +6457,12 @@ impl Inner {
         }
         drop(view);
         let token = self.shared.external.reserve_hold()?;
-        let mut waiting = Vec::with_capacity(by_shard.len());
-        let mut shards = Vec::with_capacity(by_shard.len());
-        let mut failed = None;
+        let mut sub = HoldSubmission {
+            token,
+            waiting: Vec::with_capacity(by_shard.len()),
+            held: Vec::with_capacity(by_shard.len()),
+            failed: None,
+        };
         for (shard, (reads, tablets)) in by_shard {
             let (tx, rx) = completion();
             let msg = ShardMsg::HoldReads(Box::new(crate::shard::HoldReadsReq {
@@ -6454,31 +6473,24 @@ impl Inner {
                 reply: tx,
             }));
             match self.shared.submitter(shard).submit(msg) {
-                Ok(()) => waiting.push((shard, rx)),
+                Ok(()) => sub.waiting.push((shard, Some(rx))),
                 Err(e) => {
-                    failed = Some(Error::from(e));
+                    sub.failed = Some(Error::from(e));
                     break;
                 }
             }
         }
-        for (shard, rx) in waiting {
-            match rx.wait() {
-                Some(Ok(())) => shards.push(shard),
-                // A conflict wins over another shard's transient refusal: retrying can't help.
-                Some(Err(e)) => {
-                    if !matches!(failed, Some(Error::Conflict)) {
-                        failed = Some(e);
-                    }
-                }
-                None => {
-                    failed.get_or_insert(Error::Closed);
-                }
-            }
-        }
-        match failed {
-            None => Ok((token, shards)),
+        Ok(sub)
+    }
+
+    /// The hold `sub` built once every shard answered: its token and shards, or the refusal,
+    /// with what any shard held released (without waiting, so a shard's driver may call it).
+    pub(crate) fn finish_hold(&self, sub: HoldSubmission) -> Result<(u64, Vec<ShardId>)> {
+        debug_assert!(sub.waiting.iter().all(|(_, rx)| rx.is_none()));
+        match sub.failed {
+            None => Ok((sub.token, sub.held)),
             Some(e) => {
-                self.release_reads(token, &shards, false);
+                self.release_reads(sub.token, &sub.held, false);
                 Err(e)
             }
         }
@@ -6491,12 +6503,29 @@ impl Inner {
     /// dropped hold), it doesn't wait, and its answer means nothing. The hold stops counting
     /// against the limit either way.
     pub(crate) fn release_reads(&self, token: u64, shards: &[ShardId], wait: bool) -> bool {
-        self.shared.external.release_hold();
         debug_assert!(!wait || !self.shared.drivers.current_drives());
-        let mut held = true;
+        let (mut held, waiting) = self.submit_release_reads(token, shards, wait);
+        for rx in waiting {
+            held &= rx.wait() == Some(true);
+        }
+        held && wait
+    }
+
+    /// Sends [`release_reads`](Self::release_reads)'s messages without waiting (#2059):
+    /// whether every shard took its message, and, with `answers`, the shards' answers to
+    /// come (each `true` if that shard still held it). The hold stops counting against the
+    /// limit here.
+    pub(crate) fn submit_release_reads(
+        &self,
+        token: u64,
+        shards: &[ShardId],
+        answers: bool,
+    ) -> (bool, Vec<Waiter<bool>>) {
+        self.shared.external.release_hold();
+        let mut sent = true;
         let mut waiting = Vec::new();
         for &shard in shards {
-            let (reply, rx) = if wait {
+            let (reply, rx) = if answers {
                 let (tx, rx) = completion();
                 (Some(tx), Some(rx))
             } else {
@@ -6508,15 +6537,12 @@ impl Inner {
                 .submit(ShardMsg::ReleaseReads(Box::new((token, reply))))
                 .is_err()
             {
-                held = false;
+                sent = false;
             } else if let Some(rx) = rx {
                 waiting.push(rx);
             }
         }
-        for rx in waiting {
-            held &= rx.wait() == Some(true);
-        }
-        held && wait
+        (sent, waiting)
     }
 
     /// [`submit_prepare_external`](Self::submit_prepare_external), waited for. The answer in,
@@ -8771,5 +8797,39 @@ impl std::future::Future for PendingReturning {
                 std::task::Poll::Ready(r.map(|info| (info, returned_cells(&this.out))))
             }
         }
+    }
+}
+
+/// A read hold's requests in flight (#2059, [`Inner::submit_hold_reads`]): the hold's token,
+/// each asked shard with its answer to come (`None` once answered), the shards that hold it,
+/// and the refusal so far. A conflict wins over another shard's transient refusal, since
+/// retrying can't help.
+#[derive(Debug)]
+pub(crate) struct HoldSubmission {
+    pub(crate) token: u64,
+    pub(crate) waiting: Vec<(ShardId, Option<Waiter<Result<()>>>)>,
+    pub(crate) held: Vec<ShardId>,
+    pub(crate) failed: Option<Error>,
+}
+
+impl HoldSubmission {
+    /// Notes `shard`'s answer (`None`: its notifier went unanswered, a closing shard).
+    pub(crate) fn answered(&mut self, shard: ShardId, answer: Option<Result<()>>) {
+        match answer {
+            Some(Ok(())) => self.held.push(shard),
+            Some(Err(e)) => {
+                if !matches!(self.failed, Some(Error::Conflict)) {
+                    self.failed = Some(e);
+                }
+            }
+            None => {
+                self.failed.get_or_insert(Error::Closed);
+            }
+        }
+    }
+
+    /// Every shard asked: the ones answered and the ones still to answer.
+    pub(crate) fn asked(&self) -> Vec<ShardId> {
+        self.waiting.iter().map(|(s, _)| *s).collect()
     }
 }

@@ -25,6 +25,7 @@ The feature is hidden from the docs and outside the semver promise, as `__unstab
   - A read whose table was dropped since it was read can't be held: `Conflict`.
   - A transaction with writes, or with no reads, is `InvalidArgument`. A read conflicting since the snapshot is `Conflict`.
   - Live holds count against `in_doubt_limits`' share count: past it, `hold_reads` answers `Busy`. A hold is never evicted.
+  - **Non-blocking forms (#2059, the engine's `Txn::submit_hold_reads` and `ReadHold::submit_release`):** `submit_hold_reads` returns a `PendingHold` that resolves to the `ReadHold`, or to the refusal `hold_reads` gives. `submit_release` returns a `PendingRelease` that resolves to whether the hold lasted. Neither blocks, so a thread that drives a shard may call them (D88), as it may `submit_prepare`. A `PendingHold` dropped before it resolves releases whatever its shards took. Both are refused as the blocking forms are: `InvalidArgument` for writes or no reads, and `ReadOnly` on a replica. A read-only open refuses `begin`, so no transaction there reaches either.
 - **`Pigeonhole::decide(xid, commit) -> Result<Option<Commit>>`:**
   - Commit reserves the apply seqno and timestamp, logs a Decision (type 4) and applies the shares.
   - Abort logs an External Abort (type 6) at a seqno of its own and drops them.

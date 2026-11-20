@@ -46,8 +46,9 @@ use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{
     AppendedKind, BackgroundWorker, CompactionRecord, Compression, Engine, EngineOptions,
-    EngineShard, Error, FamilyId, FamilyOptions, PendingCommit, PendingMaintenance, PickerOptions,
-    Predicate, ScanSpec, Snapshot, TableInfo, ValueRef, WriteBatch,
+    EngineShard, Error, FamilyId, FamilyOptions, PendingCommit, PendingHold, PendingMaintenance,
+    PendingRelease, PickerOptions, Predicate, ReadHold, ScanSpec, Snapshot, TableInfo, ValueRef,
+    WriteBatch,
 };
 use pigeonhole_format::key::decode_key;
 use pigeonhole_format::manifest::{CompactionStyle, FamilyKind};
@@ -114,6 +115,25 @@ fn op_row(op: &ModelOp) -> &[u8] {
         | ModelOp::DeleteColumn { row, .. }
         | ModelOp::DeleteFamily { row, .. }
         | ModelOp::DeleteRow { row, .. } => row,
+    }
+}
+
+/// The cell a put or an increment writes, as a hold reads it (#2059): table, row, family,
+/// qualifier. `None` for a delete.
+fn op_cell(op: &ModelOp) -> Option<(String, Vec<u8>, String, Vec<u8>)> {
+    match op {
+        ModelOp::Put {
+            family, qualifier, ..
+        }
+        | ModelOp::Incr {
+            family, qualifier, ..
+        } => Some((
+            op_table(op).to_owned(),
+            op_row(op).to_vec(),
+            family.clone(),
+            qualifier.clone(),
+        )),
+        _ => None,
     }
 }
 
@@ -394,6 +414,12 @@ pub struct Config {
     /// (`Engine::submit_decide`). Needs tablet changes on. 0 draws nothing, so other suites'
     /// seeds replay unchanged.
     pub external_ppm: u32,
+    /// How often (ppm) a step takes a read hold (#2059, `Txn::submit_hold_reads`) over a few
+    /// rows recent commits wrote, each read checked against the model, released some steps
+    /// later (`ReadHold::submit_release`). While it holds, a write to a held row is refused at
+    /// once, as over a share in doubt. 0 draws nothing, so other suites' seeds replay
+    /// unchanged.
+    pub hold_ppm: u32,
     /// `final_dump` only: a process crash and reopen every this many ops.
     pub crash_every: Option<usize>,
     /// `final_dump` only: a flush and full compaction every this many ops (with background
@@ -481,6 +507,7 @@ impl Config {
                 0
             },
             external_ppm: 0,
+            hold_ppm: 0,
             crash_every: None,
             compact_every: None,
             memtable_freeze_bytes: 16 << 10,
@@ -550,6 +577,19 @@ pub struct Stats {
     pub external_dropped: usize,
     /// ICR 0140 amendment 1: external prepares drawn as read-only branches (reads, no writes).
     pub external_read_only: usize,
+    /// #2059: read holds taken, refused (`Conflict`, `Busy`), released while still held,
+    /// released lost to a crash between, and abandoned in flight by a crash.
+    pub holds_taken: usize,
+    pub holds_conflict: usize,
+    pub holds_busy: usize,
+    pub holds_released_held: usize,
+    pub holds_released_lost: usize,
+    pub holds_abandoned: usize,
+    /// #2059's coverage: holds submitted when a commit above their snapshot had already
+    /// written a cell they read (each must answer `Conflict`), and when an undecided write
+    /// (a share in doubt, a commit in flight) held one of their rows.
+    pub holds_stale_at_submit: usize,
+    pub holds_undecided_at_submit: usize,
     /// Armed power losses that fired on background I/O and surfaced as a later step's error.
     pub background_crashes: usize,
     pub busy: usize,
@@ -1571,6 +1611,49 @@ struct ExternalEntry {
     deciding: bool,
 }
 
+/// A read hold the client took (#2059): the rows it reads, at `snapshot`, and where it is.
+/// `lost` once a crash came between its taking and its release: its release must answer
+/// `false`, and its rows aren't held in the reopened engine.
+struct HoldEntry {
+    rows: Vec<(String, Vec<u8>)>,
+    reads: Vec<TxnRead>,
+    snapshot: Seqno,
+    lost: bool,
+    /// The op index at which it's released.
+    release_at: usize,
+    /// The rows undecided writes held when it was submitted (shares in doubt, commits in
+    /// flight): a `Conflict` over one is real even if the write was decided before the answer
+    /// was read.
+    undecided: BTreeSet<(String, Vec<u8>)>,
+    /// The next in-flight commit's `seq` when it was taken: commits numbered from here on
+    /// were submitted after it, and those that land while it holds are checked.
+    held_from: u64,
+    /// The engine's visible seqno when its release was submitted: a write committed at or
+    /// below it was applied before the release can have reached a shard.
+    released_at: Option<Seqno>,
+    /// Each row's owning shard when the hold was submitted (for a failure's report).
+    routes: Vec<Option<u16>>,
+    phase: HoldPhase,
+}
+
+enum HoldPhase {
+    /// Its reads made at `snapshot`; the hold is submitted once the client reaches op
+    /// `submit_at`, so commits may land, or be in flight, between its reads and its validation.
+    Reading {
+        txn: pigeonhole_engine::Txn,
+        submit_at: usize,
+    },
+    Taking(PendingHold),
+    Held(ReadHold),
+    /// The release's answer to come; `either` if a crash came while it was in flight.
+    Releasing {
+        pending: PendingRelease,
+        either: bool,
+    },
+    /// Only while a poll moves the phase out.
+    Moved,
+}
+
 /// One previous value a returning commit returned (D314 amendment 1): family, qualifier,
 /// the version's timestamp and payload (an error as text).
 type PreviousCell = (
@@ -1790,6 +1873,9 @@ enum Pending {
 }
 
 struct InFlight {
+    /// Its place in submission order (`World::push_flight`): #2059's hold checks compare it
+    /// with when a hold was taken and released.
+    seq: u64,
     pending: Pending,
     commit: Committed,
     armed: bool,
@@ -1835,6 +1921,17 @@ struct World {
     external_unsure: Vec<Committed>,
     /// D329: the last xid handed out; xids are never reused in a run.
     next_xid: u64,
+    /// #2059: read holds taken, being taken or being released.
+    holds: Vec<HoldEntry>,
+    /// The next in-flight commit's `seq`.
+    next_flight: u64,
+    /// #2059: the rows of holds released while commits were in flight: a commit in flight
+    /// at the release may have been refused over them, and its outcome may be read after
+    /// the release resolved. Cleared once nothing is in flight.
+    hold_ghosts: BTreeSet<(String, Vec<u8>)>,
+    /// #2059: holds released while still held, to audit once nothing is in flight: their
+    /// reads, snapshot, and the engine's visible seqno when their release was submitted.
+    hold_audits: Vec<(Vec<TxnRead>, Seqno, Seqno)>,
     /// D329: shares decided below GroupSync: a power loss may take the decision's record,
     /// and the next open finds the share in doubt again, to be decided again.
     external_decided_weak: BTreeMap<Vec<u8>, ExternalEntry>,
@@ -1907,6 +2004,10 @@ struct World {
     faults_active: bool,
     /// A tablet change requested by the workload, still running.
     tablet_pending: Option<(PendingMaintenance, String)>,
+    /// #2059: whether a share in doubt or a live read hold existed when the running tablet
+    /// change was requested: either may make the shard give it up (`Busy`), and the answer
+    /// may be read after it's gone.
+    tablet_over_holds: bool,
 }
 
 /// An in-flight put `read_in_flight` checks: table, row, family, qualifier, value.
@@ -1939,6 +2040,10 @@ impl World {
             external_ids: BTreeSet::new(),
             external_unsure: Vec::new(),
             next_xid: 0,
+            holds: Vec::new(),
+            next_flight: 0,
+            hold_ghosts: BTreeSet::new(),
+            hold_audits: Vec::new(),
             external_decided_weak: BTreeMap::new(),
             aborted: Vec::new(),
             settled_seqnos: BTreeSet::new(),
@@ -1969,6 +2074,7 @@ impl World {
             compaction_floor: 0,
             faults_active: true,
             tablet_pending: None,
+            tablet_over_holds: false,
         }
     }
 
@@ -3000,6 +3106,19 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
         };
         self.store = Some(store);
+        // #2059: the crashed engine's holds are gone. One being taken is dropped (its engine
+        // with it); a held one is lost, and its release must say so; a release in flight may
+        // have landed before the crash or not.
+        let before = self.holds.len();
+        self.holds
+            .retain(|h| !matches!(h.phase, HoldPhase::Taking(_) | HoldPhase::Reading { .. }));
+        self.stats.holds_abandoned += before - self.holds.len();
+        for h in &mut self.holds {
+            h.lost = true;
+            if let HoldPhase::Releasing { either, .. } = &mut h.phase {
+                *either = true;
+            }
+        }
         // D329: what the crash left of the external transactions.
         self.reconcile_external()?;
         // A reopen places tablets afresh (`Catalog::reassign`) and replays a write into its
@@ -4081,10 +4200,27 @@ impl World {
 
     /// Requests a random split, merge or move (it runs while the workload goes on).
     fn request_tablet_change(&mut self, rng: &mut Rng) -> Result<(), Fail> {
-        let table = TABLES[rng.below(TABLES.len() as u64) as usize];
-        let row = format!("row{:06}", rng.below(self.cfg.spec.rows.max(1))).into_bytes();
+        let mut table = TABLES[rng.below(TABLES.len() as u64) as usize];
+        let mut row = format!("row{:06}", rng.below(self.cfg.spec.rows.max(1))).into_bytes();
         let shards = self.store().shards.len().max(1) as u64;
-        let kind = rng.below(3);
+        let mut kind = rng.below(3);
+        // #2059: half the time while a hold lives, a move of a held row's tablet, which the
+        // hold must make the shard give up (`Busy`). Drawn only with holds on, so other suites'
+        // seeds replay unchanged.
+        if self.cfg.hold_ppm > 0 && rng.chance(500_000) {
+            let held: Vec<&(String, Vec<u8>)> = self
+                .holds
+                .iter()
+                .filter(|h| !h.lost && matches!(h.phase, HoldPhase::Held(_)))
+                .flat_map(|h| h.rows.iter())
+                .collect();
+            if !held.is_empty() {
+                let (t, r) = held[rng.below(held.len() as u64) as usize];
+                if let Some(t) = TABLES.iter().find(|x| **x == t.as_str()) {
+                    (table, row, kind) = (t, r.clone(), 2);
+                }
+            }
+        }
         let to = rng.below(shards) as u16;
         let store = self.store();
         let tid = store.tables[table].id;
@@ -4096,7 +4232,11 @@ impl World {
         let label = format!("tablet {what} {table} at {} (to {to})", text(&row));
         self.trace.push(label.clone());
         match pending {
-            Ok(p) => self.tablet_pending = Some((p, label)),
+            Ok(p) => {
+                self.tablet_over_holds =
+                    !self.external.is_empty() || self.holds.iter().any(|h| !h.lost);
+                self.tablet_pending = Some((p, label));
+            }
             Err(e) => {
                 if !self.tablet_change_refused(&e) {
                     return fail(FailureClass::Protocol, format!("{label}: {e}"));
@@ -4116,7 +4256,10 @@ impl World {
                 | Error::Unsupported(_)
                 | Error::Closed
                 | Error::Io(_)
-        ) || (matches!(e, Error::Busy) && !self.external.is_empty());
+        ) || (matches!(e, Error::Busy)
+            && (self.tablet_over_holds
+                || !self.external.is_empty()
+                || self.holds.iter().any(|h| !h.lost)));
         if ok {
             self.stats.tablet_refused += 1;
             self.trace.push(format!("  -> tablet change refused: {e}"));
@@ -4603,6 +4746,7 @@ impl World {
                     let xid = xid.clone();
                     self.forget_external(&xid);
                 }
+                self.check_not_landed_on_hold(&inf, info.seqno)?;
                 successes.push((info.seqno, inf, Some(info)));
             }
             Outcome::Cas(Ok((applied, info))) => {
@@ -4616,6 +4760,9 @@ impl World {
                             "check_and_mutate applied={applied} but the model's predicate said {expected}"
                         ),
                     );
+                }
+                if applied && let Some(info) = &info {
+                    self.check_not_landed_on_hold(&inf, info.seqno)?;
                 }
                 match info {
                     Some(info) => successes.push((info.seqno, inf, Some(info))),
@@ -5039,7 +5186,8 @@ impl World {
             Ok(pc) => {
                 self.stats.large_puts += large;
                 self.note_commit_separations();
-                self.in_flight.push(InFlight {
+                self.push_flight(InFlight {
+                    seq: 0,
                     pending: Pending::Poll(pc),
                     commit,
                     armed,
@@ -5163,7 +5311,8 @@ impl World {
             }
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
-        self.in_flight.push(InFlight {
+        self.push_flight(InFlight {
+            seq: 0,
             pending,
             commit: Committed {
                 seqno: None,
@@ -5533,7 +5682,8 @@ impl World {
             }
             Err(e) => Pending::Ready(Some(Outcome::Cas(Err(e)))),
         };
-        self.in_flight.push(InFlight {
+        self.push_flight(InFlight {
+            seq: 0,
             pending,
             commit: Committed {
                 seqno: None,
@@ -5675,7 +5825,8 @@ impl World {
                 })
                 .collect()
         };
-        self.in_flight.push(InFlight {
+        self.push_flight(InFlight {
+            seq: 0,
             pending,
             commit: Committed {
                 seqno: None,
@@ -5741,7 +5892,8 @@ impl World {
             }
             Err(e) => Pending::Ready(Some(Outcome::Commit(Err(e)))),
         };
-        self.in_flight.push(InFlight {
+        self.push_flight(InFlight {
+            seq: 0,
             pending,
             commit: c,
             armed,
@@ -5754,6 +5906,470 @@ impl World {
     /// D329: whether `c`'s rows (its writes, and a transaction's reads) meet a row an
     /// external share in doubt (or one maybe in doubt) wrote or read: a refusal there is the
     /// share's hold (`Busy` for a single, `Conflict` for a PREPARE), not a conflict.
+    /// #2059: whether a shard may lose its read holds without a crash: injected I/O errors
+    /// poison a shard (`faults_on` alone is the plan being armed, true on fault-free runs too).
+    fn holds_may_drop(&self) -> bool {
+        self.faults_on() && self.cfg.faults.io_error_ppm > 0
+    }
+
+    /// The shards owning `rows` in the engine's current view.
+    fn routes_of(&self, rows: &[(String, Vec<u8>)]) -> Vec<Option<u16>> {
+        let store = self.store();
+        let view = store.engine.snapshot().expect("snapshot").view().clone();
+        rows.iter()
+            .map(|(t, r)| {
+                view.tablets()
+                    .route(store.tables[t].id, r)
+                    .map(|(_, s)| s.0)
+            })
+            .collect()
+    }
+
+    /// Puts `inf` in flight, numbered in submission order.
+    fn push_flight(&mut self, mut inf: InFlight) {
+        inf.seq = self.next_flight;
+        self.next_flight += 1;
+        self.in_flight.push(inf);
+    }
+
+    /// #2059: a commit that landed (`inf`, at `seqno`) after a hold was taken can't have
+    /// been applied while the hold held one of its rows: such a write is refused at once.
+    /// "After" is by submission (`InFlight::seq` past the hold's taking); "while held" is
+    /// by seqno, since a submitted commit may reach its shard later (a wait for room): one
+    /// committed at or below the engine's visible seqno when the release was submitted (or
+    /// with no release submitted yet) was applied before the release reached any shard.
+    /// Commits already in flight when the hold was taken may have landed first, so they
+    /// aren't judged here (the value check at release is for those).
+    fn check_not_landed_on_hold(&self, inf: &InFlight, seqno: Seqno) -> Result<(), Fail> {
+        if self.holds_may_drop() {
+            return Ok(());
+        }
+        for h in self.holds.iter().filter(|h| !h.lost) {
+            let during = inf.seq >= h.held_from && h.released_at.is_none_or(|r| seqno <= r);
+            if during
+                && inf.commit.ops.iter().any(|o| {
+                    h.rows
+                        .contains(&(op_table(o).to_owned(), op_row(o).to_vec()))
+                })
+            {
+                return fail(
+                    FailureClass::Protocol,
+                    format!(
+                        "a write submitted after a read hold (snapshot {}) was taken landed at \
+                         seqno {seqno} while the hold held its row: {:?}; the write: {:?} \
+                         (flight {}, hold from {}, released at seqno {:?}); the rows' shards \
+                         at the hold {:?}, now {:?}",
+                        h.snapshot,
+                        h.rows,
+                        inf.commit.ops.iter().map(show).collect::<Vec<_>>(),
+                        inf.seq,
+                        h.held_from,
+                        h.released_at,
+                        h.routes,
+                        self.routes_of(&h.rows)
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #2059: takes a read hold with `Txn::submit_hold_reads` over one to three rows recent
+    /// commits wrote, one cell of each read first and checked against the model. Its answer
+    /// is polled each step ([`poll_holds`](Self::poll_holds)).
+    fn submit_hold(&mut self, rng: &mut Rng) -> Result<(), Fail> {
+        // Cells something writes: recent commits, commits in flight and shares in doubt, so
+        // a hold's reads meet the writes its checks are about (a stale read, an undecided
+        // share's write, a waiting single's write, a write while it holds).
+        let mut recent: BTreeSet<(String, Vec<u8>, String, Vec<u8>)> = self
+            .history
+            .values()
+            .rev()
+            .take(16)
+            .chain(self.in_flight.iter().map(|i| &i.commit))
+            .chain(self.external.values().map(|e| &e.commit))
+            .flat_map(|c| c.ops.iter().filter_map(op_cell))
+            .collect();
+        // And the cells the next few commits will write (placed as `prepare_ops` will place
+        // them), so some holds' reads go stale before they're submitted, or meet a write in
+        // flight: what the snapshot check and the undecided-write checks are for. The ops
+        // are pulled from the workload in order, so its sequence is unchanged.
+        while self.queued.len() < 6 {
+            match self.workload.as_mut().and_then(|w| w.next()) {
+                Some(op) => self.queued.push_back(op),
+                None => break,
+            }
+        }
+        for op in &self.queued {
+            if let Op::Commit(ops, _) = op {
+                recent.extend(ops.iter().filter_map(|o| {
+                    let mut o = o.clone();
+                    place(&mut o);
+                    op_cell(&o)
+                }));
+            }
+        }
+        let recent: Vec<_> = recent.into_iter().collect();
+        if recent.is_empty() {
+            return Ok(());
+        }
+        let now = self.now();
+        let store = self.store.as_ref().expect("store open");
+        let mut txn = match store.engine.begin() {
+            Ok(t) => t,
+            Err(e) => return fail(FailureClass::Protocol, format!("begin: {e}")),
+        };
+        let snapshot = txn.snapshot().seqno();
+        let n = 1 + rng.below(3) as usize;
+        let mut rows = Vec::new();
+        let mut reads: Vec<TxnRead> = Vec::new();
+        for _ in 0..n {
+            let (table, row, family, qualifier) =
+                recent[rng.below(recent.len() as u64) as usize].clone();
+            if rows.contains(&(table.clone(), row.clone())) {
+                continue;
+            }
+            let fam_id = store.family_ids[&(table.clone(), family.clone())];
+            let table_id = store.tables[&table].id;
+            let got = txn
+                .get(table_id, fam_id, &row, &qualifier)
+                .map(|c| c.map(|c| (c.timestamp(), value_bytes(c.value()))));
+            let want = self
+                .model
+                .try_get(
+                    &table,
+                    &row,
+                    &family,
+                    &qualifier,
+                    self.model_seqno(snapshot),
+                    now,
+                )
+                .map(|c| c.map(|c| (c.ts, c.value)));
+            match (got, want) {
+                (Ok(g), Ok(w)) if g == w => {}
+                (Err(Error::Merge(_)), Err(_)) => {}
+                (Err(e), _) if !self.alive() => {
+                    drop(txn);
+                    return self.background_crash(e, rng);
+                }
+                (Err(Error::Io(e)), _) if self.cfg.faults.io_error_ppm > 0 && self.faults_on() => {
+                    drop(txn);
+                    self.stats.io_errors += 1;
+                    self.trace.push(format!("  -> hold read I/O error ({e})"));
+                    self.need_reopen = true;
+                    return Ok(());
+                }
+                (g, w) => {
+                    return fail(
+                        FailureClass::LiveReadMismatch,
+                        format!(
+                            "hold read {}/{family}:{}: engine {g:?} vs model {w:?}",
+                            text(&row),
+                            text(&qualifier)
+                        ),
+                    );
+                }
+            }
+            rows.push((table.clone(), row.clone()));
+            reads.push((table, row, family, Some(qualifier)));
+        }
+        self.trace.push(format!(
+            "hold snapshot={snapshot} [{}]",
+            rows.iter()
+                .map(|(t, r)| format!("{t}/{}", text(r)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        let submit_at = self.op_index + rng.below(4) as usize;
+        let release_at = submit_at + 1 + rng.below(30) as usize;
+        self.holds.push(HoldEntry {
+            rows,
+            reads,
+            snapshot,
+            lost: false,
+            release_at,
+            undecided: BTreeSet::new(),
+            held_from: u64::MAX,
+            released_at: None,
+            routes: Vec::new(),
+            phase: HoldPhase::Reading { txn, submit_at },
+        });
+        Ok(())
+    }
+
+    /// #2059: polls the holds being taken and released, and releases the held ones whose
+    /// time came. The oracle:
+    /// - a hold refused with `Conflict` read a row that a commit above its snapshot wrote,
+    ///   or that a commit still in flight or a share in doubt writes (an undecided write).
+    ///   Holds never conflict with each other.
+    /// - a release answers `true` unless a crash came between, then `false`. One in flight
+    ///   across a crash may answer either, and so may one under injected faults (a poisoned
+    ///   shard drops its holds).
+    fn poll_holds(&mut self) -> Result<(), Fail> {
+        if self.in_flight.is_empty() {
+            self.hold_ghosts.clear();
+            // Every commit that could have landed while those holds held is resolved now.
+            for (reads, snapshot, released_at) in std::mem::take(&mut self.hold_audits) {
+                self.audit_hold(&reads, snapshot, released_at)?;
+            }
+        }
+        if self.holds.is_empty() || self.store.is_none() {
+            return Ok(());
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut keep = Vec::with_capacity(self.holds.len());
+        for mut h in std::mem::take(&mut self.holds) {
+            match std::mem::replace(&mut h.phase, HoldPhase::Moved) {
+                // Submitted once due and an in-flight commit writes a cell it read, so its
+                // request meets that write undecided (a prepared share, a waiting single), or
+                // four ops later regardless.
+                HoldPhase::Reading { txn, submit_at }
+                    if self.op_index >= submit_at
+                        && (self.op_index >= submit_at + 4
+                            || self.in_flight.iter().any(|i| {
+                                h.reads.iter().any(|read| i.commit.touches_read(read))
+                            })) =>
+                {
+                    self.trace.push(format!(
+                        "  submit hold at snapshot {} ({} in flight)",
+                        h.snapshot,
+                        self.in_flight.len()
+                    ));
+                    h.undecided = self.external_rows();
+                    h.undecided.extend(self.in_flight.iter().flat_map(|i| {
+                        i.commit
+                            .ops
+                            .iter()
+                            .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+                    }));
+                    if self.history.values().any(|c| {
+                        c.seqno.is_some_and(|s| s > h.snapshot)
+                            && h.reads.iter().any(|read| c.touches_read(read))
+                    }) {
+                        self.stats.holds_stale_at_submit += 1;
+                    }
+                    if h.rows.iter().any(|r| h.undecided.contains(r)) {
+                        self.stats.holds_undecided_at_submit += 1;
+                    }
+                    h.routes = self.routes_of(&h.rows);
+                    match txn.submit_hold_reads() {
+                        Ok(p) => h.phase = HoldPhase::Taking(p),
+                        // A store an injected fault failed refuses at once (D58); its
+                        // reopen follows.
+                        Err(e) if !self.alive() || self.faults_on() => {
+                            self.trace
+                                .push(format!("  hold refused: {e} (store failing)"));
+                            continue;
+                        }
+                        Err(e) => {
+                            return fail(FailureClass::Protocol, format!("submit_hold_reads: {e}"));
+                        }
+                    }
+                }
+                reading @ HoldPhase::Reading { .. } => h.phase = reading,
+                HoldPhase::Taking(mut p) => {
+                    // Writes submitted while it's being taken reach their shard by another
+                    // path, and can be undecided there when the hold arrives (refusing it on
+                    // its row), then land before its answer is read (simp724's S1 on #2111).
+                    // A commit is in flight at the poll before its outcome is read, so this
+                    // gathers every one of them.
+                    h.undecided.extend(self.in_flight.iter().flat_map(|i| {
+                        i.commit
+                            .ops
+                            .iter()
+                            .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+                    }));
+                    match Pin::new(&mut p).poll(&mut cx) {
+                        Poll::Pending => h.phase = HoldPhase::Taking(p),
+                        Poll::Ready(Ok(hold)) => {
+                            self.stats.holds_taken += 1;
+                            self.trace.push(format!(
+                                "  hold at snapshot {} taken, release at op {}",
+                                h.snapshot, h.release_at
+                            ));
+                            h.held_from = self.next_flight;
+                            h.phase = HoldPhase::Held(hold);
+                        }
+                        Poll::Ready(Err(Error::Conflict)) => {
+                            let undecided = self.external_rows();
+                            let real = self.history.values().any(|c| {
+                                c.seqno.is_some_and(|s| s > h.snapshot)
+                                    && h.reads.iter().any(|read| c.touches_read(read))
+                            }) || self.in_flight.iter().any(|i| {
+                                i.commit.ops.iter().any(|o| {
+                                    h.rows
+                                        .contains(&(op_table(o).to_owned(), op_row(o).to_vec()))
+                                })
+                            }) || h
+                                .rows
+                                .iter()
+                                .any(|r| undecided.contains(r) || h.undecided.contains(r));
+                            if !real {
+                                return fail(
+                                    FailureClass::Protocol,
+                                    format!(
+                                        "spurious hold conflict: nothing above snapshot {}, in \
+                                     flight or in doubt touched {:?}",
+                                        h.snapshot, h.rows
+                                    ),
+                                );
+                            }
+                            self.stats.holds_conflict += 1;
+                            self.trace.push("  hold -> conflict".into());
+                            // While it was being taken it may have refused writes in flight
+                            // (each side can refuse the other): its rows stay a cause until they
+                            // resolve, as a released hold's do.
+                            self.hold_ghosts.extend(h.rows.iter().cloned());
+                            continue;
+                        }
+                        Poll::Ready(Err(Error::Busy)) => {
+                            self.stats.holds_busy += 1;
+                            self.trace.push("  hold -> busy".into());
+                            self.hold_ghosts.extend(h.rows.iter().cloned());
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) if !self.alive() || self.faults_on() => {
+                            self.trace.push(format!("  hold -> {e} (store failing)"));
+                            self.hold_ghosts.extend(h.rows.iter().cloned());
+                            continue;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return fail(FailureClass::Protocol, format!("hold: {e}"));
+                        }
+                    }
+                }
+                HoldPhase::Held(hold) if self.op_index >= h.release_at => {
+                    self.trace.push(format!(
+                        "  release hold at snapshot {}{}",
+                        h.snapshot,
+                        if h.lost { " (lost to a crash)" } else { "" }
+                    ));
+                    h.released_at = Some(self.store().engine.snapshot().expect("snapshot").seqno());
+                    h.phase = HoldPhase::Releasing {
+                        pending: hold.submit_release(),
+                        either: false,
+                    };
+                }
+                held @ HoldPhase::Held(_) => h.phase = held,
+                HoldPhase::Releasing {
+                    mut pending,
+                    either,
+                } => match Pin::new(&mut pending).poll(&mut cx) {
+                    Poll::Pending => h.phase = HoldPhase::Releasing { pending, either },
+                    Poll::Ready(held) => {
+                        let either =
+                            either || (!h.lost && (self.holds_may_drop() || !self.alive()));
+                        if !either && held == h.lost {
+                            return fail(
+                                FailureClass::Protocol,
+                                format!(
+                                    "hold release answered {held}, but {} came between",
+                                    if h.lost { "a crash" } else { "no crash" }
+                                ),
+                            );
+                        }
+                        if !h.lost {
+                            self.hold_ghosts.extend(h.rows.iter().cloned());
+                        }
+                        if held
+                            && !h.lost
+                            && !self.holds_may_drop()
+                            && let Some(released_at) = h.released_at
+                        {
+                            self.hold_audits
+                                .push((h.reads.clone(), h.snapshot, released_at));
+                        }
+                        if held {
+                            self.stats.holds_released_held += 1;
+                        } else {
+                            self.stats.holds_released_lost += 1;
+                        }
+                        self.trace.push(format!("  hold released: {held}"));
+                        continue;
+                    }
+                },
+                HoldPhase::Moved => unreachable!("a hold's phase is put back each poll"),
+            }
+            keep.push(h);
+        }
+        self.holds = keep;
+        Ok(())
+    }
+
+    /// #2059: a hold that lasted from `snapshot` until its release was submitted (the engine
+    /// at `released_at`) kept its reads current: no commit in between changed a cell it read.
+    /// That covers a write the hold should have refused (submitted while it held), and one
+    /// it should have conflicted with (applied above its snapshot before it validated, or
+    /// undecided, or waiting, when it did). A write that changed nothing a reader sees (a
+    /// TTL write already expired, which a flush or compaction may purge before the hold
+    /// validates) leaves the read current, so the model's value of each read cell at the
+    /// release, against its value at the snapshot, decides.
+    fn audit_hold(
+        &self,
+        reads: &[TxnRead],
+        snapshot: Seqno,
+        released_at: Seqno,
+    ) -> Result<(), Fail> {
+        let changed: Vec<Seqno> = self
+            .history
+            .values()
+            .filter_map(|c| c.seqno.map(|s| (s, c)))
+            .filter(|(s, c)| {
+                *s > snapshot && *s <= released_at && reads.iter().any(|read| c.touches_read(read))
+            })
+            .map(|(s, _)| s)
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let (now, then, upto) = (
+            self.now(),
+            self.model_seqno(snapshot),
+            self.model_seqno(released_at),
+        );
+        let moved: Vec<&TxnRead> = reads
+            .iter()
+            .filter(|(t, r, f, q)| {
+                let Some(q) = q else { return false };
+                let at = |s| {
+                    self.model
+                        .try_get(t, r, f, q, s, now)
+                        .map(|c| c.map(|c| (c.ts, c.value)))
+                };
+                matches!((at(then), at(upto)), (Ok(a), Ok(b)) if a != b)
+            })
+            .collect();
+        if moved.is_empty() {
+            return Ok(());
+        }
+        fail(
+            FailureClass::Protocol,
+            format!(
+                "a read hold from snapshot {snapshot} lasted until seqno {released_at}, but \
+                 commits {changed:?} changed cells it read ({moved:?})"
+            ),
+        )
+    }
+
+    /// The rows the shares in doubt (and maybe in doubt) write: an undecided write to each.
+    fn external_rows(&self) -> BTreeSet<(String, Vec<u8>)> {
+        self.external
+            .values()
+            .flat_map(|e| {
+                e.commit
+                    .ops
+                    .iter()
+                    .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+                    .chain(e.reads.iter().cloned())
+            })
+            .chain(self.external_unsure.iter().flat_map(|u| {
+                u.ops
+                    .iter()
+                    .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
+            }))
+            .collect()
+    }
+
     fn overlaps_external(&self, c: &Committed) -> bool {
         let mut rows: Vec<(String, Vec<u8>)> = c
             .ops
@@ -5768,22 +6384,17 @@ impl World {
         {
             rows.extend(reads.iter().map(|(t, r, _, _)| (t.clone(), r.clone())));
         }
-        let held = self
-            .external
-            .values()
-            .flat_map(|e| {
-                e.commit
-                    .ops
-                    .iter()
-                    .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
-                    .chain(e.reads.iter().cloned())
-            })
-            .chain(self.external_unsure.iter().flat_map(|u| {
-                u.ops
-                    .iter()
-                    .map(|o| (op_table(o).to_owned(), op_row(o).to_vec()))
-            }));
-        let held: BTreeSet<(String, Vec<u8>)> = held.collect();
+        // #2059: a live read hold's rows too, from its request on (a shard may hold them
+        // before the hold resolves) until its release resolves.
+        let mut held = self.external_rows();
+        // A released hold's rows, until the commits in flight at its release resolve.
+        held.extend(self.hold_ghosts.iter().cloned());
+        held.extend(
+            self.holds
+                .iter()
+                .filter(|h| !h.lost)
+                .flat_map(|h| h.rows.iter().cloned()),
+        );
         rows.iter().any(|r| held.contains(r))
     }
 
@@ -6256,7 +6867,8 @@ impl World {
                 })
                 .collect()
         };
-        self.in_flight.push(InFlight {
+        self.push_flight(InFlight {
+            seq: 0,
             pending,
             commit: Committed {
                 seqno: None,
@@ -6459,6 +7071,11 @@ impl World {
         {
             self.queued.push_front(op);
             return self.submit_decide(rng);
+        }
+        // #2059: a read hold now and then; the op waits for the next step.
+        if self.cfg.hold_ppm > 0 && rng.chance(self.cfg.hold_ppm) {
+            self.queued.push_front(op);
+            return self.submit_hold(rng);
         }
         let now = self.now();
         match op {
@@ -6878,6 +7495,7 @@ fn run_with(
                     if w.vfs.io_in_flight() > 0 {
                         w.stats.io_in_flight_steps += 1;
                     }
+                    w.poll_holds()?;
                     if !w.poll_in_flight(rng)? {
                         if w.cfg.flight_read_ppm > 0 && rng.chance(w.cfg.flight_read_ppm) {
                             w.read_beside_flight(rng)?;
@@ -6889,6 +7507,16 @@ fn run_with(
                         // D329: every share still in doubt is decided before the run ends.
                         if w.cfg.external_ppm > 0 && w.external.values().any(|e| !e.deciding) {
                             w.submit_decide(rng)?;
+                            return Ok(true);
+                        }
+                        // #2059: and every read hold released, its answer checked.
+                        if !w.holds.is_empty() {
+                            for h in &mut w.holds {
+                                h.release_at = 0;
+                                if let HoldPhase::Reading { submit_at, .. } = &mut h.phase {
+                                    *submit_at = 0;
+                                }
+                            }
                             return Ok(true);
                         }
                         return Ok(false);
