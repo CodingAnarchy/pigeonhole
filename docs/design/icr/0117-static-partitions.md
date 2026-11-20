@@ -982,6 +982,8 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 
 **pigeonhole:** `RangeDrop::overlaps(table, start, end)`, doc-hidden behind `__unstable-replication` (G2).
 
+**Covered by code only:** the source's lease check (`serving()` before and after a chunk's read, and on each tick of the catch-up stream). The rig gives a fresh node's partitions an hour's lease, so no test lets one lapse; an operator's fence doesn't reach it, since a fenced partition still serves reads, the copy's among them (cli692 on #2107).
+
 **For PR 5:**
 - **It records `from_epoch` on every range move** at COPYING, as D332's NODE moves do. The source's checks then hold: `from_epoch` exactly before HANDED_OVER, and above it from there, since the hand-over raises it (`map::source_epoch_holds`, cli692 on #2107). Until then, range moves carry 0 and the source's failover check is inert.
 - It moves the phases (from CATCHING_UP to HANDED_OVER only once `source_applied_seqno` is past the fence's last seqno).
