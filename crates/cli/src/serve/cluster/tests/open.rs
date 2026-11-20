@@ -905,7 +905,7 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         })
         .await;
     });
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = HeldPort::take(port).listen();
     let (_stop, dbs, _node) = start(listener, vec![("p1", Some(p1)), ("p3", None)], true);
     rt.block_on(async {
         eventually("p3 to serve after the restart", async || {

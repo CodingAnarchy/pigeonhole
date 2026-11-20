@@ -2092,6 +2092,11 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         service
             .decide_branch(&r.xid, r.commit, 0, 0, &cluster.spanning, &r.partition)
             .await?;
+        // A commit applied by hand acks its home too, so its record can be collected: owed,
+        // and sent by the resolver's next pass, not waited for here (#2078, audit120's Q3).
+        if r.commit {
+            cluster.spanning.queue_ack(&r.xid, &r.partition);
+        }
         Ok(tonic::Response::new(self.local(&r.partition).await?))
     }
 

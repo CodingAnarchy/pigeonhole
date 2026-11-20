@@ -910,8 +910,13 @@ impl Router {
                         unreachable!("matched")
                     };
                     drop(service.admit(&op.admit(), caller, prepaid).await?);
-                    let settled =
-                        spanning::settle(&cluster.node, &service, &r.txn_id, caller).await?;
+                    let settled = spanning::settle(
+                        &cluster.node,
+                        &service,
+                        &r.txn_id,
+                        spanning::Asker::Client(caller.principal),
+                    )
+                    .await?;
                     Ok(ServiceReply::Outcome(settled))
                 }
                 // A spanning transaction's call at its home's owner (D329).
@@ -1217,7 +1222,13 @@ impl Router {
                         .await?,
                 );
                 ServiceReply::Outcome(
-                    spanning::settle(&cluster.node, &service, &r.txn_id, caller).await?,
+                    spanning::settle(
+                        &cluster.node,
+                        &service,
+                        &r.txn_id,
+                        spanning::Asker::Client(caller.principal),
+                    )
+                    .await?,
                 )
             }
             // A spanning transaction's call at its home's owner (D329), forwarded by the

@@ -193,27 +193,38 @@ class TestVectorIndex < Minitest::Test
     end
     # What the design guarantees for closed? during a 3 s run_once: the step's current slice
     # (at most 100 ms) plus the split in progress, which the crate always finishes, and then
-    # the Fair lock lets it in before the next slice. Measured on a Mac under 2x-cores of CPU
-    # load: p90 71 ms, worst 107 ms. The bound is 5 slices, for slow CI runners; without the
-    # slicing and the give-way it took the whole 3 s (perf2's S3 on #1434). The time is
-    # closed?'s own: an earlier version also timed a ticker's sleeps, which a slow macOS
-    # runner stretched past the bound (1.19 s on #1444).
-    t0 = monotonic
+    # the Fair lock lets it in before the next slice; without the slicing and the give-way it
+    # waited out the whole run_once (perf2's S3 on #1434). The test asserts that order, not a
+    # time: a wall-clock bound on closed?'s wait (0.5 s) failed on loaded macOS and Linux
+    # runners at 0.53 to 0.81 s (#1879), where a Mac under 2x-cores of CPU load measured p90
+    # 71 ms, worst 107 ms. So: the run_once still had splits to do when closed? returned, and
+    # it did some of them after. Had closed? waited out the run_once, nothing would split
+    # after it (the run_once is this index's only rebalancer).
     refute_predicate reb, :closed?
-    waited = monotonic - t0
-    assert_operator waited, :<, 0.5, "closed? waited out the run_once"
+    lists_after_closed = idx.verify.list_lens
     # Other Ruby threads ran meanwhile: closed? waited with the GVL released.
     sleep 0.05
     assert_operator ticks, :>, 0
     ticker.kill
     ticker.join
+    # Watch for a split until the run_once ends (its 3 s budget), then stop it, leaving work
+    # for the interrupt below.
+    split_after = false
+    while worker.alive?
+      break if (split_after = idx.verify.list_lens.size > lists_after_closed.size)
+
+      sleep 0.01
+    end
+    split_after ||= idx.verify.list_lens.size > lists_after_closed.size
     worker.kill
     worker.join
-    # An interrupt ends the run_once at the next slice: the 0.2 s timeout, at most a slice
-    # and a split, and the join. The bound leaves slow runners over a second of room.
+    assert split_after, "closed? waited out the run_once: nothing split after it returned"
+    # An interrupt ends the run_once at the next slice, long before its budget: the 0.2 s
+    # timeout, at most a slice and a split, and the join, against 10 s of work it would
+    # otherwise do. Half the budget is the bound, so runner speed doesn't decide it.
     t0 = monotonic
-    assert_raises(Timeout::Error) { Timeout.timeout(0.2) { reb.run_once(5.0) } }
-    assert_operator monotonic - t0, :<, 1.5, "run_once ran past the interrupt"
+    assert_raises(Timeout::Error) { Timeout.timeout(0.2) { reb.run_once(10.0) } }
+    assert_operator monotonic - t0, :<, 5.0, "run_once ran past the interrupt"
     assert_equal 20_000, idx.verify.vectors
   end
 

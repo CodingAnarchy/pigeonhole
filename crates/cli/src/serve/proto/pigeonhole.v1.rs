@@ -5285,7 +5285,9 @@ pub mod transactions_client {
         /// and changes nothing. Once the session is gone, a transaction never committed is made
         /// final as `ABORTED`, which is why it needs write scope; so is a read-only one that
         /// committed, once its session's record is gone (TxnOutcomeResponse says why). `NotFound`
-        /// past retention, and for other transactions once their session's record is gone.
+        /// past retention, and for other transactions once their session's record is gone. While
+        /// its session's record lasts, a transaction's outcome answers only the token that owns it
+        /// (another's is `NotFound`, #2077); after that, the decided outcome answers by id alone.
         pub async fn outcome(
             &mut self,
             request: impl tonic::IntoRequest<super::TxnOutcomeRequest>,
@@ -5362,7 +5364,9 @@ pub mod transactions_server {
         /// and changes nothing. Once the session is gone, a transaction never committed is made
         /// final as `ABORTED`, which is why it needs write scope; so is a read-only one that
         /// committed, once its session's record is gone (TxnOutcomeResponse says why). `NotFound`
-        /// past retention, and for other transactions once their session's record is gone.
+        /// past retention, and for other transactions once their session's record is gone. While
+        /// its session's record lasts, a transaction's outcome answers only the token that owns it
+        /// (another's is `NotFound`, #2077); after that, the decided outcome answers by id alone.
         async fn outcome(
             &self,
             request: tonic::Request<super::TxnOutcomeRequest>,

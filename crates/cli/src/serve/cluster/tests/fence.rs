@@ -244,7 +244,14 @@ fn after_a_restart_partitions_unfence_on_a_peers_map_and_an_operators_fence_stay
             .await;
         }
     });
-    let bind = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // Each port held for its node's restart, so a parallel test can't take it meanwhile.
+    let held = std::sync::Mutex::new(
+        ports
+            .iter()
+            .map(|&p| (p, HeldPort::take(p)))
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
+    let bind = |port: u16| held.lock().unwrap().remove(&port).unwrap().listen();
     // a restarts first: its peers don't answer, so p1 stays fenced.
     let (stop, _) = data_node_full(
         &rt,
@@ -416,6 +423,8 @@ struct Rig {
     dbs: Vec<Option<pigeonhole::Pigeonhole>>,
     /// Every node's token file (empty: none).
     tokens: String,
+    /// A stopped node's port, held for its restart ([`HeldPort`]).
+    held: [Option<HeldPort>; 3],
 }
 
 const NODES: [(&str, &str); 3] = [("a", "p1"), ("b", "p2"), ("c", "p3")];
@@ -450,10 +459,11 @@ impl Rig {
             stops,
             dbs,
             tokens: tokens.to_owned(),
+            held: [None, None, None],
         }
     }
 
-    /// Stops node `i` and waits until its port refuses.
+    /// Stops node `i`, waits until its port refuses, and holds the port for its restart.
     fn stop(&mut self, i: usize) {
         if let Some(stop) = self.stops[i].take() {
             let _ = stop.send(());
@@ -464,11 +474,15 @@ impl Rig {
                 .await
                 .is_err()
         }));
+        self.held[i] = Some(HeldPort::take(port));
     }
 
     /// Starts node `i` again on its directory, as a restarted node: every partition fenced.
     fn restart(&mut self, i: usize) {
-        let l = std::net::TcpListener::bind(("127.0.0.1", self.ports[i])).unwrap();
+        let l = self.held[i]
+            .take()
+            .unwrap_or_else(|| HeldPort::take(self.ports[i]))
+            .listen();
         let (stop, _) = data_node_full(
             &self.rt,
             &self.dirs[i],
@@ -863,7 +877,14 @@ fn an_operators_fence_after_a_restart_still_waits_for_the_peers_and_unfence_asks
             .await;
         }
     });
-    let bind = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // Each port held for its node's restart, so a parallel test can't take it meanwhile.
+    let held = std::sync::Mutex::new(
+        ports
+            .iter()
+            .map(|&p| (p, HeldPort::take(p)))
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
+    let bind = |port: u16| held.lock().unwrap().remove(&port).unwrap().listen();
     let restart = |i: usize| {
         data_node_full(
             &rt,
