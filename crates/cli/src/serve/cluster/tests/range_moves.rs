@@ -542,12 +542,6 @@ fn taken(seam: &std::sync::Mutex<Vec<super::super::range_follow::HeldChunk>>, di
     !seam.lock().unwrap().iter().any(|((d, _), _)| d == dir)
 }
 
-/// Whether the follower on the node in `dir` has taken its armed hold in `seam` (the seams
-/// are shared by the tests running at once: each looks at its own).
-fn taken(seam: &std::sync::Mutex<Vec<super::super::range_follow::HeldChunk>>, dir: &Path) -> bool {
-    !seam.lock().unwrap().iter().any(|((d, _), _)| d == dir)
-}
-
 /// The records move `mv1`'s copy has written in `db` (the head's `n`).
 fn records(db: &pigeonhole::Pigeonhole) -> Option<Vec<u8>> {
     db.table(super::super::identity::TABLE)

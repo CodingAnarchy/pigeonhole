@@ -398,8 +398,14 @@ impl Sources {
                 copies.len()
             )));
         }
+        // The hold first, then the snapshot: a hold covers the tokens of snapshots opened
+        // after it, never one opened before (simp724 on #2109).
         let hold = db.hold_feed_retention(self.cap)?;
         let snap = db.snapshot()?;
+        debug_assert!(
+            !hold.lapsed(),
+            "the copy's hold is live at its first snapshot"
+        );
         let token = table
             .feed()
             .from_snapshot(&snap)
