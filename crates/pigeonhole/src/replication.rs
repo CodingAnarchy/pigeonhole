@@ -9,6 +9,11 @@ use pigeonhole_format::Kind;
 use crate::feed::StreamPosition;
 use crate::{ChangeKind, Error, ErrorCode, FeedEvent, FeedToken, Pigeonhole, Result};
 
+/// A range move's feed retention hold ([`Pigeonhole::hold_feed_retention`], D331): kept
+/// while it lives. Not part of the stable API.
+#[doc(hidden)]
+pub use pigeonhole_engine::FeedRetentionHold;
+
 /// One event of a primary's feed, as a replica applies it ([`Feed::replicated`]): a commit's
 /// changes with the primary's table and family ids, or a catalog change with its ids; the
 /// feed's position before and after it, so the runs a replica applies chain; and the feed's
@@ -70,6 +75,14 @@ impl RangeDrop {
     /// The drop's seqno, which applies nothing.
     pub fn seqno(&self) -> u64 {
         self.seqno
+    }
+
+    /// Whether the drop removes any of rows `[start, end)` of `table` (`end` `None`: to the
+    /// table's end): a range move's catch-up stream ends on one that does (D331 PR 4b).
+    pub fn overlaps(&self, table: &crate::Table, start: &[u8], end: Option<&[u8]>) -> bool {
+        table.core.info.id == self.table
+            && end.is_none_or(|e| self.start.as_slice() < e)
+            && self.end.as_deref().is_none_or(|e| start < e)
     }
 }
 
@@ -848,10 +861,9 @@ impl Pigeonhole {
 
     /// Holds the change feed's history from now on (D331, ICR 0141): a feed token from now,
     /// or of a snapshot opened after it (not one opened before), resumes until the hold is
-    /// dropped or the
-    /// database retains more than `cap_bytes` of history, when it lapses. A range move's
-    /// catch-up then finds the source's history from its copy's first snapshot, or learns it
-    /// can't. `InvalidArgument` without the change feed. Not part of
+    /// dropped or the database retains more than `cap_bytes` of history, when it lapses. A
+    /// range move's catch-up then finds the source's history from its copy's first
+    /// snapshot, or learns it can't. `InvalidArgument` without the change feed. Not part of
     /// the stable API.
     #[doc(hidden)]
     pub fn hold_feed_retention(

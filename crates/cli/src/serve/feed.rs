@@ -378,8 +378,9 @@ fn rows_of(mut event: &[u8], prefix: &[u8]) -> Option<Rows> {
         match field(&mut event)? {
             (FEED_COMMIT, Some(c)) if commit.is_none() => commit = Some(c),
             // Another commit field (prost would merge them), or another of the oneof's events
-            // (the planned catalog event, progress, partition state).
-            (FEED_COMMIT | 3 | 4 | 6, _) => return None,
+            // (the planned catalog event, progress, partition state, D331's move barrier and
+            // raw commit): the oneof's last field wins, so the decode decides.
+            (FEED_COMMIT | 3 | 4 | 6 | 8 | 9, _) => return None,
             _ => {}
         }
     }
@@ -4642,13 +4643,15 @@ mod tests {
             encode_varint(commit.len() as u64, &mut event);
             event.extend_from_slice(&commit);
             if unknown {
-                encode_key(9, WireType::Varint, &mut event);
+                // A field `FeedEvent` doesn't have (9 became D331's raw commit).
+                encode_key(14, WireType::Varint, &mut event);
                 encode_varint(next(), &mut event);
             }
             if odd == Some(0) {
-                // A progress or partition state event: the oneof's last field wins.
+                // Another of the oneof's events (progress, partition state, D331's move
+                // barrier or raw commit): the oneof's last field wins.
                 encode_key(
-                    if next() % 2 == 0 { 4 } else { 6 },
+                    [4, 6, 8, 9][(next() % 4) as usize],
                     WireType::LengthDelimited,
                     &mut event,
                 );

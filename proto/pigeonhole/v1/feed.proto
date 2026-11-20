@@ -69,6 +69,11 @@ message FeedEvent {
     // the entry node's merge holds the component there until the source's has passed the
     // move's last seqno (per-key order across the hand-over). 7 is D329's.
     MoveBarrier move_barrier = 8;
+    // D331 PR 4b: internal to a range move's catch-up (`ForwardSubscribeRequest.raw`),
+    // never sent to a client: the commits ready at once, each with its changes in the
+    // move's range as logged, oldest first (#2108). The event's token is the position after
+    // the last.
+    RawCommits raw_commits = 9;
   }
   // On a cluster subscription, the partition the event came from; empty on a single node.
   string partition = 5;
@@ -76,6 +81,31 @@ message FeedEvent {
   // id, the same on every partition's share of it, so a subscriber can group them. Empty
   // for any other commit.
   bytes xid = 7;
+}
+
+// D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
+// commits.
+message RawCommits {
+  repeated RawCommit commits = 1;
+}
+
+// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
+message RawCommit {
+  uint64 seqno = 1;
+  uint64 timestamp = 2;
+  repeated RawChange changes = 3;
+}
+
+// One change of a `RawCommit`.
+message RawChange {
+  string family = 1;
+  // The logged kind (FORMAT §2).
+  uint32 kind = 2;
+  bytes row = 3;
+  bytes qualifier = 4;
+  uint64 timestamp = 5;
+  // The stored value, tag byte first; empty for a delete.
+  bytes stored = 6;
 }
 
 // D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).

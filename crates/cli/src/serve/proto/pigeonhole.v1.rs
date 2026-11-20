@@ -1724,7 +1724,7 @@ pub struct FeedEvent {
     /// for any other commit.
     #[prost(bytes = "bytes", tag = "7")]
     pub xid: ::prost::bytes::Bytes,
-    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8")]
+    #[prost(oneof = "feed_event::Event", tags = "2, 4, 6, 8, 9")]
     pub event: ::core::option::Option<feed_event::Event>,
 }
 /// Nested message and enum types in `FeedEvent`.
@@ -1746,7 +1746,48 @@ pub mod feed_event {
         /// move's last seqno (per-key order across the hand-over). 7 is D329's.
         #[prost(message, tag = "8")]
         MoveBarrier(super::MoveBarrier),
+        /// D331 PR 4b: internal to a range move's catch-up (`ForwardSubscribeRequest.raw`),
+        /// never sent to a client: the commits ready at once, each with its changes in the
+        /// move's range as logged, oldest first (#2108). The event's token is the position after
+        /// the last.
+        #[prost(message, tag = "9")]
+        RawCommits(super::RawCommits),
     }
+}
+/// D331 PR 4b: a range move's catch-up event (#2108): at most about 256 KiB and 1,024
+/// commits.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RawCommits {
+    #[prost(message, repeated, tag = "1")]
+    pub commits: ::prost::alloc::vec::Vec<RawCommit>,
+}
+/// D331 PR 4b: a commit's changes in a range move's range, as its source logged them.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RawCommit {
+    #[prost(uint64, tag = "1")]
+    pub seqno: u64,
+    #[prost(uint64, tag = "2")]
+    pub timestamp: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub changes: ::prost::alloc::vec::Vec<RawChange>,
+}
+/// One change of a `RawCommit`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RawChange {
+    #[prost(string, tag = "1")]
+    pub family: ::prost::alloc::string::String,
+    /// The logged kind (FORMAT §2).
+    #[prost(uint32, tag = "2")]
+    pub kind: u32,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub row: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub qualifier: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub timestamp: u64,
+    /// The stored value, tag byte first; empty for a delete.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub stored: ::prost::bytes::Bytes,
 }
 /// D331: a range move's hand-over in its target's component (`FeedEvent.move_barrier`).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7376,6 +7417,23 @@ pub struct MoveStatus {
     /// The partition serves the range here.
     #[prost(bool, tag = "6")]
     pub serving: bool,
+    /// D331 PR 4b, on the target: the bytes copied so far, whether the copy is done, and the
+    /// source's seqno its catch-up has passed (PR 5 checks it against `final_seqno`).
+    #[prost(uint64, tag = "7")]
+    pub copied_bytes: u64,
+    #[prost(bool, tag = "8")]
+    pub copy_done: bool,
+    #[prost(uint64, tag = "9")]
+    pub source_applied_seqno: u64,
+    /// On the source: the move's feed retention hold lapsed (past `--move-retention-cap`, or
+    /// lost to a restart of the source); the move can't catch up and must be aborted.
+    #[prost(bool, tag = "10")]
+    pub retention_lapsed: bool,
+    /// On the target: why its range follower stopped for good (the source's history expired,
+    /// a range drop of the range, a row left partly copied, the source failed over); empty
+    /// while it runs or once it's done. PR 5's driver aborts the move on it.
+    #[prost(string, tag = "11")]
+    pub follower_error: ::prost::alloc::string::String,
 }
 /// D330: one failover of a partition to a replica, or one writer election, as the writer
 /// that made it recorded it in the map.
@@ -7857,7 +7915,7 @@ pub struct ForwardRequest {
     pub partition: ::prost::alloc::string::String,
     #[prost(
         oneof = "forward_request::Op",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 52"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 45, 46, 47, 48, 52, 49"
     )]
     pub op: ::core::option::Option<forward_request::Op>,
 }
@@ -7984,6 +8042,9 @@ pub mod forward_request {
         /// (D329): the client's caller rides `caller`, write scope.
         #[prost(message, tag = "52")]
         TxnOutcome(super::TxnOutcomeRequest),
+        /// D331 PR 4b: one chunk of a range move's copy, from the move's target to its source.
+        #[prost(message, tag = "49")]
+        RangeCopy(super::RangeCopyRequest),
     }
 }
 /// Round 1 of a text search across an index's partitions (#1722 PR 2b, ICR 0138): this
@@ -8217,7 +8278,7 @@ pub struct ForwardResponse {
     pub served_seqno: u64,
     #[prost(
         oneof = "forward_response::Reply",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 30"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 30, 27"
     )]
     pub reply: ::core::option::Option<forward_response::Reply>,
 }
@@ -8288,6 +8349,9 @@ pub mod forward_response {
         ResolveTxn(super::TxnResolution),
         #[prost(message, tag = "30")]
         TxnOutcome(super::TxnOutcomeResponse),
+        /// D331 PR 4b: `range_copy`'s chunk.
+        #[prost(message, tag = "27")]
+        RangeCopy(super::RangeCopyResponse),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -8315,6 +8379,68 @@ pub struct ForwardSubscribeRequest {
     /// `FeedExpired` if no move did, or its feed has trimmed past that position.
     #[prost(bool, tag = "6")]
     pub from_hand_over: bool,
+    /// D331 PR 4b, a range move's catch-up (internal): the rows `[range_start, range_end)` of
+    /// the request's one table, an absent bound open. With `raw`, the commits' changes in the
+    /// range come as `FeedEvent.raw_commits`, the commits ready at once batched, stored values
+    /// and kinds as logged; accepted
+    /// only for the bounds of a live move from this partition (COPYING through HANDED_OVER).
+    #[prost(message, optional, tag = "7")]
+    pub range_start: ::core::option::Option<SplitKey>,
+    #[prost(message, optional, tag = "8")]
+    pub range_end: ::core::option::Option<SplitKey>,
+    #[prost(bool, tag = "9")]
+    pub raw: bool,
+}
+/// D331 PR 4b: one chunk of a range move's copy (`ForwardRequest.range_copy`). The source
+/// serves it only as the partition's owner at the map's epoch, for a live move naming it as
+/// `from` in COPYING.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RangeCopyRequest {
+    #[prost(string, tag = "1")]
+    pub move_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub table: ::prost::alloc::string::String,
+    /// The row to start at; empty: the move's start.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub after: ::prost::bytes::Bytes,
+    /// The most bytes to read for the chunk (it ends at a row boundary past them).
+    #[prost(uint64, tag = "4")]
+    pub max_bytes: u64,
+}
+/// D331 PR 4b: a range copy's chunk, as a compaction would write it at its snapshot.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeCopyResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub cells: ::prost::alloc::vec::Vec<RangeCopyCell>,
+    /// The row to ask for next; absent: the range is done.
+    #[prost(bytes = "bytes", optional, tag = "2")]
+    pub next: ::core::option::Option<::prost::bytes::Bytes>,
+    /// The chunk's snapshot.
+    #[prost(uint64, tag = "3")]
+    pub snapshot_seqno: u64,
+    /// The source's feed token at the first chunk's snapshot (the catch-up starts there);
+    /// empty on later chunks.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub token: ::prost::bytes::Bytes,
+}
+/// One cell of a range copy, as its source logged it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RangeCopyCell {
+    #[prost(string, tag = "1")]
+    pub family: ::prost::alloc::string::String,
+    /// The logged kind (FORMAT §2: put 1, merge 2, cell delete 3, column delete 4, family
+    /// delete 5).
+    #[prost(uint32, tag = "2")]
+    pub kind: u32,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub row: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub qualifier: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "5")]
+    pub timestamp: u64,
+    /// The stored value, tag byte first; empty for a delete.
+    #[prost(bytes = "bytes", tag = "6")]
+    pub stored: ::prost::bytes::Bytes,
 }
 /// D326: a node's lease round asks each node of its map, itself included, for a grant.
 #[derive(Clone, PartialEq, ::prost::Message)]
