@@ -404,6 +404,8 @@ mod tests {
     /// on b.
     fn map() -> ClusterMap {
         let part = |id: &str, node: &str, epoch| Partition {
+            moves_history: Default::default(),
+            pinned: Default::default(),
             history_epoch: 0,
             id: id.into(),
             node: node.into(),
@@ -414,6 +416,9 @@ mod tests {
             failover_count: 0,
         };
         ClusterMap {
+            balance: Default::default(),
+            balancer: Default::default(),
+            balancer_events: Default::default(),
             cluster_id: "c1".into(),
             map_version: 7,
             previous_nodes: Vec::new(),
@@ -421,10 +426,12 @@ mod tests {
             memory: None,
             nodes: vec![
                 Node {
+                    weight: Default::default(),
                     id: "a".into(),
                     address: "127.0.0.1:7001".into(),
                 },
                 Node {
+                    weight: Default::default(),
                     id: "b".into(),
                     address: "127.0.0.1:7002".into(),
                 },
@@ -432,6 +439,7 @@ mod tests {
             partitions: vec![part("p1", "a", 1), part("p2", "b", 2), part("p3", "b", 1)],
             tables: vec![
                 TablePlacement {
+                    pinned_ranges: Default::default(),
                     name: "users".into(),
                     group: String::new(),
                     families: Vec::new(),
@@ -440,6 +448,7 @@ mod tests {
                     created: 0,
                 },
                 TablePlacement {
+                    pinned_ranges: Default::default(),
                     name: "orders".into(),
                     group: String::new(),
                     families: Vec::new(),

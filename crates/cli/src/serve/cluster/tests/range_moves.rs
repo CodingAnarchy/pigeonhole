@@ -557,7 +557,7 @@ fn records(db: &pigeonhole::Pigeonhole) -> Option<Vec<u8>> {
 async fn move_status(port: u16, p: &str, id: &str) -> Option<crate::serve::proto::MoveStatus> {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .ok()?
         .into_inner()

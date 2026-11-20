@@ -9,6 +9,8 @@
 //! partition's identity under it.
 
 mod backup;
+pub(crate) mod balance;
+pub(crate) mod balancing;
 mod bulkfan;
 pub(crate) mod cli;
 pub(crate) mod close;
@@ -83,7 +85,13 @@ pub(crate) const MAP_FEATURES: &[&str] = &[
     WRITER_TERMS_FEATURE,
     RANGE_MOVES_FEATURE,
     spanning::SPANNING_TXNS_FEATURE,
+    BALANCER_FEATURE,
 ];
+
+/// [`MAP_FEATURES`]' name for D332's map fields (`ClusterMap.balancer`, `.balance`,
+/// `.balancer_events`, `Partition.pinned`, `.moves_history`, `TablePlacement.pinned_ranges`,
+/// `Node.weight`): a node without it would drop them from its copy and read as divergent.
+pub(crate) const BALANCER_FEATURE: &str = "balancer";
 
 /// [`MAP_FEATURES`]' name for `ClusterMap.moves` (D331): a node without it would drop the
 /// field from its copy, read as divergent, and gate no moving range.
@@ -483,6 +491,8 @@ pub(crate) struct Node {
     failovers: failover::Failovers,
     /// The writer's watch for nodes a lost election stranded (#2073).
     stranded: Mutex<writer::Stranded>,
+    /// D332's balancer, while this node is the map's writer.
+    balancing: Mutex<balancing::Run>,
     /// The node's device ceiling (D332): the highest one-second rate of its partitions'
     /// device bytes within `--balance-window`, fed by [`Node::watch_device`].
     device_ceiling: load::DeviceCeiling,
@@ -571,6 +581,7 @@ impl Node {
             duties: std::sync::atomic::AtomicBool::new(false),
             failovers: failover::Failovers::default(),
             stranded: Mutex::new(writer::Stranded::default()),
+            balancing: Mutex::new(balancing::Run::default()),
             dir: dir.to_path_buf(),
             id: id.to_owned(),
             loopback_only,
@@ -917,6 +928,11 @@ impl Node {
                 self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
                     .await?;
             }
+            // And the first use of the balancer's fields (D332).
+            if !map::uses_balancer(&current) && map::uses_balancer(&map) {
+                self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
+                    .await?;
+            }
             if !current.previous_nodes.is_empty() {
                 let (joint, _) = self.joint(&current).await;
                 if !joint.held() {
@@ -945,6 +961,10 @@ impl Node {
             }
             if !map.moves.is_empty() {
                 self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
+                    .await?;
+            }
+            if map::uses_balancer(&map) {
+                self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
                     .await?;
             }
             if map::uses_failover(&map) || map.writer_term > 0 {
@@ -1269,7 +1289,7 @@ impl Node {
             asks.spawn(async move {
                 let answer = async {
                     let mut client = node.client(&address).await?;
-                    let req = node.request(proto::StatusRequest {})?;
+                    let req = node.request(proto::StatusRequest::default())?;
                     client
                         .status(req)
                         .await
@@ -1397,6 +1417,12 @@ impl Node {
 
     /// `Cluster.Status`: the node, its map version, and its directory's partition files.
     fn status(&self) -> NodeStatus {
+        self.status_with(false)
+    }
+
+    /// [`Self::status`]; with `open_only` (D332's survey, `StatusRequest.open_only`), only
+    /// the partitions open here: no closed file is opened to read its identity (perf287).
+    fn status_with(&self, open_only: bool) -> NodeStatus {
         let (version, cluster_id, divergent, map) = {
             let st = self.state();
             (
@@ -1500,6 +1526,7 @@ impl Node {
             }
             let read = match open.get(&named) {
                 Some(part) => identity::read(&part.db),
+                None if open_only => continue,
                 None => identity::read_file(&path),
             };
             match read {
@@ -1604,6 +1631,10 @@ impl Node {
                 if let Some(part) = open.get(&id) {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
+                    // Its size from the file system, no read of the file (perf287): the
+                    // path the database opened, not one built from the id (CodeQL on
+                    // #2103).
+                    lp.file_bytes = std::fs::metadata(part.db.path()).map_or(0, |m| m.len());
                 }
             }
             // D331: the moves naming it (the follower's lag comes with PR 4's follower).
@@ -1645,6 +1676,7 @@ impl Node {
             },
         );
         NodeStatus {
+            balancer: self.balancer_state(),
             writer,
             writer_term,
             writer_lease_remaining_ms: millis(writer_lease),
@@ -2262,8 +2294,9 @@ impl proto::cluster_server::Cluster for ClusterGrpc {
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let open_only = req.get_ref().open_only;
         let node = Arc::clone(&self.0);
-        let status = tokio::task::spawn_blocking(move || node.status())
+        let status = tokio::task::spawn_blocking(move || node.status_with(open_only))
             .await
             .map_err(ApiError::from)?;
         Ok(tonic::Response::new(status))

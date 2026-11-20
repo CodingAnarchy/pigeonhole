@@ -174,7 +174,7 @@ fn an_uploaded_set_installs_with_the_next_epoch_and_the_map_then_serves_it() {
         eventually("c to serve p3", async || {
             client(c)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -222,6 +222,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
     }
     let [a, b, c] = ports;
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,
@@ -292,7 +293,7 @@ fn relocate_moves_a_closed_partition_to_the_node_holding_its_files() {
         eventually("c to take writes for p1", async || {
             client(c)
                 .await
-                .status(crate::serve::proto::StatusRequest {})
+                .status(crate::serve::proto::StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -357,6 +358,7 @@ fn relocate_old_unreachable_serves_a_backup_copy_placed_by_hand() {
     // `set-map --force` first, as the guide says).
     let [a, _, c] = ports;
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{a}"),
         token_file: None,
         ca: None,
@@ -433,6 +435,7 @@ fn a_move_run_again_after_its_stamp_copies_and_checks_the_set_again() {
     }
     let [a, b, c] = ports;
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,
@@ -449,7 +452,7 @@ fn a_move_run_again_after_its_stamp_copies_and_checks_the_set_again() {
         eventually("p1's files to be hashed", async || {
             client(a)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -541,6 +544,7 @@ fn relocate_copy_refuses_a_copy_that_isnt_the_old_nodes_closed_files() {
     }
     let [a, b, c] = ports;
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,

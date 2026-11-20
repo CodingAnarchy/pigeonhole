@@ -7266,6 +7266,94 @@ pub struct ClusterMap {
     /// or target. Set only once every node keeps them (`map_features`: `range_moves`).
     #[prost(message, repeated, tag = "14")]
     pub moves: ::prost::alloc::vec::Vec<RangeMove>,
+    /// D332: the balancer, run by the map's writer (off by default). PAUSED finishes the action
+    /// in flight and starts no other. Set only once every node keeps it (`balancer`).
+    #[prost(enumeration = "BalancerMode", tag = "15")]
+    pub balancer: i32,
+    /// D332: the balancer's bounds; a 0 field is its default.
+    #[prost(message, optional, tag = "16")]
+    pub balance: ::core::option::Option<BalanceBounds>,
+    /// D332: the balancer's last 32 actions, and each change of its reason for none.
+    #[prost(message, repeated, tag = "17")]
+    pub balancer_events: ::prost::alloc::vec::Vec<BalancerEvent>,
+}
+/// D332: the balancer's bounds. A field at 0 takes the default given.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct BalanceBounds {
+    /// The largest node's size per unit of weight over the mean (1.25).
+    #[prost(double, tag = "1")]
+    pub size_ratio: f64,
+    /// The same for load (1.25).
+    #[prost(double, tag = "2")]
+    pub load_ratio: f64,
+    /// A partition past it is split (32 GiB).
+    #[prost(uint64, tag = "3")]
+    pub partition_max_bytes: u64,
+    /// A partition past this share of a node's capacity is split (0.5).
+    #[prost(double, tag = "4")]
+    pub partition_max_load: f64,
+    /// A partition under it, and under a tenth of its node's mean load, is merged
+    /// (partition_max_bytes / 8).
+    #[prost(uint64, tag = "5")]
+    pub partition_min_bytes: u64,
+    /// Consecutive 30 s passes a condition holds before the balancer acts on it (10).
+    #[prost(uint32, tag = "6")]
+    pub passes: u32,
+    /// How long what an action touched rests after it, in ms (30 min).
+    #[prost(uint64, tag = "7")]
+    pub dwell_ms: u64,
+    /// Moves within `bounce_window_ms` that auto-pin a partition (3).
+    #[prost(uint32, tag = "8")]
+    pub max_moves: u32,
+    /// The window for `max_moves`, and how long an auto-pin lasts, in ms (24 h).
+    #[prost(uint64, tag = "9")]
+    pub bounce_window_ms: u64,
+}
+/// D332: one balancer action, or a change of its reason for none.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BalancerEvent {
+    #[prost(enumeration = "BalancerEventKind", tag = "1")]
+    pub kind: i32,
+    #[prost(string, tag = "2")]
+    pub partition: ::prost::alloc::string::String,
+    /// A move's source node; a merge's source partition.
+    #[prost(string, tag = "3")]
+    pub from: ::prost::alloc::string::String,
+    /// A move's target node; a split's new partition's node; a merge's target partition.
+    #[prost(string, tag = "4")]
+    pub to: ::prost::alloc::string::String,
+    /// A split's key.
+    #[prost(message, optional, tag = "5")]
+    pub split_key: ::core::option::Option<SplitKey>,
+    #[prost(string, tag = "6")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub at_ms: u64,
+    /// The `moves` record the action started, if any.
+    #[prost(string, tag = "8")]
+    pub move_id: ::prost::alloc::string::String,
+    /// A split's table.
+    #[prost(string, tag = "9")]
+    pub table: ::prost::alloc::string::String,
+}
+/// D332: one entry of a partition's balancer history (`Partition.moves_history`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MoveHistory {
+    #[prost(enumeration = "BalancerEventKind", tag = "1")]
+    pub kind: i32,
+    #[prost(uint64, tag = "2")]
+    pub at_ms: u64,
+}
+/// A half-open key range of a table, `[start, end)` in split keys: D332's
+/// `TablePlacement.pinned_ranges`, and any other split-key range.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SplitRange {
+    /// Absent: the table's first key.
+    #[prost(message, optional, tag = "1")]
+    pub start: ::core::option::Option<SplitKey>,
+    /// Absent: to the table's end.
+    #[prost(message, optional, tag = "2")]
+    pub end: ::core::option::Option<SplitKey>,
 }
 /// D331: one range move, `[start, end)` of `table` from partition `from` to partition `to`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -7401,8 +7489,11 @@ pub struct Node {
     /// The node's listener, `host:port` (TLS unless the cluster runs without it).
     #[prost(string, tag = "2")]
     pub address: ::prost::alloc::string::String,
+    /// D332: the node's capacity relative to the others, for the balancer (0 counts as 1).
+    #[prost(uint32, tag = "3")]
+    pub weight: u32,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Partition {
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
@@ -7439,6 +7530,13 @@ pub struct Partition {
     /// events (`pigeonhole_cluster_failovers_total`).
     #[prost(uint64, tag = "11")]
     pub failover_count: u64,
+    /// D332: the balancer leaves P on its node. Set by an operator (`phdb cluster balancer  pin`), or by the balancer for a partition that bounced, with a PIN entry in
+    /// `moves_history`; the balancer's own pin expires after the bounce window.
+    #[prost(bool, tag = "9")]
+    pub pinned: bool,
+    /// D332: the balancer's last 8 actions on P (moves, splits, merges, its pins).
+    #[prost(message, repeated, tag = "10")]
+    pub moves_history: ::prost::alloc::vec::Vec<MoveHistory>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TablePlacement {
@@ -7463,6 +7561,9 @@ pub struct TablePlacement {
     /// old table and create the new.
     #[prost(uint64, tag = "6")]
     pub created: u64,
+    /// D332: ranges the balancer never splits inside or moves (an operator's pins).
+    #[prost(message, repeated, tag = "7")]
+    pub pinned_ranges: ::prost::alloc::vec::Vec<SplitRange>,
 }
 /// Where an agent memory store's namespaces are (#1915, ICR 0139). A store keeps its data in
 /// three tables (`mem_{store}`, `mem_{store}_text`, `mem_{store}_ivf`), whose index rows cover
@@ -7587,7 +7688,13 @@ pub struct PushMapResponse {
     pub map_version: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct StatusRequest {}
+pub struct StatusRequest {
+    /// D332: only the partitions open here, with their file bytes from the file system: the
+    /// balancer's survey, which skips reading every closed file's identity. Older nodes ignore
+    /// it and answer in full.
+    #[prost(bool, tag = "1")]
+    pub open_only: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NodeStatus {
     #[prost(string, tag = "1")]
@@ -7642,6 +7749,11 @@ pub struct NodeStatus {
     /// before it fails a partition over: an owner some node still grants is alive.
     #[prost(message, repeated, tag = "13")]
     pub grants: ::prost::alloc::vec::Vec<LeaseWithheld>,
+    /// D332: the balancer's state on the map's writer: its last decision, or why it takes
+    /// none, and how many passes the next action has waited. For people to read, not a format
+    /// to parse. Empty on any other node, or with the balancer off.
+    #[prost(string, tag = "14")]
+    pub balancer: ::prost::alloc::string::String,
 }
 /// A partition file in the node's directory, as its identity row says.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -7749,6 +7861,10 @@ pub struct LocalPartition {
     pub load_device: f64,
     #[prost(double, tag = "31")]
     pub load: f64,
+    /// D332: the partition file's size here, from the file system (the database is one file,
+    /// WAL included), for the balancer. Open partitions only; 0 when closed.
+    #[prost(uint64, tag = "32")]
+    pub file_bytes: u64,
 }
 /// A share held in doubt (D329).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -8532,6 +8648,83 @@ impl FenceReason {
             "FENCE_REASON_AWAITING_PEER_MAP" => Some(Self::AwaitingPeerMap),
             "FENCE_REASON_LEASE_LAPSED" => Some(Self::LeaseLapsed),
             "FENCE_REASON_RANGE_MOVING" => Some(Self::RangeMoving),
+            _ => None,
+        }
+    }
+}
+/// D332: whether the map's writer runs the balancer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BalancerMode {
+    Unspecified = 0,
+    Off = 1,
+    On = 2,
+    Paused = 3,
+}
+impl BalancerMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BALANCER_MODE_UNSPECIFIED",
+            Self::Off => "BALANCER_MODE_OFF",
+            Self::On => "BALANCER_MODE_ON",
+            Self::Paused => "BALANCER_MODE_PAUSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BALANCER_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "BALANCER_MODE_OFF" => Some(Self::Off),
+            "BALANCER_MODE_ON" => Some(Self::On),
+            "BALANCER_MODE_PAUSED" => Some(Self::Paused),
+            _ => None,
+        }
+    }
+}
+/// D332: what a balancer event records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BalancerEventKind {
+    Unspecified = 0,
+    Move = 1,
+    Split = 2,
+    Merge = 3,
+    Pin = 4,
+    /// No action, and why: written only when the reason changes.
+    Skip = 5,
+    /// A new writer ended an earlier writer's action before its commit point.
+    Abort = 6,
+}
+impl BalancerEventKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BALANCER_EVENT_KIND_UNSPECIFIED",
+            Self::Move => "BALANCER_EVENT_KIND_MOVE",
+            Self::Split => "BALANCER_EVENT_KIND_SPLIT",
+            Self::Merge => "BALANCER_EVENT_KIND_MERGE",
+            Self::Pin => "BALANCER_EVENT_KIND_PIN",
+            Self::Skip => "BALANCER_EVENT_KIND_SKIP",
+            Self::Abort => "BALANCER_EVENT_KIND_ABORT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BALANCER_EVENT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "BALANCER_EVENT_KIND_MOVE" => Some(Self::Move),
+            "BALANCER_EVENT_KIND_SPLIT" => Some(Self::Split),
+            "BALANCER_EVENT_KIND_MERGE" => Some(Self::Merge),
+            "BALANCER_EVENT_KIND_PIN" => Some(Self::Pin),
+            "BALANCER_EVENT_KIND_SKIP" => Some(Self::Skip),
+            "BALANCER_EVENT_KIND_ABORT" => Some(Self::Abort),
             _ => None,
         }
     }
