@@ -580,14 +580,14 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - several partitions per node.
 - **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
   - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Vectors.BulkLoad`, `Text.Search`, `Text.Rebuild` and both kinds' `Verify` across an index's partitions ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
-  - a table's split keys are fixed once its ranges hold data (#1499);
+  - a table's split keys change only through a range move once its ranges hold data ([Moving and splitting ranges](#moving-and-splitting-ranges));
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
   - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve reads that allow staleness, across partitions too. A replica is made the owner by hand (`phdb cluster promote`), or by the cluster itself once you turn failover on ([Automatic failover](#automatic-failover)). A cluster node refuses `--replica-of` and `Admin.Promote`.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
 - **The map** says, in two layers:
-  - which partition holds each key range of each table, given as sorted *split keys*. Range *i* is `[split i-1, split i)`, the first starting at the empty key and the last open-ended. **This layer is fixed once a range holds data.** Moving a range between partitions comes in 1.3.0 (#1499), so choose split keys up front ([Choosing split keys](#choosing-split-keys-and-hot-ranges)).
+  - which partition holds each key range of each table, given as sorted *split keys*. Range *i* is `[split i-1, split i)`, the first starting at the empty key and the last open-ended. **Once a range holds data, this layer changes only through a range move** ([Moving and splitting ranges](#moving-and-splitting-ranges)), which copies the range: a map that reshapes it otherwise is refused. So still choose split keys up front ([Choosing split keys](#choosing-split-keys-and-hot-ranges)).
   - which node serves each partition. This changes when a partition is moved to another node, with a higher epoch.
 - **The map has a version,** raised by every change. A node refuses a map no newer than its own, and every node keeps a copy (`DIR/cluster-map.json`).
 - **Ids:** pick `cluster_id` once (a UUID is a good choice). Ids are `[a-z0-9_-]`, up to 64 characters.
@@ -652,6 +652,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
      - A partition whose epoch the forced map raises starts a new history, as a promotion does: its change-feed tokens from before answer `FeedExpired`.
      - No partition's epoch may go back, or stay the same with another node, against the receiving node's map or any node's that `phdb cluster` reaches. Give each moved partition an epoch above every node's. The report lists the nodes it couldn't reach as `unchecked`; read their map files (`phdb cluster show-map --file`) if they may be newer.
      - **Leave the memory placement as it is** ([Agent memory on a cluster](#agent-memory-on-a-cluster)). A forced map isn't held to the rule that fixes it, but no store moves with it. Each partition's store stays in its file as it was: a namespace a forced map places elsewhere is then routed to a partition whose store doesn't have its memories (one is created empty there), and its old memories stay unread where they were. A forced map that drops the placement makes every memory call answer `Unsupported`, and the stores stay in their files.
+     - **Check `phdb cluster status` before forcing a range back onto a partition it moved from** ([Moving and splitting ranges](#moving-and-splitting-ranges)). A forced map isn't held to the rule that fixes the split keys. While the move's rows are kept, the old source answers the range `PartitionUnavailable` rather than serve its old copy. Once they're pruned, it serves the range as empty: its copy was dropped at the move's CLEANING, and the rows are on the move's target.
      - **Only for a writer that's down.** A writer that's up but cut off from you can still change the map, and a forced map then loses that change. Check that the writer's process is stopped first.
 6. **Check it:** `phdb cluster status --node URL` shows every node's map version side by side, so a push that hasn't reached a node shows, and how many of each node's partitions are open with the identity the map expects. A row per partition gives its state on its node: `opening` (a map just gave it here, and its calls answer `PartitionUnavailable` until it's open), `serving`, `fenced (operator)`, `fenced (awaiting peer map)`, `fenced (operator, awaiting peer map)` (both: a partition you fenced that has no lease since it opened), `fenced (lease lapsed)` (its renewals stopped reaching a majority) or `closed`. A serving partition's `lease_remaining_ms` is the time left on its lease, and a node's `grace_remaining_ms` its start grace (D326). `phdb cluster show-map (--node URL | --file DIR/cluster-map.json)` prints a map.
 7. **Give `phdb cluster` its token.** Every `phdb cluster` command that talks to a node takes these beside `--node`:
@@ -682,7 +683,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 
 ### Agent memory on a cluster
 **New in 1.3.0 (#1915, ICR 0139).** Each partition the map places the memory store on holds a whole store of its own (its memories, its keyword index and its IVF index) for the namespaces in its range. A namespace lives in one partition.
-- **Place it in the map:** `"memory": {"store": "notes", "splits": [{"text": "m"}], "partitions": ["p1", "p2"]}` puts namespaces below `m` on p1 and the rest on p2. Split keys are namespaces, and none may contain `\0` (no namespace does). Like a table's, the placement is fixed once set (#1499).
+- **Place it in the map:** `"memory": {"store": "notes", "splits": [{"text": "m"}], "partitions": ["p1", "p2"]}` puts namespaces below `m` on p1 and the rest on p2. Split keys are namespaces, and none may contain `\0` (no namespace does). The placement is fixed once set: range moves move a table's ranges, not a memory store's.
 - **Start every node with `--memory notes`** and the same memory flags. Each partition the map places the store on opens it, created with the `--memory-*` options if missing, and checked against the node's model pin, `--memory-dim` and `--memory-normalization`. A partition whose store doesn't match answers its memory calls with `FailedPrecondition`, and `phdb cluster status` lists why among its reconcile errors; the node's other partitions serve. So does a partition the map places the store on whose node was started without `--memory`, naming the flag. A node started with `--memory` while the map places no store opens one when a map places it. A map that places another store refuses the start.
 - **Use one embedder backend on every node** (all `--embed-url` with the same endpoint and model, or all `--embed-local` with the same model). The model pin checks the model's name, dimension and normalisation, not the numbers each backend computes.
 - **Routing:** any node takes a memory call and forwards it to the partition holding its namespace. `Remember` goes by its namespace, `Link` and `Supersede` by their first memory's, and `MarkUsed`, `Forget` and `Recall` by every id's or namespace's. The owner checks the token's scope and `ns=` namespaces again.
@@ -1305,12 +1306,38 @@ A node serves every partition its map gives it ([D317](../design/decisions/phase
 A few partitions per node leave room to move one to another node later.
 
 ### Choosing split keys and hot ranges
-A table's split keys are fixed once its ranges hold data, until range moves in 1.3.0 (#1499). Choose them from how your keys are shaped:
+Once a table's ranges hold data, its split keys change only through a range move ([Moving and splitting ranges](#moving-and-splitting-ranges)), which copies the range. So choose them from how your keys are shaped:
 - **Tenant prefixes** (`tenant/…`): split at tenant boundaries. A tenant's rows stay in one partition, so its batches and transactions stay in one, and a scan of one tenant reads one partition. A big tenant can be given a partition of its own.
 - **Hashed prefixes** (a byte or two of a hash in front of the natural key): split evenly over the prefix space for an even spread of rows and load. The cost is key order: a scan in natural order reads every partition.
 - **Time-bucketed keys:** don't lead with the time. With fixed split keys every new write lands in the last range, so one partition takes all the writes. Put a tenant or hashed prefix first and the time after it.
 
-**A range that turns out hot:** until ranges can move, give its partition a node of its own or a bigger one, by moving the partition ([Fencing and relocation](#fencing-and-relocation)).
+**A range that turns out hot:** split it onto a new partition on another node (`phdb cluster split`), or move it to a less busy partition (`phdb cluster move-range`): [Moving and splitting ranges](#moving-and-splitting-ranges). Or give its whole partition a node of its own or a bigger one, by moving the partition ([Fencing and relocation](#fencing-and-relocation)).
+
+### Moving and splitting ranges
+From 1.3.0 (D331), a key range of a table moves from one partition to another while both serve:
+- **`phdb cluster move-range TABLE --from S --to T [--start K] [--end K]`** moves `[K_start, K_end)` of `TABLE` from partition `S` to partition `T`. The range must lie inside one of `S`'s ranges of the table; without `--start` or `--end` it runs from that range's start or to its end.
+- **`phdb cluster split TABLE --from S --key K --node N [--id ID]`** moves `S`'s range of `TABLE` from `K` to its end onto a new partition on node `N`. The new partition's id is `ID`, or by default the smallest free `S.<n>`. `K` can't be the range's start: that's a move of the whole range.
+
+Both run on the map's writer, through its own map changes, and print each phase as it starts:
+1. **COPYING:** `T` copies the range from snapshots of `S`, at most `--move-rate-bytes` from `S`'s node, while `S` serves it as before.
+2. **CATCHING_UP:** `T` applies `S`'s writes to the range from its change history, until it's within about a second of `S`.
+3. **HANDING_OVER:** `S` refuses writes to the range (`Fenced`, reason `RANGE_MOVING`, retry-safe; nothing was written) until `T` has applied the last of them, usually well under a second. Reads go on. A transaction prepared on `S` that may touch the range is decided first; if one stays undecided, the move aborts and the range takes writes again.
+4. **HANDED_OVER:** the map gives the range to `T`. This is the commit point: from here the move only goes forward.
+5. **CLEANING:** `T` serves the range, and `S` drops its copy. Then the move's record leaves the map.
+
+**Rerun and abort:**
+- **A rerun of the same command goes on** from the phase the map records, after a crash or a timeout. A different move of a partition already moving is refused, naming the move in flight.
+- **`phdb cluster move-range --abort ID`** stops move `ID` (a split's too) before its commit point: `T` drops what it copied, `S` serves the range as before, and a split's new partition is moved aside into `.phdb-dropped/` once it's empty. A node that's down when the abort lands cleans up when it comes back. Past the commit point the abort is refused: rerun the move to finish it.
+- **A failover of `S` or `T` before the hand-over aborts the move.** From HANDING_OVER until the move is done, a failover or a promote of either partition is refused.
+
+**Limits:**
+- **Every node runs 1.3.0** (the map features `range_moves` and `move_aborting` in `phdb cluster status`).
+- **One move per partition at a time,** and none of a table in a co-location group or one an index follows.
+- **`--max-move-followers`** moves copy from one node's partitions at once; a further one waits (`Overloaded`). `--move-retention-cap` bounds the change history a move keeps on `S`: a copy that would outrun it is refused before it starts, and one that does anyway must be aborted.
+
+**What to watch:** `phdb cluster status` shows each move's phase on `S` and `T`, the bytes copied, how far `T`'s catch-up is behind, what `T` waits for (an earlier abort's drop of an overlapping range) and why a move stopped, if it did.
+
+**Change feeds:** a subscription to the table goes on across the move, in per-key order: it reads the range from `S` until the hand-over, then from `T`. A token from before a move's hand-over still resumes while the move's rows are kept (the change-feed retention past the hand-over). Once they're pruned, such a token answers `FeedExpired` on any copy of `S` or `T`: open the feed again.
 
 ## Performance
 These numbers are for `phdb serve` on one machine, serving a single database file and also as a one-node cluster. All rows use a fixed offered write rate. They show latency and feed delivery at that rate, not peak throughput.
