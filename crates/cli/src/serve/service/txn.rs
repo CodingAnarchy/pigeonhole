@@ -2,7 +2,7 @@ use super::*;
 
 /// A read-only spanning transaction's hold on `partition` lost (D329): released, the
 /// partition's lease lapsed or changed term, it moved, or this node restarted.
-fn lost_hold(partition: &str) -> ApiError {
+pub(super) fn lost_hold(partition: &str) -> ApiError {
     ApiError::from_code(
         pigeonhole::ErrorCode::Conflict,
         &format!(
@@ -14,7 +14,7 @@ fn lost_hold(partition: &str) -> ApiError {
 
 impl Service {
     /// `Transactions.Begin`: a transaction at a snapshot taken now, held for the caller.
-    fn begin(
+    pub(super) fn begin(
         &self,
         r: proto::BeginRequest,
         caller: &Caller,
@@ -31,7 +31,11 @@ impl Service {
     }
 
     /// Takes transaction `id` for a call that only an open transaction answers.
-    fn open_txn(&self, id: &str, caller: &Caller) -> Result<super::sessions::TxnGuard, ApiError> {
+    fn open_txn(
+        &self,
+        id: &str,
+        caller: &Caller,
+    ) -> Result<super::super::sessions::TxnGuard, ApiError> {
         match self.sessions.take(id, caller.principal)? {
             Taken::Open(g) => Ok(g),
             Taken::Done(outcome) => Err(ApiError::transaction_finished(&outcome)),
@@ -58,7 +62,7 @@ impl Service {
         Ok(out)
     }
 
-    async fn txn_get(
+    pub(super) async fn txn_get(
         &self,
         r: proto::TxnGetRequest,
         caller: &Caller,
@@ -80,7 +84,7 @@ impl Service {
 
     /// On the blocking pool, as `get_row` is sync-only (D196): the transaction is lent to the
     /// blocking call and back, and a panic there expires the session (uncommitted).
-    async fn txn_get_row(
+    pub(super) async fn txn_get_row(
         &self,
         r: proto::TxnGetRowRequest,
         caller: &Caller,
@@ -111,7 +115,7 @@ impl Service {
 
     /// `Transactions.Write`: buffers the writes, all or none (`txn_rows`). What only the
     /// engine can check (a family, a size) fails the `Commit`, as in-process.
-    async fn txn_write(
+    pub(super) async fn txn_write(
         &self,
         r: proto::TxnWriteRequest,
         caller: &Caller,
@@ -130,7 +134,7 @@ impl Service {
     /// `Transactions.Commit`, detached from the request (D313 B2): the commit runs in its own
     /// task, which records the outcome as the session's tombstone (B1), so a client that goes
     /// away loses only the reply. A repeated `Commit` answers the tombstone.
-    async fn commit(
+    pub(super) async fn commit(
         &self,
         r: proto::TxnCommitRequest,
         caller: &Caller,
@@ -151,7 +155,7 @@ impl Service {
             _ => None,
         };
         // D331: the rows it carries, as writes, and M3, a transaction open across a range's
-        // fence or hand-over, as simp724 agreed it ([`super::ranges`]); one load.
+        // fence or hand-over, as simp724 agreed it ([`super::super::ranges`]); one load.
         if let Some(gate) = &self.gate
             && let Some(ranges) = &*gate.ranges().load()
         {
@@ -207,12 +211,16 @@ impl Service {
         })
     }
 
-    fn abort(&self, r: &proto::TxnAbortRequest, caller: &Caller) -> Result<proto::Empty, ApiError> {
+    pub(super) fn abort(
+        &self,
+        r: &proto::TxnAbortRequest,
+        caller: &Caller,
+    ) -> Result<proto::Empty, ApiError> {
         self.open_txn(&r.txn_id, caller)?.abort();
         Ok(proto::Empty {})
     }
 
-    fn open_snapshot(
+    pub(super) fn open_snapshot(
         &self,
         r: &proto::OpenSnapshotRequest,
         caller: &Caller,

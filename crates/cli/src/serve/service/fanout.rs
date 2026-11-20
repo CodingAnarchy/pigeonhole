@@ -13,7 +13,7 @@ impl Service {
     ///
     /// The read takes the request and gives it back with its reply, so the fast path never
     /// copies it; only the strict path reads it a second time (perf287's g54 profile).
-    async fn read_charged<R, Fut>(
+    pub(super) async fn read_charged<R, Fut>(
         &self,
         caller: &Caller,
         cap: usize,
@@ -51,7 +51,10 @@ impl Service {
             return Ok(reply);
         }
         let charge = self
-            .reserve_reply(caller, reply.encoded_len() + super::charge::GRPC_FRAME)
+            .reserve_reply(
+                caller,
+                reply.encoded_len() + super::super::charge::GRPC_FRAME,
+            )
             .await?;
         Ok(self.charged(caller, reply, charge))
     }
@@ -67,16 +70,16 @@ impl Service {
     ///   `acquire_many` every free permit and each release to the queue first, so this
     ///   `try_acquire` can't overtake it.
     fn try_charge(&self, caller: &Caller, reply: ServiceReply) -> (ServiceReply, bool) {
-        let size = reply.encoded_len() + super::charge::GRPC_FRAME;
+        let size = reply.encoded_len() + super::super::charge::GRPC_FRAME;
         let want = if caller.json {
             size.saturating_mul(2)
         } else {
             size
         };
-        if want <= super::charge::PIECE {
+        if want <= super::super::charge::PIECE {
             return (reply, true);
         }
-        match super::charge::Charge::try_reserve(
+        match super::super::charge::Charge::try_reserve(
             &self.inflight,
             self.limits.inflight_bytes,
             want,
@@ -89,17 +92,17 @@ impl Service {
 
     /// A unary read's reply share on the strict path (#1567): `cap` bytes, twice that for
     /// an HTTP/JSON reply (cli692's D2), within the request timeout, else `Overloaded`.
-    async fn reserve_reply(
+    pub(super) async fn reserve_reply(
         &self,
         caller: &Caller,
         cap: usize,
-    ) -> Result<super::charge::Charge, ApiError> {
+    ) -> Result<super::super::charge::Charge, ApiError> {
         let want = if caller.json {
             cap.saturating_mul(2)
         } else {
             cap
         };
-        super::charge::Charge::reserve(
+        super::super::charge::Charge::reserve(
             &self.inflight,
             self.limits.inflight_bytes,
             want,
@@ -203,8 +206,8 @@ impl Service {
         &self,
         bytes: usize,
         wait: Duration,
-    ) -> Result<super::charge::Charge, ApiError> {
-        super::charge::Charge::reserve(
+    ) -> Result<super::super::charge::Charge, ApiError> {
+        super::super::charge::Charge::reserve(
             &self.inflight,
             self.limits.inflight_bytes,
             bytes,
@@ -216,8 +219,8 @@ impl Service {
 
     /// [`Self::fanout_hold`] only if the bytes are free now: a read ahead, or a further
     /// concurrent part, on spare budget.
-    pub(crate) fn fanout_try_hold(&self, bytes: usize) -> Option<super::charge::Charge> {
-        super::charge::Charge::try_reserve(
+    pub(crate) fn fanout_try_hold(&self, bytes: usize) -> Option<super::super::charge::Charge> {
+        super::super::charge::Charge::try_reserve(
             &self.inflight,
             self.limits.inflight_bytes,
             bytes,
@@ -233,10 +236,10 @@ impl Service {
         &self,
         caller: &Caller,
         reply: ServiceReply,
-        mut holding: super::charge::Charge,
+        mut holding: super::super::charge::Charge,
         wait: Duration,
     ) -> Result<ServiceReply, ApiError> {
-        let size = reply.encoded_len() + super::charge::GRPC_FRAME;
+        let size = reply.encoded_len() + super::super::charge::GRPC_FRAME;
         let want = if caller.json {
             size.saturating_mul(2)
         } else {
@@ -248,14 +251,14 @@ impl Service {
 
     /// `reply` with its charge: a gRPC reply's trimmed to its encoded message now; an
     /// HTTP/JSON one's fitted to its rendered body by the front-end.
-    fn charged(
+    pub(super) fn charged(
         &self,
         caller: &Caller,
         reply: ServiceReply,
-        mut charge: super::charge::Charge,
+        mut charge: super::super::charge::Charge,
     ) -> ServiceReply {
         if !caller.json {
-            charge.trim(reply.encoded_len() + super::charge::GRPC_FRAME);
+            charge.trim(reply.encoded_len() + super::super::charge::GRPC_FRAME);
         }
         ServiceReply::Charged(Box::new(reply), charge)
     }

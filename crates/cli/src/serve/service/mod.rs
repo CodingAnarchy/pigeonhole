@@ -7,35 +7,29 @@
 //! or fails as it would have, and a lost reply is logged and counted.
 
 mod spanning;
-use spanning::*;
 mod txn;
 use txn::*;
 mod feeds;
-use feeds::*;
 mod memory_calls;
-use memory_calls::*;
 mod scan;
-use scan::*;
+pub(crate) use scan::*;
 mod index_calls;
-use index_calls::*;
+pub(crate) use index_calls::*;
 mod data;
-use data::*;
 mod pool;
-use pool::*;
+pub(crate) use pool::*;
 mod copies;
-use copies::*;
+pub(crate) use copies::*;
 mod metrics;
-use metrics::*;
+pub(crate) use metrics::*;
 mod schema;
 use schema::*;
 mod partition;
-use partition::*;
-mod fanout;
-use fanout::*;
+pub(crate) use partition::*;
 mod dispatch;
-use dispatch::*;
+mod fanout;
 mod ops;
-use ops::*;
+pub(crate) use ops::*;
 use std::collections::HashMap;
 use std::ops::{Bound, ControlFlow};
 use std::pin::Pin;
@@ -664,5 +658,4 @@ impl Service {
     ) -> Result<OwnedSemaphorePermit, ApiError> {
         budget_within(&self.inflight, bytes, wait).await
     }
-
 }

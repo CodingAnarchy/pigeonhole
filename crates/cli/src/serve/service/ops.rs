@@ -39,7 +39,7 @@ pub(crate) enum ServiceOp {
     VectorSearch(proto::VectorSearchRequest),
     VectorVerify(proto::VectorVerifyRequest),
     /// A client stream: its first message's index and count, and its messages after.
-    VectorBulkLoad(super::bulk::BulkLoadOp),
+    VectorBulkLoad(super::super::bulk::BulkLoadOp),
     Promote(proto::Empty),
     Follow(proto::FollowRequest),
     TextCreateIndex(proto::CreateTextIndexRequest),
@@ -501,18 +501,18 @@ impl<'a> Touch<'a> {
 /// below `final_seqno`). One past `t_from` (or from now) carries no token, so the merge's
 /// position for the component stays where it starts; the merge lifts it at once once the
 /// source's part is past `final_seqno`, gone or absent.
-fn barriers_for(
-    rows: Vec<super::ranges::Moved>,
+pub(super) fn barriers_for(
+    rows: Vec<super::super::ranges::Moved>,
     start: Option<&proto::subscribe_request::Start>,
-) -> Vec<super::feed::Barrier> {
+) -> Vec<super::super::feed::Barrier> {
     use proto::subscribe_request::Start as S;
     let from = match start {
         None | Some(S::FromOldest(false)) | Some(S::FromSnapshot(_)) => u64::MAX,
         Some(S::FromOldest(true)) => 0,
-        Some(S::Resume(t)) => super::cluster::token::token_seqno(t).unwrap_or(0),
+        Some(S::Resume(t)) => super::super::cluster::token::token_seqno(t).unwrap_or(0),
     };
     rows.into_iter()
-        .map(|m| super::feed::Barrier {
+        .map(|m| super::super::feed::Barrier {
             t_from: m.seqno,
             token: if from <= m.seqno {
                 m.token.into()
@@ -545,7 +545,7 @@ mod barriers_for_tests {
             t.extend_from_slice(&seqno.to_le_bytes());
             t
         };
-        let row = super::super::ranges::Moved {
+        let row = super::super::super::ranges::Moved {
             id: "mv1".into(),
             table: "users".into(),
             seqno: 10,

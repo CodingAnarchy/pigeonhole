@@ -300,12 +300,12 @@ impl Metrics {
 /// The session table's gauges (D313 §3): open sessions by kind, and the oldest open one's age,
 /// since a held transaction or snapshot holds back compaction's version GC and blob GC. A
 /// client that leaks sessions shows up here. Ticket 9 moves these onto D316's names.
-pub(crate) fn render_sessions(out: &mut String, tables: &[&super::sessions::Sessions]) {
+pub(crate) fn render_sessions(out: &mut String, tables: &[&super::super::sessions::Sessions]) {
     use std::fmt::Write as _;
     // Every table on the node: a cluster node's partitions each have their own (D317 ticket
     // 8a), counted together as the caps count them (cli692's F1 on #1718).
     let now = Instant::now();
-    let mut s = super::sessions::Stats::default();
+    let mut s = super::super::sessions::Stats::default();
     for t in tables {
         let one = t.stats(now);
         s.transactions += one.transactions;
@@ -339,7 +339,7 @@ pub(crate) fn render_candle(out: &mut String, bits: u8) {
         return;
     }
     let _ = writeln!(out, "# TYPE pigeonhole_serve_embed_env_unset gauge");
-    for (i, var) in super::CANDLE_VARS.iter().enumerate() {
+    for (i, var) in super::super::CANDLE_VARS.iter().enumerate() {
         let _ = writeln!(
             out,
             "pigeonhole_serve_embed_env_unset{{variable=\"{var}\"}} {}",
@@ -354,7 +354,7 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     for (name, read) in [
         (
             "pigeonhole_serve_bulk_load_phase",
-            (|g: &super::bulk::Gauges| g.phase.load(Ordering::Relaxed)) as fn(&_) -> u64,
+            (|g: &super::super::bulk::Gauges| g.phase.load(Ordering::Relaxed)) as fn(&_) -> u64,
         ),
         ("pigeonhole_serve_bulk_load_vectors", |g| {
             g.vectors.load(Ordering::Relaxed)
@@ -379,7 +379,7 @@ fn render_bulk(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
 
 /// `--text-pack`'s counters (#1585): each partition's background pack.
 fn render_text_packs(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
-    type Read = fn(&super::texts::PackCounters) -> u64;
+    type Read = fn(&super::super::texts::PackCounters) -> u64;
     let families: [(&str, Read); 4] = [
         ("pigeonhole_serve_text_pack_passes_total", |c| {
             c.passes.load(Ordering::Relaxed)
@@ -428,7 +428,7 @@ fn render_pinning(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
     for (name, read) in [
         (
             "pigeonhole_serve_partition_memtable_bytes",
-            (|m: &super::placement::Memory| m.memtables()) as fn(&_) -> u64,
+            (|m: &super::super::placement::Memory| m.memtables()) as fn(&_) -> u64,
         ),
         ("pigeonhole_serve_partition_block_cache_bytes", |m| {
             m.block_cache
@@ -489,7 +489,7 @@ fn escape_label(out: &mut String, v: &str) {
 
 /// The feed fan-out's gauges and counters (D313 R2; perf287's notes on ticket 5).
 pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)]) {
-    type Read = fn(&super::feed::Feeds) -> u64;
+    type Read = fn(&super::super::feed::Feeds) -> u64;
     let families: [(&str, &str, Read); 9] = [
         ("pigeonhole_serve_feed_hubs", "gauge", |f| {
             f.gauges().hubs as u64
@@ -535,7 +535,7 @@ pub(crate) fn render_feeds(out: &mut String, parts: &[(Option<&str>, &Partition)
 impl Service {
     /// The metrics as Prometheus text: `/metrics` and `Admin.Metrics` alike, for `parts`,
     /// the partitions served here. A single node passes its one, unlabelled; a cluster node
-    /// passes the router's ([`Router::metrics_text`](super::router::Router::metrics_text)),
+    /// passes the router's ([`Router::metrics_text`](super::super::router::Router::metrics_text)),
     /// each labelled by its id (D317 ticket 8b); a node that only routes, none.
     ///
     /// `sessions` are the node's session tables: its own, and each partition's on a cluster
@@ -543,7 +543,7 @@ impl Service {
     pub(crate) fn metrics_text(
         &self,
         parts: &[(Option<&str>, &Partition)],
-        sessions: &[&super::sessions::Sessions],
+        sessions: &[&super::super::sessions::Sessions],
     ) -> String {
         let mut text = self.metrics.render();
         self.connections.render(&mut text);
@@ -556,7 +556,10 @@ impl Service {
             let _ = writeln!(text, "# TYPE pigeonhole_serve_feed_hub_threads gauge");
             let _ = writeln!(text, "pigeonhole_serve_feed_hub_threads {}", p.hub_threads);
         }
-        render_candle(&mut text, super::CANDLE_UNSET.load(Ordering::Relaxed));
+        render_candle(
+            &mut text,
+            super::super::CANDLE_UNSET.load(Ordering::Relaxed),
+        );
         render_bulk(&mut text, parts);
         if self.text_rebuilds.packs() {
             render_text_packs(&mut text, parts);

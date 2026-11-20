@@ -4,12 +4,12 @@ impl Service {
     /// `Feed.Subscribe` (D313 R2): the client's tables resolved once (so its hub and any
     /// catch-up stream follow the same table ids), its start checked, and its stream handed to
     /// the fan-out. It holds a `--max-streams` slot until it ends.
-    async fn subscribe(
+    pub(super) async fn subscribe(
         &self,
         r: proto::SubscribeRequest,
         caller: &Caller,
         budget: OwnedSemaphorePermit,
-    ) -> Result<super::feed::FeedEvents, ApiError> {
+    ) -> Result<super::super::feed::FeedEvents, ApiError> {
         if r.allow_partial || !r.skip_through.is_empty() || r.checkpoint_every != 0 {
             return Err(ApiError::invalid(
                 "allow_partial, skip_through and checkpoint_every are for a cluster \
@@ -36,13 +36,13 @@ impl Service {
 
     /// A subscription of this server's database: a single node's `Feed.Subscribe`, or one
     /// partition's part of a cluster subscription (D317 ticket 7), whose `skip` passes over
-    /// commits the client already handled ([`super::feed::Spec::skip`]) and which
-    /// `announce`s its start ([`super::feed::Spec::announce`]). Holds a `--max-streams`
+    /// commits the client already handled ([`super::super::feed::Spec::skip`]) and which
+    /// `announce`s its start ([`super::super::feed::Spec::announce`]). Holds a `--max-streams`
     /// place either way.
     ///
     /// D331 PR 3b, on a cluster partition a range move gave a range of these tables: a
     /// cluster component (`announce`) that starts at or before a move's hand-over carries
-    /// its barrier ([`super::feed::Barrier`]), and `from_hand_over` starts it at the earliest
+    /// its barrier ([`super::super::feed::Barrier`]), and `from_hand_over` starts it at the earliest
     /// hand-over of these tables here, not at `r`'s start (a resume that gained this
     /// partition through a move; `FeedExpired` if no move did).
     pub(crate) async fn subscribe_part(
@@ -50,7 +50,7 @@ impl Service {
         mut r: proto::SubscribeRequest,
         caller: &Caller,
         part: PartStart,
-    ) -> Result<super::feed::FeedEvents, ApiError> {
+    ) -> Result<super::super::feed::FeedEvents, ApiError> {
         let PartStart {
             skip,
             announce,
@@ -58,7 +58,7 @@ impl Service {
             from_hand_over,
             ends_at,
         } = part;
-        use super::feed::Start;
+        use super::super::feed::Start;
         use proto::subscribe_request::Start as S;
         let slot = self.stream_slot()?;
         if r.tables.is_empty() {
@@ -94,7 +94,7 @@ impl Service {
         self.part()?
             .feeds
             .subscribe(
-                super::feed::Spec {
+                super::super::feed::Spec {
                     tables,
                     prefix: r.prefix.to_vec(),
                     visible: r.visible,
@@ -142,9 +142,9 @@ impl Service {
         tables: &[String],
         r: &mut proto::SubscribeRequest,
         from_hand_over: bool,
-    ) -> Result<Vec<super::feed::Barrier>, ApiError> {
+    ) -> Result<Vec<super::super::feed::Barrier>, ApiError> {
         use proto::subscribe_request::Start as S;
-        let rows: Vec<super::ranges::Moved> = self
+        let rows: Vec<super::super::ranges::Moved> = self
             .gate
             .as_ref()
             .map(|g| g.ranges().serving_rows())
@@ -183,11 +183,11 @@ impl Service {
     /// single client's (D317 ticket 7), on a node that only routes too.
     /// The node's feed state every partition shares: its catch-up slots and the rings
     /// that split `--feed-ring-bytes` (#1798's cluster feed hubs use both).
-    pub(crate) fn feed_shared(&self) -> &super::feed::FeedShared {
+    pub(crate) fn feed_shared(&self) -> &super::super::feed::FeedShared {
         &self.feed_shared
     }
 
-    pub(crate) fn feed_limits(&self) -> super::feed::FeedLimits {
+    pub(crate) fn feed_limits(&self) -> super::super::feed::FeedLimits {
         feed_limits(&self.limits)
     }
 }

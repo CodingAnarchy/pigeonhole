@@ -1,7 +1,7 @@
 use super::*;
 
 impl Service {
-    async fn get(
+    pub(super) async fn get(
         &self,
         r: proto::GetRequest,
         caller: &Caller,
@@ -28,7 +28,7 @@ impl Service {
 
     /// On the blocking pool: `KeysRead::read_within` is sync-only (D196). TODO(#398, #1286):
     /// async once multi-get pages have an async form, so a multi-get holds no blocking thread.
-    async fn multi_get(
+    pub(super) async fn multi_get(
         &self,
         r: proto::MultiGetRequest,
         caller: &Caller,
@@ -55,7 +55,7 @@ impl Service {
                 let after = if r.after.is_empty() {
                     None
                 } else {
-                    super::cluster::position::refuse_on_a_single_node(&r.after)?;
+                    super::super::cluster::position::refuse_on_a_single_node(&r.after)?;
                     Some(KeysPosition::from_bytes(&r.after).map_err(ApiError::from)?)
                 };
                 let q = select.aggregate();
@@ -100,7 +100,7 @@ impl Service {
     /// server's default, and the server caps it), so a reply is bounded as a `MultiGet`'s is
     /// (simp724's L1 on #1565). Run on the request's task (`run_async` never blocks on a block
     /// it can fetch), so it holds no blocking thread.
-    async fn traverse(
+    pub(super) async fn traverse(
         &self,
         r: &proto::TraverseRequest,
         caller: &Caller,
@@ -159,7 +159,7 @@ impl Service {
     /// names, or now, cut to `page_bytes` by D308's measure (0 is the server's default, and
     /// the server caps it), so a reply is bounded as a `MultiGet`'s is. Run on the request's
     /// task, as `Traverse`.
-    async fn nearest(
+    pub(super) async fn nearest(
         &self,
         r: &proto::NearestRequest,
         caller: &Caller,
@@ -191,7 +191,10 @@ impl Service {
         #[cfg(test)]
         let qualifiers = qualifiers.filter(|_| {
             !self.part().is_ok_and(|p| {
-                super::cluster::old_nearest(p.db.path(), super::cluster::OldNearest::Parts)
+                super::super::cluster::old_nearest(
+                    p.db.path(),
+                    super::super::cluster::OldNearest::Parts,
+                )
             })
         });
         let select = convert::Select::new(qualifiers.as_deref())?.at(at);
@@ -225,7 +228,7 @@ impl Service {
         })
     }
 
-    async fn mutate(
+    pub(super) async fn mutate(
         &self,
         r: proto::MutateRequest,
         budget: OwnedSemaphorePermit,
@@ -252,7 +255,7 @@ impl Service {
         })
     }
 
-    async fn check_and_mutate(
+    pub(super) async fn check_and_mutate(
         &self,
         r: proto::CheckAndMutateRequest,
         budget: OwnedSemaphorePermit,
@@ -283,7 +286,7 @@ impl Service {
         })
     }
 
-    async fn batch(
+    pub(super) async fn batch(
         &self,
         r: proto::BatchRequest,
         budget: OwnedSemaphorePermit,
@@ -315,7 +318,7 @@ impl Service {
         })
     }
 
-    async fn mutate_returning(
+    pub(super) async fn mutate_returning(
         &self,
         r: proto::MutateRequest,
         budget: OwnedSemaphorePermit,

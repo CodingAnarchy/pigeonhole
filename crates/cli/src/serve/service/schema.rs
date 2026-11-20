@@ -1,7 +1,7 @@
 use super::*;
 
 /// A table as `Schema` describes it: its families with every option as stored.
-fn describe(t: &Table) -> proto::TableResponse {
+pub(super) fn describe(t: &Table) -> proto::TableResponse {
     proto::TableResponse {
         name: t.name().to_owned(),
         families: t
@@ -40,10 +40,10 @@ fn create_in(
 /// Refuses a name with the cluster's reserved prefix (`__phdb_`, ICR 0117): its tables
 /// (`__phdb_cluster`, a partition's identity) are the server's own, never a user call's.
 fn reserved(name: &str) -> Result<(), ApiError> {
-    if name.starts_with(super::cluster::map::RESERVED_PREFIX) {
+    if name.starts_with(super::super::cluster::map::RESERVED_PREFIX) {
         return Err(ApiError::invalid(format!(
             "table {name:?}: the {} prefix is reserved",
-            super::cluster::map::RESERVED_PREFIX
+            super::super::cluster::map::RESERVED_PREFIX
         )));
     }
     Ok(())
@@ -114,7 +114,7 @@ impl Service {
     /// `Schema.CreateTable`: the table with its families, created, or with `if_missing`
     /// opened with the families it lacks added. The service's handle for the name is
     /// replaced, so later calls (and feed hubs, keyed by its id) use this table.
-    async fn create_table(
+    pub(super) async fn create_table(
         &self,
         r: proto::CreateTableRequest,
     ) -> Result<proto::TableResponse, ApiError> {
@@ -174,7 +174,7 @@ impl Service {
             return Vec::new();
         };
         let mut tables = part.db.tables();
-        tables.retain(|t| !t.starts_with(super::cluster::map::RESERVED_PREFIX));
+        tables.retain(|t| !t.starts_with(super::super::cluster::map::RESERVED_PREFIX));
         tables.sort();
         tables
     }
@@ -189,7 +189,7 @@ impl Service {
     /// `Schema.DropTable`: the table and its data go, and so does the service's handle for
     /// the name. A table created again under it is a new table, with a new id: its feed hubs
     /// are new too, and those on the old one end with their engine feeds.
-    async fn drop_table(&self, name: String) -> Result<(), ApiError> {
+    pub(super) async fn drop_table(&self, name: String) -> Result<(), ApiError> {
         reserved(&name)?;
         // The memory store this server serves keeps its data in its own tables: dropping one
         // would leave the slot over a dropped table, and a restart would re-create the store

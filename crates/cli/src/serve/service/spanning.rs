@@ -33,7 +33,7 @@ impl Service {
     /// it can't fail (D329's coordinator buffers a spanning call's home rows on the session
     /// it already holds).
     pub(crate) fn buffer_rows(
-        g: &mut super::sessions::TxnGuard,
+        g: &mut super::super::sessions::TxnGuard,
         rows: &[(Table, &[u8], Vec<convert::TxnOp<'_>>)],
     ) {
         for (table, row, ops) in rows {
@@ -58,11 +58,11 @@ impl Service {
     /// budget), and `err` becomes the session's recorded outcome, so a retry finds the
     /// transaction ended rather than applying those rows again. Returns `err`.
     pub(crate) fn end_spanning(
-        mut g: super::sessions::TxnGuard,
+        mut g: super::super::sessions::TxnGuard,
         err: ApiError,
-        driver: &super::cluster::spanning::Driver,
+        driver: &super::super::cluster::spanning::Driver,
     ) -> ApiError {
-        use super::cluster::spanning::SpanView;
+        use super::super::cluster::spanning::SpanView;
         if let Some(span) = g.span() {
             let mut branches = span.branches(&driver.home);
             branches.extend(span.idle(&driver.home));
@@ -94,7 +94,7 @@ impl Service {
     /// Records that branches `acked` applied spanning transaction `xid`'s commit (D329 2b), in
     /// its decision row, for its GC. A row that's gone, or isn't a commit, is left as it is.
     pub(crate) async fn ack_decision(&self, xid: &str, acked: &[String]) -> Result<(), ApiError> {
-        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, with_acks};
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, with_acks};
         if acked.is_empty() {
             return Ok(());
         }
@@ -130,7 +130,7 @@ impl Service {
     /// Deletes this home's decision rows past `--txn-outcome-retention` at `now_ms` (D329
     /// 2b): commits every branch acknowledged, and abort markers. Returns how many went.
     pub(crate) async fn sweep_decisions(&self, now_ms: u64) -> Result<usize, ApiError> {
-        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, collectable};
         let table = self.decisions_table().await?;
         let retention = u64::try_from(self.outcome_retention().as_millis()).unwrap_or(u64::MAX);
         let gone: Vec<Vec<u8>> = {
@@ -164,12 +164,12 @@ impl Service {
     }
 
     /// What transaction `id` is now, without taking it (D329's `Outcome` and resolver), as
-    /// `principal` sees it; `None` is the node's own call ([`super::sessions::Sessions::peek`]).
+    /// `principal` sees it; `None` is the node's own call ([`super::super::sessions::Sessions::peek`]).
     pub(crate) fn peek_txn(
         &self,
         id: &str,
-        principal: Option<super::auth::Principal>,
-    ) -> super::sessions::Peek {
+        principal: Option<super::super::auth::Principal>,
+    ) -> super::super::sessions::Peek {
         self.sessions.peek(id, principal)
     }
 
@@ -181,7 +181,7 @@ impl Service {
     /// Spanning transaction `xid`'s decision row on this home partition (D329), read now:
     /// `None` when it has none.
     pub(crate) async fn decision(&self, xid: &str) -> Result<Option<Vec<u8>>, ApiError> {
-        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER};
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER};
         let table = self.decisions_table().await?;
         let row = xid.as_bytes().to_vec();
         self.blocking(move || {
@@ -199,7 +199,7 @@ impl Service {
     /// `COMMITTED`) and this can't both win. Returns the row as it is now: the marker, or
     /// what a commit point that won the race wrote.
     pub(crate) async fn decide_absent(&self, xid: &str, epoch: u64) -> Result<Vec<u8>, ApiError> {
-        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, aborted_value};
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, aborted_value};
         let table = self.decisions_table().await?;
         let row = xid.as_bytes().to_vec();
         for _ in 0..3 {
@@ -271,7 +271,7 @@ impl Service {
         &self,
         xid: &str,
         read_only: bool,
-        spanning: &Arc<super::cluster::spanning::Spanning>,
+        spanning: &Arc<super::super::cluster::spanning::Spanning>,
         partition: &str,
     ) -> Result<proto::BranchPrepared, ApiError> {
         let gate = self
@@ -337,7 +337,7 @@ impl Service {
         commit: bool,
         hold: u64,
         term: u64,
-        spanning: &super::cluster::spanning::Spanning,
+        spanning: &super::super::cluster::spanning::Spanning,
         partition: &str,
     ) -> Result<Option<pigeonhole::CommitInfo>, ApiError> {
         let gate = self
@@ -383,14 +383,14 @@ impl Service {
     /// prepared past the commit point undecided by this node.
     pub(crate) async fn commit_spanning(
         self: &Arc<Self>,
-        mut g: super::sessions::TxnGuard,
+        mut g: super::super::sessions::TxnGuard,
         r: proto::TxnCommitRequest,
         caller: &Caller,
         budget: OwnedSemaphorePermit,
-        driver: super::cluster::spanning::Driver,
+        driver: super::super::cluster::spanning::Driver,
         forwarded: bool,
     ) -> Result<proto::TxnCommitResponse, ApiError> {
-        use super::cluster::spanning::SpanView;
+        use super::super::cluster::spanning::SpanView;
         let gate = Arc::clone(
             self.gate
                 .as_ref()
@@ -493,7 +493,7 @@ impl Service {
     /// to the file: never past a fence's drain), the first time a spanning transaction
     /// begins on the partition.
     pub(crate) async fn decisions_table(&self) -> Result<Table, ApiError> {
-        use super::cluster::spanning::{DECISION_FAMILY, DECISIONS};
+        use super::super::cluster::spanning::{DECISION_FAMILY, DECISIONS};
         let db = self.part()?.db.clone();
         if let Ok(t) = db.table(DECISIONS).and_then(|t| t.open()) {
             return Ok(t);
@@ -519,17 +519,19 @@ impl Service {
     /// since the prepare round may have used the client's (audit120's S1); the answer waits
     /// for the decides only until the client's deadline.
     ///
-    /// [`Driver::for_round`]: super::cluster::spanning::Driver::for_round
+    /// [`Driver::for_round`]: super::super::cluster::spanning::Driver::for_round
     async fn spanning_write(
         &self,
         mut txn: pigeonhole::Transaction,
         durability: Option<pigeonhole::Durability>,
         decisions: &Table,
-        gate: &Arc<super::gate::WriteGate>,
-        driver: &super::cluster::spanning::Driver,
+        gate: &Arc<super::super::gate::WriteGate>,
+        driver: &super::super::cluster::spanning::Driver,
         branches: &[String],
-    ) -> super::sessions::Outcome {
-        use super::cluster::spanning::{DECISION_FAMILY, DECISION_QUALIFIER, committed_value};
+    ) -> super::super::sessions::Outcome {
+        use super::super::cluster::spanning::{
+            DECISION_FAMILY, DECISION_QUALIFIER, committed_value,
+        };
         let conflict = |why: String| ApiError::from_code(pigeonhole::ErrorCode::Conflict, &why);
         let abort = || async { driver.for_round().abort(branches).await };
         if let Err(e) = driver.check_feature().await {
@@ -548,7 +550,7 @@ impl Service {
         }
         #[cfg(test)]
         {
-            use super::cluster::spanning::seams;
+            use super::super::cluster::spanning::seams;
             if seams::at(&driver.xid, seams::Step::CommitPoint).await {
                 return Err(ApiError::outcome_unknown(
                     "abandoned before the commit point",
@@ -557,7 +559,7 @@ impl Service {
         }
         // The commit point: the decision row read (absent: no abort marker) and written in
         // the home's own commit, through its gate, at GroupSync or stronger.
-        let epoch = super::sessions::spanning_parts(&driver.xid).map_or(0, |(_, e, _)| e);
+        let epoch = super::super::sessions::spanning_parts(&driver.xid).map_or(0, |(_, e, _)| e);
         let row = driver.xid.as_bytes().to_vec();
         let marker = match txn
             .get_async(decisions, &row, DECISION_FAMILY, DECISION_QUALIFIER)
@@ -615,7 +617,7 @@ impl Service {
         };
         #[cfg(test)]
         {
-            use super::cluster::spanning::seams;
+            use super::super::cluster::spanning::seams;
             if seams::at(&driver.xid, seams::Step::Decide).await {
                 return Err(ApiError::outcome_unknown("abandoned before the decides"));
             }
@@ -655,10 +657,10 @@ impl Service {
         &self,
         txn: pigeonhole::Transaction,
         home_read: bool,
-        gate: &Arc<super::gate::WriteGate>,
-        driver: &super::cluster::spanning::Driver,
+        gate: &Arc<super::super::gate::WriteGate>,
+        driver: &super::super::cluster::spanning::Driver,
         branches: &[String],
-    ) -> super::sessions::Outcome {
+    ) -> super::super::sessions::Outcome {
         let seqno = txn.snapshot_seqno();
         let lost = || {
             ApiError::from_code(
@@ -686,7 +688,7 @@ impl Service {
         let (held, refused) = driver.prepare(branches, true).await;
         #[cfg(test)]
         {
-            use super::cluster::spanning::seams;
+            use super::super::cluster::spanning::seams;
             if seams::at(&driver.xid, seams::Step::Release).await {
                 // Abandoned: the branches' holds are never released (they expire).
                 return Err(lost());

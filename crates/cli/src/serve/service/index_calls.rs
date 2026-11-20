@@ -28,59 +28,9 @@ pub(crate) fn unreadable_stats(
     })
 }
 
-#[cfg(test)]
-mod text_part_tests {
-    use super::filled;
-    use pigeonhole::{Family, Options, Pigeonhole};
-    use pigeonhole_text::{Index, IndexOptions, Source};
-
-    /// #1722 PR 2b: a partition whose text index is still filling from its source (a
-    /// cluster creates it unfilled) can't answer a search's round: `Unavailable`, which an
-    /// `allow_partial` search skips. Once filled, it answers.
-    #[test]
-    fn a_text_index_still_filling_answers_no_round() {
-        let dir = pigeonhole::doc_support::temp_dir();
-        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
-        let table = db
-            .table("docs")
-            .unwrap()
-            .family("f", Family::default())
-            .create()
-            .unwrap();
-        let index = Index::create_unfilled(
-            &db,
-            "x",
-            Source::new(&table, "f", b"body"),
-            IndexOptions::new(),
-        )
-        .unwrap();
-        let e = filled(&index, "x").unwrap_err();
-        assert_eq!(e.code, "Unavailable", "{}", e.message);
-        assert!(e.message.contains("still filling"), "{}", e.message);
-        index
-            .resume_rebuild_with(|_| std::ops::ControlFlow::Continue(()))
-            .unwrap();
-        filled(&index, "x").unwrap();
-        // A client's rebuild (#1722 PR 2c), here stopped after its first document, leaves
-        // a rebuild pending but every document indexed: the partition still answers.
-        for id in [b"a", b"b"] {
-            table
-                .mutate(id)
-                .put("f", b"body", b"alpha")
-                .commit()
-                .unwrap();
-        }
-        let r = index
-            .rebuild_with(|_| std::ops::ControlFlow::Break(()))
-            .unwrap();
-        assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
-        filled(&index, "x").unwrap();
-    }
-}
-
 impl Service {
     /// Whether a load of `expected` vectors into index `name` fits this node's
-    /// `--bulk-load-bytes` with a part on each of `siblings` partitions ([`super::bulk::fits`]):
+    /// `--bulk-load-bytes` with a part on each of `siblings` partitions ([`super::super::bulk::fits`]):
     /// a cluster's entry node checks its own partitions before reading a load (#1722 PR 3).
     pub(crate) async fn bulk_fits(
         &self,
@@ -89,7 +39,7 @@ impl Service {
         siblings: u64,
     ) -> Result<(), ApiError> {
         let index = self.index(name).await?;
-        super::bulk::fits(
+        super::super::bulk::fits(
             &index,
             expected,
             siblings,
@@ -98,7 +48,10 @@ impl Service {
     }
 
     /// The IVF index `name`, from the cache, or opened on the blocking pool on a miss.
-    async fn index(&self, name: &str) -> Result<Arc<pigeonhole_vector::Index>, ApiError> {
+    pub(super) async fn index(
+        &self,
+        name: &str,
+    ) -> Result<Arc<pigeonhole_vector::Index>, ApiError> {
         if let Some(i) = self.part()?.indexes.cached(name) {
             return Ok(i);
         }
@@ -108,7 +61,7 @@ impl Service {
     }
 
     /// `Vectors.CreateIndex` (ICR 0100): a new index, or with `if_missing` an existing one.
-    async fn create_index(
+    pub(super) async fn create_index(
         &self,
         r: proto::CreateVectorIndexRequest,
     ) -> Result<proto::Empty, ApiError> {
@@ -119,7 +72,7 @@ impl Service {
                  single node, whose index holds every id",
             ));
         }
-        let (spec, options) = super::indexes::create_args(&r)?;
+        let (spec, options) = super::super::indexes::create_args(&r)?;
         let indexes = Arc::clone(&self.part()?.indexes);
         self.blocking(move || indexes.create(&r.name, spec, options, r.if_missing))
             .await?;
@@ -128,7 +81,7 @@ impl Service {
 
     /// `Vectors.Insert`: one vector under `id`, in the index's element type. A write: it runs
     /// detached, on the blocking pool (an insert is a transaction, and may rebalance inline).
-    async fn vector_insert(
+    pub(super) async fn vector_insert(
         &self,
         r: proto::VectorInsertRequest,
         budget: OwnedSemaphorePermit,
@@ -160,7 +113,7 @@ impl Service {
     }
 
     /// `Vectors.Delete`: the vector under `id`, if any. Detached, on the blocking pool.
-    async fn vector_delete(
+    pub(super) async fn vector_delete(
         &self,
         r: proto::VectorDeleteRequest,
         budget: OwnedSemaphorePermit,
@@ -180,7 +133,7 @@ impl Service {
 
     /// `Vectors.Search`: the `k` (at most [`MAX_NEAREST_K`]) nearest ids, on the request's
     /// task (`run_async_with_stats`), holding no blocking thread once the index is open.
-    async fn vector_search(
+    pub(super) async fn vector_search(
         &self,
         r: proto::VectorSearchRequest,
     ) -> Result<proto::VectorSearchResponse, ApiError> {
@@ -241,11 +194,11 @@ impl Service {
 
     /// `Text.CreateIndex` (ICR 0105): a new index over its source column, or with
     /// `if_missing` an existing one, as it is.
-    async fn text_create_index(
+    pub(super) async fn text_create_index(
         &self,
         r: proto::CreateTextIndexRequest,
     ) -> Result<proto::Empty, ApiError> {
-        let options = super::texts::options(&r)?;
+        let options = super::super::texts::options(&r)?;
         let table = self.table(&r.source_table).await?;
         let source = pigeonhole_text::Source::new(&table, &r.source_family, &r.source_qualifier);
         let texts = Arc::clone(&self.part()?.texts);
@@ -269,7 +222,7 @@ impl Service {
 
     /// `Text.Put`: writes the document's text to the source column and indexes it, in one
     /// transaction. A write: detached, on the blocking pool.
-    async fn text_put(
+    pub(super) async fn text_put(
         &self,
         r: proto::TextPutRequest,
         budget: OwnedSemaphorePermit,
@@ -288,7 +241,7 @@ impl Service {
     }
 
     /// `Text.Delete`: the document's text and its postings, if any. Detached, as `Put`.
-    async fn text_delete(
+    pub(super) async fn text_delete(
         &self,
         r: proto::TextDeleteRequest,
         budget: OwnedSemaphorePermit,
@@ -308,7 +261,7 @@ impl Service {
 
     /// `Text.Search`: the `k` (at most [`MAX_NEAREST_K`]) best documents by BM25, with
     /// their text and matches on request. On the blocking pool: a search is sync (D309).
-    async fn text_search(
+    pub(super) async fn text_search(
         &self,
         r: proto::TextSearchRequest,
     ) -> Result<proto::TextSearchResponse, ApiError> {
@@ -318,7 +271,7 @@ impl Service {
     /// A search's round 2 on one partition of a text index across several (#1722 PR 2b,
     /// ICR 0138): its top `k`, scored with every partition's statistics merged. Without
     /// statistics (an index on one partition), its own: the whole index's.
-    async fn text_search_part(
+    pub(super) async fn text_search_part(
         &self,
         r: proto::TextSearchPartRequest,
     ) -> Result<proto::TextSearchResponse, ApiError> {
@@ -345,7 +298,7 @@ impl Service {
         if r.k == 0 || r.k > MAX_NEAREST_K {
             return Err(ApiError::invalid(format!("k is 1 to {MAX_NEAREST_K}")));
         }
-        let query = super::texts::query(&r)?;
+        let query = super::super::texts::query(&r)?;
         let index = self.text_index(&r.index).await?;
         self.blocking(move || {
             if part {
@@ -360,7 +313,7 @@ impl Service {
             }
             let (hits, stats) = s.run_with_stats()?;
             Ok(proto::TextSearchResponse {
-                hits: hits.into_iter().map(super::texts::hit).collect(),
+                hits: hits.into_iter().map(super::super::texts::hit).collect(),
                 cut_clauses: stats
                     .fuzzy
                     .iter()
@@ -376,14 +329,14 @@ impl Service {
     /// A search's round 1 on one partition of a text index across several (#1722 PR 2b,
     /// ICR 0138): the partition's statistics for the query, read at one snapshot, as
     /// `QueryStats`' versioned bytes. `k` and `id_prefix` don't change them.
-    async fn text_stats(
+    pub(super) async fn text_stats(
         &self,
         r: proto::TextStatsRequest,
     ) -> Result<proto::TextStatsResponse, ApiError> {
         let r = r
             .search
             .ok_or_else(|| ApiError::invalid("a text search's statistics carry no search"))?;
-        let query = super::texts::query(&r)?;
+        let query = super::super::texts::query(&r)?;
         let index = self.text_index(&r.index).await?;
         self.blocking(move || {
             filled(&index, &r.index)?;
@@ -406,7 +359,7 @@ impl Service {
     /// document, answering `Fenced` with what it did, and it resumes on its own once the
     /// partition takes writes again. A resume holding the node's rebuild slot gives it up at
     /// its next document for this call.
-    async fn text_rebuild(
+    pub(super) async fn text_rebuild(
         &self,
         r: proto::TextIndexRequest,
     ) -> Result<proto::TextRebuildResponse, ApiError> {
@@ -421,13 +374,16 @@ impl Service {
         let (tx, rx) = oneshot::channel();
         // The first document runs under the request's admission; each later one enters the
         // gate itself (`Steps`), so a fence's drain waits for one document.
-        let held = self.gate.as_ref().map(super::gate::WriteGate::extend);
+        let held = self
+            .gate
+            .as_ref()
+            .map(super::super::gate::WriteGate::extend);
         let steps_texts = Arc::clone(&texts);
         texts.spawn_rebuild(move || {
             if let Some(p) = placement {
                 p.enter();
             }
-            let mut steps = super::texts::Steps::new(steps_texts, held, None);
+            let mut steps = super::super::texts::Steps::new(steps_texts, held, None);
             let r = index.rebuild_with(|_| steps.step());
             let stop = steps.finish();
             drop(index);
@@ -445,7 +401,7 @@ impl Service {
                 r.index, stats.documents, stats.changed
             );
             return Err(match stop {
-                Some(super::texts::Stop::Fenced(e)) => {
+                Some(super::super::texts::Stop::Fenced(e)) => {
                     texts.resume_soon(&self.text_rebuilds);
                     let why = e.message.trim_end_matches("; nothing was written");
                     ApiError::fenced(format!(
@@ -468,7 +424,7 @@ impl Service {
 
     /// `Text.Verify`: checks the index against itself and its source, on the blocking pool
     /// (as `Vectors.Verify` does).
-    async fn text_verify(
+    pub(super) async fn text_verify(
         &self,
         r: proto::TextIndexRequest,
     ) -> Result<proto::TextVerifyResponse, ApiError> {
@@ -487,7 +443,7 @@ impl Service {
     }
 
     /// `Vectors.Verify`: checks the index's lists against its vectors, on the blocking pool.
-    async fn vector_verify(
+    pub(super) async fn vector_verify(
         &self,
         r: proto::VectorVerifyRequest,
     ) -> Result<proto::VectorVerifyResponse, ApiError> {
@@ -500,5 +456,55 @@ impl Service {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod text_part_tests {
+    use super::filled;
+    use pigeonhole::{Family, Options, Pigeonhole};
+    use pigeonhole_text::{Index, IndexOptions, Source};
+
+    /// #1722 PR 2b: a partition whose text index is still filling from its source (a
+    /// cluster creates it unfilled) can't answer a search's round: `Unavailable`, which an
+    /// `allow_partial` search skips. Once filled, it answers.
+    #[test]
+    fn a_text_index_still_filling_answers_no_round() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = Pigeonhole::open(dir.join("t.phdb"), Options::default().shards(1)).unwrap();
+        let table = db
+            .table("docs")
+            .unwrap()
+            .family("f", Family::default())
+            .create()
+            .unwrap();
+        let index = Index::create_unfilled(
+            &db,
+            "x",
+            Source::new(&table, "f", b"body"),
+            IndexOptions::new(),
+        )
+        .unwrap();
+        let e = filled(&index, "x").unwrap_err();
+        assert_eq!(e.code, "Unavailable", "{}", e.message);
+        assert!(e.message.contains("still filling"), "{}", e.message);
+        index
+            .resume_rebuild_with(|_| std::ops::ControlFlow::Continue(()))
+            .unwrap();
+        filled(&index, "x").unwrap();
+        // A client's rebuild (#1722 PR 2c), here stopped after its first document, leaves
+        // a rebuild pending but every document indexed: the partition still answers.
+        for id in [b"a", b"b"] {
+            table
+                .mutate(id)
+                .put("f", b"body", b"alpha")
+                .commit()
+                .unwrap();
+        }
+        let r = index
+            .rebuild_with(|_| std::ops::ControlFlow::Break(()))
+            .unwrap();
+        assert!(r.stopped && index.rebuild_pending().unwrap(), "{r:?}");
+        filled(&index, "x").unwrap();
     }
 }

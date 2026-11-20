@@ -12,7 +12,7 @@ impl Service {
     ) -> Result<ServiceReply, ApiError> {
         // A mask a partition's open or close published (D317 ticket 6), taken by a busy
         // worker that hasn't parked since.
-        super::placement::refresh();
+        super::super::placement::refresh();
         let budget = self.admit(&op.admit(), caller, prepaid).await?;
         // A cluster partition's gate (D317 ticket 6, D326), once admitted, so a fence's
         // drain never waits behind a write's wait for the budget. A write is held until the
@@ -47,7 +47,7 @@ impl Service {
         };
         if let Some(load) = load
             && op.reads_partition()
-            && super::cluster::load::sample_read()
+            && super::super::cluster::load::sample_read()
         {
             let _ = op.touches(&mut |table, touch| {
                 // A range read's first key; one from the table's start has none to sample.
@@ -67,8 +67,8 @@ impl Service {
             });
         }
         let mut reply = match load {
-            Some(load) if super::cluster::load::sample_cpu() => {
-                super::cluster::load::sampled_call(
+            Some(load) if super::super::cluster::load::sample_cpu() => {
+                super::super::cluster::load::sampled_call(
                     Arc::clone(load),
                     self.answer(op, caller, budget),
                 )
@@ -110,7 +110,7 @@ impl Service {
     }
 
     /// The partition's write gate, on a cluster partition's service.
-    pub(crate) fn gate(&self) -> Option<&Arc<super::gate::WriteGate>> {
+    pub(crate) fn gate(&self) -> Option<&Arc<super::super::gate::WriteGate>> {
         self.gate.as_ref()
     }
 
@@ -255,7 +255,7 @@ impl Service {
             // single node's: a session's recorded outcome, while it lasts (D329 2b).
             ServiceOp::Outcome(r) => {
                 drop(budget);
-                use super::sessions::Peek;
+                use super::super::sessions::Peek;
                 use proto::TxnOutcomeState as S;
                 let answer = |state: S, reason: &str| proto::TxnOutcomeResponse {
                     state: state as i32,
@@ -388,7 +388,7 @@ impl Service {
                     let slot = Arc::clone(memory);
                     let opened = self.blocking(move || slot.get()).await;
                     let failed = match opened {
-                        Ok(super::memslot::Entry::Failed(e)) | Err(e) => Some(e.message),
+                        Ok(super::super::memslot::Entry::Failed(e)) | Err(e) => Some(e.message),
                         Ok(_) => None,
                     };
                     if let Some(e) = failed {
@@ -504,7 +504,7 @@ impl Service {
                 }
             }
             ServiceOp::MarkUsed(r) => {
-                let ids = super::memory::ids(&r.ids)?;
+                let ids = super::super::memory::ids(&r.ids)?;
                 self.memory_write("Memory.MarkUsed", caller, budget, move |core, scope| {
                     let m = core.mark_used(scope, &ids)?;
                     Ok(proto::MarkUsedResponse {
@@ -516,7 +516,10 @@ impl Service {
                 .map(ServiceReply::MarkUsed)
             }
             ServiceOp::Supersede(r) => {
-                let (old, new) = (super::memory::id(&r.old)?, super::memory::id(&r.new)?);
+                let (old, new) = (
+                    super::super::memory::id(&r.old)?,
+                    super::super::memory::id(&r.new)?,
+                );
                 self.memory_write("Memory.Supersede", caller, budget, move |core, scope| {
                     core.supersede(scope, &old, &new)?;
                     Ok(proto::Empty {})
@@ -525,8 +528,11 @@ impl Service {
                 .map(ServiceReply::Empty)
             }
             ServiceOp::Link(r) => {
-                let (from, to) = (super::memory::id(&r.from)?, super::memory::id(&r.to)?);
-                let ty = super::memory::link_type(r.link_type.as_ref())?;
+                let (from, to) = (
+                    super::super::memory::id(&r.from)?,
+                    super::super::memory::id(&r.to)?,
+                );
+                let ty = super::super::memory::link_type(r.link_type.as_ref())?;
                 let weight = r.weight;
                 self.memory_write("Memory.Link", caller, budget, move |core, scope| {
                     core.link(scope, &from, &to, ty, weight)?;
@@ -536,7 +542,7 @@ impl Service {
                 .map(ServiceReply::Empty)
             }
             ServiceOp::Forget(r) => {
-                let ids = super::memory::ids(&r.ids)?;
+                let ids = super::super::memory::ids(&r.ids)?;
                 self.memory_write("Memory.Forget", caller, budget, move |core, scope| {
                     // Serve answers the failure; the deletes before it stand.
                     let done = core.forget(scope, &ids)?;
@@ -590,7 +596,7 @@ impl Service {
             ServiceOp::VectorBulkLoad(op) => {
                 drop(budget);
                 let index = self.index(&op.index).await?;
-                let budget = super::bulk::Budget {
+                let budget = super::super::bulk::Budget {
                     pool: &self.bulk_budget,
                     limit: self.limits.bulk_load_bytes as u64,
                 };

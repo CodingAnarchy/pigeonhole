@@ -106,10 +106,10 @@ impl futures_core::Stream for ScanPages {
 
 /// The largest reply cap a unary read builds before it reserves (#1567, cli692's H1): the
 /// default page. A larger one reserves its cap first.
-const FAST_CAP: usize = DEFAULT_PAGE_BYTES as usize;
+pub(super) const FAST_CAP: usize = DEFAULT_PAGE_BYTES as usize;
 
 /// A page-budgeted read's reply cap, as the read applies it (#1567).
-fn cap(asked: u64) -> usize {
+pub(super) fn cap(asked: u64) -> usize {
     usize::try_from(page_bytes(asked)).unwrap_or(usize::MAX)
 }
 
@@ -152,7 +152,7 @@ fn between_reads(table: &str) {
 /// than the budget and one column is ever built. The columns that fit are fewer than the
 /// page's, so each read keeps fewer; `min` keeps that true even if the measures ever differ.
 #[cfg_attr(not(test), allow(unused_variables))]
-fn page_within<P>(
+pub(super) fn page_within<P>(
     table: &str,
     budget: u64,
     kinds: &convert::Kinds<'_>,
@@ -229,11 +229,11 @@ fn behind_after_pages(db: &std::path::Path) -> Result<(), ApiError> {
 #[derive(Clone, Debug)]
 pub(crate) enum PageCheck {
     /// The partition's lease, on its owner (D326).
-    Lease(Arc<super::gate::WriteGate>),
+    Lease(Arc<super::super::gate::WriteGate>),
     /// A replica copy's freshness within the client's bound in ms (D328 PR 2b, S2): a page
     /// past it ends the stream with `ReplicaBehind`, and the entry node continues from the
     /// last page's position elsewhere.
-    Replica(Arc<super::replica::Replica>, u64),
+    Replica(Arc<super::super::replica::Replica>, u64),
 }
 
 impl PageCheck {
@@ -272,7 +272,7 @@ impl ScanOpener {
     /// (D328 PR 2b) in place of a lease.
     pub(crate) fn bounded(
         mut self,
-        replica: Arc<super::replica::Replica>,
+        replica: Arc<super::super::replica::Replica>,
         max_lag_ms: u64,
     ) -> Self {
         self.check = Some(PageCheck::Replica(replica, max_lag_ms));
@@ -296,7 +296,7 @@ impl ScanOpener {
         let after = if r.after.is_empty() {
             None
         } else {
-            super::cluster::position::refuse_on_a_single_node(&r.after)?;
+            super::super::cluster::position::refuse_on_a_single_node(&r.after)?;
             Some(ScanPosition::from_bytes(&r.after).map_err(ApiError::from)?)
         };
         let task = |pages| {
@@ -548,7 +548,7 @@ pub(crate) fn continues(last_row: Option<&[u8]>, rows: &[proto::Row]) -> bool {
 }
 
 /// A row's size by D308's measure as the converted cells give it: its key and its cells.
-fn row_bytes(row: &proto::Row) -> u64 {
+pub(super) fn row_bytes(row: &proto::Row) -> u64 {
     row.key.len() as u64 + row.cells.iter().map(convert::cell_bytes).sum::<u64>()
 }
 
@@ -575,7 +575,7 @@ impl Service {
     /// larger than the budget. Sync, since row pages are sync-only (D196): a page within the
     /// default budget on the light pool (#1880), a larger one on the blocking pool.
     /// TODO(#398, #1286): `read_async`-based paging, so a row read holds no blocking thread.
-    async fn read_row(
+    pub(super) async fn read_row(
         &self,
         r: proto::ReadRowRequest,
         caller: &Caller,
@@ -674,7 +674,7 @@ impl Service {
     /// the idle limit ends it), not until the client has read it: a stream outlives its
     /// request's `--max-concurrent` slot. TODO(#398, #1286): async scan pages, so a page read
     /// holds no blocking thread.
-    async fn scan(
+    pub(super) async fn scan(
         &self,
         r: proto::ScanRequest,
         caller: &Caller,
@@ -725,7 +725,7 @@ impl Service {
     /// applied the target's serving row, and a copy of its source refuses a moved range as
     /// the source does. One load, `None` on every other service.
     #[inline]
-    fn copy_ranges(&self, op: &ServiceOp) -> Result<(), ApiError> {
+    pub(super) fn copy_ranges(&self, op: &ServiceOp) -> Result<(), ApiError> {
         if let Some(replica) = &self.replica
             && let Some(ranges) = &*replica.ranges().load()
         {
@@ -757,7 +757,11 @@ impl Service {
     }
 
     /// The pinned snapshot `id` names, held for one read; `None` for an empty id (now).
-    fn pinned(&self, id: &str, caller: &Caller) -> Result<Option<SnapshotGuard>, ApiError> {
+    pub(super) fn pinned(
+        &self,
+        id: &str,
+        caller: &Caller,
+    ) -> Result<Option<SnapshotGuard>, ApiError> {
         if id.is_empty() {
             return Ok(None);
         }

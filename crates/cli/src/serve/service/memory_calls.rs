@@ -3,7 +3,7 @@ use super::*;
 /// A recall's step's recall, decoded (#1915).
 fn step_recall(r: Option<proto::RecallRequest>) -> Result<crate::memcore::RecallArgs, ApiError> {
     r.ok_or_else(|| ApiError::invalid("a recall's step carries no recall"))
-        .and_then(super::memory::recall)
+        .and_then(super::super::memory::recall)
 }
 
 impl Service {
@@ -33,10 +33,10 @@ impl Service {
     /// The core a slot's entry holds, or why there's none.
     fn entry_core(
         &self,
-        slot: &super::memslot::MemSlot,
-        entry: super::memslot::Entry,
+        slot: &super::super::memslot::MemSlot,
+        entry: super::super::memslot::Entry,
     ) -> Result<Arc<crate::memcore::MemCore>, ApiError> {
-        use super::memslot::Entry;
+        use super::super::memslot::Entry;
         match entry {
             Entry::Core(core) => Ok(core),
             Entry::Failed(e) => Err(e),
@@ -79,7 +79,7 @@ impl Service {
 
     /// A memory write: detached (its real outcome even if the client goes away), on the
     /// blocking pool under the memory sub-limit, with the caller's namespaces.
-    async fn memory_write<T: Send + std::fmt::Debug + 'static>(
+    pub(super) async fn memory_write<T: Send + std::fmt::Debug + 'static>(
         &self,
         rpc: &'static str,
         caller: &Caller,
@@ -109,27 +109,27 @@ impl Service {
 
     /// `Memory.Remember`: a memory in its namespace, embedded by the server if it has an
     /// embedder. Detached, as every write.
-    async fn remember(
+    pub(super) async fn remember(
         &self,
         r: proto::RememberRequest,
         caller: &Caller,
         budget: OwnedSemaphorePermit,
     ) -> Result<proto::RememberResponse, ApiError> {
-        let (m, supersedes) = super::memory::remember(r)?;
+        let (m, supersedes) = super::super::memory::remember(r)?;
         self.memory_write("Memory.Remember", caller, budget, move |core, scope| {
             let (done, supersede_error) = core.remember(scope, m, supersedes)?;
-            Ok(super::memory::remembered(&done, supersede_error))
+            Ok(super::super::memory::remembered(&done, supersede_error))
         })
         .await
     }
 
     /// `Memory.Recall`: the best memories for a query, within a byte budget (the server's
     /// default when the request sets none, so the reply is bounded).
-    async fn recall(
+    pub(super) async fn recall(
         &self,
         r: proto::RecallRequest,
         caller: &Caller,
-    ) -> Result<(proto::RecallResponse, Option<super::charge::Charge>), ApiError> {
+    ) -> Result<(proto::RecallResponse, Option<super::super::charge::Charge>), ApiError> {
         let core = self.memory_core().await?;
         // A budget above the default page reserves its share before a memory-call slot
         // (cli692's points on #1567): a recall waiting for budget doesn't hold one. A smaller
@@ -140,13 +140,13 @@ impl Service {
         } else {
             None
         };
-        let a = super::memory::recall(r)?;
+        let a = super::super::memory::recall(r)?;
         let namespaces = caller.namespaces.clone();
         let reply = self
             .memory_blocking(move || {
                 let (hits, stats) = core.recall(crate::memcore::Scope(namespaces.as_deref()), a)?;
                 Ok(proto::RecallResponse {
-                    hits: hits.into_iter().map(super::memory::hit).collect(),
+                    hits: hits.into_iter().map(super::super::memory::hit).collect(),
                     truncated: stats.truncated,
                 })
             })
@@ -158,7 +158,7 @@ impl Service {
     /// ICR 0139): its pool, or a hop's part, as versioned bytes. The caller's namespaces are
     /// checked here again. A hop in a version this node doesn't read is
     /// `FailedPrecondition`: the nodes' builds differ.
-    async fn recall_pool(
+    pub(super) async fn recall_pool(
         &self,
         r: proto::RecallPoolRequest,
         caller: &Caller,
@@ -195,14 +195,14 @@ impl Service {
     /// A step of a recall whose namespaces are on several partitions, on this one (#1915,
     /// ICR 0139): its hits' bodies, as versioned bytes. The caller's namespaces are checked
     /// here again.
-    async fn recall_bodies(
+    pub(super) async fn recall_bodies(
         &self,
         r: proto::RecallBodiesRequest,
         caller: &Caller,
     ) -> Result<ServiceReply, ApiError> {
         let core = self.memory_core().await?;
         let namespaces = caller.namespaces.clone();
-        let ids = super::memory::ids(&r.ids)?;
+        let ids = super::super::memory::ids(&r.ids)?;
         let a = step_recall(r.request)?;
         let bodies = self
             .memory_blocking(move || {
@@ -216,26 +216,29 @@ impl Service {
     }
 
     /// `Memory.Watch`: new memories in some namespaces, under a `--max-streams` slot. On a
-    /// cluster partition, a cluster watch's component ([`super::cluster::memwatch`]).
+    /// cluster partition, a cluster watch's component ([`super::super::cluster::memwatch`]).
     pub(crate) async fn memory_watch(
         &self,
         r: proto::MemoryWatchRequest,
         caller: &Caller,
-    ) -> Result<super::memory::MemoryEvents, ApiError> {
+    ) -> Result<super::super::memory::MemoryEvents, ApiError> {
         // Before the store: a swap from here on ends the watch, and on a cluster partition
         // so does a close or a move (#1915 PR 2b).
         let part = self.part()?;
         let swaps = part.memory.get().map(|m| m.swaps());
-        let cluster = self.gate.as_ref().map(|gate| super::memory::WatchPart {
-            gate: Arc::clone(gate),
-            ended: part.feeds.parts_ended(),
-        });
+        let cluster = self
+            .gate
+            .as_ref()
+            .map(|gate| super::super::memory::WatchPart {
+                gate: Arc::clone(gate),
+                ended: part.feeds.parts_ended(),
+            });
         let core = self.memory_core().await?;
         let Some(swaps) = swaps else {
             return Err(self.no_memory());
         };
         let slot = self.stream_slot()?;
-        super::memory::watch(
+        super::super::memory::watch(
             core,
             crate::memcore::Scope(caller.namespaces.as_deref()),
             r,

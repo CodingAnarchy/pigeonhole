@@ -5,19 +5,19 @@ use super::*;
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// A backup's partition named on a single node, which has none (D317 ticket 8b).
-fn single_node_partition() -> ApiError {
+pub(super) fn single_node_partition() -> ApiError {
     ApiError::invalid("this server isn't a cluster node: a backup names no partition here")
 }
 
 /// A flush or compaction's partition named on a single node, which has none (#1852).
-fn single_node_maintenance() -> ApiError {
+pub(super) fn single_node_maintenance() -> ApiError {
     ApiError::invalid(
         "this server isn't a cluster node: a flush or compaction names no partition here",
     )
 }
 
 /// A last chunk's identity fields (D317 ticket 8b), empty on a single node.
-fn identity_fields(id: Option<&super::backup::CopyIdentity>) -> proto::BackupChunk {
+fn identity_fields(id: Option<&super::super::backup::CopyIdentity>) -> proto::BackupChunk {
     let Some(id) = id else {
         return proto::BackupChunk::default();
     };
@@ -65,12 +65,12 @@ impl Chunks {
     }
 }
 
-/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::backup::CHUNK) chunks
+/// Sends `kept`'s bytes from `start` in [`backup::CHUNK`](super::super::backup::CHUNK) chunks
 /// through `chunks`, the last carrying the total, the SHA-256 and the identity: a download's
 /// copy, or a closed partition's file (D317 ticket 6). Stops early, `Ok`, once the client
 /// went away.
 async fn send_kept(
-    kept: &super::backup::Kept,
+    kept: &super::super::backup::Kept,
     start: u64,
     id: &str,
     pool: &Arc<Semaphore>,
@@ -79,7 +79,7 @@ async fn send_kept(
     let mut at = start;
     loop {
         let path = kept.path.clone();
-        let data = blocking(pool, move || super::backup::read_chunk(&path, at)).await?;
+        let data = blocking(pool, move || super::super::backup::read_chunk(&path, at)).await?;
         // A file that isn't its listed size any more (a closed partition's file, which goes
         // as it lies, changed after its close) fails the download: short, an empty read
         // would never reach `total`; long, bytes past it would go out (#1729).
@@ -138,7 +138,10 @@ impl Service {
     }
 
     /// `Replication.Follow` (#1436): under a `--max-streams` slot, on a thread of its own.
-    fn follow(&self, r: proto::FollowRequest) -> Result<super::replica::FollowBatches, ApiError> {
+    pub(super) fn follow(
+        &self,
+        r: proto::FollowRequest,
+    ) -> Result<super::super::replica::FollowBatches, ApiError> {
         if self.replica_info().is_some() {
             // No cascading replicas in 1.2.0 (simp724's P2 on #1436).
             return Err(ApiError::failed_precondition(
@@ -148,7 +151,7 @@ impl Service {
         let part = self.part()?;
         Self::feed_on_for_replicas(self.gate.as_ref().map(|g| g.partition()), &part.db)?;
         let slot = self.stream_slot()?;
-        let batches = super::replica::follow(
+        let batches = super::super::replica::follow(
             &part.db,
             r.token.to_vec(),
             slot,
@@ -205,8 +208,8 @@ impl Service {
         part: &Partition,
         r: proto::BackupDownloadRequest,
         map_version: Option<u64>,
-    ) -> Result<super::backup::Download, ApiError> {
-        use super::backup::{Copy, CopyIdentity, Taken};
+    ) -> Result<super::super::backup::Download, ApiError> {
+        use super::super::backup::{Copy, CopyIdentity, Taken};
         let slot = self.stream_slot()?;
         if r.replica && self.replica_info().is_some() {
             // No cascading replicas in 1.2.0 (simp724's P2 on #1436): this copy would carry
@@ -234,7 +237,7 @@ impl Service {
                     } else {
                         db.snapshot()?
                     };
-                    let id = super::cluster::identity::read_at(&db, &snap)
+                    let id = super::super::cluster::identity::read_at(&db, &snap)
                         .map_err(ApiError::internal)?
                         .ok_or_else(|| {
                             ApiError::internal("the partition's file has no identity row")
@@ -354,7 +357,7 @@ impl Service {
             backups.release(&task_id);
             drop(slot);
         });
-        Ok(super::backup::Download {
+        Ok(super::super::backup::Download {
             id,
             offset: r.offset,
             copy,
@@ -371,8 +374,8 @@ impl Service {
         path: std::path::PathBuf,
         file: proto::PartitionFile,
         r: proto::BackupDownloadRequest,
-    ) -> Result<super::backup::Download, ApiError> {
-        use super::backup::{Copy, Kept};
+    ) -> Result<super::super::backup::Download, ApiError> {
+        use super::super::backup::{Copy, Kept};
         if r.durable || r.replica || !r.backup_id.is_empty() {
             return Err(ApiError::invalid(
                 "a fenced file is sent as it lies: durable, replica and backup_id don't apply",
@@ -408,7 +411,7 @@ impl Service {
             chunks.end(outcome, &metrics, started).await;
             drop(slot);
         });
-        Ok(super::backup::Download {
+        Ok(super::super::backup::Download {
             id: String::new(),
             offset: r.offset,
             copy: watch::channel(Copy::Ready(kept)).1,

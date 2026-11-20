@@ -45,18 +45,18 @@ pub(crate) struct Partition {
     pub(crate) db: Pigeonhole,
     /// Read on every call, changed only when a table is first used: a snapshot swapped
     /// whole, never a lock (perf287's note 3 on D313).
-    tables: ArcSwap<TableCache>,
+    pub(super) tables: ArcSwap<TableCache>,
     /// The feed fan-out's hubs (D313 R2).
-    pub(crate) feeds: Arc<super::feed::Feeds>,
+    pub(crate) feeds: Arc<super::super::feed::Feeds>,
     /// How its engine's threads were placed when it opened (D317 ticket 8a's pinning
     /// check): a cluster node's gauges.
     pub(crate) pinning: Pinning,
     /// Its sampled load, for the cluster balancer (D332): request CPU and read keys.
-    pub(crate) load: Arc<super::cluster::load::PartitionLoad>,
+    pub(crate) load: Arc<super::super::cluster::load::PartitionLoad>,
     /// Its engine memory (D317 ticket 8a's `--engine-memory`): as resolved at open, then as a
     /// node's re-split at another partition's open or close changed its caches (#1761). A
     /// cluster node's gauges, and the next re-split's starting point.
-    engine_memory: std::sync::Mutex<Option<super::placement::Memory>>,
+    engine_memory: std::sync::Mutex<Option<super::super::placement::Memory>>,
     /// `--backup-dir`, and the backup downloads kept for resumes.
     ///
     /// **The node's one** (simp724's N1 on #1711): `Backups::new` clears
@@ -64,18 +64,18 @@ pub(crate) struct Partition {
     /// partition (several partitions on one node, D317 8a; a partition opened at runtime,
     /// ticket 6) would delete another partition's live downloads and make the limit per
     /// partition. Partitions share the node's `Arc`.
-    backups: Arc<super::backup::Backups>,
+    pub(super) backups: Arc<super::super::backup::Backups>,
     /// The vector indexes open, and their rebalancing threads.
-    pub(crate) indexes: Arc<super::indexes::Indexes>,
+    pub(crate) indexes: Arc<super::super::indexes::Indexes>,
     /// `Vectors.BulkLoad`'s one load at a time, on a thread of its own.
-    pub(crate) bulk: super::bulk::BulkLoads,
+    pub(crate) bulk: super::super::bulk::BulkLoads,
     /// The text indexes open, and the running rebuild.
-    pub(crate) texts: Arc<super::texts::Texts>,
+    pub(crate) texts: Arc<super::super::texts::Texts>,
     /// The memory store (`--memory`), if the server serves one: opened when a call needs
     /// it, and again after the catalog or the engine changes (#1618). Set once: at start on
     /// a single node, and on a cluster partition when the map first places the store on it
     /// (#1915), which it then does for good.
-    pub(crate) memory: std::sync::OnceLock<Arc<super::memslot::MemSlot>>,
+    pub(crate) memory: std::sync::OnceLock<Arc<super::super::memslot::MemSlot>>,
     /// Held across a table's create or drop and the cache update after it, so the cache ends
     /// at the live table whatever the order (simp724's C1 on #1527).
     ///
@@ -87,32 +87,32 @@ pub(crate) struct Partition {
     /// carrying as `pigeonhole-otel`'s OpenTelemetry instruments, so its counters stay
     /// monotonic across an automatic recovery and a replica's re-bootstrap. A node that only
     /// routes has none (D317 ticket 2).
-    engine_metrics: pigeonhole_otel::Collector,
+    pub(super) engine_metrics: pigeonhole_otel::Collector,
     /// The catalog's generation: bumped by a create, a drop, and a replica's catalog
     /// change. A `/mcp` session that saw an older one checks its tool list (ai1249's M2 on
     /// D313: `create_table` in one session can bring `nearest` to another).
-    catalog: AtomicU64,
+    pub(super) catalog: AtomicU64,
 }
 
 /// What a partition is opened with, beside its database: [`Service::new`]'s and
 /// [`Service::for_partition`]'s, so each part of a [`Partition`] is built once.
 pub(crate) struct PartitionConfig {
     /// `--backup-dir`'s backups: the node's one, which a cluster node's partitions share.
-    pub(crate) backups: Arc<super::backup::Backups>,
+    pub(crate) backups: Arc<super::super::backup::Backups>,
     /// The CPUs the threads the server starts run on, off the shards': those of vector
     /// indexes (rebalancers, bulk loads: they run k-means, perf287's B2 on 7b2), the
     /// backups' and `Replication.Follow`'s (a replica catching up reads and encodes at full
     /// speed, cli692's F1 on #1583).
-    pub(crate) placement: Option<Arc<super::placement::Placement>>,
+    pub(crate) placement: Option<Arc<super::super::placement::Placement>>,
     /// How its engine's threads were placed when it opened.
     pub(crate) pinning: Pinning,
     /// Its engine memory as resolved at open: a cluster node's partitions have one.
-    pub(crate) engine_memory: Option<super::placement::Memory>,
+    pub(crate) engine_memory: Option<super::super::placement::Memory>,
 }
 
 impl PartitionConfig {
     /// A partition with `backups`, its threads not placed.
-    pub(crate) fn new(backups: Arc<super::backup::Backups>) -> Self {
+    pub(crate) fn new(backups: Arc<super::super::backup::Backups>) -> Self {
         Self {
             backups,
             placement: None,
@@ -139,7 +139,7 @@ impl Partition {
     }
 
     /// Its engine memory now (`--engine-memory`'s share), `None` without one.
-    pub(crate) fn engine_memory(&self) -> Option<super::placement::Memory> {
+    pub(crate) fn engine_memory(&self) -> Option<super::super::placement::Memory> {
         *self
             .engine_memory
             .lock()
@@ -150,7 +150,7 @@ impl Partition {
     /// node re-splitting `--engine-memory` as partitions open and close). The memtables stay
     /// as opened: `memory` carries them unchanged. Blocks while a shrink evicts: call it off
     /// async workers.
-    pub(crate) fn resize_caches(&self, memory: super::placement::Memory) {
+    pub(crate) fn resize_caches(&self, memory: super::super::placement::Memory) {
         let bytes = |b: u64| usize::try_from(b).unwrap_or(usize::MAX);
         self.db
             .set_cache_capacities(bytes(memory.block_cache), bytes(memory.row_cache));
@@ -163,12 +163,12 @@ impl Partition {
     /// What a node opens on `db`, before any table is used: partition `id` of a cluster
     /// node, whose engine metrics carry it as `pigeonhole.partition` (D317 ticket 8b). Each
     /// part is built once, from `config` and the partition's write `gate`.
-    fn new(
+    pub(super) fn new(
         db: Pigeonhole,
         id: Option<&str>,
         limits: &Limits,
-        feeds: &super::feed::FeedShared,
-        gate: Option<&Arc<super::gate::WriteGate>>,
+        feeds: &super::super::feed::FeedShared,
+        gate: Option<&Arc<super::super::gate::WriteGate>>,
         config: PartitionConfig,
     ) -> Self {
         let metrics = match id {
@@ -187,13 +187,13 @@ impl Partition {
             load: Arc::default(),
             engine_memory: std::sync::Mutex::new(config.engine_memory),
             backups: config.backups,
-            indexes: Arc::new(super::indexes::Indexes::new(
+            indexes: Arc::new(super::super::indexes::Indexes::new(
                 db.clone(),
                 config.placement.clone(),
                 gate.cloned(),
             )),
-            bulk: super::bulk::BulkLoads::new(config.placement),
-            texts: Arc::new(super::texts::Texts::new(
+            bulk: super::super::bulk::BulkLoads::new(config.placement),
+            texts: Arc::new(super::super::texts::Texts::new(
                 db.clone(),
                 gate.cloned(),
                 text_placement,
@@ -202,7 +202,7 @@ impl Partition {
             schema: tokio::sync::Mutex::new(()),
             catalog: AtomicU64::new(0),
             engine_metrics: metrics.collector(&db),
-            feeds: super::feed::Feeds::new(db.clone(), feed_limits(limits), feeds),
+            feeds: super::super::feed::Feeds::new(db.clone(), feed_limits(limits), feeds),
             db,
         }
     }

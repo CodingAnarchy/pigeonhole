@@ -9,7 +9,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 }
 
 /// One of `pool`'s permits: a place on the blocking pool.
-async fn pool_place(pool: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
+pub(super) async fn pool_place(pool: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiError> {
     Arc::clone(pool)
         .acquire_owned()
         .await
@@ -17,16 +17,16 @@ async fn pool_place(pool: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ApiEr
 }
 
 /// Runs a sync-only call on the blocking pool, in the place `_place` holds.
-async fn held<T: Send + 'static>(
+pub(super) async fn held<T: Send + 'static>(
     _place: OwnedSemaphorePermit,
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
     // A sampled call's work is timed where it runs (D332, simp724's M1 on #2063).
-    let sampled = super::cluster::load::sampled();
+    let sampled = super::super::cluster::load::sampled();
     tokio::task::spawn_blocking(move || {
         // A reused pool thread takes a mask published since it started (D317 ticket 6).
-        super::placement::refresh();
-        super::cluster::load::run_sampled(sampled.as_ref(), f)
+        super::super::placement::refresh();
+        super::super::cluster::load::run_sampled(sampled.as_ref(), f)
     })
     .await
     .map_err(|e| ApiError::internal(format!("a blocking call failed: {e}")))?
@@ -87,7 +87,7 @@ impl Service {
 
     /// Runs a write as its own task and awaits its outcome (B2). If the request goes away
     /// first, the task carries on, and its outcome is logged and counted.
-    async fn detached<T: Send + std::fmt::Debug + 'static>(
+    pub(super) async fn detached<T: Send + std::fmt::Debug + 'static>(
         &self,
         rpc: &'static str,
         budget: OwnedSemaphorePermit,
@@ -96,7 +96,10 @@ impl Service {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let metrics = Arc::clone(&self.metrics);
         // The fence's drain waits for the write, not just its request (`call` admitted it).
-        let held = self.gate.as_ref().map(super::gate::WriteGate::extend);
+        let held = self
+            .gate
+            .as_ref()
+            .map(super::super::gate::WriteGate::extend);
         tokio::spawn(async move {
             let outcome = write.await;
             // The write is done: its bytes leave the budget now, not when its request did.
