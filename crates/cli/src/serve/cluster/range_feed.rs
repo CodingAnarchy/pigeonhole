@@ -328,7 +328,10 @@ impl Stream {
                 stream: self,
             };
             let absorb = |read, batch: &mut Batch, carry: &mut _| self.absorb(read, batch, carry);
-            if let Some(t) = fill(&mut reads, &mut batch, &mut carry, linger, absorb).await? {
+            let closed = self.sink.closed();
+            if let Some(t) =
+                fill(&mut reads, &mut batch, &mut carry, linger, closed, absorb).await?
+            {
                 token = t;
             }
             busy = !batch.commits.is_empty();
@@ -467,8 +470,6 @@ impl Stream {
 trait Reads {
     /// The next event, if one is ready now.
     fn ready(&mut self) -> Result<Option<Read>, ApiError>;
-    /// The next event, waited for.
-    fn wait(&mut self) -> impl std::future::Future<Output = Result<Read, ApiError>> + Send;
     /// The position just after what's been read.
     fn token(&self) -> Bytes;
 }
@@ -488,40 +489,49 @@ impl Reads for FeedReads<'_> {
             .map(|ev| self.stream.read(ev)))
     }
 
-    fn wait(&mut self) -> impl std::future::Future<Output = Result<Read, ApiError>> + Send {
-        next(self.feed, self.stream)
-    }
-
     fn token(&self) -> Bytes {
         Bytes::copy_from_slice(self.feed.token().as_bytes())
     }
 }
 
-/// Adds to `batch` what `reads` has ready, and, with `linger` set (the stream is busy),
-/// what comes before it, until the batch is full or `carry` holds a commit for the next.
-/// `absorb` takes each event in. The token after the last event taken in, if any.
+/// Adds to `batch` what `reads` has ready; with `linger` set (the stream is busy), sleeps
+/// until then and adds what's ready by then too, until the batch is full or `carry` holds a
+/// commit for the next. It sleeps rather than waits on the feed (perf287's last re-run on
+/// #2107: waiting on it woke the stream at every commit): one wakeup a batch. `closed` (the
+/// target went away) cuts the sleep short. `absorb` takes each event in. The token after
+/// the last event taken in, if any.
 async fn fill(
     reads: &mut impl Reads,
     batch: &mut Batch,
     carry: &mut Option<proto::RawCommit>,
     linger: Option<tokio::time::Instant>,
+    closed: impl std::future::Future<Output = ()>,
     mut absorb: impl FnMut(Read, &mut Batch, &mut Option<proto::RawCommit>) -> Result<bool, ApiError>,
 ) -> Result<Option<Bytes>, ApiError> {
     let mut token = None;
-    while !batch.full() && carry.is_none() {
-        let read = match reads.ready()? {
-            Some(read) => read,
-            None => {
-                let Some(at) = linger else { break };
-                match tokio::time::timeout_at(at, reads.wait()).await {
-                    Ok(read) => read?,
-                    Err(_) => break,
-                }
+    let mut drain = |reads: &mut _, batch: &mut Batch, carry: &mut Option<_>| {
+        let reads: &mut _ = reads;
+        while !batch.full() && carry.is_none() {
+            let Some(read) = Reads::ready(reads)? else {
+                break;
+            };
+            if absorb(read, batch, carry)? {
+                token = Some(Reads::token(reads));
             }
-        };
-        if absorb(read, batch, carry)? {
-            token = Some(reads.token());
         }
+        Ok::<_, ApiError>(())
+    };
+    drain(reads, batch, carry)?;
+    if let Some(at) = linger
+        && !batch.full()
+        && carry.is_none()
+    {
+        tokio::select! {
+            biased;
+            () = closed => return Ok(token),
+            () = tokio::time::sleep_until(at) => {}
+        }
+        drain(reads, batch, carry)?;
     }
     Ok(token)
 }
@@ -592,25 +602,19 @@ mod tests {
     struct Script {
         due: std::collections::VecDeque<(tokio::time::Instant, proto::RawCommit)>,
         taken: u64,
+        /// The stream's looks at the feed: each wakeup reads until nothing is ready.
+        looked: u64,
     }
 
     impl Reads for Script {
         fn ready(&mut self) -> Result<Option<Read>, ApiError> {
+            self.looked += 1;
             let now = tokio::time::Instant::now();
             if !self.due.front().is_some_and(|(at, _)| *at <= now) {
                 return Ok(None);
             }
             self.taken += 1;
             Ok(self.due.pop_front().map(|(_, c)| Read::Commit(Some(c))))
-        }
-
-        async fn wait(&mut self) -> Result<Read, ApiError> {
-            match self.due.front() {
-                Some((at, _)) => tokio::time::sleep_until(*at).await,
-                None => std::future::pending().await,
-            }
-            self.taken += 1;
-            Ok(Read::Commit(self.due.pop_front().map(|(_, c)| c)))
         }
 
         fn token(&self) -> Bytes {
@@ -632,6 +636,7 @@ mod tests {
                 })
                 .collect(),
             taken: 0,
+            looked: 0,
         }
     }
 
@@ -651,18 +656,29 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_busy_stream_gathers_what_comes_within_its_linger() {
-        // perf287's re-run on #2107: commits 0.3 ms apart share a message while the stream
-        // is busy; one past the linger waits for the next.
+        // perf287's re-runs on #2107: commits 0.3 ms apart share a message while the stream
+        // is busy, gathered at one wakeup after the linger; one past it waits for the next.
         let mut s = script(&[0, 300, 600, 5_000]);
         let start = tokio::time::Instant::now();
         let mut batch = Batch::default();
         let mut carry = None;
-        let token = fill(&mut s, &mut batch, &mut carry, Some(start + LINGER), absorb)
-            .await
-            .unwrap();
+        let closed = std::future::pending();
+        let token = fill(
+            &mut s,
+            &mut batch,
+            &mut carry,
+            Some(start + LINGER),
+            closed,
+            absorb,
+        )
+        .await
+        .unwrap();
         assert_eq!(batch.commits.len(), 3);
         assert_eq!(token, Some(Bytes::copy_from_slice(&3u64.to_le_bytes())));
-        assert_eq!(start.elapsed(), LINGER, "it waited out its linger");
+        assert_eq!(start.elapsed(), LINGER, "it slept out its linger");
+        // Two looks at the feed (now, and at the linger's end), each read until nothing was
+        // ready: 2 + 3 reads, not one per commit as it came.
+        assert_eq!(s.looked, 5);
     }
 
     #[tokio::test(start_paused = true)]
@@ -672,11 +688,19 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut batch = Batch::default();
         let mut carry = None;
-        fill(&mut s, &mut batch, &mut carry, None, absorb)
-            .await
-            .unwrap();
+        fill(
+            &mut s,
+            &mut batch,
+            &mut carry,
+            None,
+            std::future::pending(),
+            absorb,
+        )
+        .await
+        .unwrap();
         assert_eq!(batch.commits.len(), 1);
         assert_eq!(start.elapsed(), Duration::ZERO, "nothing waited for");
+        assert_eq!(s.looked, 2, "one look at the feed");
     }
 
     #[test]

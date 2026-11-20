@@ -98,10 +98,24 @@ impl Sources {
     /// how long (cli692 on #2107: a chunk is refused `Overloaded` rather than run up a debt
     /// a capped sleep never pays).
     fn reserve(&self, bytes: f64, max_wait: Duration) -> Result<Duration, Duration> {
+        self.reserve_at(bytes, max_wait, Instant::now())
+    }
+
+    /// [`reserve`](Self::reserve) at `now`. The bucket fills to a second's worth, or to the
+    /// read when that's more (cli692 on #2107): else a read over three seconds' worth (a
+    /// 2 MiB read under about 683 KiB/s) would wait past `max_wait` from a full bucket, and
+    /// every chunk be refused for good. A big read at a slow rate then waits until its bytes
+    /// have built up, and the rate holds over time.
+    fn reserve_at(
+        &self,
+        bytes: f64,
+        max_wait: Duration,
+        now: Instant,
+    ) -> Result<Duration, Duration> {
         let mut b = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
-        let now = Instant::now();
         let rate = self.rate as f64;
-        b.tokens = (b.tokens + now.duration_since(b.at).as_secs_f64() * rate).min(rate);
+        let cap = rate.max(bytes);
+        b.tokens = (b.tokens + now.saturating_duration_since(b.at).as_secs_f64() * rate).min(cap);
         b.at = now;
         let left = b.tokens - bytes;
         let wait = if left >= 0.0 {
@@ -502,6 +516,28 @@ mod tests {
         );
         drop(s);
         db.close().unwrap();
+    }
+
+    #[test]
+    fn a_read_bigger_than_the_rate_allows_is_taken_once_its_bytes_built_up() {
+        // cli692 on #2107: at 512 KiB/s, a 2 MiB read (the least a chunk reads) is refused
+        // at first, and taken once enough time has passed, never refused for good.
+        let s = Sources::new(512 << 10, u64::MAX, 2);
+        let read = f64::from(2 << 20);
+        let start = Instant::now();
+        assert!(
+            s.reserve_at(read, MAX_WAIT, start).is_err(),
+            "3 s owed from a full bucket"
+        );
+        let taken = (1..=8u64)
+            .map(|half| start + Duration::from_millis(500 * half))
+            .find(|at| s.reserve_at(read, MAX_WAIT, *at).is_ok())
+            .expect("taken within 4 s of asking");
+        assert!(
+            taken - start <= Duration::from_secs(4),
+            "{:?}",
+            taken - start
+        );
     }
 
     #[test]
