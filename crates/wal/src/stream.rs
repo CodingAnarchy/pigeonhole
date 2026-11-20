@@ -538,9 +538,10 @@ impl FeedMarks {
     /// a range move's catch-up reads the source's history from its copy's first snapshot),
     /// from the stream's next retention pass on; `None` lets it go. Take it at an epoch the
     /// stream still has: the engine takes its checkpoint's, which retention never trims,
-    /// since a snapshot's feed token starts the stream's scan there (#2107's tests). A held stream's file grows by what its writes add meanwhile, so the holder
-    /// bounds it ([`retained_bytes`](Self::retained_bytes)). Without retention, nothing is
-    /// trimmed for a feed and the hold changes nothing.
+    /// since a snapshot's feed token starts the stream's scan there (#2107's tests). A held
+    /// stream's file grows by what its writes add meanwhile, so the holder bounds it
+    /// ([`retained_bytes`](Self::retained_bytes)). Without retention, nothing is trimmed for a
+    /// feed and the hold changes nothing.
     pub fn set_hold(&self, epoch: Option<u32>) {
         self.hold.store(epoch.unwrap_or(0), Ordering::Release);
     }

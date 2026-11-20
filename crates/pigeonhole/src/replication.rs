@@ -861,10 +861,9 @@ impl Pigeonhole {
 
     /// Holds the change feed's history from now on (D331, ICR 0141): a feed token from now,
     /// or of a snapshot opened after it (not one opened before), resumes until the hold is
-    /// dropped or the
-    /// database retains more than `cap_bytes` of history, when it lapses. A range move's
-    /// catch-up then finds the source's history from its copy's first snapshot, or learns it
-    /// can't. `InvalidArgument` without the change feed. Not part of
+    /// dropped or the database retains more than `cap_bytes` of history, when it lapses. A
+    /// range move's catch-up then finds the source's history from its copy's first
+    /// snapshot, or learns it can't. `InvalidArgument` without the change feed. Not part of
     /// the stable API.
     #[doc(hidden)]
     pub fn hold_feed_retention(
