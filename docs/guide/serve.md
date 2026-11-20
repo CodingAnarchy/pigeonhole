@@ -1161,13 +1161,13 @@ Any node still takes any call, before, during and after.
 - The mode, the bounds and the pins are map fields, so every node agrees on them and a new writer keeps them.
 
 #### What it does
-Every 30 s, the writer reads each node's partitions (their size from the file system and their [load](#fencing-and-relocation)), and compares each node with the mean of the nodes that answered:
+Every 30 s, the writer reads each node's open partitions (their size from the file system, with no read of their files, and their load: the "Partition load" note under [Fencing and relocation](#fencing-and-relocation)), and compares each node with the mean of the nodes that answered:
 - **A node's share is per unit of its weight.** Give a bigger machine a bigger `weight` in the map's `nodes` (an integer; 0 or unset counts as 1). A node with weight 2 is expected to hold twice the bytes and load of a node with weight 1.
 - **A node is over its bound** when its size or load per unit of weight is above `size_ratio` or `load_ratio` (default 1.25) times the mean.
 - **The move:** once a node has been over its bound for `passes` passes in a row (default 10, so about 5 minutes), the writer moves one of its partitions to the node that brings both closest to the mean.
   - The move never takes the target over its own bound, and never puts a partition on a node that holds one of its replicas.
   - Ties go to the smaller partition.
-  - A partition whose copy wouldn't finish within the dwell (at 64 MiB/s) isn't moved.
+  - A partition whose copy wouldn't finish within the dwell (reckoned at 64 MiB/s) isn't moved. At the defaults that's over about 112 GiB, beyond `partition_max_bytes`, so it matters only with a short dwell.
 - **It keeps going on the same node** while that node stays above `1 + 0.4 × (ratio − 1)` (1.1 at the default ratio), so it doesn't stop just under the bound and start again a pass later.
 - **The rest (`dwell_ms`, default 30 minutes):** the partition moved, and both nodes, aren't moved from or to again until it ends. With the defaults, the cluster changes at most a few times an hour.
 - **One move at a time, cluster-wide.** Nothing starts while any move is in flight, an operator's `phdb cluster move` or range move included.
@@ -1175,6 +1175,8 @@ Every 30 s, the writer reads each node's partitions (their size from the file sy
 
 **A balancer move is a [`phdb cluster move`](#fencing-and-relocation)** run by the writer with its cluster token, and recorded in the map under an id starting `bal-`:
 - **During the move:** the partition is fenced and closed on its old node, its files are copied whole and it opens on the new one. Writes answer `Fenced` and reads `PartitionUnavailable` for about as long as the copy takes: retry them.
+  - **How long:** the copy runs as fast as the disks and network allow; a whole move isn't held to a rate. As a planning figure, at 64 MiB/s that's about 16 s per GiB, so about 8.5 minutes for a 32 GiB partition.
+  - **Where an outage of that length matters,** keep the balancer paused or off and move partitions by hand in a window, or pin the ones that must stay up.
 - **Open transactions and pinned snapshots** on that partition end with the move. Clients begin them again once it serves on its new node.
 - **Kept:** the partition's history, so change-feed tokens resume and spanning transactions homed there keep their outcomes. A partition with prepared spanning-transaction shares still in doubt is never moved.
 - **Protect the cluster token** as you protect an admin token ([Securing a cluster](#running-a-cluster)): it's what the writer moves partitions with.
@@ -1222,7 +1224,7 @@ A new writer, after a failover or a forced map, keeps the mode, bounds and pins 
 - **A balancer move the old writer left behind:**
   - **Before its commit point** (the map still gives the partition to its old node), the new writer aborts it: the target's copy goes aside, the partition serves on its old node again, and an ABORT event says so.
   - **Past it,** the new writer finishes the move.
-- **With the balancer off,** such a move stays recorded. Run it again with `phdb cluster move`, or end it with `phdb cluster move P --abort`.
+- **With the balancer off (not paused),** such a move stays recorded. A paused balancer still aborts or finishes it. Run it again with `phdb cluster move`, or end it with `phdb cluster move P --abort`.
 - **The writer's lease bounds the balancer's moves at every term:** a writer cut off from the majority can't advance one.
 
 ### Backup and restore
