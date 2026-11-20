@@ -146,6 +146,13 @@ impl KeySpan {
             && self.start.as_slice() < key
             && self.end.as_deref().is_none_or(|e| key < e)
     }
+
+    /// Whether this span overlaps `[start, end)` of `table` (`end` `None`: to its end).
+    fn overlaps(&self, table: &str, start: &[u8], end: Option<&[u8]>) -> bool {
+        self.table == table
+            && end.is_none_or(|e| self.start.as_slice() < e)
+            && self.end.as_deref().is_none_or(|e| start < e)
+    }
 }
 
 /// An action the policy chose.
@@ -293,13 +300,19 @@ fn split_point(p: &PartView) -> Option<(String, Vec<u8>, f64)> {
         let outside = total - ts.iter().map(|t| weight(t)).sum::<f64>();
         let mut below = outside;
         for t in ts.iter() {
-            // Strictly inside one of P's own ranges, and outside every pin (ai1249's M1, M2
-            // on #2103).
-            let ok = p.ranges.iter().any(|r| r.strictly_holds(table, &t.start))
-                && !p
-                    .pinned_ranges
+            // Strictly inside one of P's own ranges (ai1249's M1 on #2103), and the part
+            // that moves, from the key to that range's end, overlapping no pin (M2): a key
+            // below a pin in the same range would move the pin too.
+            let moving = p
+                .ranges
+                .iter()
+                .find(|r| r.strictly_holds(table, &t.start))
+                .map(|r| r.end.as_deref());
+            let ok = moving.is_some_and(|end| {
+                !p.pinned_ranges
                     .iter()
-                    .any(|r| r.strictly_holds(table, &t.start));
+                    .any(|pin| pin.overlaps(table, &t.start, end))
+            });
             if ok {
                 let larger = below.max(total - below) / total;
                 if best.as_ref().is_none_or(|(_, _, s)| larger < *s) {
@@ -749,6 +762,31 @@ mod tests {
         assert!(
             why.contains("inside its own ranges, outside a pin"),
             "{why}"
+        );
+    }
+
+    #[test]
+    fn a_split_never_moves_a_pin_above_its_key_in_the_same_range() {
+        // ai1249 on #2103 round 1: P owns users' [m, ), with [p, r) pinned. A split at n
+        // would send [n, ) to the new partition, the pin with it: passed over. One at s
+        // leaves the pin behind.
+        let nodes = [node("a"), node("b")];
+        let tab = |start: &str, load: f64| Tablet {
+            table: "users".into(),
+            start: start.as_bytes().to_vec(),
+            bytes: 1 << 20,
+            load,
+        };
+        let mut p = part("p1", "a", 0.8, 1 << 30);
+        p.tablets = vec![tab("m", 0.4), tab("n", 0.2), tab("s", 0.2)];
+        p.ranges = vec![span("m", None)];
+        p.pinned_ranges = vec![span("p", Some("r"))];
+        let parts = [p, part("p2", "b", 0.1, 1 << 30)];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &bounds(), &mut c, &mut t, 10);
+        assert!(
+            matches!(&d, Decision::Act(Action::Split { key, .. }, _) if key == b"s"),
+            "{d:?}"
         );
     }
 
