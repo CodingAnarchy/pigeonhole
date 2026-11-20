@@ -1201,6 +1201,19 @@ fn a_range_drop_event_round_trips_and_a_flagged_one_is_refused() {
                 "version {version}"
             );
         }
+        // A well-formed version 3 header (an xid's flag and the xid) before a drop's body
+        // passes the header's checks, so the drop's own refusal is what stops it
+        // (feed1248 on #2089).
+        let mut v3 = vec![3u8, 2];
+        v3.extend_from_slice(&2u32.to_le_bytes());
+        v3.extend_from_slice(b"x1");
+        v3.extend_from_slice(&bytes[1..]);
+        let e = ReplicatedEvent::decode(&v3).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(
+            e.to_string().contains("a range drop in a version other than the plain one"),
+            "{e}"
+        );
     }
     drop((feed, t));
     db.close().unwrap();

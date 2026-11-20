@@ -114,7 +114,8 @@ pub const COUNT_MASK: u32 = !COUNT_FLAGS;
 /// The `Corrupt` reason [`WalRecord::decode_with`] gives a feed-silent batch, or a Range
 /// Drop, read without `incompat` bit 3 (D331): a reader that may have opened before the bit
 /// was set asks again on this one only.
-pub const SILENT_WITHOUT_BIT: &str = "wal record: a feed-silent batch without incompat bit 3";
+pub const SILENT_WITHOUT_BIT: &str =
+    "wal record: a feed-silent batch or a range drop without incompat bit 3";
 
 /// Whether a record's batch carries the [`SILENT_BATCH`] mark, read at its place in the
 /// record's bytes (FORMAT §10.3): a Batch's `count` ends at byte 21 (type, seqno and
