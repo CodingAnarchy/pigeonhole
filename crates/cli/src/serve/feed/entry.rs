@@ -6,30 +6,30 @@ use super::*;
 /// filters the encoded event's changes instead ([`Entry::for_prefix`]).
 pub(crate) struct Entry {
     /// The commit's seqno.
-    seqno: u64,
+    pub(super) seqno: u64,
     /// The hub feed's token right after this commit: a slice of `encoded` when there is
     /// one (its first field), so it's held once.
-    token: Bytes,
+    pub(super) token: Bytes,
     /// The hub feed's position just before it (`Feed::position`): every commit of the spec
     /// at or below it came before this one.
-    prev: u64,
+    pub(super) prev: u64,
     /// Its share of `--feed-ring-bytes`: `encoded` (the token included) or the token, and a
     /// fixed overhead.
-    bytes: usize,
+    pub(super) bytes: usize,
     /// The commit as a client with no prefix gets it, encoded once for every such client on
     /// the ring: `None` if it has no change to send. Encoded by the hub, before the entry is
     /// pushed, so no client waits on another's encode (perf287's P2 on #1541).
-    encoded: Option<Bytes>,
+    pub(super) encoded: Option<Bytes>,
 }
 
 /// An entry's size beside its bytes: the struct (88), the `Arc`'s counts (16) and the ring's
 /// slot (8) (perf287 on #1655).
-const ENTRY_OVERHEAD: usize = 112;
+pub(super) const ENTRY_OVERHEAD: usize = 112;
 
 impl Entry {
     /// An entry for `commit`, encoded for clients with no prefix and sized with that
     /// encoding (simp724's R1, perf287's P1 on #1541); `prev` is set when it's pushed.
-    fn new(commit: &Commit, token: Bytes) -> Self {
+    pub(super) fn new(commit: &Commit, token: Bytes) -> Self {
         let encoded: Option<Bytes> = filtered(commit, b"").map(|c| {
             let xid = commit.xid().unwrap_or_default();
             prost::Message::encode_to_vec(&commit_event(token.clone(), c, xid)).into()
@@ -61,7 +61,7 @@ impl Entry {
     /// The event a client with `prefix` sends for this entry: the commit's changes to rows
     /// starting with it, or `None` if there are none. Decoded from `encoded`, in the order a
     /// filter of the commit gives them.
-    fn for_prefix(&self, prefix: &[u8]) -> Option<proto::FeedEvent> {
+    pub(super) fn for_prefix(&self, prefix: &[u8]) -> Option<proto::FeedEvent> {
         let bytes = self.encoded.as_ref()?;
         // From the `Bytes` itself: protogen's `bytes(["."])` makes the row, qualifier, value
         // and token fields slices of it, not copies (perf287 on #1655).
@@ -74,14 +74,14 @@ impl Entry {
     }
 
     /// The `FeedEvent` a client with no prefix sends for this commit, encoded.
-    fn encoded(&self) -> Option<&Bytes> {
+    pub(super) fn encoded(&self) -> Option<&Bytes> {
         self.encoded.as_ref()
     }
 }
 
 /// How an entry's changes stand against a client's row prefix ([`rows`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rows {
+pub(super) enum Rows {
     /// Every change is to a matching row: the client's event is the shared one.
     All,
     /// No change is: nothing to send.
@@ -98,7 +98,7 @@ enum Rows {
 /// the shared path's cost per event (cli692's micro-benchmark), on every client of a hub.
 /// Anything the walk doesn't expect (a truncated encoding, a group, a second commit field,
 /// another event) is [`Rows::Mixed`], so the decode decides, never a skip.
-fn rows(event: &[u8], prefix: &[u8]) -> Rows {
+pub(super) fn rows(event: &[u8], prefix: &[u8]) -> Rows {
     rows_of(event, prefix).unwrap_or(Rows::Mixed)
 }
 
@@ -192,7 +192,7 @@ fn field<'a>(buf: &mut &'a [u8]) -> Option<(u64, Option<&'a [u8]>)> {
 /// encoding when every change matches, nothing when none does, and the matching changes
 /// decoded off it otherwise (#1780). The same bytes the decode alone would send, in every
 /// case (`a_prefix_client_sends_what_the_decode_would_whatever_the_rows`).
-fn prefix_out(e: &Arc<Entry>, prefix: &[u8]) -> Option<Out> {
+pub(super) fn prefix_out(e: &Arc<Entry>, prefix: &[u8]) -> Option<Out> {
     match rows(e.encoded()?, prefix) {
         Rows::All => Some(Out::Shared(Arc::clone(e))),
         Rows::None => None,
@@ -202,7 +202,7 @@ fn prefix_out(e: &Arc<Entry>, prefix: &[u8]) -> Option<Out> {
 
 /// A commit event: `c` with the token right after it, and its spanning transaction's id
 /// (`xid`, D329 2b; empty for any other commit).
-fn commit_event(token: Bytes, c: proto::FeedCommit, xid: &[u8]) -> proto::FeedEvent {
+pub(super) fn commit_event(token: Bytes, c: proto::FeedCommit, xid: &[u8]) -> proto::FeedEvent {
     proto::FeedEvent {
         token,
         event: Some(proto::feed_event::Event::Commit(c)),
@@ -213,7 +213,7 @@ fn commit_event(token: Bytes, c: proto::FeedCommit, xid: &[u8]) -> proto::FeedEv
 
 /// `commit` as the client sees it: its changes to rows under `prefix`, or `None` when it has
 /// none (the engine's prefix feed passes such a commit over).
-fn filtered(commit: &Commit, prefix: &[u8]) -> Option<proto::FeedCommit> {
+pub(super) fn filtered(commit: &Commit, prefix: &[u8]) -> Option<proto::FeedCommit> {
     let changes: Vec<proto::Change> = commit
         .changes()
         .iter()
@@ -235,7 +235,7 @@ fn filtered(commit: &Commit, prefix: &[u8]) -> Option<proto::FeedCommit> {
     })
 }
 
-fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
+pub(super) fn change_kind(k: pigeonhole::ChangeKind) -> proto::ChangeKind {
     use pigeonhole::ChangeKind as K;
     match k {
         K::Put => proto::ChangeKind::Put,

@@ -1142,8 +1142,7 @@ fn a_hub_read_only_by_cluster_merges_runs_on_the_hub_runtime_with_a_full_share()
         drop(m);
         // Every membership gone, once the clients' tasks end: no ring splits the budget.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while shared.sharers.load(Ordering::Relaxed) != 0
-            && tokio::time::Instant::now() < deadline
+        while shared.sharers.load(Ordering::Relaxed) != 0 && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1649,8 +1648,7 @@ fn a_shared_entry_is_the_exact_encoding_of_the_event_a_client_with_no_prefix_cov
         let enc = e.encoded().unwrap();
         assert!(
             enc.as_ptr() <= e.token.as_ptr()
-                && e.token.as_ptr() as usize + e.token.len()
-                    <= enc.as_ptr() as usize + enc.len(),
+                && e.token.as_ptr() as usize + e.token.len() <= enc.as_ptr() as usize + enc.len(),
             "the token is held once, inside the encoding"
         );
         // A prefix client gets the changes to its rows, as a filter of the commit

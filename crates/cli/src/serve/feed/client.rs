@@ -1,7 +1,7 @@
 use super::*;
 
 /// Where a client starts, as `subscribe` found it.
-enum Begin {
+pub(super) enum Begin {
     /// On the ring at `at`, its position `seqno` and the token with it.
     Ring { at: u64, seqno: u64, token: Bytes },
     /// On its own feed (opened to check the start), and that start as a token. Boxed: the
@@ -24,28 +24,28 @@ enum Source {
     Own(Box<FeedStream>, OwnedSemaphorePermit),
 }
 
-struct Client {
-    feeds: Arc<Feeds>,
+pub(super) struct Client {
+    pub(super) feeds: Arc<Feeds>,
     /// Its hub: replaced by the key's current one when it fails (F2).
-    hub: Mutex<Joined>,
+    pub(super) hub: Mutex<Joined>,
     /// For a `Now` start, the database's seqno when it subscribed: commits at or below it
     /// are passed over, as an in-process feed opened then would never deliver them, even
     /// when the hub hadn't read them yet.
-    after: u64,
+    pub(super) after: u64,
     /// Commits up to this seqno are passed over as already handled ([`Spec::skip`]).
-    skip: u64,
+    pub(super) skip: u64,
     /// How many of those would have been sent: at most [`SKIP_LIMIT`].
-    skipped: AtomicU64,
+    pub(super) skipped: AtomicU64,
     /// [`Spec::announce`].
-    announce: bool,
+    pub(super) announce: bool,
     /// [`Spec::internal`].
-    internal: bool,
-    tables: Vec<Table>,
-    prefix: Vec<u8>,
-    visible: bool,
-    sink: Sink,
+    pub(super) internal: bool,
+    pub(super) tables: Vec<Table>,
+    pub(super) prefix: Vec<u8>,
+    pub(super) visible: bool,
+    pub(super) sink: Sink,
     /// Where it is, for the dump.
-    tracker: Arc<Tracker>,
+    pub(super) tracker: Arc<Tracker>,
 }
 
 /// A client's position: the last commit it covered and the token right after it.
@@ -62,7 +62,7 @@ impl Client {
         Arc::clone(&self.hub.lock().unwrap_or_else(PoisonError::into_inner).0)
     }
 
-    async fn run(&self, begin: Begin) -> Result<(), ApiError> {
+    pub(super) async fn run(&self, begin: Begin) -> Result<(), ApiError> {
         let mut pos;
         // Where it starts ([`FeedEvents::start`]): the ring's position it joins at, known
         // now. An own stream's, once its first read has taken the start (`read_own`): a
@@ -156,7 +156,7 @@ impl Client {
         let mut quiet_until: Option<Instant> = None;
         loop {
             // Per delivery batch, as the hub does per read (perf287's P1 on #1755).
-            super::placement::refresh();
+            super::super::placement::refresh();
             self.tracker.set(ON_RING, at);
             let (behind, failed) = {
                 let r = hub.ring();
@@ -273,7 +273,7 @@ impl Client {
             Poll::Pending => {}
         }
         loop {
-            super::placement::refresh();
+            super::super::placement::refresh();
             // A failed hub: take the key's current one, opening a new one if none (F2), at
             // most once a second so a hub that keeps failing isn't reopened in a loop.
             let mut hub = self.hub();
@@ -447,6 +447,6 @@ pub(crate) fn idle_error(idle: Duration) -> ApiError {
 }
 
 /// The error a send to a client that went away ends with.
-fn gone() -> ApiError {
+pub(super) fn gone() -> ApiError {
     ApiError::internal("the client went away")
 }

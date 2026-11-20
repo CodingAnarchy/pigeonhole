@@ -27,21 +27,21 @@
 //!   them.
 
 mod events;
-use events::*;
+pub(crate) use events::*;
 mod client;
-use client::*;
+pub(crate) use client::*;
 mod hub;
-use hub::*;
+pub(crate) use hub::*;
 mod entry;
-use entry::*;
+pub(crate) use entry::*;
 mod tracker;
-use tracker::*;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+pub(crate) use tracker::*;
 
 use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;

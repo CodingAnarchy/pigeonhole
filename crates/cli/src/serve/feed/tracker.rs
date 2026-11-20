@@ -7,10 +7,10 @@ pub(crate) struct Tracker {
     /// [`ON_RING`], [`ON_OWN`] or [`WAITING`].
     pub(crate) state: AtomicU64,
     /// On the ring, its next index; on its own stream, the seqno it covered.
-    at: AtomicU64,
+    pub(super) at: AtomicU64,
     /// The hub it's counted under (its address): a client that moved to a failed hub's
     /// replacement is counted there only (perf287's N1 on #1643).
-    hub: AtomicUsize,
+    pub(super) hub: AtomicUsize,
 }
 
 pub(crate) const ON_RING: u64 = 0;
@@ -67,7 +67,7 @@ impl TakeClock {
     /// reads the time its wait began: a take that reads 0 was ordered before the raise, so
     /// at most one event at the wait's start goes unstamped, and the wait counts from its
     /// start anyway (simp724's N1 on #2012).
-    fn took_within(&self) {
+    pub(super) fn took_within(&self) {
         if self.watchers.load(Ordering::SeqCst) != 0 {
             self.took();
         }
@@ -75,7 +75,7 @@ impl TakeClock {
 
     /// While the guard lives, every take is stamped, not just a batch's first and last: a
     /// send waiting for room counts its idle limit from the client's last take.
-    fn watch(&self) -> Watch<'_> {
+    pub(super) fn watch(&self) -> Watch<'_> {
         self.watchers.fetch_add(1, Ordering::SeqCst);
         Watch(self)
     }
@@ -96,7 +96,7 @@ impl TakeClock {
 }
 
 /// A send waiting for room ([`TakeClock::watch`]).
-struct Watch<'a>(&'a TakeClock);
+pub(super) struct Watch<'a>(&'a TakeClock);
 
 impl Drop for Watch<'_> {
     fn drop(&mut self) {

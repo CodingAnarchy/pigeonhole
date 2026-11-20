@@ -4,14 +4,14 @@ use super::*;
 /// bytes, and ended by the idle limit when the connection stops taking. A single node's
 /// client and a cluster subscription's merge (D317 ticket 7) both send through one.
 pub(crate) struct Sink {
-    tx: mpsc::Sender<(Queued, OwnedSemaphorePermit)>,
+    pub(super) tx: mpsc::Sender<(Queued, OwnedSemaphorePermit)>,
     /// The buffer's free bytes: each event or batch in the channel, or a batch the
     /// connection is still taking events from, holds its charge ([`EVENT_FLOOR`]).
-    budget: Arc<Semaphore>,
+    pub(super) budget: Arc<Semaphore>,
     /// When the connection last took an event: a send waiting for room counts its
     /// `--stream-idle-ms` from it (simp724's I1 on #1536).
     taken: Arc<TakeClock>,
-    client_bytes: usize,
+    pub(super) client_bytes: usize,
     stream_idle: Duration,
     /// Where the stream starts, sent once it's known ([`Sink::started`], read by
     /// [`FeedEvents::start`]).
@@ -208,7 +208,7 @@ fn charge(event: &Out) -> usize {
 }
 
 /// A place in a client's channel: one event, or a batch of them, in order ([`Sink::put_all`]).
-enum Queued {
+pub(super) enum Queued {
     One(Out),
     /// At least two events.
     Many(Vec<Out>),
@@ -249,7 +249,7 @@ struct Barriers {
     /// A cluster component of a cluster partition (PR 3b): its partition's gate and its
     /// tables, so a hand-over the partition takes while the component runs (its serving
     /// row written at CLEANING) adds that barrier too, not only those known at its open.
-    watch: Option<(Arc<super::gate::WriteGate>, Vec<String>)>,
+    watch: Option<(Arc<super::super::gate::WriteGate>, Vec<String>)>,
     /// The gate's serving rows' version last looked at, the moves already barriered, and the
     /// last seqno handed out (a barrier at or past it still comes in time).
     version: u64,
@@ -479,7 +479,7 @@ impl Out {
         }
     }
 
-    fn token(&self) -> &Bytes {
+    pub(super) fn token(&self) -> &Bytes {
         static NONE: Bytes = Bytes::new();
         match self {
             Out::Event(e) => &e.token,
@@ -586,7 +586,10 @@ impl FeedEvents {
     /// 2): they wait while it has had none since it opened and the node reaches a majority,
     /// and end with `PartitionUnavailable` once it lapses or the node doesn't (feed1248's
     /// F2). Refused at once in that last case, so a subscribe never starts there.
-    pub(crate) fn leased(mut self, gate: Arc<super::gate::WriteGate>) -> Result<Self, ApiError> {
+    pub(crate) fn leased(
+        mut self,
+        gate: Arc<super::super::gate::WriteGate>,
+    ) -> Result<Self, ApiError> {
         self.1 = Some(Box::new(DeliveryLease::new(gate)?));
         Ok(self)
     }
@@ -604,7 +607,7 @@ impl FeedEvents {
         mut self,
         mut barriers: Vec<Barrier>,
         ends_at: Option<u64>,
-        watch: Option<(Arc<super::gate::WriteGate>, Vec<String>)>,
+        watch: Option<(Arc<super::super::gate::WriteGate>, Vec<String>)>,
     ) -> Self {
         if barriers.is_empty() && ends_at.is_none() && watch.is_none() {
             return self;
@@ -786,7 +789,7 @@ impl FeedEvents {
     }
 }
 
-impl super::lease::LeaseHooks for FeedEvents {
+impl super::super::lease::LeaseHooks for FeedEvents {
     fn poll_own_end(&mut self, cx: &mut Context<'_>) -> Poll<Option<ApiError>> {
         Pin::new(self).poll_end(cx)
     }

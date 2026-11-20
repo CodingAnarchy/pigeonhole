@@ -1,11 +1,11 @@
 use super::*;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct HubKey {
+pub(super) struct HubKey {
     /// The tables' feed ids, so a table dropped and created again under its name is another
     /// key (feed1248's R2, simp724's F4 on #1518).
-    tables: Vec<u64>,
-    visible: bool,
+    pub(super) tables: Vec<u64>,
+    pub(super) visible: bool,
 }
 
 /// What a hub's ring holds (#1798): a single node's commits ([`Single`]), or a cluster
@@ -91,17 +91,17 @@ impl RingKind for Single {
 pub(crate) struct SingleRing {
     /// The hub feed's position when it opened: with no entry yet, the ring holds every
     /// commit of the spec above it.
-    start_seqno: u64,
+    pub(super) start_seqno: u64,
     /// The hub feed's latest position, after its last commit or its last poll that found
     /// none (so it follows other tables' writes too), and the token taken with it: one pair,
     /// from one poll (simp724's F1 on #1518).
-    passed: u64,
-    passed_token: Bytes,
+    pub(super) passed: u64,
+    pub(super) passed_token: Bytes,
     /// The shared feed ended (an error): clients move to their own streams.
-    failed: bool,
+    pub(super) failed: bool,
 }
 
-type Ring = RingOf<Single>;
+pub(super) type Ring = RingOf<Single>;
 
 impl Ring {
     /// Where a client at position `seqno` rejoins: the index of the first entry after it.
@@ -110,7 +110,7 @@ impl Ring {
     /// So it rejoins only if that position is at most `seqno` (nothing between them was
     /// evicted) and the hub's feed has passed `seqno` (nothing it will add is one the client
     /// has): feed1248's (2) on ticket 5.
-    fn rejoin_at(&self, seqno: u64) -> Option<u64> {
+    pub(super) fn rejoin_at(&self, seqno: u64) -> Option<u64> {
         let covered_from = self.entries.front().map_or(self.start_seqno, |e| e.prev);
         if covered_from > seqno || self.passed < seqno {
             return None;
@@ -145,17 +145,17 @@ pub(crate) struct HubOf<K: RingKind> {
     joins: AtomicU64,
     /// Whether its task runs on the feed runtime beside its one client (#1689), for the
     /// gauge and the dump.
-    solo: AtomicBool,
+    pub(super) solo: AtomicBool,
     stats: Arc<FeedStats>,
     /// Live hubs of its kind: `--max-feed-hubs` counts them.
     live: Arc<AtomicU64>,
     /// The node's rings that split `--feed-ring-bytes`: every hub with a member.
     sharers: Arc<AtomicU64>,
     /// Its clients' trackers, for the dump; a gone client's is pruned there.
-    clients: Mutex<Vec<Weak<Tracker>>>,
+    pub(super) clients: Mutex<Vec<Weak<Tracker>>>,
     /// Times it told its clients its head moved (an inspection count for tests, #1901).
     #[cfg(test)]
-    notifies: AtomicU64,
+    pub(super) notifies: AtomicU64,
 }
 
 pub(crate) type Hub = HubOf<Single>;
@@ -192,7 +192,7 @@ impl<K: RingKind> HubOf<K> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn task(&self) -> MutexGuard<'_, Option<tokio::task::AbortHandle>> {
+    pub(super) fn task(&self) -> MutexGuard<'_, Option<tokio::task::AbortHandle>> {
         self.task.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -232,7 +232,7 @@ impl<K: RingKind> HubOf<K> {
     /// first: a client counted there is counted in `external` too ([`HubOf::join`]). A client
     /// leaving can still read as a merge for a moment, which costs at most one move to the
     /// hub runtime and back after `solo_after`.
-    fn internal(&self) -> bool {
+    pub(super) fn internal(&self) -> bool {
         self.members.load(Ordering::Acquire) > 0 && self.external.load(Ordering::Relaxed) == 0
     }
 
@@ -265,7 +265,7 @@ impl<K: RingKind> HubOf<K> {
 }
 
 impl Hub {
-    fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
+    pub(super) fn push(&self, commit: Commit, token: Bytes, position: u64, total: usize) {
         let limit = self.ring_limit(total);
         // Encoded here, on the hub's task and outside the ring's lock.
         let seqno = commit.seqno();
@@ -303,7 +303,7 @@ impl Hub {
         }
     }
 
-    fn fail(&self) {
+    pub(super) fn fail(&self) {
         self.ring().failed = true;
         self.stats.hub_failures.fetch_add(1, Ordering::Relaxed);
         // Wake every client: each moves to its own stream once it has taken the ring's rest.
@@ -326,7 +326,7 @@ impl<K: RingKind> Drop for HubOf<K> {
 /// a cluster hub's merge ([`HubOf::join`]).
 pub(crate) struct JoinedOf<K: RingKind>(pub(crate) Arc<HubOf<K>>, bool);
 
-type Joined = JoinedOf<Single>;
+pub(super) type Joined = JoinedOf<Single>;
 
 impl<K: RingKind> Drop for JoinedOf<K> {
     fn drop(&mut self) {
@@ -342,7 +342,7 @@ impl<K: RingKind> Drop for JoinedOf<K> {
 
 /// Where a hub's task runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Place {
+pub(super) enum Place {
     /// The feed runtime, beside its one client's task: a commit wakes the client without a
     /// cross-runtime handoff (#1689, g64's +6.4% CPU per put at one subscriber).
     Feed,
@@ -352,29 +352,29 @@ enum Place {
 }
 
 /// A hub's task: its engine stream, read into its ring.
-struct Driver {
-    stream: FeedStream,
-    hub: Weak<Hub>,
+pub(super) struct Driver {
+    pub(super) stream: FeedStream,
+    pub(super) hub: Weak<Hub>,
     /// `--feed-ring-bytes`, shared by the live hubs.
-    ring_bytes: usize,
+    pub(super) ring_bytes: usize,
     /// The server's feed and hub runtimes, when it has both: the task moves between them.
-    runtimes: Option<(tokio::runtime::Handle, tokio::runtime::Handle)>,
-    solo_after: Duration,
-    place: Place,
+    pub(super) runtimes: Option<(tokio::runtime::Handle, tokio::runtime::Handle)>,
+    pub(super) solo_after: Duration,
+    pub(super) place: Place,
     /// When the task first saw its hub alone on the hub runtime, and the joins then.
-    alone: Option<(Instant, u64)>,
+    pub(super) alone: Option<(Instant, u64)>,
     /// `Coalesce::hub`.
-    coalesce: Duration,
+    pub(super) coalesce: Duration,
     /// Pushes since the clients were last told ([`NOTIFY_EVERY`]).
-    unnotified: u32,
+    pub(super) unnotified: u32,
     /// Commits read since the feed last had nothing.
-    batch: u32,
+    pub(super) batch: u32,
     /// After a small batch, the feed isn't polled again before this ([`Coalesce`]).
-    quiet_until: Option<Instant>,
+    pub(super) quiet_until: Option<Instant>,
     /// Set once the task has tried its hub with its first item (`Feeds::after_hub_spawn`'s
     /// hold seam, #1926).
     #[cfg(test)]
-    started: Option<Arc<Started>>,
+    pub(super) started: Option<Arc<Started>>,
 }
 
 /// A drive task's first item handled: what [`Feeds::after_hub_spawn`] waits for (#1926).
@@ -408,7 +408,7 @@ impl Driver {
     /// Asked only after a commit, so a hub left alone on the hub runtime by a quiet table
     /// stays there until its next commit. That's harmless: with no commits there's no
     /// handoff to save (perf287's N1 on #1716).
-    fn moves(&mut self, hub: &Hub) -> Option<Place> {
+    pub(super) fn moves(&mut self, hub: &Hub) -> Option<Place> {
         self.runtimes.as_ref()?;
         let shared = hub.members.load(Ordering::Relaxed) >= 2 || hub.internal();
         match self.place {
@@ -437,12 +437,12 @@ impl Driver {
 /// fails. When the hub's client count calls for the other runtime (#1689), it spawns itself
 /// there between two commits, handing over the stream itself, so the ring sees one unbroken
 /// sequence of pushes. Boxed: the task spawns its own kind.
-fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+pub(super) fn drive(mut d: Driver) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         loop {
             // A mask a partition's open or close published (D317 ticket 6): a busy hub
             // may not park for the whole load (perf287's P1 on #1755).
-            super::placement::refresh();
+            super::super::placement::refresh();
             // After a small batch (#1901): the commits arriving meanwhile are read together.
             if let Some(until) = d.quiet_until.take()
                 && Instant::now() < until
