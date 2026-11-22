@@ -19,7 +19,7 @@ async fn close(port: u16, p: &str) -> Result<LocalPartition, tonic::Status> {
 async fn local(port: u16, p: &str) -> LocalPartition {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()

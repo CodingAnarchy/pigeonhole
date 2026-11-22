@@ -5098,8 +5098,11 @@ A version 2 token (minted by 1.2.x) is resumed as before, with #1857's guard onl
    - `RangeMove.from_epoch = 13` holds P's epoch at COPYING. A map that moves P otherwise (a failover's promote) drops the record, and HANDED_OVER is refused if the epoch changed (simp724's M2).
    - Each attempt has a fresh record, so an aborted attempt's copy is never trusted (M1).
    - `--abort` ends one before its commit point.
-3. The policy, the loop, the map fields, the CLI and the `Forward` tablets arm.
-4. The guide.
+3. The policy, the loop, the map fields and the CLI (ICR 0117's D332 PR 3 section).
+   - Whole moves run from the writer with its cluster token (the coordinator's scope ruling, #2094).
+   - Splits and merges are computed and wait for D331 PR 5 and PR 6; the `Forward` tablets arm comes with the split.
+   - A new writer aborts an earlier writer's pre-commit `bal-` move (simp724's M1), and an idle pass changes no map (M2).
+4. The guide: serve.md's "The cluster balancer" (the policy, the bounds, the limits, `balancer status`, and why a merge stays under half the max). D331 PR 5 and PR 6 update its splits and merges as they land.
 
 <a id="d334"></a>
 ## D334 — SST output starts its writeback as it is written (coordinator, 2026-11-17; engine/sst/io, #1991; ICR 0145)

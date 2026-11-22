@@ -941,6 +941,56 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 - A target's serving row goes only once its own feed floor has passed `t_from`.
 - A source's moved-away row goes only once its feed retention has passed `final_seqno`, plus PR 2's bounds.
 
+## D331 PR 4b: a range move's copy and catch-up (1.3.0, #1499)
+**A range move's target copies its range from the source, then applies the source's history of it through the move's `final_seqno`.** The design was reviewed by cli692 (M1–M4), feed1248 (G1, G2), simp724 (the copy's idempotence, D34) and perf287 (the cost). PR 5's driver moves the phases. This PR runs what each phase needs.
+
+**Proto** (numbers from the coordinator, `.coord/numbers.md`):
+- `ForwardRequest.range_copy = 49`, `ForwardResponse.range_copy = 27`: `RangeCopyRequest { move_id, table, after, max_bytes }`, `RangeCopyResponse { cells, next, snapshot_seqno, token }`, `RangeCopyCell { family, kind, row, qualifier, timestamp, stored }`.
+- `ForwardSubscribeRequest.range_start = 7`, `range_end = 8` (`SplitKey`, half-open, absent = open), `raw = 9`.
+- `FeedEvent.raw_commit = 9`: `RawCommit { seqno, timestamp, changes }`, `RawChange { family, kind, row, qualifier, timestamp, stored }`. Kinds are FORMAT §2's logged numbers; `stored` is the value's stored form, tag byte first.
+- `MoveStatus.copied_bytes = 7`, `copy_done = 8`, `source_applied_seqno = 9`, `retention_lapsed = 10`.
+- Flags: `--move-rate-bytes` (64 MiB/s), `--move-retention-cap` (4 GiB), `--max-move-followers` (2).
+
+**The source:**
+- **The copy** (`range_copy`):
+  - It's served only by the source's owner in its map, at the move's `from_epoch` (M3), for a range move naming it as `from`, at COPYING.
+  - The first chunk takes the move's feed retention hold (`--move-retention-cap`) and its follower slot (`--max-move-followers`; past it, `Overloaded`, counted in `pigeonhole_cluster_move_copies_refused_total`). It records the feed token at its snapshot. Asked again, the move keeps both.
+  - Each chunk is `Pigeonhole::copy_range` at a fresh snapshot: whole rows, at least 2 MiB or 128 KiB per family read. All of a node's copies share one token bucket at `--move-rate-bytes`.
+  - The hold and slot go when the move leaves COPYING through HANDED_OVER or the map, when the source moves off this node or its epoch, or after 120 s without a chunk or a catch-up tick. A lapsed hold shows in `retention_lapsed`, and the move must be aborted.
+- **The catch-up stream** (`ForwardSubscribe` with `raw`):
+  - It's served only by the source's owner at `from_epoch`, for exactly a live move's bounds, from COPYING through HANDED_OVER, from a token, with no client options (G1). A range bound without `raw` is refused.
+  - It reads its own feed of the table, feed-silent commits included and durable only. It never joins a hub's ring.
+  - It sends each commit's in-range changes as a `RawCommit` (a commit straddling a bound sends its in-range part), and anything else as `Progress`: a commit with nothing in range, a catalog change, a range drop outside the range, a quiet table.
+  - A range drop that removes any of the range ends it with an error (G2). Once the move is handed over and the stream has passed `final_seqno`, it ends with `MovedAway`. The map is read at most every 200 ms.
+
+**The target's follower:** one per range move whose `to` the map gives this node, from COPYING through HANDED_OVER. It starts on a map install and when the server starts, and stops on a map that no longer gives it the move (M2).
+- **Every commit** is a feed-silent `LoggedBatch`, by name, through the target's `WriteGate`, under its lease (M1).
+- **The copy:**
+  - Each chunk is written in its D34 split (`CopiedChunk::batches`), cut into commits of about 256 KiB. A chunk holding a merge commits whole (simp724's (b)), and one past 8 MiB stops the move, naming the table, family and row.
+  - The chunk's progress goes in its last commit only. A crash between two of its commits copies it again at a fresh snapshot, which the split makes safe.
+- **Progress rows** (`__phdb_cluster`, family `moved`, beside the moved-away and serving rows, which their readers take by prefix, M4):
+  - `copy/<id>`: `next`, `first` (the copy's token), `n`, `bytes`, `done`;
+  - `copy/<id>/<n>`: the chunk's `end` and `snap`;
+  - `follow/<id>`: the catch-up's `token`, written with the changes it applied, or alone at most once a second.
+- **The catch-up** starts from `follow/<id>`'s token, else the copy's first. B4: a change to row `k` applies only if its seqno is above the snapshot of `k`'s chunk. It's done once its position passes a handed-over move's `final_seqno`.
+- **Stopping:**
+  - A follower stops only between commits, and checks before each one.
+  - A later follower of the same move waits for a stopped one to end.
+  - At shutdown, every follower stops and is joined in the shutdown signal, before the listener closes.
+  - A resume past the source's history (`FeedExpired`), a range drop of the range, or the merge cap stops a follower for good, reported in its log. The move must be aborted.
+- **Status:** `MoveStatus.copied_bytes`, `copy_done` and `source_applied_seqno` on the target; `pigeonhole_cluster_move_follower_lag_ms{move}`.
+
+**pigeonhole:** `RangeDrop::overlaps(table, start, end)`, doc-hidden behind `__unstable-replication` (G2).
+
+**Covered by code only:** the source's lease check (`serving()` before and after a chunk's read, and on each tick of the catch-up stream). The rig gives a fresh node's partitions an hour's lease, so no test lets one lapse; an operator's fence doesn't reach it, since a fenced partition still serves reads, the copy's among them (cli692 on #2107).
+
+**For PR 5:**
+- **It records `from_epoch` on every range move** at COPYING, as D332's NODE moves do. The source's checks then hold: `from_epoch` exactly before HANDED_OVER, and above it from there, since the hand-over raises it (`map::source_epoch_holds`, cli692 on #2107). Until then, range moves carry 0 and the source's failover check is inert.
+- It moves the phases (from CATCHING_UP to HANDED_OVER only once `source_applied_seqno` is past the fence's last seqno).
+- It waits for a follower's stop before an abort's `drop_range`.
+- It checks for a drop-pending row before a copy starts.
+- It prunes the `copy/` and `follow/` rows.
+
 ## D332 PR 2: whole-partition moves recorded in the map (1.3.0, #1485)
 **`phdb cluster move P --to N` keeps a record of itself in `ClusterMap.moves`,** so a move stopped by a crash, of the CLI or of the writer, is seen. `status` shows it, failover takes it into account, and a rerun finishes it.
 
@@ -986,4 +1036,48 @@ A moved-away row outlives the move record and is pruned by PR 5's writer, at the
 `LocalPartition.moves` shows a NODE record with no table. `restore_partition` stays refused while one names P.
 
 **Mixed versions:** a record needs the `range_moves` feature on every node, which is what keeps `moves` in a node's map. Without it, the move runs unrecorded and its report says so (`recorded`). Every node reporting `range_moves` runs 1.3.0, which validates NODE.
+
+## D332 PR 3: the balancer's policy, loop, map fields and CLI (1.3.0, #1485)
+**The map's writer runs a balancer, off by default.** It moves whole partitions between nodes to keep load and size near even. Splits and merges are computed but wait for D331 PR 5's and PR 6's drivers.
+
+**Proto** (coordinator-assigned, numbers.md):
+- `ClusterMap.balancer = 15` (`BalancerMode`: OFF, ON, PAUSED), `.balance = 16` (`BalanceBounds`: ratios, partition max and min bytes, max load, passes, dwell, max moves, bounce window, each 0 for its default), `.balancer_events = 17` (`BalancerEvent`, the last 32);
+- `BalancerEventKind`: MOVE, SPLIT, MERGE, PIN, SKIP, ABORT;
+- `Partition.pinned = 9`, `.moves_history = 10` (`MoveHistory`, the last 8);
+- `TablePlacement.pinned_ranges = 7` (`SplitRange`, a half-open split-key range);
+- `Node.weight = 3`;
+- `StatusRequest.open_only = 1`, `LocalPartition.file_bytes = 32` and `NodeStatus.balancer = 14` (a string for people, not a format);
+- the map feature `balancer`.
+
+**The policy** (`balance.rs`) is a pure function, unit-tested:
+- **The priority:** a split, then a whole move, then a merge.
+- **When it acts:** after its condition holds `passes` passes in a row, with D214's hysteresis line and a dwell after each action. Moves are judged per unit of node weight, against the mean of the nodes that answered.
+- **The bounds on a move:** it never puts the target over the bound, its copy must fit in the dwell, and it never lands on a replica's node.
+- **Bouncing:** a partition moved `max_moves` times in the bounce window is auto-pinned. The auto-pin is its `pinned` with a PIN history entry, and it expires a window later. An operator's pin or unpin clears those entries, so an operator's pin never expires (simp724's S2).
+- **Never a candidate:** a pinned partition, one in any move's record, or one with in-doubt shares. For splits and merges, also a table in a group or followed by an index.
+- **Pinned ranges** (`TablePlacement.pinned_ranges`): a partition holding one never moves or merges, and never splits inside it. A split key lies strictly inside one of the partition's own ranges in the map, never at a hole a range move or drop left in its file (ai1249's M1 and M2 on #2103).
+- **Merges** go only into a neighbour, a partition holding a range next to one of its own (ai1249's S2 on #2103).
+- **Read holds and open transactions** aren't inputs (`Status` doesn't carry them). A move fences and closes the partition first, so a transaction or pinned snapshot open on it ends with the old copy, as for `phdb cluster move` (simp724's M2 on #2103).
+
+**The loop** (`balancing.rs`): one of the writer's duties, once a pass (30 s), while the map's balancer is ON or PAUSED and this node holds the writer lease, at any term. Each pass runs on a task of its own, one at a time, so the writer's other duties (failover among them) never wait on its calls to other nodes (perf287 on #2103).
+- **An earlier writer's `bal-` NODE move** before its commit point is aborted (simp724's M1): its record goes, the target's copy aside, the partition is unfenced on its node, and an ABORT event is recorded. From its commit point it's finished.
+- **Waiting:** nothing starts while any move is in flight, or while PAUSED.
+- **The survey and the decision:** an `open_only` survey (no closed file is read, and the file bytes come from the file system: perf287), then the decision.
+- **The action:** a whole move runs `phdb cluster move`'s steps on a task of its own, with the writer's cluster token (#2094), its record `bal-<ms>`.
+  - **Its map changes are set in process,** not through `SetMap`, which takes the admin scope only (audit120's M1 on #2103, the coordinator's ruling: no new scope).
+  - **Each needs the writer lease, at any term,** so a writer cut off at term 0 can't advance its move (simp724's M1 on #2103).
+  - **Its MOVE event and history** go in the map change that records the move, and its dwell starts once that has landed, so a move that can't start isn't recorded or counted (audit120's and simp724's S1).
+- **A pass that does nothing changes nothing in the map** (simp724's M2, perf287's should-fix 1). Its reason is `NodeStatus.balancer`. The counters are in memory, new with each writer term.
+
+**The CLI:** `phdb cluster balancer status|pause|resume|pin|unpin`.
+
+**Metrics:** `pigeonhole_cluster_balancer_actions_total{kind}` and `pigeonhole_cluster_node_load_ratio{node}`, on the writer.
+
+**Also:**
+- the sampled read keys are per `--balance-window` (two reservoirs, swapped once a window has passed by the clock: perf287);
+- the device ceiling keys each open by an id;
+- the thread CPU clock warms at start;
+- a move's record writes re-read the map on each retry.
+
+**Not yet:** splits and merges (D331 PR 5, PR 6; until then a too-big or too-hot partition's state says its split waits for D331 PR 5, since no tablets are surveyed), `--move-rate-bytes` (D331 PR 4b; the copy-time check uses its 64 MiB/s default), and the guide (PR 4).
 

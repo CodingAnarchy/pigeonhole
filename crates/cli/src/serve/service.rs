@@ -5267,10 +5267,8 @@ impl Service {
         Ok(n)
     }
 
-    /// What transaction `id` is now, for `caller` (D329's `Outcome` and resolver), without
-    /// taking it.
-    /// Transaction `id`'s session as `principal` sees it (`None`: the node's own call,
-    /// [`super::sessions::Sessions::peek`]).
+    /// What transaction `id` is now, without taking it (D329's `Outcome` and resolver), as
+    /// `principal` sees it; `None` is the node's own call ([`super::sessions::Sessions::peek`]).
     pub(crate) fn peek_txn(
         &self,
         id: &str,

@@ -752,6 +752,12 @@ fn serve_shared(s: Serving<'_>, stderr: &mut dyn std::io::Write) -> Result<ExitS
             for part in stopping.router.parts() {
                 part.bulk.stop();
             }
+            // The range moves this node follows as a target (D331 PR 4b) stop before the
+            // listener closes: a commit in flight ends first, so once the node stops taking
+            // connections, none of them writes.
+            if let Some(cluster) = &stopping.router.cluster {
+                cluster.range_follows.stop_all().await;
+            }
         };
         let bounds = listener::Bounds {
             connections: Arc::clone(&shared.router.service.connections),

@@ -27,6 +27,8 @@ struct Three {
     dirs: Vec<PathBuf>,
     stops: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
     dbs: Vec<Option<pigeonhole::Pigeonhole>>,
+    /// A stopped node's port, held for its restart ([`HeldPort`], #2105).
+    held: Vec<Option<HeldPort>>,
 }
 
 const IDS: [&str; 3] = ["a", "b", "c"];
@@ -78,6 +80,7 @@ impl Three {
             dirs,
             stops,
             dbs,
+            held: (0..3).map(|_| None).collect(),
         }
     }
 
@@ -86,24 +89,27 @@ impl Three {
     fn stop(&mut self, i: usize) {
         let _ = self.stops[i].take().expect("running").send(());
         self.nodes[i].take().expect("running").shutdown_background();
+        // Until its port refuses, so the next call doesn't reach it mid-shutdown; then the
+        // port is held for its restart, so a parallel test can't take it (#2105).
+        let port = self.ports[i];
+        self.rt.block_on(stopped(port));
+        self.held[i] = Some(HeldPort::take(port));
+    }
+
+    /// The stopped node `i`'s port to listen on again: the one held, or taken now.
+    fn listener(&mut self, i: usize) -> std::net::TcpListener {
+        let l = self.held[i]
+            .take()
+            .unwrap_or_else(|| HeldPort::take(self.ports[i]))
+            .listen();
+        l.set_nonblocking(true).unwrap();
+        l
     }
 
     /// Serves node `i` again on its port, with its database.
     fn restart(&mut self, i: usize) {
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", self.ports[i]).parse().unwrap();
+        let listener = self.listener(i);
         let node_rt = runtime();
-        // The old listener is gone with its runtime; its port may linger in TIME_WAIT.
-        let listener = node_rt.block_on(async {
-            for _ in 0..100 {
-                let socket = tokio::net::TcpSocket::new_v4().unwrap();
-                socket.set_reuseaddr(true).unwrap();
-                if socket.bind(addr).is_ok() {
-                    return socket.listen(64).unwrap().into_std().unwrap();
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            panic!("port {addr} never came free");
-        });
         let (stop, _) = data_node_on(
             &node_rt,
             &self.dirs[i],
@@ -121,19 +127,8 @@ impl Three {
     /// from its rounds, which it then renews, rather than standing for a node that has
     /// served all along.
     fn restart_leased(&mut self, i: usize) {
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", self.ports[i]).parse().unwrap();
+        let listener = self.listener(i);
         let node_rt = runtime();
-        let listener = node_rt.block_on(async {
-            for _ in 0..100 {
-                let socket = tokio::net::TcpSocket::new_v4().unwrap();
-                socket.set_reuseaddr(true).unwrap();
-                if socket.bind(addr).is_ok() {
-                    return socket.listen(64).unwrap().into_std().unwrap();
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            panic!("port {addr} never came free");
-        });
         let (stop, _) = data_node_full(
             &node_rt,
             &self.dirs[i],
@@ -775,6 +770,7 @@ fn a_moved_partition_keeps_its_feed_and_a_token_from_before_resumes_after() {
     let t = Three::start();
     let (a, b, c) = (t.ports[0], t.ports[1], t.ports[2]);
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,
@@ -1283,7 +1279,7 @@ fn a_component_that_subscribes_as_its_partition_closes_leaves_an_allow_partial_s
             eventually("p2's database to close on b", async || {
                 client(b)
                     .await
-                    .status(StatusRequest {})
+                    .status(StatusRequest::default())
                     .await
                     .unwrap()
                     .into_inner()
@@ -1691,6 +1687,7 @@ fn a_planned_move_with_its_release_lost_resumes_on_the_new_node_once_its_lease_s
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(t.dirs[0].clone());
     let args = super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{b}"),
         token_file: None,
         ca: None,

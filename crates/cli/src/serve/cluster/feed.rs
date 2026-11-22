@@ -1441,6 +1441,11 @@ impl Ctx {
             request: Some(open.request),
             skip_through: open.skip,
             from_hand_over: open.from_hand_over,
+            // A client subscription's part: no range bound, never raw (D331 PR 4b's are the
+            // range follower's own).
+            range_start: None,
+            range_end: None,
+            raw: false,
         };
         let request = self.node.request(req).map_err(ApiError::internal)?;
         // A commit's event can be larger than tonic's default 4 MiB cap (audit120's S-C2).

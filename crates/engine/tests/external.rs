@@ -1542,3 +1542,137 @@ fn a_read_whose_tablet_moved_to_a_participant_after_it_validated_is_still_valida
     );
     db.close().unwrap();
 }
+
+/// Polls `f` until it resolves, panicking past `secs` seconds (engine-owned shards run it).
+fn resolve<F: std::future::Future + Unpin>(mut f: F, secs: u64) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut f).poll(&mut cx) {
+            return r;
+        }
+        assert!(std::time::Instant::now() < deadline, "never resolved");
+        std::thread::yield_now();
+    }
+}
+
+/// #2059: the non-blocking forms. `submit_hold_reads` resolves to the hold (writes to its
+/// rows refused at once while it lives), `submit_release` to whether it lasted, and a hold
+/// dropped before it resolves releases what its shards took.
+#[test]
+fn the_non_blocking_hold_and_release_resolve_as_the_blocking_forms_do() {
+    let vfs = SimVfs::new(58);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let rows: [&[u8]; 3] = [b"a", b"m", b"z"];
+    let hold = resolve(reader(&db, &t, &rows).submit_hold_reads().unwrap(), 10).unwrap();
+    assert!(matches!(put(&db, &t, b"m", b"no"), Err(Error::Busy)));
+    assert!(resolve(hold.submit_release(), 10), "held throughout");
+    put(&db, &t, b"m", b"yes").unwrap();
+    // Refused as `hold_reads` is: a read changed since the snapshot conflicts.
+    let stale = reader(&db, &t, &[b"a"]);
+    put(&db, &t, b"a", b"newer").unwrap();
+    assert!(matches!(
+        resolve(stale.submit_hold_reads().unwrap(), 10),
+        Err(Error::Conflict)
+    ));
+    // Dropped unresolved: whatever its shards took is released, so writes go through.
+    drop(reader(&db, &t, &rows).submit_hold_reads().unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while put(&db, &t, b"z", b"after").is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped hold stayed"
+        );
+        std::thread::yield_now();
+    }
+    // A hold lost to a close answers its release `false`.
+    let hold = resolve(reader(&db, &t, &[b"a"]).submit_hold_reads().unwrap(), 10).unwrap();
+    db.close().unwrap();
+    assert!(!resolve(hold.submit_release(), 10));
+}
+
+/// Lets the held `Decide`s go when dropped (`Fault::HoldDecides`).
+struct ReleaseDecides<'a>(&'a Engine);
+
+impl Drop for ReleaseDecides<'_> {
+    fn drop(&mut self) {
+        self.0.inject(Fault::HoldDecides, false);
+        self.0.release_held_decides(usize::MAX);
+    }
+}
+
+/// #2059's M3: a hold over a row a waiting single writes conflicts. A cross-shard
+/// transaction reads `r` (and writes `w` on the other shard), its decision held, so its share
+/// on `r`'s shard stays undecided with `r` among its reads. A single writing `r` then waits
+/// for that decision (D263), and a hold of `r`, which reaches the shard after it, must
+/// answer `Conflict`: the single, admitted once the share is decided, would otherwise land
+/// past the hold. Only the waiting-single check sees it: the share writes `w`, not `r`, and
+/// nothing is applied to `r` yet.
+#[test]
+fn a_read_hold_over_a_row_a_waiting_single_writes_conflicts() {
+    let vfs = SimVfs::new(60);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let u = db
+        .create_table("u", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (f, uf) = (t.family("f").unwrap().id, u.family("f").unwrap().id);
+    let here = db.shard_of(t.id, b"r").expect("routed");
+    let other = 1 - here;
+    if db.shard_of(u.id, b"w") == Some(here) {
+        finish(db.move_tablet_pending(u.id, b"w", other as u16).unwrap()).unwrap();
+    }
+    db.inject(Fault::HoldDecides, true);
+    // However the test ends: a close (an unwinding drop's too) waits for the held decision.
+    let _release = ReleaseDecides(&db);
+    let mut spanning = db.begin().unwrap();
+    let _ = spanning.get(t.id, f, b"r", b"q").unwrap();
+    spanning
+        .batch()
+        .put(u.id, uf, b"w", b"q", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    let commit = spanning.submit(Some(Durability::GroupSync)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Decided once a `Decide` is held, which goes out only after every participant
+    // prepared: `r`'s shard holds the share, undecided.
+    while db.held_decides() == 0 {
+        assert!(std::time::Instant::now() < deadline, "never decided");
+        std::thread::yield_now();
+    }
+    // A single writing `r` waits for the share. The hold is submitted after it from this
+    // thread, so `r`'s shard takes it after the single.
+    let mut wb = WriteBatch::new();
+    wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"single"))
+        .unwrap();
+    let waits = db.metrics().cross_shard.share_waits;
+    let single = db.submit(wb, Some(Durability::GroupSync)).unwrap();
+    // Held back behind the share once a group counts it: only then is it a waiting single
+    // (a commit may reach its shard late, a wait for room, so its submission alone isn't).
+    while db.metrics().cross_shard.share_waits == waits {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the single never waited"
+        );
+        std::thread::yield_now();
+    }
+    let held = resolve(reader(&db, &t, &[b"r"]).submit_hold_reads().unwrap(), 10);
+    assert!(
+        matches!(held, Err(Error::Conflict)),
+        "a hold over a row a waiting single writes: {held:?}"
+    );
+    db.inject(Fault::HoldDecides, false);
+    db.release_held_decides(usize::MAX);
+    resolve(commit, 10).unwrap();
+    resolve(single, 10).unwrap();
+    assert_eq!(get_bytes(&db, &t, b"r").as_deref(), Some(&b"single"[..]));
+    // With nothing waiting, the hold is taken.
+    let hold = resolve(reader(&db, &t, &[b"r"]).submit_hold_reads().unwrap(), 10).unwrap();
+    assert!(resolve(hold.submit_release(), 10));
+    db.close().unwrap();
+}

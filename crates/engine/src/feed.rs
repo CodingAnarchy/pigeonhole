@@ -708,7 +708,9 @@ impl Feed {
     /// Stream `stream`'s checkpoint moved to `at`, past records of keys at most `key`
     /// (`ShardState::ckpt_key`). Called before the stream's own checkpoint mark is stored,
     /// so a reader that loaded the mark finds an entry at least that new. At most two
-    /// entries per segment: the first, and the latest.
+    /// entries per segment: the first, and the latest. The first is never replaced:
+    /// [`hold_retention`](Self::hold_retention)'s guarantee rests on it (a snapshot opened
+    /// after a hold starts at an entry in the held epoch or later; feed1248 on #2109).
     pub(crate) fn note_checkpoint(
         &self,
         stream: usize,
@@ -1165,13 +1167,27 @@ impl Feed {
         self.sidecar_syncs.load(Ordering::Relaxed)
     }
 
-    /// Holds every stream's history from its current segment on (D331, ICR 0141), until
+    /// Holds every stream's history from its checkpoint's segment on (D331, ICR 0141), until
     /// the hold is released or the database retains more than `cap` bytes of history, when
     /// it lapses: it's dropped and marked so, and retention trims as before. `None` until
     /// every stream is open.
     ///
-    /// A stream's head segment is never trimmed, so the hold always starts at history the
-    /// stream has; it takes effect at each stream's next retention pass.
+    /// **From the checkpoint, not the head** (found by #2107's tests): a token taken from a
+    /// snapshot doesn't know the snapshot's place in each stream's log, so it starts the
+    /// stream's scan at its checkpoint then, which can be segments behind the head. A token
+    /// from now, or of a snapshot opened after the hold (more exactly, whose checkpoint
+    /// start is read after the hold's), starts each stream at or past that stream's
+    /// checkpoint at the hold, since checkpoints only move forward: so the hold covers it. A
+    /// snapshot opened before the hold may carry an older checkpoint, and its token isn't
+    /// covered (simp724): take the hold first. What it keeps beyond a head-only hold is the
+    /// stream's unflushed log at the hold, which the memtable budget bounds.
+    ///
+    /// Retention never trims a segment at or past a stream's checkpoint, so the hold starts
+    /// at history the stream has; it takes effect at each stream's next retention pass. A
+    /// pass between the epochs' read and their publication (simp724 on the fix) can only
+    /// trim segments behind a checkpoint that moved on meanwhile, below every later token's
+    /// start: the hold then names a trimmed epoch, which keeps everything from the floor on,
+    /// and no token taken after it is affected.
     pub(crate) fn hold_retention(&self, cap: u64) -> Option<Arc<RetentionHold>> {
         let mut holds = self
             .retention_holds
@@ -1180,7 +1196,7 @@ impl Feed {
         let epochs = self
             .marks
             .iter()
-            .map(|m| m.get().map(|m| m.head()))
+            .map(|m| m.get().map(|m| m.checkpoint().epoch().clamp(1, m.head())))
             .collect::<Option<Vec<u32>>>()?;
         let hold = Arc::new(RetentionHold {
             epochs,

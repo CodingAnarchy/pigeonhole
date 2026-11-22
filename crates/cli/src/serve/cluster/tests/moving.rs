@@ -51,6 +51,7 @@ impl Cluster {
             dbs.extend(db);
         }
         let args = super::super::cli::NodeArgs {
+            own: None,
             node: format!("http://127.0.0.1:{}", ports[1]),
             token_file: None,
             ca: None,
@@ -287,7 +288,7 @@ fn a_promote_before_a_moves_commit_point_ends_the_move_in_its_map() {
         eventually("b's copy of p1 to follow a", async || {
             client(b)
                 .await
-                .status(crate::serve::proto::StatusRequest {})
+                .status(crate::serve::proto::StatusRequest::default())
                 .await
                 .is_ok_and(|s| {
                     s.into_inner().partitions.iter().any(|lp| {
@@ -632,7 +633,7 @@ fn a_relocation_that_leaves_the_old_copy_open_moves_its_subscriptions_along() {
             .unwrap();
         let status = client(a)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -693,7 +694,7 @@ fn a_moves_map_step_refuses_once_the_old_node_was_reopened_since_its_check() {
         );
         let checked = client(a)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -866,7 +867,7 @@ async fn give_p1_to(writer: u16, node: &str) {
 async fn p1_is(port: u16, state: crate::serve::proto::LocalPartitionState) -> bool {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .is_ok_and(|s| {
             s.into_inner()
@@ -1069,7 +1070,7 @@ fn a_close_whose_drain_fails_leaves_the_partition_open_under_the_operators_fence
         );
         let lp = client(a)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -1127,6 +1128,7 @@ fn a_moves_wait_for_a_majority_to_take_its_map_gives_up_at_its_timeout() {
     }
     t.rt.block_on(async {
         let args = super::super::cli::NodeArgs {
+            own: None,
             node: format!("http://127.0.0.1:{a}"),
             token_file: None,
             ca: None,
@@ -1207,7 +1209,7 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
         eventually("c to open p1, unconfirmed", async || {
             client(c)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .is_ok_and(|s| {
                     s.into_inner().partitions.iter().any(|lp| {
@@ -1216,6 +1218,26 @@ fn a_feed_on_a_new_owner_not_yet_confirmed_subscribes_and_gets_the_first_write_a
                             && lp.awaiting_peers
                     })
                 })
+        })
+        .await;
+        // #2072: Status reports p1 from its gate, which the open registers before the router
+        // has the partition (`open_gate`, then the parts' store). A call in between answers
+        // `PartitionUnavailable` ("isn't open here"), retry-safe and right, so wait until a
+        // write reaches p1's gate. Nothing else may answer, and nothing is written.
+        eventually("c's router to route to p1", async || {
+            let e = data(c)
+                .await
+                .mutate(MutateRequest {
+                    writes: Some(put_row("amy", "0")),
+                    durability: 0,
+                })
+                .await
+                .expect_err("an unconfirmed partition takes no write");
+            match code(&e).as_str() {
+                "Fenced" => true,
+                "PartitionUnavailable" => false,
+                other => panic!("{other}: {e}"),
+            }
         })
         .await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{c}"))

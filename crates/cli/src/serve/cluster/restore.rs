@@ -332,7 +332,7 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
         let got = async {
             let (c, _) = channel(args, url).await?;
             proto::cluster_client::ClusterClient::new(c)
-                .status(request(StatusRequest {}, token.as_deref())?)
+                .status(request(StatusRequest::default(), token.as_deref())?)
                 .await
                 .map(|r| r.into_inner().partitions)
                 .map_err(|s| Failure::usage(s.message()))
@@ -860,7 +860,7 @@ async fn restore_partition(
         let got = async {
             let (c, _) = channel(args, node_url).await?;
             proto::cluster_client::ClusterClient::new(c)
-                .status(request(StatusRequest {}, token.as_deref())?)
+                .status(request(StatusRequest::default(), token.as_deref())?)
                 .await
                 .map(|r| r.into_inner().partitions)
                 .map_err(|s| Failure::usage(s.message()))

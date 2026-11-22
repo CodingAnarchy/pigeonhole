@@ -1201,6 +1201,20 @@ fn a_range_drop_event_round_trips_and_a_flagged_one_is_refused() {
                 "version {version}"
             );
         }
+        // A well-formed version 3 header (an xid's flag and the xid) before a drop's body
+        // passes the header's checks, so the drop's own refusal is what stops it
+        // (feed1248 on #2089).
+        let mut v3 = vec![3u8, 2];
+        v3.extend_from_slice(&2u32.to_le_bytes());
+        v3.extend_from_slice(b"x1");
+        v3.extend_from_slice(&bytes[1..]);
+        let e = ReplicatedEvent::decode(&v3).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(
+            e.to_string()
+                .contains("a range drop in a version other than the plain one"),
+            "{e}"
+        );
     }
     drop((feed, t));
     db.close().unwrap();
@@ -1892,4 +1906,107 @@ fn the_first_silent_commit_flags_its_bit_under_the_writers_exclusion() {
     assert!(t.get(b"r", "a", b"q").unwrap().is_some());
     drop(t);
     db.close().unwrap();
+}
+
+/// D331 PR 4b (feed1248's G2): a feed that includes silent records gets a range drop as
+/// an event, and a range move's catch-up asks whether it removes any of its range:
+/// half-open at both ends, an open end to the table's end, and only in its own table.
+#[test]
+fn a_range_drop_event_tells_which_ranges_it_removes() {
+    let vfs = SimVfs::new(63);
+    let db = Pigeonhole::open("/d/data.phdb", options(&vfs)).unwrap();
+    let make = |name: &str| {
+        db.table(name)
+            .unwrap()
+            .family("a", Family::default())
+            .create_if_missing()
+            .unwrap()
+    };
+    let (t, other) = (make("t"), make("u"));
+    t.mutate(b"r6").put("a", b"q", b"v").commit().unwrap();
+    let mut feed = t.feed().open().unwrap();
+    feed.include_silent();
+    db.drop_range(&t, b"r5", Some(b"r9")).unwrap();
+    let removed = loop {
+        match feed.next_event(Duration::from_secs(5)).unwrap() {
+            Some(FeedEvent::RangeDrop(d)) => break d.clone(),
+            Some(_) => {}
+            None => panic!("no range drop event"),
+        }
+    };
+    let overlaps = |s: &[u8], e: Option<&[u8]>| removed.overlaps(&t, s, e);
+    assert!(overlaps(b"r5", Some(b"r9")));
+    assert!(overlaps(b"r4", Some(b"r6")), "across its start");
+    assert!(overlaps(b"r8", None), "an open end");
+    assert!(overlaps(b"", None), "the whole table");
+    assert!(!overlaps(b"r9", None), "its end is excluded");
+    assert!(!overlaps(b"r0", Some(b"r5")), "a range ending at its start");
+    assert!(
+        !removed.overlaps(&other, b"r5", Some(b"r9")),
+        "another table"
+    );
+    drop(feed);
+    drop((t, other));
+    db.close().unwrap();
+}
+
+/// D331 (#2107's catch-up, found by its tests): a token taken just after a retention hold
+/// resumes after the writes, flushes and compactions that follow, whatever the shard count.
+/// Each stream keeps a share of the change feed's retention, so with many shards a stream
+/// keeps about one segment. A stream whose last record ended a sealed segment, behind an
+/// empty head, is positioned in that sealed segment: the hold has to keep it, or the next
+/// retention pass recycles it and the token reads as expired, though nothing after it is
+/// gone. Run at 4 shards (where it passed) and at the counts where it failed.
+#[test]
+fn a_token_under_a_retention_hold_resumes_at_any_shard_count() {
+    for shards in [4usize, 8, 10, 16] {
+        let seed = 64 + shards as u64;
+        let vfs = SimVfs::new(seed);
+        let db = Pigeonhole::open(
+            "/d/data.phdb",
+            Options::default()
+                .vfs(Arc::clone(&vfs) as _)
+                .shards(shards)
+                .wal_segment_size(1 << 20)
+                .change_feed(FeedRetention::bytes(16 << 20)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        for i in 0..4u32 {
+            t.mutate(format!("c{i}").as_bytes())
+                .put("f", b"q", &[1u8; 700 << 10])
+                .commit()
+                .unwrap();
+        }
+        let hold = db.hold_feed_retention(4 << 30).unwrap();
+        let snap = db.snapshot().unwrap();
+        let token = t.feed().from_snapshot(&snap).open().unwrap().token();
+        drop(snap);
+        for i in 0..30u32 {
+            t.mutate(format!("d{i}").as_bytes())
+                .put("f", b"q", b"v")
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let mut feed = t.feed().resume(&token).open().unwrap();
+        feed.include_silent();
+        let mut n = 0;
+        loop {
+            match feed.next_event(Duration::from_millis(200)) {
+                Ok(Some(_)) => n += 1,
+                Ok(None) => break,
+                Err(e) => panic!("{shards} shards (seed {seed}): after {n} events: {e}"),
+            }
+        }
+        assert!(n >= 30, "{shards} shards (seed {seed}): {n} events");
+        drop((feed, hold, t));
+        db.close().unwrap();
+    }
 }

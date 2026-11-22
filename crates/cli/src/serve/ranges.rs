@@ -853,6 +853,9 @@ pub(crate) fn statuses(map: &ClusterMap, partition: &str) -> Vec<MoveStatus> {
                 } else {
                     phase >= MovePhase::Cleaning
                 },
+                // D331 PR 4b: the copy's progress and the hold's lapse, filled in by the
+                // range follower and the source's copy server.
+                ..MoveStatus::default()
             }
         })
         .collect()
@@ -885,6 +888,7 @@ mod tests {
             cluster_id: "c1".into(),
             map_version: 7,
             nodes: vec![Node {
+                weight: Default::default(),
                 id: "a".into(),
                 address: "127.0.0.1:7001".into(),
             }],

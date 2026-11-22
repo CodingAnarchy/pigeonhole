@@ -141,7 +141,7 @@ fn a_restore_puts_the_backup_back_at_new_epochs_and_old_tokens_expire() {
             eventually(&format!("{p} to serve again"), async || {
                 client(*port)
                     .await
-                    .status(StatusRequest {})
+                    .status(StatusRequest::default())
                     .await
                     .unwrap()
                     .into_inner()
@@ -370,7 +370,7 @@ fn a_restore_run_again_skips_what_an_earlier_run_did() {
         for (port, (_, p)) in ports.iter().zip(NODES) {
             let serving = client(*port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -484,7 +484,7 @@ async fn on(port: u16, p: &str, call: &str) -> Result<(), tonic::Status> {
 async fn serves(port: u16, p: &str) -> bool {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -610,7 +610,8 @@ fn a_partition_restored_alone_to_another_node_while_its_node_is_down() {
         put_row(a, "y-later", 100).await;
         // c's process stops: its p3 can't be fenced or closed.
         let _ = stops.remove(2).send(());
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Until c refuses, not a fixed sleep (#2105).
+        stopped(ports[2]).await;
         let e = restore(&args(a), &part_args(&out, "p3", Some("b")))
             .await
             .err()
@@ -782,7 +783,7 @@ fn a_partition_restore_run_again_reuses_its_stamp_only_while_it_fits() {
         eventually("p3 not opening on c", async || {
             client(c)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()

@@ -660,7 +660,7 @@ fn a_schema_change_reconciles_every_partition_on_a_node() {
         assert!(!has(&dbs[2], "orders"), "p2 on b");
         let status = client(ports[0])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -894,7 +894,7 @@ fn bad_row(row: &str) -> crate::serve::proto::RowWrites {
 }
 
 /// `row`'s increment of the counter `n:c` by `delta`.
-fn incr_row(row: &str, delta: i64) -> crate::serve::proto::RowWrites {
+pub(super) fn incr_row(row: &str, delta: i64) -> crate::serve::proto::RowWrites {
     use crate::serve::proto::{Incr, RowKey, RowWrites, Write, write};
     RowWrites {
         row: Some(RowKey {
@@ -913,7 +913,7 @@ fn incr_row(row: &str, delta: i64) -> crate::serve::proto::RowWrites {
 }
 
 /// `row`'s counter `n:c` through `port` (0 when absent).
-async fn counter(port: u16, row: &str) -> i64 {
+pub(super) async fn counter(port: u16, row: &str) -> i64 {
     let reply = data(port)
         .await
         .get(crate::serve::proto::GetRequest {
@@ -933,7 +933,7 @@ async fn counter(port: u16, row: &str) -> i64 {
 
 /// Adds the counter family `n` to `users` through `port`, then waits until every node's
 /// partitions have taken that map.
-async fn add_counter(ports: &[u16], port: u16) {
+pub(super) async fn add_counter(ports: &[u16], port: u16) {
     use crate::serve::proto::schema_client::SchemaClient;
     use crate::serve::proto::{
         Aggregation, AggregationKind, CreateTableRequest, FamilySpec, family_spec,
@@ -964,7 +964,9 @@ async fn add_counter(ports: &[u16], port: u16) {
         eventually("every partition to take the map with n", async || {
             client(p)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest {
+                    open_only: Default::default(),
+                })
                 .await
                 .unwrap()
                 .into_inner()

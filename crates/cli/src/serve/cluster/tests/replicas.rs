@@ -12,7 +12,7 @@ use crate::serve::proto::{
 async fn copy_of(port: u16, p: &str) -> Option<LocalPartition> {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -135,6 +135,7 @@ fn following(
 /// The node args of a `phdb cluster` command through node `port`.
 fn args_at(port: u16) -> super::super::cli::NodeArgs {
     super::super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,
@@ -256,7 +257,7 @@ fn a_replica_copy_bootstraps_follows_and_closes_when_the_map_drops_it() {
         assert!(copy_of(ports[1], "p3").await.is_none());
         let c = client(ports[2])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -907,6 +908,7 @@ fn a_promotion_with_the_owner_unreachable_reports_the_loss_as_unknown() {
         .await;
     });
     let _ = stops.remove(2).send(());
+    rt.block_on(stopped(ports[2]));
     rt.block_on(async {
         let r = within(super::super::promote::promote(
             &args_at(ports[0]),
@@ -1301,6 +1303,7 @@ fn bounded_reads_answer_from_the_replica_while_the_owner_is_down() {
             .is_ok_and(|(_, by, _)| by.as_deref() == Some("replica"))
     }));
     let _ = stops.remove(2).send(());
+    rt.block_on(stopped(ports[2]));
     rt.block_on(async {
         let multi_get = |bound: bool| {
             let mut req = tonic::Request::new(crate::serve::proto::MultiGetRequest {

@@ -485,17 +485,23 @@ mod tests {
 
     fn map(version: u64, epoch: u64, splits: &[&str]) -> ClusterMap {
         ClusterMap {
+            balance: Default::default(),
+            balancer: Default::default(),
+            balancer_events: Default::default(),
             cluster_id: "c1".into(),
             map_version: version,
             previous_nodes: Vec::new(),
             indexes: Vec::new(),
             memory: None,
             nodes: vec![Node {
+                weight: Default::default(),
                 id: "n1".into(),
                 address: "a:1".into(),
             }],
             partitions: vec![
                 Partition {
+                    moves_history: Default::default(),
+                    pinned: Default::default(),
                     history_epoch: 0,
                     id: "p1".into(),
                     node: "n1".into(),
@@ -506,6 +512,8 @@ mod tests {
                     failover_count: 0,
                 },
                 Partition {
+                    moves_history: Default::default(),
+                    pinned: Default::default(),
                     history_epoch: 0,
                     id: "p2".into(),
                     node: "n1".into(),
@@ -557,6 +565,8 @@ mod tests {
         assert!(moved(&a, &map(9, 2, &["m"])).is_some_and(|w| w.contains("epoch")));
         let mut added = map(9, 1, &["m"]);
         added.partitions.push(Partition {
+            moves_history: Default::default(),
+            pinned: Default::default(),
             history_epoch: 0,
             id: "p3".into(),
             node: "n1".into(),

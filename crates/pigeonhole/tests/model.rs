@@ -3288,14 +3288,39 @@ fn log_summary(line: &str) {
     }
 }
 
-/// How long one seed may run before [`check`] declares it hung: `PIGEONHOLE_SEED_TIMEOUT`
-/// seconds, 120 by default (a seed normally takes well under a second).
-fn seed_timeout() -> Duration {
-    let secs = std::env::var("PIGEONHOLE_SEED_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(120);
-    Duration::from_secs(secs)
+/// How long a seed may stay on one step before [`check`] declares it hung (stuck):
+/// `PIGEONHOLE_SEED_TIMEOUT` seconds, 60 by default. A step is one op or a reopen, normally
+/// well under a second. Progress-based since #2044: a seed a slow runner slows down keeps
+/// finishing steps and isn't hung; one that stops is, sooner than a total deadline caught it.
+fn seed_stall() -> Duration {
+    env_secs("PIGEONHOLE_SEED_TIMEOUT", 60)
+}
+
+/// The hard cap on one seed's whole run, however it progresses: `PIGEONHOLE_SEED_CAP`
+/// seconds, 600 by default, well under the CI job's limit, so a crawling seed fails as
+/// `HUNG` with its stacks rather than as a job timeout (the coordinator's condition on #2044).
+fn seed_cap() -> Duration {
+    env_secs("PIGEONHOLE_SEED_CAP", 600)
+}
+
+/// When a seed still running is first reported `SLOW`: `PIGEONHOLE_SEED_SLOW` seconds, 120 by
+/// default (a seed normally takes a few: #2044's runs had the whole direct-I/O binary at
+/// 20–68 s on CI). Then every [`SLOW_EVERY`].
+fn seed_slow() -> Duration {
+    env_secs("PIGEONHOLE_SEED_SLOW", 120)
+}
+const SLOW_EVERY: Duration = Duration::from_secs(60);
+
+/// How often the watchdog looks at a seed's progress.
+const WATCH_EVERY: Duration = Duration::from_millis(100);
+
+fn env_secs(name: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default),
+    )
 }
 
 /// How long the hang report's first gdb pass, every thread's stack, may take (`timeout`'s
@@ -3382,7 +3407,7 @@ fn dump_stacks() {
 /// Starts the hang report's deadlines, before the report does anything that can block: once
 /// the report ([`dump_stacks`]' two gdb passes, then 5 s of trace) has had time to finish,
 /// the process ends, whatever the report is blocked on. A stalled disk then ends the job
-/// about [`seed_timeout`] plus 135 s after the seed started, not at the job's limit.
+/// about 135 s after the hang was found, not at the job's limit.
 ///
 /// Two of them:
 /// - a thread of this process that writes a note and aborts, at 125 s;
@@ -3430,14 +3455,16 @@ fn hang_deadline() {
         });
 }
 
-/// Runs every seed of `cfg`. Each runs on its own thread under a watchdog: a seed that
-/// outlives [`seed_timeout`] is reported with its test, configuration and the step it was
-/// on, and the process aborts, so a hang fails fast and names itself instead of eating the
-/// job's timeout (#244, #209).
+/// Runs every seed of `cfg`. Each runs on its own thread under a watchdog: a seed that stays
+/// on one step past [`seed_stall`], or runs past [`seed_cap`] in all, is reported with its
+/// test, configuration and the step it was on, and the process aborts, so a hang fails fast
+/// and names itself instead of eating the job's timeout (#244, #209). A seed still moving
+/// past [`seed_slow`] is only reported `SLOW`, with its op rate, every [`SLOW_EVERY`]
+/// (#2044: a slow runner, not a stall).
 fn check(cfg: &Config) -> Vec<Stats> {
     let _running = RunningCheck::enter();
     let test = std::thread::current().name().unwrap_or("?").to_owned();
-    let limit = seed_timeout();
+    let (stall, cap, slow_after) = (seed_stall(), seed_cap(), seed_slow());
     // Row cache hits over every seed: a crash-heavy seed may hit none (each crash empties
     // the cache), but a test whose seeds never hit is not testing the cache (D201).
     let (mut reads, mut row_cache_hits) = (0, 0);
@@ -3460,100 +3487,142 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 })
                 .expect("spawn a seed's thread")
         };
-        match rx.recv_timeout(limit) {
-            Ok(Ok(stats)) => {
-                eprintln!(
-                    "seed {seed} ({placed}): {stats:?} in {:?}",
-                    started.elapsed()
-                );
-                reads += stats.reads;
-                row_cache_hits += stats.row_cache_hits;
-                traversals += stats.traversals;
-                deep_traversals += stats.deep_traversals;
-                nearests += stats.nearests;
-                nearests_found += stats.nearests_found;
-                all.push(stats);
-            }
-            Ok(Err(e)) => {
-                log_failure(&format!(
-                    "FAILED: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
-                     {placed}): {e}",
-                    cfg.shards, cfg.tablet_changes, cfg.deferred_io
-                ));
-                panic!("{e}")
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // The abort first, on a thread of its own: everything below may block (a
-                // runner disk that stops returning holds a file write, or a spawn, for good;
-                // #1906's job then sat 29 minutes past this point until the job's limit), and
-                // the process must end regardless.
-                hang_deadline();
-                let (at, step_secs, steps) = {
-                    let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
-                    (p.step.clone(), p.since.elapsed().as_secs_f64(), p.steps)
-                };
-                // Counted now, before this check ends: itself and every other model test
-                // still running in the process.
-                let running = RUNNING_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
-                // Straight to stderr: the test harness's capture would lose an `eprintln!`.
-                let hung = format!(
-                    "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
-                     {placed}) did not finish in {limit:?}; it was at {at}, for {step_secs:.1}s; \
-                     model tests running in this process: {running}",
-                    cfg.shards, cfg.tablet_changes, cfg.deferred_io
-                );
-                let _ = writeln!(std::io::stderr(), "{hung}");
-                // Every thread's stack, where gdb can attach: what the hung thread waits
-                // on, when nothing else shows it (#838). Only on CI (`CI` is set on the
-                // runners, where root bypasses ptrace_scope) or on request
-                // (`PIGEONHOLE_HUNG_STACKS=1`), never on a developer's machine by itself;
-                // bounded by `timeout`, and by `hang_deadline` beyond it.
-                if std::env::var_os("CI").is_some()
-                    || std::env::var("PIGEONHOLE_HUNG_STACKS").is_ok_and(|v| v == "1")
-                {
-                    dump_stacks();
-                }
-                // What the shards do from here on, if anything (#244).
-                pigeonhole_engine::set_tracing(true);
-                std::thread::sleep(Duration::from_secs(5));
-                let _ = writeln!(std::io::stderr(), "HUNG: end of the trace after the hang");
-                // Stuck or slow (#2044): whether the seed moved past the step it was on at the
-                // deadline, while the stacks and the trace were taken.
-                let verdict = match rx.try_recv() {
-                    Ok(Ok(_)) => "slow: the seed finished after the deadline".to_owned(),
-                    Ok(Err(e)) => format!("slow: the seed failed after the deadline: {e}"),
-                    // Its thread ended without sending: it panicked after the deadline.
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        "slow: the seed's thread panicked after the deadline".to_owned()
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
+        let mut next_slow = slow_after;
+        let hung = loop {
+            let wait = match rx.recv_timeout(WATCH_EVERY) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let (at, step_secs, steps) = {
                         let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
-                        if p.steps == steps {
-                            format!(
-                                "stuck: still at the same step, for {:.1}s",
-                                p.since.elapsed().as_secs_f64()
-                            )
-                        } else {
-                            format!(
-                                "slow: {} more steps since the deadline; now at {}",
-                                p.steps - steps,
-                                p.step
-                            )
-                        }
+                        (p.step.clone(), p.since.elapsed(), p.steps)
+                    };
+                    let total = started.elapsed();
+                    if step_secs >= stall {
+                        break Some(format!("made no progress in {stall:?}"));
                     }
-                };
-                let _ = writeln!(std::io::stderr(), "HUNG: {verdict}");
-                // The failure log last: it is a file write (a sweep sets
-                // `PIGEONHOLE_FAIL_LOG`), and a stalled disk there must not cost the stacks.
-                log_failure(&format!("{hung}; {verdict}"));
-                std::process::abort();
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if let Err(panic) = worker.join() {
-                    std::panic::resume_unwind(panic);
+                    if total >= cap {
+                        break Some(format!("did not finish in {cap:?}"));
+                    }
+                    if total >= next_slow {
+                        next_slow += SLOW_EVERY;
+                        let running = RUNNING_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
+                        // Straight to stderr, as `HUNG` is: a passing seed's capture would
+                        // lose it, and it's the trend the coordinator watches.
+                        let slow = format!(
+                            "SLOW: {test}: seed {seed} ({} shards, tablet changes {}, deferred \
+                             I/O {}, {placed}) at {at} after {:.0}s: {steps} steps, {:.1} steps/s; \
+                             model tests running in this process: {running}",
+                            cfg.shards,
+                            cfg.tablet_changes,
+                            cfg.deferred_io,
+                            total.as_secs_f64(),
+                            steps as f64 / total.as_secs_f64(),
+                        );
+                        let _ = writeln!(std::io::stderr(), "{slow}");
+                        log_summary(&slow);
+                    }
+                    continue;
                 }
-                unreachable!("a seed's thread ended without a result");
+                other => other,
+            };
+            match wait {
+                Ok(Ok(stats)) => {
+                    eprintln!(
+                        "seed {seed} ({placed}): {stats:?} in {:?}",
+                        started.elapsed()
+                    );
+                    reads += stats.reads;
+                    row_cache_hits += stats.row_cache_hits;
+                    traversals += stats.traversals;
+                    deep_traversals += stats.deep_traversals;
+                    nearests += stats.nearests;
+                    nearests_found += stats.nearests_found;
+                    all.push(stats);
+                    break None;
+                }
+                Ok(Err(e)) => {
+                    log_failure(&format!(
+                        "FAILED: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
+                         {placed}): {e}",
+                        cfg.shards, cfg.tablet_changes, cfg.deferred_io
+                    ));
+                    panic!("{e}")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => unreachable!("a timeout is handled above"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Err(panic) = worker.join() {
+                        std::panic::resume_unwind(panic);
+                    }
+                    unreachable!("a seed's thread ended without a result");
+                }
             }
+        };
+        // A hang: no step finished in `stall`, or the whole seed ran past `cap`.
+        if let Some(hung) = hung {
+            // The abort first, on a thread of its own: everything below may block (a
+            // runner disk that stops returning holds a file write, or a spawn, for good;
+            // #1906's job then sat 29 minutes past this point until the job's limit), and
+            // the process must end regardless.
+            hang_deadline();
+            let (at, step_secs, steps) = {
+                let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                (p.step.clone(), p.since.elapsed().as_secs_f64(), p.steps)
+            };
+            let total = started.elapsed().as_secs_f64();
+            // Counted now, before this check ends: itself and every other model test
+            // still running in the process.
+            let running = RUNNING_CHECKS.load(std::sync::atomic::Ordering::Relaxed);
+            // Straight to stderr: the test harness's capture would lose an `eprintln!`.
+            let report = format!(
+                "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
+                 {placed}) {hung}; it was at {at}, for {step_secs:.1}s, after {total:.0}s in \
+                 all, {steps} steps; model tests running in this process: {running}",
+                cfg.shards, cfg.tablet_changes, cfg.deferred_io
+            );
+            let _ = writeln!(std::io::stderr(), "{report}");
+            // Every thread's stack, where gdb can attach: what the hung thread waits
+            // on, when nothing else shows it (#838). Only on CI (`CI` is set on the
+            // runners, where root bypasses ptrace_scope) or on request
+            // (`PIGEONHOLE_HUNG_STACKS=1`), never on a developer's machine by itself;
+            // bounded by `timeout`, and by `hang_deadline` beyond it.
+            if std::env::var_os("CI").is_some()
+                || std::env::var("PIGEONHOLE_HUNG_STACKS").is_ok_and(|v| v == "1")
+            {
+                dump_stacks();
+            }
+            // What the shards do from here on, if anything (#244).
+            pigeonhole_engine::set_tracing(true);
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = writeln!(std::io::stderr(), "HUNG: end of the trace after the hang");
+            // Stuck or slow (#2044): whether the seed moved past the step it was on when the
+            // hang was found, while the stacks and the trace were taken.
+            let verdict = match rx.try_recv() {
+                Ok(Ok(_)) => "slow: the seed finished after the hang was found".to_owned(),
+                Ok(Err(e)) => format!("slow: the seed failed after the hang was found: {e}"),
+                // Its thread ended without sending: it panicked after the hang was found.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    "slow: the seed's thread panicked after the hang was found".to_owned()
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    let p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                    if p.steps == steps {
+                        format!(
+                            "stuck: still at the same step, for {:.1}s",
+                            p.since.elapsed().as_secs_f64()
+                        )
+                    } else {
+                        format!(
+                            "slow: {} more steps since the hang was found; now at {}",
+                            p.steps - steps,
+                            p.step
+                        )
+                    }
+                }
+            };
+            let _ = writeln!(std::io::stderr(), "HUNG: {verdict}");
+            // The failure log last: it is a file write (a sweep sets
+            // `PIGEONHOLE_FAIL_LOG`), and a stalled disk there must not cost the stacks.
+            log_failure(&format!("{report}; {verdict}"));
+            std::process::abort();
         }
         let _ = worker.join();
     }

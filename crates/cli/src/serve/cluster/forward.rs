@@ -553,6 +553,12 @@ pub(crate) fn op_of(op: Option<forward_request::Op>) -> Result<ServiceOp, ApiErr
             Op::BranchBegin(_) | Op::BranchPrepare(_) | Op::BranchDecide(_) | Op::ResolveTxn(_) => {
                 return Err(ApiError::invalid("a branch's call isn't a client's"));
             }
+            // Answered by the cluster's range move code before a forward becomes a call.
+            Op::RangeCopy(_) => {
+                return Err(ApiError::internal(
+                    "a range copy is answered by the cluster, not as a call",
+                ));
+            }
         },
     )
 }
@@ -642,6 +648,11 @@ pub(crate) fn reply_of(reply: ForwardResponse) -> Result<ServiceReply, ApiError>
                 return Err(ApiError::internal("a node's own reply isn't a client's"));
             }
             Reply::TxnOutcome(r) => ServiceReply::Outcome(r),
+            Reply::RangeCopy(_) => {
+                return Err(ApiError::internal(
+                    "a range copy's chunk is read by the range follower, not as a call's reply",
+                ));
+            }
         },
     )
 }

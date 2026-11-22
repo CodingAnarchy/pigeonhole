@@ -101,6 +101,9 @@ fn text(s: &str) -> SplitKey {
 /// at "m" over p1 and p2.
 fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
     ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: version,
         previous_nodes: Vec::new(),
@@ -110,6 +113,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             .iter()
             .zip(ports)
             .map(|(id, port)| MapNode {
+                weight: Default::default(),
                 id: (*id).into(),
                 address: format!("127.0.0.1:{port}"),
             })
@@ -117,6 +121,8 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
         partitions: [("p1", "a"), ("p2", "b"), ("p3", "c")]
             .iter()
             .map(|(id, node)| Partition {
+                moves_history: Default::default(),
+                pinned: Default::default(),
                 history_epoch: 0,
                 id: (*id).into(),
                 node: (*node).into(),
@@ -128,6 +134,7 @@ fn the_map(version: u64, ports: &[u16; 3]) -> ClusterMap {
             })
             .collect(),
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
@@ -158,7 +165,7 @@ async fn client(
 async fn version(port: u16) -> u64 {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -172,6 +179,56 @@ async fn within<T>(f: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(120), f)
         .await
         .expect("the move or relocation finishes within 2 minutes")
+}
+
+/// A stopped node's port, held for its restart: bound but not listening, so a parallel
+/// test's node can't take it in between (it would fail the restart with AddrInUse, as on
+/// #2100's macOS run), while a dial of it is still refused, as a stopped node's is. Taken as
+/// soon as the node lets the port go, retrying for up to five seconds while the OS frees it
+/// (as #2074's fix in `moving.rs` does with a listener).
+struct HeldPort(socket2::Socket);
+
+impl HeldPort {
+    fn take(port: u16) -> Self {
+        use socket2::{Domain, Socket, Type};
+        let at: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            // As std's `TcpListener::bind` does on Unix: a closed connection's TIME_WAIT
+            // doesn't hold the port.
+            #[cfg(unix)]
+            s.set_reuse_address(true).unwrap();
+            match s.bind(&at.into()) {
+                Ok(()) => return Self(s),
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "port {port} wasn't freed for the restart: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// The restarted node's listener, on the port held.
+    fn listen(self) -> std::net::TcpListener {
+        self.0.listen(1024).unwrap();
+        self.0.into()
+    }
+}
+
+/// Waits until a stopped node's port refuses connections (#2105): a call before then can
+/// reach the node mid-shutdown and be reset after it was sent (`OutcomeUnknown`, not the
+/// `PartitionUnavailable` a stopped node gets).
+async fn stopped(port: u16) {
+    eventually("the node to stop", async || {
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    })
+    .await;
 }
 
 /// Waits for `cond` (a node's state settling after a background push or pull), 5 s at most.
@@ -431,7 +488,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         assert!(e.message().contains(super::DIVERGENT), "{e:?}");
         let s = client(ports[1])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -457,7 +514,7 @@ fn a_map_set_on_one_node_reaches_the_others_and_survives_restarts() {
         assert!(
             client(ports[1])
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -852,7 +909,7 @@ fn a_family_added_to_a_cached_table_reads_with_its_aggregate_view() {
         eventually("a's p1 to reconcile to the map with q", async || {
             client(a)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -1285,13 +1342,22 @@ fn data_node_served(
     };
     let resolver =
         super::spanning::start_resolver(Arc::downgrade(&shared), shared.limits.txn_resolve_delay);
+    let follows = Arc::clone(&node);
     let start: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
         if let Some(sync) = sync {
             sync();
         }
         resolver();
+        follows.start_range_follows();
     }));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    // Stopped at the server's stop, before its listener closes, as `run` stops them (D331
+    // PR 4b).
+    let follows = shared
+        .router
+        .cluster
+        .as_ref()
+        .map(|c| Arc::clone(&c.range_follows));
     let app = crate::serve::http::router(shared);
     rt.spawn(async move {
         listener.set_nonblocking(true).unwrap();
@@ -1302,6 +1368,9 @@ fn data_node_served(
             app,
             async {
                 let _ = stopped.await;
+                if let Some(follows) = follows {
+                    follows.stop_all().await;
+                }
             },
             Duration::from_millis(100),
             None,
@@ -2325,7 +2394,7 @@ fn status_reports_each_partitions_load_and_a_read_only_partitions_sampled_cpu() 
     let row_of = async |port: u16, p: &str| {
         client(port)
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner()
@@ -4231,6 +4300,9 @@ fn split_nodes(
         .map(|l| l.local_addr().unwrap().port())
         .collect();
     let map = ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
@@ -4240,12 +4312,15 @@ fn split_nodes(
             .iter()
             .enumerate()
             .map(|(i, port)| MapNode {
+                weight: Default::default(),
                 id: format!("n{i}"),
                 address: format!("127.0.0.1:{port}"),
             })
             .collect(),
         partitions: (0..n)
             .map(|i| Partition {
+                moves_history: Default::default(),
+                pinned: Default::default(),
                 history_epoch: 0,
                 id: format!("q{i}"),
                 node: format!("n{i}"),
@@ -4257,6 +4332,7 @@ fn split_nodes(
             })
             .collect(),
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
@@ -4438,7 +4514,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
             for &port in &ports {
                 let s = client(port)
                     .await
-                    .status(StatusRequest {})
+                    .status(StatusRequest::default())
                     .await
                     .unwrap()
                     .into_inner();
@@ -4592,7 +4668,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
         settled().await;
         let status = client(ports[1])
             .await
-            .status(StatusRequest {})
+            .status(StatusRequest::default())
             .await
             .unwrap()
             .into_inner();
@@ -4629,7 +4705,7 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
                 .into_inner();
             let s = client(port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner();
@@ -4739,6 +4815,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
         super::proto::schema_client::SchemaClient::new(channel)
     };
     let args = |port: u16| super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,
@@ -4905,7 +4982,7 @@ fn a_forced_map_replaces_a_writer_thats_down_and_the_old_writer_follows_it() {
             .await;
             let s = client(port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner();
@@ -4937,6 +5014,7 @@ fn a_forced_map_never_reuses_an_epoch_its_node_or_a_reachable_one_has_used() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_stops, ports, _dbs) = three_nodes(&rt);
     let args = |port: u16| super::cli::NodeArgs {
+        own: None,
         node: format!("http://127.0.0.1:{port}"),
         token_file: None,
         ca: None,

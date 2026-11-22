@@ -321,6 +321,10 @@ The rules a client keys on ([D313](../design/decisions/phase-3.md#d313), [ICR 01
 - `--max-streams` (256): feed streams at once. `--max-feed-hubs` (32): distinct table sets subscribed at once. Past either, a subscription gets `Overloaded`.
 - **128 streams per connection:** one HTTP/2 connection carries at most 128 streams at once (scans, feed streams and calls alike). A client that opens more on one connection doesn't get an error: the extra streams wait until earlier ones end, and a feed stream may never end. Open another connection for each 128 concurrent streams. With tonic, that means another `Channel`, because one `Channel` is one connection.
 - `--max-catch-up` (16): feed streams reading their own history at once (from a token, a snapshot or the oldest commit, or after falling behind); the rest wait their turn.
+- **Range moves (cluster):**
+  - `--move-rate-bytes` (64 MiB/s): the node's copy bandwidth, shared by every range move copying from its partitions. A move's catch-up afterwards isn't throttled.
+  - `--move-retention-cap` (4 GiB): the most change-feed history a range move keeps on its source while it copies and catches up. Past it, the move's hold lapses (`phdb cluster status` shows it) and the move must be aborted.
+  - `--max-move-followers` (2): range moves copying from a node's partitions at once. A further move's copy is refused (`Overloaded`, counted in `pigeonhole_cluster_move_copies_refused_total`) until one ends. Each move's catch-up costs its source CPU for every commit it makes while the move runs, so this cap bounds that cost: about 2 µs of the source's CPU per put per move (about +3% with 1, +6% at the default 2 and +12% with 4, at 20,000 puts/s on the reference machine), with each move's catch-up lag at 1 ms or less.
 - `--feed-ring-bytes` (256 MiB): the recent commits the shared feeds keep for their streams, in all, shared out over the table sets subscribed. A commit is kept as its encoded event, which carries its resume token (about 45 + 16 × shards bytes), plus about 110 bytes; a stream with a `prefix` filters that event. With 100-byte values and 4 shards, a commit costs about 380 bytes. Each table set's share is `--feed-ring-bytes` over the sets subscribed, so with many sets, raise it to keep the seconds of commits a stream can fall behind and still catch up from the ring. This is outside `--inflight-bytes`; `/metrics` reports what's in use.
 - `--backup-dir`: where `Admin.Backup` writes, and where downloads are kept for resumes. It must exist; put it on a disk with room for a copy or two of the database, not tmpfs. There's no default: without it, backups are off. `--max-backups` (1) runs that many at once.
 - `--max-sessions` (1,024) and `--max-sessions-per-token` (64): transactions, pinned snapshots and committed transactions' records held at once. Past either, `Begin` and `Open` get `Overloaded`.
@@ -578,7 +582,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
   - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Vectors.BulkLoad`, `Text.Search`, `Text.Rebuild` and both kinds' `Verify` across an index's partitions ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
   - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
-  - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve reads that allow staleness, across partitions too. A replica is made the owner by hand (`phdb cluster promote`); automatic failover is #1484. A cluster node refuses `--replica-of` and `Admin.Promote`.
+  - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve reads that allow staleness, across partitions too. A replica is made the owner by hand (`phdb cluster promote`), or by the cluster itself once you turn failover on ([Automatic failover](#automatic-failover)). A cluster node refuses `--replica-of` and `Admin.Promote`.
 
 ### How a cluster is laid out
 - **Partitions are whole database files.** A partition holds key ranges of one or more tables. Its file records which cluster and partition it is, and its *epoch* (`__phdb_cluster`, hidden from `ListTables`).
@@ -778,6 +782,8 @@ Transactions and pinned snapshots run in one partition, on its node.
 - **Every node** must run a build that keeps the `spanning_txns` map feature, and `--txn-max-branches` (16) bounds the branches of one transaction. Without the opt-in, a row of another partition is still `CrossPartition`.
 - **In doubt.** If the home fails during a commit, a branch may hold its share prepared, its outcome unknown. It's still readable as before the commit, and a write over the same cell waits for the outcome.
   - Each node's resolver asks the home once a share has been in doubt for `--txn-resolve-delay` (default: the request timeout), and decides it by the answer.
+  - It asks up to eight homes at once, each home's shares in turn. A home that gives no answer (its node down or too slow) is asked once a pass, and its other shares wait for the next one, so one dead home doesn't hold up the others or the collection of decided records.
+  - A branch that applies a commit, by its resolver or by `txn decide --commit`, then tells the home, so the home's record can be collected after `--txn-outcome-retention`. The branch's node keeps that ack in memory and retries it until the home takes it. If that node restarts first, the home's committed record stays: about a hundred bytes, never collected for now (#2098).
   - With no decision recorded and the home's history unchanged, the home records an abort first, so a late commit can't follow.
   - Across a change of the home's history (a restore, a relocate without `--copy`, a promotion), the answer is unknown, and the share stays in doubt with that reason.
   - `phdb cluster status` shows how many shares each partition holds in doubt and the oldest's age; with `--format json` it lists each one's xid, age and why it's waiting.
@@ -786,6 +792,7 @@ Transactions and pinned snapshots run in one partition, on its node.
   - **A commit that wrote** is answered from its decision row on the home. The row is kept for `--txn-outcome-retention` (24 h) from the time of the decision, and a commit's row also stays until every branch has acknowledged it.
   - **A read-only one** has no decision row. It's answered committed only while its session's record lasts: one `--txn-idle-ms` after its `Commit`, on the home's node, and not across that node's restart. After that, the home answers aborted: the first ask records it, for a retention, and the answer is not found once that record is collected. Either way it wrote nothing. Rely on `Commit`'s own answer, not on `Outcome`, for whether its reads held.
   - **Not found, past retention.** From a full `--txn-outcome-retention` after a transaction began, a missing decision row may be one that was collected, so the home answers not found rather than presume an abort.
+  - **Only its own client's** (#2077). While a transaction's session or its record lasts, another token's `Outcome` on its id is not found, and nothing is read or recorded for it. After that, the decision row doesn't say whose transaction it was, so the decided outcome is answered to any write-scope token that has the id: the 80 random bits in its id are the guard.
 - **Deciding by hand.** `phdb cluster txn decide <xid> --partition P --commit|--abort` decides a share in doubt.
   - It's refused while the home can settle the share (it answers committed, aborted or in progress), since the resolver does that then.
   - It goes ahead without `--force` when the home can't answer, answers unknown (its history changed), or answers not found. That last case is a share still in doubt a full `--txn-outcome-retention` after its transaction began: the resolver can't settle it, so decide it by hand. Check the transaction's other partitions, or an operation id it wrote ([recovery](recovery.md)), for which way it went.
@@ -914,25 +921,12 @@ A node writes a partition only while its newest map names it for the partition a
   - **`set-map --force` across a change of nodes promises nothing about the old majority:** it skips the wait for the old nodes. If the nodes it dropped are alive on the other side of a cut, both sides can serve. Use it only for nodes that are gone.
   - **Clocks:** no node compares its clock with another's; each times its own grants and leases on a clock that counts time the machine was suspended. A clock may run up to 1% fast or slow. A VM its host pauses without the guest's clock catching up breaks that: don't run cluster nodes on hosts that pause VMs without adjusting their clocks.
   - **The map's writer holds a lease too (1.3.0, D330).** From the first writer term on, it changes the map only while a majority grants it. With the map's `failover` on (off by default, set with `set-map`), a writer whose lease has been out for `--cluster-failover-after-ms` (default twice `--cluster-lease-ms`) is replaced by an elected one; `phdb cluster status` shows the writer, its term and its lease. A forced map raises the term, so a writer it replaced can't change the map when it comes back.
-  - **Partition failover (1.3.0, D330).** With the map's `failover` on, the writer promotes a down partition's freshest replica on its own. A partition is down once its owner's lease has been out for `--cluster-failover-after-ms`, and no node still grants it.
-    - The new owner serves once a majority grants its lease, about L + the margin + a few rounds after the owner went (30–35 s with the defaults).
-    - **What can be lost:** replication is asynchronous, so a failover can lose the commits the replica hadn't applied. The map's event records the known part (`primary_seqno − applied_seqno`). Commits acknowledged in the last heartbeat and lease before the owner went may be lost too.
-    - `--cluster-failover-max-lag-ms` refuses a replica staler than that. Set a partition's `failover` to `OFF` in the map to opt it out.
-    - `phdb cluster status` shows each failover and election (the map's `failovers`), and why a down partition isn't failed over (`failover_blocked`). `/metrics` has `pigeonhole_cluster_failovers_total{partition}` and `pigeonhole_cluster_writer_term`.
-    - **In-doubt transactions:** the event lists the old owner's in-doubt transaction shares, as of its last renewal. After a failover of a partition that homes spanning transactions, check every node's in-doubt list.
-    - **The old owner** doesn't rejoin on its own: it keeps its file and serves nothing for the partition. Drop it there (`phdb cluster drop-partition`), or add its node back to the replicas once you've copied off anything you need.
-    - **A promote that didn't finish leaves an orphaned copy.** If the writer stops after stamping the replica it promotes and before the map, the next writer finishes the promote while the partition is still down. If the owner comes back and serves first, the writer abandons the promote.
-      - **What status shows:** `failover_blocked` names the copy: "an unfinished promote stamped node X at epoch E: drop that copy".
-      - **What it can't do:** that copy serves nothing, and a node doesn't open it as a replica.
-      - **To get it back as a replica:**
-        1. Run `phdb cluster drop-partition P --node <X>` on that node.
-        2. Add the node to P's `replicas` with `set-map`. If it's already listed, set the map again with no other change, or wait for the next map change: the node opens the replica only when a map that lists it lands after the drop.
-        3. It then downloads a fresh copy from P's owner.
-      - **Epochs:** every later change of P's epoch (a relocation, a move, a range move's hand-over) goes above the epoch the promote stamped, so that copy is never taken for P's history.
+  - **Partition failover (1.3.0, D330).** With the map's `failover` on, the writer promotes a down partition's freshest replica on its own: [Automatic failover](#automatic-failover).
   - **Partition load (1.3.0, D332).** `phdb cluster status` shows each partition's `load_cpu`, `load_device` and `load` (the larger), exponential averages over `--balance-window` (seconds, default 300, 30 to 86400: each 30 s reading weighs `1 − e^(−30/window)`), for the cluster balancer. Every node folds them once a second, whether or not anyone reads them.
     - `load_cpu` is the partition's share of the node's cores: its shards' busy time, or their group-sync time if larger, plus sampled request CPU (one call in 16 per thread). The sampled CPU includes the reads' work on the server's read pools. CPU outside its service calls isn't counted (request decoding and encoding, framing, sockets).
     - `load_device` is its bytes per second at its files over the node's ceiling: the highest one-second rate of the same counters, summed over the node's partitions, within the window. It's per node and measured, with no flag. These are the engine's own estimates, for every file of the partition (metadata such as the manifest included): reads the OS page cache served count too. A newly opened partition's counts start from its open, so its open doesn't count toward the ceiling.
     - Use them to compare partitions, not as absolute CPU or disk use.
+  - **The cluster balancer (1.3.0, D332). Off by default.** The map's writer can move whole partitions to even out the nodes' size and load: [The cluster balancer](#the-cluster-balancer).
   - `--cluster-lease-ms` must be at least 3 times `--cluster-push-timeout-ms`, and not 0. **Every node must take the same value:** a node refuses to grant a lease to one whose `--cluster-lease-ms` differs (`FailedPrecondition`, naming both values, in the asking node's log), since a node with a longer lease than its peers' could serve past their grants. Change it on every node by restarting them one at a time only if a majority keeps one value throughout; otherwise stop them all and start them with the new value.
   - **During a rolling upgrade from 1.2** (#2047), a 1.2 node doesn't grant leases (it answers `Cluster.Lease` with `Unimplemented`). A 1.3 node counts each 1.2 node that holds the round's map as granting (a node whose `Status` lacks the `leases` feature), so the first node upgraded serves as soon as it restarts, as a 1.2 node would, and logs once per such peer that it does. A 1.3 node that reports `leases` but whose `Cluster.Lease` answers `Unimplemented` counts as nothing, and the log says to check what sits between the nodes: a proxy or ingress in front of a node must route every `/pigeonhole.v1.Cluster/` call, `Lease` and `Release` included. While any node runs 1.2, the guarantee is 1.2's (a majority holds the map naming the node), not the lease's: a 1.2 node withholds nothing, so after `relocate --old-unreachable` or a forced map, an old owner on the other side of a cut may serve until its lease runs out. A 1.2 node that doesn't answer counts as nothing, as any node does: a 1.3 node cut off still stops within its lease. Finish the upgrade before relying on the lease, and don't `relocate --old-unreachable` mid-upgrade unless the old node is known to be down.
   - **Backups aren't gated by the lease:** `phdb cluster backup`, `Admin.Backup` and `Admin.BackupDownload` copy a partition whether or not its node holds the lease. A copy of a fenced or closed partition is what a move or a recovery needs.
@@ -1013,7 +1007,7 @@ A node writes a partition only while its newest map names it for the partition a
 - **Errors:** `Fenced` (409, gRPC `FAILED_PRECONDITION`) means the write wasn't applied because its partition is fenced or has no lease. Send it again once the partition is unfenced or has moved: a node that takes it reroutes to the new owner. A read on a partition without a lease answers `PartitionUnavailable`, and a write whose commit outran its lease `OutcomeUnknown` (D326).
 
 ### Read replicas in a cluster
-**New in 1.3.0 (D328, ICR 0117).** A partition can have read replicas: whole copies on other nodes that follow its owner and serve reads that accept a bounded staleness. One can be made the owner by hand with `phdb cluster promote` (below); automatic failover is #1484.
+**New in 1.3.0 (D328, ICR 0117).** A partition can have read replicas: whole copies on other nodes that follow its owner and serve reads that accept a bounded staleness. One can be made the owner by hand with `phdb cluster promote` (below), or by the cluster itself when its owner goes down ([Automatic failover](#automatic-failover)).
 - **Placing them.** List the nodes in the partition's `replicas` in the map, through `phdb cluster set-map`, in order of preference. Each must be a node of the map, not the partition's own node, and listed once. A node removed from the map must be dropped from every `replicas` list first. Changing `replicas` isn't a move: the partition's epoch and owner stay as they are. Every node must run a build that knows replicas (it reports the `replicas` map feature) before a map can add the first one.
 - **The owner's change feed must be on** (`--change-feed` on the owner's node). A replica follows the owner's feed, so without it the replica can't start: its status says `OWNER_FEED_OFF`, and it tries again until the feed is on. The owner's feed retention is also how long a replica may be down or behind before it must copy the whole partition again, as for a [single node's replica](#replicas): size it for the longest replica outage you want to ride out.
 - **What a node does with one.** A node listed in P's `replicas` opens `DIR/P.phdb` as P's replica copy (made empty if missing), downloads a copy of P from its owner, then follows the owner's commits. A map that drops the node closes the copy; the file stays until `phdb cluster drop-partition P` moves it aside. A replica copy takes no writes of its own, holds no lease and is never fenced. It counts in the node's budgets (`--shards`, `--compaction-threads`, `--engine-memory`) like a partition it owns.
@@ -1040,6 +1034,202 @@ A node writes a partition only while its newest map names it for the partition a
   - **Run it again** to finish one that stopped: it carries on from the closed or stamped copy. If the map changed in between (a `set-map`, relocate or another promote), the rerun is refused, so it can't replace what the partition took since. Check the map, then move ID's file aside (`phdb cluster drop-partition P --node <ID>`).
   - **The old owner afterwards** keeps its files, and serves nothing for P once it holds the new map. Leases (D326) keep it from serving P once ID does. To have it follow ID as a replica: `phdb cluster drop-partition P --node <old owner>` (its files go aside, so copy off anything you want from its tail first), then add it to P's `replicas` with `set-map`. Its unreplicated commits are gone either way.
 - **Moving P onto a node that holds its replica** (`move`, `relocate`, `restore --partition`): the command first sets a map without that node in P's replicas and waits for it to close its copy. The copy's file goes aside when P's files are installed there.
+
+### Automatic failover
+**New in 1.3.0 (D330, ICR 0117). Off by default.** With the map's `failover` on, the cluster replaces a partition's owner that has gone down with one of its [read replicas](#read-replicas-in-a-cluster), and replaces a map writer that has gone down with an elected one. Nobody has to run `phdb cluster promote` or `set-map --force`.
+
+**Failover can lose acknowledged writes.** Replication is asynchronous, so the replica that takes over may not have every commit the old owner acknowledged ([What can be lost](#what-can-be-lost)). Turn it on only where that's acceptable.
+
+#### Turning it on
+- **In the map:** set `"failover": true` with `phdb cluster set-map`. It's a map field, so every node agrees on it and a new writer inherits it.
+- **One partition out:** set that partition's `"failover": "FAILOVER_MODE_OFF"`. The map's flag is the master switch: with it off, a partition's own `ON` does nothing.
+- **What it needs:**
+  - three or more nodes, since everything here takes a majority of the map's nodes;
+  - at least one replica for each partition that should fail over;
+  - every node on a build that keeps the `writer_terms` map feature (1.3.0). Until then the map can't carry `failover`.
+- **Flags, on every node:**
+  - `--cluster-failover-after-ms` is the margin A: how long a lease must have been out before the cluster acts. The default, 0, means twice `--cluster-lease-ms`.
+  - `--cluster-failover-max-lag-ms` refuses a replica staler than that (default 0: no limit beyond the freshness rule below).
+- **With it off,** a down partition stays down until an operator promotes a replica, and a down writer until a forced map. `phdb cluster status` still reports the down partition, with "failover off".
+
+#### What fails over, and when
+Two things can fail over. Both wait for the same two times: the lease L (`--cluster-lease-ms`, default 10 s) and the margin A (default 2·L).
+
+- **A partition, when its owner goes down.** The writer is one of every partition's grantors, so it sees each owner's renewals. P is **down** once the writer's own grant of P to its owner has been out, unrenewed, for A.
+  - The writer then asks every node at once (a survey, bounded by the push timeout). It fails P over only if no other node still grants P's lease to the owner, and the owner doesn't answer as serving P.
+  - It promotes the freshest replica that qualifies, by the same steps as `phdb cluster promote`. One promote runs at a time.
+- **The writer, when it goes down.** A node starts an election once its grant of the writer lease has been out for A and every node it reaches reports no writer lease.
+  - Smaller ids go first: each live node with a smaller id gets one more A before a larger one tries.
+  - The candidate first asks whether a majority would vote (a pre-vote), then takes the votes at a higher writer term, and sets the newest map that majority holds, naming itself.
+  - The new writer then fails over the old writer's partitions as above.
+
+**Which replica.** Of P's replicas, the writer takes the one with the highest applied seqno (then the map's order) whose copy:
+- is `FOLLOWING` or `BEHIND`;
+- is on a node that holds the writer's own map;
+- is inside P's current history (not still copying after a restore or an earlier promotion);
+- had heard from the owner no earlier than a heartbeat (1 s) before the owner's last renewal, and is within `--cluster-failover-max-lag-ms` if set.
+
+**What isn't failed over.** `phdb cluster status` lists each down partition the writer leaves alone, with the reason (`failover_blocked`):
+- failover is off, for the map or for that partition;
+- it has no replicas, or none qualifies;
+- its owner answers and serves it;
+- the operator fenced or closed it on its node. A lease that ran out because of that is the operator's doing;
+- another node still grants its lease to the owner ("node X still grants its lease"). The owner is alive and only the writer is cut off from it;
+- the writer has seen no renewal from the owner since the writer's node started, so it can't tell how fresh a replica is. The reason says to promote by hand (`phdb cluster promote P --to <replica> --old-unreachable`).
+
+A blocked partition is looked at again when its reason can have ended: when the grant it waits on runs out, on a map change, or after A.
+
+#### The timeline
+With the defaults (L = 10 s, A = 20 s), counted from the owner's last renewal that reached a majority. Renewals go every third of a lease, so from the failure itself it's up to L/3 less.
+
+| After the last renewal | What happens |
+|---|---|
+| up to L (10 s) | The owner's lease runs out. An owner that's cut off but alive stops serving P by then. |
+| L + A (30 s) | The writer counts P down and surveys the nodes. |
+| a few seconds more | The promote: a map that records it pending, the stamp of the replica's copy, the map that gives it P. Then the new owner's lease round. |
+| about 30–35 s | P serves on the new owner. |
+
+- **The formula:** L + A + the survey + the promote + one lease round. The margin is why the new owner never waits on the old one's lease: the old grants ran out a whole A earlier.
+- **A down writer takes longer.** The election comes first, about L + A after the writer's last renewal, plus one A for each smaller-id node that's alive but didn't win. The new writer then counts each partition's silence from a lease after it took office, so the old writer's own partitions serve again after about 2·(L + A): a little over a minute with the defaults.
+- **Shorter:** lower `--cluster-lease-ms` (it must stay at least 3 times `--cluster-push-timeout-ms`, and the same on every node) or `--cluster-failover-after-ms`. A margin under one lease gives a slow owner less time to renew before it's replaced.
+
+#### What a client sees
+Any node still takes any call, before, during and after.
+- **While P is down:**
+  - A call for P answers `PartitionUnavailable` when its node can't be reached. Nothing was sent, so it's safe to retry, writes included.
+  - An owner that's alive but cut off from the majority answers `Fenced` to writes and `PartitionUnavailable` to reads once its lease has run out. A write whose commit returned after the lease ended answers `OutcomeUnknown`: read it back before you retry.
+  - Reads that allow staleness (`x-pigeonhole-read-replica-max-lag-ms`) go on from P's replicas for as long as the bound allows. The replicas hear nothing new, so a read with a bound of N ms stops being served about N ms after the owner went. The replica being promoted stops serving reads when the promote starts, at about L + A, whatever the bound.
+  - Feed streams of P end with `PartitionUnavailable`, or a `partition_state` event with `allow_partial` ([When a partition's node is down](#when-a-partitions-node-is-down)).
+  - Other partitions aren't affected.
+- **Once P serves on its new owner:**
+  - Calls go there through any node. Retry what answered `PartitionUnavailable`.
+  - **P has a new history,** as after a manual promotion:
+    - change-feed tokens for P from before answer `FeedExpired`: read the tables again and subscribe from there;
+    - a seqno you kept for read-your-own-writes names nothing in the new history: drop it;
+    - P's other replicas copy it again from the new owner, serving their old copy meanwhile.
+  - Open transactions and pinned snapshots on P ended with its old node. Begin again.
+  - A write the old owner acknowledged may be missing. Nothing tells the client which.
+- **While the writer is down,** data calls go on as before. No map change and no schema call (`CreateTable`, `DropTable`) can be made until a writer is elected.
+- **Spanning transactions** ([Transactions across partitions](#transactions-across-partitions)) whose home was P: their home's history changed, so `Outcome` answers unknown and their shares on other partitions stay in doubt with that reason. Decide them with `phdb cluster txn decide`.
+
+#### What can be lost
+- **The known part:** the commits the owner had made durable and the promoted copy hadn't applied. The map's event records it as `primary_seqno − applied_seqno`.
+- **The rest:** commits the owner acknowledged in the last heartbeat (up to 1 s) before it was cut off, and those in the lease that followed. A cut-off owner stops acknowledging within L.
+- **To bound it,** set `--cluster-failover-max-lag-ms`: a failover to a staler replica is refused, and P stays down for an operator. Nothing in 1.3.0 makes a commit wait for a replica.
+- **In-doubt transaction shares** on the old owner are lost with its history. The event lists them, as of the owner's last renewal. After a failover of a partition that homes spanning transactions, check every node's in-doubt list (`phdb cluster status`).
+
+#### The old owner
+- **Cut off but alive,** it stops serving P within the lease. No other node serves P until the old owner's grants have run out, and a failover comes a whole A after that, so the two never serve P at once.
+- **If it comes back before the failover,** it renews its lease and serves again. The writer sees the renewal and leaves P alone.
+- **If it comes back after,** it takes the newer map, finds P on another node and serves nothing for it. Its file stays at the old epoch.
+  - It doesn't rejoin on its own. Copy off anything you need from its unreplicated tail, drop the file (`phdb cluster drop-partition P --node <old owner>`), then add the node to P's `replicas` with `set-map`. It copies P again from the new owner.
+- **An old writer that comes back** takes the elected map, which has a higher term, and follows it. The nodes that voted refuse every map and writer lease below the new term, so the old writer can't change the map at its old one.
+
+#### Seeing it
+- **`phdb cluster status`** shows:
+  - the writer, its term and its lease, and whether `failover` is on;
+  - `failovers`: the map's last 16 finished events and every pending one. A partition's event has its old and new node, the writer and its term, `applied_seqno` and `primary_seqno`, the in-doubt shares, the epoch it stamped and its state (pending, done or abandoned). An election's event names the old and new writer;
+  - `failover_blocked`: each down partition that isn't failed over, and why.
+- **`/metrics`:** `pigeonhole_cluster_failovers_total{partition}` and `pigeonhole_cluster_writer_term`. Every node shows the same values, since they come from the map.
+- **The writer's log** has a line for each failover and election.
+
+#### Two cases that settle themselves
+- **A node that lost an election.** A candidate can pass its pre-vote and then lose the vote itself, for example when it's cut off between the two. It has recorded its own vote, so it refuses every map of the lower term the cluster is still on.
+  - **What you see:** that node's partitions stay fenced and it routes by an old map, for up to about a lease after it's reachable again, and usually only a lease round or two. The other nodes go on serving and renewing.
+  - **What ends it:** the live writer notices a node that stays behind, reads the term it voted for, and holds an election of its own at one term above. It wins, since every node already grants it the writer lease, and the stranded node takes that map. `failovers` shows a writer event from the writer to itself.
+  - Nothing for the operator to do.
+- **A promote that didn't finish.** If the writer stops after stamping the replica it promotes and before the map, the promote stays pending in the map.
+  - **While P is still down,** the next writer finishes it: same replica, same epoch.
+  - **If the owner comes back and serves first,** the writer abandons the promote. It can't finish while the old owner holds a lease.
+  - **What's left is an orphaned copy** on the node it stamped. That copy serves nothing, and a node doesn't open it as a replica. `failover_blocked` names it: "an unfinished promote stamped node X at epoch E: drop that copy".
+  - **To get it back as a replica:**
+    1. Run `phdb cluster drop-partition P --node <X>` on that node.
+    2. Add the node to P's `replicas` with `set-map`. If it's already listed, set the map again with no other change, or wait for the next map change: the node opens the replica only when a map that lists it lands after the drop.
+    3. It then downloads a fresh copy from P's owner.
+  - **Epochs:** every later change of P's epoch (a relocation, a move, a range move's hand-over) goes above the epoch the promote stamped, so that copy is never taken for P's history.
+
+#### What it can't do
+- **A lost majority.** Nothing can be granted, so nothing fails over and no writer is elected: a minority can't tell a dead majority from one it's cut off from. Recovery is still `set-map --force` with a map without the lost nodes ([Running a cluster](#running-a-cluster)).
+- **Two nodes.** A majority is both, so with one down nothing fails over.
+- **A replica cut off with its owner.** If P's owner and its only replica are on the same side of a split, away from the majority, there's nothing to promote.
+- **Rejoin the old owner.** It becomes a replica again only by the steps above.
+- **Lose nothing.** See [What can be lost](#what-can-be-lost).
+
+### The cluster balancer
+**New in 1.3.0 (D332, ICR 0117). Off by default.** With the balancer on, the map's writer moves whole partitions off a node that holds more than its share of the cluster's size or load, one move at a time. It reacts only to imbalance that lasts: a node must stay over its bound for minutes before anything moves, and what a move touched then rests for half an hour.
+
+#### Turning it on
+- **`phdb cluster balancer resume --node URL`** turns it on (the map's `"balancer": "BALANCER_MODE_ON"`), from off or paused. You can also set the field with `phdb cluster set-map`.
+- **What it needs:** every node on a build that keeps the `balancer` map feature (1.3.0). Until then the map can't turn it on.
+- **`phdb cluster balancer pause --node URL`** (PAUSED) lets a move in flight finish and starts no other. Setting the map's `balancer` to OFF does the same, and the balancer does nothing more.
+- The mode, the bounds and the pins are map fields, so every node agrees on them and a new writer keeps them.
+
+#### What it does
+Every 30 s, the writer reads each node's open partitions (their size from the file system, with no read of their files, and their load: the "Partition load" note under [Fencing and relocation](#fencing-and-relocation)), and compares each node with the mean of the nodes that answered:
+- **A node's share is per unit of its weight.** Give a bigger machine a bigger `weight` in the map's `nodes` (an integer; 0 or unset counts as 1). A node with weight 2 is expected to hold twice the bytes and load of a node with weight 1.
+- **A node is over its bound** when its size or load per unit of weight is above `size_ratio` or `load_ratio` (default 1.25) times the mean.
+- **The move:** once a node has been over its bound for `passes` passes in a row (default 10, so about 5 minutes), the writer moves one of its partitions to the node that brings both closest to the mean.
+  - The move never takes the target over its own bound, and never puts a partition on a node that holds one of its replicas.
+  - Ties go to the smaller partition.
+  - A partition whose copy wouldn't finish within the dwell (reckoned at 64 MiB/s) isn't moved. At the defaults that's over about 112 GiB, beyond `partition_max_bytes`, so it matters only with a short dwell.
+- **It keeps going on the same node** while that node stays above `1 + 0.4 × (ratio − 1)` (1.1 at the default ratio), so it doesn't stop just under the bound and start again a pass later.
+- **The rest (`dwell_ms`, default 30 minutes):** the partition moved, and both nodes, aren't moved from or to again until it ends. With the defaults, the cluster changes at most a few times an hour.
+- **One move at a time, cluster-wide.** Nothing starts while any move is in flight, an operator's `phdb cluster move` or range move included.
+- **A node that didn't answer** is neither a source nor a target, and its count of passes starts again.
+
+**A balancer move is a [`phdb cluster move`](#fencing-and-relocation)** run by the writer with its cluster token, and recorded in the map under an id starting `bal-`:
+- **During the move:** the partition is fenced and closed on its old node, its files are copied whole and it opens on the new one. Writes answer `Fenced` and reads `PartitionUnavailable` for about as long as the copy takes: retry them.
+  - **How long:** the copy runs as fast as the disks and network allow; a whole move isn't held to a rate. As a planning figure, at 64 MiB/s that's about 16 s per GiB, so about 8.5 minutes for a 32 GiB partition.
+  - **Where an outage of that length matters,** keep the balancer paused or off and move partitions by hand in a window, or pin the ones that must stay up.
+- **Open transactions and pinned snapshots** on that partition end with the move. Clients begin them again once it serves on its new node.
+- **Kept:** the partition's history, so change-feed tokens resume and spanning transactions homed there keep their outcomes. A partition with prepared spanning-transaction shares still in doubt is never moved.
+- **Protect the cluster token** as you protect an admin token ([Securing a cluster](#running-a-cluster)): it's what the writer moves partitions with.
+
+#### What it leaves alone
+- **A pinned partition.** `phdb cluster balancer pin P --node URL` keeps P on its node; `unpin` lets the balancer act on it again. An operator's pin never expires.
+- **A partition that keeps moving.** One moved `max_moves` times (default 3) within `bounce_window_ms` (default 24 h) is pinned by the balancer, with the reason "bouncing". That pin expires after another bounce window. An operator's `pin` or `unpin` replaces it.
+- **A pinned range.** A table's `pinned_ranges` in the map (each a `start` and `end` split key, half-open) keeps those keys where they are. A partition holding one is never moved.
+- **A partition in any move,** or with spanning-transaction shares in doubt.
+
+#### Splits and merges
+The balancer also judges partitions too big (over `partition_max_bytes`, default 32 GiB) or too hot (over `partition_max_load`, default 0.5 of a node), and small, cold ones (under `partition_min_bytes`, default 4 GiB). Splitting and merging them use the online split and merge (D331). Until those land, `status` names the partition and says its split or merge waits.
+- **A split** will cut at a tablet boundary that halves the partition, never inside a pinned range. If the best cut leaves over 80% on one side (a hot key), the partition is reported as unsplittable instead.
+- **A merge** will join a partition only with a neighbour (one holding the next range of one of its tables), and only while the two together stay under **half** of `partition_max_bytes` and `partition_max_load`. So a merge never makes a partition the next pass would split.
+- **Never split or merged:** a table in a co-location group, or one an index follows. Those partitions move only whole.
+
+#### The bounds
+Set them in the map's `balance` with `set-map`. Each field left at 0 takes its default:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `size_ratio`, `load_ratio` | 1.25 | A node's bound, as a multiple of the mean per unit of weight. Must be above 1. |
+| `passes` | 10 | Passes in a row (30 s each) a condition must hold before an action. |
+| `dwell_ms` | 1,800,000 (30 min) | How long what an action touched rests. |
+| `max_moves`, `bounce_window_ms` | 3, 86,400,000 (24 h) | A partition moved this often within the window is pinned. |
+| `partition_max_bytes` | 32 GiB | Over this, a partition is too big (a split). |
+| `partition_max_load` | 0.5 | Over this share of a node, a partition is too hot (a split). At most 1. |
+| `partition_min_bytes` | 4 GiB | Under this, and cold, a partition is small (a merge). At most a quarter of `partition_max_bytes`. |
+
+#### Seeing it
+- **`phdb cluster balancer status --node URL`** shows:
+  - the mode and the writer;
+  - `state`: the writer's last decision and why. Examples: "skip: within bounds", "skip: node a is over its bound, but no partition on it can move within the bounds", "moving p3 from a to c (bal-…): node a is at 1.43x the mean size", "paused", "waiting: move … is in flight";
+  - the pinned partitions, and whether the balancer or an operator pinned each;
+  - the bounds in force;
+  - the last 32 events: each move, the balancer's pins and their expiry, and each abort, with its partition, nodes, reason and time.
+- **A pass that does nothing changes nothing in the map.** Its reason is only in `state`, not an event.
+- **Each partition's `moves_history`** in the map keeps its last 8 balancer moves and pins.
+- **`/metrics` on the writer:**
+  - `pigeonhole_cluster_balancer_actions_total{kind}`: `move`, `pin` (a pin or its expiry) and `abort`. It counts from the writer's start;
+  - `pigeonhole_cluster_node_load_ratio{node}`: each node's load per unit of weight over the mean, at the last pass.
+
+#### When the writer changes
+A new writer, after a failover or a forced map, keeps the mode, bounds and pins from the map. Its counts of passes start again, so it waits out `passes` before acting.
+- **A balancer move the old writer left behind:**
+  - **Before its commit point** (the map still gives the partition to its old node), the new writer aborts it: the target's copy goes aside, the partition serves on its old node again, and an ABORT event says so.
+  - **Past it,** the new writer finishes the move.
+- **With the balancer off (not paused),** such a move stays recorded. A paused balancer still aborts or finishes it. Run it again with `phdb cluster move`, or end it with `phdb cluster move P --abort`.
+- **The writer's lease bounds the balancer's moves at every term:** a writer cut off from the majority can't advance one.
 
 ### Backup and restore
 - **`phdb cluster backup DIR --node URL`** backs up every partition, each through the node the map gives it, into a new or empty `DIR`. It writes `<partition>.phdb` for each partition, `map.json` and `manifest.json`.

@@ -53,7 +53,7 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
         eventually("c to open p3 and serve it", async || {
             client(c)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -96,7 +96,7 @@ fn a_map_that_gives_a_node_a_partition_opens_it_and_it_serves() {
         eventually("c's p3 to reconcile to the map with items", async || {
             client(c)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -336,6 +336,8 @@ fn opened_off_the_others_cores_alone() {
         replicas: Vec::new(),
         failover: 0,
         failover_count: 0,
+        pinned: Default::default(),
+        moves_history: Default::default(),
     };
     let mut map = ClusterMap {
         cluster_id: "c1".into(),
@@ -344,6 +346,7 @@ fn opened_off_the_others_cores_alone() {
         nodes: vec![MapNode {
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
+            weight: Default::default(),
         }],
         partitions: vec![part("p1")],
         tables: vec![TablePlacement {
@@ -353,6 +356,7 @@ fn opened_off_the_others_cores_alone() {
             splits: Vec::new(),
             partitions: vec!["p1".into()],
             created: 0,
+            pinned_ranges: Default::default(),
         }],
         indexes: Vec::new(),
         memory: None,
@@ -362,6 +366,9 @@ fn opened_off_the_others_cores_alone() {
         failover_rejoin: false,
         failovers: Vec::new(),
         moves: Vec::new(),
+        balancer: Default::default(),
+        balance: Default::default(),
+        balancer_events: Default::default(),
     };
     super::super::write_map(&dir, &super::super::map::canonical_json(&map)).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -656,6 +663,8 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        moves_history: Default::default(),
+        pinned: Default::default(),
         id: id.into(),
         node: "a".into(),
         epoch: 1,
@@ -666,14 +675,19 @@ fn a_run_time_open_resplits_the_engine_memory_and_a_close_gives_it_back() {
         failover_count: 0,
     };
     let mut map = ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: 1,
         nodes: vec![MapNode {
+            weight: Default::default(),
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
         }],
         partitions: vec![part("p1")],
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
@@ -794,6 +808,8 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        moves_history: Default::default(),
+        pinned: Default::default(),
         id: id.into(),
         node: "a".into(),
         epoch: 1,
@@ -804,17 +820,22 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         failover_count: 0,
     };
     let mut map = ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: 1,
         previous_nodes: Vec::new(),
         indexes: Vec::new(),
         memory: None,
         nodes: vec![MapNode {
+            weight: Default::default(),
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
         }],
         partitions: vec![part("p1")],
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
@@ -884,13 +905,13 @@ fn an_open_past_the_engine_memory_is_refused_and_a_restart_serves_it() {
         })
         .await;
     });
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let listener = HeldPort::take(port).listen();
     let (_stop, dbs, _node) = start(listener, vec![("p1", Some(p1)), ("p3", None)], true);
     rt.block_on(async {
         eventually("p3 to serve after the restart", async || {
             client(port)
                 .await
-                .status(StatusRequest {})
+                .status(StatusRequest::default())
                 .await
                 .unwrap()
                 .into_inner()
@@ -975,7 +996,7 @@ async fn give_c_p3(ports: &[u16; 3]) {
 async fn p3_on_c(c: u16) -> Option<crate::serve::proto::LocalPartition> {
     client(c)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -1091,7 +1112,7 @@ async fn create_items_on(port: u16, p: &str) {
 async fn part_on(port: u16, p: &str) -> Option<crate::serve::proto::LocalPartition> {
     client(port)
         .await
-        .status(StatusRequest {})
+        .status(StatusRequest::default())
         .await
         .unwrap()
         .into_inner()
@@ -1322,6 +1343,8 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let part = |id: &str| Partition {
+        moves_history: Default::default(),
+        pinned: Default::default(),
         id: id.into(),
         node: "a".into(),
         epoch: 1,
@@ -1332,14 +1355,19 @@ fn a_run_time_open_keeps_the_feed_history_its_partition_came_with() {
         failover_count: 0,
     };
     let mut map = ClusterMap {
+        balance: Default::default(),
+        balancer: Default::default(),
+        balancer_events: Default::default(),
         cluster_id: "c1".into(),
         map_version: 1,
         nodes: vec![MapNode {
+            weight: Default::default(),
             id: "a".into(),
             address: format!("127.0.0.1:{port}"),
         }],
         partitions: vec![part("p1")],
         tables: vec![TablePlacement {
+            pinned_ranges: Default::default(),
             name: "users".into(),
             group: String::new(),
             families: Vec::new(),
