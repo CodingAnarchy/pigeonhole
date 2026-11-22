@@ -1335,7 +1335,9 @@ Both run on the map's writer, through its own map changes, and print each phase 
 - **One move per partition at a time,** and none of a table in a co-location group or one an index follows.
 - **`--max-move-followers`** moves copy from one node's partitions at once; a further one waits (`Overloaded`). `--move-retention-cap` bounds the change history a move keeps on `S`: a copy that would outrun it is refused before it starts, and one that does anyway must be aborted.
 
-**What to watch:** `phdb cluster status` shows each move's phase on `S` and `T`, the bytes copied, how far `T`'s catch-up is behind, what `T` waits for (an earlier abort's drop of an overlapping range) and why a move stopped, if it did.
+**What to watch:** `phdb cluster status` shows each move's phase on `S` and `T`, the bytes copied, how far `T`'s catch-up is behind, what `T` waits for (an earlier abort's drop of an overlapping range) and why a move stopped, if it did. `T`'s `/metrics` has `pigeonhole_cluster_move_follower_lag_ms{move}`, how far behind `S`'s commits each move's catch-up applies; `S`'s has `pigeonhole_cluster_move_copies_refused_total`.
+
+**Backups and restores:** a whole restore ([Backup and restore](#backup-and-restore)) ends every range move in flight: the backup's map has no move record, and each restored file is clipped to that map's ranges, so a range a move had half copied isn't served twice. `restore --partition` is refused while a move names the partition.
 
 **Change feeds:** a subscription to the table goes on across the move, in per-key order: it reads the range from `S` until the hand-over, then from `T`. A token from before a move's hand-over still resumes while the move's rows are kept (the change-feed retention past the hand-over). Once they're pruned, such a token answers `FeedExpired` on any copy of `S` or `T`: open the feed again.
 
