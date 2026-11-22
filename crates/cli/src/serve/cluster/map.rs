@@ -696,7 +696,7 @@ pub(crate) fn handed_over(
 }
 
 /// A split key for `bytes` in canonical form: `text` when they're UTF-8, else `raw`.
-fn canonical_key(bytes: &[u8]) -> SplitKey {
+pub(crate) fn canonical_key(bytes: &[u8]) -> SplitKey {
     SplitKey {
         key: Some(match std::str::from_utf8(bytes) {
             Ok(s) => split_key::Key::Text(s.to_owned()),
