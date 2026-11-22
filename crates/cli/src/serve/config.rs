@@ -158,9 +158,10 @@ pub(crate) struct ServeArgs {
     /// commit never meets it.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub txn_resolve_delay: Option<Duration>,
-    /// How long a transaction's decision record is kept after every partition acknowledged
-    /// it (D329): `Transactions.Outcome` answers it for this long, e.g. `24h`. At least
-    /// `--txn-lifetime-ms` + the request timeout + 1 minute.
+    /// How long a transaction's decision record is kept, from the time of the decision
+    /// (D329): `Transactions.Outcome` answers it for this long, e.g. `24h`. A commit's record
+    /// also stays until every partition has acknowledged it. At least `--txn-lifetime-ms` +
+    /// the request timeout + 1 minute.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration, default_value = "24h")]
     pub txn_outcome_retention: Duration,
     /// How long a pinned snapshot may sit idle, in milliseconds: each read at it renews it.
@@ -370,9 +371,10 @@ pub(crate) struct ServeArgs {
         conflicts_with = "file"
     )]
     pub cluster_lease_ms: u64,
-    /// The failover margin, in milliseconds (D330): how long the map's writer goes without
-    /// its writer lease before another node is elected in its place, while the map has
-    /// failover on (`phdb cluster set-map`). 0: twice `--cluster-lease-ms`.
+    /// The failover margin, in milliseconds (D330), while the map has failover on (`phdb
+    /// cluster set-map`): how long a partition's owner goes without its lease before the
+    /// map's writer promotes a replica in its place, and how long the writer goes without
+    /// its own before another node is elected. 0: twice `--cluster-lease-ms`.
     #[arg(
         long,
         value_name = "MS",
