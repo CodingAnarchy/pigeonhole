@@ -382,6 +382,25 @@ pub(crate) async fn restore(args: &NodeArgs, r: &RestoreArgs) -> Result<Report, 
             .iter()
             .flat_map(|l| &l.partitions)
             .find(|q| q.id == p.id);
+        // A node holding P's replica copy (D328) refuses P's stamp, which comes only after
+        // every upload, and maybe after other partitions' stamps. A move or relocate takes
+        // the node out of P's replicas first (`leave_replicas`); a whole restore doesn't, so
+        // it's refused here, before anything changes (audit120's M10). By the live map's
+        // replicas, or the copy the node itself reports.
+        let replica_here = old.is_some_and(|o| o.replicas.contains(&p.node))
+            || states.get(&p.node).is_some_and(|s| {
+                s.iter()
+                    .flatten()
+                    .any(|lp| lp.id == p.id && lp.role == proto::PartitionRole::Replica as i32)
+            });
+        if replica_here {
+            return Err(Failure::usage(&format!(
+                "node {:?}, which partition {} is restored to, holds a replica copy of it: set \
+                 a map without {:?} in {}'s replicas, move the copy aside (phdb cluster \
+                 drop-partition {} --node <{}'s URL>), then restore again",
+                p.node, p.id, p.node, p.id, p.id, p.node
+            )));
+        }
         if let Some(o) = old
             && o.node != p.node
             && !r.old_unreachable
@@ -728,6 +747,31 @@ fn schema_against(
     Ok((empty, dropped))
 }
 
+/// `restore --partition`'s refusal while move record `m` names `partition` in the live map
+/// (at `version`), worded by the record's kind (audit120's M9): a range move, a split, or a
+/// whole partition's move to another node, whose abort has its own command.
+fn moving_refusal(m: &proto::RangeMove, partition: &str, version: u64) -> Failure {
+    let then = match proto::MoveKind::try_from(m.kind).unwrap_or_default() {
+        proto::MoveKind::Node => format!(
+            "move {:?} relocates partition {partition:?} in the live map (version \
+             {version}): finish it, or abort it before its commit point (phdb cluster move \
+             {partition} --abort), then restore",
+            m.id
+        ),
+        proto::MoveKind::Partition => format!(
+            "split {:?} names partition {partition:?} in the live map (version {version}): \
+             finish or abort it, then restore",
+            m.id
+        ),
+        _ => format!(
+            "range move {:?} names partition {partition:?} in the live map (version \
+             {version}): finish or abort it, then restore",
+            m.id
+        ),
+    };
+    Failure::usage(&then)
+}
+
 /// [`schema_against`]'s refusal: `name`'s range on `partition` changed since the backup.
 fn moved_range(partition: &str, kind: &str, name: &str) -> Failure {
     Failure::usage(&format!(
@@ -800,11 +844,7 @@ async fn restore_partition(
         .iter()
         .find(|m| m.from == partition || m.to == partition)
     {
-        return Err(Failure::usage(&format!(
-            "range move {:?} names partition {partition:?} in the live map (version {}): \
-             finish or abort it, then restore",
-            m.id, live.map_version
-        )));
+        return Err(moving_refusal(m, partition, live.map_version));
     }
     let target = r.to.clone().unwrap_or_else(|| now.node.clone());
     let nodes: BTreeMap<String, String> = live
@@ -1426,5 +1466,36 @@ mod tests {
         assert_eq!(unhex(&h), Some([0xab; 32]));
         assert_eq!(unhex(&h[..62]), None);
         assert_eq!(unhex(&"zz".repeat(32)), None);
+    }
+
+    /// audit120's M9: `restore --partition`'s refusal names the move record by its kind.
+    #[test]
+    fn a_partition_restores_move_refusal_names_the_records_kind() {
+        let rec = |kind: proto::MoveKind| proto::RangeMove {
+            id: "m1".into(),
+            kind: kind as i32,
+            from: "p3".into(),
+            to: "b".into(),
+            ..Default::default()
+        };
+        let said = |kind| moving_refusal(&rec(kind), "p3", 7).message().to_owned();
+        let node = said(proto::MoveKind::Node);
+        assert!(
+            node.starts_with("move \"m1\" relocates partition \"p3\""),
+            "{node}"
+        );
+        assert!(node.contains("phdb cluster move p3 --abort"), "{node}");
+        assert!(!node.contains("range move"), "{node}");
+        let split = said(proto::MoveKind::Partition);
+        assert!(
+            split.starts_with("split \"m1\" names partition \"p3\""),
+            "{split}"
+        );
+        let range = said(proto::MoveKind::Range);
+        assert!(
+            range.starts_with("range move \"m1\" names partition \"p3\""),
+            "{range}"
+        );
+        assert!(range.contains("(version 7)"), "{range}");
     }
 }
