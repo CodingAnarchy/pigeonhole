@@ -3463,3 +3463,87 @@ fn a_partition_with_a_share_in_doubt_isnt_moved_by_the_balancer_with_failover_of
         let _ = commit.await;
     });
 }
+
+#[test]
+fn a_grant_from_before_the_balancer_was_on_still_says_a_share_is_in_doubt() {
+    // simp724 on #2127: the balancer reads a partition's in-doubt count from the writer's
+    // last grant of it, ended or not. A grant renewed before the balancer was switched on
+    // must say so too, or the first pass after the switch, with an operator's passes 1,
+    // could move the partition. p2's share is held in doubt (a commit homed on c, held at
+    // its commit point). A few renewals later b's renewals to a are cut, so a's last grant
+    // of p2 is one from before the switch. Then the balancer comes on with only b over its
+    // bound: it reports that b can't move anything, and p2 stays on b.
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    use crate::serve::proto::BalancerEventKind;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, b, c] = t.ports;
+    t.rt.block_on(async {
+        assert!(!map_of(a).await.failover, "failover is off");
+        for (port, p) in [(b, "p2"), (c, "p3")] {
+            eventually_within(Duration::from_secs(10), "p2 and p3 to serve", async || {
+                state(port, p).await == LocalPartitionState::Serving
+            })
+            .await;
+        }
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        super::txn_write(
+            c,
+            &id,
+            vec![super::put_row("hank", "1"), super::put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let p = pause(&id, Step::CommitPoint);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move { super::spanning::commit_parts(c, &id, Vec::new()).await })
+        };
+        p.reached.notified().await;
+        // A renewal or two with the share in doubt, while the balancer is still off; then
+        // b's renewals to a stop, so a's last grant of p2 is one of those.
+        tokio::time::sleep(super::TEST_LEASE * 2).await;
+        let cut = (t.dirs[1].clone(), format!("127.0.0.1:{a}"));
+        super::super::CUT_BETWEEN.lock().unwrap().push(cut.clone());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        balancer_map(&t, None, |m| {
+            for n in m.nodes.iter_mut().filter(|n| n.id != "b") {
+                n.weight = 10;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                size_ratio: 1.2,
+                passes: 1,
+                dwell_ms: 600_000,
+                partition_min_bytes: 1,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        balancer_until(a, Duration::from_secs(20), |s| {
+            s.starts_with("skip: node b is over its bound, but no partition on it can move")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of(a).await;
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Move),
+            "{:?}",
+            m.balancer_events
+        );
+        assert!(
+            m.partitions.iter().any(|q| q.id == "p2" && q.node == "b"),
+            "{:?}",
+            m.partitions
+        );
+        super::super::CUT_BETWEEN
+            .lock()
+            .unwrap()
+            .retain(|e| *e != cut);
+        p.go.send(false).unwrap();
+        let _ = commit.await;
+    });
+}
