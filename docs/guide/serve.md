@@ -581,7 +581,7 @@ phdb serve replica.phdb --create --listen 0.0.0.0:7448 --tls-cert cert.pem --tls
 - **Its limits,** each with a 1.3.0 follow-up, and detailed in the sections below:
   - a cluster node builds the IVF and full-text indexes, writes to them, and runs `Vectors.Search`, `Vectors.BulkLoad`, `Text.Search`, `Text.Rebuild` and both kinds' `Verify` across an index's partitions ([Indexes on a cluster](#indexes-on-a-cluster), #1722); agent memory and `/mcp` are served across partitions too. [How calls are routed](#how-calls-are-routed) lists every call a node refuses;
   - a table's split keys are fixed once its ranges hold data (#1499);
-  - when the feed side saturates, a cluster's put p99 is higher than a single node's: 0.55–1.46 s against 45–90 ms in the AX102 runs, with the writers' throughput swinging for about 20 s after delivery starts (#1798);
+  - at feed saturation (256 subscribers at 55,000 puts/s), a cluster's writers no longer wait much longer than a single node's. The [Performance](#performance) table's 0.55–1.46 s of put p99 came before shared merges (#1798), batched hand-off (#2012, #2020) and its yield to puts (#2031); the latest AX102 run measured a one-node cluster's at 13–55 ms (g150). Its 55,000 × 256 rows are re-measured at the release candidate;
   - [read replicas](#read-replicas-in-a-cluster) follow their partition's owner and serve reads that allow staleness, across partitions too. A replica is made the owner by hand (`phdb cluster promote`), or by the cluster itself once you turn failover on ([Automatic failover](#automatic-failover)). A cluster node refuses `--replica-of` and `Admin.Promote`.
 
 ### How a cluster is laid out
@@ -1356,7 +1356,7 @@ These numbers are for `phdb serve` on one machine, serving a single database fil
   - Delivery trails the writes by seconds, so each subscriber received only about half of the run's commits before it ended.
   - Subscribers that fall behind catch up from the log rather than being dropped.
 - **A one-node cluster matches a single file** up to 32 subscribers at 55,000 puts/s.
-- **With 256 subscribers at 55,000 puts/s, the cluster's writers wait much longer:** p99 of 0.55–1.46 s, against 45–90 ms for a single file. This is a known gap, tracked for 1.3.0 (#1798).
+- **With 256 subscribers at 55,000 puts/s, the cluster's writers waited much longer in these runs:** p99 of 0.55–1.46 s, against 45–90 ms for a single file. That gap is fixed in 1.3.0 (#1798, #2012, #2020, #2031): the latest AX102 run measured a one-node cluster's put p99 at 13–55 ms (g150). *(Draft: the two 55,000 × 256 rows are replaced by the 1.3.0 release candidate's run, measured in one session.)*
 - **Feed lag** is measured from a put's send time to its arrival at a subscriber, so it includes the put's own latency.
 
 ## Next
