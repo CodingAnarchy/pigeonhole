@@ -80,9 +80,11 @@ What the public API does, and the first release with each piece. The [README's l
 | | the cluster side: `BeginRequest.spans_partitions`, two-phase commit across partitions (#2062); the resolver for shares in doubt, `Transactions.Outcome`, `phdb cluster txn decide` and the transaction's id on the feed (#2076) | on `main`, 1.3.0 |
 | | automatic failover, off by default (D330, #1484): the map's writer under a lease with terms, and elections (#2056); partition failover to the freshest replica (#2069) | on `main`, 1.3.0 |
 | | online split and range move (D331, #1499): range moves in the map and their gates (#2075), replica copies and restore across a move (#2080), the change feed across a move (#2084) | on `main`, 1.3.0 |
-| | the range's copy, the move's driver and its commands | to come, 1.3.0 |
+| | the range's copy and catch-up on the target (#2089, #2107) | on `main`, 1.3.0 |
+| | the move's driver and its commands | to come, 1.3.0 |
 | | a balancer (D332, #1485): what it measures, per-partition CPU and device load (#2063, ICR 0142); `phdb cluster move` recorded in the map, with `--abort` (#2092) | on `main`, 1.3.0 |
-| | the balancer itself, off by default | to come, 1.3.0 |
+| | the balancer itself, off by default: the map's writer moves whole partitions between nodes (#2103) | on `main`, 1.3.0 |
+| | the balancer's splits and merges (they wait for D331's driver) | to come, 1.3.0 |
 
 ## Phases
 Every gate also requires the phase's GitHub milestone to have no open issues (D62); check with `scripts/phase-gate.sh <phase>`.
@@ -206,8 +208,8 @@ Everything below shipped in [1.2.0](https://github.com/CodingAnarchy/pigeonhole/
   - **Read replicas:** `--replica-of`, read-your-writes and `phdb promote` (#1583, #1594).
   - **Running it:** `/metrics` with the engine's metrics through `pigeonhole-otel`'s `Collector` ([D323](design/decisions/phase-3.md#d323), #1687); thread placement and `--affinity` (#1697); a default shard count kept across restarts (#1699); WAL rings sized at start-up (#1681, ICR 0130); and jemalloc in the `phdb` binary (#1670, [D322](design/decisions/phase-3.md#d322)).
 - **Clusters** ([D317](design/decisions/phase-3.md#d317), #1482, [ICR 0117](design/icr/0117-static-partitions.md)): one database split across `phdb serve --cluster` nodes by static key-range partitions, with routing, fan-out, transactions, feeds, schema, fencing, moves, backups and `phdb cluster`. [Clusters](guide/serve.md#clusters) has the details.
-  - **Done in 1.3.0:** indexed vector and text search, rebuilds and bulk loads across partitions (#1722); read replicas of a partition, and promoting one (#1851); a partition confirmed by a majority of the map's nodes (#1760), and served only under a majority's lease ([D326](design/decisions/phase-3.md#d326)), which holds through a rolling upgrade from 1.2 (#2047); a lower put p99 at feed saturation, since one subscription's subscribers on a node share one merge (#1798); `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852); transactions across partitions (D329, #1483); and automatic failover, off by default (D330, #1484).
-  - **Still to come in 1.3.0:** the commands for online split and range move (D331, #1499), whose map records and gates are on `main`, and the balancer (D332, #1485), whose measurements are.
+  - **Done in 1.3.0:** indexed vector and text search, rebuilds and bulk loads across partitions (#1722); read replicas of a partition, and promoting one (#1851); a partition confirmed by a majority of the map's nodes (#1760), and served only under a majority's lease ([D326](design/decisions/phase-3.md#d326)), which holds through a rolling upgrade from 1.2 (#2047); a lower put p99 at feed saturation, since one subscription's subscribers on a node share one merge (#1798); `Admin.Info`, `Flush` and `Compact` on a cluster node (#1852); transactions across partitions (D329, #1483); automatic failover, off by default (D330, #1484); and the cluster balancer's whole-partition moves, off by default (D332, #1485).
+  - **Still to come in 1.3.0:** the driver and commands for online split and range move (D331, #1499), whose map records, gates and copy are on `main`, and with them the balancer's splits and merges.
 - **Replication in the library** ([D315](design/decisions/phase-3.md#d315), #1436, ICR 0125):
   - `backup_at` and a replica's bootstrap and promotion (#1578), behind `__unstable-replication`;
   - a feed of every table that delivers catalog changes (#1515, #1539).
