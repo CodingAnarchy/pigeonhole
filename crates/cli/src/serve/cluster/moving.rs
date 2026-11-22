@@ -110,10 +110,12 @@ impl At {
     /// The node's `Status`.
     pub(super) async fn status(&self) -> Result<proto::NodeStatus, Failure> {
         let (mut c, _) = connect(&self.args, &self.args.node).await?;
-        Ok(c.status(request(StatusRequest::default(), self.token.as_deref())?)
-            .await
-            .map_err(|s| self.failed("status", &s))?
-            .into_inner())
+        Ok(
+            c.status(request(StatusRequest::default(), self.token.as_deref())?)
+                .await
+                .map_err(|s| self.failed("status", &s))?
+                .into_inner(),
+        )
     }
 
     /// Fence, close or drop partition `p` here.

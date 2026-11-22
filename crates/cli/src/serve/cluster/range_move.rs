@@ -88,9 +88,9 @@ pub(super) fn resolve(m: &ClusterMap, spec: &Spec) -> Result<(Vec<u8>, Option<Ve
     let start = spec.start.clone();
     let holding = ranges.iter().find(|(lo, hi, p)| {
         *p == spec.from
-            && start.as_deref().is_none_or(|s| {
-                s >= lo.as_slice() && hi.as_deref().is_none_or(|h| s < h)
-            })
+            && start
+                .as_deref()
+                .is_none_or(|s| s >= lo.as_slice() && hi.as_deref().is_none_or(|h| s < h))
     });
     let Some((lo, hi, _)) = holding else {
         return Err(Failure::usage(&format!(
@@ -106,7 +106,9 @@ pub(super) fn resolve(m: &ClusterMap, spec: &Spec) -> Result<(Vec<u8>, Option<Ve
     let start = start.unwrap_or_else(|| lo.clone());
     let end = spec.end.clone().or_else(|| hi.clone());
     if end.as_deref().is_some_and(|e| e <= start.as_slice()) {
-        return Err(Failure::usage("the range is empty: its end isn't after its start"));
+        return Err(Failure::usage(
+            "the range is empty: its end isn't after its start",
+        ));
     }
     if !map::inside(t, &start, end.as_deref(), &spec.from) {
         return Err(Failure::usage(&format!(
@@ -145,7 +147,11 @@ fn record_for<'m>(
          again), or abort it before its commit point (phdb cluster move-range --abort {}), \
          then move",
         r.id,
-        if map::node_move(r) { "a whole-partition move" } else { "a range move" },
+        if map::node_move(r) {
+            "a whole-partition move"
+        } else {
+            "a range move"
+        },
         r.table,
         r.from,
         r.to,
@@ -176,7 +182,7 @@ fn check(m: &ClusterMap, spec: &Spec) -> Result<(), Failure> {
             spec.table, t.group
         )));
     }
-    if m.indexes.iter().any(|i| i.table == spec.table) {
+    if m.indexes.iter().any(|i| i.follows == spec.table) {
         return Err(Failure::usage(&format!(
             "an index follows table {:?}: its ranges don't move",
             spec.table
@@ -356,7 +362,10 @@ fn abort_reason(
     if let Some(t) = t
         && !t.follower_error.is_empty()
     {
-        return Some(format!("its target's follower stopped: {}", t.follower_error));
+        return Some(format!(
+            "its target's follower stopped: {}",
+            t.follower_error
+        ));
     }
     if s.is_some_and(|s| s.retention_lapsed) {
         return Some(format!(
@@ -712,7 +721,10 @@ mod tests {
             resolve(&m, &spec(Some("c"), None)).unwrap(),
             (b"c".to_vec(), Some(b"m".to_vec()))
         );
-        assert_eq!(resolve(&m, &spec(None, None)).unwrap(), (Vec::new(), Some(b"m".to_vec())));
+        assert_eq!(
+            resolve(&m, &spec(None, None)).unwrap(),
+            (Vec::new(), Some(b"m".to_vec()))
+        );
         // Past the source's range, empty, or a range p1 doesn't hold.
         assert!(resolve(&m, &spec(Some("c"), Some("z"))).is_err());
         assert!(resolve(&m, &spec(Some("f"), Some("c"))).is_err());
@@ -723,7 +735,11 @@ mod tests {
     fn a_rerun_finds_its_record_and_another_move_in_flight_refuses() {
         let mut m = map();
         let range = (b"c".to_vec(), Some(b"f".to_vec()));
-        assert!(record_for(&m, &spec(Some("c"), Some("f")), &range).unwrap().is_none());
+        assert!(
+            record_for(&m, &spec(Some("c"), Some("f")), &range)
+                .unwrap()
+                .is_none()
+        );
         let mut r = RangeMove {
             id: "range-1".into(),
             kind: MoveKind::Range as i32,
@@ -740,7 +756,11 @@ mod tests {
         assert_eq!(found.map(|r| r.id.as_str()), Some("range-1"));
         let other = (b"c".to_vec(), Some(b"e".to_vec()));
         let e = record_for(&m, &spec(Some("c"), Some("e")), &other).unwrap_err();
-        assert!(e.message().contains("move \"range-1\" is in flight"), "{}", e.message());
+        assert!(
+            e.message().contains("move \"range-1\" is in flight"),
+            "{}",
+            e.message()
+        );
         // An aborting record is never resumed.
         m.moves[0].set_phase(MovePhase::Aborting);
         assert!(record_for(&m, &spec(Some("c"), Some("f")), &range).is_err());
@@ -759,19 +779,35 @@ mod tests {
         assert_eq!(abort_reason(&m, &r, None, None), None);
         let mut moved = m.clone();
         moved.partitions[1].epoch = 2;
-        assert!(abort_reason(&moved, &r, None, None).unwrap().contains("target p2 failed over"));
+        assert!(
+            abort_reason(&moved, &r, None, None)
+                .unwrap()
+                .contains("target p2 failed over")
+        );
         moved.partitions[0].epoch = 2;
-        assert!(abort_reason(&moved, &r, None, None).unwrap().contains("source p1 failed over"));
+        assert!(
+            abort_reason(&moved, &r, None, None)
+                .unwrap()
+                .contains("source p1 failed over")
+        );
         let t = MoveStatus {
             follower_error: "the source's history expired".into(),
             ..Default::default()
         };
-        assert!(abort_reason(&m, &r, None, Some(&t)).unwrap().contains("history expired"));
+        assert!(
+            abort_reason(&m, &r, None, Some(&t))
+                .unwrap()
+                .contains("history expired")
+        );
         let s = MoveStatus {
             retention_lapsed: true,
             ..Default::default()
         };
-        assert!(abort_reason(&m, &r, Some(&s), None).unwrap().contains("hold lapsed"));
+        assert!(
+            abort_reason(&m, &r, Some(&s), None)
+                .unwrap()
+                .contains("hold lapsed")
+        );
         // A record from before to_epoch isn't compared on it.
         let old = RangeMove { to_epoch: 0, ..r };
         let mut moved = m;

@@ -2720,7 +2720,13 @@ fn three_nodes_held(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
-    three_nodes_at(rt, inflight, hold, &[test_dir(), test_dir(), test_dir()])
+    three_nodes_at(
+        rt,
+        inflight,
+        hold,
+        &[test_dir(), test_dir(), test_dir()],
+        None,
+    )
 }
 
 /// [`three_nodes`] in `dirs`, a's, b's and c's, for a test that arms a seam keyed by a
@@ -2733,7 +2739,7 @@ fn three_nodes_in(
     Vec<u16>,
     Vec<pigeonhole::Pigeonhole>,
 ) {
-    three_nodes_at(rt, 256 << 20, false, dirs)
+    three_nodes_at(rt, 256 << 20, false, dirs, None)
 }
 
 fn three_nodes_at(
@@ -2741,6 +2747,8 @@ fn three_nodes_at(
     inflight: usize,
     hold: bool,
     dirs: &[PathBuf; 3],
+    // The nodes' request timeout, if not the test default's (5 s).
+    request_timeout: Option<Duration>,
 ) -> (
     Vec<tokio::sync::oneshot::Sender<()>>,
     Vec<u16>,
@@ -2773,6 +2781,10 @@ fn three_nodes_at(
             stream_idle: Duration::from_secs(30),
             hold_after_part_page: hold,
             ..crate::serve::server_tests::limits()
+        };
+        let limits = crate::serve::config::Limits {
+            request_timeout: request_timeout.unwrap_or(limits.request_timeout),
+            ..limits
         };
         let (stop, db) = data_node_with(rt, dir, id, Some(p), l, limits);
         stops.push(stop);
@@ -4479,7 +4491,14 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
         TablePlacementRequest, schema_client::SchemaClient,
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (_stops, ports, dbs) = three_nodes(&rt);
+    // A long request timeout: twelve creates queue at the writer below (#2121).
+    let (_stops, ports, dbs) = three_nodes_at(
+        &rt,
+        256 << 20,
+        false,
+        &[test_dir(), test_dir(), test_dir()],
+        Some(Duration::from_secs(30)),
+    );
     // Made by hand in p2's file: one the map never places, one it will.
     for name in ["manual", "collide"] {
         dbs[1]
@@ -4681,6 +4700,12 @@ fn schema_calls_change_the_map_and_every_partition_follows_it() {
         // at once, four through each node, all land, and every node ends with the same map,
         // with no divergence. Before the single writer, two entry nodes' compare-and-sets
         // each made the same next version, and one table was lost.
+        //
+        // The writer makes them one at a time, so the last waits behind the other eleven
+        // (about 35 ms each on a Mac, in a staircase). On a loaded runner that passed the
+        // test default's 5 s request timeout (#2121, Windows CI), so this test's nodes take
+        // 30 s (`three_nodes_at`'s `request_timeout`). Each create is sent once, never again:
+        // a resend could re-create a table the bug lost after an `OutcomeUnknown` (simp724).
         let mut tasks = tokio::task::JoinSet::new();
         for i in 0..12usize {
             let (port, part) = (ports[i % 3], ["p1", "p2", "p3"][i % 3]);
