@@ -219,10 +219,10 @@ pub(crate) enum ClusterCommand {
         partition: String,
         #[command(flatten)]
         node: NodeArgs,
-        /// Lift a fence the peers don't confirm (a majority of the map's nodes must hold the
-        /// newest map, naming this node): only when they can't answer and you know the
-        /// partition hasn't moved. A newer map may have given it to another node, and then
-        /// both would take writes.
+        /// Lift the operator's fence without asking the peers (a majority of the map's nodes
+        /// must otherwise hold the newest map, naming this node): only when they can't
+        /// answer and you know the partition hasn't moved. It never makes the partition
+        /// serve without a lease, which still takes a majority of the map's nodes (D326).
         #[arg(long)]
         force: bool,
     },
@@ -310,8 +310,9 @@ pub(crate) enum ClusterCommand {
         /// files aside there (`drop-partition`: nothing is deleted).
         #[arg(long)]
         drop_source: bool,
-        /// Give up a wait for a node after SECS (at least 1): OLD hashing the closed files, or `--to`
-        /// serving the partition once the map gives it to it. The error names the step and
+        /// Give up a wait after SECS (at least 1): OLD hashing the closed files, a majority
+        /// of the nodes taking the new map, or `--to` serving the partition once the map
+        /// gives it to it. The error names the step and
         /// the node's last `status` line for the partition. It bounds each wait, not the
         /// copy, which takes as long as the files do. A wait asks the node every 200 ms.
         /// Without it, a wait goes on as long as it takes, saying every 10 s what it waits for.
@@ -487,7 +488,8 @@ pub(crate) enum TxnCommand {
     /// Decide a transaction's share held in doubt on partition `--partition`, on the node
     /// that serves it (`--node`), for a transaction whose home will never settle it. Refused
     /// while the home can (it answers committed, aborted or in progress) unless `--force`,
-    /// which can break the transaction's atomicity; a home that answers unknown can't.
+    /// which can break the transaction's atomicity; a home that answers unknown or not
+    /// found (its record's retention has passed) can't.
     /// Answers the partition's line.
     Decide {
         /// The transaction's id (as `phdb cluster status` lists it).

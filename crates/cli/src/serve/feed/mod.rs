@@ -26,22 +26,12 @@
 //!   The server compares tokens only for equality (has the position moved), never orders
 //!   them.
 
-mod events;
-pub(crate) use events::*;
-mod client;
-pub(crate) use client::*;
-mod hub;
-pub(crate) use hub::*;
-mod entry;
-pub(crate) use entry::*;
-mod tracker;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-pub(crate) use tracker::*;
 
 use futures_core::Stream;
 use pigeonhole::nonblocking::FeedStream;
@@ -54,6 +44,18 @@ use super::lease::DeliveryLease;
 use super::convert;
 use super::errors::ApiError;
 use super::proto;
+
+mod client;
+mod entry;
+mod events;
+mod hub;
+mod tracker;
+
+pub(crate) use client::*;
+pub(crate) use entry::*;
+pub(crate) use events::*;
+pub(crate) use hub::*;
+pub(crate) use tracker::*;
 
 /// The feed fan-out's limits.
 #[derive(Debug, Clone, Copy)]
