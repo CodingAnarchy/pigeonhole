@@ -318,6 +318,45 @@ pub(crate) enum ClusterCommand {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// Move a key range of a table from partition `--from` to partition `--to` while both
+    /// serve (D331): the target copies the range, catches up on the source's writes, then the
+    /// source fences the range's writes for about as long as the target needs to apply the
+    /// last of them, and the map gives the range to the target. Prints each phase. Run it
+    /// again to go on after a stop; `--abort ID` ends a move before its commit point. The
+    /// range must lie inside one range of the table that `--from` holds.
+    MoveRange {
+        /// The table whose range moves.
+        #[arg(required_unless_present = "abort")]
+        table: Option<String>,
+        /// The partition holding the range.
+        #[arg(long, value_name = "ID", required_unless_present = "abort")]
+        from: Option<String>,
+        /// The partition it moves to.
+        #[arg(long, value_name = "ID", required_unless_present = "abort")]
+        to: Option<String>,
+        /// The range's first key (text); without it, the start of `--from`'s range.
+        #[arg(long, value_name = "KEY")]
+        start: Option<String>,
+        /// The key just past the range (text); without it, the end of `--from`'s range.
+        #[arg(long, value_name = "KEY")]
+        end: Option<String>,
+        /// End move ID (a split's too) before its commit point: the target drops what it
+        /// copied, and the source serves the range as before. Refused once the map gives the
+        /// range to the target: run the move again to finish it.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["table", "from", "to", "start", "end"]
+        )]
+        abort: Option<String>,
+        #[command(flatten)]
+        node: NodeArgs,
+        /// Give up waiting for the move after SECS (at least 1): the error names the phase
+        /// and what it waited for. The move stays where the map records it: run it again, or
+        /// abort it. Without it, the move runs to its end, saying every 10 s what it waits for.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
     /// Move a partition's files on `--node` to `DIR/.phdb-dropped/<P>-<epoch>-<time>/`,
     /// once the map no longer places it there and it isn't open (close it first). Nothing
     /// is deleted: delete that directory once the move is checked. It frees no space
@@ -452,6 +491,36 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             partition,
             to.as_deref().unwrap_or_default(),
             *drop_source,
+            timeout.map(Duration::from_secs),
+        )),
+        ClusterCommand::MoveRange {
+            abort: Some(id),
+            node,
+            timeout,
+            ..
+        } => runtime()?.block_on(super::range_move::abort(
+            node,
+            id,
+            timeout.map(Duration::from_secs),
+        )),
+        ClusterCommand::MoveRange {
+            table,
+            from,
+            to,
+            start,
+            end,
+            node,
+            timeout,
+            ..
+        } => runtime()?.block_on(super::range_move::run(
+            node,
+            &super::range_move::Spec {
+                table: table.clone().unwrap_or_default(),
+                from: from.clone().unwrap_or_default(),
+                to: to.clone().unwrap_or_default(),
+                start: start.as_ref().map(|s| s.as_bytes().to_vec()),
+                end: end.as_ref().map(|s| s.as_bytes().to_vec()),
+            },
             timeout.map(Duration::from_secs),
         )),
         ClusterCommand::DropPartition { partition, node } => {

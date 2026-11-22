@@ -1474,6 +1474,84 @@ fn a_target_down_when_its_move_aborted_drops_its_copy_at_open() {
     let _ = db_b.close();
 }
 
+/// D331 PR 5: `phdb cluster move-range` end to end, under writes. Every write the cluster
+/// acknowledged is read back from the target; the source dropped its copy; the map gives
+/// the range to the target, with the source's epoch raised, and no record is left.
+#[test]
+fn move_range_moves_a_range_under_writes_end_to_end() {
+    let t = three();
+    let (a, c) = (t.ports[0], t.ports[2]);
+    let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    t.rt.block_on(async {
+        for i in 0..50 {
+            try_put(c, &format!("d{i:02}"), "0").await.unwrap();
+        }
+        // Writes into the range and outside it all through the move; a fenced one is
+        // retried, as a client does.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (acked, stop) = (std::sync::Arc::clone(&acked), std::sync::Arc::clone(&stop));
+            tokio::spawn(async move {
+                let mut i = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (row, value) = (format!("d{:02}", i % 50), i.to_string());
+                    try_put(c, "a", &value).await.ok();
+                    if try_put(c, &row, &value).await.is_ok() {
+                        acked.lock().unwrap().push((row, value));
+                    }
+                    i += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+        };
+        let spec = super::super::range_move::Spec {
+            table: "users".into(),
+            from: "p1".into(),
+            to: "p2".into(),
+            start: Some(b"c".to_vec()),
+            end: Some(b"f".to_vec()),
+        };
+        super::super::range_move::run(
+            &super::backup::args(a),
+            &spec,
+            Some(Duration::from_secs(120)),
+        )
+        .await
+        .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.await.unwrap();
+        // The last acknowledged value of each row reads back, from the target.
+        let mut last = std::collections::HashMap::new();
+        for (row, value) in acked.lock().unwrap().iter() {
+            last.insert(row.clone(), value.clone());
+        }
+        assert!(!last.is_empty());
+        for (row, value) in &last {
+            assert_eq!(
+                get_row(c, row).await.unwrap(),
+                Some(value.as_bytes().to_vec()),
+                "row {row}"
+            );
+        }
+        let m = client(a)
+            .await
+            .get_map(crate::serve::proto::GetMapRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(m.moves.is_empty(), "{:?}", m.moves);
+        let users = &m.tables[0];
+        assert!(super::super::map::inside(users, b"c", Some(b"f"), "p2"));
+        assert_eq!(m.partitions[0].epoch, 2, "the source's epoch rose");
+    });
+    let src = t.db_a.table("users").unwrap().open().unwrap();
+    assert!(
+        src.get(b"d00", "f", b"q").unwrap().is_none(),
+        "the source dropped its copy"
+    );
+    assert!(src.get(b"a", "f", b"q").unwrap().is_some());
+}
+
 /// `row`'s puts of `cells` values of `bytes` each, qualifiers `q0`.. (one commit).
 fn wide_row(row: &str, cells: usize, bytes: usize) -> crate::serve::proto::RowWrites {
     use crate::serve::proto::{Put, RowKey, RowWrites, Value, Write, value, write};

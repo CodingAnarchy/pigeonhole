@@ -35,9 +35,6 @@ use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{ClusterMap, LocalPartition, MoveKind, MovePhase, MoveStatus, RangeMove};
 
-/// How often the driver asks the nodes how a phase is going.
-const POLL: Duration = Duration::from_millis(200);
-
 /// The most a source's fence may take to report its seqno (its drain, and the shares in
 /// doubt on the range) before the move aborts and lifts it (simp724's bounded wait).
 pub(super) const FENCE_BOUND: Duration = Duration::from_secs(30);
