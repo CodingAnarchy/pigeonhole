@@ -763,6 +763,8 @@ fn moving_refusal(m: &proto::RangeMove, partition: &str, version: u64) -> Failur
              finish or abort it, then restore",
             m.id
         ),
+        // RANGE (and UNSPECIFIED). D332 PR 6's MOVE_KIND_MERGE would land here too, worded
+        // as a range move: give it an arm when it lands (cli692's nit on #2126).
         _ => format!(
             "range move {:?} names partition {partition:?} in the live map (version \
              {version}): finish or abort it, then restore",
