@@ -3386,3 +3386,80 @@ fn a_writer_cut_off_at_term_0_doesnt_advance_its_balancer_move() {
         .await;
     });
 }
+
+#[test]
+fn a_partition_with_a_share_in_doubt_isnt_moved_by_the_balancer_with_failover_off() {
+    // audit120's M1 on 1.3.0: the balancer never moves a partition with spanning shares in
+    // doubt. It reads the count from the owner's lease renewals, which carried it only with
+    // failover on. With failover off, p1's share is prepared and in doubt: a commit homed on
+    // c is held at its commit point, so the resolver leaves it, since its home has it in
+    // progress. b and c weigh ten, so only a is over its bound, and p1 is its one candidate.
+    // The balancer says so and moves nothing.
+    use crate::serve::cluster::spanning::seams::{Step, pause};
+    use crate::serve::proto::BalancerEventKind;
+    let mut t = Rig::start();
+    writer_leased(&mut t);
+    let [a, _, c] = t.ports;
+    t.rt.block_on(async {
+        assert!(!map_of(a).await.failover, "failover is off");
+        // c's p3 (the transaction's home) under its lease, as writer_leased waits only for a.
+        eventually_within(Duration::from_secs(10), "p3 to serve on c", async || {
+            state(c, "p3").await == LocalPartitionState::Serving
+        })
+        .await;
+        let id = super::spanning::begin_spanning(c, "zed").await.unwrap();
+        super::txn_write(
+            c,
+            &id,
+            vec![super::put_row("alice", "1"), super::put_row("zed", "1")],
+            None,
+        )
+        .await
+        .unwrap();
+        let p = pause(&id, Step::CommitPoint);
+        let commit = {
+            let id = id.clone();
+            tokio::spawn(async move { super::spanning::commit_parts(c, &id, Vec::new()).await })
+        };
+        p.reached.notified().await;
+        // A renewal or two, so the writer holds p1's count before the balancer turns on.
+        tokio::time::sleep(super::TEST_LEASE * 2).await;
+        balancer_map(&t, None, |m| {
+            for n in m.nodes.iter_mut().filter(|n| n.id != "a") {
+                n.weight = 10;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                size_ratio: 1.2,
+                passes: 1,
+                dwell_ms: 600_000,
+                // No partition counts as small, so no merge decision takes the reason.
+                partition_min_bytes: 1,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        balancer_until(a, Duration::from_secs(20), |s| {
+            s.starts_with("skip: node a is over its bound, but no partition on it can move")
+        })
+        .await;
+        // Passes more, and still nothing moved.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        let m = map_of(a).await;
+        assert!(
+            !m.balancer_events
+                .iter()
+                .any(|e| e.kind() == BalancerEventKind::Move),
+            "{:?}",
+            m.balancer_events
+        );
+        assert!(
+            m.partitions.iter().any(|q| q.id == "p1" && q.node == "a"),
+            "{:?}",
+            m.partitions
+        );
+        // The commit goes on.
+        p.go.send(false).unwrap();
+        let _ = commit.await;
+    });
+}

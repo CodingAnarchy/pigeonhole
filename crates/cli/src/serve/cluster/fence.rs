@@ -827,8 +827,10 @@ impl Node {
     async fn ask_leases(self: &Arc<Self>, round: &mut Round, holding: &[(String, String)]) {
         let mut parts = self.fences.askable(&round.map, &self.id);
         // With failover on, each part carries the partition's in-doubt shares, so a writer
-        // that fails it over can name them (D330 PR 2's F7).
-        if round.map.failover {
+        // that fails it over can name them (D330 PR 2's F7). With the balancer on too: it
+        // never moves a partition with shares in doubt (D332), and reads the count from
+        // these renewals (audit120's M1 on 1.3.0).
+        if round.map.failover || super::map::uses_balancer(&round.map) {
             for p in &mut parts {
                 (p.in_doubt_xids, p.in_doubt_count) = self.in_doubt_of(&p.partition);
             }
