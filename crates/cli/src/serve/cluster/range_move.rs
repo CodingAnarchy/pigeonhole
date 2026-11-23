@@ -822,12 +822,18 @@ async fn abort_record(
             return Ok(());
         }
         // A split's partition closed here was closed by this tail, past its drop: a rerun
-        // after a stop there goes on (audit120's M1 on #2130).
+        // after a stop there goes on (audit120's M1 on #2130), whatever its range drop got
+        // to. Status reports the move's state on a closed partition too, from the map, and a
+        // drop the close cut short stays undone there (main's Windows red on 0285e076f).
+        // Before the commit point a split's partition holds only the move's copy (T serves
+        // none of the range), and the tail below moves its whole file aside.
         let dropped = match side(args, &m, &r.to, &r.id).await {
-            Ok((_, Some(t))) => t.dropped,
-            Ok((Some(lp), None)) => {
-                split && lp.state() == crate::serve::proto::LocalPartitionState::Closed
+            Ok((Some(lp), _))
+                if split && lp.state() == crate::serve::proto::LocalPartitionState::Closed =>
+            {
+                true
             }
+            Ok((_, Some(t))) => t.dropped,
             _ => false,
         };
         if dropped {

@@ -1802,8 +1802,11 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
         mut _stops,
         ..
     } = t;
+    // Not released: the held follower goes on only once it sees the stop (`hold_at` waits
+    // for either), so it meets the stop inside the row. A release here raced the stop: when
+    // it won, the follower finished the row before the stop reached it, and the restarted
+    // follower found no partial row to name (#2135's Linux red, Windows on #2131).
     let _ = _stops.swap_remove(1).send(());
-    let _ = release.send(());
     rt.block_on(eventually("b to stop", async || {
         tokio::net::TcpStream::connect(("127.0.0.1", b))
             .await
@@ -1819,15 +1822,22 @@ fn a_row_left_partly_copied_stops_the_move_naming_it() {
         Some(db_b.clone()),
     );
     rt.block_on(async {
-        eventually("b's follower stops, naming the row", async || {
-            move_status(b, "p2", "mv1")
-                .await
-                .is_some_and(|s| s.follower_error.contains("row \"d\""))
-        })
+        // After the restart the follower retries until b's lease is back, its backoff
+        // doubling to 5 s; its first step then names the row: the restart tests' 30 s.
+        eventually_within(
+            Duration::from_secs(30),
+            "b's follower stops, naming the row",
+            async || {
+                move_status(b, "p2", "mv1")
+                    .await
+                    .is_some_and(|s| s.follower_error.contains("row \"d\""))
+            },
+        )
         .await;
         let s = move_status(b, "p2", "mv1").await.unwrap();
         assert!(!s.copy_done, "{s:?}");
     });
+    drop(release);
     let _ = (c, db_a.close(), db_b.close());
 }
 
@@ -2785,12 +2795,27 @@ fn a_merge_rerun_removes_the_emptied_source_once_nothing_waits() {
 /// partition, before the map change. Run again, the abort goes on past the closed partition
 /// (no fence on it, which a closed partition refuses): the map drops the record and p1-1,
 /// p1-1's files are moved aside, and the abort's fence leaves no operator fence on the id.
+///
+/// p1-1's range drop is held until it's closed, so the close always cuts it short and its
+/// Status says the drop isn't done: the rerun takes the closed split partition as done
+/// anyway (main's Windows red on 0285e076f, where the drop lost that race by chance).
 #[test]
 fn an_aborted_split_stopped_after_its_close_is_finished_by_a_rerun() {
     let t = three();
     let a = t.ports[0];
     t.rt.block_on(async {
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (go, held) = tokio::sync::oneshot::channel();
+        super::super::range_drop::HOLD.lock().unwrap().push((
+            "split-9".into(),
+            std::sync::Arc::clone(&reached),
+            held,
+        ));
         aborting_split_closed_on_c(&t).await;
+        tokio::time::timeout(Duration::from_secs(30), reached.notified())
+            .await
+            .expect("p1-1's drop of split-9's copy started, and is held");
+        let _ = go.send(());
         super::super::range_move::abort(
             &super::backup::args(a),
             "split-9",
