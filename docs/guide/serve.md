@@ -1194,9 +1194,10 @@ Every 30 s, the writer reads each node's open partitions (their size from the fi
 - **A partition in any move,** or with spanning-transaction shares in doubt.
 
 #### Splits and merges
-The balancer also judges partitions too big (over `partition_max_bytes`, default 32 GiB) or too hot (over `partition_max_load`, default 0.5 of a node), and small, cold ones (under `partition_min_bytes`, default 4 GiB). It splits and merges them with the online split and merge (D331), as `phdb cluster split` and `merge` do, recorded in the map under an id starting `bal-`. Splits come first in a pass, then whole moves, then merges.
+The balancer also judges partitions too big (over `partition_max_bytes`, default 32 GiB) or too hot (over `partition_max_load`, default 0.5 of a node), and small, cold ones (under `partition_min_bytes`, default 4 GiB, and cold: under a tenth of its node's mean load, or under a hundredth of `partition_max_load` whatever the mean, as in an idle cluster). It splits and merges them with the online split and merge (D331), as `phdb cluster split` and `merge` do, recorded in the map under an id starting `bal-`. Splits come first in a pass, then whole moves, then merges.
 - **A split** cuts one table of the partition P at a tablet boundary, never inside a pinned range:
   - **Where:** the boundary that halves P's load, each tablet's load being the larger of its share of P's reads (sampled) and of its writes. With no load measured, it halves P's bytes. If the best cut leaves over 80% on one side (a hot key, or a narrow hot range), P is reported as unsplittable, and a whole move is considered instead.
+  - **Which partition is looked at:** each pass asks one partition's node for its tablets, the one furthest over its bound among those that could split now. A partition with no cut (a hot key, or no tablet boundary in its own ranges), whose node didn't answer, or whose split couldn't start, is set aside for a dwell, so the next one over gets its turn; `state` names each partition set aside, why, and for how long.
   - **What moves:** from the cut to the end of P's range of that table that holds it. P's other ranges, and its other tables, stay.
   - **Where to:** a new partition on the coldest node holding none of P's replicas. It's named `<P>-<v>`, with `v` the map version of the change that records the split: for example `p3-1742`, and `p3-1742-1800` for a later split of that one. A name is never used twice, even after a merge drops its partition, so an old change-feed token or history can't name the new one. A split whose name would be over 64 characters, or is taken, is skipped, with that reason.
   - **The copy** runs at the source's `--move-rate-bytes`. One that wouldn't finish within the dwell at that rate isn't started.
@@ -1204,8 +1205,9 @@ The balancer also judges partitions too big (over `partition_max_bytes`, default
   - **History:** P keeps its own `moves_history`, and gains a SPLIT entry; the new partition starts with none. The SPLIT event names the table and the key.
 - **A merge** of S into T joins S only with a neighbour (one holding a range next to one of S's), and only while the two together stay under **half** of `partition_max_bytes` and `partition_max_load`. So a merge never makes a partition the next pass would split.
   - **How:** each of S's ranges is a range move into T, and then S is dropped.
-  - **Interrupted part-way** (the writer changed, or a range move aborted), some of S's ranges are in T and S holds the rest. That's a valid layout: the next pass judges S again, and merges the rest. An S emptied but not dropped is dropped.
-  - Neither side of a merge was split within the last four dwells, so a split isn't merged straight back.
+  - **Interrupted part-way** (the writer changed, or a range move aborted), some of S's ranges are in T and S holds the rest. That's a valid layout: the next pass judges S again, and merges the rest.
+  - **An S emptied but not yet dropped** (something still needs it, such as a change feed's tail, kept at most 24 h after the hand-over; see [Merging partitions](#merging-partitions)): each pass tries its drop again, and `state` says what S waits for. Meanwhile S is neither moved nor merged into, and the balancer goes on with other actions.
+  - Neither side of a merge was split within the last four dwells, so a split isn't merged straight back. A split aborted before its hand-over counts too: P keeps its SPLIT entry, so P isn't merged for those four dwells either.
 - **Never split or merged:** a table in a co-location group, or one an index follows. Those partitions move only whole.
 
 #### The bounds
@@ -1239,7 +1241,7 @@ A new writer, after an election or a forced map, keeps the mode, bounds and pins
 - **A balancer move the old writer left behind:**
   - **Before its commit point** (the map still gives the partition to its old node), the new writer aborts it: the target's copy goes aside, the partition serves on its old node again, and an ABORT event says so.
   - **Past it,** the new writer finishes the move.
-- **A balancer split, or one range of a merge, the old writer left behind:**
+- **A balancer split, or one range of a merge, that stopped** (the old writer left it behind, or the writer's own run of it stopped):
   - **Before it was handed over,** the new writer aborts it: the range serves from P (or S) again, and a split's new partition, still empty, is removed from the map. An ABORT event says so.
   - **From the hand-over on,** the new writer finishes it.
   - The rest of an interrupted merge waits for a later pass (above).

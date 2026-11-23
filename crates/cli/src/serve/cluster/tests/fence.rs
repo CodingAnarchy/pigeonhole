@@ -436,6 +436,11 @@ impl Rig {
 
     /// [`Rig::start`], each node with the token file `tokens`.
     fn start_with(tokens: &str) -> Self {
+        Self::start_p1(tokens, None)
+    }
+
+    /// [`Rig::start_with`], p1's database created with `p1` if given (small tablets, say).
+    fn start_p1(tokens: &str, p1: Option<pigeonhole::Options>) -> Self {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let listeners: Vec<std::net::TcpListener> = (0..3)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -446,9 +451,14 @@ impl Rig {
         let limits = crate::serve::server_tests::limits();
         let mut stops = Vec::new();
         let mut dbs = Vec::new();
+        let mut p1 = p1;
         for ((l, dir), (id, p)) in listeners.into_iter().zip(&dirs).zip(NODES) {
             super::super::write_map(dir, &super::super::map::canonical_json(&map)).unwrap();
-            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, tokens, limits, None, false);
+            let given = p1
+                .take()
+                .filter(|_| p == "p1")
+                .map(|o| test_partition_with(dir, p, o));
+            let (stop, db) = data_node_full(&rt, dir, id, Some(p), l, tokens, limits, given, false);
             stops.push(Some(stop));
             dbs.push(db);
         }
@@ -3045,7 +3055,9 @@ async fn balancer_mode(t: &Rig, mode: crate::serve::proto::BalancerMode) -> u64 
 
 /// Turns the balancer on over a skewed cluster: node c weighs ten, so a and b each hold ten
 /// times c's share of the bytes per unit of weight (1.43x the mean), over a `size_ratio`
-/// of 1.2 after one pass. The move goes to c; the dwell is long, so it's the only one.
+/// of 1.2 after one pass. The move goes to c; the dwell is long, so it's the only one. No
+/// partition is under a 1-byte `partition_min_bytes`, so none of these idle partitions is
+/// merged meanwhile.
 async fn balance_skewed(t: &Rig, token: Option<&str>) -> u64 {
     balancer_map(t, token, |m| {
         for n in m.nodes.iter_mut().filter(|n| n.id == "c") {
@@ -3055,6 +3067,7 @@ async fn balance_skewed(t: &Rig, token: Option<&str>) -> u64 {
             size_ratio: 1.2,
             passes: 1,
             dwell_ms: 600_000,
+            partition_min_bytes: 1,
             ..Default::default()
         });
         m.set_balancer(crate::serve::proto::BalancerMode::On);
@@ -3629,36 +3642,156 @@ async fn with_family(t: &Rig, token: Option<&str>) -> u64 {
 }
 
 #[test]
-fn a_big_partition_splits_at_its_halving_tablet_onto_a_cold_node_with_tokens_configured() {
-    use crate::serve::proto::{BalancerEventKind, TabletInfo};
-    // D332 PR 5's design §7.2: every node has tokens, and the writer runs the split with its
-    // cluster token alone. p2 and p3 are pinned and the size bound tiny, so p1 alone is a
-    // split candidate; its owner reports tablets at "" and "d" (a test's tablets: a real one
-    // splits at 256 MiB), so the cut is at d and [d, g) goes to a new partition p1-<v> on b
-    // or c, under writes. One SPLIT event naming users; p1's history has it and the new
-    // partition's is empty; every acknowledged write reads back; nothing else splits within
-    // the dwell.
+fn two_small_neighbours_merge_and_the_emptied_source_is_dropped_with_tokens_configured() {
+    use crate::serve::proto::BalancerEventKind;
+    // D332 PR 5's design §7.2: two small, cold neighbours merge (an idle partition's load,
+    // under a hundredth of `partition_max_load`, is cold), and the emptied source is dropped once nothing waits for it. p3 is pinned, so
+    // p1 merges into its neighbour p2: its range moves as `bal-` records, with one MERGE
+    // event and p1's MERGE history entry. p1 then stays listed, holding nothing, while its
+    // moved-away row waits for the change feed (24 h, pruned here as #2131's tests do); the
+    // balancer's next passes retry its removal, and it leaves the map, the table one range
+    // on p2.
     let mut t = Rig::start_with(&balancer_tokens());
     let tok = Some(BALANCER_ADMIN);
     writer_leased_as(&mut t, tok);
     let a = t.ports[0];
-    let tablet = |start: &str| TabletInfo {
-        table: "users".into(),
-        start: start.as_bytes().to_vec().into(),
-        bytes: 1 << 20,
-        ..Default::default()
-    };
-    super::super::balancing::TABLETS_FOR.lock().unwrap().push((
-        t.dirs[0].clone(),
-        "p1".into(),
-        vec![tablet(""), tablet("d")],
-    ));
+    t.rt.block_on(async {
+        balancer_map(&t, tok, |m| {
+            for p in m.partitions.iter_mut().filter(|p| p.id == "p3") {
+                p.pinned = true;
+            }
+            m.balance = Some(crate::serve::proto::BalanceBounds {
+                passes: 1,
+                dwell_ms: 600_000,
+                ..Default::default()
+            });
+            m.set_balancer(crate::serve::proto::BalancerMode::On);
+        })
+        .await;
+        let m = map_until(
+            a,
+            tok,
+            Duration::from_secs(120),
+            "p1 emptied into p2",
+            |m| {
+                m.moves.is_empty()
+                    && !super::super::map::placed(m, "p1")
+                    && m.partitions.iter().any(|p| p.id == "p1")
+            },
+        )
+        .await;
+        let merges: Vec<_> = m
+            .balancer_events
+            .iter()
+            .filter(|e| e.kind() == BalancerEventKind::Merge)
+            .collect();
+        assert_eq!(merges.len(), 1, "{:?}", m.balancer_events);
+        assert_eq!(
+            (merges[0].partition.as_str(), merges[0].to.as_str()),
+            ("p1", "p2")
+        );
+        let p1 = m.partitions.iter().find(|p| p.id == "p1").unwrap();
+        assert_eq!(
+            p1.moves_history
+                .last()
+                .map(crate::serve::proto::MoveHistory::kind),
+            Some(BalancerEventKind::Merge),
+            "{p1:?}"
+        );
+        assert!(
+            super::super::map::inside(&m.tables[0], b"", Some(b"m"), "p2"),
+            "{:?}",
+            m.tables[0]
+        );
+        // p1's moved-away rows pruned, as the 24 h grace would; the next pass drops it. Its
+        // removal closes p1's database, so a read here may find it closed: p1 is going.
+        let db_a = t.dbs[0].clone().unwrap();
+        let m = map_until(a, tok, Duration::from_secs(60), "p1 dropped", |m| {
+            for row in crate::serve::ranges::read_moved(&db_a).unwrap_or_default() {
+                let _ = crate::serve::ranges::prune_row(
+                    &db_a,
+                    crate::serve::ranges::Pruned::Moved,
+                    &row,
+                );
+            }
+            !m.partitions.iter().any(|p| p.id == "p1")
+        })
+        .await;
+        assert!(
+            super::super::map::inside(&m.tables[0], b"", Some(b"m"), "p2"),
+            "{:?}",
+            m.tables[0]
+        );
+    });
+}
+
+#[test]
+fn a_big_partition_splits_at_its_halving_tablet_onto_a_cold_node_with_tokens_configured() {
+    use crate::serve::proto::BalancerEventKind;
+    // D332 PR 5's design §7.2: every node has tokens, and the writer runs the split with its
+    // cluster token alone. p2 and p3 are pinned and the size bound tiny, so p1 alone is a
+    // split candidate. p1's database splits its tablets at 16 KiB (the engine's test hook,
+    // the coordinator's ruling on #2137), so its users rows fill real tablets, and the
+    // balancer cuts [cut, g) to a new partition p1-<v> on b or c, under writes. One SPLIT
+    // event naming users; p1's history has it and the new partition's is empty; every
+    // acknowledged write reads back; nothing else splits within the dwell.
+    let small = pigeonhole::Options::default()
+        .tablet_changes(true)
+        .tablet_balance(Duration::from_millis(20), 1 << 20, 16 << 10);
+    let mut t = Rig::start_p1(&balancer_tokens(), Some(small));
+    let tok = Some(BALANCER_ADMIN);
+    writer_leased_as(&mut t, tok);
+    let a = t.ports[0];
     let acked: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
     // Writes answered `Unknown`: the hand-over raises p1's epoch, so its lease on a ends
     // for a round, and a commit in flight then may or may not be kept.
     let unknown: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
     t.rt.block_on(async {
         with_family(&t, tok).await;
+        // About 400 KiB of users rows in p1 that don't compress (hex from a fixed xorshift),
+        // flushed: SST bytes past the tablets' 16 KiB. Values of 1 KiB stay in the SSTs (a
+        // large one is kept apart, and a tablet's bytes count its SSTs only).
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut value = || {
+            (0..64)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    format!("{x:016x}")
+                })
+                .collect::<String>()
+        };
+        // Two flushes, so the engine's size split (at the middle of its SSTs' bounds) cuts
+        // between the b rows and the e rows, where the writes below split evenly too.
+        let db = t.dbs[0].clone().unwrap();
+        for prefix in ["b", "e"] {
+            for i in 0..200 {
+                put_as(a, &format!("{prefix}{i:03}"), &value(), tok)
+                    .await
+                    .unwrap();
+            }
+            db.flush().unwrap();
+        }
+        let until = tokio::time::Instant::now() + Duration::from_secs(30);
+        while db
+            .tablets()
+            .iter()
+            .filter(|t| t.table == "users" && !t.start.is_empty())
+            .count()
+            == 0
+        {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "p1's users rows in two or more tablets: tablets {:?}; refusals {:?}",
+                db.tablets()
+                    .iter()
+                    .map(|t| (t.table.clone(), t.start.clone(), t.bytes))
+                    .collect::<Vec<_>>(),
+                db.tablet_refusals()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         for i in 0..20 {
             put_as(a, &format!("b{i:02}"), "0", tok).await.unwrap();
             put_as(a, &format!("e{i:02}"), "0", tok).await.unwrap();
@@ -3740,16 +3873,26 @@ fn a_big_partition_splits_at_its_halving_tablet_onto_a_cold_node_with_tokens_con
             vec![BalancerEventKind::Split],
             "{p1:?}"
         );
+        // The cut is a real tablet boundary inside p1's [.., g).
+        let cut = super::super::map::table_ranges(&m.tables[0])
+            .into_iter()
+            .find(|(_, _, p)| *p == new.id)
+            .map(|(lo, _, _)| lo)
+            .unwrap();
+        assert!(
+            !cut.is_empty() && cut.as_slice() < b"g".as_slice(),
+            "{cut:?}"
+        );
         assert!(super::super::map::inside(
             &m.tables[0],
-            b"d",
+            &cut,
             Some(b"g"),
             &new.id
         ));
         assert!(super::super::map::inside(
             &m.tables[0],
-            b"a",
-            Some(b"d"),
+            b"",
+            Some(&cut),
             "p1"
         ));
         let mut last = std::collections::HashMap::new();

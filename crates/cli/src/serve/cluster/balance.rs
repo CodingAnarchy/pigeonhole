@@ -251,6 +251,11 @@ impl Counters {
         }
     }
 
+    /// `key`'s streak so far: the passes in a row its condition held, before this one.
+    fn streak_of(&self, key: &str) -> u32 {
+        self.streak.get(key).copied().unwrap_or(0)
+    }
+
     fn resting(&self, key: &str, now: u64) -> bool {
         self.rest.get(key).is_some_and(|&t| now < t)
     }
@@ -333,6 +338,68 @@ struct Cut {
 /// The split of `p` that best halves it: a tablet boundary of one table (not the table's
 /// first key) where the load (or the bytes, with no load measured) below is closest to half
 /// of the partition's. `None` with no boundary to split at.
+/// The split candidate whose tablets a pass asks for (D332 PR 5's design §1), through the
+/// split loop's own gates so that one partition that can't split doesn't hold up the rest
+/// (perf2's and ai1249's S1 on #2137): over `partition_max_bytes` or `partition_max_load`;
+/// not pinned, busy or moving only whole; on a node that answered; not resting nor
+/// bouncing; its condition held `passes` passes counting this one, so a survey isn't
+/// wasted on a streak not yet complete; and not set aside in `no_cut` (by partition, until
+/// when, in ms: one whose last survey found no cut, or whose split couldn't start). Of
+/// those, the one furthest over, by the larger of its two ratios.
+pub(crate) fn split_candidate(
+    nodes: &[NodeView],
+    parts: &[PartView],
+    b: &Bounds,
+    counters: &Counters,
+    now: u64,
+    no_cut: &HashMap<String, u64>,
+) -> Option<usize> {
+    parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            !p.pinned
+                && !p.busy
+                && !p.whole_only
+                && nodes.iter().any(|n| n.fresh && n.id == p.node)
+                && !counters.resting(&p.id, now)
+                && bounces(p, now, b) < b.max_moves
+                && counters.streak_of(&format!("split:{}", p.id)) + 1 >= b.passes.max(1)
+                && no_cut.get(&p.id).is_none_or(|&until| now >= until)
+        })
+        .map(|(i, p)| {
+            let size = p.bytes as f64 / b.partition_max_bytes.max(1) as f64;
+            let load = if b.partition_max_load > 0.0 {
+                p.load / b.partition_max_load
+            } else {
+                0.0
+            };
+            (i, size.max(load))
+        })
+        .filter(|(_, over)| *over > 1.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// Why surveyed `p` has no cut, whatever the pass: no tablet boundary inside its own
+/// ranges outside a pin, or a best cut that leaves over 80% on one side (a hot key).
+/// `None` when it has one; whether a node is free to take it is the pass's.
+pub(crate) fn unsplittable(p: &PartView) -> Option<String> {
+    match split_point(p) {
+        None => Some(format!(
+            "{} has no tablet boundary inside its own ranges, outside a pin, to split at",
+            p.id
+        )),
+        Some(cut) if cut.larger > 0.8 => Some(format!(
+            "{}'s best split leaves {:.0}% on one side: a hot key or a narrow hot range, \
+             unsplittable",
+            p.id,
+            cut.larger * 100.0
+        )),
+        Some(_) => None,
+    }
+}
+
 fn split_point(p: &PartView) -> Option<Cut> {
     let use_load = p.tablets.iter().any(|t| t.load > 0.0);
     let weight = |t: &Tablet| {
@@ -539,7 +606,7 @@ pub(crate) fn decide(
             });
             continue;
         }
-        // The loop surveys no tablets until D331 PR 5's split (ai1249's S1 on #2103).
+        // Only the pass's one surveyed candidate has tablets ([`split_candidate`]).
         if p.tablets.is_empty() {
             skip.get_or_insert_with(|| {
                 format!(
@@ -702,12 +769,18 @@ pub(crate) fn decide(
     {
         let key = format!("merge:{}", p.id);
         let node_mean = stats.iter().find(|s| s.0.id == p.node).map_or(0.0, |s| s.1);
-        let small = p.bytes < b.partition_min_bytes && p.load < node_mean.max(mean_load) / 10.0;
+        // Cold: under a tenth of the mean, or under a hundredth of `partition_max_load` (0.5%
+        // of a node by default) whatever the mean: in an idle cluster every load is near 0,
+        // the mean too, and nothing was under a tenth of it, so nothing ever merged.
+        let cold = (node_mean.max(mean_load) / 10.0).max(b.partition_max_load / 100.0);
+        let small = p.bytes < b.partition_min_bytes && p.load < cold;
         if !counters.hold(&key, small, b.passes) || counters.resting(&p.id, now) {
             continue;
         }
         // Neither side within four dwells of its own split: P keeps its SPLIT entry, and its
         // new partition starts with none, so a split isn't merged straight back either way.
+        // A split aborted before its hand-over keeps its entry too, so P isn't merged for
+        // those four dwells either (simp724 on #2137: conservative, and kept).
         let split_lately =
             |q: &PartView| split_at(q).is_some_and(|at| now < at.saturating_add(4 * b.dwell_ms));
         if split_lately(p) {
@@ -1328,6 +1401,108 @@ mod tests {
         assert!(
             !matches!(&d, Decision::Act(Action::Merge { from, .. }, _) if from == "p1"),
             "{d:?}"
+        );
+    }
+
+    #[test]
+    fn a_hot_key_candidate_is_set_aside_and_the_next_one_over_is_surveyed() {
+        // perf2's and ai1249's S1 on #2137: p1 is the furthest over, but its load is all in
+        // one tablet (a hot key); p2 is too big and splittable.
+        let nodes = [node("a"), node("b"), node("c")];
+        let b = Bounds {
+            partition_max_bytes: 1 << 30,
+            passes: 1,
+            ..bounds()
+        };
+        let r = |start: &str, write_load: f64| TabletReport {
+            table: "users".into(),
+            start: start.as_bytes().to_vec(),
+            bytes: 1 << 20,
+            write_load,
+            reads: 0,
+        };
+        let mut p1 = part("p1", "a", 0.9, 4 << 30);
+        p1.ranges = vec![span("", Some("g"))];
+        let mut p2 = part("p2", "b", 0.1, 2 << 30);
+        p2.ranges = vec![span("g", None)];
+        let mut parts = vec![p1, p2, part("p3", "c", 0.0, 1 << 20)];
+        let (c, now) = (Counters::default(), 1_000);
+        let mut no_cut = HashMap::new();
+        assert_eq!(
+            split_candidate(&nodes, &parts, &b, &c, now, &no_cut),
+            Some(0)
+        );
+        parts[0].tablets = tablet_loads(&[r("", 100.0), r("c", 0.0)], 0.9);
+        let why = unsplittable(&parts[0]).expect("a hot key");
+        assert!(why.contains("hot key"), "{why}");
+        no_cut.insert("p1".to_owned(), now + b.dwell_ms);
+        // The next pass surveys p2, which splits.
+        assert_eq!(
+            split_candidate(&nodes, &parts, &b, &c, now + 30_000, &no_cut),
+            Some(1)
+        );
+        parts[0].tablets.clear();
+        parts[1].tablets = tablet_loads(&[r("g", 1.0), r("p", 1.0)], 0.1);
+        assert_eq!(unsplittable(&parts[1]), None);
+        let mut c = Counters::default();
+        let d = decide(&nodes, &parts, &b, &mut c, now + 30_000, 64 << 20);
+        assert!(
+            matches!(&d, Decision::Act(Action::Split { partition, .. }, _) if partition == "p2"),
+            "{d:?}"
+        );
+        // Once its time is up, p1 is surveyed again.
+        assert_eq!(
+            split_candidate(&nodes, &parts, &b, &c, now + b.dwell_ms, &no_cut),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_resting_stale_or_unripe_partition_isnt_surveyed() {
+        let mut nodes = vec![node("a"), node("b"), node("c")];
+        let b = Bounds {
+            partition_max_bytes: 1 << 30,
+            passes: 3,
+            ..bounds()
+        };
+        let parts = [part("p1", "a", 0.1, 4 << 30), part("p2", "b", 0.1, 2 << 30)];
+        let mut c = Counters::default();
+        let no_cut = HashMap::new();
+        // Its condition hasn't held `passes` passes yet: no survey.
+        assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), None);
+        c.hold("split:p1", true, 3);
+        c.hold("split:p1", true, 3);
+        c.hold("split:p2", true, 3);
+        c.hold("split:p2", true, 3);
+        assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), Some(0));
+        // p1 resting: p2.
+        c.rest.insert("p1".into(), 10_000);
+        assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), Some(1));
+        // p2's node didn't answer: none.
+        nodes[1].fresh = false;
+        assert_eq!(split_candidate(&nodes, &parts, &b, &c, 0, &no_cut), None);
+    }
+
+    #[test]
+    fn an_idle_clusters_small_partitions_are_cold() {
+        // Every load near 0 (no load measured, or background work only), so the mean is too:
+        // under a hundredth of `partition_max_load` is cold whatever the mean.
+        let nodes = [node("a"), node("b")];
+        let b = Bounds::default();
+        let mut p1 = part("p1", "a", 0.001, 1 << 20);
+        p1.neighbours = vec!["p2".into()];
+        let parts = [p1, part("p2", "b", 0.001, 1 << 20)];
+        let (mut c, mut t) = (Counters::default(), 0);
+        let d = run(&nodes, &parts, &b, &mut c, &mut t, 10);
+        assert_eq!(
+            d,
+            Decision::Act(
+                Action::Merge {
+                    from: "p1".into(),
+                    into: "p2".into()
+                },
+                "p1 is small and cold".into()
+            )
         );
     }
 
