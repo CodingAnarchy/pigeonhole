@@ -34,7 +34,8 @@ use super::range_move;
 use crate::exit::Failure;
 use crate::output::Report;
 use crate::serve::proto::{
-    ClusterMap, LocalPartition, LocalPartitionState, MovePhase, NodeStatus, PartitionRole,
+    ClusterMap, FenceReason, LocalPartition, LocalPartitionState, MovePhase, NodeStatus,
+    PartitionRole,
 };
 
 /// How often the removal starts again when the map moved under it, before giving up.
@@ -73,8 +74,12 @@ pub(super) async fn run(
 /// How a merge ended: S removed, or S emptied and waiting for what still needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Ended {
-    /// S is out of the map; `dropped` names each file moved aside, `node: file`.
-    Removed { dropped: Vec<String> },
+    /// S is out of the map; `dropped` names each file moved aside, `node: file`, and
+    /// `left` each node or file the removal couldn't finish (a rerun goes on with them).
+    Removed {
+        dropped: Vec<String>,
+        left: Vec<String>,
+    },
     /// S holds no range but stays listed: why (`drop_waits`, or a share homed at it).
     Waiting(String),
 }
@@ -93,9 +98,8 @@ pub(super) async fn run_as(
     let ended = loop {
         let m = map_now(args).await?;
         if !m.partitions.iter().any(|p| p.id == from) {
-            break Ended::Removed {
-                dropped: unlisted_drops(args, &m, from).await?,
-            };
+            let (dropped, left) = unlisted_drops(args, &m, from).await?;
+            break Ended::Removed { dropped, left };
         }
         check(&m, from, into)?;
         if let Some(r) = m
@@ -134,7 +138,16 @@ pub(super) async fn run_as(
         moved += 1;
     };
     let (state, detail) = match &ended {
-        Ended::Removed { dropped } => ("removed", dropped.join(", ")),
+        Ended::Removed { dropped, left } if left.is_empty() => ("removed", dropped.join(", ")),
+        Ended::Removed { dropped, left } => (
+            "removed",
+            format!(
+                "{}{}not done: {}",
+                dropped.join(", "),
+                if dropped.is_empty() { "" } else { "; " },
+                left.join("; ")
+            ),
+        ),
         Ended::Waiting(why) => {
             eprintln!(
                 "phdb cluster merge: {from} holds no range now; its removal waits for {why}: \
@@ -251,9 +264,8 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
         let m0 = map_now(args).await?;
         let v0 = m0.map_version;
         let Some(p) = m0.partitions.iter().find(|p| p.id == s).cloned() else {
-            return Ok(Ended::Removed {
-                dropped: unlisted_drops(args, &m0, s).await?,
-            });
+            let (dropped, left) = unlisted_drops(args, &m0, s).await?;
+            return Ok(Ended::Removed { dropped, left });
         };
         if map::placed(&m0, s) || m0.moves.iter().any(|r| r.from == s || r.to == s) {
             return Err(Failure::usage(&format!(
@@ -263,7 +275,7 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
         let (node, address) = range_move::node_of(&m0, s)?;
         let at = At::new(args, node, address).await?;
         // 1.
-        let lp = owner_copy(&at, s, node, address, p.epoch).await?;
+        let lp = owner_copy(&at, s, node, address, p.epoch, v0).await?;
         if let Some(why) = waits(&lp, args, &m0, s).await? {
             return Ok(Ended::Waiting(why));
         }
@@ -271,9 +283,15 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
         if let Err(f) = at.call(s, "fence").await {
             return Err(fence_left(s, node, address, f.message()));
         }
-        // 3.
-        let lp = at.local(s).await?;
+        // 3. Its Status from a map at v0 or later: an older one may not compute
+        // `drop_waits` (audit120's S-c). A failed read leaves the fence named (S-b).
+        let (at_version, lp) = local_at(&at, s)
+            .await
+            .map_err(|f| fence_left(s, node, address, f.message()))?;
         let again = match lp.as_ref() {
+            _ if at_version < v0 => Some(format!(
+                "node {node} to hold map version {v0} (it holds {at_version})"
+            )),
             Some(lp) if lp.epoch == p.epoch && lp.role() == PartitionRole::Owner => {
                 waits(lp, args, &m0, s).await?
             }
@@ -283,6 +301,8 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
             unfence_or_stop(&at, s, node, address).await?;
             return Ok(Ended::Waiting(why));
         }
+        #[cfg(test)]
+        hold(&args.node).await;
         // 4.
         let moved = std::sync::atomic::AtomicBool::new(false);
         let set = set_record(args, |now: &ClusterMap| {
@@ -298,7 +318,9 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
         match set {
             Ok(()) => {}
             Err(_) if moved.load(std::sync::atomic::Ordering::Relaxed) => {
-                let now = map_now(args).await?;
+                let now = map_now(args)
+                    .await
+                    .map_err(|f| fence_left(s, node, address, f.message()))?;
                 moved_by.push(now.map_version);
                 if now
                     .partitions
@@ -313,7 +335,7 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
         }
         eprintln!("phdb cluster merge: {s} left the map at version {}", v0 + 1);
         // 5.
-        let mut dropped = Vec::new();
+        let (mut dropped, mut left) = (Vec::new(), Vec::new());
         at.call(s, "close").await?;
         if let Some(file) = drop_settled(&at, s).await? {
             dropped.push(format!("{node}: {file}"));
@@ -325,48 +347,95 @@ async fn remove(args: &NodeArgs, s: &str) -> Result<Ended, Failure> {
             let at = match At::new(args, r, &n.address).await {
                 Ok(at) => at,
                 Err(e) => {
-                    eprintln!(
-                        "phdb cluster merge: node {r} (a replica of {s}) didn't answer: {}; \
-                         run merge again to drop its copy",
+                    left.push(format!(
+                        "node {r} (a replica of {s}) didn't answer: {}; run merge again to \
+                         drop its copy",
                         e.message()
-                    );
+                    ));
                     continue;
                 }
             };
             match drop_settled(&at, s).await {
                 Ok(Some(file)) => dropped.push(format!("{r}: {file}")),
                 Ok(None) => {}
-                Err(e) => eprintln!(
-                    "phdb cluster merge: {s}'s replica copy on node {r}: {}; run merge again to \
-                     drop it",
+                Err(e) => left.push(format!(
+                    "{s}'s replica copy on node {r}: {}; run merge again to drop it",
                     e.message()
-                ),
+                )),
             }
         }
-        return Ok(Ended::Removed { dropped });
+        for l in &left {
+            eprintln!("phdb cluster merge: {l}");
+        }
+        return Ok(Ended::Removed { dropped, left });
     }
     Err(Failure::usage(&format!(
         "the map kept changing under {s}'s removal (versions {moved_by:?}): run merge again"
     )))
 }
 
+/// A test's hold of the removal of the merge talking to node URL `.0`, once, between its
+/// re-check (step 3) and its map change (step 4): `.1` is told it got there, and the
+/// removal goes on once `.2` is (a hold seam, as `range_move::STOP` is a stop one).
+#[cfg(test)]
+pub(super) static HOLD: std::sync::Mutex<Vec<Hold>> = std::sync::Mutex::new(Vec::new());
+
+/// One [`HOLD`]: the node URL, then the reached and go signals.
+#[cfg(test)]
+pub(super) type Hold = (String, Arc<Notify>, Arc<Notify>);
+
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use tokio::sync::Notify;
+
+#[cfg(test)]
+async fn hold(node: &str) {
+    let held = {
+        let mut holds = HOLD.lock().unwrap();
+        let i = holds.iter().position(|(url, _, _)| url == node);
+        i.map(|i| holds.remove(i))
+    };
+    if let Some((_, reached, go)) = held {
+        reached.notify_one();
+        go.notified().await;
+    }
+}
+
+/// The node's map version and its line for `s`, from one Status.
+async fn local_at(at: &At, s: &str) -> Result<(u64, Option<LocalPartition>), Failure> {
+    let st = at.status().await?;
+    Ok((
+        st.map_version,
+        st.partitions.into_iter().find(|lp| lp.id == s),
+    ))
+}
+
 /// Step 1's read of `s` on its owner `node`: its owner copy, serving with its lease at
-/// `epoch` (audit120's M1). Already fenced stops the merge, naming the fence (M2).
+/// `epoch` (audit120's M1), from a Status at map `v0` or later (an older map may not
+/// compute `drop_waits`: audit120's S-c). An operator's fence already there stops the
+/// merge, naming it (M2).
 async fn owner_copy(
     at: &At,
     s: &str,
     node: &str,
     address: &str,
     epoch: u64,
+    v0: u64,
 ) -> Result<LocalPartition, Failure> {
-    let lp = at
-        .local(s)
-        .await?
-        .ok_or_else(|| Failure::usage(&format!("node {node} doesn't list partition {s}")))?;
-    if matches!(
-        lp.state(),
-        LocalPartitionState::Fenced | LocalPartitionState::Closed
-    ) {
+    let (at_version, lp) = local_at(at, s).await?;
+    if at_version < v0 {
+        return Err(Failure::usage(&format!(
+            "node {node} holds map version {at_version}, behind the merge's {v0}: run merge \
+             again once it has the map"
+        )));
+    }
+    let lp =
+        lp.ok_or_else(|| Failure::usage(&format!("node {node} doesn't list partition {s}")))?;
+    // A lapsed lease or one still awaited is no operator's fence: the message below.
+    if lp.state() == LocalPartitionState::Closed
+        || (lp.state() == LocalPartitionState::Fenced && lp.fence_reason() == FenceReason::Operator)
+    {
         return Err(fence_left(
             s,
             node,
@@ -472,15 +541,17 @@ async fn drop_at(at: &At, s: &str) -> Result<Option<String>, Failure> {
 }
 
 /// [`drop_at`] on a node that may not have installed the map without `s` yet: its refusal
-/// while it still places `s` (cli692's S1 on #2130), or while a former replica's copy is
-/// still open (audit120's S2), is retried for [`REPLICA_CLOSE`].
+/// while it still places `s` (cli692's S1 on #2130), while it still lists itself among
+/// `s`'s replicas (ai1249's S1 on #2131), or while a former replica's copy is still open
+/// (audit120's S2), is retried for [`REPLICA_CLOSE`].
 async fn drop_settled(at: &At, s: &str) -> Result<Option<String>, Failure> {
     let until = tokio::time::Instant::now() + REPLICA_CLOSE;
     loop {
         match drop_at(at, s).await {
             Err(f)
                 if (f.message().contains("still open")
-                    || f.message().contains("still places partition"))
+                    || f.message().contains("still places partition")
+                    || f.message().contains("lists this node among"))
                     && tokio::time::Instant::now() < until =>
             {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -491,31 +562,48 @@ async fn drop_settled(at: &At, s: &str) -> Result<Option<String>, Failure> {
 }
 
 /// A rerun after `s` left the map (M3): every node's file of `s` whose identity names this
-/// cluster and `s` (Status: [`UNLISTED`]), closed if it's open, then moved aside, each named
-/// first (audit120's R2). Refused while a record names `s` (a split creating a partition of
-/// that name).
-async fn unlisted_drops(args: &NodeArgs, m: &ClusterMap, s: &str) -> Result<Vec<String>, Failure> {
+/// cluster and `s` (Status: exactly [`UNLISTED`], which a split-marked file never gets:
+/// audit120's S-a), closed if it's open, then moved aside, each named first (R2). Refused
+/// while a record names `s` (a split creating a partition of that name). Returns the files
+/// moved aside, and each node or file left as it was, with why.
+async fn unlisted_drops(
+    args: &NodeArgs,
+    m: &ClusterMap,
+    s: &str,
+) -> Result<(Vec<String>, Vec<String>), Failure> {
     if let Some(r) = m.moves.iter().find(|r| r.from == s || r.to == s) {
         return Err(range_move::in_flight(r, "merge"));
     }
-    let mut dropped = Vec::new();
+    let (mut dropped, mut left) = (Vec::new(), Vec::new());
     for n in &m.nodes {
-        let at = match At::new(args, &n.id, &n.address).await {
-            Ok(at) => at,
+        let lp = match At::new(args, &n.id, &n.address).await {
+            Ok(at) => at.local(s).await.map(|lp| (at, lp)),
+            Err(e) => Err(e),
+        };
+        let (at, lp) = match lp {
+            Ok((at, Some(lp))) => (at, lp),
+            Ok((_, None)) => continue,
             Err(e) => {
-                eprintln!(
-                    "phdb cluster merge: node {} didn't answer: {}; run merge again for any \
-                     file of {s} there",
+                left.push(format!(
+                    "node {} didn't answer: {}; run merge again for any file of {s} there",
                     n.id,
                     e.message()
-                );
+                ));
                 continue;
             }
         };
-        let Some(lp) = at.local(s).await? else {
-            continue;
-        };
         if lp.error != UNLISTED {
+            left.push(format!(
+                "node {}: {} of {s} left as it is ({}): run merge again once it's closed and \
+                 unlisted there",
+                n.id,
+                lp.file,
+                if lp.error.is_empty() {
+                    format!("{:?}, {:?}", lp.state(), lp.role())
+                } else {
+                    lp.error.clone()
+                }
+            ));
             continue;
         }
         eprintln!(
@@ -535,5 +623,74 @@ async fn unlisted_drops(args: &NodeArgs, m: &ClusterMap, s: &str) -> Result<Vec<
             dropped.push(format!("{}: {file}", n.id));
         }
     }
-    Ok(dropped)
+    for l in &left {
+        eprintln!("phdb cluster merge: {l}");
+    }
+    Ok((dropped, left))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::proto::InDoubtShare;
+
+    fn node(parts: &[(&str, &[&str])]) -> NodeStatus {
+        NodeStatus {
+            partitions: parts
+                .iter()
+                .map(|(id, xids)| LocalPartition {
+                    id: (*id).into(),
+                    in_doubt_shares: xids
+                        .iter()
+                        .map(|x| InDoubtShare {
+                            xid: (*x).into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    const HEX: &str = "0123456789abcdef0123456789abcdef";
+
+    /// simp724's M1: a share elsewhere whose transaction is homed at S holds S's removal,
+    /// named with its node and partition; a share homed elsewhere, or an id that isn't a
+    /// spanning one, doesn't.
+    #[test]
+    fn a_share_homed_at_s_on_any_node_holds_the_removal() {
+        let homed = format!("p1:h3-{HEX}");
+        let other = format!("p2:h3-{HEX}");
+        let statuses: HashMap<String, NodeStatus> = [
+            ("a".to_owned(), node(&[("p1", &[])])),
+            (
+                "b".to_owned(),
+                node(&[("p2", &[other.as_str(), "p1:plain"])]),
+            ),
+        ]
+        .into();
+        assert_eq!(homed_share(&statuses, "p1"), None);
+        let statuses: HashMap<String, NodeStatus> = [
+            ("a".to_owned(), node(&[("p1", &[])])),
+            ("c".to_owned(), node(&[("p3", &[homed.as_str()])])),
+            (
+                "b".to_owned(),
+                node(&[("p2", &[other.as_str(), homed.as_str()])]),
+            ),
+        ]
+        .into();
+        let why = homed_share(&statuses, "p1").unwrap();
+        // The first node by id names it, whatever the map's order.
+        assert!(why.contains("partition p2 (node b)"), "{why}");
+        assert!(why.contains(&homed), "{why}");
+        assert_eq!(
+            homed_share(&statuses, "p2"),
+            Some(format!(
+                "transaction {other} homed at p2, whose share on partition p2 (node b) is in \
+             doubt: its resolver settles it through p2"
+            ))
+        );
+    }
 }
