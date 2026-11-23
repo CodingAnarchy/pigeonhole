@@ -161,7 +161,21 @@ pub(super) async fn run_as(
 /// refusal unless `fit` is off (`--skip-fit-check`), and an unknown source refuses.
 async fn plan(args: &NodeArgs, m: &ClusterMap, from: &str, fit: bool) -> Result<(), Failure> {
     let (node, address) = range_move::node_of(m, from)?;
-    let st = At::new(args, node, address).await?.status().await?;
+    let at = At::new(args, node, address).await?;
+    // As `move-range`'s: S's write rate is reported once its first load interval ends (30 s
+    // at most, from its open), so wait for it rather than refuse a merge just after a start.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    let st = loop {
+        let st = at.status().await?;
+        let rated = st
+            .partitions
+            .iter()
+            .any(|lp| lp.id == from && lp.write_bytes_rate.is_some());
+        if rated || tokio::time::Instant::now() >= deadline {
+            break st;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     let statuses = [(node.to_owned(), st)].into();
     match range_move::plan(m, &statuses, from, None) {
         Ok(_) => Ok(()),
