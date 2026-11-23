@@ -327,13 +327,13 @@ pub(crate) enum ClusterCommand {
     /// range must lie inside one range of the table that `--from` holds.
     MoveRange {
         /// The table whose range moves.
-        #[arg(required_unless_present = "abort")]
+        #[arg(required_unless_present_any = ["abort", "resume"])]
         table: Option<String>,
         /// The partition holding the range.
-        #[arg(long, value_name = "ID", required_unless_present = "abort")]
+        #[arg(long, value_name = "ID", required_unless_present_any = ["abort", "resume"])]
         from: Option<String>,
         /// The partition it moves to.
-        #[arg(long, value_name = "ID", required_unless_present = "abort")]
+        #[arg(long, value_name = "ID", required_unless_present_any = ["abort", "resume"])]
         to: Option<String>,
         /// The range's first key (text); without it, the start of `--from`'s range.
         #[arg(long, value_name = "KEY")]
@@ -350,10 +350,18 @@ pub(crate) enum ClusterCommand {
             conflicts_with_all = ["table", "from", "to", "start", "end"]
         )]
         abort: Option<String>,
+        /// Go on with move ID (a split's too, or the balancer's) from the phase the map
+        /// records it at, to its end: for a move whose command stopped, by its id alone.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["table", "from", "to", "start", "end", "abort"]
+        )]
+        resume: Option<String>,
         /// Start the move though its plan says the copy would outrun the source's
         /// `--move-retention-cap`. The plan reckons with the source's whole file, since
         /// nothing reports one range's bytes: a small range in a big partition fits anyway.
-        #[arg(long, conflicts_with = "abort")]
+        #[arg(long, conflicts_with_all = ["abort", "resume"])]
         skip_fit_check: bool,
         #[command(flatten)]
         node: NodeArgs,
@@ -563,6 +571,19 @@ pub(crate) fn run(cli: &Cli, cmd: &ClusterCommand) -> Result<Report, Failure> {
             id,
             timeout.map(Duration::from_secs),
         )),
+        ClusterCommand::MoveRange {
+            resume: Some(id),
+            node,
+            timeout,
+            ..
+        } => runtime()?.block_on(async {
+            super::range_move::resume(node, id, timeout.map(Duration::from_secs)).await?;
+            Ok(report(
+                "cluster move-range",
+                vec![("move", id.clone().into())],
+                serde_json::json!({}),
+            ))
+        }),
         ClusterCommand::MoveRange {
             table,
             from,

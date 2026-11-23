@@ -352,7 +352,7 @@ pub(super) fn node_of<'m>(m: &'m ClusterMap, p: &str) -> Result<(&'m str, &'m st
 }
 
 /// Partition `p`'s line on its node, and move `id`'s status there, if it lists them.
-async fn side(
+pub(super) async fn side(
     args: &NodeArgs,
     m: &ClusterMap,
     p: &str,
