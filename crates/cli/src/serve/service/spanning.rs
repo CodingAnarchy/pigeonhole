@@ -278,7 +278,7 @@ impl Service {
             .gate
             .as_ref()
             .ok_or_else(|| ApiError::internal("a branch off a cluster partition"))?;
-        let g = match self.sessions.take_branch(xid)? {
+        let mut g = match self.sessions.take_branch(xid)? {
             Taken::Open(g) => g,
             Taken::Done(outcome) => return Err(ApiError::transaction_finished(&outcome)),
         };
@@ -308,6 +308,17 @@ impl Service {
             return prepared;
         }
         let held = gate.enter()?;
+        // D331 PR 5 (cli692's M1 on #2130): a local commit's range rule, under the held
+        // count. A branch whose transaction began before a range fence or hand-over here may
+        // hold rows of that range written before it: refused (retry-safe), as a local
+        // commit is, so its share can't land above the fence's seqno. One that passes is
+        // either waited for by the fence's drain (admitted before it) or saw no fence.
+        if let Some(ranges) = &*gate.ranges().load() {
+            ranges.commit(&[], g.txn().snapshot_seqno(), true)?;
+        }
+        // D331 PR 5: what its writes touched, for a range move's in-doubt watch. Recorded
+        // before the share can be in doubt.
+        gate.ranges().prepared(xid.as_bytes(), g.watched().clone());
         let (txn, _, ticket) = g.commit();
         let xid_bytes = xid.as_bytes().to_vec();
         let prepared = self

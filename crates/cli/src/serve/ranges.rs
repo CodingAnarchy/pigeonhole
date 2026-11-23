@@ -51,12 +51,17 @@ const FAMILY: &str = "moved";
 const PREFIX: &[u8] = b"moved/";
 /// The serving rows' prefix (`serving/<move id>`): a target's ranges ([`read_serving`]).
 const SERVING: &[u8] = b"serving/";
+/// The pruned watermarks' rows, one per table (D331 PR 5, simp724's P2 form): `pruned/moved/
+/// <table>` and `pruned/serving/<table>` ([`watermark`]).
+const PRUNED_MOVED: &[u8] = b"pruned/moved/";
+const PRUNED_SERVING: &[u8] = b"pruned/serving/";
 
 /// A range that moved off this partition, as its file records it once the partition takes
 /// the hand-over's map. It outlives the map's move record: M3's conflicts and stale
-/// forwards need it after the move is done. PR 5's writer prunes it at the later of "every
-/// node holds a map at or after the hand-over" and "the transaction lifetime plus the
-/// request timeout since it"; a node that never comes back keeps it. It's a plain logged
+/// forwards need it after the move is done. Its node prunes it ([`crate::serve::cluster::
+/// range_prune`]) once the move is out of the map, every node holds a map at or after the
+/// hand-over, the transaction lifetime plus the request timeout have passed since it, and
+/// its feed retention has passed it; a node that never comes back keeps it. It's a plain logged
 /// write, so it's in the partition's feed and reaches its replica copies, and a promoted
 /// copy keeps answering for it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -101,8 +106,9 @@ pub(crate) fn read_moved(db: &Pigeonhole) -> Result<Vec<Moved>, String> {
 ///
 /// **Lifetime (cli692):** a serving row gates the target's serving while its move is in the
 /// map, and afterwards clears the part of an older moved-away row it covers (a move back).
-/// So it lives as long as either holds: PR 5's writer prunes it only once no older
-/// moved-away row here overlaps it, never on the feed's retention.
+/// So it lives as long as either holds: its node prunes it ([`crate::serve::cluster::
+/// range_prune`]) only once its move is out of the map, no older moved-away row here
+/// overlaps it, and its feed retention has passed `t_from`.
 ///
 /// **Copies:** it's a plain logged write, so a replica copy of the target has it once it
 /// has applied past `t_from`. A copy promoted (D330) while the move is in the map can't
@@ -189,9 +195,12 @@ fn write_row(db: &Pigeonhole, prefix: &[u8], m: &Moved) -> Result<(), String> {
         w = w.put(FAMILY, b"final", m.final_seqno.to_string().as_bytes());
     }
     if !m.source.is_empty() {
-        w = w
-            .put(FAMILY, b"source", m.source.as_bytes())
-            .put(FAMILY, b"token", &m.token);
+        w = w.put(FAMILY, b"source", m.source.as_bytes());
+    }
+    // A serving row's token at `t_from`; a moved-away row's at the hand-over (D331 PR 5: the
+    // prune's retention test resumes from it).
+    if !m.token.is_empty() {
+        w = w.put(FAMILY, b"token", &m.token);
     }
     w.commit()
         .map(|_| ())
@@ -288,6 +297,9 @@ enum Rule {
     /// the PR 2 review: a forced map): its copy here may be cleaned, so serving it would
     /// answer rows as absent.
     Returned,
+    /// Nothing refused: a source's range a move before its commit point copies (D331 PR 5),
+    /// whose writes in a transaction its in-doubt watch tags ([`RangeGate::prepared`]).
+    Watch,
 }
 
 /// One gated range of one table.
@@ -383,6 +395,7 @@ impl RangeState {
                     continue;
                 }
                 refused = match s.rule {
+                    Rule::Watch => continue,
                     Rule::Fenced if !write => continue,
                     Rule::Fenced => Some(ApiError::range_moving(format!(
                         "partition {:?} is handing table {table:?}'s range over to another \
@@ -464,6 +477,21 @@ impl RangeState {
 }
 
 impl RangeState {
+    /// The moves whose watched ranges (D331 PR 5) `rows` write: a transaction's tags.
+    pub(crate) fn watched(&self, rows: &[super::proto::RowWrites]) -> Vec<String> {
+        let mut moves = Vec::new();
+        for s in self.spans.iter().filter(|s| s.rule == Rule::Watch) {
+            let hit = rows
+                .iter()
+                .filter_map(|r| r.row.as_ref())
+                .any(|k| k.table == s.table && s.overlaps(Touch::Row(&k.row)));
+            if hit && !moves.contains(&s.move_id) {
+                moves.push(s.move_id.clone());
+            }
+        }
+        moves
+    }
+
     /// Whether every key of `table` is in a range this partition moved away (feed1248's M3
     /// on PR 3b): its `Moved` spans cover the table from its first key on, unbroken.
     pub(crate) fn moved_whole(&self, table: &str) -> bool {
@@ -520,6 +548,20 @@ pub(crate) struct RangeGate {
     /// cluster component of the partition looks for a new hand-over's barrier, or for its
     /// tables having moved away whole (feed1248's M3 on PR 3b), when it moves.
     rows_version: std::sync::atomic::AtomicU64,
+    /// D331 PR 5's in-doubt watch (simp724's rule on the design): raised as each move's
+    /// watch begins here, after the state that holds its `Watch` span is stored; a
+    /// transaction's first write reads it before the state (both `SeqCst`), so one that
+    /// reads it at or past a watch's begin sees that watch's span.
+    watch_seq: std::sync::atomic::AtomicU64,
+    watch: Mutex<WatchBook>,
+}
+
+/// What the in-doubt watch knows: when each watching move's watch began here, and each
+/// prepared share's [`Watched`](super::sessions::Watched), by xid, while it's in doubt.
+#[derive(Debug, Default)]
+struct WatchBook {
+    begun: std::collections::HashMap<String, u64>,
+    prepared: std::collections::HashMap<Vec<u8>, super::sessions::Watched>,
 }
 
 impl RangeGate {
@@ -626,7 +668,29 @@ impl RangeGate {
             prev.as_deref(),
             visible,
         );
+        let watching: Vec<String> = next
+            .as_ref()
+            .map(|s| {
+                s.spans
+                    .iter()
+                    .filter(|s| s.rule == Rule::Watch)
+                    .map(|s| s.move_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         self.state.store(next.map(Arc::new));
+        // Each new watch begins after its span is in the stored state.
+        {
+            let mut book = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+            book.begun.retain(|id, _| watching.contains(id));
+            for id in watching {
+                book.begun.entry(id).or_insert_with(|| {
+                    self.watch_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1
+                });
+            }
+        }
         self.pending
             .store(pending, std::sync::atomic::Ordering::Release);
         self.rows_version
@@ -636,6 +700,41 @@ impl RangeGate {
     /// Whether the state waits for a row the file doesn't hold yet (see `pending`).
     pub(crate) fn pending(&self) -> bool {
         self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// D331 PR 5: the watch sequence a transaction's write reads before it loads the state
+    /// (its first write's is the one kept).
+    pub(crate) fn watch_seq(&self) -> u64 {
+        self.watch_seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Records branch `xid`'s prepared share and what its writes were seen to touch.
+    pub(crate) fn prepared(&self, xid: &[u8], watched: super::sessions::Watched) {
+        self.watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .prepared
+            .insert(xid.to_vec(), watched);
+    }
+
+    /// The shares of `in_doubt` (the partition's in-doubt xids now) that may touch move
+    /// `id`'s range (simp724's rule): all but those whose first write came at or after the
+    /// move's watch began here and that wrote none of its range. A move not watched here
+    /// counts every one. Forgets the prepared shares no longer in doubt.
+    pub(crate) fn in_doubt_on(&self, id: &str, in_doubt: &[Vec<u8>]) -> usize {
+        let mut book = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+        book.prepared.retain(|xid, _| in_doubt.contains(xid));
+        let Some(&begun) = book.begun.get(id) else {
+            return in_doubt.len();
+        };
+        in_doubt
+            .iter()
+            .filter(|xid| {
+                !book.prepared.get(*xid).is_some_and(|w| {
+                    w.first.is_some_and(|f| f >= begun) && !w.moves.iter().any(|m| m == id)
+                })
+            })
+            .count()
     }
 }
 
@@ -674,6 +773,9 @@ fn derive(
         }
         let phase = map::phase(m);
         if m.from == partition {
+            if map::before_commit(phase) {
+                spans.extend(span(m, Rule::Watch));
+            }
             match phase {
                 MovePhase::HandingOver => spans.extend(span(m, Rule::Fenced)),
                 MovePhase::HandedOver | MovePhase::Cleaning => {
@@ -689,11 +791,11 @@ fn derive(
                 _ => {}
             }
         } else if m.to == partition
-            && (phase < MovePhase::Cleaning || !serving.iter().any(|r| r.id == m.id))
+            && (!map::target_serves(phase) || !serving.iter().any(|r| r.id == m.id))
         {
             // Served from CLEANING on, once its serving row is in the file (written before
             // the gate opens it, so nothing of the range lands here below its `t_from`).
-            let cleaning = phase >= MovePhase::Cleaning;
+            let cleaning = map::target_serves(phase);
             spans.extend(span(m, Rule::Unserved).map(|s| Span {
                 awaits_row: cleaning,
                 ..s
@@ -846,12 +948,11 @@ pub(crate) fn statuses(map: &ClusterMap, partition: &str) -> Vec<MoveStatus> {
                 phase: m.phase,
                 source,
                 fenced: !node && source && phase == MovePhase::HandingOver,
-                serving: if node {
-                    phase >= MovePhase::Cleaning
-                } else if source {
-                    phase < MovePhase::HandedOver
+                // An aborting move's source serves the range; its target serves none of it.
+                serving: if node || !source {
+                    map::target_serves(phase)
                 } else {
-                    phase >= MovePhase::Cleaning
+                    !map::committed(phase)
                 },
                 // D331 PR 4b: the copy's progress and the hold's lapse, filled in by the
                 // range follower and the source's copy server.
@@ -1006,12 +1107,18 @@ mod tests {
     #[test]
     fn nothing_gates_a_partition_no_move_names() {
         assert!(gate(&map(None), "p1", Vec::new(), 1).load().is_none());
-        // Nor while the move copies, on its source.
-        assert!(
-            gate(&map(Some(MovePhase::Copying)), "p1", Vec::new(), 1)
-                .load()
-                .is_none()
-        );
+        // Nor while the move copies, on its source: its range is only watched (D331 PR 5,
+        // the in-doubt watch), so reads and writes of it go on, and a write is tagged.
+        let source = gate(&map(Some(MovePhase::Copying)), "p1", Vec::new(), 1)
+            .state
+            .load_full()
+            .expect("the watch");
+        assert_eq!(code(&source, &get("d")), None);
+        assert_eq!(code(&source, &put("d")), None);
+        let ServiceOp::Mutate(m) = put("d") else {
+            unreachable!()
+        };
+        assert_eq!(source.watched(&[m.writes.unwrap()]), vec!["mv1".to_owned()]);
     }
 
     #[test]
@@ -1342,6 +1449,58 @@ mod tests {
         );
     }
 
+    /// D331 PR 5 (simp724's P2 form, feed1248's W1, W2): a prune deletes its row and raises
+    /// its table's watermark in one write; the watermark never goes down (a later prune of
+    /// an older move keeps it), is per kind and table, and outlives the table itself.
+    #[test]
+    fn a_prune_raises_its_tables_watermark_only_and_it_outlives_the_table() {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db =
+            Pigeonhole::open(dir.join("p.phdb"), pigeonhole::Options::default().shards(1)).unwrap();
+        db.table("users")
+            .and_then(|b| b.family("f", Family::default()).create_if_missing())
+            .unwrap();
+        let row = |id: &str, final_seqno: u64| Moved {
+            id: id.into(),
+            table: "users".into(),
+            final_seqno,
+            seqno: final_seqno / 2,
+            token: b"held".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 0);
+        for r in [row("mv1", 80), row("mv2", 30)] {
+            write_moved(&db, &r).unwrap();
+        }
+        let back = read_moved(&db).unwrap();
+        assert_eq!(back.iter().find(|m| m.id == "mv1").unwrap().token, b"held");
+        prune_row(&db, Pruned::Moved, &row("mv1", 80)).unwrap();
+        assert_eq!(
+            read_moved(&db)
+                .unwrap()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mv2"]
+        );
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 80);
+        // An older move's prune doesn't lower it (W2).
+        prune_row(&db, Pruned::Moved, &row("mv2", 30)).unwrap();
+        assert!(read_moved(&db).unwrap().is_empty());
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 80);
+        // Per kind and table: a serving row's watermark is its `t_from`.
+        assert_eq!(watermark(&db, Pruned::Serving, "users").unwrap(), 0);
+        assert_eq!(watermark(&db, Pruned::Moved, "orders").unwrap(), 0);
+        write_serving(&db, &row("mv3", 90)).unwrap();
+        prune_row(&db, Pruned::Serving, &row("mv3", 90)).unwrap();
+        assert!(read_serving(&db).unwrap().is_empty());
+        assert_eq!(watermark(&db, Pruned::Serving, "users").unwrap(), 45);
+        // The table goes (the reconcile's drop after the last moved-away row): the
+        // watermark stays, in the cluster table (W1).
+        db.drop_table("users").unwrap();
+        assert_eq!(watermark(&db, Pruned::Moved, "users").unwrap(), 80);
+    }
+
     #[test]
     fn moved_away_rows_round_trip_through_the_file() {
         let dir = pigeonhole::doc_support::temp_dir();
@@ -1392,5 +1551,189 @@ mod tests {
         );
         let s = statuses(&map(Some(MovePhase::Cleaning)), "p1");
         assert!(!s[0].serving);
+        // D331 PR 5: an aborting move's source serves the range, unfenced; its target serves
+        // none of it.
+        let s = statuses(&map(Some(MovePhase::Aborting)), "p1");
+        assert!(s[0].source && !s[0].fenced && s[0].serving);
+        let t = statuses(&map(Some(MovePhase::Aborting)), "p2");
+        assert!(!t[0].serving);
     }
+
+    // D331 PR 5, simp724's rule: a share in doubt is clear of a move only when its first
+    // write came at or after the move's watch began here and it wrote none of the range.
+    #[test]
+    fn a_share_in_doubt_holds_a_moves_fence_unless_it_provably_missed_the_range() {
+        use crate::serve::sessions::Watched;
+        let g = RangeGate::default();
+        let before = g.watch_seq();
+        // A share written before any watch, prepared before it began.
+        g.prepared(
+            b"x-early",
+            Watched {
+                first: Some(before),
+                moves: Vec::new(),
+            },
+        );
+        g.update(&map(Some(MovePhase::Copying)), "p1", 10);
+        let begun = g.watch_seq();
+        assert!(begun > before, "the watch began");
+        // Written after, off the range; written after, on it; never recorded (from before a
+        // restart); and a write before the watch prepared after it (simp724's (g)).
+        g.prepared(
+            b"x-off",
+            Watched {
+                first: Some(begun),
+                moves: Vec::new(),
+            },
+        );
+        g.prepared(
+            b"x-on",
+            Watched {
+                first: Some(begun),
+                moves: vec!["mv1".into()],
+            },
+        );
+        g.prepared(
+            b"x-straddle",
+            Watched {
+                first: Some(before),
+                moves: Vec::new(),
+            },
+        );
+        let all = |xs: &[&[u8]]| xs.iter().map(|x| x.to_vec()).collect::<Vec<_>>();
+        assert_eq!(g.in_doubt_on("mv1", &all(&[b"x-off"])), 0);
+        for x in [&b"x-early"[..], b"x-on", b"x-unknown", b"x-straddle"] {
+            assert_eq!(g.in_doubt_on("mv1", &all(&[x, b"x-off"])), 1, "{x:?}");
+        }
+        // A move not watched here counts every share.
+        assert_eq!(g.in_doubt_on("mv9", &all(&[b"x-off"])), 1);
+        // Decided shares are forgotten.
+        assert_eq!(g.in_doubt_on("mv1", &[]), 0);
+        assert_eq!(
+            g.in_doubt_on("mv1", &all(&[b"x-on"])),
+            1,
+            "unknown once forgotten"
+        );
+        // The watch is the source's, before the commit point only, and refuses nothing.
+        let t = g.state.load_full().expect("a watch span");
+        assert_eq!(code(&t, &put("d")), None);
+        assert_eq!(
+            t.watched(&[proto::RowWrites {
+                row: Some(proto::RowKey {
+                    table: "users".into(),
+                    row: prost::bytes::Bytes::from_static(b"d"),
+                }),
+                ..Default::default()
+            }]),
+            ["mv1"]
+        );
+        g.update(&map(Some(MovePhase::HandedOver)), "p1", 10);
+        assert!(
+            g.state
+                .load_full()
+                .is_none_or(|s| s.watched(&[]).is_empty())
+        );
+    }
+
+    // D331 PR 5: ABORTING is out of the phases' order (above CLEANING in number), and the
+    // gate reads it as before the commit point and inactive.
+    #[test]
+    fn an_aborting_move_gates_its_target_and_leaves_its_source_serving() {
+        let aborting = map(Some(MovePhase::Aborting));
+        let t = gate(&aborting, "p2", Vec::new(), 10)
+            .state
+            .load_full()
+            .expect("gated");
+        assert_eq!(code(&t, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        assert_eq!(code(&t, &put("d")).as_deref(), Some("PartitionUnavailable"));
+        // Even with a serving row in its file, which only CLEANING opens.
+        let serving = Moved {
+            id: "mv1".into(),
+            table: "users".into(),
+            start: b"c".to_vec(),
+            end: Some(b"f".to_vec()),
+            version: 5,
+            seqno: 30,
+            ..Default::default()
+        };
+        let t = gate_serving(&aborting, "p2", Vec::new(), vec![serving], 31)
+            .state
+            .load_full()
+            .expect("gated");
+        assert_eq!(code(&t, &get("d")).as_deref(), Some("PartitionUnavailable"));
+        // The source: no fence, no moved-away span.
+        if let Some(s) = gate(&aborting, "p1", Vec::new(), 10).state.load_full() {
+            assert_eq!(code(&s, &put("d")), None);
+            assert_eq!(code(&s, &get("d")), None);
+        }
+    }
+}
+
+/// Which rows a watermark is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pruned {
+    /// A source's moved-away rows: the largest `final_seqno` pruned (`moved_pruned`).
+    Moved,
+    /// A target's serving rows: the largest `t_from` pruned (`served_pruned`).
+    Serving,
+}
+
+impl Pruned {
+    fn row(self, table: &str) -> Vec<u8> {
+        let prefix = match self {
+            Self::Moved => PRUNED_MOVED,
+            Self::Serving => PRUNED_SERVING,
+        };
+        [prefix, table.as_bytes()].concat()
+    }
+}
+
+/// Table `table`'s pruned watermark in `db` (D331 PR 5, simp724's P2 form; 0: none pruned).
+/// A cluster component's start below it, with no live row of the table covering it, is
+/// `FeedExpired` on every copy of the partition: the watermark is a logged write, so
+/// replicas carry it, whatever their own retention. In `__phdb_cluster`, so it outlives the
+/// table (feed1248's W1).
+pub(crate) fn watermark(db: &Pigeonhole, kind: Pruned, table: &str) -> Result<u64, String> {
+    let t = match db.table(identity::TABLE).and_then(|t| t.open()) {
+        Ok(t) => t,
+        Err(e) if e.code() == ErrorCode::TableNotFound => return Ok(0),
+        Err(e) => return Err(format!("read {}: {e}", identity::TABLE)),
+    };
+    if !t.families().contains(&FAMILY) {
+        return Ok(0);
+    }
+    let cell = t
+        .get(&kind.row(table), FAMILY, b"seqno")
+        .map_err(|e| format!("read the pruned watermark of {table:?}: {e}"))?;
+    Ok(cell
+        .and_then(|c| std::str::from_utf8(c.value()).ok()?.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Prunes row `m` (a moved-away row with [`Pruned::Moved`], a serving one with
+/// [`Pruned::Serving`]) in one logged write that also raises its table's watermark to its
+/// `final_seqno` or `t_from`, never lowering it (feed1248's W2: one write, made from the
+/// node's one pruning pass, so two can't race).
+pub(crate) fn prune_row(db: &Pigeonhole, kind: Pruned, m: &Moved) -> Result<(), String> {
+    let t = db
+        .table(identity::TABLE)
+        .and_then(|b| b.family(FAMILY, Family::default()).create_if_missing())
+        .map_err(|e| format!("open the moved-away ranges: {e}"))?;
+    let (prefix, at) = match kind {
+        Pruned::Moved => (PREFIX, m.final_seqno),
+        Pruned::Serving => (SERVING, m.seqno),
+    };
+    let mark = watermark(db, kind, &m.table)?.max(at);
+    let mut b = db.write_batch();
+    b.delete_row(&t, &[prefix, m.id.as_bytes()].concat());
+    b.put(
+        &t,
+        &kind.row(&m.table),
+        FAMILY,
+        b"seqno",
+        mark.to_string().as_bytes(),
+    );
+    b.commit()
+        .map(|_| ())
+        .map_err(|e| format!("prune the row of move {:?}: {e}", m.id))
 }

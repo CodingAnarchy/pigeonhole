@@ -346,6 +346,11 @@ impl Node {
                 self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
                     .await?;
             }
+            // And every range move's start, or an abort's record (D331 PR 5).
+            if map::starts_range_move(&current, &map) {
+                self.every_node_keeps(&map, MOVE_ABORTING_FEATURE, "a range move")
+                    .await?;
+            }
             // And the first use of the balancer's fields (D332).
             if !map::uses_balancer(&current) && map::uses_balancer(&map) {
                 self.every_node_keeps(&map, BALANCER_FEATURE, "the balancer's fields")
@@ -379,6 +384,10 @@ impl Node {
             }
             if !map.moves.is_empty() {
                 self.every_node_keeps(&map, RANGE_MOVES_FEATURE, "a range move")
+                    .await?;
+            }
+            if map.moves.iter().any(|m| !map::node_move(m)) {
+                self.every_node_keeps(&map, MOVE_ABORTING_FEATURE, "a range move")
                     .await?;
             }
             if map::uses_balancer(&map) {

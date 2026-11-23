@@ -122,11 +122,24 @@ impl Service {
     ) -> Result<proto::Empty, ApiError> {
         let rows = self.txn_rows(&r.rows).await?;
         let mut g = self.open_txn(&r.txn_id, caller)?;
+        // D331 PR 5's in-doubt watch: the sequence before the state (simp724's rule).
+        let watch = self.gate.as_ref().map(|gate| {
+            let seq = gate.ranges().watch_seq();
+            let moves = gate
+                .ranges()
+                .load()
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.watched(&r.rows));
+            (seq, moves)
+        });
         for (table, row, ops) in &rows {
             convert::txn_apply(g.txn(), table, row, ops);
         }
         if !rows.is_empty() {
             g.wrote_now();
+            if let Some((seq, moves)) = watch {
+                g.note_write(seq, moves);
+            }
         }
         Ok(proto::Empty {})
     }

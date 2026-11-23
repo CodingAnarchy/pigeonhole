@@ -93,6 +93,12 @@ impl Sources {
         }
     }
 
+    /// `--move-rate-bytes`, `--move-retention-cap` and `--max-move-followers`, as this node
+    /// reports them for a move's plan (D331 PR 5).
+    pub(crate) fn limits(&self) -> (u64, u64, usize) {
+        (self.rate, self.cap, self.max_followers)
+    }
+
     /// Takes `bytes` from the bucket (negative gives back), and how long the read must wait
     /// to keep the node at its rate; or, past `max_wait` of waiting, takes nothing and says
     /// how long (cli692 on #2107: a chunk is refused `Overloaded` rather than run up a debt
@@ -237,8 +243,7 @@ impl Sources {
                     &m.id == id
                         && !super::map::node_move(m)
                         && m.from == s.partition
-                        && (MovePhase::Copying..=MovePhase::HandedOver)
-                            .contains(&super::map::phase(m))
+                        && super::map::follows(super::map::phase(m))
                         && owned(m)
                 });
                 live && now.duration_since(s.asked) < IDLE

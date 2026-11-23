@@ -312,15 +312,17 @@ pub(crate) fn qualify(
     // A whole-partition move of P past its commit point (D332 PR 2): P is on the move's
     // target, and only finishing the move serves it.
     if let Some(m) = map.moves.iter().find(|m| {
-        super::map::node_move(m)
-            && m.from == p.id
-            && super::map::phase(m) >= proto::MovePhase::HandedOver
+        super::map::node_move(m) && m.from == p.id && super::map::committed(super::map::phase(m))
     }) {
         return Err(format!(
             "move {} (relocating it to node {}) is past its commit point: let it finish, or \
              use a forced map",
             m.id, m.to
         ));
+    }
+    // A range move naming P at its hand-over or past it (D331): it only goes on.
+    if let Some(why) = super::promote::range_move_holds(map, &p.id) {
+        return Err(why);
     }
     // A promote of P left pending (its writer stopped after the stamp): finished on the
     // copy it stamped, if that node answers with it (finish only, F4).
@@ -927,6 +929,52 @@ mod tests {
         // The next survey's stamps replace them: one it didn't take keeps none.
         f.note_surveyed(vec![("p2".into(), 3_000)], 7);
         assert!(f.survey_due("p1", 0, 7));
+    }
+
+    /// D331: a partition a range move holds from its hand-over on is blocked from failover,
+    /// with the move named; before the hand-over it isn't held by the move.
+    #[test]
+    fn a_range_move_from_its_hand_over_blocks_failover_of_its_source_and_target() {
+        use proto::{MoveKind, MovePhase, RangeMove};
+        let d = down("p1", None);
+        let at = |phase: MovePhase, from: &str, to: &str| {
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "t".into(),
+                from: from.into(),
+                to: to.into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            ClusterMap {
+                partitions: vec![d.p.clone()],
+                moves: vec![r],
+                ..Default::default()
+            }
+        };
+        let none = HashMap::new();
+        for (from, to) in [("p1", "p2"), ("p2", "p1")] {
+            for phase in [
+                MovePhase::HandingOver,
+                MovePhase::HandedOver,
+                MovePhase::Cleaning,
+            ] {
+                let why = qualify(&at(phase, from, to), &d.p, None, &none, 0, None).unwrap_err();
+                assert!(why.contains("range move mv1"), "{phase:?}: {why}");
+            }
+            let why = qualify(
+                &at(MovePhase::Copying, from, to),
+                &d.p,
+                None,
+                &none,
+                0,
+                None,
+            )
+            .err()
+            .unwrap_or_default();
+            assert!(!why.contains("range move"), "{why}");
+        }
     }
 
     /// The still-granting grant comes from another node only: the owner's own grant to

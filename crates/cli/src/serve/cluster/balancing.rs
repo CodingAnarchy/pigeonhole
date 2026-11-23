@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use super::balance::{self, Action, Bounds, Counters, Decision, Kind, NodeView, PartView};
 use super::proto::{
-    self, BalancerEvent, BalancerEventKind, BalancerMode, ClusterMap, MoveHistory, MovePhase,
-    NodeStatus, PartitionRequest, PartitionRole, SetMapRequest,
+    self, BalancerEvent, BalancerEventKind, BalancerMode, ClusterMap, MoveHistory, NodeStatus,
+    PartitionRequest, PartitionRole, SetMapRequest,
 };
 use super::{Node, map, schema};
 
@@ -353,7 +353,7 @@ impl Node {
             .find(|m| map::node_move(m) && m.id.starts_with("bal-"))
             .cloned()
         {
-            if map::phase(&rec) < MovePhase::HandedOver {
+            if !map::committed(map::phase(&rec)) {
                 self.abort_balancer_move(&map, &rec).await;
             } else {
                 self.set_balancer_state(format!(

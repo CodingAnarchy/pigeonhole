@@ -382,6 +382,25 @@ fn wall_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Why `partition` can't fail over or be promoted in `m`, if a range move (D331) naming it,
+/// as its source or its target, is at HANDING_OVER or past it: the move only goes on from
+/// there, on the epochs it recorded (the coordinator's ruling).
+pub(crate) fn range_move_holds(m: &proto::ClusterMap, partition: &str) -> Option<String> {
+    let r = m.moves.iter().find(|r| {
+        !super::map::node_move(r)
+            && (r.from == partition || r.to == partition)
+            && super::map::handing_over_or_past(super::map::phase(r))
+    })?;
+    Some(format!(
+        "range move {} of table {:?} ({} to {}) is at {:?}, past where it can abort: let it          finish (phdb cluster move-range, or its split, run again), then promote",
+        r.id,
+        r.table,
+        r.from,
+        r.to,
+        super::map::phase(r)
+    ))
+}
+
 /// Promotes node `to`'s copy of `partition` in `m` (D328 PR 3, with D330 PR 2's pending
 /// events): the steps after the caller's checks of the old owner.
 /// 1. `to` leaves P's replicas, so it closes its copy; with writer terms the same map
@@ -405,6 +424,9 @@ pub(crate) async fn run(
             m.map_version
         )));
     };
+    if let Some(why) = range_move_holds(m, partition) {
+        return Err(Failure::usage(&why));
+    }
     // ID's copy: open and following (its row a replica's), or closed by an earlier run (its
     // file's own row), or stamped by one (at the target epoch).
     let row = ops.row(to, partition).await?.ok_or_else(|| {
@@ -502,6 +524,9 @@ pub(crate) async fn run(
                 restore_from_cluster_id: String::new(),
                 promote: true,
                 replica_epoch: e_b,
+                create: false,
+                create_move: String::new(),
+                create_version: 0,
             },
         )
         .await?;
@@ -535,6 +560,11 @@ pub(crate) async fn run(
             p.node
         )));
     }
+    // A range move that reached its hand-over since step 1 keeps P's epoch: the promote
+    // stays pending, for a run after the move.
+    if let Some(why) = range_move_holds(&m2, partition) {
+        return Err(Failure::usage(&why));
+    }
     if now.node != p.node || now.epoch != p.epoch || now.replicas.iter().any(|r| r == to) {
         return Err(Failure::usage(&format!(
             "the map changed during the promote: {partition} is on node {:?} at epoch {} in \
@@ -551,7 +581,7 @@ pub(crate) async fn run(
     m2.moves.retain(|r| {
         !(super::map::node_move(r)
             && r.from == partition
-            && super::map::phase(r) < proto::MovePhase::HandedOver)
+            && !super::map::committed(super::map::phase(r)))
     });
     for q in m2.partitions.iter_mut().filter(|q| q.id == partition) {
         q.node = to.to_owned();
@@ -722,6 +752,43 @@ mod tests {
         m.failovers.push(ev("p3", "a", 8, S::Pending));
         m.failovers.push(ev("p9", "a", 20, S::Pending));
         assert_eq!(promote_floor(&m, "p3"), 8);
+    }
+
+    /// D331 (the coordinator's ruling): from HANDING_OVER through CLEANING a range move
+    /// holds both its partitions against a promote or a failover, the one site both take
+    /// ([`run`] checks it first and again before its map). Before it (and ABORTING) the move
+    /// aborts on an epoch change instead; a NODE move and another partition's don't count.
+    #[test]
+    fn a_range_move_from_its_hand_over_holds_both_its_partitions() {
+        use proto::{MoveKind, MovePhase as P, RangeMove};
+        let with = |phase: P, kind: MoveKind| {
+            let mut m = with_p3(5);
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: kind as i32,
+                table: "t".into(),
+                from: "p3".into(),
+                to: "p4".into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            m.moves.push(r);
+            m
+        };
+        for phase in [P::HandingOver, P::HandedOver, P::Cleaning] {
+            let m = with(phase, MoveKind::Range);
+            for p in ["p3", "p4"] {
+                let why = range_move_holds(&m, p).unwrap_or_else(|| panic!("{phase:?} {p}"));
+                assert!(why.contains("range move mv1"), "{why}");
+            }
+            assert_eq!(range_move_holds(&m, "p9"), None);
+            assert_eq!(range_move_holds(&with(phase, MoveKind::Node), "p3"), None);
+        }
+        for phase in [P::Copying, P::CatchingUp, P::Aborting] {
+            let m = with(phase, MoveKind::Range);
+            assert_eq!(range_move_holds(&m, "p3"), None, "{phase:?}");
+            assert_eq!(range_move_holds(&m, "p4"), None, "{phase:?}");
+        }
     }
 
     #[test]

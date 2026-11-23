@@ -17,6 +17,14 @@
 //! past the lease's end answers `OutcomeUnknown`, since whether anyone reads it depends on
 //! whether this node gets the lease back. A read is checked once it has taken its snapshot.
 //!
+//! **A range fence's drain (D331 PR 5):** the in-flight count is two counts, by the parity
+//! of the generation a write was admitted in. A range fence installs its state in
+//! [`ranges`](WriteGate::ranges), then starts a new generation and waits for the old one's
+//! count only ([`WriteGate::drain_range_fence`]): writes admitted since go on, so a busy
+//! partition drains. A write reads the generation, counts itself, then reads the range
+//! state, all `SeqCst` (the state's `ArcSwap` load and store too): a write the drain didn't
+//! wait for counted itself after the drain read the count, so it read the fenced state.
+//!
 //! Lock order: a write takes the gate after the service's own admission (scope, size, the
 //! in-flight budget), so a fence's drain never waits behind a write still waiting for
 //! budget, and holds it until its commit has finished, past its reply when the write runs
@@ -123,8 +131,20 @@ const OPERATOR: u8 = 1;
 pub(crate) struct WriteGate {
     /// The partition's id, for the refusal's message.
     partition: String,
-    /// Writes admitted and not yet finished.
-    inflight: AtomicUsize,
+    /// Writes admitted and not yet finished, by the parity of the generation they were
+    /// admitted in (D331 PR 5's range drain).
+    inflight: [AtomicUsize; 2],
+    /// The admission generation, raised by each range fence's drain: a write counts in
+    /// `inflight[generation & 1]`.
+    generation: AtomicUsize,
+    /// Extensions running, each counted in both slots: `inflight` counts them once.
+    extensions: AtomicUsize,
+    /// Range drains waiting, so a write's release wakes them.
+    range_draining: AtomicUsize,
+    /// One range drain at a time: a second one's new generation would mix the first's. It
+    /// holds the slot a drain left undrained (its wait ended first): no generation starts
+    /// while it holds writes, since a third would share its slot (cli692's M2 on #2130).
+    range_drain: tokio::sync::Mutex<Option<usize>>,
     /// `OPERATOR`, set or clear.
     fence: AtomicU8,
     /// When the lease ends, on `clock`: 0 when the partition has held none since it opened
@@ -155,7 +175,11 @@ impl WriteGate {
     pub(crate) fn opened(partition: &str, operator: bool, clock: Arc<LeaseClock>) -> Arc<Self> {
         Arc::new(Self {
             partition: partition.to_owned(),
-            inflight: AtomicUsize::new(0),
+            inflight: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            generation: AtomicUsize::new(0),
+            extensions: AtomicUsize::new(0),
+            range_draining: AtomicUsize::new(0),
+            range_drain: tokio::sync::Mutex::new(None),
             fence: AtomicU8::new(if operator { OPERATOR } else { OPEN }),
             lease_end: AtomicU64::new(0),
             leased_once: std::sync::atomic::AtomicBool::new(false),
@@ -177,8 +201,7 @@ impl WriteGate {
     /// [`Held::committed`] once the commit returns.
     #[inline]
     pub(crate) fn enter(self: &Arc<Self>) -> Result<Held, ApiError> {
-        self.inflight.fetch_add(1, Ordering::SeqCst);
-        let held = Held(Arc::clone(self));
+        let held = self.count();
         match self.fenced() {
             None => Ok(held),
             Some(why) => {
@@ -319,27 +342,81 @@ impl WriteGate {
         self.fence.fetch_and(!OPERATOR, Ordering::SeqCst);
     }
 
+    /// Counts a write in the current generation's slot: before the fence or range state it's
+    /// checked against is read.
+    #[inline]
+    fn count(self: &Arc<Self>) -> Held {
+        let slot = self.generation.load(Ordering::SeqCst) & 1;
+        self.inflight[slot].fetch_add(1, Ordering::SeqCst);
+        Held(Arc::clone(self), slot)
+    }
+
     /// Another hold for a write [`enter`](Self::enter) admitted and that's still held: the
     /// task a write continues in after its request (a detached write, a commit, a bulk
     /// load's thread). Never refused, since the write was admitted; only sound while that
-    /// admission's hold is alive, which keeps a fence's drain from finishing meanwhile.
+    /// admission's hold is alive, which keeps a fence's drain from finishing meanwhile. Its
+    /// admission's generation isn't known here, so it counts in both: any range drain begun
+    /// while it runs waits for it.
     pub(crate) fn extend(self: &Arc<Self>) -> Held {
-        self.inflight.fetch_add(1, Ordering::SeqCst);
-        Held(Arc::clone(self))
+        self.inflight[0].fetch_add(1, Ordering::SeqCst);
+        self.inflight[1].fetch_add(1, Ordering::SeqCst);
+        self.extensions.fetch_add(1, Ordering::SeqCst);
+        Held(Arc::clone(self), BOTH)
     }
 
     /// Counts work that runs whatever the fence (the schema reconcile, which a missing lease
     /// must not stop), then reads the fence: `enter`'s order, so a fence's drain either waits
     /// for it or it sees the fence. The caller decides from the fence whether to go on.
     pub(crate) fn hold(self: &Arc<Self>) -> (Held, Option<Fence>) {
-        self.inflight.fetch_add(1, Ordering::SeqCst);
-        let held = Held(Arc::clone(self));
+        let held = self.count();
         (held, self.fenced())
     }
 
-    /// Writes admitted and not yet finished.
+    /// Writes admitted and not yet finished (an extension counts once).
     pub(crate) fn inflight(&self) -> usize {
-        self.inflight.load(Ordering::SeqCst)
+        (self.inflight[0].load(Ordering::SeqCst) + self.inflight[1].load(Ordering::SeqCst))
+            .saturating_sub(self.extensions.load(Ordering::SeqCst))
+    }
+
+    /// D331 PR 5: waits, at most `wait`, until every write admitted before now has finished,
+    /// once a range fence's state is in [`ranges`](Self::ranges): a new generation starts, and
+    /// only the writes counted before it are waited for. Writes admitted from now go on (the
+    /// fence refuses the range's own). `Err` with the count still running when `wait` ends
+    /// first; the slot stays pending, and the next drain (a retry, or another move's) waits
+    /// it out before it starts a generation, so a write admitted before any fence is never
+    /// left behind (cli692's M2 on #2130).
+    pub(crate) async fn drain_range_fence(&self, wait: Duration) -> Result<(), usize> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut pending = self.range_drain.lock().await;
+        // The state's store comes before the new generation (module docs).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if let Some(slot) = *pending {
+            self.drain_slot(slot, deadline).await?;
+        }
+        let old = self.generation.fetch_add(1, Ordering::SeqCst) & 1;
+        *pending = Some(old);
+        self.drain_slot(old, deadline).await?;
+        *pending = None;
+        Ok(())
+    }
+
+    /// Waits until `inflight[slot]` is 0, or `deadline` (`Err` with its count).
+    async fn drain_slot(&self, slot: usize, deadline: tokio::time::Instant) -> Result<(), usize> {
+        self.range_draining.fetch_add(1, Ordering::SeqCst);
+        let done = loop {
+            let woken = self.drained.notified();
+            tokio::pin!(woken);
+            // Registered before the count is read, so a release in between wakes it.
+            woken.as_mut().enable();
+            if self.inflight[slot].load(Ordering::SeqCst) == 0 {
+                break Ok(());
+            }
+            if tokio::time::timeout_at(deadline, woken).await.is_err() {
+                break Err(self.inflight[slot].load(Ordering::SeqCst));
+            }
+        };
+        self.range_draining.fetch_sub(1, Ordering::SeqCst);
+        done
     }
 
     /// Waits, at most `wait`, until no admitted write is running: after
@@ -367,9 +444,12 @@ impl WriteGate {
     }
 }
 
-/// An admitted write, counted until dropped.
+/// [`Held`]'s slot for an extension, counted in both.
+const BOTH: usize = 2;
+
+/// An admitted write, counted until dropped, in its generation's slot (or both: `BOTH`).
 #[derive(Debug)]
-pub(crate) struct Held(Arc<WriteGate>);
+pub(crate) struct Held(Arc<WriteGate>, usize);
 
 impl Held {
     /// The write's check once its commit returned (D326): `OutcomeUnknown` when the lease
@@ -393,9 +473,20 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        // Only a fence's drain waits (`drained`), and it waits only behind the operator's
-        // fence.
-        if self.0.inflight.fetch_sub(1, Ordering::SeqCst) == 1 && self.0.operator_fenced() {
+        // Only a fence's drain waits: the operator's (`drained`), or a range fence's
+        // (`drain_range_fence`), each woken as a slot empties.
+        let slots = if self.1 == BOTH {
+            self.0.extensions.fetch_sub(1, Ordering::SeqCst);
+            0..2
+        } else {
+            self.1..self.1 + 1
+        };
+        let mut emptied = false;
+        for slot in slots {
+            emptied |= self.0.inflight[slot].fetch_sub(1, Ordering::SeqCst) == 1;
+        }
+        if emptied && (self.0.operator_fenced() || self.0.range_draining.load(Ordering::SeqCst) > 0)
+        {
             self.0.drained.notify_waiters();
         }
     }
@@ -606,6 +697,107 @@ mod tests {
                 // Admitted: it read the flag before the fence's store, so its increment
                 // came before the fence's read of the count, which saw it.
                 assert_eq!(seen, 1, "an admitted write the fence's read missed");
+            }
+        }
+    }
+
+    // D331 PR 5: a range fence's drain waits for the writes admitted before it (and their
+    // extensions), not for those admitted since, so a busy partition drains.
+    #[tokio::test]
+    async fn a_range_drain_waits_only_for_writes_admitted_before_it() {
+        let g = open("p1");
+        let before = g.enter().unwrap();
+        let detached = g.extend();
+        drop(before);
+        let draining = {
+            let g = Arc::clone(&g);
+            tokio::spawn(async move { g.drain_range_fence(Duration::from_secs(30)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Admitted after the drain began: never waited for.
+        let after = g.enter().unwrap();
+        assert!(!draining.is_finished(), "the detached write still runs");
+        drop(detached);
+        assert_eq!(draining.await.unwrap(), Ok(()));
+        assert_eq!(g.inflight(), 1, "the later write runs on");
+        assert_eq!(
+            g.drain_range_fence(Duration::from_millis(20)).await,
+            Err(1),
+            "a later drain waits for it"
+        );
+        drop(after);
+        assert_eq!(g.drain_range_fence(Duration::from_millis(20)).await, Ok(()));
+    }
+
+    // cli692's M2 on #2130: a drain whose wait ends first leaves its slot pending. The retry
+    // (or another move's drain) waits on that same slot, never a new generation's, so the
+    // write admitted before the fence is waited for however often the fence retries, and
+    // writes admitted since don't stand in for it.
+    #[tokio::test]
+    async fn a_retried_range_drain_still_waits_for_the_write_admitted_before_the_fence() {
+        let g = open("p1");
+        let stuck = g.enter().unwrap();
+        let wait = Duration::from_millis(20);
+        assert_eq!(g.drain_range_fence(wait).await, Err(1));
+        // Admitted after the first drain began, and finished: not what the retry waits for.
+        drop(g.enter().unwrap());
+        for _ in 0..3 {
+            assert_eq!(
+                g.drain_range_fence(wait).await,
+                Err(1),
+                "a retry let the pre-fence write go"
+            );
+        }
+        let later = g.enter().unwrap();
+        drop(stuck);
+        // The pending slot drains; the retry's own generation then holds `later`.
+        assert_eq!(g.drain_range_fence(wait).await, Err(1));
+        drop(later);
+        assert_eq!(g.drain_range_fence(wait).await, Ok(()));
+    }
+
+    /// A write and a range drain racing: the drain waits for it, or it reads the state
+    /// stored before the drain began. Never counted in the old generation and missed.
+    #[test]
+    fn a_racing_write_is_either_drained_or_reads_the_fenced_state() {
+        use std::sync::atomic::AtomicBool;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        for _ in 0..2000 {
+            let g = open("p1");
+            // Stands in for the range state's `ArcSwap` (both `SeqCst`).
+            let fenced = Arc::new(AtomicBool::new(false));
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let writer = {
+                let (g, fenced) = (Arc::clone(&g), Arc::clone(&fenced));
+                std::thread::spawn(move || {
+                    let held = g.enter().unwrap();
+                    let saw = fenced.load(Ordering::SeqCst);
+                    if !saw {
+                        // Admitted against the open range: held until the drain is seen
+                        // either way.
+                        let _ = go_rx.recv();
+                    }
+                    drop(held);
+                    let _ = done_tx.send(());
+                    saw
+                })
+            };
+            fenced.store(true, Ordering::SeqCst);
+            let drained = rt.block_on(g.drain_range_fence(Duration::from_millis(1)));
+            let _ = go_tx.send(());
+            let saw = writer.join().unwrap();
+            let _ = done_rx.recv();
+            if !saw {
+                // It wrote against the open range: the drain must have waited for it, so
+                // a drain that returned at once never ran while it was held.
+                assert!(
+                    drained.is_err(),
+                    "a write against the open range the drain missed"
+                );
             }
         }
     }

@@ -892,6 +892,7 @@ impl Node {
             .map(|p| p.id.clone())
             .collect();
         self.sync_replicas(&map).await;
+        self.reconcile_split_files(&map).await;
         for id in mine {
             // Open, or closed by the operator: a close holds until `unfence`.
             // One read, so a reopen between two can't make it look like neither.

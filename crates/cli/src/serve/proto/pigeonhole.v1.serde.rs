@@ -13715,6 +13715,9 @@ impl serde::Serialize for LocalPartition {
         if self.file_bytes != 0 {
             len += 1;
         }
+        if self.write_bytes_rate.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.LocalPartition", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -13837,6 +13840,11 @@ impl serde::Serialize for LocalPartition {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("file_bytes", ToString::to_string(&self.file_bytes).as_str())?;
         }
+        if let Some(v) = self.write_bytes_rate.as_ref() {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("write_bytes_rate", ToString::to_string(&v).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -13899,6 +13907,8 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             "load",
             "file_bytes",
             "fileBytes",
+            "write_bytes_rate",
+            "writeBytesRate",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -13934,6 +13944,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
             LoadDevice,
             Load,
             FileBytes,
+            WriteBytesRate,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -13986,6 +13997,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                             "loadDevice" | "load_device" => Ok(GeneratedField::LoadDevice),
                             "load" => Ok(GeneratedField::Load),
                             "fileBytes" | "file_bytes" => Ok(GeneratedField::FileBytes),
+                            "writeBytesRate" | "write_bytes_rate" => Ok(GeneratedField::WriteBytesRate),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -14036,6 +14048,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                 let mut load_device__ = None;
                 let mut load__ = None;
                 let mut file_bytes__ = None;
+                let mut write_bytes_rate__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -14252,6 +14265,14 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::WriteBytesRate => {
+                            if write_bytes_rate__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("writeBytesRate"));
+                            }
+                            write_bytes_rate__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
                     }
                 }
                 Ok(LocalPartition {
@@ -14286,6 +14307,7 @@ impl<'de> serde::Deserialize<'de> for LocalPartition {
                     load_device: load_device__.unwrap_or_default(),
                     load: load__.unwrap_or_default(),
                     file_bytes: file_bytes__.unwrap_or_default(),
+                    write_bytes_rate: write_bytes_rate__,
                 })
             }
         }
@@ -16437,6 +16459,7 @@ impl serde::Serialize for MovePhase {
             Self::HandingOver => "MOVE_PHASE_HANDING_OVER",
             Self::HandedOver => "MOVE_PHASE_HANDED_OVER",
             Self::Cleaning => "MOVE_PHASE_CLEANING",
+            Self::Aborting => "MOVE_PHASE_ABORTING",
         };
         serializer.serialize_str(variant)
     }
@@ -16454,6 +16477,7 @@ impl<'de> serde::Deserialize<'de> for MovePhase {
             "MOVE_PHASE_HANDING_OVER",
             "MOVE_PHASE_HANDED_OVER",
             "MOVE_PHASE_CLEANING",
+            "MOVE_PHASE_ABORTING",
         ];
 
         struct GeneratedVisitor;
@@ -16500,6 +16524,7 @@ impl<'de> serde::Deserialize<'de> for MovePhase {
                     "MOVE_PHASE_HANDING_OVER" => Ok(MovePhase::HandingOver),
                     "MOVE_PHASE_HANDED_OVER" => Ok(MovePhase::HandedOver),
                     "MOVE_PHASE_CLEANING" => Ok(MovePhase::Cleaning),
+                    "MOVE_PHASE_ABORTING" => Ok(MovePhase::Aborting),
                     _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
                 }
             }
@@ -16548,6 +16573,15 @@ impl serde::Serialize for MoveStatus {
         if !self.follower_error.is_empty() {
             len += 1;
         }
+        if self.fence_seqno != 0 {
+            len += 1;
+        }
+        if self.dropped {
+            len += 1;
+        }
+        if !self.follower_waiting.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.MoveStatus", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -16588,6 +16622,17 @@ impl serde::Serialize for MoveStatus {
         if !self.follower_error.is_empty() {
             struct_ser.serialize_field("follower_error", &self.follower_error)?;
         }
+        if self.fence_seqno != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("fence_seqno", ToString::to_string(&self.fence_seqno).as_str())?;
+        }
+        if self.dropped {
+            struct_ser.serialize_field("dropped", &self.dropped)?;
+        }
+        if !self.follower_waiting.is_empty() {
+            struct_ser.serialize_field("follower_waiting", &self.follower_waiting)?;
+        }
         struct_ser.end()
     }
 }
@@ -16614,6 +16659,11 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
             "retentionLapsed",
             "follower_error",
             "followerError",
+            "fence_seqno",
+            "fenceSeqno",
+            "dropped",
+            "follower_waiting",
+            "followerWaiting",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16629,6 +16679,9 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
             SourceAppliedSeqno,
             RetentionLapsed,
             FollowerError,
+            FenceSeqno,
+            Dropped,
+            FollowerWaiting,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16661,6 +16714,9 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                             "sourceAppliedSeqno" | "source_applied_seqno" => Ok(GeneratedField::SourceAppliedSeqno),
                             "retentionLapsed" | "retention_lapsed" => Ok(GeneratedField::RetentionLapsed),
                             "followerError" | "follower_error" => Ok(GeneratedField::FollowerError),
+                            "fenceSeqno" | "fence_seqno" => Ok(GeneratedField::FenceSeqno),
+                            "dropped" => Ok(GeneratedField::Dropped),
+                            "followerWaiting" | "follower_waiting" => Ok(GeneratedField::FollowerWaiting),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16691,6 +16747,9 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                 let mut source_applied_seqno__ = None;
                 let mut retention_lapsed__ = None;
                 let mut follower_error__ = None;
+                let mut fence_seqno__ = None;
+                let mut dropped__ = None;
+                let mut follower_waiting__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -16763,6 +16822,26 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                             }
                             follower_error__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::FenceSeqno => {
+                            if fence_seqno__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("fenceSeqno"));
+                            }
+                            fence_seqno__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::Dropped => {
+                            if dropped__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dropped"));
+                            }
+                            dropped__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::FollowerWaiting => {
+                            if follower_waiting__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("followerWaiting"));
+                            }
+                            follower_waiting__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(MoveStatus {
@@ -16777,6 +16856,9 @@ impl<'de> serde::Deserialize<'de> for MoveStatus {
                     source_applied_seqno: source_applied_seqno__.unwrap_or_default(),
                     retention_lapsed: retention_lapsed__.unwrap_or_default(),
                     follower_error: follower_error__.unwrap_or_default(),
+                    fence_seqno: fence_seqno__.unwrap_or_default(),
+                    dropped: dropped__.unwrap_or_default(),
+                    follower_waiting: follower_waiting__.unwrap_or_default(),
                 })
             }
         }
@@ -18480,6 +18562,15 @@ impl serde::Serialize for NodeStatus {
         if !self.balancer.is_empty() {
             len += 1;
         }
+        if self.move_rate_bytes != 0 {
+            len += 1;
+        }
+        if self.move_retention_cap != 0 {
+            len += 1;
+        }
+        if self.max_move_followers != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.NodeStatus", len)?;
         if !self.node_id.is_empty() {
             struct_ser.serialize_field("node_id", &self.node_id)?;
@@ -18528,6 +18619,19 @@ impl serde::Serialize for NodeStatus {
         if !self.balancer.is_empty() {
             struct_ser.serialize_field("balancer", &self.balancer)?;
         }
+        if self.move_rate_bytes != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("move_rate_bytes", ToString::to_string(&self.move_rate_bytes).as_str())?;
+        }
+        if self.move_retention_cap != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("move_retention_cap", ToString::to_string(&self.move_retention_cap).as_str())?;
+        }
+        if self.max_move_followers != 0 {
+            struct_ser.serialize_field("max_move_followers", &self.max_move_followers)?;
+        }
         struct_ser.end()
     }
 }
@@ -18559,6 +18663,12 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             "failoverBlocked",
             "grants",
             "balancer",
+            "move_rate_bytes",
+            "moveRateBytes",
+            "move_retention_cap",
+            "moveRetentionCap",
+            "max_move_followers",
+            "maxMoveFollowers",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -18576,6 +18686,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
             FailoverBlocked,
             Grants,
             Balancer,
+            MoveRateBytes,
+            MoveRetentionCap,
+            MaxMoveFollowers,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18610,6 +18723,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             "failoverBlocked" | "failover_blocked" => Ok(GeneratedField::FailoverBlocked),
                             "grants" => Ok(GeneratedField::Grants),
                             "balancer" => Ok(GeneratedField::Balancer),
+                            "moveRateBytes" | "move_rate_bytes" => Ok(GeneratedField::MoveRateBytes),
+                            "moveRetentionCap" | "move_retention_cap" => Ok(GeneratedField::MoveRetentionCap),
+                            "maxMoveFollowers" | "max_move_followers" => Ok(GeneratedField::MaxMoveFollowers),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18642,6 +18758,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                 let mut failover_blocked__ = None;
                 let mut grants__ = None;
                 let mut balancer__ = None;
+                let mut move_rate_bytes__ = None;
+                let mut move_retention_cap__ = None;
+                let mut max_move_followers__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::NodeId => {
@@ -18732,6 +18851,30 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                             }
                             balancer__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::MoveRateBytes => {
+                            if move_rate_bytes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moveRateBytes"));
+                            }
+                            move_rate_bytes__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::MoveRetentionCap => {
+                            if move_retention_cap__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("moveRetentionCap"));
+                            }
+                            move_retention_cap__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::MaxMoveFollowers => {
+                            if max_move_followers__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("maxMoveFollowers"));
+                            }
+                            max_move_followers__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(NodeStatus {
@@ -18748,6 +18891,9 @@ impl<'de> serde::Deserialize<'de> for NodeStatus {
                     failover_blocked: failover_blocked__.unwrap_or_default(),
                     grants: grants__.unwrap_or_default(),
                     balancer: balancer__.unwrap_or_default(),
+                    move_rate_bytes: move_rate_bytes__.unwrap_or_default(),
+                    move_retention_cap: move_retention_cap__.unwrap_or_default(),
+                    max_move_followers: max_move_followers__.unwrap_or_default(),
                 })
             }
         }
@@ -22470,6 +22616,9 @@ impl serde::Serialize for RangeMove {
         if self.from_epoch != 0 {
             len += 1;
         }
+        if self.to_epoch != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.RangeMove", len)?;
         if !self.id.is_empty() {
             struct_ser.serialize_field("id", &self.id)?;
@@ -22524,6 +22673,11 @@ impl serde::Serialize for RangeMove {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("from_epoch", ToString::to_string(&self.from_epoch).as_str())?;
         }
+        if self.to_epoch != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("to_epoch", ToString::to_string(&self.to_epoch).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -22552,6 +22706,8 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
             "handedOverTerm",
             "from_epoch",
             "fromEpoch",
+            "to_epoch",
+            "toEpoch",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -22569,6 +22725,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
             HandedOverVersion,
             HandedOverTerm,
             FromEpoch,
+            ToEpoch,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -22603,6 +22760,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                             "handedOverVersion" | "handed_over_version" => Ok(GeneratedField::HandedOverVersion),
                             "handedOverTerm" | "handed_over_term" => Ok(GeneratedField::HandedOverTerm),
                             "fromEpoch" | "from_epoch" => Ok(GeneratedField::FromEpoch),
+                            "toEpoch" | "to_epoch" => Ok(GeneratedField::ToEpoch),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -22635,6 +22793,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                 let mut handed_over_version__ = None;
                 let mut handed_over_term__ = None;
                 let mut from_epoch__ = None;
+                let mut to_epoch__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Id => {
@@ -22725,6 +22884,14 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::ToEpoch => {
+                            if to_epoch__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("toEpoch"));
+                            }
+                            to_epoch__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(RangeMove {
@@ -22741,6 +22908,7 @@ impl<'de> serde::Deserialize<'de> for RangeMove {
                     handed_over_version: handed_over_version__.unwrap_or_default(),
                     handed_over_term: handed_over_term__.unwrap_or_default(),
                     from_epoch: from_epoch__.unwrap_or_default(),
+                    to_epoch: to_epoch__.unwrap_or_default(),
                 })
             }
         }
@@ -27513,6 +27681,15 @@ impl serde::Serialize for StampRequest {
         if self.replica_epoch != 0 {
             len += 1;
         }
+        if self.create {
+            len += 1;
+        }
+        if !self.create_move.is_empty() {
+            len += 1;
+        }
+        if self.create_version != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("pigeonhole.v1.StampRequest", len)?;
         if !self.cluster_id.is_empty() {
             struct_ser.serialize_field("cluster_id", &self.cluster_id)?;
@@ -27544,6 +27721,17 @@ impl serde::Serialize for StampRequest {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("replica_epoch", ToString::to_string(&self.replica_epoch).as_str())?;
         }
+        if self.create {
+            struct_ser.serialize_field("create", &self.create)?;
+        }
+        if !self.create_move.is_empty() {
+            struct_ser.serialize_field("create_move", &self.create_move)?;
+        }
+        if self.create_version != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("create_version", ToString::to_string(&self.create_version).as_str())?;
+        }
         struct_ser.end()
     }
 }
@@ -27567,6 +27755,11 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
             "promote",
             "replica_epoch",
             "replicaEpoch",
+            "create",
+            "create_move",
+            "createMove",
+            "create_version",
+            "createVersion",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -27579,6 +27772,9 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
             RestoreFromClusterId,
             Promote,
             ReplicaEpoch,
+            Create,
+            CreateMove,
+            CreateVersion,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -27608,6 +27804,9 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                             "restoreFromClusterId" | "restore_from_cluster_id" => Ok(GeneratedField::RestoreFromClusterId),
                             "promote" => Ok(GeneratedField::Promote),
                             "replicaEpoch" | "replica_epoch" => Ok(GeneratedField::ReplicaEpoch),
+                            "create" => Ok(GeneratedField::Create),
+                            "createMove" | "create_move" => Ok(GeneratedField::CreateMove),
+                            "createVersion" | "create_version" => Ok(GeneratedField::CreateVersion),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -27635,6 +27834,9 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                 let mut restore_from_cluster_id__ = None;
                 let mut promote__ = None;
                 let mut replica_epoch__ = None;
+                let mut create__ = None;
+                let mut create_move__ = None;
+                let mut create_version__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::ClusterId => {
@@ -27691,6 +27893,26 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::Create => {
+                            if create__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("create"));
+                            }
+                            create__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::CreateMove => {
+                            if create_move__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createMove"));
+                            }
+                            create_move__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::CreateVersion => {
+                            if create_version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("createVersion"));
+                            }
+                            create_version__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(StampRequest {
@@ -27702,6 +27924,9 @@ impl<'de> serde::Deserialize<'de> for StampRequest {
                     restore_from_cluster_id: restore_from_cluster_id__.unwrap_or_default(),
                     promote: promote__.unwrap_or_default(),
                     replica_epoch: replica_epoch__.unwrap_or_default(),
+                    create: create__.unwrap_or_default(),
+                    create_move: create_move__.unwrap_or_default(),
+                    create_version: create_version__.unwrap_or_default(),
                 })
             }
         }

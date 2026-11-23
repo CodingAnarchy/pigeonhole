@@ -76,7 +76,13 @@ A range move (D331) copies a key range from partition S to partition T, follows 
 - Refused on a replica (`ReadOnly`).
 
 ## Callers
-D331's range move (serve, later PRs) and D328/D315's replication. Nothing else.
+D331's range move in serve, and D328/D315's replication. Nothing else.
+- **D331 PR 4b:** the target's copy and catch-up write through `logged_batch`, feed-silent; the source's feed retention hold is taken before the copy's first snapshot.
+- **D331 PR 5:** `drop_range` runs from a persisted drop row (`cluster/range_drop.rs`), and is run again after a crash until it returns.
+  - The source drops the moved range at CLEANING, once the target serves it. Its range fence stays up until then, so no writer of the range is in flight.
+  - The target drops what it copied when a move aborts, after the follower is joined. That includes a target that was down when the abort landed, at its next open.
+  - A drop of a table the file no longer has does nothing and counts as done.
+- **A flush across a drop (#2128, found by PR 5's tests):** a flush that froze a memtable before `drop_range` retired its tablets commits without them, skipping their edits as for a dropped table. Before the fix it was refused (a debug assertion; in release, retried for ever).
 
 ## Tests
 - `crates/format/tests/validation.rs`: a silent batch round-trips, and is `Corrupt` to `decode` and to `decode_with(.., false)`. As a build before D331 reads it, the count runs past the batch's bytes.

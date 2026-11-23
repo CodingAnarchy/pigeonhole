@@ -217,6 +217,8 @@ impl Node {
                 if let Some(part) = open.get(&id) {
                     let l = self.partition_load(part);
                     (lp.load_cpu, lp.load_device, lp.load) = (l.cpu, l.device, l.load());
+                    // D331 PR 5's plan: absent until the first interval ends.
+                    lp.write_bytes_rate = l.write_rate.map(|r| r as u64);
                     // Its size from the file system, no read of the file (perf287): the
                     // path the database opened, not one built from the id (CodeQL on
                     // #2103).
@@ -230,6 +232,17 @@ impl Node {
                 if let Some(copies) = self.range_copies() {
                     for s in lp.moves.iter_mut().filter(|s| s.source) {
                         s.retention_lapsed = copies.lapsed(&s.id);
+                    }
+                }
+                // PR 5: a source's fence seqno, once its fence drained; either side's drop.
+                if let Some(fences) = self.range_fences() {
+                    for s in lp.moves.iter_mut().filter(|s| s.source) {
+                        s.fence_seqno = fences.seqno(&s.id);
+                    }
+                }
+                if let Some(drops) = self.range_drops() {
+                    for s in &mut lp.moves {
+                        s.dropped = drops.dropped(&s.id);
                     }
                 }
                 if let Some(follows) = self.range_follows() {
@@ -246,6 +259,11 @@ impl Node {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .clone()
                                 .unwrap_or_default();
+                            s.follower_waiting = p
+                                .waiting
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
                         }
                     }
                 }
@@ -261,7 +279,15 @@ impl Node {
                 )
             },
         );
+        let (move_rate_bytes, move_retention_cap, max_move_followers) =
+            self.range_copies().map_or((0, 0, 0), |s| {
+                let (rate, cap, followers) = s.limits();
+                (rate, cap, u32::try_from(followers).unwrap_or(u32::MAX))
+            });
         NodeStatus {
+            move_rate_bytes,
+            move_retention_cap,
+            max_move_followers,
             balancer: self.balancer_state(),
             writer,
             writer_term,

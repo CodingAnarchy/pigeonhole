@@ -233,6 +233,60 @@ pub(crate) fn phase(m: &RangeMove) -> MovePhase {
     MovePhase::try_from(m.phase).unwrap_or(MovePhase::Unspecified)
 }
 
+// D331 PR 5: the phases' order, for every comparison of phases. MOVE_PHASE_ABORTING (7) is
+// out of the order: PR 6's AWAITING_OUTCOMES (6) comes after CLEANING in it, and ABORTING
+// leaves the order from any phase before the commit point. So no phase is compared by
+// number but in these, and each places ABORTING explicitly. An aborting move is before its
+// commit point and inactive: its source holds and serves the range, unfenced; its target
+// serves and follows none of it.
+
+/// Whether `new` starts a range move (not a whole-partition one) that `old` lacks, or holds
+/// an aborting record `old` doesn't (D331 PR 5): each needs every node to know
+/// `MOVE_PHASE_ABORTING` (`MOVE_ABORTING_FEATURE`).
+pub(crate) fn starts_range_move(old: &ClusterMap, new: &ClusterMap) -> bool {
+    new.moves.iter().any(|m| {
+        !node_move(m)
+            && !old
+                .moves
+                .iter()
+                .any(|o| o.id == m.id && (phase(o) == phase(m) || phase(m) != MovePhase::Aborting))
+    })
+}
+
+/// Past the commit point: HANDED_OVER and every phase after it in the order. Never ABORTING.
+pub(crate) fn committed(p: MovePhase) -> bool {
+    p != MovePhase::Aborting && p >= MovePhase::HandedOver
+}
+
+/// The target serves the range: CLEANING and every phase after it in the order. Never
+/// ABORTING.
+pub(crate) fn target_serves(p: MovePhase) -> bool {
+    p != MovePhase::Aborting && p >= MovePhase::Cleaning
+}
+
+/// Live before the commit point: COPYING, CATCHING_UP or HANDING_OVER. Never ABORTING (an
+/// abort under way), whose record is before the commit point too but runs nothing of the
+/// move.
+pub(crate) fn before_commit(p: MovePhase) -> bool {
+    matches!(
+        p,
+        MovePhase::Copying | MovePhase::CatchingUp | MovePhase::HandingOver
+    )
+}
+
+/// From the hand-over on: HANDING_OVER and every phase after it in the order. Never
+/// ABORTING. Neither partition of a range move here fails over or is promoted (the
+/// coordinator's ruling): before it, the move aborts on an epoch change instead.
+pub(crate) fn handing_over_or_past(p: MovePhase) -> bool {
+    p == MovePhase::HandingOver || committed(p)
+}
+
+/// The target follows the range from the source, and the source serves its copy and feed:
+/// COPYING through HANDED_OVER. Never ABORTING.
+pub(crate) fn follows(p: MovePhase) -> bool {
+    before_commit(p) || p == MovePhase::HandedOver
+}
+
 /// D331: a move's range as bytes, `[start, end)`: an absent start is the table's first key
 /// (the empty key), an absent end the table's end.
 pub(crate) fn move_range(m: &RangeMove) -> Result<(Vec<u8>, Option<Vec<u8>>), Refusal> {
@@ -300,7 +354,7 @@ pub(crate) fn source_epoch_holds(m: &RangeMove, epoch: u64) -> bool {
     if m.from_epoch == 0 {
         return true;
     }
-    if phase(m) >= MovePhase::HandedOver {
+    if committed(phase(m)) {
         epoch > m.from_epoch
     } else {
         epoch == m.from_epoch
@@ -446,13 +500,21 @@ fn validate_node_move(map: &ClusterMap, m: &RangeMove) -> Result<(), Refusal> {
             "move {id:?} relocates a whole partition, which has no CATCHING_UP phase"
         ));
     }
+    // D331 PR 5's ABORTING is a range move's: a whole-partition move is aborted by removing
+    // its record (D332 PR 2).
+    if phase == MovePhase::Aborting {
+        return Err(format!(
+            "move {id:?} relocates a whole partition, which is aborted by removing it, not \
+             through ABORTING"
+        ));
+    }
     if m.from_epoch == 0 || m.snapshot_seqno != 0 || m.final_seqno != 0 {
         return Err(format!(
             "move {id:?} relocates a whole partition: it records its epoch at COPYING \
              (from_epoch), and no seqnos"
         ));
     }
-    let handed = phase >= MovePhase::HandedOver;
+    let handed = committed(phase);
     let at = if handed {
         p.node == m.to && p.epoch > m.from_epoch
     } else {
@@ -570,7 +632,7 @@ fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
                 "move {id:?}'s range is empty: its end isn't after its start"
             ));
         }
-        let handed = phase >= MovePhase::HandedOver;
+        let handed = committed(phase);
         let holder = if handed { &m.to } else { &m.from };
         if !inside(t, &start, end.as_deref(), holder) {
             return Err(format!(
@@ -584,7 +646,12 @@ fn validate_moves(map: &ClusterMap) -> Result<(), Refusal> {
                 }
             ));
         }
-        if m.final_seqno != 0 && phase < MovePhase::HandingOver {
+        // An abort from HANDING_OVER keeps the final_seqno it had.
+        if m.final_seqno != 0
+            && !(phase == MovePhase::HandingOver
+                || committed(phase)
+                || phase == MovePhase::Aborting)
+        {
             return Err(format!("move {id:?} has a final_seqno before HANDING_OVER"));
         }
         let pair = (m.handed_over_term, m.handed_over_version);
@@ -636,7 +703,7 @@ pub(crate) fn handed_over(
 }
 
 /// A split key for `bytes` in canonical form: `text` when they're UTF-8, else `raw`.
-fn canonical_key(bytes: &[u8]) -> SplitKey {
+pub(crate) fn canonical_key(bytes: &[u8]) -> SplitKey {
     SplitKey {
         key: Some(match std::str::from_utf8(bytes) {
             Ok(s) => split_key::Key::Text(s.to_owned()),
@@ -1246,6 +1313,26 @@ fn validate_move_steps(old: &ClusterMap, new: &ClusterMap) -> Result<(), Refusal
             return Err(format!(
                 "move {id:?}'s table, range, partitions or kind changed: a move keeps them"
             ));
+        }
+        // D331 PR 5: an abort goes to ABORTING from before the commit point, and an aborting
+        // move stays so until it's removed. ABORTING is out of the phases' order, so this
+        // comes before the step by number.
+        match (phase(o), phase(m)) {
+            (MovePhase::Aborting, MovePhase::Aborting) => continue,
+            (MovePhase::Aborting, p) => {
+                return Err(format!(
+                    "move {id:?} is aborting: it can't go on to {p:?}, only stay ABORTING \
+                     until it's removed"
+                ));
+            }
+            (p, MovePhase::Aborting) if !before_commit(p) => {
+                return Err(format!(
+                    "move {id:?} is at {p:?}: only a move before its commit point (COPYING, \
+                     CATCHING_UP or HANDING_OVER) can abort"
+                ));
+            }
+            (_, MovePhase::Aborting) => continue,
+            _ => {}
         }
         let (was, now) = (phase(o) as i32, phase(m) as i32);
         // A NODE move has no CATCHING_UP: it goes from COPYING to HANDING_OVER (D332 PR 2).
@@ -2713,5 +2800,127 @@ mod tests {
         let mut m = map();
         p3(&mut m).failover_count = 1;
         assert!(uses_failover(&m));
+    }
+
+    // D331 PR 5: MOVE_PHASE_ABORTING is out of the phases' order (above CLEANING and PR 6's
+    // AWAITING_OUTCOMES in number), so each predicate places it explicitly: before the
+    // commit point and inactive.
+    #[test]
+    fn aborting_is_before_the_commit_point_and_inactive_in_every_phase_predicate() {
+        use MovePhase::*;
+        assert!(Aborting as i32 > Cleaning as i32);
+        // (phase, committed, target_serves, before_commit, follows)
+        for (p, c, t, b, f) in [
+            (Unspecified, false, false, false, false),
+            (Copying, false, false, true, true),
+            (CatchingUp, false, false, true, true),
+            (HandingOver, false, false, true, true),
+            (HandedOver, true, false, false, true),
+            (Cleaning, true, true, false, false),
+            (Aborting, false, false, false, false),
+        ] {
+            assert_eq!(committed(p), c, "committed({p:?})");
+            assert_eq!(target_serves(p), t, "target_serves({p:?})");
+            assert_eq!(before_commit(p), b, "before_commit({p:?})");
+            assert_eq!(follows(p), f, "follows({p:?})");
+        }
+    }
+
+    // map.rs's sites: the holder check, the handed-over pair, `final_seqno` and
+    // `source_epoch_holds` read an aborting record as its source still holding the range.
+    #[test]
+    fn an_aborting_move_is_checked_as_its_source_holding_the_range() {
+        let mut m = moving(MovePhase::Aborting);
+        validate(&m, true).unwrap();
+        // An abort from HANDING_OVER keeps its final_seqno.
+        m.moves[0].final_seqno = 9;
+        validate(&m, true).unwrap();
+        let mut handed = m.clone();
+        handed.tables[0] = handed_over(&handed.tables[0], b"c", Some(b"f"), "p2");
+        refused(validate(&handed, true), "the source holds it");
+        let mut pair = m.clone();
+        pair.moves[0].handed_over_version = 1;
+        refused(validate(&pair, true), "from HANDED_OVER on, only then");
+        let mut r = m.moves[0].clone();
+        r.from_epoch = 3;
+        assert!(source_epoch_holds(&r, 3));
+        assert!(!source_epoch_holds(&r, 4));
+        // A whole-partition move is aborted by removing it.
+        refused(
+            validate(&node_move(MovePhase::Aborting, 2), true),
+            "not through ABORTING",
+        );
+    }
+
+    #[test]
+    fn a_move_aborts_from_before_its_commit_point_and_stays_aborting_until_removed() {
+        let at = |phase: MovePhase, version: u64| {
+            let mut m = moving(phase);
+            m.map_version = version;
+            m
+        };
+        for p in [
+            MovePhase::Copying,
+            MovePhase::CatchingUp,
+            MovePhase::HandingOver,
+        ] {
+            validate_change(&at(p, 1), &at(MovePhase::Aborting, 2)).unwrap();
+        }
+        // It stays, or goes; never on, or back.
+        validate_change(&at(MovePhase::Aborting, 1), &at(MovePhase::Aborting, 2)).unwrap();
+        let mut gone = map();
+        gone.map_version = 2;
+        validate_change(&at(MovePhase::Aborting, 1), &gone).unwrap();
+        for p in [
+            MovePhase::Copying,
+            MovePhase::CatchingUp,
+            MovePhase::HandingOver,
+            MovePhase::HandedOver,
+            MovePhase::Cleaning,
+        ] {
+            refused(
+                validate_change(&at(MovePhase::Aborting, 1), &at(p, 2)),
+                "only stay ABORTING",
+            );
+        }
+        // Not from the commit point on.
+        let mut handed = at(MovePhase::HandedOver, 5);
+        handed.moves[0].handed_over_version = 5;
+        handed.tables[0] = handed_over(&handed.tables[0], b"c", Some(b"f"), "p2");
+        handed.partitions[0].epoch = 2;
+        let mut aborting = handed.clone();
+        aborting.map_version = 6;
+        aborting.moves[0].phase = MovePhase::Aborting as i32;
+        refused(
+            validate_change(&handed, &aborting),
+            "only a move before its commit point",
+        );
+        // It never starts aborting.
+        refused(
+            validate_change(&map(), &at(MovePhase::Aborting, 2)),
+            "start at COPYING",
+        );
+    }
+
+    #[test]
+    fn every_range_moves_start_and_abort_needs_the_aborting_feature() {
+        let at = |phase: MovePhase| moving(phase);
+        assert!(starts_range_move(&map(), &at(MovePhase::Copying)));
+        assert!(!starts_range_move(
+            &at(MovePhase::Copying),
+            &at(MovePhase::CatchingUp)
+        ));
+        assert!(starts_range_move(
+            &at(MovePhase::CatchingUp),
+            &at(MovePhase::Aborting)
+        ));
+        assert!(!starts_range_move(
+            &at(MovePhase::Aborting),
+            &at(MovePhase::Aborting)
+        ));
+        assert!(!starts_range_move(
+            &map(),
+            &node_move(MovePhase::Copying, 2)
+        ));
     }
 }

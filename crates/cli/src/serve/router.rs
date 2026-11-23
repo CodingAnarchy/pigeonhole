@@ -45,6 +45,10 @@ pub(crate) struct Cluster {
     pub(crate) range_copies: Arc<super::cluster::range_copy::Sources>,
     /// The range moves this node follows as their target (D331 PR 4b).
     pub(crate) range_follows: Arc<super::cluster::range_follow::Followers>,
+    /// The range moves' fences this node's partitions hold as their source (D331 PR 5).
+    pub(crate) range_fences: Arc<super::cluster::range_fence::Fences>,
+    /// The range moves' drops this node's partitions run (D331 PR 5).
+    pub(crate) range_drops: Arc<super::cluster::range_drop::Drops>,
 }
 
 impl Cluster {
@@ -259,6 +263,8 @@ impl Router {
                     2,
                 )),
                 range_follows: Arc::default(),
+                range_fences: Arc::default(),
+                range_drops: Arc::default(),
             }),
         }
     }

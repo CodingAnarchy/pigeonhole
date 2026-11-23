@@ -630,6 +630,16 @@ impl Node {
         Ok(())
     }
 
+    /// Drops `id` from the operator's fences (and `fenced.json`) if it's there: its files are
+    /// gone, so the fence was another partition's of that name. The caller holds `changing`.
+    pub(super) async fn forget_operator_fence(&self, id: &str) -> Result<(), ApiError> {
+        let mut fenced = self.fences.operator().clone();
+        if fenced.remove(id) {
+            self.persist_fences(fenced).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn persist_fences(&self, fenced: BTreeSet<String>) -> Result<(), ApiError> {
         let dir = self.dir.clone();
         let written = fenced.clone();
@@ -1200,8 +1210,10 @@ impl Node {
     /// One loop per node, started once its partitions are open; it holds the node only
     /// while a round runs, and ends once the node is gone.
     pub(crate) fn renew_leases(self: &Arc<Self>) {
-        // The node's device ceiling's readings start with its lease renewals (D332).
+        // The node's device ceiling's readings start with its lease renewals (D332), and so
+        // does its range rows' pruning (D331 PR 5).
         self.watch_device();
+        self.watch_range_prunes();
         if self
             .fences
             .retrying

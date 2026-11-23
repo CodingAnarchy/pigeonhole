@@ -129,9 +129,7 @@ impl Routes {
             // A NODE move (a whole relocation, D332 PR 2) leaves the copies serving reads.
             map.moves.iter().any(|m| {
                 !super::map::node_move(m)
-                    && (m.to == id
-                        || (m.from == id
-                            && super::map::phase(m) >= crate::serve::proto::MovePhase::HandedOver))
+                    && (m.to == id || (m.from == id && super::map::committed(super::map::phase(m))))
             })
         };
         let owners = map
@@ -619,5 +617,50 @@ mod tests {
         on_b.sort_unstable();
         assert_eq!(on_b, ["p2", "p3"]);
         assert_eq!(r.partitions_of("c").count(), 0);
+    }
+
+    // D331 PR 5: an aborting move's source is before its commit point, so its copies go on
+    // serving its reads; only from HANDED_OVER do they stop.
+    #[test]
+    fn an_aborting_moves_source_keeps_its_copies_serving_reads() {
+        use crate::serve::proto::{MoveKind, MovePhase, RangeMove};
+        let at = |phase: MovePhase| {
+            let mut m = map();
+            m.partitions[0].replicas = vec!["b".into()];
+            let mut r = RangeMove {
+                id: "mv1".into(),
+                kind: MoveKind::Range as i32,
+                table: "users".into(),
+                start: Some(text("a")),
+                end: Some(text("c")),
+                from: "p1".into(),
+                to: "p2".into(),
+                ..Default::default()
+            };
+            r.set_phase(phase);
+            m.moves.push(r);
+            Routes::new(&m)
+        };
+        assert!(
+            !at(MovePhase::Aborting)
+                .owner("p1")
+                .unwrap()
+                .replicas
+                .is_empty()
+        );
+        assert!(
+            !at(MovePhase::HandingOver)
+                .owner("p1")
+                .unwrap()
+                .replicas
+                .is_empty()
+        );
+        assert!(
+            at(MovePhase::HandedOver)
+                .owner("p1")
+                .unwrap()
+                .replicas
+                .is_empty()
+        );
     }
 }
