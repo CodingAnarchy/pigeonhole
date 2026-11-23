@@ -599,8 +599,15 @@ impl Node {
                 }
             }
         }
+        // A paused balancer names the removals that wait or stopped, as a skip does (audit120's
+        // nit on #2137): pausing doesn't hide a fence an operator has to lift.
         if mode == BalancerMode::Paused {
-            self.set_balancer_state("paused".into());
+            let mut st = String::from("paused");
+            for more in &waiting {
+                st.push_str("; ");
+                st.push_str(more);
+            }
+            self.set_balancer_state(st);
             return;
         }
         let mut statuses: HashMap<String, NodeStatus> = self
