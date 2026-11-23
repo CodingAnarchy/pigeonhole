@@ -264,6 +264,12 @@ pub struct Catalog {
     pub(crate) has_unknown_merge: bool,
     /// The operators this process knows (`EngineOptions::merge_operators`).
     registry: Arc<MergeRegistry>,
+    /// Tablets a range drop (D331) retired in this process: a flush that took one of their
+    /// memtables before the drop skips its edits, as for a dropped table's tablet, where a
+    /// split's or merge's retired tablet refuses the flush. Never persisted: after a reopen
+    /// no memtable holds a tablet the manifest no longer has (`Engine::drop_range`'s replay
+    /// note), and a drop run again after a crash fills it again.
+    range_dropped: Arc<std::collections::BTreeSet<TabletId>>,
 }
 
 impl Catalog {
@@ -278,6 +284,16 @@ impl Catalog {
     /// The operator registry.
     pub(crate) fn registry(&self) -> &Arc<MergeRegistry> {
         &self.registry
+    }
+
+    /// Notes `tablets` as retired by a range drop (D331), in the drop's own catalog change.
+    pub(crate) fn note_range_dropped(&mut self, tablets: &[TabletId]) {
+        Arc::make_mut(&mut self.range_dropped).extend(tablets.iter().copied());
+    }
+
+    /// Whether a range drop in this process retired `tablet`.
+    pub(crate) fn range_dropped(&self, tablet: TabletId) -> bool {
+        self.range_dropped.contains(&tablet)
     }
 
     /// Applies one edit. A tablet a `PutTablet` creates goes to shard `tablet % shards`
